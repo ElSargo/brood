@@ -3,20 +3,7 @@
 ## Reference Code
 
 When implementing features, check the code in `reference/` for relevant examples before designing a new approach from scratch.
-
-Use these local checkouts as implementation references:
-
-- `reference/waypipe`
-- `reference/niri`
-- `reference/smithay`
-- `reference/helix`
-- `reference/zed`
-
-Prefer patterns that fit Manifold's own architecture and terminology. Treat the reference repositories as examples, not source to copy wholesale.
-
-## Dependencies
-
-Use normal Cargo registry resolution for now. Do not commit `vendor/` or repo-local `.cargo/` configuration unless we explicitly decide to vendor dependencies for reproducible/offline builds.
+Refer patterns that fit Manifold's own architecture and terminology. Treat the reference repositories as examples, not source to copy wholesale.
 
 ## WSLg Wayland Screenshots
 
