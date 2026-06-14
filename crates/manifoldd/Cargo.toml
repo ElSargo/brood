@@ -1,0 +1,21 @@
+[package]
+name = "manifoldd"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+calloop.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smithay.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

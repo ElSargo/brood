@@ -1,0 +1,35 @@
+# Rust
+/target/
+**/*.rs.bk
+/.cargo/
+/vendor/
+
+# Local implementation references
+/reference/
+
+# Build outputs and caches
+/.codex-artifacts/
+/.cache/
+/dist/
+/build/
+/out/
+__pycache__/
+*.pyc
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Local environment
+.env
+.env.*
+!.env.example

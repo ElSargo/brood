@@ -1,0 +1,25 @@
+diff --git a/vendor/weston/libweston/pixman-renderer.c b/vendor/weston/libweston/pixman-renderer.c
+index 699352b9..68a79e92 100644
+--- a/vendor/weston/libweston/pixman-renderer.c
++++ b/vendor/weston/libweston/pixman-renderer.c
+@@ -857,6 +857,19 @@ pixman_renderer_surface_copy_content(struct weston_surface *surface,
+ 				 0, 0,         /* dest_x, dest_y */
+ 				 target_width, target_height);
+ 	pixman_image_set_transform(ps->image, NULL);
+ 	pixman_image_unref(out_buf);
+ 
++	for (int y = 0; y < target_height; y++) {
++		uint8_t *row = (uint8_t *)target + y * target_stride;
++
++		for (int x = 0; x < target_width; x++) {
++			uint8_t *pixel = row + x * 4;
++
++			pixel[0] = 0xff - pixel[0];
++			pixel[1] = 0xff - pixel[1];
++			pixel[2] = 0xff - pixel[2];
++		}
++	}
++
+ 	return 0;
+ }
+ 

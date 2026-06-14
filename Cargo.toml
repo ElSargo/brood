@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/manifoldd"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+calloop = "0.14.4"
+clap = { version = "4.6.1", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_drm",
+    "backend_winit",
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+    "use_system_lib",
+] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }

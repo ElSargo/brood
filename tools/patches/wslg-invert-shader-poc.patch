@@ -1,0 +1,41 @@
+diff --git a/vendor/weston/libweston/renderer-gl/gl-renderer.c b/vendor/weston/libweston/renderer-gl/gl-renderer.c
+index 7240c211..c381dec9 100644
+--- a/vendor/weston/libweston/renderer-gl/gl-renderer.c
++++ b/vendor/weston/libweston/renderer-gl/gl-renderer.c
+@@ -2948,6 +2948,7 @@ static const char vertex_shader[] =
+ 	"  gl_FragColor.r = y + 1.59602678 * v;\n"			\
+ 	"  gl_FragColor.g = y - 0.39176229 * u - 0.81296764 * v;\n"	\
+ 	"  gl_FragColor.b = y + 2.01723214 * u;\n"			\
++	"  gl_FragColor.rgb = alpha - gl_FragColor.rgb;\n"		\
+ 	"  gl_FragColor.a = alpha;\n"
+ 
+ static const char fragment_debug[] =
+@@ -2963,7 +2964,8 @@ static const char texture_fragment_shader_rgba[] =
+ 	"uniform float alpha;\n"
+ 	"void main()\n"
+ 	"{\n"
+-	"   gl_FragColor = alpha * texture2D(tex, v_texcoord)\n;"
++	"   vec4 color = texture2D(tex, v_texcoord);\n"
++	"   gl_FragColor = vec4(alpha * (1.0 - color.rgb), alpha * color.a)\n;"
+ 	;
+ 
+ static const char texture_fragment_shader_rgbx[] =
+@@ -2973,7 +2975,7 @@ static const char texture_fragment_shader_rgbx[] =
+ 	"uniform float alpha;\n"
+ 	"void main()\n"
+ 	"{\n"
+-	"   gl_FragColor.rgb = alpha * texture2D(tex, v_texcoord).rgb\n;"
++	"   gl_FragColor.rgb = alpha * (1.0 - texture2D(tex, v_texcoord).rgb)\n;"
+ 	"   gl_FragColor.a = alpha;\n"
+ 	;
+ 
+@@ -2985,7 +2987,8 @@ static const char texture_fragment_shader_egl_external[] =
+ 	"uniform float alpha;\n"
+ 	"void main()\n"
+ 	"{\n"
+-	"   gl_FragColor = alpha * texture2D(tex, v_texcoord)\n;"
++	"   vec4 color = texture2D(tex, v_texcoord);\n"
++	"   gl_FragColor = vec4(alpha * (1.0 - color.rgb), alpha * color.a)\n;"
+ 	;
+ 
+ static const char texture_fragment_shader_y_uv[] =
