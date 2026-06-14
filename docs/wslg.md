@@ -136,7 +136,7 @@ The first pass should focus on WSLg's documented private system distro flow befo
 
 The private WSLg experiment must fail loudly if the RDP backend cannot use graphics redirection shared memory. The stock upstream path treats `WESTON_RDP_SHARED_MEMORY=true` as a preference: it probes `WSL2_SHARED_MEMORY_MOUNT_POINT`, FreeRDP gfxredir support, and a tiny `/mnt/shared_memory` allocation, then silently falls back to copy-heavy RDPGFX surface commands when any probe fails. It also allows the slow path when `WESTON_RDP_SHARED_MEMORY=false`; Manifold does not.
 
-Manifold patches this into a hard startup failure with `tools/patches/wslg-require-gfxredir-fastpath.patch`. A failing Weston start with `refusing slow RDPGFX fallback` in `/mnt/wslg/weston.log` is therefore intentional. Fix the shared-memory path before benchmarking or using fullscreen app workloads.
+Manifold patches this into a hard startup/runtime failure with `tools/patches/wslg-require-gfxredir-fastpath.patch`. `tools/patches/wslg-retry-gfxredir-shm-open.patch` also gives the real gfxredir shared-memory allocation a bounded wait for the Windows-side namespace to become usable. A Weston log line with `refusing slow RDPGFX fallback` is therefore intentional: fix the shared-memory path before benchmarking or using fullscreen app workloads.
 
 ## Dev Container Goal
 

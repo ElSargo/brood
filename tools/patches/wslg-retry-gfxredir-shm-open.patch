@@ -1,0 +1,35 @@
+diff --git a/libweston/backend-rdp/rdputil.c b/libweston/backend-rdp/rdputil.c
+index 1c0d9eb3..3c921223 100644
+--- a/libweston/backend-rdp/rdputil.c
++++ b/libweston/backend-rdp/rdputil.c
+@@ -43,0 +44,3 @@
++#define RDP_SHARED_MEMORY_OPEN_RETRY_COUNT 500
++#define RDP_SHARED_MEMORY_OPEN_RETRY_DELAY_US 10000
++
+@@ -169 +172,20 @@ rdp_allocate_shared_memory(struct rdp_backend *b, struct weston_rdp_shared_memor
+-	fd = open(path, O_CREAT | O_RDWR | O_EXCL, S_IWUSR | S_IRUSR);
++	int open_attempts = 0;
++	int open_error = 0;
++
++	while (open_attempts < RDP_SHARED_MEMORY_OPEN_RETRY_COUNT) {
++		open_attempts++;
++		fd = open(path, O_CREAT | O_RDWR | O_EXCL, S_IWUSR | S_IRUSR);
++		if (fd >= 0)
++			break;
++
++		open_error = errno;
++		if (open_error != EIO && open_error != ENOENT)
++			break;
++
++		if (open_attempts == 1)
++			rdp_debug(b, "%s: waiting for shared-memory path \"%s\" to become usable.\n",
++				__func__, path);
++
++		usleep(RDP_SHARED_MEMORY_OPEN_RETRY_DELAY_US);
++	}
++
+@@ -171,2 +193,2 @@ rdp_allocate_shared_memory(struct rdp_backend *b, struct weston_rdp_shared_memor
+-		rdp_debug_error(b, "%s: Failed to open \"%s\" with error: %s\n",
+-			__func__, path, strerror(errno));
++		rdp_debug_error(b, "%s: Failed to open \"%s\" after %d attempts with error: %s\n",
++			__func__, path, open_attempts, strerror(open_error));

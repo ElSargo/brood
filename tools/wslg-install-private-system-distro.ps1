@@ -7,15 +7,30 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$exists = wsl -d $Distro -- test -f $WslVhdPath
-if ($LASTEXITCODE -ne 0) {
-    throw "VHD not found in WSL: $WslVhdPath. Run tools/wslg-build-private-system-distro.sh first."
+if ($WslVhdPath -match '^/mnt/([a-zA-Z])/(.+)$') {
+    $drive = $Matches[1].ToUpperInvariant()
+    $rest = $Matches[2].Replace("/", "\")
+    $windowsSource = "${drive}:\$rest"
+    if (-not (Test-Path -LiteralPath $windowsSource)) {
+        throw "VHD not found at $windowsSource. Run tools/wslg-build-private-system-distro.sh first."
+    }
+} elseif ($WslVhdPath -match '^[a-zA-Z]:\\') {
+    $windowsSource = $WslVhdPath
+    if (-not (Test-Path -LiteralPath $windowsSource)) {
+        throw "VHD not found at $windowsSource. Run tools/wslg-build-private-system-distro.sh first."
+    }
+} else {
+    $exists = wsl -d $Distro -- test -f $WslVhdPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "VHD not found in WSL: $WslVhdPath. Run tools/wslg-build-private-system-distro.sh first."
+    }
+    $windowsSource = (wsl -d $Distro -- wslpath -w $WslVhdPath).Trim()
 }
 
-$windowsSource = (wsl -d $Distro -- wslpath -w $WslVhdPath).Trim()
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-$target = Join-Path $InstallDir "system_x64.vhd"
+$targetStamp = Get-Date -Format yyyyMMdd-HHmmss
+$target = Join-Path $InstallDir "system_x64-$targetStamp.vhd"
 Copy-Item -Force -Path $windowsSource -Destination $target
 
 $wslConfig = Join-Path $env:USERPROFILE ".wslconfig"

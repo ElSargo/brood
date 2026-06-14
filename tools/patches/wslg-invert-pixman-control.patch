@@ -2,7 +2,7 @@ diff --git a/vendor/weston/libweston/pixman-renderer.c b/vendor/weston/libweston
 index 699352b9..68a79e92 100644
 --- a/vendor/weston/libweston/pixman-renderer.c
 +++ b/vendor/weston/libweston/pixman-renderer.c
-@@ -857,6 +857,19 @@ pixman_renderer_surface_copy_content(struct weston_surface *surface,
+@@ -857,6 +857,18 @@ pixman_renderer_surface_copy_content(struct weston_surface *surface,
  				 0, 0,         /* dest_x, dest_y */
  				 target_width, target_height);
  	pixman_image_set_transform(ps->image, NULL);
