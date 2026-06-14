@@ -86,6 +86,26 @@ Build a private WSLg system distro VHD with:
 ./tools/wslg-build-private-system-distro.sh
 ```
 
+### Fast Iteration Deploy
+
+For Weston/WSLg iteration, prefer the image hot-deploy loop:
+
+```powershell
+.\tools\wslg-hot-deploy-weston.ps1
+```
+
+That command rebuilds the private WSLg Docker image, copies the Weston/WSLg runtime binaries from the image into the active private system distro, and shuts WSL down so the next GUI launch loads the new binaries. It skips Docker export, tar-to-VHD conversion, VHD copy, and `.wslconfig` rewrites.
+
+If the Docker image is already current, skip the rebuild and only copy the binaries:
+
+```powershell
+.\tools\wslg-hot-deploy-weston.ps1 -SkipBuild
+```
+
+Use `-NoShutdown` to copy binaries without immediately restarting WSL, and `-DryRun` to list the files that would be deployed.
+
+Hot deploy is appropriate for changes to Weston, the RDP backend, RDPRAIL shell, WSLGd, and renderer modules. Use the full VHD deploy when changing the base system image, installed packages, startup configuration, Dockerfile-only system contents, or when producing a reproducible artifact.
+
 Install the built VHD as the private WSLg system distro from PowerShell with:
 
 ```powershell
@@ -128,8 +148,8 @@ The first pass should focus on WSLg's documented private system distro flow befo
 - WSLg vendor sources have been bootstrapped under `reference/wslg/vendor`.
 - PulseAudio's Microsoft mirror does not provide usable version metadata inside Docker because `.dockerignore` strips `.git`; the private build script writes `vendor/pulseaudio/.tarball-version` with `17.0`.
 - A private WSLg VHD was successfully built at `reference/wslg/system_x64.vhd`.
-- The private VHD was installed to `C:\Users\sargo\manifold-wslg\system_x64.vhd` through `.wslconfig` `systemDistro=...`.
-- The active system distro has verified marker `manifold-wslg-impl` in `/etc/manifold-wslg.txt` and `/mnt/wslg/versions.txt`.
+- Private VHD installs use timestamped files under `C:\Users\sargo\manifold-wslg\` through `.wslconfig` `systemDistro=...`, so a running system distro does not block the next copy.
+- The active system distro has verified marker `manifold-wslg-fastpath-required` in `/etc/manifold-wslg.txt` and `/mnt/wslg/versions.txt`.
 - `wayland-info` from Ubuntu connects to the modified WSLg instance and reports `weston_rdprail_shell`.
 
 ## Fast-Path Requirement

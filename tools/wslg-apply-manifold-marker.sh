@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WSLG_DIR="$ROOT/reference/wslg"
 MARKER_PATCH="$ROOT/tools/patches/wslg-manifold-marker.patch"
+WSLG_LOCAL_EXPORT_PATCH="$ROOT/tools/patches/wslg-speed-up-local-export.patch"
 WESTON_FASTPATH_PATCH="$ROOT/tools/patches/wslg-require-gfxredir-fastpath.patch"
 WESTON_SHM_RETRY_PATCH="$ROOT/tools/patches/wslg-retry-gfxredir-shm-open.patch"
 WESTON_PIXMAN_PATCH="$ROOT/tools/patches/wslg-invert-pixman-control.patch"
@@ -41,6 +42,14 @@ else
     git -C "$WSLG_DIR" apply "$MARKER_PATCH"
 fi
 
+apply_patch_if_missing \
+    "$WSLG_DIR" \
+    "$WSLG_LOCAL_EXPORT_PATCH" \
+    "$WSLG_DIR/build-and-export.sh" \
+    'tmp/system_x64.tar' \
+    "WSLg local export speedup" \
+    "--unidiff-zero"
+
 if [[ -d "$WSLG_DIR/vendor/weston/.git" ]]; then
     apply_patch_if_missing \
         "$WSLG_DIR/vendor/weston" \
@@ -77,6 +86,7 @@ else
 fi
 
 git -C "$WSLG_DIR" diff -- Dockerfile
+git -C "$WSLG_DIR" diff -- .dockerignore build-and-export.sh
 git -C "$WSLG_DIR/vendor/weston" diff -- \
     libweston/backend-rdp/rdprail.c \
     libweston/backend-rdp/rdputil.c \
