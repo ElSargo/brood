@@ -9,6 +9,7 @@ WESTON_FASTPATH_PATCH="$ROOT/tools/patches/wslg-require-gfxredir-fastpath.patch"
 WESTON_SHM_RETRY_PATCH="$ROOT/tools/patches/wslg-retry-gfxredir-shm-open.patch"
 WESTON_PIXMAN_PATCH="$ROOT/tools/patches/wslg-invert-pixman-control.patch"
 WESTON_GL_PATCH="$ROOT/tools/patches/wslg-invert-shader-poc.patch"
+WESTON_COMPOSITE_PATCH="$ROOT/tools/patches/wslg-composite-two-clients-poc.patch"
 MARKER_VALUE="manifold-wslg-fastpath-required"
 
 apply_patch_if_missing() {
@@ -80,6 +81,13 @@ if [[ -d "$WSLG_DIR/vendor/weston/.git" ]]; then
         "$WSLG_DIR/vendor/weston/libweston/renderer-gl/gl-renderer.c" \
         "alpha * (1.0 - color.rgb)" \
         "WSLg Weston GL compositor inversion"
+
+    apply_patch_if_missing \
+        "$WSLG_DIR" \
+        "$WESTON_COMPOSITE_PATCH" \
+        "$WSLG_DIR/vendor/weston/libweston/backend-rdp/rdprail.c" \
+        "MANIFOLD_COMPOSITE_WIDTH" \
+        "WSLg Weston two-client composite PoC"
 else
     echo "WSLg Weston vendor checkout is missing; run tools/wslg-bootstrap-vendors.sh before applying Weston patches." >&2
     exit 1
@@ -88,7 +96,9 @@ fi
 git -C "$WSLG_DIR" diff -- Dockerfile
 git -C "$WSLG_DIR" diff -- .dockerignore build-and-export.sh
 git -C "$WSLG_DIR/vendor/weston" diff -- \
+    include/libweston/backend-rdp.h \
     libweston/backend-rdp/rdprail.c \
     libweston/backend-rdp/rdputil.c \
+    libweston/backend-rdp/rdp.h \
     libweston/pixman-renderer.c \
     libweston/renderer-gl/gl-renderer.c

@@ -158,6 +158,10 @@ The private WSLg experiment must fail loudly if the RDP backend cannot use graph
 
 Manifold patches this into a hard startup/runtime failure with `tools/patches/wslg-require-gfxredir-fastpath.patch`. `tools/patches/wslg-retry-gfxredir-shm-open.patch` also gives the real gfxredir shared-memory allocation a bounded wait for the Windows-side namespace to become usable. A Weston log line with `refusing slow RDPGFX fallback` is therefore intentional: fix the shared-memory path before benchmarking or using fullscreen app workloads.
 
+## Two-Client Composite PoC
+
+`tools/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a fixed two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own and copied into the host buffer beside the first surface. This is intentionally scoped to the triangle/cube proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
+
 ## Dev Container Goal
 
 The WSLg experiment should eventually be reproducible from a one-liner development environment. The target shape is either:
