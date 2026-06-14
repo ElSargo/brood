@@ -132,6 +132,12 @@ The first pass should focus on WSLg's documented private system distro flow befo
 - The active system distro has verified marker `manifold-wslg-impl` in `/etc/manifold-wslg.txt` and `/mnt/wslg/versions.txt`.
 - `wayland-info` from Ubuntu connects to the modified WSLg instance and reports `weston_rdprail_shell`.
 
+## Fast-Path Requirement
+
+The private WSLg experiment must fail loudly if the RDP backend cannot use graphics redirection shared memory. The stock upstream path treats `WESTON_RDP_SHARED_MEMORY=true` as a preference: it probes `WSL2_SHARED_MEMORY_MOUNT_POINT`, FreeRDP gfxredir support, and a tiny `/mnt/shared_memory` allocation, then silently falls back to copy-heavy RDPGFX surface commands when any probe fails. It also allows the slow path when `WESTON_RDP_SHARED_MEMORY=false`; Manifold does not.
+
+Manifold patches this into a hard startup failure with `tools/patches/wslg-require-gfxredir-fastpath.patch`. A failing Weston start with `refusing slow RDPGFX fallback` in `/mnt/wslg/weston.log` is therefore intentional. Fix the shared-memory path before benchmarking or using fullscreen app workloads.
+
 ## Dev Container Goal
 
 The WSLg experiment should eventually be reproducible from a one-liner development environment. The target shape is either:

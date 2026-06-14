@@ -6,7 +6,7 @@ index 3d33a39..9dcdf7a 100644
  
  COPY --from=dev /work/versions.txt /etc/versions.txt
  
-+ARG MANIFOLD_WSLG_MARKER="manifold-wslg-invert-pixman-control"
++ARG MANIFOLD_WSLG_MARKER="manifold-wslg-fastpath-required"
 +RUN printf 'marker=%s\nbuilt=%s\n' \
 +        "${MANIFOLD_WSLG_MARKER}" \
 +        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

@@ -1,0 +1,20 @@
+diff --git a/libweston/backend-rdp/rdprail.c b/libweston/backend-rdp/rdprail.c
+index d3ba25cf..8d1c8ef5 100644
+--- a/libweston/backend-rdp/rdprail.c
++++ b/libweston/backend-rdp/rdprail.c
+@@ -4958,6 +4958,15 @@ rdp_rail_backend_create(struct rdp_backend *b, struct weston_rdp_backend_config
+ 
+ 	b->use_gfxredir = use_gfxredir;
+ 	rdp_debug(b, "RDP backend: use_gfxredir = %d\n", b->use_gfxredir);
++	if (!b->use_gfxredir) {
++		rdp_debug_error(b,
++				"RDP backend: gfxredir fast path is unavailable; refusing slow RDPGFX fallback.\n");
++		return -1;
++	}
++#else
++	rdp_debug_error(b,
++			"RDP backend: FreeRDP gfxredir support is not compiled in; refusing slow RDPGFX fallback.\n");
++	return -1;
+ #endif /* HAVE_FREERDP_GFXREDIR_H */
+ 
+ 	b->enable_hi_dpi_support = config->rail_config.enable_hi_dpi_support;

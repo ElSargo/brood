@@ -5,13 +5,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WSLG_DIR="$ROOT/reference/wslg"
 
 "$ROOT/tools/wslg-bootstrap-reference.sh"
-"$ROOT/tools/wslg-apply-manifold-marker.sh"
-"$ROOT/tools/wslg-ensure-build-deps.sh"
 
 if [[ ! -d "$WSLG_DIR/vendor/weston/.git" ]]; then
     echo "WSLg vendor sources are missing; bootstrapping them now."
     "$ROOT/tools/wslg-bootstrap-vendors.sh"
 fi
+
+"$ROOT/tools/wslg-apply-manifold-marker.sh"
+"$ROOT/tools/wslg-ensure-build-deps.sh"
 
 if [[ ! -f "$WSLG_DIR/vendor/pulseaudio/.tarball-version" ]]; then
     printf '17.0\n' > "$WSLG_DIR/vendor/pulseaudio/.tarball-version"
