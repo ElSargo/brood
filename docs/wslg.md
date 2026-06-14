@@ -160,7 +160,7 @@ Manifold patches this into a hard startup/runtime failure with `tools/patches/ws
 
 ## Two-Client Composite PoC
 
-`tools/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a fixed two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own and copied into the host buffer beside the first surface. This is intentionally scoped to the triangle/cube proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
+`tools/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own, both surfaces are server-resized into adjacent borderless cells, and shell window geometry is used when copying so compositor-managed borders are skipped. This is intentionally scoped to the triangle/cube and two-Chrome proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
 
 ## Dev Container Goal
 

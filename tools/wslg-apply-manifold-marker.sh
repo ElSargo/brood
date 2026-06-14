@@ -86,7 +86,7 @@ if [[ -d "$WSLG_DIR/vendor/weston/.git" ]]; then
         "$WSLG_DIR" \
         "$WESTON_COMPOSITE_PATCH" \
         "$WSLG_DIR/vendor/weston/libweston/backend-rdp/rdprail.c" \
-        "MANIFOLD_COMPOSITE_WIDTH" \
+        "rdp_rail_manifold_layout_surface" \
         "WSLg Weston two-client composite PoC"
 else
     echo "WSLg Weston vendor checkout is missing; run tools/wslg-bootstrap-vendors.sh before applying Weston patches." >&2
@@ -100,5 +100,6 @@ git -C "$WSLG_DIR/vendor/weston" diff -- \
     libweston/backend-rdp/rdprail.c \
     libweston/backend-rdp/rdputil.c \
     libweston/backend-rdp/rdp.h \
+    rdprail-shell/shell.c \
     libweston/pixman-renderer.c \
     libweston/renderer-gl/gl-renderer.c

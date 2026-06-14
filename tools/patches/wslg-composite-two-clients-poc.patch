@@ -1,17 +1,22 @@
 diff --git a/vendor/weston/include/libweston/backend-rdp.h b/vendor/weston/include/libweston/backend-rdp.h
-index 2140ac0..54cae98 100644
+index 2140ac05..33db3cd9 100644
 --- a/vendor/weston/include/libweston/backend-rdp.h
 +++ b/vendor/weston/include/libweston/backend-rdp.h
-@@ -240,6 +240,7 @@ struct weston_surface_rail_state {
+@@ -240,6 +240,12 @@ struct weston_surface_rail_state {
  	bool isCursor;
  	bool isWindowCreated;
  	bool isWindowSnapped;
 +	bool manifoldCompositeSuppressed;
++	bool manifoldCompositeLayoutValid;
++	int manifoldCompositeLayoutX;
++	int manifoldCompositeLayoutY;
++	int manifoldCompositeLayoutWidth;
++	int manifoldCompositeLayoutHeight;
  	uint32_t showState_requested;
  	uint32_t showState;
  	bool forceRecreateSurface;
 diff --git a/vendor/weston/libweston/backend-rdp/rdp.h b/vendor/weston/libweston/backend-rdp/rdp.h
-index 8ba0dee..6100b14 100644
+index 8ba0deeb..6100b14c 100644
 --- a/vendor/weston/libweston/backend-rdp/rdp.h
 +++ b/vendor/weston/libweston/backend-rdp/rdp.h
 @@ -134,6 +134,8 @@ struct rdp_backend {
@@ -24,18 +29,44 @@ index 8ba0dee..6100b14 100644
  	bool enable_fractional_hi_dpi_support;
  	bool enable_fractional_hi_dpi_roundup;
 diff --git a/vendor/weston/libweston/backend-rdp/rdprail.c b/vendor/weston/libweston/backend-rdp/rdprail.c
-index c9cef25..161c1cb 100644
+index d3ba25cf..e3792dac 100644
 --- a/vendor/weston/libweston/backend-rdp/rdprail.c
 +++ b/vendor/weston/libweston/backend-rdp/rdprail.c
-@@ -1482,6 +1482,182 @@ rdp_showstate_to_string(uint32_t showstate)
- 	}
+@@ -1463,9 +1463,9 @@ rdp_rail_update_cursor(struct weston_surface *surface)
+ 	return 0;
  }
  
+-static char *
+-rdp_showstate_to_string(uint32_t showstate)
+-{
++static char *
++rdp_showstate_to_string(uint32_t showstate)
++{
+ 	switch (showstate) {
+ 	case RDP_WINDOW_HIDE:
+ 		return "Hide";
+@@ -1479,16 +1479,339 @@ rdp_showstate_to_string(uint32_t showstate)
+ 		return "Normal";
+ 	default:
+ 		return "Unknown";
+-	}
+-}
+-
+-static void
+-rdp_rail_create_window(struct wl_listener *listener, void *data)
+-{
+-	struct weston_surface *surface = data;
+-	struct weston_compositor *compositor = surface->compositor;
+-	struct weston_surface_rail_state *rail_state = surface->backend_state;
+-	struct rdp_backend *b = to_rdp_backend(compositor);
++	}
++}
++
 +#define MANIFOLD_COMPOSITE_COLUMNS 2
 +#define MANIFOLD_COMPOSITE_CELL_WIDTH 640
 +#define MANIFOLD_COMPOSITE_CELL_HEIGHT 480
-+#define MANIFOLD_COMPOSITE_MARGIN 24
-+#define MANIFOLD_COMPOSITE_GAP 24
++#define MANIFOLD_COMPOSITE_MARGIN 0
++#define MANIFOLD_COMPOSITE_GAP 0
 +#define MANIFOLD_COMPOSITE_WIDTH \
 +	((MANIFOLD_COMPOSITE_MARGIN * 2) + \
 +	 (MANIFOLD_COMPOSITE_CELL_WIDTH * MANIFOLD_COMPOSITE_COLUMNS) + \
@@ -106,6 +137,102 @@ index c9cef25..161c1cb 100644
 +	rdp_debug(b, "Manifold composite host surface: %p\n", surface);
 +}
 +
++static void
++rdp_rail_manifold_composite_slot_rect(int slot,
++				      int *x,
++				      int *y,
++				      int *width,
++				      int *height)
++{
++	*x = MANIFOLD_COMPOSITE_MARGIN +
++	     slot * (MANIFOLD_COMPOSITE_CELL_WIDTH + MANIFOLD_COMPOSITE_GAP);
++	*y = MANIFOLD_COMPOSITE_MARGIN;
++	*width = MANIFOLD_COMPOSITE_CELL_WIDTH;
++	*height = MANIFOLD_COMPOSITE_CELL_HEIGHT;
++}
++
++static void
++rdp_rail_manifold_get_copy_geometry(struct rdp_backend *b,
++				    struct weston_surface *surface,
++				    struct weston_geometry *geometry);
++
++static void
++rdp_rail_manifold_layout_surface(struct rdp_backend *b,
++				 struct weston_surface *surface,
++				 int slot)
++{
++	struct weston_surface_rail_state *rail_state = surface->backend_state;
++	struct weston_geometry geometry;
++	int x, y, width, height;
++	int request_x, request_y, request_width, request_height;
++	int frame_width, frame_height;
++
++	if (!rail_state || !b->rdprail_shell_api ||
++	    !b->rdprail_shell_api->request_window_move)
++		return;
++
++	rdp_rail_manifold_composite_slot_rect(slot, &x, &y, &width, &height);
++	rdp_rail_manifold_get_copy_geometry(b, surface, &geometry);
++	frame_width = max(0, surface->width - geometry.width);
++	frame_height = max(0, surface->height - geometry.height);
++	request_x = x - geometry.x;
++	request_y = y - geometry.y;
++	request_width = width + frame_width;
++	request_height = height + frame_height;
++
++	if (rail_state->manifoldCompositeLayoutValid &&
++	    rail_state->manifoldCompositeLayoutX == x &&
++	    rail_state->manifoldCompositeLayoutY == y &&
++	    rail_state->manifoldCompositeLayoutWidth == width &&
++	    rail_state->manifoldCompositeLayoutHeight == height)
++		return;
++
++	b->rdprail_shell_api->request_window_move(surface,
++						 request_x, request_y,
++						 request_width, request_height);
++	rail_state->manifoldCompositeLayoutValid = true;
++	rail_state->manifoldCompositeLayoutX = x;
++	rail_state->manifoldCompositeLayoutY = y;
++	rail_state->manifoldCompositeLayoutWidth = width;
++	rail_state->manifoldCompositeLayoutHeight = height;
++	rdp_debug(b,
++		  "Manifold composite layout surface:%p slot:%d content:(%d,%d) %dx%d request:(%d,%d) %dx%d frame:%dx%d\n",
++		  surface, slot, x, y, width, height,
++		  request_x, request_y, request_width, request_height,
++		  frame_width, frame_height);
++}
++
++static void
++rdp_rail_manifold_get_copy_geometry(struct rdp_backend *b,
++				    struct weston_surface *surface,
++				    struct weston_geometry *geometry)
++{
++	geometry->x = 0;
++	geometry->y = 0;
++	geometry->width = surface->width;
++	geometry->height = surface->height;
++
++	if (b->rdprail_shell_api && b->rdprail_shell_api->get_window_geometry)
++		b->rdprail_shell_api->get_window_geometry(surface, geometry);
++
++	if (geometry->x < 0)
++		geometry->x = 0;
++	if (geometry->y < 0)
++		geometry->y = 0;
++	if (geometry->width < 0)
++		geometry->width = 0;
++	if (geometry->height < 0)
++		geometry->height = 0;
++	if (geometry->x + geometry->width > surface->width)
++		geometry->width = surface->width - geometry->x;
++	if (geometry->y + geometry->height > surface->height)
++		geometry->height = surface->height - geometry->y;
++	if (geometry->width < 0)
++		geometry->width = 0;
++	if (geometry->height < 0)
++		geometry->height = 0;
++}
++
 +struct manifold_composite_copy_data {
 +	struct rdp_backend *b;
 +	struct weston_surface *host;
@@ -119,36 +246,87 @@ index c9cef25..161c1cb 100644
 +rdp_rail_copy_manifold_surface(struct manifold_composite_copy_data *data,
 +			       struct weston_surface *surface)
 +{
-+	int width = min(surface->width, MANIFOLD_COMPOSITE_CELL_WIDTH);
-+	int height = min(surface->height, MANIFOLD_COMPOSITE_CELL_HEIGHT);
++	struct weston_geometry geometry;
++	int slot_x, slot_y, slot_width, slot_height;
++	int content_width, content_height;
++	int src_x, src_y;
++	int width, height;
 +	int x, y, offset;
++	size_t required;
 +
 +	if (data->slot >= MANIFOLD_COMPOSITE_MAX_SURFACES)
 +		return 0;
++
++	rdp_rail_manifold_layout_surface(data->b, surface, data->slot);
++	rdp_rail_manifold_get_copy_geometry(data->b, surface, &geometry);
++
++	rdp_rail_manifold_composite_slot_rect(data->slot,
++					      &slot_x, &slot_y,
++					      &slot_width, &slot_height);
++	width = min(geometry.width, slot_width);
++	height = min(geometry.height, slot_height);
 +	if (width <= 0 || height <= 0)
 +		return 0;
 +
-+	x = MANIFOLD_COMPOSITE_MARGIN +
-+	    data->slot * (MANIFOLD_COMPOSITE_CELL_WIDTH + MANIFOLD_COMPOSITE_GAP);
-+	y = MANIFOLD_COMPOSITE_MARGIN +
-+	    (MANIFOLD_COMPOSITE_CELL_HEIGHT - height) / 2;
++	weston_surface_get_content_size(surface, &content_width, &content_height);
++	if (content_width <= 0 || content_height <= 0)
++		return 0;
++
++	src_x = geometry.x;
++	src_y = geometry.y;
++	if (src_x + width > content_width) {
++		if (width <= content_width)
++			src_x = 0;
++		else if (src_x < content_width)
++			width = content_width - src_x;
++		else
++			return 0;
++	}
++	if (src_y + height > content_height) {
++		if (height <= content_height)
++			src_y = 0;
++		else if (src_y < content_height)
++			height = content_height - src_y;
++		else
++			return 0;
++	}
++	if (width <= 0 || height <= 0)
++		return 0;
++
++	x = slot_x + (slot_width - width) / 2;
++	y = slot_y + (slot_height - height) / 2;
 +	offset = y * data->stride + x * 4;
++	required = (size_t)offset +
++		   (size_t)(height - 1) * (size_t)data->stride +
++		   (size_t)width * 4;
++	if (offset < 0 || required > (size_t)data->buffer_size) {
++		rdp_debug_error(data->b,
++				"Manifold composite copy out of bounds for surface:%p slot:%d dst:(%d,%d) %dx%d required:%zu buffer:%d\n",
++				surface, data->slot, x, y, width, height,
++				required, data->buffer_size);
++		return -1;
++	}
 +
 +	if (weston_surface_copy_content(surface,
 +					data->bits + offset,
-+					data->buffer_size - offset,
++					data->buffer_size,
 +					data->stride,
 +					width,
 +					height,
-+					0,
-+					0,
++					src_x,
++					src_y,
 +					width,
 +					height,
 +					false,
 +					true) < 0) {
 +		rdp_debug_error(data->b,
-+				"Manifold composite copy failed for surface:%p slot:%d\n",
-+				surface, data->slot);
++				"Manifold composite copy failed for surface:%p slot:%d src:(%d,%d) %dx%d content:%dx%d geometry:(%d,%d) %dx%d dst:(%d,%d)\n",
++				surface, data->slot,
++				src_x, src_y, width, height,
++				content_width, content_height,
++				geometry.x, geometry.y,
++				geometry.width, geometry.height,
++				x, y);
 +		return -1;
 +	}
 +
@@ -207,13 +385,41 @@ index c9cef25..161c1cb 100644
 +	return 0;
 +}
 +
- static void
- rdp_rail_create_window(struct wl_listener *listener, void *data)
- {
-@@ -1557,6 +1733,42 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
- 			return;
++static void
++rdp_rail_create_window(struct wl_listener *listener, void *data)
++{
++	struct weston_surface *surface = data;
++	struct weston_compositor *compositor = surface->compositor;
++	struct weston_surface_rail_state *rail_state = surface->backend_state;
++	struct rdp_backend *b = to_rdp_backend(compositor);
+ 	const struct weston_rdprail_shell_api *api = b->rdprail_shell_api;
+ 	rdpUpdate *update;
+ 	WINDOW_ORDER_INFO window_order_info = {};
+@@ -1548,18 +1871,54 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 		return;
  	}
  
+-	if (!rail_state) {
+-		rail_state = xzalloc(sizeof *rail_state);
+-		surface->backend_state = rail_state;
+-	} else {
+-		/* If ever encouter error for this window, no more attempt to create window */
+-		if (rail_state->error)
+-			return;
+-	}
+-
+-	/* windowId can be assigned only after activation completed */
+-	if (!rdp_id_manager_allocate_id(&peer_ctx->windowId, surface, &window_id)) {
+-		rail_state->error = true;
++	if (!rail_state) {
++		rail_state = xzalloc(sizeof *rail_state);
++		surface->backend_state = rail_state;
++	} else {
++		/* If ever encouter error for this window, no more attempt to create window */
++		if (rail_state->error)
++			return;
++	}
++
 +	if (surface->role_name != NULL) {
 +		if (strcmp(surface->role_name, "wl_subsurface") == 0) {
 +			rail_state->parent_surface = weston_surface_get_main_surface(surface);
@@ -250,13 +456,19 @@ index c9cef25..161c1cb 100644
 +		return;
 +	}
 +
- 	/* windowId can be assigned only after activation completed */
- 	if (!rdp_id_manager_allocate_id(&peer_ctx->windowId, surface, &window_id)) {
- 		rail_state->error = true;
-@@ -1570,14 +1782,6 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
- 	rail_state->destroy_listener.notify = rdp_rail_destroy_window;
- 	wl_signal_add(&surface->destroy_signal, &rail_state->destroy_listener);
- 
++	/* windowId can be assigned only after activation completed */
++	if (!rdp_id_manager_allocate_id(&peer_ctx->windowId, surface, &window_id)) {
++		rail_state->error = true;
+ 		rdp_debug_error(b, "CreateWindow(): fail to insert windowId (windowId:0x%x surface:%p).\n",
+ 				window_id, surface);
+ 		return;
+@@ -1567,19 +1926,11 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+ 	rail_state->window_id = window_id;
+ 	/* Once this surface is inserted to hash table, we want to be notified for destroy */
+ 	assert(!rail_state->destroy_listener.notify);
+-	rail_state->destroy_listener.notify = rdp_rail_destroy_window;
+-	wl_signal_add(&surface->destroy_signal, &rail_state->destroy_listener);
+-
 -	if (surface->role_name != NULL) {
 -		if (strcmp(surface->role_name, "wl_subsurface") == 0) {
 -			rail_state->parent_surface = weston_surface_get_main_surface(surface);
@@ -265,18 +477,46 @@ index c9cef25..161c1cb 100644
 -			rail_state->isCursor = true;
 -		}
 -	}
- 	if (rail_state->isCursor) {
- 		if (rdp_rail_create_cursor(surface) < 0)
+-	if (rail_state->isCursor) {
+-		if (rdp_rail_create_cursor(surface) < 0)
++	rail_state->destroy_listener.notify = rdp_rail_destroy_window;
++	wl_signal_add(&surface->destroy_signal, &rail_state->destroy_listener);
++
++	if (rail_state->isCursor) {
++		if (rdp_rail_create_cursor(surface) < 0)
  			rail_state->error = true;
-@@ -1825,9 +2029,25 @@ rdp_rail_destroy_window(struct wl_listener *listener, void *data)
- 	if (!rail_state)
- 		return;
+ 		goto Exit;
+ 	}
+@@ -1813,21 +2164,37 @@ rdp_rail_destroy_window(struct wl_listener *listener, void *data)
+ {
+ 	struct weston_surface *surface = data;
+ 	struct weston_compositor *compositor = surface->compositor;
+-	struct weston_surface_rail_state *rail_state = surface->backend_state;
+-	struct rdp_backend *b = to_rdp_backend(compositor);
+-	RdpgfxServerContext *gfx_ctx;
+-	rdpUpdate *update;
++	struct weston_surface_rail_state *rail_state = surface->backend_state;
++	struct rdp_backend *b = to_rdp_backend(compositor);
++	RdpgfxServerContext *gfx_ctx;
++	rdpUpdate *update;
+ 	WINDOW_ORDER_INFO window_order_info = {};
+ 	POINTER_SYSTEM_UPDATE pointerSystem = {};
+ 	uint32_t window_id;
+ 	RdpPeerContext *peer_ctx;
  
+-	if (!rail_state)
+-		return;
+-
+-	window_id = rail_state->window_id;
+-	if (!window_id)
+-		goto Exit;
++	if (!rail_state)
++		return;
++
 +	if (b->manifold_composite_host_surface == surface)
 +		b->manifold_composite_host_surface = NULL;
 +
- 	window_id = rail_state->window_id;
--	if (!window_id)
++	window_id = rail_state->window_id;
 +	if (!window_id) {
 +		if (rail_state->manifoldCompositeSuppressed) {
 +			if (rail_state->repaint_listener.notify) {
@@ -290,28 +530,48 @@ index c9cef25..161c1cb 100644
 +			}
 +			rdp_rail_manifold_damage_composite_host(b);
 +		}
- 		goto Exit;
++		goto Exit;
 +	}
  
  	assert(b && b->rdp_peer);
  
-@@ -1938,6 +2158,12 @@ rdp_rail_schedule_update_window(struct wl_listener *listener, void *data)
- 	if (!rail_state || rail_state->error)
- 		return;
+@@ -1935,12 +2302,18 @@ rdp_rail_schedule_update_window(struct wl_listener *listener, void *data)
+ 	struct weston_surface_rail_state *rail_state = surface->backend_state;
+ 	uint32_t window_id;
  
+-	if (!rail_state || rail_state->error)
+-		return;
+-
+-	window_id = rail_state->window_id;
+-	if (!window_id)
+-		return;
++	if (!rail_state || rail_state->error)
++		return;
++
 +	if (rdp_rail_manifold_composite_candidate(b, surface) &&
 +	    b->manifold_composite_host_surface &&
 +	    b->manifold_composite_host_surface != surface) {
 +		rdp_rail_manifold_damage_composite_host(b);
 +	}
 +
- 	window_id = rail_state->window_id;
- 	if (!window_id)
- 		return;
-@@ -2052,6 +2278,14 @@ rdp_rail_update_window(struct weston_surface *surface,
- 		}
- 	}
++	window_id = rail_state->window_id;
++	if (!window_id)
++		return;
  
+ 	assert_compositor_thread(b);
+ 
+@@ -2049,11 +2422,19 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 				assert(rail_state->isCursor);
+ 				return rdp_rail_update_cursor(surface);
+ 			}
+-		}
+-	}
+-
+-	/* some spews for future investigation */
+-	{
++		}
++	}
++
 +	rdp_rail_manifold_choose_composite_host(b, surface);
 +	if (rdp_rail_manifold_composite_candidate(b, surface) &&
 +	    b->manifold_composite_host_surface &&
@@ -320,13 +580,48 @@ index c9cef25..161c1cb 100644
 +		return 0;
 +	}
 +
- 	/* some spews for future investigation */
- 	{
++	/* some spews for future investigation */
++	{
  		if (surface->width == 0 || surface->height == 0)
-@@ -2189,8 +2423,16 @@ rdp_rail_update_window(struct weston_surface *surface,
- 		}
- 	}
+ 			rdp_debug_verbose(b, "update_window: surface width and height is zero windowId:0x%x (%dx%d)\n", window_id, surface->width, surface->height);
  
+@@ -2171,10 +2552,10 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 	content_buffer_window_geometry = geometry;
+ 
+ 	/* apply global to output transform, and translate to client coordinate */
+-	if (surface->output) {
+-		to_client_coordinate(peer_ctx, surface->output,
+-				     &newClientPos.x, &newClientPos.y,
+-				     &newClientPos.width,
++	if (surface->output) {
++		to_client_coordinate(peer_ctx, surface->output,
++				     &newClientPos.x, &newClientPos.y,
++				     &newClientPos.width,
+ 				     &newClientPos.height);
+ 
+ 		if (should_strip_window_shadow(peer_ctx, rail_state)) {
+@@ -2183,18 +2564,26 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 					     &window_margin_top,
+ 					     NULL, NULL);
+ 			to_client_coordinate(peer_ctx, surface->output,
+-					     &window_margin_right,
+-					     &window_margin_bottom,
+-					     NULL, NULL);
+-		}
+-	}
+-
+-	/* when window move to new output with different scale, refresh all state to client. */
+-	if (rail_state->output_scale != surface->output->current_scale) {
+-		rail_state->forceUpdateWindowState = true;
+-		rail_state->forceRecreateSurface = true;
+-		rail_state->output_scale = surface->output->current_scale;
+-	}
++					     &window_margin_right,
++					     &window_margin_bottom,
++					     NULL, NULL);
++		}
++	}
++
 +	if (b->manifold_composite_host_surface == surface) {
 +		newPos.width = MANIFOLD_COMPOSITE_WIDTH;
 +		newPos.height = MANIFOLD_COMPOSITE_HEIGHT;
@@ -334,17 +629,24 @@ index c9cef25..161c1cb 100644
 +		newClientPos.height = MANIFOLD_COMPOSITE_HEIGHT;
 +	}
 +
- 	/* when window move to new output with different scale, refresh all state to client. */
--	if (rail_state->output_scale != surface->output->current_scale) {
++	/* when window move to new output with different scale, refresh all state to client. */
 +	if (surface->output &&
 +	    rail_state->output_scale != surface->output->current_scale) {
- 		rail_state->forceUpdateWindowState = true;
- 		rail_state->forceRecreateSurface = true;
- 		rail_state->output_scale = surface->output->current_scale;
-@@ -2523,13 +2765,27 @@ rdp_rail_update_window(struct weston_surface *surface,
- 						&content_buffer_width,
- 						&content_buffer_height);
++		rail_state->forceUpdateWindowState = true;
++		rail_state->forceRecreateSurface = true;
++		rail_state->output_scale = surface->output->current_scale;
++	}
  
+ 	/* Adjust the Windows size and position on the screen */
+ 	if (rail_state->clientPos.x != newClientPos.x ||
+@@ -2519,17 +2908,31 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 
+ 		/* contentBuffer represents buffer from Linux application. */
+ 		/* this size could be larger than it's window size for native HI-DPI rendering */
+-		weston_surface_get_content_size(surface,
+-						&content_buffer_width,
+-						&content_buffer_height);
+-
 -		/* scale window geometry to content buffer base */
 -		rdp_matrix_transform_position(&surface->surface_to_buffer_matrix,
 -					      &content_buffer_window_geometry.x,
@@ -352,6 +654,10 @@ index c9cef25..161c1cb 100644
 -		rdp_matrix_transform_position(&surface->surface_to_buffer_matrix,
 -					      &content_buffer_window_geometry.width,
 -					      &content_buffer_window_geometry.height);
++		weston_surface_get_content_size(surface,
++						&content_buffer_width,
++						&content_buffer_height);
++
 +		if (b->manifold_composite_host_surface == surface) {
 +			content_buffer_width = MANIFOLD_COMPOSITE_WIDTH;
 +			content_buffer_height = MANIFOLD_COMPOSITE_HEIGHT;
@@ -376,20 +682,51 @@ index c9cef25..161c1cb 100644
  
  		/* copy buffer represents the buffer allocated to share with RDP client. */
  		/* this can be shared memory buffer or grfx channel surface */
-@@ -2620,6 +2876,12 @@ rdp_rail_update_window(struct weston_surface *surface,
- 						if (!rail_state->surfaceBuffer)
- 							rdp_destroy_shared_buffer(surface);
+@@ -2571,10 +2974,10 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 						/* at window resize, reset name as old name might still be referenced by client */
+ 						rail_state->shared_memory.name[0] = '\0';
  					}
+-					assert(rail_state->surfaceBuffer == NULL);
+-					assert(rail_state->shared_memory.addr == NULL);
+-					rail_state->shared_memory.size = copy_buffer_size;
+-					if (rdp_allocate_shared_memory(b, &rail_state->shared_memory)) {
++					assert(rail_state->surfaceBuffer == NULL);
++					assert(rail_state->shared_memory.addr == NULL);
++					rail_state->shared_memory.size = copy_buffer_size;
++					if (rdp_allocate_shared_memory(b, &rail_state->shared_memory)) {
+ 						uint32_t new_pool_id = 0;
+ 
+ 						if (rdp_id_manager_allocate_id(&peer_ctx->poolId, surface, &new_pool_id)) {
+@@ -2616,14 +3019,20 @@ rdp_rail_update_window(struct weston_surface *surface,
+ 								}
+ 							}
+ 						}
+-						/* if failed, clean up */
+-						if (!rail_state->surfaceBuffer)
+-							rdp_destroy_shared_buffer(surface);
+-					}
+-				} else {
+-#else
+-				{
+-#endif /* HAVE_FREERDP_GFXREDIR_H */
++						/* if failed, clean up */
++						if (!rail_state->surfaceBuffer)
++							rdp_destroy_shared_buffer(surface);
++					}
 +					if (!rail_state->surfaceBuffer) {
 +						rdp_debug_error(b,
 +								"gfxredir shared-memory buffer creation failed for windowId:0x%x; refusing slow RDPGFX fallback.\n",
 +								window_id);
 +						return -1;
 +					}
- 				} else {
- #else
- 				{
-@@ -2658,7 +2920,8 @@ rdp_rail_update_window(struct weston_surface *surface,
++				} else {
++#else
++				{
++#endif /* HAVE_FREERDP_GFXREDIR_H */
+ 					if (rdp_id_manager_allocate_id(&peer_ctx->surfaceId, surface, &new_surface_id)) {
+ 						RdpgfxServerContext *gfx_ctx;
+ 
+@@ -2658,7 +3067,8 @@ rdp_rail_update_window(struct weston_surface *surface,
  				damage_box.y1 = 0;
  				damage_box.x2 = content_buffer_width;
  				damage_box.y2 = content_buffer_height;
@@ -399,7 +736,7 @@ index c9cef25..161c1cb 100644
  				/* scale damage using surface to buffer matrix */
  				rdp_matrix_transform_position(&surface->surface_to_buffer_matrix,
  							      &damage_box.x1,
-@@ -2734,18 +2997,29 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2734,21 +3144,32 @@ rdp_rail_update_window(struct weston_surface *surface,
  						  scaleFactorWidth,
  						  scaleFactorHeight);
  
@@ -415,6 +752,9 @@ index c9cef25..161c1cb 100644
 -								damage_height,
 -								false /* y-flip */,
 -								true /* is_argb */) < 0) {
+-					rdp_debug_error(b,
+-							"weston_surface_copy_content failed for windowId:0x%x, copyBuffer:%dx%d %d, damage:(%d,%d) %dx%d, content:%dx%d\n",
+-							window_id,
 +				if (b->manifold_composite_host_surface == surface) {
 +					if (rdp_rail_copy_manifold_composite(b,
 +									     surface,
@@ -438,10 +778,13 @@ index c9cef25..161c1cb 100644
 +								       damage_height,
 +								       false /* y-flip */,
 +								       true /* is_argb */) < 0) {
- 					rdp_debug_error(b,
- 							"weston_surface_copy_content failed for windowId:0x%x, copyBuffer:%dx%d %d, damage:(%d,%d) %dx%d, content:%dx%d\n",
- 							window_id,
-@@ -4944,22 +5218,17 @@ rdp_rail_backend_create(struct rdp_backend *b, struct weston_rdp_backend_config
++					rdp_debug_error(b,
++							"weston_surface_copy_content failed for windowId:0x%x, copyBuffer:%dx%d %d, damage:(%d,%d) %dx%d, content:%dx%d\n",
++							window_id,
+ 							copy_damage_width,
+ 							copy_damage_height,
+ 							copy_buffer_size,damage_box.x1,
+@@ -4944,25 +5365,20 @@ rdp_rail_backend_create(struct rdp_backend *b, struct weston_rdp_backend_config
  		}
  	}
  
@@ -459,8 +802,13 @@ index c9cef25..161c1cb 100644
 -		}
 -	}
 -
- 	b->use_gfxredir = use_gfxredir;
- 	rdp_debug(b, "RDP backend: use_gfxredir = %d\n", b->use_gfxredir);
+-	b->use_gfxredir = use_gfxredir;
+-	rdp_debug(b, "RDP backend: use_gfxredir = %d\n", b->use_gfxredir);
+-#endif /* HAVE_FREERDP_GFXREDIR_H */
+-
+-	b->enable_hi_dpi_support = config->rail_config.enable_hi_dpi_support;
++	b->use_gfxredir = use_gfxredir;
++	rdp_debug(b, "RDP backend: use_gfxredir = %d\n", b->use_gfxredir);
 +	if (!b->use_gfxredir) {
 +		rdp_debug_error(b,
 +				"RDP backend: gfxredir fast path is unavailable; refusing slow RDPGFX fallback.\n");
@@ -470,6 +818,270 @@ index c9cef25..161c1cb 100644
 +	rdp_debug_error(b,
 +			"RDP backend: FreeRDP gfxredir support is not compiled in; refusing slow RDPGFX fallback.\n");
 +	return -1;
- #endif /* HAVE_FREERDP_GFXREDIR_H */
++#endif /* HAVE_FREERDP_GFXREDIR_H */
++
++	b->enable_hi_dpi_support = config->rail_config.enable_hi_dpi_support;
+ 	rdp_debug(b, "RDP backend: enable_hi_dpi_support = %d\n",
+ 		  b->enable_hi_dpi_support);
  
- 	b->enable_hi_dpi_support = config->rail_config.enable_hi_dpi_support;
+diff --git a/vendor/weston/rdprail-shell/shell.c b/vendor/weston/rdprail-shell/shell.c
+index 75fc8367..b7845a0e 100644
+--- a/vendor/weston/rdprail-shell/shell.c
++++ b/vendor/weston/rdprail-shell/shell.c
+@@ -94,14 +94,15 @@ struct focus_state {
+  *     (shsurf->parent != NULL) ⇒ !wl_list_is_empty(shsurf->children_link)
+  */
+ 
+-struct shell_surface {
+-	struct wl_signal destroy_signal;
+-
+-	struct weston_desktop_surface *desktop_surface;
+-	struct weston_view *view;
+-	int32_t last_width, last_height;
+-
+-	struct desktop_shell *shell;
++struct shell_surface {
++	struct wl_signal destroy_signal;
++
++	struct weston_desktop_surface *desktop_surface;
++	struct weston_view *view;
++	int32_t last_width, last_height;
++	uint32_t manifold_tile_slot;
++
++	struct desktop_shell *shell;
+ 
+ 	struct shell_surface *parent;
+ 	struct wl_list children_list;
+@@ -2417,10 +2418,11 @@ desktop_surface_added(struct weston_desktop_surface *desktop_surface,
+ 	shsurf->saved_showstate_valid = false;
+ 	shsurf->saved_position_valid = false;
+ 	shsurf->saved_rotation_valid = false;
+-	shsurf->desktop_surface = desktop_surface;
+-	shsurf->view = view;
+-	shsurf->fullscreen.black_view = NULL;
+-	wl_list_init(&shsurf->fullscreen.transform.link);
++	shsurf->desktop_surface = desktop_surface;
++	shsurf->view = view;
++	shsurf->manifold_tile_slot = shell->manifold_tile_next_slot++;
++	shsurf->fullscreen.black_view = NULL;
++	wl_list_init(&shsurf->fullscreen.transform.link);
+ 
+ 	shell_surface_set_output(shsurf, get_default_output(ec));
+ 
+@@ -2593,18 +2595,16 @@ map(struct desktop_shell *shell, struct shell_surface *shsurf,
+ 	struct weston_seat *seat;
+ 
+ 	/* initial positioning, see also configure() */
+-	if (shsurf->state.fullscreen) {
+-		center_on_output(shsurf->view, shsurf->fullscreen_output);
+-		shell_map_fullscreen(shsurf);
+-	} else if (shsurf->state.maximized) {
+-		set_maximized_position(shell, shsurf);
+-	} else if (shsurf->xwayland.is_set) {
+-		set_position_from_xwayland(shsurf);
+-	} else if (shsurf->parent) {
+-		set_default_position_from_parent(shsurf);
+-	} else {
+-		weston_view_set_initial_position(shsurf);
+-	}
++	if (shsurf->state.fullscreen) {
++		center_on_output(shsurf->view, shsurf->fullscreen_output);
++		shell_map_fullscreen(shsurf);
++	} else if (shsurf->state.maximized) {
++		set_maximized_position(shell, shsurf);
++	} else if (shsurf->parent) {
++		set_default_position_from_parent(shsurf);
++	} else {
++		weston_view_set_initial_position(shsurf);
++	}
+ 
+ 	/* Surface stacking order, see also activate(). */
+ 	shell_surface_update_layer(shsurf);
+@@ -3065,33 +3065,75 @@ shell_backend_request_window_restore(struct weston_surface *surface)
+ 	}
+ }
+ 
+-static void
+-shell_backend_request_window_move(struct weston_surface *surface, int x, int y, int width, int height)
+-{
+-	struct weston_view *view;
+-	struct shell_surface *shsurf = get_shell_surface(surface);
+-
+-	view = get_default_view(surface);
+-	if (!view)
+-		return;
+-
+-	if (shsurf && shsurf->shell->is_localmove_pending) {
+-		shsurf->shell->is_localmove_pending = false;
+-	}
+-
+-	assert(!shsurf->snapped.is_maximized_requested);
+-
+-	if (surface->width != width || surface->height != height) {
+-		//TODO: support window resize (width x height)
+-		shell_rdp_debug(shsurf->shell, "%s: surface:%p is resized (%dx%d) -> (%d,%d)\n",
+-			__func__, surface, surface->width, surface->height, width, height);
+-	}
+-
+-	weston_view_set_position(view, x, y);
+-
+-	shell_rdp_debug(shsurf->shell, "%s: surface:%p is moved to (%d,%d) %dx%d\n",
+-		__func__, surface, x, y, width, height);
+-}
++static void
++shell_backend_request_window_move(struct weston_surface *surface, int x, int y, int width, int height)
++{
++	struct weston_view *view;
++	struct shell_surface *shsurf = get_shell_surface(surface);
++	struct weston_desktop_surface *desktop_surface;
++	struct weston_geometry geometry;
++	const struct weston_xwayland_surface_api *api;
++
++	view = get_default_view(surface);
++	if (!view || !shsurf)
++		return;
++
++	if (shsurf && shsurf->shell->is_localmove_pending) {
++		shsurf->shell->is_localmove_pending = false;
++	}
++
++	assert(!shsurf->snapped.is_maximized_requested);
++
++	if (width > 0 && height > 0 &&
++	    (surface->width != width || surface->height != height)) {
++		struct weston_size max_size;
++		struct weston_size min_size;
++
++		desktop_surface = weston_surface_get_desktop_surface(surface);
++		if (desktop_surface) {
++			geometry = weston_desktop_surface_get_geometry(desktop_surface);
++
++			/* weston_desktop_surface_set_size() expects window geometry coordinates. */
++			width -= (surface->width - geometry.width);
++			height -= (surface->height - geometry.height);
++
++			max_size = weston_desktop_surface_get_max_size(desktop_surface);
++			min_size = weston_desktop_surface_get_min_size(desktop_surface);
++
++			min_size.width = MAX(1, min_size.width);
++			min_size.height = MAX(1, min_size.height);
++
++			if (width < min_size.width)
++				width = min_size.width;
++			else if (max_size.width > 0 && width > max_size.width)
++				width = max_size.width;
++			if (height < min_size.height)
++				height = min_size.height;
++			else if (max_size.height > 0 && height > max_size.height)
++				height = max_size.height;
++
++			shell_rdp_debug(shsurf->shell,
++					"%s: surface:%p is resized (%dx%d) -> (%d,%d)\n",
++					__func__, surface,
++					surface->width, surface->height,
++					width, height);
++			weston_desktop_surface_set_size(desktop_surface,
++							width, height);
++		}
++	}
++
++	weston_view_set_position(view, x, y);
++	api = shsurf->shell->xwayland_surface_api;
++	if (!api) {
++		api = weston_xwayland_surface_get_api(shsurf->shell->compositor);
++		shsurf->shell->xwayland_surface_api = api;
++	}
++	if (api && api->is_xwayland_surface(surface))
++		api->send_position(surface, x, y);
++
++	shell_rdp_debug(shsurf->shell, "%s: surface:%p is moved to (%d,%d) %dx%d\n",
++		__func__, surface, x, y, width, height);
++}
+ 
+ static void
+ shell_backend_request_window_snap(struct weston_surface *surface, int x, int y, int width, int height)
+@@ -4098,17 +4140,21 @@ center_on_output(struct weston_view *view, struct weston_output *output)
+ 	weston_view_set_position(view, x, y);
+ }
+ 
+-static void
+-weston_view_set_initial_position(struct shell_surface *shsurf)
+-{
+-	struct weston_view *view = shsurf->view;
+-	struct desktop_shell *shell = shsurf->shell;
+-	struct weston_compositor *compositor = shell->compositor;
+-	int32_t range_x, range_y;
+-	int32_t x, y;
+-	struct weston_output *target_output = NULL;
+-	pixman_rectangle32_t area;
+-	struct weston_geometry geometry;
++static void
++weston_view_set_initial_position(struct shell_surface *shsurf)
++{
++	struct weston_view *view = shsurf->view;
++	struct desktop_shell *shell = shsurf->shell;
++	struct weston_compositor *compositor = shell->compositor;
++	const int32_t margin = 24;
++	const int32_t gap = 40;
++	const int32_t columns = 2;
++	int32_t usable_width, column_width, row_height;
++	int32_t col, row;
++	int32_t x, y;
++	struct weston_output *target_output = NULL;
++	pixman_rectangle32_t area;
++	struct weston_geometry geometry;
+ 
+ 	/* As a heuristic place the new window on the same output as the
+ 	 * pointer. Falling back to the output containing 0, 0.
+@@ -4161,24 +4207,33 @@ weston_view_set_initial_position(struct shell_surface *shsurf)
+ 	 * If this is negative it means that the surface is bigger than
+ 	 * output.
+ 	 */
+-	get_output_work_area(shell, target_output, &area);
+-	geometry = weston_desktop_surface_get_geometry(shsurf->desktop_surface);
+-	x = area.x - geometry.x;
+-	y = area.y - geometry.y;
+-	range_x = area.width - view->surface->width;
+-	range_y = area.height - view->surface->height;
+-
+-	if (range_x > 0)
+-		x += random() % range_x;
+-
+-	if (range_y > 0)
+-		y += random() % range_y;
+-
+-	shell_rdp_debug_verbose(shell, "%s: view:%p, (%d, %d)\n",
+-				__func__, view, x, y); 
+-
+-	weston_view_set_position(view, x, y);
+-}
++	get_output_work_area(shell, target_output, &area);
++	geometry = weston_desktop_surface_get_geometry(shsurf->desktop_surface);
++	usable_width = area.width - (2 * margin) - gap;
++	column_width = usable_width > 0 ? usable_width / columns : area.width;
++	row_height = view->surface->height + gap;
++	if (row_height < 320)
++		row_height = 320;
++	col = shsurf->manifold_tile_slot % columns;
++	row = shsurf->manifold_tile_slot / columns;
++
++	x = area.x + margin + col * (column_width + gap) - geometry.x;
++	y = area.y + margin + row * row_height - geometry.y;
++
++	if (x + view->surface->width > area.x + area.width)
++		x = area.x + area.width - view->surface->width - geometry.x;
++	if (y + view->surface->height > area.y + area.height)
++		y = area.y + area.height - view->surface->height - geometry.y;
++	if (x < area.x - geometry.x)
++		x = area.x - geometry.x;
++	if (y < area.y - geometry.y)
++		y = area.y - geometry.y;
++
++	shell_rdp_debug_verbose(shell, "%s: view:%p, slot:%u, (%d, %d)\n",
++				__func__, view, shsurf->manifold_tile_slot, x, y);
++
++	weston_view_set_position(view, x, y);
++}
+ 
+ static bool
+ check_desktop_shell_crash_too_early(struct desktop_shell *shell)
