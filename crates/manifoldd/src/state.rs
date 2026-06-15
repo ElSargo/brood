@@ -620,6 +620,15 @@ pub struct RuntimeStats {
     pub max_commit_batch_commits: u64,
     pub last_commit_to_frame_micros: Option<u128>,
     pub max_commit_to_frame_micros: u128,
+    pub last_commit_to_submit_micros: Option<u128>,
+    pub max_commit_to_submit_micros: u128,
+    pub pending_client_frame_callback_at: Option<Instant>,
+    pub pending_client_frame_callbacks: u64,
+    pub client_frame_callback_commit_count: u64,
+    pub last_client_frame_callback_batch_callbacks: u64,
+    pub max_client_frame_callback_batch_callbacks: u64,
+    pub last_client_frame_callback_to_commit_micros: Option<u128>,
+    pub max_client_frame_callback_to_commit_micros: u128,
     pub input_events: u64,
     pub keyboard_events: u64,
     pub pointer_motion_events: u64,
@@ -639,6 +648,16 @@ pub struct RuntimeStats {
     pub max_input_batch_events: u64,
     pub last_input_to_frame_micros: Option<u128>,
     pub max_input_to_frame_micros: u128,
+    pub last_input_to_submit_micros: Option<u128>,
+    pub max_input_to_submit_micros: u128,
+    pub pending_input_commit_at: Option<Instant>,
+    pub pending_input_to_commit_micros: Option<u128>,
+    pub input_commit_frame_count: u64,
+    pub input_without_commit_frame_count: u64,
+    pub last_input_to_commit_micros: Option<u128>,
+    pub max_input_to_commit_micros: u128,
+    pub last_input_commit_to_submit_micros: Option<u128>,
+    pub max_input_commit_to_submit_micros: u128,
     pub attach_count: u64,
     pub detach_count: u64,
     pub pending_attach_request_at: Option<Instant>,
@@ -693,8 +712,12 @@ impl RuntimeStats {
     fn clear_pending_visible_latency_samples(&mut self) {
         self.pending_input_at = None;
         self.pending_input_events = 0;
+        self.pending_input_commit_at = None;
+        self.pending_input_to_commit_micros = None;
         self.pending_commit_at = None;
         self.pending_commits = 0;
+        self.pending_client_frame_callback_at = None;
+        self.pending_client_frame_callbacks = 0;
     }
 
     pub fn record_input(&mut self, can_present_input: bool) {
@@ -710,11 +733,46 @@ impl RuntimeStats {
     pub fn record_commit(&mut self, can_present_commit: bool) {
         self.commits += 1;
         if can_present_commit {
+            let now = Instant::now();
             if self.pending_commit_at.is_none() {
-                self.pending_commit_at = Some(Instant::now());
+                self.pending_commit_at = Some(now);
             }
             self.pending_commits += 1;
+
+            if let Some(input_at) = self.pending_input_at {
+                if self.pending_input_commit_at.is_none() {
+                    self.pending_input_to_commit_micros =
+                        Some(now.duration_since(input_at).as_micros());
+                    self.pending_input_commit_at = Some(now);
+                }
+            }
+
+            if let Some(callback_at) = self.pending_client_frame_callback_at.take() {
+                let callbacks = self.pending_client_frame_callbacks;
+                self.pending_client_frame_callbacks = 0;
+                self.client_frame_callback_commit_count += 1;
+                self.last_client_frame_callback_batch_callbacks = callbacks;
+                self.max_client_frame_callback_batch_callbacks = self
+                    .max_client_frame_callback_batch_callbacks
+                    .max(callbacks);
+                let latency = now.duration_since(callback_at).as_micros();
+                self.last_client_frame_callback_to_commit_micros = Some(latency);
+                self.max_client_frame_callback_to_commit_micros =
+                    self.max_client_frame_callback_to_commit_micros.max(latency);
+            }
         }
+    }
+
+    pub fn record_client_frame_callbacks(&mut self, callbacks: u64) {
+        self.client_frame_callbacks += callbacks;
+        if callbacks == 0 {
+            return;
+        }
+
+        if self.pending_client_frame_callback_at.is_none() {
+            self.pending_client_frame_callback_at = Some(Instant::now());
+        }
+        self.pending_client_frame_callbacks += callbacks;
     }
 
     pub fn record_frame(&mut self, frame_duration: Duration) {
@@ -738,6 +796,24 @@ impl RuntimeStats {
             let latency = input_at.elapsed().as_micros();
             self.last_input_to_frame_micros = Some(latency);
             self.max_input_to_frame_micros = self.max_input_to_frame_micros.max(latency);
+            self.last_input_to_submit_micros = Some(latency);
+            self.max_input_to_submit_micros = self.max_input_to_submit_micros.max(latency);
+
+            if let Some(commit_at) = self.pending_input_commit_at.take() {
+                self.input_commit_frame_count += 1;
+                if let Some(input_to_commit) = self.pending_input_to_commit_micros.take() {
+                    self.last_input_to_commit_micros = Some(input_to_commit);
+                    self.max_input_to_commit_micros =
+                        self.max_input_to_commit_micros.max(input_to_commit);
+                }
+                let commit_to_submit = now.duration_since(commit_at).as_micros();
+                self.last_input_commit_to_submit_micros = Some(commit_to_submit);
+                self.max_input_commit_to_submit_micros =
+                    self.max_input_commit_to_submit_micros.max(commit_to_submit);
+            } else {
+                self.input_without_commit_frame_count += 1;
+                self.pending_input_to_commit_micros = None;
+            }
         }
 
         if let Some(commit_at) = self.pending_commit_at.take() {
@@ -749,6 +825,8 @@ impl RuntimeStats {
             let latency = commit_at.elapsed().as_micros();
             self.last_commit_to_frame_micros = Some(latency);
             self.max_commit_to_frame_micros = self.max_commit_to_frame_micros.max(latency);
+            self.last_commit_to_submit_micros = Some(latency);
+            self.max_commit_to_submit_micros = self.max_commit_to_submit_micros.max(latency);
         }
 
         if let Some(attach_at) = self.pending_attach_frame_at.take() {
@@ -779,6 +857,8 @@ mod runtime_stats_tests {
         assert_eq!(stats.max_input_batch_events, 2);
         assert_eq!(stats.pending_input_events, 0);
         assert!(stats.last_input_to_frame_micros.is_some());
+        assert!(stats.last_input_to_submit_micros.is_some());
+        assert_eq!(stats.input_without_commit_frame_count, 1);
     }
 
     #[test]
@@ -822,6 +902,66 @@ mod runtime_stats_tests {
         assert_eq!(stats.max_commit_batch_commits, 2);
         assert_eq!(stats.pending_commits, 0);
         assert!(stats.last_commit_to_frame_micros.is_some());
+        assert!(stats.last_commit_to_submit_micros.is_some());
+    }
+
+    #[test]
+    fn input_followed_by_commit_before_frame_records_same_frame_candidate() {
+        let mut stats = RuntimeStats::default();
+
+        stats.record_input(true);
+        stats.record_commit(true);
+        stats.record_frame(Duration::ZERO);
+
+        assert_eq!(stats.input_frame_count, 1);
+        assert_eq!(stats.commit_frame_count, 1);
+        assert_eq!(stats.input_commit_frame_count, 1);
+        assert_eq!(stats.input_without_commit_frame_count, 0);
+        assert!(stats.last_input_to_commit_micros.is_some());
+        assert!(stats.last_input_commit_to_submit_micros.is_some());
+        assert!(stats.max_input_to_commit_micros >= stats.last_input_to_commit_micros.unwrap());
+        assert!(
+            stats.max_input_commit_to_submit_micros
+                >= stats.last_input_commit_to_submit_micros.unwrap()
+        );
+    }
+
+    #[test]
+    fn commit_before_input_is_not_an_input_commit_hit() {
+        let mut stats = RuntimeStats::default();
+
+        stats.record_commit(true);
+        stats.record_input(true);
+        stats.record_frame(Duration::ZERO);
+
+        assert_eq!(stats.input_frame_count, 1);
+        assert_eq!(stats.commit_frame_count, 1);
+        assert_eq!(stats.input_commit_frame_count, 0);
+        assert_eq!(stats.input_without_commit_frame_count, 1);
+        assert!(stats.last_input_to_commit_micros.is_none());
+        assert!(stats.last_input_commit_to_submit_micros.is_none());
+    }
+
+    #[test]
+    fn client_frame_callback_to_commit_latency_uses_first_following_commit() {
+        let mut stats = RuntimeStats::default();
+
+        stats.record_client_frame_callbacks(1);
+        stats.record_client_frame_callbacks(2);
+        stats.record_commit(true);
+        stats.record_commit(true);
+
+        assert_eq!(stats.client_frame_callbacks, 3);
+        assert_eq!(stats.client_frame_callback_commit_count, 1);
+        assert_eq!(stats.last_client_frame_callback_batch_callbacks, 3);
+        assert_eq!(stats.max_client_frame_callback_batch_callbacks, 3);
+        assert_eq!(stats.pending_client_frame_callbacks, 0);
+        assert!(stats.pending_client_frame_callback_at.is_none());
+        assert!(stats.last_client_frame_callback_to_commit_micros.is_some());
+        assert!(
+            stats.max_client_frame_callback_to_commit_micros
+                >= stats.last_client_frame_callback_to_commit_micros.unwrap()
+        );
     }
 
     #[test]
@@ -851,10 +991,13 @@ mod runtime_stats_tests {
         assert_eq!(stats.commits, 1);
         assert_eq!(stats.pending_input_events, 0);
         assert_eq!(stats.pending_commits, 0);
+        assert_eq!(stats.pending_client_frame_callbacks, 0);
         assert_eq!(stats.input_frame_count, 0);
         assert_eq!(stats.commit_frame_count, 0);
         assert!(stats.last_input_to_frame_micros.is_none());
         assert!(stats.last_commit_to_frame_micros.is_none());
+        assert!(stats.last_input_to_commit_micros.is_none());
+        assert!(stats.last_input_commit_to_submit_micros.is_none());
         assert!(stats.last_detach_latency_micros.is_some());
     }
 

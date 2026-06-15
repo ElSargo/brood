@@ -154,6 +154,11 @@ required = {
     "last_commit_batch_commits": int,
     "max_commit_batch_commits": int,
     "max_commit_to_frame_us": int,
+    "max_commit_to_submit_us": int,
+    "client_frame_callback_commit_count": int,
+    "last_client_frame_callback_batch_callbacks": int,
+    "max_client_frame_callback_batch_callbacks": int,
+    "max_client_frame_callback_to_commit_us": int,
     "last_frame_us": int,
     "max_frame_us": int,
     "last_frame_interval_us": int,
@@ -175,6 +180,11 @@ required = {
     "last_input_batch_events": int,
     "max_input_batch_events": int,
     "max_input_to_frame_us": int,
+    "max_input_to_submit_us": int,
+    "input_commit_frame_count": int,
+    "input_without_commit_frame_count": int,
+    "max_input_to_commit_us": int,
+    "max_input_commit_to_submit_us": int,
     "attach_count": int,
     "detach_count": int,
     "max_attach_latency_us": int,
@@ -233,7 +243,16 @@ if "last_commit_to_frame_us" not in data:
     raise SystemExit(f"missing last_commit_to_frame_us: {data}")
 if data["last_commit_to_frame_us"] is not None and not isinstance(data["last_commit_to_frame_us"], int):
     raise SystemExit(f"last_commit_to_frame_us has wrong type: {data}")
-for key in ("last_attach_latency_us", "last_attach_to_frame_us", "last_detach_latency_us"):
+for key in (
+    "last_commit_to_submit_us",
+    "last_client_frame_callback_to_commit_us",
+    "last_input_to_submit_us",
+    "last_input_to_commit_us",
+    "last_input_commit_to_submit_us",
+    "last_attach_latency_us",
+    "last_attach_to_frame_us",
+    "last_detach_latency_us",
+):
     if key not in data:
         raise SystemExit(f"missing {key}: {data}")
     if data[key] is not None and not isinstance(data[key], int):
@@ -242,6 +261,11 @@ for key in ("last_attach_latency_us", "last_attach_to_frame_us", "last_detach_la
 optional_latency_keys = {
     "last_input_to_frame_us",
     "last_commit_to_frame_us",
+    "last_input_to_submit_us",
+    "last_commit_to_submit_us",
+    "last_input_to_commit_us",
+    "last_input_commit_to_submit_us",
+    "last_client_frame_callback_to_commit_us",
     "last_attach_latency_us",
     "last_attach_to_frame_us",
     "last_detach_latency_us",
@@ -282,6 +306,10 @@ if data["last_commit_to_frame_us"] is None:
     raise SystemExit(f"expected visible commit-to-frame latency: {data}")
 if data["max_commit_to_frame_us"] < data["last_commit_to_frame_us"]:
     raise SystemExit(f"expected max commit-to-frame latency to cover last latency: {data}")
+if data["last_commit_to_submit_us"] is None:
+    raise SystemExit(f"expected visible commit-to-submit latency: {data}")
+if data["max_commit_to_submit_us"] < data["last_commit_to_submit_us"]:
+    raise SystemExit(f"expected max commit-to-submit latency to cover last latency: {data}")
 if data["input_events"] < 3 or data["pointer_motion_events"] < 1 or data["pointer_button_events"] < 2:
     raise SystemExit(f"expected attached input counters after injected input: {data}")
 if data["pointer_target_hits"] < 1:
@@ -292,6 +320,10 @@ if data["last_input_to_frame_us"] is None:
     raise SystemExit(f"expected visible input-to-frame latency: {data}")
 if data["max_input_to_frame_us"] < data["last_input_to_frame_us"]:
     raise SystemExit(f"expected max input-to-frame latency to cover last latency: {data}")
+if data["last_input_to_submit_us"] is None:
+    raise SystemExit(f"expected visible input-to-submit latency: {data}")
+if data["max_input_to_submit_us"] < data["last_input_to_submit_us"]:
+    raise SystemExit(f"expected max input-to-submit latency to cover last latency: {data}")
 if data["attach_count"] < 1:
     raise SystemExit(f"expected attach_count >= 1: {data}")
 if data["last_attach_latency_us"] is None:

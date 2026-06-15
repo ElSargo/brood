@@ -158,7 +158,13 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
                     );
                     state.reconfigure_focus_stack();
                 }
-                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Input(event) => {
+                    state.process_input_event(event);
+                    if let Err(err) = state.display_handle.flush_clients() {
+                        warn!(?err, "flush clients after presentation input failed");
+                    }
+                    event_presenter.backend.borrow().window().request_redraw();
+                }
                 WinitEvent::Redraw => {
                     if state.presentation == PresentationStatus::Detached {
                         return;
@@ -238,8 +244,9 @@ fn render_presenter_frame(
             window.send_dmabuf_feedback(&output, |_, _| Some(output.clone()), |_, _| feedback);
         }
     });
-    state.stats.client_frame_callbacks += client_frame_callbacks;
-    state.refresh_window_state();
+    state
+        .stats
+        .record_client_frame_callbacks(client_frame_callbacks);
     if let Err(err) = state.display_handle.flush_clients() {
         warn!(?err, "flush clients failed");
     }

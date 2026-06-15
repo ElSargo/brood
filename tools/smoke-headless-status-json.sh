@@ -101,6 +101,11 @@ required = {
     "last_commit_batch_commits": int,
     "max_commit_batch_commits": int,
     "max_commit_to_frame_us": int,
+    "max_commit_to_submit_us": int,
+    "client_frame_callback_commit_count": int,
+    "last_client_frame_callback_batch_callbacks": int,
+    "max_client_frame_callback_batch_callbacks": int,
+    "max_client_frame_callback_to_commit_us": int,
     "last_frame_us": int,
     "max_frame_us": int,
     "last_frame_interval_us": int,
@@ -122,6 +127,11 @@ required = {
     "last_input_batch_events": int,
     "max_input_batch_events": int,
     "max_input_to_frame_us": int,
+    "max_input_to_submit_us": int,
+    "input_commit_frame_count": int,
+    "input_without_commit_frame_count": int,
+    "max_input_to_commit_us": int,
+    "max_input_commit_to_submit_us": int,
     "attach_count": int,
     "detach_count": int,
     "max_attach_latency_us": int,
@@ -160,7 +170,16 @@ if "last_commit_to_frame_us" not in data:
     raise SystemExit(f"missing last_commit_to_frame_us: {data}")
 if data["last_commit_to_frame_us"] is not None and not isinstance(data["last_commit_to_frame_us"], int):
     raise SystemExit(f"last_commit_to_frame_us has wrong type: {data}")
-for key in ("last_attach_latency_us", "last_attach_to_frame_us", "last_detach_latency_us"):
+for key in (
+    "last_commit_to_submit_us",
+    "last_client_frame_callback_to_commit_us",
+    "last_input_to_submit_us",
+    "last_input_to_commit_us",
+    "last_input_commit_to_submit_us",
+    "last_attach_latency_us",
+    "last_attach_to_frame_us",
+    "last_detach_latency_us",
+):
     if key not in data:
         raise SystemExit(f"missing {key}: {data}")
     if data[key] is not None and not isinstance(data[key], int):
@@ -175,13 +194,38 @@ if data["windows"] < 1 or data["commits"] < 1:
     raise SystemExit(f"expected mapped real nested client with commits: {data}")
 if data["frames"] != 0 or data["client_frame_callbacks"] != 0:
     raise SystemExit(f"headless compositor should not render frontend frames: {data}")
-if data["pending_commits"] != 0 or data["commit_frame_count"] != 0 or data["last_commit_to_frame_us"] is not None or data["max_commit_to_frame_us"] != 0:
+if (
+    data["pending_commits"] != 0
+    or data["commit_frame_count"] != 0
+    or data["last_commit_to_frame_us"] is not None
+    or data["max_commit_to_frame_us"] != 0
+    or data["last_commit_to_submit_us"] is not None
+    or data["max_commit_to_submit_us"] != 0
+    or data["client_frame_callback_commit_count"] != 0
+    or data["last_client_frame_callback_batch_callbacks"] != 0
+    or data["max_client_frame_callback_batch_callbacks"] != 0
+    or data["last_client_frame_callback_to_commit_us"] is not None
+    or data["max_client_frame_callback_to_commit_us"] != 0
+):
     raise SystemExit(f"headless compositor should not report visible commit-to-frame latency: {data}")
 if data["shm_formats"] < 2:
     raise SystemExit(f"expected mandatory shm formats in headless mode: {data}")
 if data["pointer_motion_events"] < 1 or data["pointer_target_hits"] < 1:
     raise SystemExit(f"expected injected center-motion to target nested surface: {data}")
-if data["pending_input_events"] != 0 or data["input_frame_count"] != 0 or data["last_input_to_frame_us"] is not None or data["max_input_to_frame_us"] != 0:
+if (
+    data["pending_input_events"] != 0
+    or data["input_frame_count"] != 0
+    or data["last_input_to_frame_us"] is not None
+    or data["max_input_to_frame_us"] != 0
+    or data["last_input_to_submit_us"] is not None
+    or data["max_input_to_submit_us"] != 0
+    or data["input_commit_frame_count"] != 0
+    or data["input_without_commit_frame_count"] != 0
+    or data["last_input_to_commit_us"] is not None
+    or data["max_input_to_commit_us"] != 0
+    or data["last_input_commit_to_submit_us"] is not None
+    or data["max_input_commit_to_submit_us"] != 0
+):
     raise SystemExit(f"headless compositor should not report visible input-to-frame latency: {data}")
 if data["dmabuf"] != "none" or data["dmabuf_formats"] != 0:
     raise SystemExit(f"headless compositor should not advertise presentation dmabuf before attach: {data}")

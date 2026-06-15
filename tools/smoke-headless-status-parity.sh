@@ -99,7 +99,12 @@ for key in ("wayland_display", "presentation", "presentation_last_error", "dmabu
 
 optional_latency_keys = {
     "last_commit_to_frame_us",
+    "last_commit_to_submit_us",
+    "last_client_frame_callback_to_commit_us",
     "last_input_to_frame_us",
+    "last_input_to_submit_us",
+    "last_input_to_commit_us",
+    "last_input_commit_to_submit_us",
     "last_attach_latency_us",
     "last_attach_to_frame_us",
     "last_detach_latency_us",

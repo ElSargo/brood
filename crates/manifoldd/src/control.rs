@@ -107,7 +107,7 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
             let snapshot = StatusSnapshot::from_state(state);
             writeln!(
                 stream,
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -132,6 +132,13 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 snapshot.max_commit_batch_commits,
                 snapshot.last_commit_to_frame_us_text,
                 snapshot.max_commit_to_frame_us,
+                snapshot.last_commit_to_submit_us_text,
+                snapshot.max_commit_to_submit_us,
+                snapshot.client_frame_callback_commit_count,
+                snapshot.last_client_frame_callback_batch_callbacks,
+                snapshot.max_client_frame_callback_batch_callbacks,
+                snapshot.last_client_frame_callback_to_commit_us_text,
+                snapshot.max_client_frame_callback_to_commit_us,
                 snapshot.last_frame_us,
                 snapshot.max_frame_us,
                 snapshot.last_frame_interval_us,
@@ -154,6 +161,14 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 snapshot.max_input_batch_events,
                 snapshot.last_input_to_frame_us_text,
                 snapshot.max_input_to_frame_us,
+                snapshot.last_input_to_submit_us_text,
+                snapshot.max_input_to_submit_us,
+                snapshot.input_commit_frame_count,
+                snapshot.input_without_commit_frame_count,
+                snapshot.last_input_to_commit_us_text,
+                snapshot.max_input_to_commit_us,
+                snapshot.last_input_commit_to_submit_us_text,
+                snapshot.max_input_commit_to_submit_us,
                 snapshot.attach_count,
                 snapshot.detach_count,
                 snapshot.last_attach_latency_us_text,
@@ -257,6 +272,17 @@ struct StatusSnapshot {
     #[serde(skip)]
     last_commit_to_frame_us_text: String,
     max_commit_to_frame_us: u128,
+    last_commit_to_submit_us: Option<u128>,
+    #[serde(skip)]
+    last_commit_to_submit_us_text: String,
+    max_commit_to_submit_us: u128,
+    client_frame_callback_commit_count: u64,
+    last_client_frame_callback_batch_callbacks: u64,
+    max_client_frame_callback_batch_callbacks: u64,
+    last_client_frame_callback_to_commit_us: Option<u128>,
+    #[serde(skip)]
+    last_client_frame_callback_to_commit_us_text: String,
+    max_client_frame_callback_to_commit_us: u128,
     last_frame_us: u128,
     max_frame_us: u128,
     last_frame_interval_us: u128,
@@ -281,6 +307,20 @@ struct StatusSnapshot {
     #[serde(skip)]
     last_input_to_frame_us_text: String,
     max_input_to_frame_us: u128,
+    last_input_to_submit_us: Option<u128>,
+    #[serde(skip)]
+    last_input_to_submit_us_text: String,
+    max_input_to_submit_us: u128,
+    input_commit_frame_count: u64,
+    input_without_commit_frame_count: u64,
+    last_input_to_commit_us: Option<u128>,
+    #[serde(skip)]
+    last_input_to_commit_us_text: String,
+    max_input_to_commit_us: u128,
+    last_input_commit_to_submit_us: Option<u128>,
+    #[serde(skip)]
+    last_input_commit_to_submit_us_text: String,
+    max_input_commit_to_submit_us: u128,
     attach_count: u64,
     detach_count: u64,
     last_attach_latency_us: Option<u128>,
@@ -321,6 +361,12 @@ impl StatusSnapshot {
 
         let last_input_to_frame_us = state.stats.last_input_to_frame_micros;
         let last_commit_to_frame_us = state.stats.last_commit_to_frame_micros;
+        let last_input_to_submit_us = state.stats.last_input_to_submit_micros;
+        let last_commit_to_submit_us = state.stats.last_commit_to_submit_micros;
+        let last_input_to_commit_us = state.stats.last_input_to_commit_micros;
+        let last_input_commit_to_submit_us = state.stats.last_input_commit_to_submit_micros;
+        let last_client_frame_callback_to_commit_us =
+            state.stats.last_client_frame_callback_to_commit_micros;
         let last_attach_latency_us = state.stats.last_attach_latency_micros;
         let last_attach_to_frame_us = state.stats.last_attach_to_frame_micros;
         let last_detach_latency_us = state.stats.last_detach_latency_micros;
@@ -376,6 +422,23 @@ impl StatusSnapshot {
             last_commit_to_frame_us_text: last_commit_to_frame_us
                 .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_commit_to_frame_us: state.stats.max_commit_to_frame_micros,
+            last_commit_to_submit_us,
+            last_commit_to_submit_us_text: last_commit_to_submit_us
+                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
+            max_commit_to_submit_us: state.stats.max_commit_to_submit_micros,
+            client_frame_callback_commit_count: state.stats.client_frame_callback_commit_count,
+            last_client_frame_callback_batch_callbacks: state
+                .stats
+                .last_client_frame_callback_batch_callbacks,
+            max_client_frame_callback_batch_callbacks: state
+                .stats
+                .max_client_frame_callback_batch_callbacks,
+            last_client_frame_callback_to_commit_us,
+            last_client_frame_callback_to_commit_us_text: last_client_frame_callback_to_commit_us
+                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
+            max_client_frame_callback_to_commit_us: state
+                .stats
+                .max_client_frame_callback_to_commit_micros,
             last_frame_us: state.stats.last_frame_micros,
             max_frame_us: state.stats.max_frame_micros,
             last_frame_interval_us: state.stats.last_frame_interval_micros,
@@ -400,6 +463,20 @@ impl StatusSnapshot {
             last_input_to_frame_us_text: last_input_to_frame_us
                 .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_input_to_frame_us: state.stats.max_input_to_frame_micros,
+            last_input_to_submit_us,
+            last_input_to_submit_us_text: last_input_to_submit_us
+                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
+            max_input_to_submit_us: state.stats.max_input_to_submit_micros,
+            input_commit_frame_count: state.stats.input_commit_frame_count,
+            input_without_commit_frame_count: state.stats.input_without_commit_frame_count,
+            last_input_to_commit_us,
+            last_input_to_commit_us_text: last_input_to_commit_us
+                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
+            max_input_to_commit_us: state.stats.max_input_to_commit_micros,
+            last_input_commit_to_submit_us,
+            last_input_commit_to_submit_us_text: last_input_commit_to_submit_us
+                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
+            max_input_commit_to_submit_us: state.stats.max_input_commit_to_submit_micros,
             attach_count: state.stats.attach_count,
             detach_count: state.stats.detach_count,
             last_attach_latency_us,
@@ -503,8 +580,24 @@ fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
             }
             state.forward_pointer_axis(frame);
         }
+        "wheel" if rest.len() == 2 => {
+            let horizontal = parse_i32(&rest[0], "horizontal_v120")?;
+            let vertical = parse_i32(&rest[1], "vertical_v120")?;
+            let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+            if horizontal != 0 {
+                frame = frame
+                    .value(Axis::Horizontal, f64::from(horizontal) * 15.0 / 120.0)
+                    .v120(Axis::Horizontal, horizontal);
+            }
+            if vertical != 0 {
+                frame = frame
+                    .value(Axis::Vertical, f64::from(vertical) * 15.0 / 120.0)
+                    .v120(Axis::Vertical, vertical);
+            }
+            state.forward_pointer_axis(frame);
+        }
         _ => bail!(
-            "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical>"
+            "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical> | wheel <horizontal_v120> <vertical_v120>"
         ),
     }
 
@@ -526,6 +619,12 @@ fn parse_u32(value: &str, name: &str) -> Result<u32> {
     value
         .parse()
         .with_context(|| format!("{name} must be an unsigned integer"))
+}
+
+fn parse_i32(value: &str, name: &str) -> Result<i32> {
+    value
+        .parse()
+        .with_context(|| format!("{name} must be an integer"))
 }
 
 fn parse_button_state(value: &str) -> Result<ButtonState> {

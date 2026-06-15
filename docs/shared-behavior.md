@@ -129,4 +129,5 @@ Expected behavior:
 - Prefer GPU-resident surfaces through DMA-BUF, WSLg graphics redirection, or equivalent platform-native handles.
 - Avoid full-frame CPU streaming as the primary local presentation path.
 - Keep input-to-visible-result and commit-to-visible-result latency within a frame whenever practical.
+- For native nested clients, prefer a late-latched ordering where host input is forwarded, the client commits, Manifold composites, and Manifold submits within one output frame when the client can meet the deadline.
 - Report fallback use, frame cadence, and latency in diagnostics so performance failures are explainable.
