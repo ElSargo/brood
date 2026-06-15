@@ -106,10 +106,14 @@ required = {
     "last_client_frame_callback_batch_callbacks": int,
     "max_client_frame_callback_batch_callbacks": int,
     "max_client_frame_callback_to_commit_us": int,
+    "client_frame_deferrals": int,
+    "client_deferred_frames": int,
     "last_frame_us": int,
     "max_frame_us": int,
     "last_frame_interval_us": int,
     "max_frame_interval_us": int,
+    "input_frame_deferrals": int,
+    "input_deferred_frames": int,
     "input_events": int,
     "keyboard_events": int,
     "pointer_motion_events": int,
@@ -206,6 +210,8 @@ if (
     or data["max_client_frame_callback_batch_callbacks"] != 0
     or data["last_client_frame_callback_to_commit_us"] is not None
     or data["max_client_frame_callback_to_commit_us"] != 0
+    or data["client_frame_deferrals"] != 0
+    or data["client_deferred_frames"] != 0
 ):
     raise SystemExit(f"headless compositor should not report visible commit-to-frame latency: {data}")
 if data["shm_formats"] < 2:
@@ -213,7 +219,9 @@ if data["shm_formats"] < 2:
 if data["pointer_motion_events"] < 1 or data["pointer_target_hits"] < 1:
     raise SystemExit(f"expected injected center-motion to target nested surface: {data}")
 if (
-    data["pending_input_events"] != 0
+    data["input_frame_deferrals"] != 0
+    or data["input_deferred_frames"] != 0
+    or data["pending_input_events"] != 0
     or data["input_frame_count"] != 0
     or data["last_input_to_frame_us"] is not None
     or data["max_input_to_frame_us"] != 0

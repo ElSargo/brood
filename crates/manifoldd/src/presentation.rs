@@ -48,6 +48,9 @@ struct Presenter {
 
 const PRESENTATION_REFRESH_MILLIHZ: i32 = 60_000;
 const TEMP_AGGRESSIVE_PRESENTATION_POLL: bool = false;
+const CLIENT_FRAME_DEFER: Duration = Duration::from_millis(2);
+const INPUT_FRAME_DEFER_MAX: Duration = Duration::from_millis(3);
+const INPUT_FRAME_DEFER_MIN: Duration = Duration::from_micros(500);
 
 pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold) -> Result<()> {
     if state.presentation_started {
@@ -163,10 +166,15 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
                     if let Err(err) = state.display_handle.flush_clients() {
                         warn!(?err, "flush clients after presentation input failed");
                     }
-                    event_presenter.backend.borrow().window().request_redraw();
+                    if !schedule_deferred_client_frame(&event_presenter, state) {
+                        event_presenter.backend.borrow().window().request_redraw();
+                    }
                 }
                 WinitEvent::Redraw => {
                     if state.presentation == PresentationStatus::Detached {
+                        return;
+                    }
+                    if schedule_deferred_client_frame(&event_presenter, state) {
                         return;
                     }
 
@@ -185,6 +193,60 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         .map_err(|err| anyhow!("insert winit source: {err}"))?;
 
     Ok(())
+}
+
+fn schedule_deferred_client_frame(presenter: &Rc<Presenter>, state: &mut Manifold) -> bool {
+    if state.presentation_redraw_deferred {
+        return true;
+    }
+    if state.active_window().is_none() {
+        return false;
+    }
+
+    let input_delay = state
+        .stats
+        .input_frame_defer_remaining(INPUT_FRAME_DEFER_MAX)
+        .filter(|delay| *delay >= INPUT_FRAME_DEFER_MIN);
+    let delay = input_delay.unwrap_or(CLIENT_FRAME_DEFER);
+
+    state.presentation_redraw_deferred = true;
+    state.stats.record_client_frame_deferred();
+    let deferred_for_input = input_delay.is_some();
+    if deferred_for_input {
+        state.stats.record_input_frame_deferred();
+    }
+    let early_callbacks = send_active_client_frame_callbacks(presenter, state);
+    if early_callbacks > 0 {
+        state.presentation_skip_post_submit_frame_callbacks = true;
+    }
+    let timer_presenter = Rc::clone(presenter);
+    let result =
+        state
+            .loop_handle
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                state.presentation_redraw_deferred = false;
+                apply_pending_attach_state(&timer_presenter, state);
+                if state.presentation == PresentationStatus::Attached {
+                    state.stats.record_client_deferred_frame();
+                    if deferred_for_input {
+                        state.stats.record_input_deferred_frame();
+                    }
+                    if let Err(failure) = render_presenter_frame(&timer_presenter, state) {
+                        record_presentation_runtime_failure(state, &failure);
+                        apply_pending_attach_state(&timer_presenter, state);
+                    }
+                } else {
+                    state.presentation_skip_post_submit_frame_callbacks = false;
+                }
+                TimeoutAction::Drop
+            });
+    if let Err(err) = result {
+        state.presentation_redraw_deferred = false;
+        warn!(?err, "insert deferred input presentation timer failed");
+        return false;
+    }
+
+    true
 }
 
 fn render_presenter_frame(
@@ -231,6 +293,19 @@ fn render_presenter_frame(
         .map_err(|err| PresentationRuntimeFailure::new("submit_winit_frame", err))?;
     state.stats.record_frame(frame_started.elapsed());
 
+    if state.presentation_skip_post_submit_frame_callbacks {
+        state.presentation_skip_post_submit_frame_callbacks = false;
+    } else {
+        send_active_client_frame_callbacks(presenter, state);
+    }
+
+    backend.window().request_redraw();
+    Ok(())
+}
+
+fn send_active_client_frame_callbacks(presenter: &Rc<Presenter>, state: &mut Manifold) -> u64 {
+    let output = presenter.output.clone();
+    let active_window = state.active_window();
     let mut client_frame_callbacks = 0;
     active_window.iter().for_each(|window| {
         window.send_frame(
@@ -251,8 +326,7 @@ fn render_presenter_frame(
         warn!(?err, "flush clients failed");
     }
 
-    backend.window().request_redraw();
-    Ok(())
+    client_frame_callbacks
 }
 
 fn initialize_dmabuf(state: &mut Manifold, backend: &mut WinitGraphicsBackend<GlesRenderer>) {

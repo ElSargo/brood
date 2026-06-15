@@ -102,6 +102,8 @@ pub struct Manifold {
     pub(crate) suppress_mode_toggle_key_release: bool,
     pub input_mode: InputMode,
     managed_fullscreen: bool,
+    pub(crate) presentation_redraw_deferred: bool,
+    pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
 }
 
 impl Manifold {
@@ -166,6 +168,8 @@ impl Manifold {
             suppress_mode_toggle_key_release: false,
             input_mode: InputMode::Passthrough,
             managed_fullscreen: false,
+            presentation_redraw_deferred: false,
+            presentation_skip_post_submit_frame_callbacks: false,
         }
     }
 
@@ -629,6 +633,10 @@ pub struct RuntimeStats {
     pub max_client_frame_callback_batch_callbacks: u64,
     pub last_client_frame_callback_to_commit_micros: Option<u128>,
     pub max_client_frame_callback_to_commit_micros: u128,
+    pub client_frame_deferrals: u64,
+    pub client_deferred_frames: u64,
+    pub input_frame_deferrals: u64,
+    pub input_deferred_frames: u64,
     pub input_events: u64,
     pub keyboard_events: u64,
     pub pointer_motion_events: u64,
@@ -728,6 +736,31 @@ impl RuntimeStats {
             }
             self.pending_input_events += 1;
         }
+    }
+
+    pub fn input_frame_defer_remaining(&self, max_delay: Duration) -> Option<Duration> {
+        let input_at = self.pending_input_at?;
+        if self.pending_input_commit_at.is_some() {
+            return None;
+        }
+
+        max_delay.checked_sub(input_at.elapsed())
+    }
+
+    pub fn record_input_frame_deferred(&mut self) {
+        self.input_frame_deferrals += 1;
+    }
+
+    pub fn record_input_deferred_frame(&mut self) {
+        self.input_deferred_frames += 1;
+    }
+
+    pub fn record_client_frame_deferred(&mut self) {
+        self.client_frame_deferrals += 1;
+    }
+
+    pub fn record_client_deferred_frame(&mut self) {
+        self.client_deferred_frames += 1;
     }
 
     pub fn record_commit(&mut self, can_present_commit: bool) {
@@ -923,6 +956,31 @@ mod runtime_stats_tests {
         assert!(
             stats.max_input_commit_to_submit_micros
                 >= stats.last_input_commit_to_submit_micros.unwrap()
+        );
+    }
+
+    #[test]
+    fn input_frame_defer_remaining_only_waits_for_input_without_commit() {
+        let mut stats = RuntimeStats::default();
+
+        assert!(
+            stats
+                .input_frame_defer_remaining(Duration::from_millis(3))
+                .is_none()
+        );
+
+        stats.record_input(true);
+        assert!(
+            stats
+                .input_frame_defer_remaining(Duration::from_millis(3))
+                .is_some()
+        );
+
+        stats.record_commit(true);
+        assert!(
+            stats
+                .input_frame_defer_remaining(Duration::from_millis(3))
+                .is_none()
         );
     }
 

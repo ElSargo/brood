@@ -18,9 +18,9 @@ MIN_SCROLL_DELTA_Y="${MANIFOLD_NATIVE_SCROLL_MIN_DELTA_Y:-1000}"
 MIN_FRAME_FPS="${MANIFOLD_NATIVE_SCROLL_MIN_FRAME_FPS:-59.0}"
 MIN_COMMIT_FPS="${MANIFOLD_NATIVE_SCROLL_MIN_COMMIT_FPS:-59.0}"
 MAX_FRAME_INTERVAL_P95_US="${MANIFOLD_NATIVE_SCROLL_MAX_FRAME_INTERVAL_P95_US:-20000}"
-MAX_COMMIT_TO_FRAME_P95_US="${MANIFOLD_NATIVE_SCROLL_MAX_COMMIT_TO_FRAME_P95_US:-20000}"
+MAX_COMMIT_TO_FRAME_P95_US="${MANIFOLD_NATIVE_SCROLL_MAX_COMMIT_TO_FRAME_P95_US:-8000}"
 MAX_INPUT_TO_FRAME_P95_US="${MANIFOLD_NATIVE_SCROLL_MAX_INPUT_TO_FRAME_P95_US:-20000}"
-MIN_INPUT_COMMIT_FRAME_RATIO="${MANIFOLD_NATIVE_SCROLL_MIN_INPUT_COMMIT_FRAME_RATIO:-0}"
+MIN_INPUT_COMMIT_FRAME_RATIO="${MANIFOLD_NATIVE_SCROLL_MIN_INPUT_COMMIT_FRAME_RATIO:-0.75}"
 OUTPUT_DIR="${MANIFOLD_NATIVE_SCROLL_OUTPUT_DIR:-}"
 
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -399,6 +399,10 @@ commit_count = active[-1]["status"]["commits"] - active[0]["status"]["commits"]
 callback_count = active[-1]["status"]["client_frame_callbacks"] - active[0]["status"]["client_frame_callbacks"]
 input_count = active[-1]["status"]["input_events"] - active[0]["status"]["input_events"]
 axis_count = active[-1]["status"]["pointer_axis_events"] - active[0]["status"]["pointer_axis_events"]
+client_frame_deferrals = active[-1]["status"]["client_frame_deferrals"] - active[0]["status"]["client_frame_deferrals"]
+client_deferred_frames = active[-1]["status"]["client_deferred_frames"] - active[0]["status"]["client_deferred_frames"]
+input_frame_deferrals = active[-1]["status"]["input_frame_deferrals"] - active[0]["status"]["input_frame_deferrals"]
+input_deferred_frames = active[-1]["status"]["input_deferred_frames"] - active[0]["status"]["input_deferred_frames"]
 input_commit_frame_count = active[-1]["status"]["input_commit_frame_count"] - active[0]["status"]["input_commit_frame_count"]
 input_without_commit_frame_count = active[-1]["status"]["input_without_commit_frame_count"] - active[0]["status"]["input_without_commit_frame_count"]
 client_frame_callback_commit_count = active[-1]["status"]["client_frame_callback_commit_count"] - active[0]["status"]["client_frame_callback_commit_count"]
@@ -499,6 +503,10 @@ print(f"active_commits={commit_count}")
 print(f"active_client_frame_callbacks={callback_count}")
 print(f"active_input_events={input_count}")
 print(f"active_axis_events={axis_count}")
+print(f"active_client_frame_deferrals={client_frame_deferrals}")
+print(f"active_client_deferred_frames={client_deferred_frames}")
+print(f"active_input_frame_deferrals={input_frame_deferrals}")
+print(f"active_input_deferred_frames={input_deferred_frames}")
 print(f"active_input_commit_frames={input_commit_frame_count}")
 print(f"active_input_without_commit_frames={input_without_commit_frame_count}")
 print(f"active_input_commit_frame_ratio={input_commit_frame_ratio:.3f}" if input_commit_frame_ratio is not None else "active_input_commit_frame_ratio=none")
