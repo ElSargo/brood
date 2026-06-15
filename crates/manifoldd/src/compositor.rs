@@ -1,4 +1,6 @@
 use anyhow::Result;
+#[cfg(feature = "shm-fallback")]
+use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
     backend::{
         allocator::{Buffer, dmabuf::Dmabuf},
@@ -35,7 +37,6 @@ use smithay::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
             XdgToplevelSurfaceData,
         },
-        shm::{ShmHandler, ShmState},
     },
 };
 use tracing::{info, warn};
@@ -234,6 +235,7 @@ impl BufferHandler for Manifold {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
+#[cfg(feature = "shm-fallback")]
 impl ShmHandler for Manifold {
     fn shm_state(&self) -> &ShmState {
         &self.shm_state
@@ -486,6 +488,7 @@ mod tests {
 
 smithay::delegate_compositor!(Manifold);
 smithay::delegate_xdg_shell!(Manifold);
+#[cfg(feature = "shm-fallback")]
 smithay::delegate_shm!(Manifold);
 smithay::delegate_dmabuf!(Manifold);
 smithay::delegate_drm_syncobj!(Manifold);

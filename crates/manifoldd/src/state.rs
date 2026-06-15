@@ -8,6 +8,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+#[cfg(feature = "shm-fallback")]
+use smithay::wayland::shm::ShmState;
 use smithay::{
     backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
@@ -32,7 +34,6 @@ use smithay::{
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::XdgShellState,
-        shm::ShmState,
         socket::ListeningSocketSource,
     },
 };
@@ -40,6 +41,7 @@ use tracing::{info, warn};
 
 use crate::browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager};
 
+#[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
 const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -59,6 +61,7 @@ pub struct Manifold {
     pub space: Space<Window>,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    #[cfg(feature = "shm-fallback")]
     pub shm_state: ShmState,
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
@@ -88,6 +91,7 @@ impl Manifold {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        #[cfg(feature = "shm-fallback")]
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
@@ -103,8 +107,11 @@ impl Manifold {
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
 
-        let mut dmabuf = DmabufRuntime::default();
-        dmabuf.shm_formats = MANDATORY_SHM_FORMATS;
+        let dmabuf = DmabufRuntime {
+            #[cfg(feature = "shm-fallback")]
+            shm_formats: MANDATORY_SHM_FORMATS,
+            ..DmabufRuntime::default()
+        };
 
         Self {
             start_time,
@@ -115,6 +122,7 @@ impl Manifold {
             space: Space::default(),
             compositor_state,
             xdg_shell_state,
+            #[cfg(feature = "shm-fallback")]
             shm_state,
             output_manager_state,
             seat_state,

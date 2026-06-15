@@ -8,12 +8,14 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+#[cfg(feature = "shm-fallback")]
+use smithay::backend::renderer::ImportMemWl;
 use smithay::{
     backend::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
-            ImportDma, ImportEgl, ImportMemWl, damage::OutputDamageTracker,
+            ImportDma, ImportEgl, damage::OutputDamageTracker,
             element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
@@ -63,9 +65,12 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         size: backend.window_size(),
         refresh: PRESENTATION_REFRESH_MILLIHZ,
     };
-    let shm_formats = backend.renderer().shm_formats().collect::<Vec<_>>();
-    state.dmabuf.shm_formats = shm_formats.len();
-    state.shm_state.update_formats(shm_formats);
+    #[cfg(feature = "shm-fallback")]
+    {
+        let shm_formats = backend.renderer().shm_formats().collect::<Vec<_>>();
+        state.dmabuf.shm_formats = shm_formats.len();
+        state.shm_state.update_formats(shm_formats);
+    }
     match backend.renderer().bind_wl_display(&state.display_handle) {
         Ok(()) => {
             state.dmabuf.egl_wl_bind_status = "ok".to_string();
@@ -243,7 +248,11 @@ fn initialize_dmabuf(state: &mut Manifold, backend: &mut WinitGraphicsBackend<Gl
         state.dmabuf.disabled_reason = Some(reason);
         state.dmabuf.explicit_sync_disabled_reason =
             explicit_sync_disabled_reason_for(advertisement);
+        #[cfg(not(feature = "shm-fallback"))]
+        panic!("renderer reported no importable dmabuf texture formats");
+        #[cfg(feature = "shm-fallback")]
         warn!("renderer reported no dmabuf texture formats; linux dmabuf global disabled");
+        #[cfg(feature = "shm-fallback")]
         return;
     }
     state.dmabuf.disabled_reason = None;
