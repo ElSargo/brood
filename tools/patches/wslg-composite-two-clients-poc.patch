@@ -15,8 +15,20 @@ index 2140ac05..33db3cd9 100644
  	uint32_t showState_requested;
  	uint32_t showState;
  	bool forceRecreateSurface;
+diff --git a/vendor/weston/libweston/backend-rdp/rdp.c b/vendor/weston/libweston/backend-rdp/rdp.c
+index f135a186..9ac46ae1 100644
+--- a/vendor/weston/libweston/backend-rdp/rdp.c
++++ b/vendor/weston/libweston/backend-rdp/rdp.c
+@@ -1296,6 +1296,7 @@ rdp_translate_and_notify_mouse_position(RdpPeerContext *peerContext, UINT16 x, U
+ 	         different scaling. In such case, hit test to that window area on
+ 	         non primary-resident monitor (surface->output) dosn't work. */
+ 	if (to_weston_coordinate(peerContext, &sx, &sy, NULL, NULL)) {
++		rdp_rail_translate_manifold_pointer(peerContext, &sx, &sy);
+ 		weston_compositor_get_time(&time);
+ 		notify_motion_absolute(peerContext->item.seat, &time, sx, sy);
+ 		return TRUE;
 diff --git a/vendor/weston/libweston/backend-rdp/rdp.h b/vendor/weston/libweston/backend-rdp/rdp.h
-index 8ba0deeb..6100b14c 100644
+index 8ba0deeb..e01ed937 100644
 --- a/vendor/weston/libweston/backend-rdp/rdp.h
 +++ b/vendor/weston/libweston/backend-rdp/rdp.h
 @@ -134,6 +134,8 @@ struct rdp_backend {
@@ -28,8 +40,16 @@ index 8ba0deeb..6100b14c 100644
  	bool enable_hi_dpi_support;
  	bool enable_fractional_hi_dpi_support;
  	bool enable_fractional_hi_dpi_roundup;
+@@ -385,6 +387,7 @@ void rdp_rail_sync_window_status(freerdp_peer *client);
+ bool rdp_rail_peer_init(freerdp_peer *client, RdpPeerContext *peerCtx);
+ void rdp_rail_peer_context_free(freerdp_peer *client, RdpPeerContext *context);
+ void rdp_rail_output_repaint(struct weston_output *output, pixman_region32_t *damage);
++bool rdp_rail_translate_manifold_pointer(RdpPeerContext *peerContext, int32_t *x, int32_t *y);
+ bool rdp_drdynvc_init(freerdp_peer *client);
+ void rdp_drdynvc_destroy(RdpPeerContext *context);
+ 
 diff --git a/vendor/weston/libweston/backend-rdp/rdprail.c b/vendor/weston/libweston/backend-rdp/rdprail.c
-index d3ba25cf..e3792dac 100644
+index d3ba25cf..e9870a46 100644
 --- a/vendor/weston/libweston/backend-rdp/rdprail.c
 +++ b/vendor/weston/libweston/backend-rdp/rdprail.c
 @@ -1463,9 +1463,9 @@ rdp_rail_update_cursor(struct weston_surface *surface)
@@ -45,7 +65,7 @@ index d3ba25cf..e3792dac 100644
  	switch (showstate) {
  	case RDP_WINDOW_HIDE:
  		return "Hide";
-@@ -1479,16 +1479,339 @@ rdp_showstate_to_string(uint32_t showstate)
+@@ -1479,16 +1479,526 @@ rdp_showstate_to_string(uint32_t showstate)
  		return "Normal";
  	default:
  		return "Unknown";
@@ -63,8 +83,8 @@ index d3ba25cf..e3792dac 100644
 +}
 +
 +#define MANIFOLD_COMPOSITE_COLUMNS 2
-+#define MANIFOLD_COMPOSITE_CELL_WIDTH 640
-+#define MANIFOLD_COMPOSITE_CELL_HEIGHT 480
++#define MANIFOLD_COMPOSITE_CELL_WIDTH 800
++#define MANIFOLD_COMPOSITE_CELL_HEIGHT 1000
 +#define MANIFOLD_COMPOSITE_MARGIN 0
 +#define MANIFOLD_COMPOSITE_GAP 0
 +#define MANIFOLD_COMPOSITE_WIDTH \
@@ -74,6 +94,8 @@ index d3ba25cf..e3792dac 100644
 +#define MANIFOLD_COMPOSITE_HEIGHT \
 +	((MANIFOLD_COMPOSITE_MARGIN * 2) + MANIFOLD_COMPOSITE_CELL_HEIGHT)
 +#define MANIFOLD_COMPOSITE_MAX_SURFACES 2
++#define MANIFOLD_COMPOSITE_INPUT_X_BIAS 16
++#define MANIFOLD_COMPOSITE_INPUT_Y_BIAS 10
 +
 +static bool
 +rdp_rail_manifold_composite_enabled(void)
@@ -231,6 +253,191 @@ index d3ba25cf..e3792dac 100644
 +		geometry->width = 0;
 +	if (geometry->height < 0)
 +		geometry->height = 0;
++}
++
++static bool
++rdp_rail_manifold_surface_content_origin(struct rdp_backend *b,
++					 struct weston_surface *surface,
++					 int *x,
++					 int *y)
++{
++	struct weston_geometry geometry;
++	struct weston_view *view;
++	float global_x, global_y;
++
++	wl_list_for_each(view, &surface->views, surface_link) {
++		weston_view_to_global_float(view, 0, 0,
++					    &global_x, &global_y);
++		rdp_rail_manifold_get_copy_geometry(b, surface, &geometry);
++		*x = (int)global_x + geometry.x;
++		*y = (int)global_y + geometry.y;
++		return true;
++	}
++
++	return false;
++}
++
++static bool
++rdp_rail_manifold_surface_draw_rect(struct rdp_backend *b,
++				    struct weston_surface *surface,
++				    int slot,
++				    int *x,
++				    int *y,
++				    int *width,
++				    int *height)
++{
++	struct weston_geometry geometry;
++	int slot_x, slot_y, slot_width, slot_height;
++	int content_width, content_height;
++	int copy_width, copy_height;
++
++	rdp_rail_manifold_get_copy_geometry(b, surface, &geometry);
++	rdp_rail_manifold_composite_slot_rect(slot,
++					      &slot_x, &slot_y,
++					      &slot_width, &slot_height);
++	copy_width = min(geometry.width, slot_width);
++	copy_height = min(geometry.height, slot_height);
++	if (copy_width <= 0 || copy_height <= 0)
++		return false;
++
++	weston_surface_get_content_size(surface, &content_width, &content_height);
++	if (content_width <= 0 || content_height <= 0)
++		return false;
++	if (copy_width > content_width)
++		copy_width = content_width;
++	if (copy_height > content_height)
++		copy_height = content_height;
++	if (copy_width <= 0 || copy_height <= 0)
++		return false;
++
++	*x = slot_x + (slot_width - copy_width) / 2;
++	*y = slot_y + (slot_height - copy_height) / 2;
++	*width = copy_width;
++	*height = copy_height;
++	return true;
++}
++
++struct manifold_composite_pointer_data {
++	struct rdp_backend *b;
++	struct weston_surface *host;
++	int presentation_x;
++	int presentation_y;
++	int slot;
++	bool translated;
++	int weston_x;
++	int weston_y;
++};
++
++static void
++rdp_rail_manifold_translate_pointer_surface(struct manifold_composite_pointer_data *data,
++					    struct weston_surface *surface)
++{
++	int draw_x, draw_y, draw_width, draw_height;
++	int origin_x, origin_y;
++
++	if (data->translated ||
++	    data->slot >= MANIFOLD_COMPOSITE_MAX_SURFACES)
++		return;
++	if (!rdp_rail_manifold_surface_draw_rect(data->b, surface, data->slot,
++						 &draw_x, &draw_y,
++						 &draw_width, &draw_height)) {
++		data->slot++;
++		return;
++	}
++	if (data->presentation_x < draw_x ||
++	    data->presentation_y < draw_y ||
++	    data->presentation_x >= draw_x + draw_width ||
++	    data->presentation_y >= draw_y + draw_height) {
++		data->slot++;
++		return;
++	}
++	if (!rdp_rail_manifold_surface_content_origin(data->b, surface,
++						      &origin_x, &origin_y)) {
++		data->slot++;
++		return;
++	}
++
++	data->weston_x = origin_x + data->presentation_x - draw_x +
++			 MANIFOLD_COMPOSITE_INPUT_X_BIAS;
++	data->weston_y = origin_y + data->presentation_y - draw_y +
++			 MANIFOLD_COMPOSITE_INPUT_Y_BIAS;
++	data->translated = true;
++	rdp_debug_verbose(data->b,
++			  "Manifold composite input presentation:(%d,%d) slot:%d bias:(%d,%d) surface:%p -> weston:(%d,%d)\n",
++			  data->presentation_x, data->presentation_y,
++			  data->slot,
++			  MANIFOLD_COMPOSITE_INPUT_X_BIAS,
++			  MANIFOLD_COMPOSITE_INPUT_Y_BIAS,
++			  surface,
++			  data->weston_x, data->weston_y);
++}
++
++static void
++rdp_rail_manifold_translate_pointer_iter(void *element, void *opaque)
++{
++	struct weston_view *view = element;
++	struct weston_surface *surface = view->surface;
++	struct manifold_composite_pointer_data *data = opaque;
++
++	if (surface == data->host)
++		return;
++	if (!rdp_rail_manifold_composite_candidate(data->b, surface))
++		return;
++
++	rdp_rail_manifold_translate_pointer_surface(data, surface);
++}
++
++bool
++rdp_rail_translate_manifold_pointer(RdpPeerContext *peerContext,
++				    int32_t *x,
++				    int32_t *y)
++{
++	struct rdp_backend *b = peerContext->rdpBackend;
++	struct weston_surface *host;
++	struct weston_view *view;
++	int host_origin_x, host_origin_y;
++	struct manifold_composite_pointer_data data;
++
++	if (!b || !rdp_rail_manifold_composite_enabled())
++		return false;
++	host = b->manifold_composite_host_surface;
++	if (!host || !rdp_rail_manifold_composite_candidate(b, host))
++		return false;
++	if (!rdp_rail_manifold_surface_content_origin(b, host,
++						      &host_origin_x,
++						      &host_origin_y))
++		return false;
++
++	data = (struct manifold_composite_pointer_data) {
++		.b = b,
++		.host = host,
++		.presentation_x = *x - host_origin_x,
++		.presentation_y = *y - host_origin_y,
++		.slot = 0,
++		.translated = false,
++		.weston_x = *x,
++		.weston_y = *y,
++	};
++
++	if (data.presentation_x < 0 || data.presentation_y < 0 ||
++	    data.presentation_x >= MANIFOLD_COMPOSITE_WIDTH ||
++	    data.presentation_y >= MANIFOLD_COMPOSITE_HEIGHT)
++		return false;
++
++	rdp_rail_manifold_translate_pointer_surface(&data, host);
++	wl_list_for_each_reverse(view, &b->compositor->view_list, link) {
++		if (data.translated ||
++		    data.slot >= MANIFOLD_COMPOSITE_MAX_SURFACES)
++			break;
++		rdp_rail_manifold_translate_pointer_iter(view, &data);
++	}
++
++	if (!data.translated)
++		return false;
++
++	*x = data.weston_x;
++	*y = data.weston_y;
++	return true;
 +}
 +
 +struct manifold_composite_copy_data {
@@ -395,7 +602,7 @@ index d3ba25cf..e3792dac 100644
  	const struct weston_rdprail_shell_api *api = b->rdprail_shell_api;
  	rdpUpdate *update;
  	WINDOW_ORDER_INFO window_order_info = {};
-@@ -1548,18 +1871,54 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+@@ -1548,18 +2058,54 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
  		return;
  	}
  
@@ -462,7 +669,7 @@ index d3ba25cf..e3792dac 100644
  		rdp_debug_error(b, "CreateWindow(): fail to insert windowId (windowId:0x%x surface:%p).\n",
  				window_id, surface);
  		return;
-@@ -1567,19 +1926,11 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
+@@ -1567,19 +2113,11 @@ rdp_rail_create_window(struct wl_listener *listener, void *data)
  	rail_state->window_id = window_id;
  	/* Once this surface is inserted to hash table, we want to be notified for destroy */
  	assert(!rail_state->destroy_listener.notify);
@@ -487,7 +694,7 @@ index d3ba25cf..e3792dac 100644
  			rail_state->error = true;
  		goto Exit;
  	}
-@@ -1813,21 +2164,37 @@ rdp_rail_destroy_window(struct wl_listener *listener, void *data)
+@@ -1813,21 +2351,37 @@ rdp_rail_destroy_window(struct wl_listener *listener, void *data)
  {
  	struct weston_surface *surface = data;
  	struct weston_compositor *compositor = surface->compositor;
@@ -535,7 +742,7 @@ index d3ba25cf..e3792dac 100644
  
  	assert(b && b->rdp_peer);
  
-@@ -1935,12 +2302,18 @@ rdp_rail_schedule_update_window(struct wl_listener *listener, void *data)
+@@ -1935,12 +2489,18 @@ rdp_rail_schedule_update_window(struct wl_listener *listener, void *data)
  	struct weston_surface_rail_state *rail_state = surface->backend_state;
  	uint32_t window_id;
  
@@ -560,7 +767,7 @@ index d3ba25cf..e3792dac 100644
  
  	assert_compositor_thread(b);
  
-@@ -2049,11 +2422,19 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2049,11 +2609,19 @@ rdp_rail_update_window(struct weston_surface *surface,
  				assert(rail_state->isCursor);
  				return rdp_rail_update_cursor(surface);
  			}
@@ -585,7 +792,7 @@ index d3ba25cf..e3792dac 100644
  		if (surface->width == 0 || surface->height == 0)
  			rdp_debug_verbose(b, "update_window: surface width and height is zero windowId:0x%x (%dx%d)\n", window_id, surface->width, surface->height);
  
-@@ -2171,10 +2552,10 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2171,10 +2739,10 @@ rdp_rail_update_window(struct weston_surface *surface,
  	content_buffer_window_geometry = geometry;
  
  	/* apply global to output transform, and translate to client coordinate */
@@ -600,7 +807,7 @@ index d3ba25cf..e3792dac 100644
  				     &newClientPos.height);
  
  		if (should_strip_window_shadow(peer_ctx, rail_state)) {
-@@ -2183,18 +2564,26 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2183,18 +2751,26 @@ rdp_rail_update_window(struct weston_surface *surface,
  					     &window_margin_top,
  					     NULL, NULL);
  			to_client_coordinate(peer_ctx, surface->output,
@@ -639,7 +846,7 @@ index d3ba25cf..e3792dac 100644
  
  	/* Adjust the Windows size and position on the screen */
  	if (rail_state->clientPos.x != newClientPos.x ||
-@@ -2519,17 +2908,31 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2519,17 +3095,31 @@ rdp_rail_update_window(struct weston_surface *surface,
  
  		/* contentBuffer represents buffer from Linux application. */
  		/* this size could be larger than it's window size for native HI-DPI rendering */
@@ -682,7 +889,7 @@ index d3ba25cf..e3792dac 100644
  
  		/* copy buffer represents the buffer allocated to share with RDP client. */
  		/* this can be shared memory buffer or grfx channel surface */
-@@ -2571,10 +2974,10 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2571,10 +3161,10 @@ rdp_rail_update_window(struct weston_surface *surface,
  						/* at window resize, reset name as old name might still be referenced by client */
  						rail_state->shared_memory.name[0] = '\0';
  					}
@@ -697,7 +904,7 @@ index d3ba25cf..e3792dac 100644
  						uint32_t new_pool_id = 0;
  
  						if (rdp_id_manager_allocate_id(&peer_ctx->poolId, surface, &new_pool_id)) {
-@@ -2616,14 +3019,20 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2616,14 +3206,20 @@ rdp_rail_update_window(struct weston_surface *surface,
  								}
  							}
  						}
@@ -726,7 +933,7 @@ index d3ba25cf..e3792dac 100644
  					if (rdp_id_manager_allocate_id(&peer_ctx->surfaceId, surface, &new_surface_id)) {
  						RdpgfxServerContext *gfx_ctx;
  
-@@ -2658,7 +3067,8 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2658,7 +3254,8 @@ rdp_rail_update_window(struct weston_surface *surface,
  				damage_box.y1 = 0;
  				damage_box.x2 = content_buffer_width;
  				damage_box.y2 = content_buffer_height;
@@ -736,7 +943,7 @@ index d3ba25cf..e3792dac 100644
  				/* scale damage using surface to buffer matrix */
  				rdp_matrix_transform_position(&surface->surface_to_buffer_matrix,
  							      &damage_box.x1,
-@@ -2734,21 +3144,32 @@ rdp_rail_update_window(struct weston_surface *surface,
+@@ -2734,21 +3331,32 @@ rdp_rail_update_window(struct weston_surface *surface,
  						  scaleFactorWidth,
  						  scaleFactorHeight);
  
@@ -784,7 +991,7 @@ index d3ba25cf..e3792dac 100644
  							copy_damage_width,
  							copy_damage_height,
  							copy_buffer_size,damage_box.x1,
-@@ -4944,25 +5365,20 @@ rdp_rail_backend_create(struct rdp_backend *b, struct weston_rdp_backend_config
+@@ -4944,25 +5552,20 @@ rdp_rail_backend_create(struct rdp_backend *b, struct weston_rdp_backend_config
  		}
  	}
  

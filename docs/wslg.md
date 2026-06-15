@@ -6,6 +6,8 @@ This page tracks the WSLg-specific implementation path for Manifold.
 
 The WSLg work should be a WSLg-native implementation, not a slow fallback of the generic nested compositor.
 
+The product goal is not "remote desktop." The goal is to keep managed app surfaces on WSLg's accelerated GPU-backed presentation path, preserve Manifold workspace behavior at the compositor/session layer, and minimize added presentation latency.
+
 On WSLg, normal Linux GUI apps can use Mesa's D3D12 path and present through WSLg. The current nested Manifold prototype sits between the managed app and WSLg. Because WSLg does not expose DRM render nodes, GBM, importable DMA-BUF formats, or syncobj fences to Manifold's Winit/GLES presenter, GPU-capable hosted Wayland apps fall back to `wl_shm` when talking to Manifold.
 
 The goal is to avoid this shape:
@@ -27,7 +29,7 @@ The WSLg-native path and the Linux nested compositor should remain separate expe
 - Ubuntu 24.04 WSL and Arch WSL both expose `/dev/dxg` but no `/dev/dri/renderD*` in this environment.
 - Manifold's DMA-BUF diagnostics report no importable DMA-BUF texture formats under WSLg.
 - Direct WSLg clients can still use GPU acceleration through Mesa D3D12, which means the missing piece is not "WSL cannot accelerate GUI apps"; it is "Manifold's nested compositor cannot import those GPU buffers through normal Linux DMA-BUF APIs."
-- Software Chrome nested through Manifold is surprisingly usable on UMA hardware, but it is still the wrong WSL architecture if we can keep clients on WSLg's native accelerated path.
+- Software Chrome nested through Manifold is surprisingly usable on UMA hardware, but it is still the wrong WSL architecture if we can keep clients on WSLg's native accelerated path and avoid copy-heavy surface movement.
 
 ## Investigation Targets
 
@@ -88,23 +90,60 @@ Build a private WSLg system distro VHD with:
 
 ### Fast Iteration Deploy
 
-For Weston/WSLg iteration, prefer the image hot-deploy loop:
+For a reliable one-command redeploy of the WSLg path and the two-Chrome
+composite smoke setup, run:
+
+```powershell
+.\tools\wslg-redeploy-two-chrome.ps1
+```
+
+That rebuilds the private WSLg system distro VHD, installs it through
+`.wslconfig`, restarts WSL, opens isolated red/green Chrome browser windows in the
+target distro, and verifies the private system distro marker. Use
+`-SkipBuild -SkipInstall` to reopen the two Chrome test windows against the
+currently active WSLg image.
+
+For Weston/WSLg iteration, the experimental hot-deploy loop can rebuild just the
+Weston artifacts:
+
+```powershell
+.\tools\wslg-hot-deploy-weston.ps1 -WestonOnly
+```
+
+That command uses a cached WSLg dev-stage image as the build environment,
+rebuilds Weston incrementally from the local `reference/wslg/vendor/weston`
+checkout, and copies the hot-deploy artifacts into the active private system
+distro. It skips rebuilding the final runtime image, Docker export, tar-to-VHD
+conversion, VHD copy, and `.wslconfig` rewrites.
+
+Current limitation: this path is useful for producing artifacts, but it is not
+yet a reliable end-to-end redeploy. The active system distro is an overlay over
+the private system VHD. Copying binaries into the running system distro updates
+the overlay and checksums correctly, but `wsl --shutdown` discards that overlay.
+The next GUI launch therefore reloads the binaries from the private VHD, not the
+hot-copied files. Use the full private VHD build/install path when the next
+verification needs a clean WSLg restart.
+
+Use the full-image hot deploy when you need the final runtime image rebuilt as well:
 
 ```powershell
 .\tools\wslg-hot-deploy-weston.ps1
 ```
 
-That command rebuilds the private WSLg Docker image, copies the Weston/WSLg runtime binaries from the image into the active private system distro, and shuts WSL down so the next GUI launch loads the new binaries. It skips Docker export, tar-to-VHD conversion, VHD copy, and `.wslconfig` rewrites.
-
 If the Docker image is already current, skip the rebuild and only copy the binaries:
 
 ```powershell
-.\tools\wslg-hot-deploy-weston.ps1 -SkipBuild
+.\tools\wslg-hot-deploy-weston.ps1 -WestonOnly -SkipBuild
 ```
 
-Use `-NoShutdown` to copy binaries without immediately restarting WSL, and `-DryRun` to list the files that would be deployed.
+Use `-NoShutdown` to copy binaries without immediately restarting WSL, and
+`-DryRun` to list the files that would be deployed.
 
-Hot deploy is appropriate for changes to Weston, the RDP backend, RDPRAIL shell, WSLGd, and renderer modules. Use the full VHD deploy when changing the base system image, installed packages, startup configuration, Dockerfile-only system contents, or when producing a reproducible artifact.
+Hot deploy is intended for changes to Weston, the RDP backend, RDPRAIL shell,
+WSLGd, and renderer modules, but the reload step still needs work. Use the full
+VHD deploy when changing the base system image, installed packages, startup
+configuration, Dockerfile-only system contents, when producing a reproducible
+artifact, or when the test must survive `wsl --shutdown`.
 
 Install the built VHD as the private WSLg system distro from PowerShell with:
 
@@ -151,6 +190,33 @@ The first pass should focus on WSLg's documented private system distro flow befo
 - Private VHD installs use timestamped files under `C:\Users\sargo\manifold-wslg\` through `.wslconfig` `systemDistro=...`, so a running system distro does not block the next copy.
 - The active system distro has verified marker `manifold-wslg-fastpath-required` in `/etc/manifold-wslg.txt` and `/mnt/wslg/versions.txt`.
 - `wayland-info` from Ubuntu connects to the modified WSLg instance and reports `weston_rdprail_shell`.
+- The GL compositor negative-effect shader was removed from the local Weston
+  source and from the Manifold patch application flow. Private WSLg rebuilds no
+  longer apply `tools/patches/wslg-invert-shader-poc.patch`, and the Pixman
+  inversion hook is now opt-in through `WSLG_APPLY_PIXMAN_INVERT=1`.
+- A two-Chrome validation with red and green app windows proved the current
+  hot-deploy reload problem. After copying clean non-inverting renderer
+  artifacts into the live system distro and then restarting WSL, the captured
+  composite window was still inverted:
+  `left_red=0/9600`, `left_cyan=8733/9600`, `right_green=0/9600`,
+  `right_magenta=8703/9600`.
+- The live overlay copy itself did work: checksums for
+  `/usr/lib/libweston-9/gl-renderer.so` and
+  `/usr/lib/libweston-9.so.0.0.0` matched the local artifacts, and the inversion
+  shader strings were absent on disk. The running Weston process still had old
+  mapped objects shown as `(deleted)` in `/proc/<weston-pid>/maps`, so it kept
+  rendering with the previously loaded negative effect.
+- Killing only Weston caused WSLGd to respawn Weston against the current overlay
+  files, and the new process maps no longer showed `(deleted)` libraries. That
+  did not restore a healthy Windows RAIL export for the Chrome test: Weston saw
+  the Chrome surfaces, but no visible `RAIL_WINDOW` host window appeared on the
+  Windows side.
+- A direct private-VHD patch route was investigated but not adopted. The active
+  private system VHD is an ext4 image with the `read-only` filesystem feature set
+  and essentially no free space. It can be copied and mounted with `wsl --mount`,
+  but safe writable patching needs a deliberate VHD resize/feature workflow. For
+  now, prefer rebuilding and reinstalling the private VHD instead of editing it
+  in place.
 
 ## Fast-Path Requirement
 
@@ -160,7 +226,7 @@ Manifold patches this into a hard startup/runtime failure with `tools/patches/ws
 
 ## Two-Client Composite PoC
 
-`tools/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own, both surfaces are server-resized into adjacent borderless cells, and shell window geometry is used when copying so compositor-managed borders are skipped. This is intentionally scoped to the triangle/cube and two-Chrome proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
+`tools/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own, both surfaces are server-resized into adjacent borderless cells, and shell window geometry is used when copying so compositor-managed borders are skipped. Pointer input is translated from the exported presentation surface into the matching client cell before Weston dispatch. This is intentionally scoped to the triangle/cube and two-Chrome proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
 
 ## Dev Container Goal
 

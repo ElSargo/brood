@@ -1,5 +1,8 @@
 param(
     [string]$Image = "system-distro-x64:latest",
+    [string]$WestonImage = "system-distro-x64-weston-build:latest",
+    [string]$WestonArtifactDir = "reference/wslg/tmp/weston-artifacts",
+    [switch]$WestonOnly,
     [switch]$SkipBuild,
     [switch]$NoShutdown,
     [switch]$DryRun
@@ -10,16 +13,34 @@ $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 
 Push-Location $root
 try {
+    $deployImage = $Image
+    $sourceRoot = "/"
+    $sourceDir = $null
+
     if (-not $SkipBuild) {
-        Write-Output "Building private WSLg Docker image..."
-        $env:WSLG_IMAGE_TAG = $Image
-        bash tools/wslg-build-private-image.sh
-        if ($LASTEXITCODE -ne 0) {
-            throw "Image build failed with exit code $LASTEXITCODE"
+        if ($WestonOnly) {
+            Write-Output "Building Weston hot-deploy artifacts..."
+            $env:WSLG_WESTON_IMAGE_TAG = $WestonImage
+            $env:WSLG_WESTON_ARTIFACT_DIR = $WestonArtifactDir
+            bash tools/wslg-build-weston-artifacts.sh
+            $sourceDir = $WestonArtifactDir
+        } else {
+            Write-Output "Building private WSLg Docker image..."
+            $env:WSLG_IMAGE_TAG = $Image
+            bash tools/wslg-build-private-image.sh
         }
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Build failed with exit code $LASTEXITCODE"
+        }
+    } elseif ($WestonOnly) {
+        $sourceDir = $WestonArtifactDir
     }
 
-    $bashArgs = @("tools/wslg-hot-deploy-weston.sh", "--image", $Image)
+    $bashArgs = @("tools/wslg-hot-deploy-weston.sh", "--image", $deployImage, "--source-root", $sourceRoot)
+    if ($sourceDir) {
+        $bashArgs += @("--source-dir", $sourceDir)
+    }
     if ($DryRun) {
         $bashArgs += "--dry-run"
     }

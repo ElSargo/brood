@@ -8,7 +8,6 @@ WSLG_LOCAL_EXPORT_PATCH="$ROOT/tools/patches/wslg-speed-up-local-export.patch"
 WESTON_FASTPATH_PATCH="$ROOT/tools/patches/wslg-require-gfxredir-fastpath.patch"
 WESTON_SHM_RETRY_PATCH="$ROOT/tools/patches/wslg-retry-gfxredir-shm-open.patch"
 WESTON_PIXMAN_PATCH="$ROOT/tools/patches/wslg-invert-pixman-control.patch"
-WESTON_GL_PATCH="$ROOT/tools/patches/wslg-invert-shader-poc.patch"
 WESTON_COMPOSITE_PATCH="$ROOT/tools/patches/wslg-composite-two-clients-poc.patch"
 MARKER_VALUE="manifold-wslg-fastpath-required"
 
@@ -68,38 +67,38 @@ if [[ -d "$WSLG_DIR/vendor/weston/.git" ]]; then
         "WSLg Weston gfxredir shared-memory open retry" \
         "--unidiff-zero"
 
-    apply_patch_if_missing \
-        "$WSLG_DIR" \
-        "$WESTON_PIXMAN_PATCH" \
-        "$WSLG_DIR/vendor/weston/libweston/pixman-renderer.c" \
-        "pixel[0] = 0xff - pixel[0]" \
-        "WSLg Weston pixman compositor inversion"
-
-    apply_patch_if_missing \
-        "$WSLG_DIR" \
-        "$WESTON_GL_PATCH" \
-        "$WSLG_DIR/vendor/weston/libweston/renderer-gl/gl-renderer.c" \
-        "alpha * (1.0 - color.rgb)" \
-        "WSLg Weston GL compositor inversion"
+    if [[ "${WSLG_APPLY_PIXMAN_INVERT:-0}" != "0" ]]; then
+        apply_patch_if_missing \
+            "$WSLG_DIR" \
+            "$WESTON_PIXMAN_PATCH" \
+            "$WSLG_DIR/vendor/weston/libweston/pixman-renderer.c" \
+            "pixel[0] = 0xff - pixel[0]" \
+            "WSLg Weston pixman compositor inversion"
+    else
+        echo "Skipping WSLg Weston pixman compositor inversion."
+    fi
 
     apply_patch_if_missing \
         "$WSLG_DIR" \
         "$WESTON_COMPOSITE_PATCH" \
-        "$WSLG_DIR/vendor/weston/libweston/backend-rdp/rdprail.c" \
-        "rdp_rail_manifold_layout_surface" \
+        "$WSLG_DIR/vendor/weston/libweston/backend-rdp/rdp.c" \
+        "rdp_rail_translate_manifold_pointer" \
         "WSLg Weston two-client composite PoC"
 else
     echo "WSLg Weston vendor checkout is missing; run tools/wslg-bootstrap-vendors.sh before applying Weston patches." >&2
     exit 1
 fi
 
-git -C "$WSLG_DIR" diff -- Dockerfile
-git -C "$WSLG_DIR" diff -- .dockerignore build-and-export.sh
-git -C "$WSLG_DIR/vendor/weston" diff -- \
-    include/libweston/backend-rdp.h \
-    libweston/backend-rdp/rdprail.c \
-    libweston/backend-rdp/rdputil.c \
-    libweston/backend-rdp/rdp.h \
-    rdprail-shell/shell.c \
-    libweston/pixman-renderer.c \
-    libweston/renderer-gl/gl-renderer.c
+if [[ "${WSLG_APPLY_SHOW_DIFF:-1}" != "0" ]]; then
+    git -C "$WSLG_DIR" diff -- Dockerfile
+    git -C "$WSLG_DIR" diff -- .dockerignore build-and-export.sh
+    git -C "$WSLG_DIR/vendor/weston" diff -- \
+        include/libweston/backend-rdp.h \
+        libweston/backend-rdp/rdp.c \
+        libweston/backend-rdp/rdprail.c \
+        libweston/backend-rdp/rdputil.c \
+        libweston/backend-rdp/rdp.h \
+        rdprail-shell/shell.c \
+        libweston/pixman-renderer.c \
+        libweston/renderer-gl/gl-renderer.c
+fi
