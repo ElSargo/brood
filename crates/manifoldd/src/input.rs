@@ -10,8 +10,18 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
 };
+use tracing::warn;
 
-use crate::state::{Manifold, PresentationStatus};
+use crate::state::{FocusDirection, InputMode, Manifold, PresentationStatus};
+
+const KEY_LEFTCTRL: Keycode = Keycode::new(37);
+const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
+const KEY_B: Keycode = Keycode::new(56);
+const KEY_F: Keycode = Keycode::new(41);
+const KEY_J: Keycode = Keycode::new(44);
+const KEY_K: Keycode = Keycode::new(45);
+const KEY_Q: Keycode = Keycode::new(24);
+const KEY_W: Keycode = Keycode::new(25);
 
 impl Manifold {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -76,8 +86,89 @@ impl Manifold {
     }
 
     pub fn forward_keyboard_key(&mut self, key_code: Keycode, state: KeyState, time: u32) {
-        let can_sample_visible_latency = self.presentation == PresentationStatus::Attached
-            && self.space.elements().next().is_some();
+        let is_ctrl = matches!(key_code, KEY_LEFTCTRL | KEY_RIGHTCTRL);
+
+        if key_code == KEY_B && state == KeyState::Released && self.suppress_mode_toggle_key_release
+        {
+            self.suppress_mode_toggle_key_release = false;
+            self.record_consumed_keyboard_input();
+            return;
+        }
+
+        if is_ctrl {
+            self.ctrl_pressed = state == KeyState::Pressed;
+            match (state, self.input_mode, self.ctrl_forwarded_to_client) {
+                (KeyState::Pressed, InputMode::Passthrough, _) => {
+                    self.ctrl_forwarded_to_client = true;
+                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+                }
+                (KeyState::Released, _, true) => {
+                    self.ctrl_forwarded_to_client = false;
+                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+                }
+                _ => self.record_consumed_keyboard_input(),
+            }
+            return;
+        }
+
+        if self.ctrl_pressed && key_code == KEY_B {
+            self.record_consumed_keyboard_input();
+            if state == KeyState::Pressed {
+                self.suppress_mode_toggle_key_release = true;
+                self.toggle_input_mode();
+            }
+            return;
+        }
+
+        if self.input_mode == InputMode::Normal {
+            self.record_consumed_keyboard_input();
+            if state == KeyState::Pressed {
+                self.handle_normal_mode_key(key_code);
+            }
+            return;
+        }
+
+        self.forward_keyboard_key_to_focused_client(key_code, state, time);
+    }
+
+    fn handle_normal_mode_key(&mut self, key_code: Keycode) {
+        match key_code {
+            KEY_J => {
+                self.cycle_focus(FocusDirection::Next);
+            }
+            KEY_K => {
+                self.cycle_focus(FocusDirection::Previous);
+            }
+            KEY_F => {
+                self.toggle_managed_fullscreen();
+            }
+            KEY_Q => {
+                self.close_active_window();
+            }
+            KEY_W => {
+                if let Err(err) = self.spawn_wezterm_pane() {
+                    warn!(?err, "failed to spawn wezterm pane from normal mode");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_consumed_keyboard_input(&mut self) {
+        let can_sample_visible_latency =
+            self.presentation == PresentationStatus::Attached && self.active_window().is_some();
+        self.stats.record_input(can_sample_visible_latency);
+        self.stats.keyboard_events += 1;
+    }
+
+    fn forward_keyboard_key_to_focused_client(
+        &mut self,
+        key_code: Keycode,
+        state: KeyState,
+        time: u32,
+    ) {
+        let can_sample_visible_latency =
+            self.presentation == PresentationStatus::Attached && self.active_window().is_some();
         self.stats.record_input(can_sample_visible_latency);
         self.stats.keyboard_events += 1;
         let serial = SERIAL_COUNTER.next_serial();
@@ -120,10 +211,17 @@ impl Manifold {
         let pointer = self.seat.get_pointer().expect("pointer");
         let keyboard = self.seat.get_keyboard().expect("keyboard");
         let serial = SERIAL_COUNTER.next_serial();
-        let target_window = self
-            .space
-            .element_under(pointer.current_location())
-            .map(|(window, location)| (window.clone(), location));
+        let target_window: Option<(smithay::desktop::Window, Point<i32, Logical>)> = self
+            .active_window()
+            .filter(|window| {
+                window
+                    .surface_under(
+                        pointer.current_location(),
+                        smithay::desktop::WindowSurfaceType::ALL,
+                    )
+                    .is_some()
+            })
+            .map(|window| (window, Point::<i32, Logical>::from((0, 0))));
         self.stats.record_input(
             self.presentation == PresentationStatus::Attached && target_window.is_some(),
         );
@@ -136,14 +234,7 @@ impl Manifold {
 
         if state == ButtonState::Pressed && !pointer.is_grabbed() {
             if let Some((window, _location)) = target_window {
-                self.space.raise_element(&window, true);
-                if let Some(active_surface) = Manifold::window_toplevel_surface(&window) {
-                    self.activate_window_exclusively(Some(&active_surface));
-                    keyboard.set_focus(self, Some(active_surface), serial);
-                } else {
-                    self.activate_window_exclusively(None);
-                    keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-                }
+                self.focus_window(&window);
             } else {
                 self.activate_window_exclusively(None);
                 keyboard.set_focus(self, Option::<WlSurface>::None, serial);

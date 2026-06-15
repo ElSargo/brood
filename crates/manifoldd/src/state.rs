@@ -20,8 +20,9 @@ use smithay::{
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Display, DisplayHandle,
+            Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
         },
@@ -49,6 +50,18 @@ const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 pub enum PresentationStatus {
     Attached,
     Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDirection {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum InputMode {
+    Passthrough,
+    Normal,
 }
 
 pub struct Manifold {
@@ -83,6 +96,12 @@ pub struct Manifold {
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
+    active_toplevel_surface: Option<WlSurface>,
+    pub(crate) ctrl_pressed: bool,
+    pub(crate) ctrl_forwarded_to_client: bool,
+    pub(crate) suppress_mode_toggle_key_release: bool,
+    pub input_mode: InputMode,
+    managed_fullscreen: bool,
 }
 
 impl Manifold {
@@ -141,6 +160,12 @@ impl Manifold {
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
+            active_toplevel_surface: None,
+            ctrl_pressed: false,
+            ctrl_forwarded_to_client: false,
+            suppress_mode_toggle_key_release: false,
+            input_mode: InputMode::Passthrough,
+            managed_fullscreen: false,
         }
     }
 
@@ -293,13 +318,11 @@ impl Manifold {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(surface, point)| (surface, (point + location).to_f64()))
-            })
+        self.active_window().and_then(|window| {
+            window
+                .surface_under(pos, WindowSurfaceType::ALL)
+                .map(|(surface, point)| (surface, point.to_f64()))
+        })
     }
 
     pub fn first_window_center(&self) -> Option<Point<f64, Logical>> {
@@ -315,7 +338,7 @@ impl Manifold {
     pub fn allocate_toplevel_location(&mut self) -> Point<i32, Logical> {
         let slot = self.next_window_slot;
         self.next_window_slot += 1;
-        cascade_location(slot, self.presentation_size())
+        focus_stack_location(slot)
     }
 
     pub fn record_dmabuf_blocker_failure(&mut self, error: &str) {
@@ -330,6 +353,24 @@ impl Manifold {
                 return;
             };
             let is_active = active_surface == Some(toplevel.wl_surface());
+            let size = self.presentation_size();
+            toplevel.with_pending_state(|state| {
+                state.size = Some(size.into());
+                state.bounds = Some(size.into());
+                if self.managed_fullscreen {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                } else {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                }
+                if is_active {
+                    state.states.set(xdg_toplevel::State::Activated);
+                } else {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                }
+                state.fullscreen_output = None;
+            });
             window.set_activated(is_active);
             toplevel.send_pending_configure();
         });
@@ -343,15 +384,128 @@ impl Manifold {
 
     pub fn record_window_mapped(&mut self) {
         self.last_window_count = self.space.elements().count();
+        self.reconfigure_focus_stack();
     }
 
     pub fn focus_toplevel_surface(&mut self, active_surface: Option<WlSurface>) {
+        self.active_toplevel_surface = active_surface.clone();
         self.activate_window_exclusively(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
         self.seat
             .get_keyboard()
             .expect("keyboard")
             .set_focus(self, active_surface, serial);
+    }
+
+    pub fn active_window(&self) -> Option<Window> {
+        self.active_toplevel_surface.as_ref().and_then(|active| {
+            self.space
+                .elements()
+                .find(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
+                .cloned()
+        })
+    }
+
+    pub fn focus_window(&mut self, window: &Window) {
+        self.space.raise_element(window, true);
+        self.focus_toplevel_surface(Manifold::window_toplevel_surface(window));
+    }
+
+    pub fn cycle_focus(&mut self, direction: FocusDirection) -> bool {
+        let windows = self.space.elements().cloned().collect::<Vec<_>>();
+        let window_count = windows.len();
+        if window_count == 0 {
+            self.focus_toplevel_surface(None);
+            return false;
+        }
+
+        let active_index = self
+            .active_toplevel_surface
+            .as_ref()
+            .and_then(|active| {
+                windows.iter().position(|window| {
+                    Manifold::window_toplevel_surface(window).as_ref() == Some(active)
+                })
+            })
+            .unwrap_or(window_count - 1);
+        let next_index = match direction {
+            FocusDirection::Next => (active_index + 1) % window_count,
+            FocusDirection::Previous => (active_index + window_count - 1) % window_count,
+        };
+        self.focus_window(&windows[next_index]);
+        true
+    }
+
+    pub fn focused_window_index(&self) -> Option<usize> {
+        let active = self.active_toplevel_surface.as_ref()?;
+        self.space
+            .elements()
+            .position(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
+    }
+
+    pub fn focused_window_count(&self) -> usize {
+        usize::from(self.active_window().is_some())
+    }
+
+    pub fn focused_surface_id(&self) -> Option<String> {
+        self.active_toplevel_surface.as_ref().map(|surface| {
+            crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()))
+        })
+    }
+
+    pub fn reconfigure_focus_stack(&mut self) {
+        let windows = self.space.elements().cloned().collect::<Vec<_>>();
+        for window in &windows {
+            self.space
+                .map_element(window.clone(), focus_stack_location(0), false);
+        }
+        if let Some(active_window) = self.active_window() {
+            self.space.raise_element(&active_window, true);
+            self.activate_window_exclusively(self.active_toplevel_surface.clone().as_ref());
+        } else if let Some(window) = windows.last() {
+            self.focus_window(window);
+        } else {
+            self.focus_toplevel_surface(None);
+        }
+    }
+
+    pub fn toggle_input_mode(&mut self) -> InputMode {
+        self.input_mode = match self.input_mode {
+            InputMode::Passthrough => InputMode::Normal,
+            InputMode::Normal => InputMode::Passthrough,
+        };
+        self.input_mode
+    }
+
+    pub fn toggle_managed_fullscreen(&mut self) -> bool {
+        self.managed_fullscreen = !self.managed_fullscreen;
+        self.reconfigure_focus_stack();
+        self.managed_fullscreen
+    }
+
+    pub fn managed_fullscreen(&self) -> bool {
+        self.managed_fullscreen
+    }
+
+    pub fn close_active_window(&mut self) -> bool {
+        let Some(window) = self.active_window() else {
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        toplevel.send_close();
+        true
+    }
+
+    pub fn spawn_wezterm_pane(&self) -> Result<()> {
+        self.spawn_hosted_app_argv(&[
+            "flatpak".to_string(),
+            "run".to_string(),
+            "--env=GDK_BACKEND=wayland".to_string(),
+            "--env=QT_QPA_PLATFORM=wayland".to_string(),
+            "org.wezfurlong.wezterm".to_string(),
+        ])
     }
 
     pub fn refresh_window_state(&mut self) {
@@ -372,6 +526,7 @@ impl Manifold {
     fn refresh_window_state_inner(&mut self) -> WindowRefreshOutcome {
         self.space.refresh();
         self.popups.cleanup();
+        self.reconfigure_focus_stack();
 
         let mut outcome = WindowRefreshOutcome::default();
         let live_toplevel_surfaces = self
@@ -421,20 +576,8 @@ impl Manifold {
     }
 }
 
-fn cascade_location(slot: usize, presentation_size: (i32, i32)) -> Point<i32, Logical> {
-    const STEP_X: i32 = 40;
-    const STEP_Y: i32 = 32;
-    const MARGIN: i32 = 24;
-    const MIN_PANE_WIDTH: i32 = 480;
-    const MIN_PANE_HEIGHT: i32 = 320;
-
-    let max_x = (presentation_size.0 - MIN_PANE_WIDTH).max(MARGIN);
-    let max_y = (presentation_size.1 - MIN_PANE_HEIGHT).max(MARGIN);
-    let x_steps = (max_x / STEP_X).max(1) + 1;
-    let y_steps = (max_y / STEP_Y).max(1) + 1;
-    let x = ((slot as i32 % x_steps) * STEP_X).min(max_x);
-    let y = (((slot as i32 / x_steps) % y_steps) * STEP_Y).min(max_y);
-    Point::from((x, y))
+fn focus_stack_location(_slot: usize) -> Point<i32, Logical> {
+    Point::from((0, 0))
 }
 
 #[derive(Default)]
@@ -445,27 +588,15 @@ struct WindowRefreshOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::cascade_location;
+    use super::focus_stack_location;
 
     #[test]
-    fn cascades_windows_within_presentation_bounds() {
-        let first = cascade_location(0, (1280, 800));
-        let second = cascade_location(1, (1280, 800));
-        let far = cascade_location(100, (1280, 800));
+    fn focus_stack_places_every_window_at_origin() {
+        let first = focus_stack_location(0);
+        let later = focus_stack_location(99);
 
         assert_eq!((first.x, first.y), (0, 0));
-        assert_eq!((second.x, second.y), (40, 0));
-        assert!(far.x <= 800);
-        assert!(far.y <= 480);
-    }
-
-    #[test]
-    fn small_presentations_still_get_stable_locations() {
-        let first = cascade_location(0, (320, 200));
-        let second = cascade_location(1, (320, 200));
-
-        assert_eq!((first.x, first.y), (0, 0));
-        assert_eq!((second.x, second.y), (24, 0));
+        assert_eq!((later.x, later.y), (0, 0));
     }
 }
 

@@ -20,6 +20,7 @@ use smithay::{
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
+    desktop::Space,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -155,6 +156,7 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
                         None,
                         None,
                     );
+                    state.reconfigure_focus_stack();
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Redraw => {
@@ -189,6 +191,12 @@ fn render_presenter_frame(
     let mut damage_tracker = presenter.damage_tracker.borrow_mut();
     let size = backend.window_size();
     let damage = Rectangle::from_size(size);
+    let active_window = state.active_window();
+    let mut render_space = Space::default();
+    if let Some(window) = active_window.clone() {
+        render_space.map_output(&output, (0, 0));
+        render_space.map_element(window, (0, 0), true);
+    }
 
     {
         let (renderer, mut framebuffer) = backend
@@ -205,7 +213,7 @@ fn render_presenter_frame(
             &mut framebuffer,
             1.0,
             0,
-            [&state.space],
+            [&render_space],
             &[],
             &mut damage_tracker,
             [0.02, 0.02, 0.025, 1.0],
@@ -218,7 +226,7 @@ fn render_presenter_frame(
     state.stats.record_frame(frame_started.elapsed());
 
     let mut client_frame_callbacks = 0;
-    state.space.elements().for_each(|window| {
+    active_window.iter().for_each(|window| {
         window.send_frame(
             &output,
             state.start_time.elapsed(),

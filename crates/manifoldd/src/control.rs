@@ -15,7 +15,10 @@ use smithay::{
 };
 use tracing::{info, warn};
 
-use crate::{CtlArgs, browser, state::Manifold};
+use crate::{
+    CtlArgs, browser,
+    state::{FocusDirection, Manifold},
+};
 
 const MAX_CONTROL_COMMAND_BYTES: usize = 64 * 1024;
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_millis(250);
@@ -104,7 +107,7 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
             let snapshot = StatusSnapshot::from_state(state);
             writeln!(
                 stream,
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -114,6 +117,11 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 snapshot.presentation_runtime_failures,
                 snapshot.presentation_last_error,
                 snapshot.windows,
+                snapshot.focused_windows,
+                snapshot.focused_window_index_text,
+                snapshot.focused_surface_id,
+                snapshot.input_mode,
+                snapshot.managed_fullscreen,
                 snapshot.browsers,
                 snapshot.frames,
                 snapshot.client_frame_callbacks,
@@ -193,6 +201,15 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
             state.spawn_hosted_app_argv(args)?;
             writeln!(stream, "OK spawned {}", args.join(" "))?;
         }
+        "focus" => {
+            let direction = match args {
+                [arg] if arg == "next" => FocusDirection::Next,
+                [arg] if arg == "prev" || arg == "previous" => FocusDirection::Previous,
+                _ => bail!("focus requires next or prev"),
+            };
+            let changed = state.cycle_focus(direction);
+            writeln!(stream, "OK focus changed={changed}")?;
+        }
         "browser" => {
             write!(stream, "{}", browser::handle_control(args, state)?)?;
         }
@@ -221,6 +238,13 @@ struct StatusSnapshot {
     presentation_runtime_failures: u64,
     presentation_last_error: String,
     windows: usize,
+    focused_windows: usize,
+    focused_window_index: Option<usize>,
+    #[serde(skip)]
+    focused_window_index_text: String,
+    focused_surface_id: String,
+    input_mode: &'static str,
+    managed_fullscreen: bool,
     browsers: usize,
     frames: u64,
     client_frame_callbacks: u64,
@@ -327,6 +351,19 @@ impl StatusSnapshot {
                 .unwrap_or("none")
                 .to_string(),
             windows: state.space.elements().count(),
+            focused_windows: state.focused_window_count(),
+            focused_window_index: state.focused_window_index(),
+            focused_window_index_text: state
+                .focused_window_index()
+                .map_or_else(|| "none".to_string(), |index| index.to_string()),
+            focused_surface_id: state
+                .focused_surface_id()
+                .unwrap_or_else(|| "none".to_string()),
+            input_mode: match state.input_mode {
+                crate::state::InputMode::Passthrough => "passthrough",
+                crate::state::InputMode::Normal => "normal",
+            },
+            managed_fullscreen: state.managed_fullscreen(),
             browsers: state.browsers.len(),
             frames: state.stats.frames_rendered,
             client_frame_callbacks: state.stats.client_frame_callbacks,
