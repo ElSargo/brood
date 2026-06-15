@@ -1,12 +1,14 @@
 # Browser Pane
 
-The browser should be a first-party pane client, not a native child window.
+The browser roadmap has two useful shapes: a real Chromium/Chrome managed app for testing workspace behavior, and a future minimal first-party browser pane client for low-overhead page display.
 
 ## Direction
 
-The browser pane client owns Chromium or CEF runtime details, while the Manifold session process owns pane lifecycle, focus, commands, permissions, and surface placement.
+The future browser pane client should own Chromium or CEF runtime details, while the Manifold session process owns pane lifecycle, focus, commands, permissions, and surface placement.
 
-This keeps Chromium out of the core session binary and lets the browser crash, restart, or evolve independently.
+This keeps browser runtime details out of the core session binary and lets the browser crash, restart, or evolve independently.
+
+For workspace behavior testing, Manifold should prefer real Chrome/Chromium. It exercises realistic app startup, input, surface, tab/window, DevTools, and lifecycle behavior better than a minimal pane browser would.
 
 ## Responsibilities
 
@@ -44,7 +46,7 @@ Native child windows are explicitly not the desired model.
 
 ## Current Prototype
 
-`manifoldd` can launch Chromium as a hosted Wayland browser pane through the local control socket:
+`manifoldd` can launch Chromium as a hosted Wayland managed app through the local control socket:
 
 ```sh
 manifoldd run --browser https://example.com
@@ -68,7 +70,7 @@ Each `browser open` call uses an isolated profile directory by default, assigns 
 
 If no extensions are configured, Manifold passes `--disable-extensions` for a lighter process. If local unpacked extensions are configured, their canonical paths are passed to both `--disable-extensions-except` and `--load-extension` so Chromium loads only the requested local extensions.
 
-New browser toplevels are placed by Manifold's pane allocator instead of all being mapped at the origin. The current allocator is a deterministic cascade bounded by the presentation size; it is intentionally small and will be replaced by the real pane tree as the workspace model grows.
+New browser toplevels are placed by Manifold's temporary pane allocator instead of all being mapped at the origin. The current allocator is a deterministic cascade bounded by the presentation size; it is intentionally small and will be replaced as the workspace/session model and presentation-surface behavior mature.
 
 The `browser tabs`, `browser new`, `browser activate`, `browser close-target`, and `browser devtools` commands bridge to Chromium's local DevTools HTTP endpoint through Manifold's Unix control socket. This keeps browser control local and per-instance while avoiding a global remote debugging port.
 

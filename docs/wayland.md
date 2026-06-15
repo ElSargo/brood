@@ -1,22 +1,22 @@
 # Nested Wayland
 
-Manifold may eventually host nested Wayland clients as managed apps in panes.
+Manifold currently hosts nested Wayland clients as managed apps in panes through the v1 `manifoldd` proof of concept.
 
 ## Goal
 
-Applications launched inside a Manifold session should be able to appear as panes, participate in layouts, and survive presentation window close/reopen where possible.
+Applications launched inside a Manifold session should create panes through their Wayland windows, be arranged by the presentation surface, and survive presentation window close/reopen where possible.
 
 ## Direction
 
-`manifoldd` should own the nested Wayland compositor state. For the MVP, `manifoldd` should also open the local presentation window and import/composite hosted Wayland app surfaces itself.
+`manifoldd` owns the current nested Wayland compositor state. For the MVP, `manifoldd` also opens the local presentation window and imports/composites hosted Wayland app surfaces itself.
 
 A separate presentation endpoint process is deferred until Manifold needs process isolation or multi-endpoint presentation.
 
-Smithay or a similar compositor-building library is a likely research target, but no final library choice has been made.
+The current implementation uses Smithay for the Linux/Rust nested compositor path. That does not make Smithay part of the future WASM, workspace, or WSLg-native API surface.
 
 ## Surface Sharing
 
-The likely Linux path is DMA-BUF/EGL-compatible surface sharing, with explicit fallback where practical.
+The preferred Linux path is DMA-BUF/EGL-compatible surface sharing so client surfaces can remain GPU-resident through composition. Shared-memory and CPU upload paths exist for correctness and limited backends, but they are not the performance target.
 
 ## Open Questions
 

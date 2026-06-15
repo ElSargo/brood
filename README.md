@@ -2,7 +2,7 @@
 
 Manifold is a new workspace project for a persistent, graphical developer environment.
 
-The core idea is a local session process that owns durable workspace state and can open a native presentation window. The presentation window is not a remote framebuffer viewer. It is a compositor endpoint that presents scene commits, imported surfaces, text, images, animations, and input routing from the latest session state.
+The core idea is a local workspace containing isolated sessions. A local session process owns durable workspace/session state and can open a native presentation window. The presentation window is not a remote framebuffer viewer. It is a compositor endpoint that presents one session at a time, showing any number of that session's panes with presentation-surface-owned layout, animation, and interaction.
 
 ## Thesis
 
@@ -41,10 +41,12 @@ Concrete choices for renderer stack, CEF integration, IPC, protocol encoding, WA
 ## Docs
 
 - [Vision](docs/vision.md)
+- [Shared Behavior Spec](docs/shared-behavior.md)
 - [Architecture](docs/architecture.md)
 - [Protocol](docs/protocol.md)
 - [Rendering](docs/rendering.md)
 - [Apps](docs/apps.md)
+- [WASM Integration](docs/wasm-integration.md)
 - [Browser](docs/browser.md)
 - [Wayland](docs/wayland.md)
 - [Development Environment](docs/dev-environment.md)

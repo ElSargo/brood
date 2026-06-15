@@ -25,7 +25,7 @@ Scene commits should describe retained or patchable primitives:
 - surface slots
 - animation intents
 
-The presentation endpoint may cache and animate scene state without asking the session process for every frame.
+The presentation endpoint may cache scene state and animate presentation state without asking the session process for every frame.
 
 ## Surface Commits
 

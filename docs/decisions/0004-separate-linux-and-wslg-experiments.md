@@ -12,7 +12,7 @@ The WSLg path is a C-first experiment inside WSLg/Weston. WSLg already owns Wind
 
 Keep the Linux/Rust nested compositor and WSLg/C Weston implementation as separate experiments for now.
 
-Unify them through a shared behavior spec rather than shared runtime code. The shared spec should describe Manifold semantics such as pane identity, focus rules, attach/detach, show/hide, input routing, session persistence, and window grouping. Each implementation may satisfy those semantics using platform-specific mechanisms.
+Unify them through a shared behavior spec rather than shared runtime code. The shared spec describes Manifold semantics such as pane identity, focus rules, attach/detach, show/hide, input routing, session persistence, browser testing shape, and window grouping. Each implementation may satisfy those semantics using platform-specific mechanisms.
 
 ## Consequences
 
@@ -24,6 +24,6 @@ Unify them through a shared behavior spec rather than shared runtime code. The s
 
 ## Follow-Up
 
-- Write the first shared behavior spec once the WSLg multi-window composition PoC exists.
+- Keep the shared behavior spec current as the WSLg multi-window composition PoC and Linux workspace model evolve.
 - Revisit shared code only after both implementations have converged on stable concepts.
 - Prefer protocol compatibility over shared renderer or compositor abstractions.

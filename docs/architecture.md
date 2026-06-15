@@ -1,6 +1,6 @@
 # Architecture
 
-Manifold is organized around an authoritative local session process that can also own a presentation endpoint for the MVP.
+Manifold is organized around a workspace containing isolated sessions. The authoritative local session process can also own a presentation endpoint for the MVP.
 
 The long-term architecture may split presentation into a separate endpoint process, but the first prototype keeps the session, nested Wayland compositor, and local presentation window in `manifoldd` to prove detach/reopen behavior with the fewest moving parts.
 
@@ -10,11 +10,12 @@ The long-term architecture may split presentation into a separate endpoint proce
 
 The session process owns workspace truth:
 
-- documents, buffers, selections, modes, commands, and pane tree
-- focus, input routing, layouts, and session lifecycle
+- sessions, session lifecycle, environment, cwd, capabilities, and producer membership
+- documents, buffers, selections, modes, commands, and pane records
+- focus and input routing policy between panes and producers
 - terminals, browser pane clients, Wayland app hosts, agents, and git models
 - WASM app lifecycle, capability grants, and app state
-- semantic scene commits and surface placement
+- semantic scene commits and surface slots
 - the MVP native presentation window and final composition path
 
 ### `manifold-client`
@@ -26,14 +27,14 @@ A future presentation endpoint would own presentation execution:
 - native window and input collection
 - GL/EGL context and final composition
 - glyph atlas, image cache, theme resources, and local animation clock
-- smooth scroll interpolation, cursor blink, hover state, and hit testing
+- pane visibility, placement, dragging, animation, smooth scroll interpolation, cursor blink, hover state, and hit testing
 - imported GPU surfaces from browser, Wayland, terminal, or other pane producers
 
-The presentation endpoint should not own authoritative editor state.
+The presentation endpoint should not own authoritative editor, app, or pane state. It may save presentation preferences such as layout or visibility into the workspace. Pane producers can send presentation requests, but the presentation endpoint decides whether to honor them.
 
 ### Pane Producers
 
-Pane producers are anything that supplies content for a pane: supervised pane client processes, managed app surfaces, or WASM app views.
+Pane producers are anything that can create or supply content for panes: supervised pane client processes, managed app surfaces, or WASM app views. A pane is the unit of presentation, while pane state lives behind an indirection layer in the session process, a WASM module, a managed app, or another producer.
 
 First-party pane clients may include:
 
@@ -42,11 +43,15 @@ First-party pane clients may include:
 - nested Wayland app host
 - future native surface panes
 
-Pane clients are not native child windows. They produce surfaces and metadata that the Manifold presentation compositor presents.
+Pane clients are not native child windows. They produce surfaces and metadata that the Manifold presentation compositor presents as panes.
 
 ### WASM Apps
 
-WASM apps run in a sandboxed app host and emit scene patches using host-provided APIs. They are intended for built-in tools such as git UI, settings, dashboards, inspectors, and agent panels.
+WASM apps run in a sandboxed app host and emit scene patches using host-provided APIs. They may create any number of panes. They are intended for built-in tools such as git UI, settings, dashboards, inspectors, and agent panels.
+
+WASM modules should interact with Manifold through a stable workspace/app API rather than compositor or renderer internals. The workspace core should model sessions, panes, pane producers, focus, commands, events, scene state, surface slots, and presentation requests before the WASM runtime becomes the primary extension point. Presentation layout and animation are presentation-surface concerns unless explicitly saved as workspace preferences.
+
+See [WASM Integration](wasm-integration.md) for the planned host boundary, module roles, hot reload workflow, and milestones.
 
 ## MVP Data Flow
 
