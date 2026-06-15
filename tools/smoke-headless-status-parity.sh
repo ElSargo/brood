@@ -121,6 +121,11 @@ for key in optional_latency_keys:
 for key, value in data.items():
     if key in optional_latency_keys or isinstance(value, str):
         continue
+    if isinstance(value, bool):
+        expected = "true" if value else "false"
+        if text_fields[key] != expected:
+            raise SystemExit(f"boolean field {key} differs: text={text_fields[key]!r} json={value!r}")
+        continue
     if not isinstance(value, int):
         raise SystemExit(f"unexpected non-int/non-string JSON field {key}: {value!r}")
     if str(value) != text_fields[key]:
