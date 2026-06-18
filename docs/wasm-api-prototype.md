@@ -205,6 +205,8 @@ The first runnable spike uses a narrow core-WASM ABI instead of WIT:
 manifoldd run --wasm-key-handler /path/to/key_handler.wasm
 ```
 
+For normal development, Manifold also loads enabled modules from `./manifold.toml` by default. The checked-in config enables the `dev` fast key handler at `examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm`. Use `manifoldd run --no-default-modules` to bypass config-loaded modules, or `manifoldd run --config ./other.toml` to point at another config.
+
 The guest exports:
 
 ```text

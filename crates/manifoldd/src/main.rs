@@ -1,5 +1,6 @@
 mod browser;
 mod compositor;
+mod config;
 mod control;
 mod input;
 mod presentation;
@@ -47,6 +48,26 @@ struct RunArgs {
     /// Load a core-WASM normal-mode key handler.
     #[arg(long = "wasm-key-handler", value_name = "PATH")]
     wasm_key_handler: Option<PathBuf>,
+    /// Project/session config file to load at startup.
+    #[arg(long = "config", value_name = "PATH", default_value = "manifold.toml")]
+    config: PathBuf,
+    /// Start without loading modules from the config file.
+    #[arg(long = "no-default-modules")]
+    no_default_modules: bool,
+}
+
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            command: None,
+            control_socket: PathBuf::from("/tmp/manifoldd.sock"),
+            headless: false,
+            browser: None,
+            wasm_key_handler: None,
+            config: PathBuf::from("manifold.toml"),
+            no_default_modules: false,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -71,7 +92,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
     info!(?args, "starting manifoldd");
 
-    match args.command.unwrap_or(Command::Check) {
+    match args
+        .command
+        .unwrap_or_else(|| Command::Run(RunArgs::default()))
+    {
         Command::Check => {
             println!("manifoldd: ok");
             Ok(())

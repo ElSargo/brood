@@ -131,3 +131,18 @@ Expected behavior:
 - Keep input-to-visible-result and commit-to-visible-result latency within a frame whenever practical.
 - For native nested clients, prefer a late-latched ordering where host input is forwarded, the client commits, Manifold composites, and Manifold submits within one output frame when the client can meet the deadline.
 - Report fallback use, frame cadence, and latency in diagnostics so performance failures are explainable.
+
+## Nested Development
+
+Manifold should be able to host a development Manifold instance inside a stable Manifold instance. This is both a product stress test and a practical development workflow.
+
+Expected behavior:
+
+- A stable instance can launch a dev instance as a managed app.
+- The dev instance can expose its own control socket and nested Wayland display.
+- The dev instance can launch and interact with its own managed apps while presented inside the stable instance.
+- Stable and dev status streams can be sampled together for frame, input, commit, and latency analysis.
+- Host-visible captures can include the stable presentation surface with the dev presentation inside it.
+- Hot reload failures in the dev instance should not destabilize the stable instance.
+
+See [Nested Development Harness](nested-dev-harness.md) for the initial harness shape.

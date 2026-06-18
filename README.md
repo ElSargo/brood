@@ -34,6 +34,32 @@ The current PoC can:
 - reattach the presentation window and resume the nested window
 - report frame cadence, input-to-frame latency, client commits, frame callbacks, dmabuf state, and explicit-sync state
 
+## Common Commands
+
+Run the project:
+
+```sh
+cargo run
+```
+
+By default this starts `manifoldd run` and loads enabled modules from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists.
+
+Run the tests:
+
+```sh
+cargo test
+```
+
+Useful variants:
+
+```sh
+cargo run -- check
+cargo run -- run --headless
+cargo run -- run --no-default-modules
+cargo run -- run --config ./manifold.toml
+cargo run -- ctl status-json
+```
+
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the full v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On the current WSLg backend, the full smoke suite passes and the positive dmabuf/sync checks skip with `rc=77` because WSLg exposes no importable dmabuf formats. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
 
 Concrete choices for renderer stack, CEF integration, IPC, protocol encoding, WASM runtime, and crate layout are intentionally deferred. Remote presentation is a non-goal for the current prototype.

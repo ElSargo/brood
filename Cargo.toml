@@ -20,6 +20,7 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "use_system_lib",
 ] }
 thiserror = "2.0.18"
+toml = "0.9.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wasmtime = "43.0.2"

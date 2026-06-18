@@ -1,0 +1,9 @@
+[module.dev]
+enabled = true
+kind = "fast-key-handler"
+path = "examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm"
+capabilities = [
+  "shortcuts:handle",
+  "apps:run-argv",
+  "workspace:close-focused-pane",
+]
