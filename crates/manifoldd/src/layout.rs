@@ -107,15 +107,304 @@ pub struct LayoutState {
     pub right_dock_visible: bool,
     pub bottom_dock_visible: bool,
     pub center_visible: bool,
+    root: LayoutNode,
+    active_leaf: LayoutLeafId,
+    next_leaf: u64,
 }
 
 impl Default for LayoutState {
     fn default() -> Self {
+        let active_leaf = LayoutLeafId(1);
         Self {
             left_dock_visible: false,
             right_dock_visible: false,
             bottom_dock_visible: false,
             center_visible: true,
+            root: LayoutNode::Leaf(LayoutLeaf {
+                id: active_leaf,
+                kind: LayoutLeafKind::Client,
+            }),
+            active_leaf,
+            next_leaf: 2,
+        }
+    }
+}
+
+impl LayoutState {
+    pub fn split_active(&mut self, axis: LayoutAxis) -> bool {
+        let new_leaf = LayoutLeaf {
+            id: self.allocate_leaf(),
+            kind: LayoutLeafKind::Placeholder,
+        };
+        self.root.split_leaf(self.active_leaf, axis, new_leaf)
+    }
+
+    pub fn active_leaf(&self) -> LayoutLeafId {
+        self.active_leaf
+    }
+
+    pub fn occupy_active_leaf(&mut self) -> Option<LayoutLeafId> {
+        self.root
+            .set_leaf_kind(self.active_leaf, LayoutLeafKind::Client)
+            .then_some(self.active_leaf)
+    }
+
+    pub fn active_rect(&self, size: LayoutSize) -> Option<LayoutRect> {
+        self.leaf_rect(self.active_leaf, size)
+    }
+
+    pub fn leaf_rect(&self, leaf: LayoutLeafId, size: LayoutSize) -> Option<LayoutRect> {
+        self.resolve(size)
+            .into_iter()
+            .find(|region| region.leaf == leaf)
+            .map(|region| region.rect)
+    }
+
+    pub fn active_kind(&self) -> Option<LayoutLeafKind> {
+        self.root.leaf_kind(self.active_leaf)
+    }
+
+    pub fn focus_next(&mut self) -> bool {
+        self.focus_by_offset(1)
+    }
+
+    pub fn focus_previous(&mut self) -> bool {
+        self.focus_by_offset(-1)
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.root.leaf_count()
+    }
+
+    pub fn placeholder_count(&self) -> usize {
+        self.root.placeholder_count()
+    }
+
+    pub fn resolve(&self, size: LayoutSize) -> Vec<LayoutRegion> {
+        let mut regions = Vec::new();
+        self.root.resolve(
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: size.w.max(1),
+                h: size.h.max(1),
+            },
+            self.active_leaf,
+            &mut regions,
+        );
+        regions
+    }
+
+    fn allocate_leaf(&mut self) -> LayoutLeafId {
+        let id = LayoutLeafId(self.next_leaf);
+        self.next_leaf += 1;
+        id
+    }
+
+    fn focus_by_offset(&mut self, offset: isize) -> bool {
+        let mut leaves = Vec::new();
+        self.root.collect_leaf_ids(&mut leaves);
+        let len = leaves.len();
+        if len == 0 {
+            return false;
+        }
+        let current_ix = leaves
+            .iter()
+            .position(|leaf| *leaf == self.active_leaf)
+            .unwrap_or(0);
+        let next_ix = (current_ix as isize + offset).rem_euclid(len as isize) as usize;
+        let next = leaves[next_ix];
+        if next == self.active_leaf {
+            return false;
+        }
+        self.active_leaf = next;
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutSize {
+    pub w: i32,
+    pub h: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl LayoutRect {
+    pub fn contains_f64(self, x: f64, y: f64) -> bool {
+        x >= f64::from(self.x)
+            && y >= f64::from(self.y)
+            && x < f64::from(self.x + self.w)
+            && y < f64::from(self.y + self.h)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutRegion {
+    pub leaf: LayoutLeafId,
+    pub rect: LayoutRect,
+    pub kind: LayoutLeafKind,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutLeafId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutLeafKind {
+    Client,
+    Placeholder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayoutLeaf {
+    id: LayoutLeafId,
+    kind: LayoutLeafKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LayoutNode {
+    Leaf(LayoutLeaf),
+    Split {
+        axis: LayoutAxis,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    fn collect_leaf_ids(&self, leaves: &mut Vec<LayoutLeafId>) {
+        match self {
+            Self::Leaf(leaf) => leaves.push(leaf.id),
+            Self::Split { first, second, .. } => {
+                first.collect_leaf_ids(leaves);
+                second.collect_leaf_ids(leaves);
+            }
+        }
+    }
+
+    fn leaf_kind(&self, target: LayoutLeafId) -> Option<LayoutLeafKind> {
+        match self {
+            Self::Leaf(leaf) if leaf.id == target => Some(leaf.kind),
+            Self::Leaf(_) => None,
+            Self::Split { first, second, .. } => {
+                first.leaf_kind(target).or_else(|| second.leaf_kind(target))
+            }
+        }
+    }
+
+    fn set_leaf_kind(&mut self, target: LayoutLeafId, kind: LayoutLeafKind) -> bool {
+        match self {
+            Self::Leaf(leaf) if leaf.id == target => {
+                leaf.kind = kind;
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                first.set_leaf_kind(target, kind) || second.set_leaf_kind(target, kind)
+            }
+        }
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
+    fn placeholder_count(&self) -> usize {
+        match self {
+            Self::Leaf(leaf) => usize::from(leaf.kind == LayoutLeafKind::Placeholder),
+            Self::Split { first, second, .. } => {
+                first.placeholder_count() + second.placeholder_count()
+            }
+        }
+    }
+
+    fn split_leaf(&mut self, target: LayoutLeafId, axis: LayoutAxis, new_leaf: LayoutLeaf) -> bool {
+        match self {
+            Self::Leaf(leaf) if leaf.id == target => {
+                let current = Self::Leaf(leaf.clone());
+                let new = Self::Leaf(new_leaf);
+                *self = Self::Split {
+                    axis,
+                    first: Box::new(current),
+                    second: Box::new(new),
+                };
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                first.split_leaf(target, axis, new_leaf.clone())
+                    || second.split_leaf(target, axis, new_leaf)
+            }
+        }
+    }
+
+    fn resolve(
+        &self,
+        rect: LayoutRect,
+        active_leaf: LayoutLeafId,
+        regions: &mut Vec<LayoutRegion>,
+    ) {
+        match self {
+            Self::Leaf(leaf) => regions.push(LayoutRegion {
+                leaf: leaf.id,
+                rect,
+                kind: leaf.kind,
+                active: leaf.id == active_leaf,
+            }),
+            Self::Split {
+                axis,
+                first,
+                second,
+            } => {
+                let (first_rect, second_rect) = split_rect(rect, *axis);
+                first.resolve(first_rect, active_leaf, regions);
+                second.resolve(second_rect, active_leaf, regions);
+            }
+        }
+    }
+}
+
+fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRect) {
+    match axis {
+        LayoutAxis::Horizontal => {
+            let first_w = rect.w / 2;
+            let second_w = rect.w - first_w;
+            (
+                LayoutRect { w: first_w, ..rect },
+                LayoutRect {
+                    x: rect.x + first_w,
+                    w: second_w,
+                    ..rect
+                },
+            )
+        }
+        LayoutAxis::Vertical => {
+            let first_h = rect.h / 2;
+            let second_h = rect.h - first_h;
+            (
+                LayoutRect { h: first_h, ..rect },
+                LayoutRect {
+                    y: rect.y + first_h,
+                    h: second_h,
+                    ..rect
+                },
+            )
         }
     }
 }
@@ -157,12 +446,12 @@ impl Default for LayoutKeymap {
                     action: LayoutAction::ToggleManagedFullscreen,
                 },
                 LayoutKeyBinding {
-                    key: Keycode::new(38),
+                    key: Keycode::new(46),
                     ctrl: false,
                     action: LayoutAction::SplitActiveRight,
                 },
                 LayoutKeyBinding {
-                    key: Keycode::new(44),
+                    key: Keycode::new(43),
                     ctrl: true,
                     action: LayoutAction::SplitActiveDown,
                 },
@@ -228,8 +517,87 @@ mod tests {
             Some(LayoutAction::FocusNext)
         );
         assert_eq!(
-            keymap.action_for_key(Keycode::new(44), true),
+            keymap.action_for_key(Keycode::new(43), true),
             Some(LayoutAction::SplitActiveDown)
+        );
+    }
+
+    #[test]
+    fn split_active_creates_placeholder_region() {
+        let mut layout = super::LayoutState::default();
+
+        assert!(layout.split_active(super::LayoutAxis::Horizontal));
+        let regions = layout.resolve(super::LayoutSize { w: 100, h: 80 });
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].rect.w, 50);
+        assert!(regions[0].active);
+        assert_eq!(regions[1].kind, super::LayoutLeafKind::Placeholder);
+        assert_eq!(layout.region_count(), 2);
+        assert_eq!(layout.placeholder_count(), 1);
+    }
+
+    #[test]
+    fn focus_moves_between_client_and_placeholder_regions() {
+        let mut layout = super::LayoutState::default();
+        layout.split_active(super::LayoutAxis::Horizontal);
+
+        assert_eq!(layout.active_kind(), Some(super::LayoutLeafKind::Client));
+        assert!(layout.focus_next());
+        assert_eq!(
+            layout.active_kind(),
+            Some(super::LayoutLeafKind::Placeholder)
+        );
+        assert!(layout.focus_previous());
+        assert_eq!(layout.active_kind(), Some(super::LayoutLeafKind::Client));
+    }
+
+    #[test]
+    fn client_rect_stays_with_client_when_placeholder_is_focused() {
+        let mut layout = super::LayoutState::default();
+        layout.split_active(super::LayoutAxis::Horizontal);
+        let size = super::LayoutSize { w: 100, h: 80 };
+        let client_rect = layout
+            .resolve(size)
+            .into_iter()
+            .find(|region| region.kind == super::LayoutLeafKind::Client)
+            .map(|region| region.rect);
+
+        assert!(layout.focus_next());
+        assert_eq!(
+            layout.active_kind(),
+            Some(super::LayoutLeafKind::Placeholder)
+        );
+        assert_eq!(
+            layout
+                .resolve(size)
+                .into_iter()
+                .find(|region| region.kind == super::LayoutLeafKind::Client)
+                .map(|region| region.rect),
+            client_rect
+        );
+        assert_ne!(layout.active_rect(size), client_rect);
+    }
+
+    #[test]
+    fn occupying_active_placeholder_turns_it_into_client_region() {
+        let mut layout = super::LayoutState::default();
+        layout.split_active(super::LayoutAxis::Horizontal);
+        assert!(layout.focus_next());
+
+        let occupied_leaf = layout.occupy_active_leaf();
+        let regions = layout.resolve(super::LayoutSize { w: 100, h: 80 });
+
+        assert_eq!(occupied_leaf, Some(layout.active_leaf()));
+        assert_eq!(layout.active_kind(), Some(super::LayoutLeafKind::Client));
+        assert_eq!(layout.placeholder_count(), 0);
+        assert_eq!(regions.iter().filter(|region| region.active).count(), 1);
+        assert_eq!(
+            regions
+                .iter()
+                .filter(|region| region.kind == super::LayoutLeafKind::Client)
+                .count(),
+            2
         );
     }
 }

@@ -42,7 +42,9 @@ use tracing::{info, warn};
 
 use crate::{
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
-    layout::{LayoutAction, LayoutState},
+    layout::{
+        LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
+    },
     wasm_key::WasmKeyHandler,
 };
 
@@ -102,6 +104,7 @@ pub struct Manifold {
     next_window_slot: usize,
     last_window_count: usize,
     active_toplevel_surface: Option<WlSurface>,
+    window_layout_leaves: Vec<(WlSurface, LayoutLeafId)>,
     pub(crate) ctrl_pressed: bool,
     pub(crate) ctrl_forwarded_to_client: bool,
     pub(crate) suppress_mode_toggle_key_release: bool,
@@ -170,6 +173,7 @@ impl Manifold {
             next_window_slot: 0,
             last_window_count: 0,
             active_toplevel_surface: None,
+            window_layout_leaves: Vec::new(),
             ctrl_pressed: false,
             ctrl_forwarded_to_client: false,
             suppress_mode_toggle_key_release: false,
@@ -330,9 +334,17 @@ impl Manifold {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+            return None;
+        }
+        let rect = self.active_layout_rect()?;
+        if !rect.contains_f64(pos.x, pos.y) {
+            return None;
+        }
+        let local_pos = Point::from((pos.x - f64::from(rect.x), pos.y - f64::from(rect.y)));
         self.active_window().and_then(|window| {
             window
-                .surface_under(pos, WindowSurfaceType::ALL)
+                .surface_under(local_pos, WindowSurfaceType::ALL)
                 .map(|(surface, point)| (surface, point.to_f64()))
         })
     }
@@ -360,15 +372,19 @@ impl Manifold {
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
+        let client_leaf_active = self.layout.active_kind() == Some(LayoutLeafKind::Client);
         self.space.elements().for_each(|window| {
             let Some(toplevel) = window.toplevel() else {
                 return;
             };
-            let is_active = active_surface == Some(toplevel.wl_surface());
-            let size = self.presentation_size();
+            let client_size = self.window_layout_rect(window).map_or_else(
+                || self.presentation_size(),
+                |rect| (rect.w.max(1), rect.h.max(1)),
+            );
+            let is_active = client_leaf_active && active_surface == Some(toplevel.wl_surface());
             toplevel.with_pending_state(|state| {
-                state.size = Some(size.into());
-                state.bounds = Some(size.into());
+                state.size = Some(client_size.into());
+                state.bounds = Some(client_size.into());
                 if self.managed_fullscreen {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                     state.states.unset(xdg_toplevel::State::Maximized);
@@ -399,14 +415,57 @@ impl Manifold {
         self.reconfigure_focus_stack();
     }
 
+    pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) {
+        let leaf = if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
+            self.layout.occupy_active_leaf()
+        } else {
+            Some(self.layout.active_leaf())
+        };
+        if let Some(leaf) = leaf {
+            self.window_layout_leaves.push((surface.clone(), leaf));
+        }
+    }
+
+    pub fn window_layout_rect(&self, window: &Window) -> Option<LayoutRect> {
+        let surface = Manifold::window_toplevel_surface(window)?;
+        let leaf = self
+            .window_layout_leaves
+            .iter()
+            .rev()
+            .find_map(|(assigned_surface, leaf)| (assigned_surface == &surface).then_some(*leaf))?;
+        self.layout.leaf_rect(leaf, self.presentation_layout_size())
+    }
+
+    fn surface_for_layout_leaf(&self, target_leaf: LayoutLeafId) -> Option<WlSurface> {
+        self.window_layout_leaves
+            .iter()
+            .rev()
+            .find_map(|(surface, leaf)| (*leaf == target_leaf).then(|| surface.clone()))
+    }
+
+    fn focus_active_layout_leaf(&mut self) {
+        let active_surface = if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
+            self.surface_for_layout_leaf(self.layout.active_leaf())
+        } else {
+            None
+        };
+        self.focus_toplevel_surface(active_surface);
+        self.reconfigure_focus_stack();
+    }
+
     pub fn focus_toplevel_surface(&mut self, active_surface: Option<WlSurface>) {
         self.active_toplevel_surface = active_surface.clone();
         self.activate_window_exclusively(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
+        let keyboard_focus = if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
+            active_surface
+        } else {
+            None
+        };
         self.seat
             .get_keyboard()
             .expect("keyboard")
-            .set_focus(self, active_surface, serial);
+            .set_focus(self, keyboard_focus, serial);
     }
 
     pub fn active_window(&self) -> Option<Window> {
@@ -449,6 +508,9 @@ impl Manifold {
     }
 
     pub fn focused_window_index(&self) -> Option<usize> {
+        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+            return None;
+        }
         let active = self.active_toplevel_surface.as_ref()?;
         self.space
             .elements()
@@ -456,10 +518,16 @@ impl Manifold {
     }
 
     pub fn focused_window_count(&self) -> usize {
-        usize::from(self.active_window().is_some())
+        usize::from(
+            self.layout.active_kind() == Some(LayoutLeafKind::Client)
+                && self.active_window().is_some(),
+        )
     }
 
     pub fn focused_surface_id(&self) -> Option<String> {
+        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+            return None;
+        }
         self.active_toplevel_surface.as_ref().map(|surface| {
             crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()))
         })
@@ -468,8 +536,21 @@ impl Manifold {
     pub fn reconfigure_focus_stack(&mut self) {
         let windows = self.space.elements().cloned().collect::<Vec<_>>();
         for window in &windows {
-            self.space
-                .map_element(window.clone(), focus_stack_location(0), false);
+            let location = self.window_layout_rect(window).map_or_else(
+                || focus_stack_location(0),
+                |rect| Point::from((rect.x, rect.y)),
+            );
+            self.space.map_element(window.clone(), location, false);
+        }
+        if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
+            self.focus_toplevel_surface(None);
+            return;
+        }
+        if self.active_window().is_none() {
+            let active_leaf_surface = self.surface_for_layout_leaf(self.layout.active_leaf());
+            if active_leaf_surface.is_some() {
+                self.focus_toplevel_surface(active_leaf_surface);
+            }
         }
         if let Some(active_window) = self.active_window() {
             self.space.raise_element(&active_window, true);
@@ -501,16 +582,42 @@ impl Manifold {
 
     pub fn apply_layout_action(&mut self, action: LayoutAction) -> bool {
         match action {
-            LayoutAction::FocusNext => self.cycle_focus(FocusDirection::Next),
-            LayoutAction::FocusPrevious => self.cycle_focus(FocusDirection::Previous),
+            LayoutAction::FocusNext => {
+                if self.layout.focus_next() {
+                    self.focus_active_layout_leaf();
+                    true
+                } else {
+                    self.cycle_focus(FocusDirection::Next)
+                }
+            }
+            LayoutAction::FocusPrevious => {
+                if self.layout.focus_previous() {
+                    self.focus_active_layout_leaf();
+                    true
+                } else {
+                    self.cycle_focus(FocusDirection::Previous)
+                }
+            }
             LayoutAction::CloseActivePane => self.close_active_window(),
             LayoutAction::ToggleManagedFullscreen => {
                 self.toggle_managed_fullscreen();
                 true
             }
-            LayoutAction::SplitActiveRight
-            | LayoutAction::SplitActiveDown
-            | LayoutAction::JoinActivePane
+            LayoutAction::SplitActiveRight => {
+                let changed = self.layout.split_active(LayoutAxis::Horizontal);
+                if changed {
+                    self.reconfigure_focus_stack();
+                }
+                changed
+            }
+            LayoutAction::SplitActiveDown => {
+                let changed = self.layout.split_active(LayoutAxis::Vertical);
+                if changed {
+                    self.reconfigure_focus_stack();
+                }
+                changed
+            }
+            LayoutAction::JoinActivePane
             | LayoutAction::MoveActiveToLeftDock
             | LayoutAction::MoveActiveToRightDock
             | LayoutAction::MoveActiveToBottomDock
@@ -587,6 +694,8 @@ impl Manifold {
                     .map(|toplevel| toplevel.wl_surface().clone())
             })
             .collect::<Vec<_>>();
+        self.window_layout_leaves
+            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         let window_count = live_toplevel_surfaces.len();
 
         let keyboard = self.seat.get_keyboard().expect("keyboard");
@@ -622,6 +731,15 @@ impl Manifold {
             .map_or((1280, 800), |geometry| {
                 (geometry.size.w.max(1), geometry.size.h.max(1))
             })
+    }
+
+    pub fn presentation_layout_size(&self) -> LayoutSize {
+        let (w, h) = self.presentation_size();
+        LayoutSize { w, h }
+    }
+
+    pub fn active_layout_rect(&self) -> Option<LayoutRect> {
+        self.layout.active_rect(self.presentation_layout_size())
     }
 }
 

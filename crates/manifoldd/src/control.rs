@@ -108,7 +108,7 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
             let snapshot = StatusSnapshot::from_state(state);
             writeln!(
                 stream,
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -123,6 +123,10 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 snapshot.focused_surface_id,
                 snapshot.input_mode,
                 snapshot.managed_fullscreen,
+                snapshot.layout_regions,
+                snapshot.layout_placeholders,
+                snapshot.layout_active_kind,
+                snapshot.layout_active_rect,
                 snapshot.browsers,
                 snapshot.frames,
                 snapshot.client_frame_callbacks,
@@ -275,6 +279,10 @@ struct StatusSnapshot {
     focused_surface_id: String,
     input_mode: &'static str,
     managed_fullscreen: bool,
+    layout_regions: usize,
+    layout_placeholders: usize,
+    layout_active_kind: &'static str,
+    layout_active_rect: String,
     browsers: usize,
     frames: u64,
     client_frame_callbacks: u64,
@@ -401,6 +409,10 @@ impl StatusSnapshot {
             .dmabuf
             .explicit_sync_protocol_version
             .map_or_else(|| "none".to_string(), |version| format!("v{version}"));
+        let layout_active_rect = state.active_layout_rect().map_or_else(
+            || "none".to_string(),
+            |rect| format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h),
+        );
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
@@ -429,6 +441,14 @@ impl StatusSnapshot {
                 crate::state::InputMode::Normal => "normal",
             },
             managed_fullscreen: state.managed_fullscreen(),
+            layout_regions: state.layout.region_count(),
+            layout_placeholders: state.layout.placeholder_count(),
+            layout_active_kind: match state.layout.active_kind() {
+                Some(crate::layout::LayoutLeafKind::Client) => "client",
+                Some(crate::layout::LayoutLeafKind::Placeholder) => "placeholder",
+                None => "none",
+            },
+            layout_active_rect,
             browsers: state.browsers.len(),
             frames: state.stats.frames_rendered,
             client_frame_callbacks: state.stats.client_frame_callbacks,

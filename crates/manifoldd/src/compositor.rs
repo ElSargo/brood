@@ -367,6 +367,9 @@ impl XdgShellHandler for Manifold {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
         let active_surface = Manifold::window_toplevel_surface(&window);
+        if let Some(surface) = active_surface.as_ref() {
+            self.assign_new_toplevel_surface(surface);
+        }
         let location = self.allocate_toplevel_location();
         self.space.map_element(window, location, true);
         self.record_window_mapped();

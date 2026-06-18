@@ -15,8 +15,13 @@ use smithay::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
-            ImportDma, ImportEgl, damage::OutputDamageTracker,
-            element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer,
+            ImportDma, ImportEgl,
+            damage::OutputDamageTracker,
+            element::{
+                Kind,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
+            },
+            gles::GlesRenderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
@@ -30,7 +35,7 @@ use smithay::{
         winit::{dpi::LogicalSize, window::WindowAttributes},
     },
     utils::DeviceFd,
-    utils::{Rectangle, Transform},
+    utils::{Point, Rectangle, Transform},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -38,7 +43,10 @@ use smithay::{
 };
 use tracing::{info, warn};
 
-use crate::state::{Manifold, PresentationStatus};
+use crate::{
+    layout::{LayoutLeafKind, LayoutRect},
+    state::{Manifold, PresentationStatus},
+};
 
 struct Presenter {
     backend: Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>,
@@ -259,30 +267,34 @@ fn render_presenter_frame(
     let mut damage_tracker = presenter.damage_tracker.borrow_mut();
     let size = backend.window_size();
     let damage = Rectangle::from_size(size);
-    let active_window = state.active_window();
     let mut render_space = Space::default();
-    if let Some(window) = active_window.clone() {
-        render_space.map_output(&output, (0, 0));
-        render_space.map_element(window, (0, 0), true);
+    render_space.map_output(&output, (0, 0));
+    for window in state.space.elements() {
+        let loc = state
+            .window_layout_rect(window)
+            .map_or((0, 0), |rect| (rect.x, rect.y));
+        render_space.map_element(window.clone(), loc, true);
     }
+    if let Some(active_window) = state.active_window() {
+        let loc = state
+            .window_layout_rect(&active_window)
+            .map_or((0, 0), |rect| (rect.x, rect.y));
+        render_space.map_element(active_window, loc, true);
+    }
+    let chrome_elements = layout_chrome_elements(state);
 
     {
         let (renderer, mut framebuffer) = backend
             .bind()
             .map_err(|err| PresentationRuntimeFailure::new("bind_winit_backend", err))?;
-        smithay::desktop::space::render_output::<
-            _,
-            WaylandSurfaceRenderElement<GlesRenderer>,
-            _,
-            _,
-        >(
+        smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
             &output,
             renderer,
             &mut framebuffer,
             1.0,
             0,
             [&render_space],
-            &[],
+            &chrome_elements,
             &mut damage_tracker,
             [0.02, 0.02, 0.025, 1.0],
         )
@@ -301,6 +313,94 @@ fn render_presenter_frame(
 
     backend.window().request_redraw();
     Ok(())
+}
+
+fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
+    const PLACEHOLDER_FILL: [f32; 4] = [0.08, 0.12, 0.15, 0.92];
+    const PLACEHOLDER_INSET: [f32; 4] = [0.12, 0.18, 0.22, 0.86];
+    const BORDER: [f32; 4] = [0.22, 0.30, 0.36, 1.0];
+    const ACTIVE_BORDER: [f32; 4] = [0.36, 0.64, 0.78, 1.0];
+
+    let mut elements = Vec::new();
+    for region in state.layout.resolve(state.presentation_layout_size()) {
+        if region.kind == LayoutLeafKind::Placeholder {
+            push_rect(&mut elements, inset(region.rect, 10), PLACEHOLDER_FILL);
+            push_rect(&mut elements, inset(region.rect, 18), PLACEHOLDER_INSET);
+        }
+
+        let color = if region.active { ACTIVE_BORDER } else { BORDER };
+        push_border(&mut elements, region.rect, 1, color);
+    }
+    elements
+}
+
+fn push_border(
+    elements: &mut Vec<SolidColorRenderElement>,
+    rect: LayoutRect,
+    thickness: i32,
+    color: [f32; 4],
+) {
+    let thickness = thickness.max(1);
+    push_rect(
+        elements,
+        LayoutRect {
+            h: thickness,
+            ..rect
+        },
+        color,
+    );
+    push_rect(
+        elements,
+        LayoutRect {
+            y: rect.y + rect.h - thickness,
+            h: thickness,
+            ..rect
+        },
+        color,
+    );
+    push_rect(
+        elements,
+        LayoutRect {
+            w: thickness,
+            ..rect
+        },
+        color,
+    );
+    push_rect(
+        elements,
+        LayoutRect {
+            x: rect.x + rect.w - thickness,
+            w: thickness,
+            ..rect
+        },
+        color,
+    );
+}
+
+fn inset(rect: LayoutRect, amount: i32) -> LayoutRect {
+    let amount = amount.max(0);
+    let max_inset = (rect.w / 2).min(rect.h / 2).saturating_sub(1);
+    let amount = amount.min(max_inset);
+    LayoutRect {
+        x: rect.x + amount,
+        y: rect.y + amount,
+        w: rect.w - amount * 2,
+        h: rect.h - amount * 2,
+    }
+}
+
+fn push_rect(elements: &mut Vec<SolidColorRenderElement>, rect: LayoutRect, color: [f32; 4]) {
+    if rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    let buffer = SolidColorBuffer::new((rect.w, rect.h), color);
+    elements.push(SolidColorRenderElement::from_buffer(
+        &buffer,
+        Point::from((rect.x, rect.y)),
+        1.0,
+        1.0,
+        Kind::Unspecified,
+    ));
 }
 
 fn send_active_client_frame_callbacks(presenter: &Rc<Presenter>, state: &mut Manifold) -> u64 {

@@ -13,7 +13,7 @@ use smithay::{
 use tracing::warn;
 
 use crate::{
-    layout::LayoutKeymap,
+    layout::{LayoutKeymap, LayoutLeafKind},
     state::{InputMode, Manifold, PresentationStatus},
 };
 
@@ -226,17 +226,32 @@ impl Manifold {
         let pointer = self.seat.get_pointer().expect("pointer");
         let keyboard = self.seat.get_keyboard().expect("keyboard");
         let serial = SERIAL_COUNTER.next_serial();
+        let active_rect = self.active_layout_rect();
         let target_window: Option<(smithay::desktop::Window, Point<i32, Logical>)> = self
             .active_window()
             .filter(|window| {
+                if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+                    return false;
+                }
+                let Some(rect) = active_rect else {
+                    return false;
+                };
+                let pointer_location = pointer.current_location();
+                if !rect.contains_f64(pointer_location.x, pointer_location.y) {
+                    return false;
+                }
+                let local_location = Point::from((
+                    pointer_location.x - f64::from(rect.x),
+                    pointer_location.y - f64::from(rect.y),
+                ));
                 window
-                    .surface_under(
-                        pointer.current_location(),
-                        smithay::desktop::WindowSurfaceType::ALL,
-                    )
+                    .surface_under(local_location, smithay::desktop::WindowSurfaceType::ALL)
                     .is_some()
             })
-            .map(|window| (window, Point::<i32, Logical>::from((0, 0))));
+            .map(|window| {
+                let loc = active_rect.map_or((0, 0), |rect| (rect.x, rect.y));
+                (window, Point::<i32, Logical>::from(loc))
+            });
         self.stats.record_input(
             self.presentation == PresentationStatus::Attached && target_window.is_some(),
         );
