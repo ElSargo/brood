@@ -46,12 +46,18 @@ use crate::{
     browser::BrowserLaunchOptions,
     control, presentation,
     state::{ClientState, Manifold, PresentationStatus},
+    wasm_key::WasmKeyHandler,
 };
 
 pub fn run(args: RunArgs) -> Result<()> {
     let mut event_loop: EventLoop<'static, Manifold> = EventLoop::try_new()?;
     let display: Display<Manifold> = Display::new()?;
     let mut state = Manifold::new(&mut event_loop, display);
+
+    if let Some(path) = args.wasm_key_handler.as_deref() {
+        state.wasm_key_handler = Some(WasmKeyHandler::load(path)?);
+        info!(path = %path.display(), "loaded WASM key handler");
+    }
 
     control::listen(&mut event_loop, &args.control_socket)?;
 

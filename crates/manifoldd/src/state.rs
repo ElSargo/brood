@@ -40,7 +40,10 @@ use smithay::{
 };
 use tracing::{info, warn};
 
-use crate::browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager};
+use crate::{
+    browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
+    wasm_key::WasmKeyHandler,
+};
 
 #[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
@@ -104,6 +107,7 @@ pub struct Manifold {
     managed_fullscreen: bool,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
+    pub(crate) wasm_key_handler: Option<WasmKeyHandler>,
 }
 
 impl Manifold {
@@ -170,6 +174,7 @@ impl Manifold {
             managed_fullscreen: false,
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
+            wasm_key_handler: None,
         }
     }
 

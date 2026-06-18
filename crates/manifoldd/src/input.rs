@@ -132,6 +132,28 @@ impl Manifold {
     }
 
     fn handle_normal_mode_key(&mut self, key_code: Keycode) {
+        if let Some(result) = self.wasm_key_handler.as_mut().map(|handler| {
+            handler.handle_key(
+                key_code,
+                KeyState::Pressed,
+                self.input_mode,
+                self.ctrl_pressed,
+            )
+        }) {
+            match result {
+                Ok(outcome) => {
+                    outcome.apply(self);
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "WASM normal-mode key handler failed; using built-in fallback"
+                    );
+                }
+            }
+        }
+
         match key_code {
             KEY_J => {
                 self.cycle_focus(FocusDirection::Next);

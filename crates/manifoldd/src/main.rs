@@ -4,6 +4,7 @@ mod control;
 mod input;
 mod presentation;
 mod state;
+mod wasm_key;
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -43,6 +44,9 @@ struct RunArgs {
     /// Launch an isolated Chromium browser pane at startup.
     #[arg(long = "browser", value_name = "URL", num_args = 0..=1, default_missing_value = "about:blank")]
     browser: Option<String>,
+    /// Load a core-WASM normal-mode key handler.
+    #[arg(long = "wasm-key-handler", value_name = "PATH")]
+    wasm_key_handler: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]

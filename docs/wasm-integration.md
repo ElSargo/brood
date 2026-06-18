@@ -32,6 +32,8 @@ This means the first useful milestone is not the WASM runtime itself. The first 
 
 The runtime then becomes an adapter over this model. Linux-native `manifoldd` can host the runtime in-process at first. Future WSLg work can satisfy the same behavior through a protocol-facing session process or another backend-specific adapter.
 
+The execution model is recorded in [WASM Execution Model](wasm-execution-model.md). In short, Manifold should keep calloop as the authoritative session/compositor loop, run ordinary plugin work in a separate async lane, and reserve a synchronous fast lane for bounded pre-commit policy hooks.
+
 This boundary is recorded in [ADR 0005](decisions/0005-wasm-through-workspace-api.md).
 
 ## Module Roles
@@ -151,6 +153,8 @@ Examples:
 
 Event delivery should have backpressure and diagnostics. Slow modules should be visible in status output and logs.
 
+Event delivery belongs to the async lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded fast lane described in [WASM Execution Model](wasm-execution-model.md).
+
 ### Scene Store
 
 The scene store holds retained semantic scene state for WASM pane apps and other scene-producing systems.
@@ -173,6 +177,8 @@ The initial API should be intentionally small:
 - `init`
 - `update(event) -> list<requested-command>`
 - `render() -> scene-patch`
+
+The first concrete command/API spike is documented in [WASM API Prototype](wasm-api-prototype.md). It should prove, in order, workspace navigation, running managed apps, and keyboard shortcut registration/dispatch. Those operations already exist in the native prototype as focus movement, hosted app spawning, presentation attach/detach, and normal-mode key handling, so they are the lowest-risk way to exercise the WASM host boundary.
 
 Candidate WIT packages:
 
