@@ -34,6 +34,8 @@ The runtime then becomes an adapter over this model. Linux-native `manifoldd` ca
 
 The execution model is recorded in [WASM Execution Model](wasm-execution-model.md). In short, Manifold should keep calloop as the authoritative session/compositor loop, run ordinary plugin work in a separate async lane, and reserve a synchronous fast lane for bounded pre-commit policy hooks.
 
+The layout policy boundary is recorded in [Layout Mould](layout-mould.md). In short, WASM may produce or transform logical layout data, while the native host renders, hit-tests, validates constraints, and owns fallback behavior.
+
 This boundary is recorded in [ADR 0005](decisions/0005-wasm-through-workspace-api.md).
 
 ## Module Roles

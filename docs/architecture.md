@@ -53,6 +53,8 @@ WASM modules should interact with Manifold through a stable workspace/app API ra
 
 See [WASM Integration](wasm-integration.md) for the planned host boundary, module roles, hot reload workflow, and milestones.
 
+See [Layout Mould](layout-mould.md) for the planned split between reloadable layout policy and native presentation rendering.
+
 ## MVP Data Flow
 
 1. Hosted Wayland apps connect to the nested Wayland compositor owned by `manifoldd`.
