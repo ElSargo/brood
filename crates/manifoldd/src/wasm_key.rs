@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use smithay::backend::input::{KeyState, Keycode};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
-use crate::state::{FocusDirection, InputMode, Manifold};
+use crate::{
+    layout::LayoutAction,
+    state::{InputMode, Manifold},
+};
 
 const ABI_KEY_RELEASED: i32 = 0;
 const ABI_KEY_PRESSED: i32 = 1;
@@ -14,9 +17,7 @@ const MAX_SPAWN_COMMAND_BYTES: usize = 4096;
 
 #[derive(Debug)]
 enum WasmKeyCommand {
-    Focus(FocusDirection),
-    ToggleFullscreen,
-    CloseActiveWindow,
+    Layout(LayoutAction),
     SpawnApp(Vec<String>),
 }
 
@@ -45,7 +46,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Focus(FocusDirection::Next));
+                        .push(WasmKeyCommand::Layout(LayoutAction::FocusNext));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.focus_next import: {err}"))?;
@@ -57,7 +58,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Focus(FocusDirection::Previous));
+                        .push(WasmKeyCommand::Layout(LayoutAction::FocusPrevious));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.focus_previous import: {err}"))?;
@@ -69,7 +70,9 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::ToggleFullscreen);
+                        .push(WasmKeyCommand::Layout(
+                            LayoutAction::ToggleManagedFullscreen,
+                        ));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.toggle_fullscreen import: {err}"))?;
@@ -81,10 +84,27 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::CloseActiveWindow);
+                        .push(WasmKeyCommand::Layout(LayoutAction::CloseActivePane));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.close_active_window import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
+                "layout_action",
+                |mut caller: Caller<'_, WasmKeyStore>, action: i32| -> i32 {
+                    let Some(action) = LayoutAction::from_abi(action) else {
+                        tracing::warn!(action, "WASM key handler requested unknown layout action");
+                        return 0;
+                    };
+                    caller
+                        .data_mut()
+                        .pending_commands
+                        .push(WasmKeyCommand::Layout(action));
+                    1
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("define manifold.layout_action import: {err}"))?;
         linker
             .func_wrap(
                 "manifold",
@@ -168,14 +188,8 @@ impl WasmKeyOutcome {
     pub fn apply(self, state: &mut Manifold) -> bool {
         for command in self.commands {
             match command {
-                WasmKeyCommand::Focus(direction) => {
-                    state.cycle_focus(direction);
-                }
-                WasmKeyCommand::ToggleFullscreen => {
-                    state.toggle_managed_fullscreen();
-                }
-                WasmKeyCommand::CloseActiveWindow => {
-                    state.close_active_window();
+                WasmKeyCommand::Layout(action) => {
+                    state.apply_layout_action(action);
                 }
                 WasmKeyCommand::SpawnApp(argv) => {
                     if let Err(err) = state.spawn_hosted_app_argv(&argv) {

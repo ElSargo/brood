@@ -16,7 +16,14 @@ manifoldd run \
   --wasm-key-handler examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm
 ```
 
-Bindings:
+Default keymap:
 
 - `Ctrl-O`: spawn `kitty`
-- `Ctrl-Q`: close the active window
+- `Ctrl-J`: focus next pane
+- `Ctrl-K`: focus previous pane
+- `Ctrl-Q`: close the active pane
+- `Ctrl-F`: toggle managed fullscreen
+- `Ctrl-L`: split active pane right
+- `Ctrl-H`: split active pane down
+- `Ctrl-D`: toggle bottom dock
+- `Ctrl-P`: toggle left and right docks

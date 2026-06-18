@@ -3,6 +3,7 @@ mod compositor;
 mod config;
 mod control;
 mod input;
+mod layout;
 mod presentation;
 mod state;
 mod wasm_key;

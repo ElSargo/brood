@@ -12,15 +12,14 @@ use smithay::{
 };
 use tracing::warn;
 
-use crate::state::{FocusDirection, InputMode, Manifold, PresentationStatus};
+use crate::{
+    layout::LayoutKeymap,
+    state::{InputMode, Manifold, PresentationStatus},
+};
 
 const KEY_LEFTCTRL: Keycode = Keycode::new(37);
 const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
 const KEY_B: Keycode = Keycode::new(56);
-const KEY_F: Keycode = Keycode::new(41);
-const KEY_J: Keycode = Keycode::new(44);
-const KEY_K: Keycode = Keycode::new(45);
-const KEY_Q: Keycode = Keycode::new(24);
 const KEY_W: Keycode = Keycode::new(25);
 
 impl Manifold {
@@ -155,24 +154,18 @@ impl Manifold {
         }
 
         match key_code {
-            KEY_J => {
-                self.cycle_focus(FocusDirection::Next);
-            }
-            KEY_K => {
-                self.cycle_focus(FocusDirection::Previous);
-            }
-            KEY_F => {
-                self.toggle_managed_fullscreen();
-            }
-            KEY_Q => {
-                self.close_active_window();
-            }
             KEY_W => {
                 if let Err(err) = self.spawn_wezterm_pane() {
                     warn!(?err, "failed to spawn wezterm pane from normal mode");
                 }
             }
-            _ => {}
+            _ => {
+                if let Some(action) =
+                    LayoutKeymap::default().action_for_key(key_code, self.ctrl_pressed)
+                {
+                    self.apply_layout_action(action);
+                }
+            }
         }
     }
 

@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::{
     CtlArgs, browser,
+    layout::LayoutAction,
     state::{FocusDirection, Manifold},
 };
 
@@ -228,6 +229,16 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
             };
             let changed = state.cycle_focus(direction);
             writeln!(stream, "OK focus changed={changed}")?;
+        }
+        "layout-action" | "layout" => {
+            let [action] = args else {
+                bail!("layout-action requires exactly one action name");
+            };
+            let action = action
+                .parse::<LayoutAction>()
+                .with_context(|| format!("parse layout action {action:?}"))?;
+            let changed = state.apply_layout_action(action);
+            writeln!(stream, "OK layout-action action={action} changed={changed}")?;
         }
         "browser" => {
             write!(stream, "{}", browser::handle_control(args, state)?)?;

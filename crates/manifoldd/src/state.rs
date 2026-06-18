@@ -42,6 +42,7 @@ use tracing::{info, warn};
 
 use crate::{
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
+    layout::{LayoutAction, LayoutState},
     wasm_key::WasmKeyHandler,
 };
 
@@ -96,6 +97,7 @@ pub struct Manifold {
     pub attach_requested: bool,
     pub detach_requested: bool,
     pub browsers: BrowserManager,
+    pub layout: LayoutState,
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
@@ -163,6 +165,7 @@ impl Manifold {
             attach_requested: false,
             detach_requested: false,
             browsers: BrowserManager::default(),
+            layout: LayoutState::default(),
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
@@ -494,6 +497,43 @@ impl Manifold {
 
     pub fn managed_fullscreen(&self) -> bool {
         self.managed_fullscreen
+    }
+
+    pub fn apply_layout_action(&mut self, action: LayoutAction) -> bool {
+        match action {
+            LayoutAction::FocusNext => self.cycle_focus(FocusDirection::Next),
+            LayoutAction::FocusPrevious => self.cycle_focus(FocusDirection::Previous),
+            LayoutAction::CloseActivePane => self.close_active_window(),
+            LayoutAction::ToggleManagedFullscreen => {
+                self.toggle_managed_fullscreen();
+                true
+            }
+            LayoutAction::SplitActiveRight
+            | LayoutAction::SplitActiveDown
+            | LayoutAction::JoinActivePane
+            | LayoutAction::MoveActiveToLeftDock
+            | LayoutAction::MoveActiveToRightDock
+            | LayoutAction::MoveActiveToBottomDock
+            | LayoutAction::MoveActiveToCenter => {
+                warn!(
+                    ?action,
+                    "layout action accepted but not implemented by the hardcoded layout yet"
+                );
+                false
+            }
+            LayoutAction::ToggleLeftDock => {
+                self.layout.left_dock_visible = !self.layout.left_dock_visible;
+                true
+            }
+            LayoutAction::ToggleRightDock => {
+                self.layout.right_dock_visible = !self.layout.right_dock_visible;
+                true
+            }
+            LayoutAction::ToggleBottomDock => {
+                self.layout.bottom_dock_visible = !self.layout.bottom_dock_visible;
+                true
+            }
+        }
     }
 
     pub fn close_active_window(&mut self) -> bool {
