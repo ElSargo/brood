@@ -3,6 +3,7 @@ use std::{
     fmt,
     fs::OpenOptions,
     os::fd::OwnedFd,
+    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use smithay::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
+            ExportMem,
             ImportDma, ImportEgl,
             damage::OutputDamageTracker,
             element::{
@@ -25,6 +27,7 @@ use smithay::{
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
+    backend::allocator::Fourcc,
     desktop::Space,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
@@ -35,7 +38,7 @@ use smithay::{
         winit::{dpi::LogicalSize, window::WindowAttributes},
     },
     utils::DeviceFd,
-    utils::{Point, Rectangle, Transform},
+    utils::{Buffer as BufferCoords, Point, Rectangle, Transform},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -48,10 +51,10 @@ use crate::{
     state::{Manifold, PresentationStatus},
 };
 
-struct Presenter {
-    backend: Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>,
-    output: Output,
-    damage_tracker: RefCell<OutputDamageTracker>,
+pub(crate) struct PresenterHandle {
+    pub(crate) backend: Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>,
+    pub(crate) output: Output,
+    pub(crate) damage_tracker: RefCell<OutputDamageTracker>,
 }
 
 const PRESENTATION_REFRESH_MILLIHZ: i32 = 60_000;
@@ -117,11 +120,12 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
     let damage_tracker = OutputDamageTracker::from_output(&output);
     let backend = Rc::new(RefCell::new(backend));
     state.dmabuf.importer = Some(Rc::clone(&backend));
-    let presenter = Rc::new(Presenter {
+    let presenter = Rc::new(PresenterHandle {
         backend,
         output,
         damage_tracker: RefCell::new(damage_tracker),
     });
+    state.presenter = Some(Rc::clone(&presenter));
 
     state.presentation = PresentationStatus::Attached;
     state.presentation_started = true;
@@ -203,7 +207,7 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
     Ok(())
 }
 
-fn schedule_deferred_client_frame(presenter: &Rc<Presenter>, state: &mut Manifold) -> bool {
+fn schedule_deferred_client_frame(presenter: &Rc<PresenterHandle>, state: &mut Manifold) -> bool {
     if state.presentation_redraw_deferred {
         return true;
     }
@@ -258,8 +262,39 @@ fn schedule_deferred_client_frame(presenter: &Rc<Presenter>, state: &mut Manifol
 }
 
 fn render_presenter_frame(
-    presenter: &Rc<Presenter>,
+    presenter: &Rc<PresenterHandle>,
     state: &mut Manifold,
+) -> std::result::Result<(), PresentationRuntimeFailure> {
+    render_presenter_frame_with_capture(presenter, state, None)
+}
+
+pub(crate) fn dump_composed_frame(
+    state: &mut Manifold,
+    path: &Path,
+) -> std::result::Result<(), PresentationRuntimeFailure> {
+    if state.presentation != PresentationStatus::Attached {
+        return Err(PresentationRuntimeFailure {
+            context: "capture",
+            detail: "presentation_not_attached".to_string(),
+        });
+    }
+    let presenter = state
+        .presenter
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            PresentationRuntimeFailure {
+                context: "capture",
+                detail: "presentation_not_attached".to_string(),
+            }
+        })?;
+    render_presenter_frame_with_capture(&presenter, state, Some(path))
+}
+
+fn render_presenter_frame_with_capture(
+    presenter: &Rc<PresenterHandle>,
+    state: &mut Manifold,
+    capture_path: Option<&Path>,
 ) -> std::result::Result<(), PresentationRuntimeFailure> {
     let frame_started = Instant::now();
     let mut backend = presenter.backend.borrow_mut();
@@ -299,6 +334,20 @@ fn render_presenter_frame(
             [0.02, 0.02, 0.025, 1.0],
         )
         .map_err(|err| PresentationRuntimeFailure::new("render_output", err))?;
+        if let Some(path) = capture_path {
+            let mapping = renderer
+                .copy_framebuffer(
+                    &framebuffer,
+                    Rectangle::<i32, BufferCoords>::from_size((size.w, size.h).into()),
+                    Fourcc::Abgr8888,
+                )
+                .map_err(|err| PresentationRuntimeFailure::new("copy_framebuffer", err))?;
+            let copy = renderer
+                .map_texture(&mapping)
+                .map_err(|err| PresentationRuntimeFailure::new("map_texture", err))?;
+            image::save_buffer(path, copy, size.w as u32, size.h as u32, image::ColorType::Rgba8)
+                .map_err(|err| PresentationRuntimeFailure::new("save_buffer", err))?;
+        }
     }
     backend
         .submit(Some(&[damage]))
@@ -403,7 +452,7 @@ fn push_rect(elements: &mut Vec<SolidColorRenderElement>, rect: LayoutRect, colo
     ));
 }
 
-fn send_active_client_frame_callbacks(presenter: &Rc<Presenter>, state: &mut Manifold) -> u64 {
+fn send_active_client_frame_callbacks(presenter: &Rc<PresenterHandle>, state: &mut Manifold) -> u64 {
     let output = presenter.output.clone();
     let active_window = state.active_window();
     let mut client_frame_callbacks = 0;
@@ -635,7 +684,7 @@ fn explicit_sync_disabled_reason_for(advertisement: DmabufAdvertisement) -> &'st
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PresentationRuntimeFailure {
+pub(crate) struct PresentationRuntimeFailure {
     context: &'static str,
     detail: String,
 }
@@ -681,7 +730,7 @@ pub(crate) fn sanitize_status_value(value: &str) -> String {
         .collect()
 }
 
-fn apply_pending_attach_state(presenter: &Rc<Presenter>, state: &mut Manifold) {
+fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manifold) {
     if state.detach_requested {
         state.detach_requested = false;
         presenter.backend.borrow().window().set_visible(false);

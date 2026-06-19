@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::{
     CtlArgs, browser,
+    debug_dump::{self, DumpOptions},
     layout::LayoutAction,
     state::{FocusDirection, Manifold},
 };
@@ -84,30 +85,49 @@ pub fn send(args: CtlArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn execute_json_command(input: &str, state: &mut Manifold) -> Result<String> {
+    let tokens = parse_command_tokens(input.trim())?;
+    execute_tokens(&tokens, state)
+}
+
+pub fn status_json_string(state: &mut Manifold) -> Result<String> {
+    let snapshot = StatusSnapshot::from_state(state);
+    serde_json::to_string(&snapshot.to_json()).context("serialize status snapshot")
+}
+
 fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
     let input = read_command_line(stream)?;
-    let tokens = parse_command_tokens(input.trim())?;
+    let response = execute_json_command(&input, state)?;
+    write!(stream, "{response}")?;
+
+    if let Err(err) = state.display_handle.flush_clients() {
+        warn!(?err, "flush clients after control command failed");
+    }
+
+    Ok(())
+}
+
+fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
     let Some((command, args)) = tokens.split_first() else {
         bail!("empty control command");
     };
 
-    match command.as_str() {
+    let response = match command.as_str() {
         "attach" if args.is_empty() => {
             state.request_attach();
-            writeln!(stream, "OK attach requested")?;
+            "OK attach requested\n".to_string()
         }
         "detach" if args.is_empty() => {
             state.request_detach();
-            writeln!(stream, "OK detach requested")?;
+            "OK detach requested\n".to_string()
         }
         "close-frontend" | "frontend-close" if args.is_empty() => {
             state.request_detach();
-            writeln!(stream, "OK frontend close requested")?;
+            "OK frontend close requested\n".to_string()
         }
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
-            writeln!(
-                stream,
+            format!(
                 "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
@@ -204,26 +224,24 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 snapshot.render_node,
                 snapshot.explicit_sync,
                 snapshot.explicit_sync_disabled
-            )?;
+            ) + "\n"
         }
         "status-json" if args.is_empty() => {
-            let snapshot = StatusSnapshot::from_state(state);
-            writeln!(stream, "{}", snapshot.to_json())?;
+            format!("{}\n", status_json_string(state)?)
         }
         "quit" if args.is_empty() => {
             let closed_browsers = state.browsers.close_all().len();
             state.loop_signal.stop();
-            writeln!(
-                stream,
+            format!(
                 "OK quit requested browsers_closed={closed_browsers}"
-            )?;
+            ) + "\n"
         }
         "spawn" => {
             if args.is_empty() {
                 bail!("spawn requires a command");
             }
             state.spawn_hosted_app_argv(args)?;
-            writeln!(stream, "OK spawned {}", args.join(" "))?;
+            format!("OK spawned {}\n", args.join(" "))
         }
         "focus" => {
             let direction = match args {
@@ -232,7 +250,7 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 _ => bail!("focus requires next or prev"),
             };
             let changed = state.cycle_focus(direction);
-            writeln!(stream, "OK focus changed={changed}")?;
+            format!("OK focus changed={changed}\n")
         }
         "layout-action" | "layout" => {
             let [action] = args else {
@@ -242,23 +260,39 @@ fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
                 .parse::<LayoutAction>()
                 .with_context(|| format!("parse layout action {action:?}"))?;
             let changed = state.apply_layout_action(action);
-            writeln!(stream, "OK layout-action action={action} changed={changed}")?;
+            format!("OK layout-action action={action} changed={changed}\n")
         }
-        "browser" => {
-            write!(stream, "{}", browser::handle_control(args, state)?)?;
-        }
+        "browser" => browser::handle_control(args, state)?,
+        "harness" => match args {
+            [subcommand, name] if subcommand == "signal" => {
+                state.signal_test_harness(name.clone())?;
+                format!("OK harness signal {}\n", name)
+            }
+            _ => bail!("usage: harness signal <name>"),
+        },
+        "debug" => match args {
+            [subcommand, dir] if subcommand == "dump" => {
+                let manifest = debug_dump::dump_bundle(state, Path::new(dir), DumpOptions::parse(None)?)?;
+                format!("OK debug dump {}\n", manifest)
+            }
+            [subcommand, dir, selectors] if subcommand == "dump" => {
+                let manifest = debug_dump::dump_bundle(
+                    state,
+                    Path::new(dir),
+                    DumpOptions::parse(Some(selectors))?,
+                )?;
+                format!("OK debug dump {}\n", manifest)
+            }
+            _ => bail!("usage: debug dump <dir> [state,composed,surfaces]"),
+        },
         "inject" => {
             handle_inject(args, state)?;
-            writeln!(stream, "OK injected {}", args.join(" "))?;
+            format!("OK injected {}\n", args.join(" "))
         }
         _ => bail!("unknown command: {}", tokens.join(" ")),
-    }
+    };
 
-    if let Err(err) = state.display_handle.flush_clients() {
-        warn!(?err, "flush clients after control command failed");
-    }
-
-    Ok(())
+    Ok(response)
 }
 
 #[derive(serde::Serialize)]

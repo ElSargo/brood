@@ -47,6 +47,7 @@ use crate::{
     config, control, presentation,
     state::{ClientState, Manifold, PresentationStatus},
     wasm_key::WasmKeyHandler,
+    wasm_test::TestHarnessRuntime,
 };
 
 pub fn run(args: RunArgs) -> Result<()> {
@@ -61,6 +62,11 @@ pub fn run(args: RunArgs) -> Result<()> {
     if let Some(path) = args.wasm_key_handler.as_deref() {
         state.wasm_key_handler = Some(WasmKeyHandler::load(path)?);
         info!(path = %path.display(), "loaded CLI WASM key handler");
+    }
+
+    if let Some(path) = args.test_harness.as_deref() {
+        state.test_harness = Some(TestHarnessRuntime::start(path)?);
+        info!(path = %path.display(), "loaded CLI test harness");
     }
 
     control::listen(&mut event_loop, &args.control_socket)?;
@@ -92,11 +98,19 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     info!("manifoldd compositor running");
     event_loop.run(None, &mut state, |state| {
+        state.service_test_harness();
         if state.attach_requested && !state.presentation_started {
             state.attach_requested = false;
             state.schedule_attach();
         }
     })?;
+
+    if let Some(completion) = state.test_harness_completion.as_ref() {
+        println!(
+            "TEST_HARNESS_RESULT kind={:?} exit_code={} detail={}",
+            completion.kind, completion.exit_code, completion.detail
+        );
+    }
 
     Ok(())
 }

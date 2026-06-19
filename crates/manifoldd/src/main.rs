@@ -2,11 +2,13 @@ mod browser;
 mod compositor;
 mod config;
 mod control;
+mod debug_dump;
 mod input;
 mod layout;
 mod presentation;
 mod state;
 mod wasm_key;
+mod wasm_test;
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -49,6 +51,9 @@ struct RunArgs {
     /// Load a core-WASM normal-mode key handler.
     #[arg(long = "wasm-key-handler", value_name = "PATH")]
     wasm_key_handler: Option<PathBuf>,
+    /// Load an async core-WASM test harness.
+    #[arg(long = "test-harness", value_name = "PATH")]
+    test_harness: Option<PathBuf>,
     /// Project/session config file to load at startup.
     #[arg(long = "config", value_name = "PATH", default_value = "manifold.toml")]
     config: PathBuf,
@@ -65,6 +70,7 @@ impl Default for RunArgs {
             headless: false,
             browser: None,
             wasm_key_handler: None,
+            test_harness: None,
             config: PathBuf::from("manifold.toml"),
             no_default_modules: false,
         }

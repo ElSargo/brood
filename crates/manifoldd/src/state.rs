@@ -45,7 +45,9 @@ use crate::{
     layout::{
         LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
     },
+    presentation::PresenterHandle,
     wasm_key::WasmKeyHandler,
+    wasm_test::{TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request},
 };
 
 #[cfg(feature = "shm-fallback")]
@@ -112,7 +114,10 @@ pub struct Manifold {
     managed_fullscreen: bool,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
+    pub(crate) presenter: Option<Rc<PresenterHandle>>,
     pub(crate) wasm_key_handler: Option<WasmKeyHandler>,
+    pub(crate) test_harness: Option<TestHarnessRuntime>,
+    pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
 }
 
 impl Manifold {
@@ -181,7 +186,10 @@ impl Manifold {
             managed_fullscreen: false,
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
+            presenter: None,
             wasm_key_handler: None,
+            test_harness: None,
+            test_harness_completion: None,
         }
     }
 
@@ -369,6 +377,52 @@ impl Manifold {
         self.dmabuf.stats.blocker_install_failures += 1;
         self.dmabuf.stats.last_blocker_error =
             Some(crate::presentation::sanitize_status_value(error));
+    }
+
+    pub fn service_test_harness(&mut self) {
+        let Some(mut harness) = self.test_harness.take() else {
+            return;
+        };
+
+        for request in harness.take_pending_requests() {
+            service_request(self, request);
+        }
+
+        if self.test_harness_completion.is_none() {
+            if let Some(completion) = harness.try_take_completion() {
+                match completion.kind {
+                    TestHarnessOutcomeKind::Passed => {
+                        info!(detail = %completion.detail, "test harness passed");
+                        self.loop_signal.stop();
+                    }
+                    TestHarnessOutcomeKind::Failed => {
+                        warn!(
+                            exit_code = completion.exit_code,
+                            detail = %completion.detail,
+                            "test harness failed"
+                        );
+                        self.loop_signal.stop();
+                    }
+                    TestHarnessOutcomeKind::Paused => {
+                        warn!(
+                            exit_code = completion.exit_code,
+                            detail = %completion.detail,
+                            "test harness paused for interactive inspection"
+                        );
+                    }
+                }
+                self.test_harness_completion = Some(completion);
+            }
+        }
+
+        self.test_harness = Some(harness);
+    }
+
+    pub fn signal_test_harness(&self, name: String) -> Result<()> {
+        let Some(harness) = self.test_harness.as_ref() else {
+            anyhow::bail!("no running test harness");
+        };
+        harness.send_signal(name)
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {

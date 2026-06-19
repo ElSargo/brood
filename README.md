@@ -33,6 +33,7 @@ The current PoC can:
 - close/detach the presentation window while hosted Wayland apps keep running
 - reattach the presentation window and resume the nested window
 - report frame cadence, input-to-frame latency, client commits, frame callbacks, dmabuf state, and explicit-sync state
+- run async core-WASM behavior harnesses through `manifoldd run --test-harness`
 
 ## Common Commands
 
@@ -73,6 +74,7 @@ Concrete choices for renderer stack, CEF integration, IPC, protocol encoding, WA
 - [Rendering](docs/rendering.md)
 - [Apps](docs/apps.md)
 - [WASM Integration](docs/wasm-integration.md)
+- [WASM Test Harness Prototype](docs/wasm-test-harness-prototype.md)
 - [Browser](docs/browser.md)
 - [Wayland](docs/wayland.md)
 - [Development Environment](docs/dev-environment.md)
