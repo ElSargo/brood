@@ -1,6 +1,6 @@
 # Architecture
 
-Manifold is organized around a workspace containing isolated sessions. The authoritative local session process can also own a presentation endpoint for the MVP.
+Manifold is organized around a product-level workspace containing isolated sessions. The authoritative local session process can also own a presentation endpoint for the MVP.
 
 The long-term architecture may split presentation into a separate endpoint process, but the first prototype keeps the session, nested Wayland compositor, and local presentation window in `manifoldd` to prove detach/reopen behavior with the fewest moving parts.
 
@@ -8,7 +8,7 @@ The long-term architecture may split presentation into a separate endpoint proce
 
 ### `manifoldd`
 
-The session process owns workspace truth:
+The session process owns durable session truth and the wider workspace-level environment around it:
 
 - sessions, session lifecycle, environment, cwd, capabilities, and producer membership
 - documents, buffers, selections, modes, commands, and pane records

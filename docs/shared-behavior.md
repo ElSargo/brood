@@ -9,7 +9,7 @@ Unless a section explicitly switches to Windows/WSLg context, references here to
 ## Principles
 
 - Manifold preserves workspace meaning above backend mechanics.
-- A workspace contains sessions; a presentation surface presents one session at a time.
+- The product-level workspace contains sessions; a presentation surface presents one session at a time.
 - Surfaces should remain GPU-resident whenever the platform can support it.
 - Presentation should add as little latency as possible between producer commits, input, and visible output.
 - Fallbacks are correctness paths, not the architecture Manifold is trying to optimize for.
@@ -17,7 +17,7 @@ Unless a section explicitly switches to Windows/WSLg context, references here to
 
 ## Workspace And Sessions
 
-The workspace is the whole managed Manifold environment. A session is an isolated collection of related panes, producer state, environment, cwd, agents, programs, and capabilities.
+The workspace is the whole managed Manifold environment at the product level. A session is the concrete durable runtime unit: an isolated collection of related panes, producer state, environment, cwd, agents, programs, and capabilities.
 
 Expected behavior:
 
@@ -32,7 +32,7 @@ Expected behavior:
 - External apps may use a session-scoped DBus proxy for desktop-style communication inside the session.
 - The session DBus proxy should not expose ambient host-wide or cross-session DBus access by default.
 - First-phase sessions use the real host/project filesystem through session cwd, environment, and granted capabilities.
-- A virtual filesystem may become useful later, but it is not required for the current workspace/session model.
+- A virtual filesystem may become useful later, but it is not required for the current workspace and session model.
 - Manifold uses power-user defaults: explicit session actions should not trigger confirmation prompts by default.
 - Prefer observable effects, logs, history, undo/recovery where practical, and opt-in guardrails over nagging confirmations.
 - Agents are same-session apps for trust and capability purposes, but their requested and performed actions should be logged inside the session for traceability.
@@ -113,7 +113,7 @@ Expected behavior:
 
 ## Session Persistence
 
-The session process owns durable workspace truth.
+The session process owns durable session truth within the wider workspace environment.
 
 Expected behavior:
 

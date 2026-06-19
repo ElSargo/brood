@@ -10,7 +10,7 @@ The current Linux prototype keeps session state, Smithay compositor state, and t
 
 WASM modules will interact with Manifold through a stable workspace/app API rather than compositor or renderer internals.
 
-The first implementation milestone should create a native workspace/session core for sessions, panes as presentation units, pane producers, focus, commands, events, scene state, and surface slots. Presentation layout, dragging, and animation belong to the presentation surface, with saved preferences stored in the workspace when needed. The WASM app host should then become an adapter over that model. Linux-native `manifoldd` can host Wasmtime in-process for fast iteration, while future WSLg work can satisfy the same behavior through a protocol-facing session process or backend-specific adapter.
+The first implementation milestone should create a native session core, with any needed workspace-level model around it, for sessions, panes as presentation units, pane producers, focus, commands, events, scene state, and surface slots. Presentation layout, dragging, and animation belong to the presentation surface, with saved preferences stored in the workspace when needed. The WASM app host should then become an adapter over that model. Linux-native `manifoldd` can host Wasmtime in-process for fast iteration, while future WSLg work can satisfy the same behavior through a protocol-facing session process or backend-specific adapter.
 
 ## Consequences
 

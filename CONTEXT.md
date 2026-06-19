@@ -5,7 +5,7 @@ Manifold is a local persistent graphical workspace that explores whether an extr
 ## Language
 
 **Workspace**:
-The whole managed Manifold environment that contains sessions, saved presentation preferences, configuration, and shared project context.
+The product-level Manifold environment: the user's virtual workspace as a whole, including sessions, saved presentation preferences, configuration, and shared project context.
 _Avoid_: single session, presentation window
 
 **Session**:
@@ -17,7 +17,7 @@ The assumption that programs, agents, and WASM apps inside the same session may 
 _Avoid_: cross-session ambient trust, internet-safe sandbox boundary
 
 **Session process**:
-The authoritative local process that owns durable workspace/session state.
+The authoritative local process that owns durable session state and the wider workspace-level environment around it.
 _Avoid_: server, daemon, display server when not discussing a protocol role
 
 **Pane**:
@@ -120,7 +120,7 @@ _Avoid_: ambient permission, unrestricted access
 
 - The current `manifoldd` binary is the MVP **session process** and also owns the MVP **presentation endpoint**.
 - A future `manifold-client` may become a separate **presentation endpoint** without owning authoritative session state.
-- A **workspace** contains one or more **sessions**.
+- A **workspace** is the product-level umbrella that contains one or more **sessions**.
 - A **session** contains related panes, producer state, environment, cwd, agents, programs, and capabilities isolated from other sessions.
 - The **session trust boundary** is the primary first-phase trust model: things in the same session are assumed to trust each other, while cross-session access requires explicit workspace-level bridging or grants.
 - **WASM pane apps** in the same **session** may communicate with each other through session APIs and capabilities.
@@ -168,3 +168,4 @@ _Avoid_: ambient permission, unrestricted access
 - "WSL path" is ambiguous. Use **WSLg-native implementation** when discussing a compositor-layer integration with WSLg, and use "WSL SHM fallback" only for the current nested `manifoldd` behavior on WSLg.
 - Unqualified "default" or "the implementation" is ambiguous across platforms. Default to the Linux-native path in general docs unless the Windows/WSLg context is explicit; on Windows-focused docs, default to the WSLg-native path instead.
 - "shared implementation" is premature. Use **shared behavior spec** when we mean common Manifold semantics across Linux and WSLg, and reserve shared code for a later decision.
+- "workspace" can be ambiguous between the product umbrella and the concrete durable runtime object. Prefer **workspace** for the product-level environment and **session** for the implementation-level durable unit unless the document is explicitly talking about both layers at once.

@@ -32,13 +32,15 @@ The integration should make behavior reloadable without redeploying WSLg or rebu
 
 WASM modules talk to Manifold through a stable workspace/app API, not through compositor internals.
 
-This means the first useful milestone is not the WASM runtime itself. The first milestone is a native workspace/session model that can represent sessions, panes, pane producers, focus, commands, events, scene state, surface slots, and presentation requests independently from the current Smithay `Space<Window>` representation. Presentation layout, dragging, and animation belong to the presentation surface, not the producer model.
+This means the first useful milestone is not the WASM runtime itself. The first milestone is a native session model, with any needed workspace-level model around it, that can represent sessions, panes, pane producers, focus, commands, events, scene state, surface slots, and presentation requests independently from the current Smithay `Space<Window>` representation. Presentation layout, dragging, and animation belong to the presentation surface, not the producer model.
 
 The runtime then becomes an adapter over this model. Linux-native `manifoldd` can host the runtime in-process at first. Future WSLg work can satisfy the same behavior through a protocol-facing session process or another backend-specific adapter.
 
 The execution model is recorded in [WASM Execution Model](wasm-execution-model.md). In short, Manifold should keep calloop as the authoritative session/compositor loop, run ordinary plugin work in a separate async lane, and reserve a synchronous fast lane for bounded pre-commit policy hooks.
 
 The layout policy boundary is recorded in [Layout Mould](layout-mould.md). In short, WASM may produce or transform logical layout data, while the native host renders, hit-tests, validates constraints, and owns fallback behavior.
+
+The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md). In short, modules should target `global`, `session`, or `surface` realms, with mostly shared host APIs plus realm-local convenience bindings and lifetimes.
 
 This boundary is recorded in [ADR 0005](decisions/0005-wasm-through-workspace-api.md).
 
@@ -122,6 +124,14 @@ Preferred direction:
 
 The exact runtime crate layout remains open until the workspace core exists.
 
+The host should also own realm instantiation:
+
+- one `global` realm contract for the session process lifetime
+- one lazy `session` realm contract per session
+- one lazy `surface` realm contract per presentation surface
+
+Modules should target one realm kind explicitly. A single module binary may then have many live instances of that realm kind, such as one build-manager instance per session.
+
 ### Capability Broker
 
 The capability broker checks every privileged host operation against both:
@@ -143,6 +153,8 @@ Capability families should start narrow:
 
 The broker should return explainable denial errors so failed experiments are easy to debug.
 
+Realm choice should not be treated as a separate hard security boundary. It primarily changes binding, lifecycle, and API ergonomics. Capability checks still apply at the operation level where Manifold needs them.
+
 ### Event Bus
 
 The event bus delivers bounded workspace and app events to controllers, pane apps, extensions, agents, and host adapters.
@@ -160,6 +172,12 @@ Examples:
 Event delivery should have backpressure and diagnostics. Slow modules should be visible in status output and logs.
 
 Event delivery belongs to the async lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded fast lane described in [WASM Execution Model](wasm-execution-model.md).
+
+Realm-local events should be easy:
+
+- global modules may observe the whole process
+- session modules observe their bound session and its child objects
+- surface modules observe their bound surface and receive explicit events when the attached session changes
 
 ### Scene Store
 
@@ -198,7 +216,60 @@ Candidate WIT packages:
 
 Same-session apps should be able to communicate directly through host-mediated session APIs. Cross-session communication should require an explicit workspace-level grant or bridge.
 
+The API should mostly be one object-addressed host surface with realm-local conveniences layered on top of it.
+
+The intended shape is:
+
+- global APIs operate on explicit ids such as `SessionId`, `SurfaceId`, and `PaneId`
+- session-realm modules get `this_session()` so they do not need to pass their own session id
+- surface-realm modules get `this_surface()` and may also get a fallible `attached_session()`
+
+Outside the bound realm object, references should be weak. Object lookups and cross-realm operations should therefore return `result` or `option` when the target may have disappeared.
+
+Panes are ordinary objects, not a separate realm kind. Modules should be free to create any number of panes when their host capabilities allow it.
+
 The Rust side can first model these as native traits and structs. Once the semantics are proven, the WIT interface should mirror the same boundary.
+
+## Realms
+
+The current target design is three realm kinds:
+
+- `global`
+- `session`
+- `surface`
+
+These are API and lifetime contracts for module instances, not replacements for the workspace and session object model and not separate trust boundaries.
+
+### Global Realm
+
+Global modules are tied to the session-process lifetime. They are suited to cross-session or background work such as brokers, registries, automation, and system-wide policy.
+
+Global modules should access sessions, surfaces, and panes explicitly by id or lookup. Because the global realm can outlive those objects, all such access must be treated as weak and fallible.
+
+### Session Realm
+
+Session modules are tied to one session and should be the default place for durable per-session behavior such as build managers, project tools, git/status apps, and session-local agents.
+
+Session modules should have implicit access to their own bound session and explicit access everywhere else. One module binary may be instantiated many times across many sessions. By default, session-targeted modules should auto-start for matching sessions and may choose to decline activation during `init`.
+
+### Surface Realm
+
+Surface modules are tied to one presentation surface and should host presentation-local behavior such as arranging panes, manipulating the current view, switching the presented session, and other surface-scoped UI actions.
+
+A surface may switch which session it presents without recreating the surface-realm instance. The instance stays alive and receives an explicit switch event. `this_surface()` remains stable for the life of the instance, while any convenience access to the currently attached session remains fallible.
+
+## Cross-Module Coordination
+
+Manifold should provide minimal built-in cross-module coordination primitives rather than forcing every interaction through a custom global broker.
+
+The initial built-ins should be:
+
+- a registry
+- mailbox-style messaging
+
+Instance ids should be the default addressing model. Named aliases or higher-level service routing can be layered on top later through the registry or a broker module.
+
+RPC can remain a later addition if real workloads prove it necessary.
 
 ## Data Flow
 
@@ -228,6 +299,8 @@ Reload policy should be explicit:
 - reset in-memory app instance state unless the module implements a migration hook
 - preserve pane identity where possible
 - show reload failures in status output without tearing down the session process
+
+When a module binary has many live realm instances, reload should restart all live instances of that module.
 
 ## Milestones
 
