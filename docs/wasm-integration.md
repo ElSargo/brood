@@ -1,5 +1,9 @@
 # WASM Integration
 
+This is the canonical WASM design-target document.
+
+It describes the intended Manifold app and module model, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
+
 WASM is Manifold's planned fast-iteration layer for workspace behavior, built-in tools, user apps, extensions, and agents. Manifold should have a workspace and WASM app model; the open question is the exact shape, not whether this direction belongs in the project.
 
 The integration should make behavior reloadable without redeploying WSLg or rebuilding compositor patches, while preserving Manifold's core rule: authoritative workspace, session, and app state live behind the presentation surface, and presentation endpoints render the latest scene and surface state for one session at a time. More native, browser, Wayland, and WSLg experiments are needed before freezing the API, ABI, runtime crate layout, or WIT package shape.
@@ -208,15 +212,15 @@ The Rust side can first model these as native traits and structs. Once the seman
 
 ## Hot Reload Workflow
 
-Linux-native development should make reload cheap:
+Linux-native development should make reload cheap.
 
-```sh
-manifoldd ctl wasm load /path/to/app.manifest.json
-manifoldd ctl wasm reload <app-id>
-manifoldd ctl wasm list
-manifoldd ctl wasm logs <app-id>
-manifoldd ctl wasm unload <app-id>
-```
+The target usability is a host-managed load, reload, inspect, and unload loop for modules and pane apps. The exact CLI or control-socket surface is intentionally not frozen here.
+
+Current usability note:
+
+- the exact currently implemented CLI entry points are defined in `crates/manifoldd/src/main.rs`
+- config-loaded startup modules are defined in `manifold.toml` and parsed in `crates/manifoldd/src/config.rs`
+- the current runnable WASM paths are the fast key handler in `crates/manifoldd/src/wasm_key.rs` and the test harness in `crates/manifoldd/src/wasm_test.rs`
 
 Reload policy should be explicit:
 

@@ -1,10 +1,10 @@
 # WASM Test Harness Prototype
 
-The first async test-harness prototype is available through:
+This page records the focused target and current usability shape of the WASM test-harness lane.
 
-```sh
-manifoldd run --test-harness /path/to/harness.wasm
-```
+Use [WASM Integration](wasm-integration.md) as the canonical overview for the broader WASM model.
+
+The first async test-harness prototype is currently exposed through the `run` CLI. For the exact arguments, see `crates/manifoldd/src/main.rs`.
 
 This is intentionally separate from `--wasm-key-handler`.
 

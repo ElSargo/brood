@@ -1,5 +1,7 @@
 This is a minimal async core-WASM test harness for `manifoldd run --test-harness`.
 
+For the exact CLI argument definition, see `crates/manifoldd/src/main.rs`.
+
 Build:
 
 ```sh

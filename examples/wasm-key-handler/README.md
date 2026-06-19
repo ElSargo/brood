@@ -1,6 +1,6 @@
 # WASM Key Handler Example
 
-This is a minimal core-WASM normal-mode key handler for `manifoldd --wasm-key-handler`.
+This is a minimal core-WASM normal-mode key handler for `manifoldd run --wasm-key-handler`.
 
 Build:
 
@@ -15,6 +15,8 @@ Run:
 manifoldd run \
   --wasm-key-handler examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm
 ```
+
+For the exact CLI argument definition, see `crates/manifoldd/src/main.rs`.
 
 Default keymap:
 

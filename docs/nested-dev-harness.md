@@ -1,5 +1,9 @@
 # Nested Development Harness
 
+This page describes the nested-development and nested-testing target shape by default.
+
+Current implementation details are included only where they affect usability.
+
 Manifold should be able to run and test a development instance inside a stable instance. This gives the project a realistic way to exercise input routing, frame pacing, screenshot capture, hot-reload behavior, and latency metrics with Manifold acting as both the outer workspace and the inner system under test.
 
 ## Shape
@@ -42,14 +46,7 @@ This nested topology is the intended default test mode for behavior and graphics
 
 By default the outer supervisor runs headless, so the nested topology can start without a host-visible presentation window. The inner instance still attaches a presentation window into the outer nested compositor, which preserves the Manifold-in-Manifold path even though the outer host presentation is detached.
 
-Useful options:
-
-```sh
-manifoldd test nested --keep-running
-manifoldd test nested --harness ./outer_test.wasm
-manifoldd test nested --outer-headful
-manifoldd test nested --inner-command kitty
-```
+For exact `manifoldd test nested` arguments, see `crates/manifoldd/src/main.rs`.
 
 When the topology is running, the outer instance can proxy control requests to the inner instance:
 
@@ -88,13 +85,7 @@ The script:
 6. Samples `status-json` from both instances.
 7. Optionally captures the stable host window through WSLg `PrintWindow`.
 
-Useful options:
-
-```sh
-tools/dev-nested-manifold.sh --dev-client kitty
-tools/dev-nested-manifold.sh --dev-client "weston-simple-egl"
-tools/dev-nested-manifold.sh --out-dir /tmp/manifold-nested --capture
-```
+For exact helper-script arguments, see `tools/dev-nested-manifold.sh`.
 
 The output directory contains:
 

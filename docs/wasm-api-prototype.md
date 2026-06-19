@@ -1,5 +1,9 @@
 # WASM API Prototype
 
+This page is a focused target-design note for the first WASM API spike.
+
+Use [WASM Integration](wasm-integration.md) as the canonical overview. This page only narrows the first command/API slice.
+
 This note scopes the first WASM API spike to workspace navigation, managed app launch, and keyboard shortcut handling. These are deliberately small because they already exist in the native prototype as focus commands, hosted app spawning, browser launch control, and normal-mode key handling.
 
 The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Manifold should execute those requests through the same session process paths used by native input and control commands.
@@ -199,13 +203,13 @@ The `command: string` placeholder in `register-shortcut` should become a typed c
 
 ## Loaded Key Handler Prototype
 
-The first runnable spike uses a narrow core-WASM ABI instead of WIT:
+The first runnable spike uses a narrow core-WASM ABI instead of WIT.
 
-```sh
-manifoldd run --wasm-key-handler /path/to/key_handler.wasm
-```
+Current usability note:
 
-For normal development, Manifold also loads enabled modules from `./manifold.toml` by default. The checked-in config enables the `dev` fast key handler at `examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm`. Use `manifoldd run --no-default-modules` to bypass config-loaded modules, or `manifoldd run --config ./other.toml` to point at another config.
+- the exact run arguments are defined in `crates/manifoldd/src/main.rs`
+- config-loaded startup modules are parsed in `crates/manifoldd/src/config.rs`
+- the checked-in example module path lives in `manifold.toml`
 
 The guest exports:
 
@@ -238,19 +242,7 @@ The sample handler lives in `examples/wasm-key-handler` and currently maps norma
 - `Ctrl-O` -> spawn `kitty`
 - `Ctrl-Q` -> `close_active_window`
 
-Build it with:
-
-```sh
-rustup target add wasm32-unknown-unknown
-cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release
-```
-
-Then load:
-
-```sh
-manifoldd run \
-  --wasm-key-handler examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm
-```
+For the example build/run flow, see `examples/wasm-key-handler/README.md`.
 
 ## Validation
 

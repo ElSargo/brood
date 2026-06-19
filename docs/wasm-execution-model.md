@@ -1,5 +1,9 @@
 # WASM Execution Model
 
+This page records one focused part of the WASM target design: execution lanes and failure policy.
+
+Use [WASM Integration](wasm-integration.md) as the canonical overview for the broader app and module model.
+
 Manifold should run user code through two execution lanes with different contracts:
 
 - a synchronous fast lane for bounded pre-commit policy
