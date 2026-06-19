@@ -1,4 +1,13 @@
-use anyhow::Result;
+use std::{
+    env,
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
@@ -42,7 +51,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    RunArgs,
+    NestedTestArgs, RunArgs, TestArgs, TestCommand,
     browser::BrowserLaunchOptions,
     config, control, presentation,
     state::{ClientState, Manifold, PresentationStatus},
@@ -68,6 +77,8 @@ pub fn run(args: RunArgs) -> Result<()> {
         state.test_harness = Some(TestHarnessRuntime::start(path)?);
         info!(path = %path.display(), "loaded CLI test harness");
     }
+
+    state.nested_inner_control_socket = args.nested_inner_control_socket.clone();
 
     control::listen(&mut event_loop, &args.control_socket)?;
 
@@ -113,6 +124,249 @@ pub fn run(args: RunArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn run_test(args: TestArgs) -> Result<()> {
+    match args.command {
+        TestCommand::Nested(args) => run_nested_test(args),
+    }
+}
+
+fn run_nested_test(args: NestedTestArgs) -> Result<()> {
+    let out_dir = match args.out_dir {
+        Some(dir) => {
+            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            dir
+        }
+        None => {
+            let dir = env::temp_dir().join(format!("manifold-nested-test-{}", std::process::id()));
+            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            dir
+        }
+    };
+
+    let outer_sock = out_dir.join("outer.sock");
+    let inner_sock = out_dir.join("inner.sock");
+    let outer_log = out_dir.join("outer.log");
+    let inner_log = out_dir.join("inner.log");
+    let current_exe = env::current_exe().context("resolve current executable")?;
+
+    let mut outer_child = spawn_outer(
+        &current_exe,
+        &outer_sock,
+        &inner_sock,
+        &outer_log,
+        args.outer_headful,
+        args.harness.as_deref(),
+    )?;
+
+    let cleanup = NestedCleanup {
+        outer_sock: outer_sock.clone(),
+        inner_sock: inner_sock.clone(),
+    };
+
+    wait_for_control_socket(&outer_sock, &outer_log, &mut outer_child, "outer")?;
+    spawn_inner(
+        &outer_sock,
+        &current_exe,
+        &inner_sock,
+        &inner_log,
+        args.inner_headless,
+    )?;
+    wait_for_control_socket(&inner_sock, &inner_log, &mut outer_child, "inner")?;
+
+    if !args.inner_headless {
+        wait_for_outer_window(&outer_sock, &outer_log, &mut outer_child)?;
+    }
+
+    if let Some(command) = args.inner_command.as_deref() {
+        let inner_command = shell_split(command)?;
+        control::request_socket_command(&inner_sock, &[vec!["spawn".to_string()], inner_command].concat(), false)?;
+    }
+
+    println!("OK nested test ready");
+    println!("out_dir={}", out_dir.display());
+    println!("outer_control={}", outer_sock.display());
+    println!("inner_control={}", inner_sock.display());
+    println!("outer_log={}", outer_log.display());
+    println!("inner_log={}", inner_log.display());
+    println!("outer_headless={}", !args.outer_headful);
+    println!("inner_headless={}", args.inner_headless);
+
+    if args.keep_running {
+        let status = outer_child.wait().context("wait for outer process")?;
+        if !status.success() {
+            bail!("outer process exited with {status}");
+        }
+        return Ok(());
+    }
+
+    if args.harness.is_some() {
+        let status = outer_child.wait().context("wait for outer process")?;
+        println!("outer_exit={status}");
+        if !status.success() {
+            bail!("outer process exited with {status}");
+        }
+        return Ok(());
+    }
+
+    cleanup.stop_all();
+    let status = outer_child.wait().context("wait for outer process")?;
+    if !status.success() {
+        bail!("outer process exited with {status}");
+    }
+    Ok(())
+}
+
+fn spawn_outer(
+    current_exe: &Path,
+    outer_sock: &Path,
+    inner_sock: &Path,
+    outer_log: &Path,
+    outer_headful: bool,
+    harness: Option<&Path>,
+) -> Result<Child> {
+    let mut command = Command::new(current_exe);
+    command.arg("run");
+    command.arg("--control-socket").arg(outer_sock);
+    command.arg("--nested-inner-control-socket").arg(inner_sock);
+    if !outer_headful {
+        command.arg("--headless");
+    }
+    if let Some(harness) = harness {
+        command.arg("--test-harness").arg(harness);
+    }
+    command.stdout(Stdio::from(fs::File::create(outer_log).with_context(|| format!("create {}", outer_log.display()))?));
+    command.stderr(Stdio::from(fs::OpenOptions::new().append(true).open(outer_log).with_context(|| format!("open {}", outer_log.display()))?));
+    command.spawn().with_context(|| format!("spawn outer process {}", current_exe.display()))
+}
+
+fn spawn_inner(
+    outer_sock: &Path,
+    current_exe: &Path,
+    inner_sock: &Path,
+    inner_log: &Path,
+    inner_headless: bool,
+) -> Result<()> {
+    let mut command = format!(
+        "exec {} run --control-socket {}",
+        shell_quote(&current_exe.display().to_string()),
+        shell_quote(&inner_sock.display().to_string()),
+    );
+    if inner_headless {
+        command.push_str(" --headless");
+    }
+    command.push_str(&format!(
+        " >{} 2>&1",
+        shell_quote(&inner_log.display().to_string())
+    ));
+    let inner_args = vec![
+        "spawn".to_string(),
+        "bash".to_string(),
+        "-lc".to_string(),
+        command,
+    ];
+    let response = control::request_socket_command(outer_sock, &inner_args, false)?;
+    if !response.starts_with("OK ") {
+        bail!("spawn inner failed: {}", response.trim());
+    }
+    Ok(())
+}
+
+fn wait_for_control_socket(
+    control_socket: &Path,
+    log_path: &Path,
+    outer_child: &mut Child,
+    label: &str,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = outer_child.try_wait().context("poll outer process")? {
+            let log_tail = read_log_tail(log_path);
+            bail!("{label} failed before control socket ready: {status}\n{log_tail}");
+        }
+        if let Ok(response) = control::request_socket_command(
+            control_socket,
+            &[String::from("status-json")],
+            false,
+        ) {
+            if response.trim_start().starts_with('{') {
+                return Ok(());
+            }
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            let log_tail = read_log_tail(log_path);
+            bail!("timed out waiting for {label} control socket\n{log_tail}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_outer_window(
+    outer_sock: &Path,
+    log_path: &Path,
+    outer_child: &mut Child,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = outer_child.try_wait().context("poll outer process")? {
+            let log_tail = read_log_tail(log_path);
+            bail!("outer exited before inner presentation mapped: {status}\n{log_tail}");
+        }
+        if let Ok(response) = control::request_socket_command(
+            outer_sock,
+            &[String::from("status-json")],
+            false,
+        ) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                if json.get("windows").and_then(serde_json::Value::as_u64).unwrap_or(0) >= 1 {
+                    return Ok(());
+                }
+            }
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            let log_tail = read_log_tail(log_path);
+            bail!("timed out waiting for outer to host inner presentation\n{log_tail}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn shell_split(command: &str) -> Result<Vec<String>> {
+    let command = command.trim();
+    if command.is_empty() {
+        bail!("inner command must not be empty");
+    }
+    Ok(command
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn read_log_tail(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let lines = contents.lines().rev().take(40).collect::<Vec<_>>();
+            lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+        }
+        Err(err) => format!("log unreadable: {err}"),
+    }
+}
+
+struct NestedCleanup {
+    outer_sock: PathBuf,
+    inner_sock: PathBuf,
+}
+
+impl NestedCleanup {
+    fn stop_all(&self) {
+        let _ = control::request_socket_command(&self.inner_sock, &[String::from("quit")], false);
+        let _ = control::request_socket_command(&self.outer_sock, &[String::from("quit")], false);
+    }
 }
 
 impl CompositorHandler for Manifold {

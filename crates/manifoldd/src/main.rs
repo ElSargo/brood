@@ -30,6 +30,8 @@ enum Command {
     Check,
     /// Run a nested Wayland compositor and attach a presentation window.
     Run(RunArgs),
+    /// Run built-in test workflows.
+    Test(TestArgs),
     /// Send a command to a running manifoldd control socket.
     Ctl(CtlArgs),
 }
@@ -54,6 +56,9 @@ struct RunArgs {
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     test_harness: Option<PathBuf>,
+    /// Inner control socket used by nested test supervisors.
+    #[arg(long = "nested-inner-control-socket", value_name = "PATH", hide = true)]
+    nested_inner_control_socket: Option<PathBuf>,
     /// Project/session config file to load at startup.
     #[arg(long = "config", value_name = "PATH", default_value = "manifold.toml")]
     config: PathBuf,
@@ -71,10 +76,45 @@ impl Default for RunArgs {
             browser: None,
             wasm_key_handler: None,
             test_harness: None,
+            nested_inner_control_socket: None,
             config: PathBuf::from("manifold.toml"),
             no_default_modules: false,
         }
     }
+}
+
+#[derive(Debug, Parser)]
+struct TestArgs {
+    #[command(subcommand)]
+    command: TestCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TestCommand {
+    /// Launch a nested Manifold-in-Manifold test topology.
+    Nested(NestedTestArgs),
+}
+
+#[derive(Debug, Parser)]
+struct NestedTestArgs {
+    /// Directory for sockets, logs, and artifacts.
+    #[arg(long = "out-dir", value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    /// Keep the nested topology running after startup.
+    #[arg(long = "keep-running")]
+    keep_running: bool,
+    /// Load the async test harness into the outer supervisor instance.
+    #[arg(long = "harness", value_name = "PATH")]
+    harness: Option<PathBuf>,
+    /// Start the outer supervisor with a visible presentation window.
+    #[arg(long = "outer-headful")]
+    outer_headful: bool,
+    /// Start the inner system under test without an attached presentation window.
+    #[arg(long = "inner-headless")]
+    inner_headless: bool,
+    /// Spawn a hosted Wayland app inside the inner instance after startup.
+    #[arg(long = "inner-command", value_name = "CMD")]
+    inner_command: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -108,6 +148,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run(args) => compositor::run(args),
+        Command::Test(args) => compositor::run_test(args),
         Command::Ctl(args) => control::send(args).context("send control command"),
     }
 }

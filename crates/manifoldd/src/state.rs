@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     ffi::OsString,
+    path::PathBuf,
     process::Command,
     rc::Rc,
     sync::Arc,
@@ -118,6 +119,7 @@ pub struct Manifold {
     pub(crate) wasm_key_handler: Option<WasmKeyHandler>,
     pub(crate) test_harness: Option<TestHarnessRuntime>,
     pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
+    pub(crate) nested_inner_control_socket: Option<PathBuf>,
 }
 
 impl Manifold {
@@ -190,6 +192,7 @@ impl Manifold {
             wasm_key_handler: None,
             test_harness: None,
             test_harness_completion: None,
+            nested_inner_control_socket: None,
         }
     }
 

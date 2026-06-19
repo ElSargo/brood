@@ -20,6 +20,56 @@ Both instances expose their own control sockets:
 - stable control socket: drives the outer workspace, captures host-visible presentation, injects input into the dev presentation window
 - dev control socket: drives the inner workspace, launches test clients, samples inner frame/input/commit status
 
+## Built-In CLI
+
+The first built-in orchestration path is:
+
+```sh
+manifoldd test nested
+```
+
+This launches:
+
+- an outer supervisor instance
+- an inner system-under-test instance hosted inside the outer instance
+
+This nested topology is the intended default test mode for behavior and graphics validation. The outer instance should be the authoritative end-to-end supervisor:
+
+- drive the full outer-to-inner input path
+- capture host-visible or offscreen-composed output
+- record outer-visible latency and frame metrics
+- proxy diagnostic inspection into the inner instance when a deviation appears
+
+By default the outer supervisor runs headless, so the nested topology can start without a host-visible presentation window. The inner instance still attaches a presentation window into the outer nested compositor, which preserves the Manifold-in-Manifold path even though the outer host presentation is detached.
+
+Useful options:
+
+```sh
+manifoldd test nested --keep-running
+manifoldd test nested --harness ./outer_test.wasm
+manifoldd test nested --outer-headful
+manifoldd test nested --inner-command kitty
+```
+
+When the topology is running, the outer instance can proxy control requests to the inner instance:
+
+```sh
+manifoldd ctl --control-socket /path/to/outer.sock nested-inner status-json
+```
+
+Current limitation: headless outer mode preserves behavior and control-path testing, but it does not yet provide a composed outer framebuffer capture. That still requires either an attached outer presentation window or a future offscreen presenter.
+
+## Future Work
+
+The most important remaining gap for the intended default nested test mode is full outer capture while staying headless by default.
+
+Planned work:
+
+- add an offscreen outer presenter so `manifoldd test nested` can capture the composed outer framebuffer without opening a host-visible window
+- retain the same nested topology, control flow, and latency instrumentation when switching between outer-headful and outer-headless execution
+- make full capture part of the default nested artifact bundle rather than a special-case debugging path
+- keep inner-instance dumps and diagnostics as supporting evidence, while outer composed capture remains the authoritative end-to-end visual record
+
 ## Harness
 
 Run:

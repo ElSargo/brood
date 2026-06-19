@@ -66,23 +66,32 @@ pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, path: &Path) -> Res
 }
 
 pub fn send(args: CtlArgs) -> Result<()> {
-    let mut stream = UnixStream::connect(&args.control_socket)
-        .with_context(|| format!("connect {}", args.control_socket.display()))?;
-    let command = if args.json {
-        args.command.join(" ")
+    let response = request_socket_command(&args.control_socket, &args.command, args.json)?;
+    print!("{response}");
+    Ok(())
+}
+
+pub fn request_socket_command(
+    control_socket: &Path,
+    command: &[String],
+    json: bool,
+) -> Result<String> {
+    let mut stream = UnixStream::connect(control_socket)
+        .with_context(|| format!("connect {}", control_socket.display()))?;
+    let encoded = if json {
+        command.join(" ")
     } else {
-        serde_json::to_string(&args.command).context("encode control command")?
+        serde_json::to_string(command).context("encode control command")?
     };
-    if args.json {
+    if json {
         let _: Vec<String> =
-            serde_json::from_str(&command).context("validate JSON control argv")?;
+            serde_json::from_str(&encoded).context("validate JSON control argv")?;
     }
-    writeln!(stream, "{command}")?;
+    writeln!(stream, "{encoded}")?;
 
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    print!("{response}");
-    Ok(())
+    Ok(response)
 }
 
 pub fn execute_json_command(input: &str, state: &mut Manifold) -> Result<String> {
@@ -270,6 +279,16 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             }
             _ => bail!("usage: harness signal <name>"),
         },
+        "nested-inner" => {
+            let socket = state
+                .nested_inner_control_socket
+                .clone()
+                .context("nested inner control socket not configured")?;
+            if args.is_empty() {
+                bail!("usage: nested-inner <command...>");
+            }
+            request_socket_command(&socket, args, false)?
+        }
         "debug" => match args {
             [subcommand, dir] if subcommand == "dump" => {
                 let manifest = debug_dump::dump_bundle(state, Path::new(dir), DumpOptions::parse(None)?)?;

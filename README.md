@@ -34,6 +34,9 @@ The current PoC can:
 - reattach the presentation window and resume the nested window
 - report frame cadence, input-to-frame latency, client commits, frame callbacks, dmabuf state, and explicit-sync state
 - run async core-WASM behavior harnesses through `manifoldd run --test-harness`
+- orchestrate nested Manifold-in-Manifold tests through `manifoldd test nested`
+
+The intended default behavior-testing mode is nested Manifold-in-Manifold execution with outer-instance capture and full-path input driving. The built-in `manifoldd test nested` command is the canonical path toward that mode, even though headless outer capture still needs an offscreen presenter to be fully complete.
 
 ## Common Commands
 
@@ -59,6 +62,7 @@ cargo run -- run --headless
 cargo run -- run --no-default-modules
 cargo run -- run --config ./manifold.toml
 cargo run -- ctl status-json
+cargo run -- test nested
 ```
 
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the full v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On the current WSLg backend, the full smoke suite passes and the positive dmabuf/sync checks skip with `rc=77` because WSLg exposes no importable dmabuf formats. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
