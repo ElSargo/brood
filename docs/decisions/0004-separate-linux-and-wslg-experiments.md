@@ -8,6 +8,8 @@ The normal Linux path is a Rust nested Wayland compositor with a presentation wi
 
 The WSLg path is a C-first experiment inside WSLg/Weston. WSLg already owns Windows window creation and RDPRAIL presentation, and the current insertion point is not a normal Manifold presentation endpoint. Attempts to force the same runtime implementation across both paths would introduce FFI, lifecycle, ownership, and backend abstraction costs before the WSLg architecture is understood.
 
+For durable docs, this means unqualified references to "the implementation" should default to the Linux-native path unless the document is explicitly in Windows/WSLg context. In Windows-focused docs, that default should usually flip to the WSLg-native path instead.
+
 ## Decision
 
 Keep the Linux/Rust nested compositor and WSLg/C Weston implementation as separate experiments for now.

@@ -4,6 +4,8 @@ This document records the Manifold behavior that backend implementations should 
 
 The Linux/Rust nested compositor remains the clean reference path for now. The WSLg-native path may satisfy the same behavior through Weston, RDPRAIL, and Windows window integration rather than through Manifold-owned Winit presentation.
 
+Unless a section explicitly switches to Windows/WSLg context, references here to the implementation, backend, or default behavior mean the Linux-native path. When this spec is read for Windows behavior, that default usually maps to the WSLg-native path instead.
+
 ## Principles
 
 - Manifold preserves workspace meaning above backend mechanics.

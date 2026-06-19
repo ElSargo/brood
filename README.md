@@ -4,6 +4,8 @@ Manifold is a new workspace project for a persistent, graphical developer enviro
 
 The core idea is a local workspace containing isolated sessions. A local session process owns durable workspace/session state and can open a native presentation window. The presentation window is not a remote framebuffer viewer. It is a compositor endpoint that presents one session at a time, showing any number of that session's panes with presentation-surface-owned layout, animation, and interaction.
 
+Unless a document explicitly calls out WSLg, Windows, or another backend, implementation prose defaults to the Linux-native Manifold path. When running on Windows, that same default should usually be read as the Windows/WSLg-native path instead.
+
 ## Thesis
 
 Manifold should feel like a native editor while behaving more like a rich tmux session:

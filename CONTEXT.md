@@ -100,6 +100,10 @@ _Avoid_: remote desktop, streaming
 A platform-specific way to host surfaces, route input, pace frames, and present Manifold sessions while preserving the same session semantics.
 _Avoid_: fallback path, workaround
 
+**Default implementation assumption**:
+In durable prose, unqualified references to "the implementation", "the backend", or default behavior mean the Linux-native Manifold path unless the document is explicitly about Windows/WSLg. On Windows, that same default should usually be read as the Windows/WSLg-native path.
+_Avoid_: treating Linux and WSLg as equal implicit defaults in the same sentence
+
 **WSLg-native implementation**:
 A Windows Subsystem for Linux implementation that integrates Manifold's pane/session behavior at the WSLg compositor layer so managed apps can keep WSLg's accelerated presentation path.
 _Avoid_: WSL fallback, SHM-only WSL path
@@ -137,6 +141,7 @@ _Avoid_: ambient permission, unrestricted access
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
 - **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with correctness fallbacks.
 - A **backend implementation** may be a nested compositor on normal Linux or a WSLg-integrated compositor/shell on WSL.
+- The **default implementation assumption** for docs is Linux-native unless the doc explicitly switches to Windows/WSLg context. On Windows, that default usually flips to the WSLg-native path.
 - The **WSLg-native implementation** should avoid forcing GPU-capable managed apps through Manifold's SHM-only nested compositor path.
 - The Linux/Rust nested compositor and the WSLg/C Weston implementation are separate experiments for now. Share behavior notes and test intent first; defer shared runtime code until the WSLg insertion point and control surface are clearer.
 - A **shared behavior spec** is the near-term unification target. The Linux implementation can remain the clean Rust reference while WSLg proves the Windows/RAIL compositor path in C.
@@ -161,4 +166,5 @@ _Avoid_: ambient permission, unrestricted access
 - "frontend" remains a legacy/control-command spelling in the MVP tools. In docs, use **presentation endpoint** for the component and **presentation window** for the desktop window.
 - "server" and "daemon" are implementation-adjacent. Use **session process** for Manifold's authoritative state owner unless discussing protocol direction or process names.
 - "WSL path" is ambiguous. Use **WSLg-native implementation** when discussing a compositor-layer integration with WSLg, and use "WSL SHM fallback" only for the current nested `manifoldd` behavior on WSLg.
+- Unqualified "default" or "the implementation" is ambiguous across platforms. Default to the Linux-native path in general docs unless the Windows/WSLg context is explicit; on Windows-focused docs, default to the WSLg-native path instead.
 - "shared implementation" is premature. Use **shared behavior spec** when we mean common Manifold semantics across Linux and WSLg, and reserve shared code for a later decision.

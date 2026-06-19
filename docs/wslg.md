@@ -2,6 +2,8 @@
 
 This page tracks the WSLg-specific implementation path for Manifold.
 
+This page is one of the explicit exceptions to the usual doc default: here, unqualified implementation language means the Windows/WSLg-native path, not the Linux-native path.
+
 ## Thesis
 
 The WSLg work should be a WSLg-native implementation, not a slow fallback of the generic nested compositor.
