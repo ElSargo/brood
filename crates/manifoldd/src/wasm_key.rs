@@ -5,6 +5,7 @@ use smithay::backend::input::{KeyState, Keycode};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 use crate::{
+    command::{SurfaceCommand, WorkspaceCommand},
     layout::LayoutAction,
     state::{InputMode, Manifold},
 };
@@ -13,22 +14,23 @@ const ABI_KEY_RELEASED: i32 = 0;
 const ABI_KEY_PRESSED: i32 = 1;
 const ABI_MODE_PASSTHROUGH: i32 = 0;
 const ABI_MODE_NORMAL: i32 = 1;
+const ABI_MOD_CTRL: i32 = 1;
+const ABI_MOD_ALT: i32 = 2;
 const MAX_SPAWN_COMMAND_BYTES: usize = 4096;
-
-#[derive(Debug)]
-enum WasmKeyCommand {
-    Layout(LayoutAction),
-    SpawnApp(Vec<String>),
-}
 
 #[derive(Default)]
 struct WasmKeyStore {
-    pending_commands: Vec<WasmKeyCommand>,
+    pending_commands: Vec<WorkspaceCommand>,
 }
 
 pub struct WasmKeyHandler {
     store: Store<WasmKeyStore>,
-    on_key: TypedFunc<(i32, i32, i32, i32), i32>,
+    on_key: WasmKeyEntry,
+}
+
+enum WasmKeyEntry {
+    V1(TypedFunc<(i32, i32, i32, i32), i32>),
+    V2(TypedFunc<(i32, i32, i32, i32, i32), i32>),
 }
 
 impl WasmKeyHandler {
@@ -46,7 +48,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Layout(LayoutAction::FocusNext));
+                        .push(WorkspaceCommand::Layout(LayoutAction::FocusNext));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.focus_next import: {err}"))?;
@@ -58,7 +60,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Layout(LayoutAction::FocusPrevious));
+                        .push(WorkspaceCommand::Layout(LayoutAction::FocusPrevious));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.focus_previous import: {err}"))?;
@@ -70,7 +72,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Layout(
+                        .push(WorkspaceCommand::Layout(
                             LayoutAction::ToggleManagedFullscreen,
                         ));
                 },
@@ -84,7 +86,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Layout(LayoutAction::CloseActivePane));
+                        .push(WorkspaceCommand::Layout(LayoutAction::CloseActivePane));
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.close_active_window import: {err}"))?;
@@ -100,11 +102,45 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::Layout(action));
+                        .push(WorkspaceCommand::Layout(action));
                     1
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.layout_action import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
+                "switch_active_session_next",
+                |mut caller: Caller<'_, WasmKeyStore>| -> i32 {
+                    caller
+                        .data_mut()
+                        .pending_commands
+                        .push(WorkspaceCommand::Surface(
+                            SurfaceCommand::SwitchActiveSessionNext,
+                        ));
+                    1
+                },
+            )
+            .map_err(|err| {
+                anyhow::anyhow!("define manifold.switch_active_session_next import: {err}")
+            })?;
+        linker
+            .func_wrap(
+                "manifold",
+                "create_and_attach_session",
+                |mut caller: Caller<'_, WasmKeyStore>| -> i32 {
+                    caller
+                        .data_mut()
+                        .pending_commands
+                        .push(WorkspaceCommand::Surface(
+                            SurfaceCommand::CreateAndAttachSession,
+                        ));
+                    1
+                },
+            )
+            .map_err(|err| {
+                anyhow::anyhow!("define manifold.create_and_attach_session import: {err}")
+            })?;
         linker
             .func_wrap(
                 "manifold",
@@ -127,7 +163,7 @@ impl WasmKeyHandler {
                     caller
                         .data_mut()
                         .pending_commands
-                        .push(WasmKeyCommand::SpawnApp(argv));
+                        .push(WorkspaceCommand::SpawnApp(argv));
                     1
                 },
             )
@@ -137,13 +173,21 @@ impl WasmKeyHandler {
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|err| anyhow::anyhow!("instantiate WASM key handler: {err}"))?;
-        let on_key = instance
-            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "on_key")
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "find exported on_key(key_code, key_state, input_mode, ctrl_pressed): {err}"
-                )
-            })?;
+        let on_key = match instance
+            .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "on_key_v2")
+        {
+            Ok(func) => WasmKeyEntry::V2(func),
+            Err(_) => {
+                let func = instance
+                    .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "on_key")
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "find exported on_key_v2(..., modifiers) or on_key(..., ctrl_pressed): {err}"
+                        )
+                    })?;
+                WasmKeyEntry::V1(func)
+            }
+        };
 
         Ok(Self { store, on_key })
     }
@@ -154,20 +198,29 @@ impl WasmKeyHandler {
         key_state: KeyState,
         input_mode: InputMode,
         ctrl_pressed: bool,
+        alt_pressed: bool,
     ) -> Result<WasmKeyOutcome> {
         self.store.data_mut().pending_commands.clear();
-        let handled = self
-            .on_key
-            .call(
+        let key_args = (
+            i32::try_from(key_code.raw()).unwrap_or(i32::MAX),
+            abi_key_state(key_state),
+            abi_input_mode(input_mode),
+            i32::from(ctrl_pressed),
+        );
+        let handled = match &self.on_key {
+            WasmKeyEntry::V1(on_key) => on_key.call(&mut self.store, key_args),
+            WasmKeyEntry::V2(on_key) => on_key.call(
                 &mut self.store,
                 (
-                    i32::try_from(key_code.raw()).unwrap_or(i32::MAX),
-                    abi_key_state(key_state),
-                    abi_input_mode(input_mode),
-                    i32::from(ctrl_pressed),
+                    key_args.0,
+                    key_args.1,
+                    key_args.2,
+                    key_args.3,
+                    abi_modifiers(ctrl_pressed, alt_pressed),
                 ),
-            )
-            .map_err(|err| anyhow::anyhow!("call WASM on_key: {err}"))?
+            ),
+        }
+        .map_err(|err| anyhow::anyhow!("call WASM key handler: {err}"))?
             != 0;
         let commands = self
             .store
@@ -181,22 +234,13 @@ impl WasmKeyHandler {
 
 pub struct WasmKeyOutcome {
     handled: bool,
-    commands: Vec<WasmKeyCommand>,
+    commands: Vec<WorkspaceCommand>,
 }
 
 impl WasmKeyOutcome {
     pub fn apply(self, state: &mut Manifold) -> bool {
         for command in self.commands {
-            match command {
-                WasmKeyCommand::Layout(action) => {
-                    state.apply_layout_action(action);
-                }
-                WasmKeyCommand::SpawnApp(argv) => {
-                    if let Err(err) = state.spawn_hosted_app_argv(&argv) {
-                        tracing::warn!(?err, ?argv, "WASM key handler failed to spawn app");
-                    }
-                }
-            }
+            command.apply(state);
         }
         self.handled
     }
@@ -214,6 +258,17 @@ fn abi_input_mode(mode: InputMode) -> i32 {
         InputMode::Passthrough => ABI_MODE_PASSTHROUGH,
         InputMode::Normal => ABI_MODE_NORMAL,
     }
+}
+
+fn abi_modifiers(ctrl_pressed: bool, alt_pressed: bool) -> i32 {
+    let mut modifiers = 0;
+    if ctrl_pressed {
+        modifiers |= ABI_MOD_CTRL;
+    }
+    if alt_pressed {
+        modifiers |= ABI_MOD_ALT;
+    }
+    modifiers
 }
 
 fn read_guest_string(caller: &mut Caller<'_, WasmKeyStore>, ptr: i32, len: i32) -> Result<String> {

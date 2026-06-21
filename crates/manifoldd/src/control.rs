@@ -6,20 +6,22 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState},
     input::pointer::AxisFrame,
-    reexports::calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
+    reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction},
     utils::Point,
 };
 use tracing::{info, warn};
 
 use crate::{
-    CtlArgs, browser,
+    browser,
+    command::{SurfaceCommand, WorkspaceCommand},
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
     state::{FocusDirection, Manifold},
+    CtlArgs,
 };
 
 const MAX_CONTROL_COMMAND_BYTES: usize = 64 * 1024;
@@ -137,7 +139,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
             format!(
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} browsers={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -147,6 +149,9 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 snapshot.presentation_runtime_failures,
                 snapshot.presentation_last_error,
                 snapshot.windows,
+                snapshot.total_windows,
+                snapshot.active_surface_session,
+                snapshot.surface_sessions,
                 snapshot.focused_windows,
                 snapshot.focused_window_index_text,
                 snapshot.focused_surface_id,
@@ -241,9 +246,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "quit" if args.is_empty() => {
             let closed_browsers = state.browsers.close_all().len();
             state.loop_signal.stop();
-            format!(
-                "OK quit requested browsers_closed={closed_browsers}"
-            ) + "\n"
+            format!("OK quit requested browsers_closed={closed_browsers}") + "\n"
         }
         "spawn" => {
             if args.is_empty() {
@@ -271,6 +274,24 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             let changed = state.apply_layout_action(action);
             format!("OK layout-action action={action} changed={changed}\n")
         }
+        "surface-session" => match args {
+            [subcommand] if subcommand == "next" => {
+                let changed =
+                    WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext).apply(state);
+                format!(
+                    "OK surface-session active={} changed={changed}\n",
+                    state.active_surface_session().raw()
+                )
+            }
+            [subcommand] if subcommand == "new" => {
+                WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
+                format!(
+                    "OK surface-session active={} created=true\n",
+                    state.active_surface_session().raw()
+                )
+            }
+            _ => bail!("usage: surface-session next|new"),
+        },
         "browser" => browser::handle_control(args, state)?,
         "harness" => match args {
             [subcommand, name] if subcommand == "signal" => {
@@ -291,7 +312,8 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         }
         "debug" => match args {
             [subcommand, dir] if subcommand == "dump" => {
-                let manifest = debug_dump::dump_bundle(state, Path::new(dir), DumpOptions::parse(None)?)?;
+                let manifest =
+                    debug_dump::dump_bundle(state, Path::new(dir), DumpOptions::parse(None)?)?;
                 format!("OK debug dump {}\n", manifest)
             }
             [subcommand, dir, selectors] if subcommand == "dump" => {
@@ -325,6 +347,9 @@ struct StatusSnapshot {
     presentation_runtime_failures: u64,
     presentation_last_error: String,
     windows: usize,
+    total_windows: usize,
+    active_surface_session: u64,
+    surface_sessions: usize,
     focused_windows: usize,
     focused_window_index: Option<usize>,
     #[serde(skip)]
@@ -480,7 +505,10 @@ impl StatusSnapshot {
                 .as_deref()
                 .unwrap_or("none")
                 .to_string(),
-            windows: state.space.elements().count(),
+            windows: state.active_surface_session_window_count(),
+            total_windows: state.space.elements().count(),
+            active_surface_session: state.active_surface_session().raw(),
+            surface_sessions: state.surface_session_count(),
             focused_windows: state.focused_window_count(),
             focused_window_index: state.focused_window_index(),
             focused_window_index_text: state

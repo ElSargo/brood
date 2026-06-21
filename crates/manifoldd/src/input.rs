@@ -19,6 +19,8 @@ use crate::{
 
 const KEY_LEFTCTRL: Keycode = Keycode::new(37);
 const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
+const KEY_LEFTALT: Keycode = Keycode::new(64);
+const KEY_RIGHTALT: Keycode = Keycode::new(108);
 const KEY_B: Keycode = Keycode::new(56);
 const KEY_W: Keycode = Keycode::new(25);
 
@@ -86,6 +88,7 @@ impl Manifold {
 
     pub fn forward_keyboard_key(&mut self, key_code: Keycode, state: KeyState, time: u32) {
         let is_ctrl = matches!(key_code, KEY_LEFTCTRL | KEY_RIGHTCTRL);
+        let is_alt = matches!(key_code, KEY_LEFTALT | KEY_RIGHTALT);
 
         if key_code == KEY_B && state == KeyState::Released && self.suppress_mode_toggle_key_release
         {
@@ -103,6 +106,22 @@ impl Manifold {
                 }
                 (KeyState::Released, _, true) => {
                     self.ctrl_forwarded_to_client = false;
+                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+                }
+                _ => self.record_consumed_keyboard_input(),
+            }
+            return;
+        }
+
+        if is_alt {
+            self.alt_pressed = state == KeyState::Pressed;
+            match (state, self.input_mode, self.alt_forwarded_to_client) {
+                (KeyState::Pressed, InputMode::Passthrough, _) => {
+                    self.alt_forwarded_to_client = true;
+                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+                }
+                (KeyState::Released, _, true) => {
+                    self.alt_forwarded_to_client = false;
                     self.forward_keyboard_key_to_focused_client(key_code, state, time);
                 }
                 _ => self.record_consumed_keyboard_input(),
@@ -137,6 +156,7 @@ impl Manifold {
                 KeyState::Pressed,
                 self.input_mode,
                 self.ctrl_pressed,
+                self.alt_pressed,
             )
         }) {
             match result {

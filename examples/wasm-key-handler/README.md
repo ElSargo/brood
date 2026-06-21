@@ -21,6 +21,7 @@ For the exact CLI argument definition, see `crates/manifoldd/src/main.rs`.
 Default keymap:
 
 - `Ctrl-O`: spawn `kitty`
+- `Ctrl-N`: create and attach a new surface session
 - `Ctrl-J`: focus next pane
 - `Ctrl-K`: focus previous pane
 - `Ctrl-Q`: close the active pane
@@ -29,3 +30,4 @@ Default keymap:
 - `Ctrl-H`: split active pane down
 - `Ctrl-D`: toggle bottom dock
 - `Ctrl-P`: toggle left and right docks
+- `Alt-Space`: switch the active surface to the next session

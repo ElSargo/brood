@@ -8,32 +8,31 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 #[cfg(feature = "shm-fallback")]
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
+    backend::allocator::Fourcc,
     backend::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
-            ExportMem,
-            ImportDma, ImportEgl,
             damage::OutputDamageTracker,
             element::{
-                Kind,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
+                Kind,
             },
             gles::GlesRenderer,
+            ExportMem, ImportDma, ImportEgl,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    backend::allocator::Fourcc,
     desktop::Space,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
-            LoopHandle,
             timer::{TimeoutAction, Timer},
+            LoopHandle,
         },
         winit::{dpi::LogicalSize, window::WindowAttributes},
     },
@@ -41,7 +40,7 @@ use smithay::{
     utils::{Buffer as BufferCoords, Point, Rectangle, Transform},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
-        drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
+        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState},
     },
 };
 use tracing::{info, warn};
@@ -278,16 +277,15 @@ pub(crate) fn dump_composed_frame(
             detail: "presentation_not_attached".to_string(),
         });
     }
-    let presenter = state
-        .presenter
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| {
-            PresentationRuntimeFailure {
+    let presenter =
+        state
+            .presenter
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| PresentationRuntimeFailure {
                 context: "capture",
                 detail: "presentation_not_attached".to_string(),
-            }
-        })?;
+            })?;
     render_presenter_frame_with_capture(&presenter, state, Some(path))
 }
 
@@ -304,7 +302,11 @@ fn render_presenter_frame_with_capture(
     let damage = Rectangle::from_size(size);
     let mut render_space = Space::default();
     render_space.map_output(&output, (0, 0));
-    for window in state.space.elements() {
+    for window in state
+        .space
+        .elements()
+        .filter(|window| state.window_in_active_surface_session(window))
+    {
         let loc = state
             .window_layout_rect(window)
             .map_or((0, 0), |rect| (rect.x, rect.y));
@@ -345,8 +347,14 @@ fn render_presenter_frame_with_capture(
             let copy = renderer
                 .map_texture(&mapping)
                 .map_err(|err| PresentationRuntimeFailure::new("map_texture", err))?;
-            image::save_buffer(path, copy, size.w as u32, size.h as u32, image::ColorType::Rgba8)
-                .map_err(|err| PresentationRuntimeFailure::new("save_buffer", err))?;
+            image::save_buffer(
+                path,
+                copy,
+                size.w as u32,
+                size.h as u32,
+                image::ColorType::Rgba8,
+            )
+            .map_err(|err| PresentationRuntimeFailure::new("save_buffer", err))?;
         }
     }
     backend
@@ -452,7 +460,10 @@ fn push_rect(elements: &mut Vec<SolidColorRenderElement>, rect: LayoutRect, colo
     ));
 }
 
-fn send_active_client_frame_callbacks(presenter: &Rc<PresenterHandle>, state: &mut Manifold) -> u64 {
+fn send_active_client_frame_callbacks(
+    presenter: &Rc<PresenterHandle>,
+    state: &mut Manifold,
+) -> u64 {
     let output = presenter.output.clone();
     let active_window = state.active_window();
     let mut client_frame_callbacks = 0;
@@ -770,9 +781,9 @@ fn presentation_control_poll_interval(
 #[cfg(test)]
 mod tests {
     use super::{
-        DmabufAdvertisement, RenderNodeProbe, dmabuf_advertisement_for,
-        explicit_sync_disabled_reason_for, presentation_control_poll_interval,
-        presentation_runtime_error_status, sanitize_status_value,
+        dmabuf_advertisement_for, explicit_sync_disabled_reason_for,
+        presentation_control_poll_interval, presentation_runtime_error_status,
+        sanitize_status_value, DmabufAdvertisement, RenderNodeProbe,
     };
 
     #[test]

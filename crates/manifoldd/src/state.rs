@@ -17,15 +17,15 @@ use smithay::{
     input::{Seat, SeatState},
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
             generic::Generic,
             timer::{TimeoutAction, Timer},
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
+            Display, DisplayHandle, Resource,
         },
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -48,7 +48,9 @@ use crate::{
     },
     presentation::PresenterHandle,
     wasm_key::WasmKeyHandler,
-    wasm_test::{TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request},
+    wasm_test::{
+        service_request, TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime,
+    },
 };
 
 #[cfg(feature = "shm-fallback")]
@@ -71,6 +73,15 @@ pub enum FocusDirection {
 pub enum InputMode {
     Passthrough,
     Normal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct SurfaceSessionId(u64);
+
+impl SurfaceSessionId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 pub struct Manifold {
@@ -109,10 +120,16 @@ pub struct Manifold {
     active_toplevel_surface: Option<WlSurface>,
     window_layout_leaves: Vec<(WlSurface, LayoutLeafId)>,
     pub(crate) ctrl_pressed: bool,
+    pub(crate) alt_pressed: bool,
     pub(crate) ctrl_forwarded_to_client: bool,
+    pub(crate) alt_forwarded_to_client: bool,
     pub(crate) suppress_mode_toggle_key_release: bool,
     pub input_mode: InputMode,
     managed_fullscreen: bool,
+    active_surface_session: SurfaceSessionId,
+    next_surface_session: u64,
+    surface_sessions: Vec<SurfaceSessionId>,
+    window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
@@ -182,10 +199,16 @@ impl Manifold {
             active_toplevel_surface: None,
             window_layout_leaves: Vec::new(),
             ctrl_pressed: false,
+            alt_pressed: false,
             ctrl_forwarded_to_client: false,
+            alt_forwarded_to_client: false,
             suppress_mode_toggle_key_release: false,
             input_mode: InputMode::Passthrough,
             managed_fullscreen: false,
+            active_surface_session: SurfaceSessionId(1),
+            next_surface_session: 2,
+            surface_sessions: vec![SurfaceSessionId(1)],
+            window_surface_sessions: Vec::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             presenter: None,
@@ -468,11 +491,13 @@ impl Manifold {
     }
 
     pub fn record_window_mapped(&mut self) {
-        self.last_window_count = self.space.elements().count();
+        self.last_window_count = self.active_surface_session_window_count();
         self.reconfigure_focus_stack();
     }
 
     pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) {
+        self.window_surface_sessions
+            .push((surface.clone(), self.active_surface_session));
         let leaf = if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
             self.layout.occupy_active_leaf()
         } else {
@@ -483,7 +508,75 @@ impl Manifold {
         }
     }
 
+    pub fn active_surface_session(&self) -> SurfaceSessionId {
+        self.active_surface_session
+    }
+
+    pub fn surface_session_count(&self) -> usize {
+        self.surface_sessions.len()
+    }
+
+    pub fn active_surface_session_window_count(&self) -> usize {
+        self.space
+            .elements()
+            .filter(|window| self.window_in_active_surface_session(window))
+            .count()
+    }
+
+    pub fn switch_to_next_surface_session(&mut self) -> bool {
+        let Some(active_index) = self
+            .surface_sessions
+            .iter()
+            .position(|session| *session == self.active_surface_session)
+        else {
+            self.active_surface_session = self
+                .surface_sessions
+                .first()
+                .copied()
+                .unwrap_or(SurfaceSessionId(1));
+            self.reconfigure_focus_stack();
+            return true;
+        };
+        if self.surface_sessions.len() <= 1 {
+            return false;
+        }
+        self.active_surface_session =
+            self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
+        self.reconfigure_focus_stack();
+        true
+    }
+
+    pub fn create_and_attach_surface_session(&mut self) -> SurfaceSessionId {
+        let session = SurfaceSessionId(self.next_surface_session);
+        self.next_surface_session += 1;
+        self.surface_sessions.push(session);
+        self.active_surface_session = session;
+        self.reconfigure_focus_stack();
+        session
+    }
+
+    fn session_for_toplevel_surface(&self, surface: &WlSurface) -> Option<SurfaceSessionId> {
+        self.window_surface_sessions
+            .iter()
+            .rev()
+            .find_map(|(assigned_surface, session)| {
+                (assigned_surface == surface).then_some(*session)
+            })
+    }
+
+    pub fn window_in_active_surface_session(&self, window: &Window) -> bool {
+        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+            return false;
+        };
+        self.session_for_toplevel_surface(&surface)
+            .unwrap_or(SurfaceSessionId(1))
+            == self.active_surface_session
+    }
+
     pub fn window_layout_rect(&self, window: &Window) -> Option<LayoutRect> {
+        if !self.window_in_active_surface_session(window) {
+            return None;
+        }
         let surface = Manifold::window_toplevel_surface(window)?;
         let leaf = self
             .window_layout_leaves
@@ -497,7 +590,14 @@ impl Manifold {
         self.window_layout_leaves
             .iter()
             .rev()
-            .find_map(|(surface, leaf)| (*leaf == target_leaf).then(|| surface.clone()))
+            .find_map(|(surface, leaf)| {
+                (*leaf == target_leaf
+                    && self
+                        .session_for_toplevel_surface(surface)
+                        .unwrap_or(SurfaceSessionId(1))
+                        == self.active_surface_session)
+                    .then(|| surface.clone())
+            })
     }
 
     fn focus_active_layout_leaf(&mut self) {
@@ -529,7 +629,10 @@ impl Manifold {
         self.active_toplevel_surface.as_ref().and_then(|active| {
             self.space
                 .elements()
-                .find(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
+                .find(|window| {
+                    self.window_in_active_surface_session(window)
+                        && Manifold::window_toplevel_surface(window).as_ref() == Some(active)
+                })
                 .cloned()
         })
     }
@@ -540,7 +643,12 @@ impl Manifold {
     }
 
     pub fn cycle_focus(&mut self, direction: FocusDirection) -> bool {
-        let windows = self.space.elements().cloned().collect::<Vec<_>>();
+        let windows = self
+            .space
+            .elements()
+            .filter(|window| self.window_in_active_surface_session(window))
+            .cloned()
+            .collect::<Vec<_>>();
         let window_count = windows.len();
         if window_count == 0 {
             self.focus_toplevel_surface(None);
@@ -571,6 +679,7 @@ impl Manifold {
         let active = self.active_toplevel_surface.as_ref()?;
         self.space
             .elements()
+            .filter(|window| self.window_in_active_surface_session(window))
             .position(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
     }
 
@@ -591,7 +700,12 @@ impl Manifold {
     }
 
     pub fn reconfigure_focus_stack(&mut self) {
-        let windows = self.space.elements().cloned().collect::<Vec<_>>();
+        let windows = self
+            .space
+            .elements()
+            .filter(|window| self.window_in_active_surface_session(window))
+            .cloned()
+            .collect::<Vec<_>>();
         for window in &windows {
             let location = self.window_layout_rect(window).map_or_else(
                 || focus_stack_location(0),
@@ -753,15 +867,29 @@ impl Manifold {
             .collect::<Vec<_>>();
         self.window_layout_leaves
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
-        let window_count = live_toplevel_surfaces.len();
+        self.window_surface_sessions
+            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        let window_count = self.active_surface_session_window_count();
 
         let keyboard = self.seat.get_keyboard().expect("keyboard");
         if let Some(current_focus) = keyboard.current_focus() {
-            let focus_is_live = live_toplevel_surfaces
-                .iter()
-                .any(|surface| surface == &current_focus);
+            let focus_is_live = live_toplevel_surfaces.iter().any(|surface| {
+                surface == &current_focus
+                    && self
+                        .session_for_toplevel_surface(surface)
+                        .unwrap_or(SurfaceSessionId(1))
+                        == self.active_surface_session
+            });
             if !focus_is_live {
-                if let Some(next_focus) = live_toplevel_surfaces.first().cloned() {
+                if let Some(next_focus) = live_toplevel_surfaces
+                    .iter()
+                    .find(|surface| {
+                        self.session_for_toplevel_surface(surface)
+                            .unwrap_or(SurfaceSessionId(1))
+                            == self.active_surface_session
+                    })
+                    .cloned()
+                {
                     self.focus_toplevel_surface(Some(next_focus));
                     self.stats.focus_repairs += 1;
                     outcome.focus_repaired = true;
@@ -1183,25 +1311,19 @@ mod runtime_stats_tests {
     fn input_frame_defer_remaining_only_waits_for_input_without_commit() {
         let mut stats = RuntimeStats::default();
 
-        assert!(
-            stats
-                .input_frame_defer_remaining(Duration::from_millis(3))
-                .is_none()
-        );
+        assert!(stats
+            .input_frame_defer_remaining(Duration::from_millis(3))
+            .is_none());
 
         stats.record_input(true);
-        assert!(
-            stats
-                .input_frame_defer_remaining(Duration::from_millis(3))
-                .is_some()
-        );
+        assert!(stats
+            .input_frame_defer_remaining(Duration::from_millis(3))
+            .is_some());
 
         stats.record_commit(true);
-        assert!(
-            stats
-                .input_frame_defer_remaining(Duration::from_millis(3))
-                .is_none()
-        );
+        assert!(stats
+            .input_frame_defer_remaining(Duration::from_millis(3))
+            .is_none());
     }
 
     #[test]

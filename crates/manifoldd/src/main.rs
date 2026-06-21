@@ -1,4 +1,5 @@
 mod browser;
+mod command;
 mod compositor;
 mod config;
 mod control;
