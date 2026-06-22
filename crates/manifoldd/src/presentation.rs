@@ -60,6 +60,7 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
     let Some(backend) = runtime.backend.as_mut() else {
         return;
     };
+    state.dmabuf.importer = Some(Rc::clone(&presenter.runtime));
     let mode = Mode {
         size: backend.window_size(),
         refresh: PRESENTATION_REFRESH_MILLIHZ,
@@ -111,6 +112,7 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         return Ok(());
     }
 
+    state.restore_last_interacted_surface_session();
     state.stats.record_attach_request();
     let mode = Mode {
         size: (1280, 800).into(),
@@ -577,11 +579,9 @@ fn send_active_client_frame_callbacks(
 fn initialize_dmabuf(state: &mut Manifold, backend: &mut PresenterBackend) {
     let dmabuf_formats = backend.renderer().dmabuf_formats();
     state.dmabuf.advertised_formats = dmabuf_formats.indexset().len();
-    let advertisement = dmabuf_advertisement_for(state.dmabuf.advertised_formats, None);
+    let advertisement = dmabuf_advertisement_for(state.dmabuf.advertised_formats);
     if let DmabufAdvertisement::Disabled { reason } = advertisement {
-        state.dmabuf.disabled_reason = Some(reason);
-        state.dmabuf.explicit_sync_disabled_reason =
-            explicit_sync_disabled_reason_for(advertisement);
+        disable_dmabuf(state, reason);
         #[cfg(not(feature = "shm-fallback"))]
         panic!("renderer reported no importable dmabuf texture formats");
         #[cfg(feature = "shm-fallback")]
@@ -596,37 +596,22 @@ fn initialize_dmabuf(state: &mut Manifold, backend: &mut PresenterBackend) {
 
     match render_node {
         Ok(Some(node)) => {
-            debug_assert_eq!(
-                dmabuf_advertisement_for(
-                    state.dmabuf.advertised_formats,
-                    Some(RenderNodeProbe::Available),
-                ),
-                DmabufAdvertisement::Version4,
-            );
-            let feedback =
-                match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone()).build() {
-                    Ok(feedback) => feedback,
-                    Err(err) => {
-                        if let DmabufAdvertisement::Version3 { disabled_reason } =
-                            dmabuf_advertisement_for(
-                                state.dmabuf.advertised_formats,
-                                Some(RenderNodeProbe::DefaultFeedbackFailed),
-                            )
-                        {
-                            state.dmabuf.disabled_reason = Some(disabled_reason);
-                            state.dmabuf.explicit_sync_disabled_reason = disabled_reason;
-                        }
-                        state.dmabuf.default_feedback = None;
-                        state.dmabuf.render_node = Some(format!("{node:?}"));
-                        warn!(
-                            ?err,
-                            render_node = ?state.dmabuf.render_node,
-                            "failed to build linux dmabuf default feedback; falling back to v3"
-                        );
-                        initialize_dmabuf_v3(state, dmabuf_formats);
-                        return;
-                    }
-                };
+            debug_assert_eq!(advertisement, DmabufAdvertisement::Version4);
+            let feedback = match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone())
+                .build()
+            {
+                Ok(feedback) => feedback,
+                Err(err) => {
+                    state.dmabuf.render_node = Some(format!("{node:?}"));
+                    disable_dmabuf(state, "default_feedback_error");
+                    warn!(
+                        ?err,
+                        render_node = ?state.dmabuf.render_node,
+                        "failed to build linux dmabuf default feedback; linux dmabuf global disabled"
+                    );
+                    return;
+                }
+            };
             let global = state
                 .dmabuf
                 .state
@@ -643,29 +628,15 @@ fn initialize_dmabuf(state: &mut Manifold, backend: &mut PresenterBackend) {
             );
         }
         Ok(None) => {
-            if let DmabufAdvertisement::Version3 { disabled_reason } = dmabuf_advertisement_for(
-                state.dmabuf.advertised_formats,
-                Some(RenderNodeProbe::Unavailable),
-            ) {
-                state.dmabuf.disabled_reason = Some(disabled_reason);
-                state.dmabuf.explicit_sync_disabled_reason = disabled_reason;
-            }
-            warn!("failed to query EGL render node; falling back to linux dmabuf v3");
-            initialize_dmabuf_v3(state, dmabuf_formats);
+            disable_dmabuf(state, "no_render_node");
+            warn!("failed to query EGL render node; linux dmabuf global disabled");
         }
         Err(err) => {
-            if let DmabufAdvertisement::Version3 { disabled_reason } = dmabuf_advertisement_for(
-                state.dmabuf.advertised_formats,
-                Some(RenderNodeProbe::QueryFailed),
-            ) {
-                state.dmabuf.disabled_reason = Some(disabled_reason);
-                state.dmabuf.explicit_sync_disabled_reason = disabled_reason;
-            }
+            disable_dmabuf(state, "egl_device_error");
             warn!(
                 ?err,
-                "failed to query EGL device; falling back to linux dmabuf v3"
+                "failed to query EGL device; linux dmabuf global disabled"
             );
-            initialize_dmabuf_v3(state, dmabuf_formats);
         }
     }
 }
@@ -716,65 +687,37 @@ fn initialize_explicit_sync(state: &mut Manifold, render_node: DrmNode) {
     );
 }
 
-fn initialize_dmabuf_v3(
-    state: &mut Manifold,
-    dmabuf_formats: smithay::backend::allocator::format::FormatSet,
-) {
-    let global = state
-        .dmabuf
-        .state
-        .create_global::<Manifold>(&state.display_handle, dmabuf_formats);
-    state.dmabuf.global = Some(global);
-    state.dmabuf.protocol_version = Some(3);
-    info!(
-        formats = state.dmabuf.advertised_formats,
-        "linux dmabuf v3 advertised"
-    );
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderNodeProbe {
-    Available,
-    Unavailable,
-    QueryFailed,
-    DefaultFeedbackFailed,
+fn disable_dmabuf(state: &mut Manifold, reason: &'static str) {
+    state.dmabuf.global = None;
+    state.dmabuf.default_feedback = None;
+    state.dmabuf.protocol_version = None;
+    state.dmabuf.importer = None;
+    state.dmabuf.disabled_reason = Some(reason);
+    state.dmabuf.explicit_sync_state = None;
+    state.dmabuf.explicit_sync_protocol_version = None;
+    state.dmabuf.explicit_sync_disabled_reason = reason;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DmabufAdvertisement {
     Disabled { reason: &'static str },
-    Version3 { disabled_reason: &'static str },
     Version4,
 }
 
-fn dmabuf_advertisement_for(
-    format_count: usize,
-    render_node: Option<RenderNodeProbe>,
-) -> DmabufAdvertisement {
+fn dmabuf_advertisement_for(format_count: usize) -> DmabufAdvertisement {
     if format_count == 0 {
         return DmabufAdvertisement::Disabled {
             reason: "no_dmabuf_texture_formats",
         };
     }
 
-    match render_node {
-        Some(RenderNodeProbe::Available) => DmabufAdvertisement::Version4,
-        Some(RenderNodeProbe::Unavailable) | None => DmabufAdvertisement::Version3 {
-            disabled_reason: "v3_no_render_node",
-        },
-        Some(RenderNodeProbe::QueryFailed) => DmabufAdvertisement::Version3 {
-            disabled_reason: "v3_egl_device_error",
-        },
-        Some(RenderNodeProbe::DefaultFeedbackFailed) => DmabufAdvertisement::Version3 {
-            disabled_reason: "v3_default_feedback_error",
-        },
-    }
+    DmabufAdvertisement::Version4
 }
 
+#[cfg(test)]
 fn explicit_sync_disabled_reason_for(advertisement: DmabufAdvertisement) -> &'static str {
     match advertisement {
         DmabufAdvertisement::Disabled { reason } => reason,
-        DmabufAdvertisement::Version3 { disabled_reason } => disabled_reason,
         DmabufAdvertisement::Version4 => "none",
     }
 }
@@ -829,7 +772,8 @@ pub(crate) fn sanitize_status_value(value: &str) -> String {
 fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manifold) {
     if state.detach_requested {
         state.detach_requested = false;
-        presenter.runtime.borrow_mut().destroy_window();
+        state.reset_transient_input_state();
+        presenter.runtime.borrow_mut().close_window();
         state.space.unmap_output(&presenter.output);
         state.presentation = PresentationStatus::Detached;
         state.stats.record_detach_applied();
@@ -838,7 +782,11 @@ fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manif
     }
 
     if state.attach_requested {
-        presenter.runtime.borrow_mut().request_window();
+        state.restore_last_interacted_surface_session();
+        let has_existing_window = presenter.runtime.borrow_mut().request_window();
+        if has_existing_window {
+            apply_presenter_created(presenter, state);
+        }
     }
 }
 
@@ -859,21 +807,15 @@ fn presentation_control_poll_interval(
 #[cfg(test)]
 mod tests {
     use super::{
-        DmabufAdvertisement, RenderNodeProbe, dmabuf_advertisement_for,
-        explicit_sync_disabled_reason_for, presentation_control_poll_interval,
-        presentation_runtime_error_status, sanitize_status_value,
+        DmabufAdvertisement, dmabuf_advertisement_for, explicit_sync_disabled_reason_for,
+        presentation_control_poll_interval, presentation_runtime_error_status,
+        sanitize_status_value,
     };
 
     #[test]
     fn dmabuf_is_disabled_when_renderer_reports_no_formats() {
         assert_eq!(
-            dmabuf_advertisement_for(0, None),
-            DmabufAdvertisement::Disabled {
-                reason: "no_dmabuf_texture_formats",
-            },
-        );
-        assert_eq!(
-            dmabuf_advertisement_for(0, Some(RenderNodeProbe::Available)),
+            dmabuf_advertisement_for(0),
             DmabufAdvertisement::Disabled {
                 reason: "no_dmabuf_texture_formats",
             },
@@ -882,66 +824,17 @@ mod tests {
 
     #[test]
     fn dmabuf_uses_v4_when_formats_and_render_node_are_available() {
-        assert_eq!(
-            dmabuf_advertisement_for(3, Some(RenderNodeProbe::Available)),
-            DmabufAdvertisement::Version4,
-        );
-    }
-
-    #[test]
-    fn dmabuf_falls_back_to_v3_when_render_node_is_missing_or_errors() {
-        assert_eq!(
-            dmabuf_advertisement_for(3, Some(RenderNodeProbe::Unavailable)),
-            DmabufAdvertisement::Version3 {
-                disabled_reason: "v3_no_render_node",
-            },
-        );
-        assert_eq!(
-            dmabuf_advertisement_for(3, Some(RenderNodeProbe::QueryFailed)),
-            DmabufAdvertisement::Version3 {
-                disabled_reason: "v3_egl_device_error",
-            },
-        );
-        assert_eq!(
-            dmabuf_advertisement_for(3, Some(RenderNodeProbe::DefaultFeedbackFailed)),
-            DmabufAdvertisement::Version3 {
-                disabled_reason: "v3_default_feedback_error",
-            },
-        );
+        assert_eq!(dmabuf_advertisement_for(3), DmabufAdvertisement::Version4,);
     }
 
     #[test]
     fn explicit_sync_disabled_reason_tracks_dmabuf_advertisement() {
         assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(0, None)),
+            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(0)),
             "no_dmabuf_texture_formats",
         );
         assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(
-                3,
-                Some(RenderNodeProbe::Unavailable),
-            )),
-            "v3_no_render_node",
-        );
-        assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(
-                3,
-                Some(RenderNodeProbe::QueryFailed),
-            )),
-            "v3_egl_device_error",
-        );
-        assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(
-                3,
-                Some(RenderNodeProbe::DefaultFeedbackFailed),
-            )),
-            "v3_default_feedback_error",
-        );
-        assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(
-                3,
-                Some(RenderNodeProbe::Available),
-            )),
+            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(3)),
             "none",
         );
     }

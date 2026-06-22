@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.codex/hooks/btrfs-pre-prompt-snapshot.sh\"",
+            "timeout": 30,
+            "statusMessage": "Snapshotting repo"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -98,6 +98,156 @@
         }
       );
 
+      packages = forEachSystem (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+
+          lib = pkgs.lib;
+
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            targets = [ "wasm32-unknown-unknown" ];
+          };
+
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
+
+          nativeLibs = with pkgs; [
+            libGL
+            libgbm
+            libinput
+            libxkbcommon
+            mesa
+            seatd
+            systemdLibs
+            vulkan-loader
+            wayland
+          ];
+
+          westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
+            mesonFlags = map (
+              flag: if flag == "-Dsimple-clients=" then "-Dsimple-clients=all" else flag
+            ) old.mesonFlags;
+          });
+
+          source = lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              let
+                base = baseNameOf path;
+              in
+              !(
+                type == "directory"
+                && builtins.elem base [
+                  "target"
+                  ".git"
+                ]
+              );
+          };
+
+          manifoldd = rustPlatform.buildRustPackage {
+            pname = "manifoldd";
+            version = "0.1.0";
+            src = source;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = nativeLibs;
+            cargoBuildFlags = [
+              "-p"
+              "manifoldd"
+            ];
+            cargoTestFlags = [
+              "-p"
+              "manifoldd"
+            ];
+          };
+
+          firefoxCloseReattachHarness =
+            pkgs.runCommand "manifold-firefox-close-reattach-harness.wasm"
+              {
+                nativeBuildInputs = [ rustToolchain ];
+              }
+              ''
+                rustc \
+                  --edition=2024 \
+                  --crate-name manifold_firefox_close_reattach_harness \
+                  --crate-type cdylib \
+                  --target wasm32-unknown-unknown \
+                  -O \
+                  ${./examples/wasm-firefox-close-reattach-harness/src/lib.rs} \
+                  -o "$out"
+              '';
+
+          firefoxCloseReattachTestScript =
+            pkgs.runCommand "manifold-firefox-close-reattach-test-script"
+              {
+                nativeBuildInputs = [ pkgs.makeWrapper ];
+              }
+              ''
+                mkdir -p "$out/bin"
+                makeWrapper ${pkgs.bash}/bin/bash "$out/bin/manifold-firefox-close-reattach-test" \
+                  --add-flags ${./tools/run-headless-firefox-close-reattach.sh} \
+                  --prefix PATH : "${
+                    lib.makeBinPath [
+                      pkgs.bash
+                      pkgs.coreutils
+                      pkgs.firefox
+                      pkgs.gnugrep
+                      pkgs.gnused
+                      pkgs.jq
+                      westonWithSimpleClients
+                    ]
+                  }" \
+                  --set LD_LIBRARY_PATH "${lib.makeLibraryPath nativeLibs}" \
+                  --set MANIFOLDD_BIN "${manifoldd}/bin/manifoldd" \
+                  --set HARNESS_WASM "${firefoxCloseReattachHarness}" \
+                  --set FIREFOX_BIN "${pkgs.firefox}/bin/firefox" \
+                  --set WESTON_SIMPLE_SHM "${westonWithSimpleClients}/bin/weston-simple-shm"
+              '';
+
+          firefoxCloseReattachTest =
+            pkgs.runCommand "manifold-firefox-close-reattach-test"
+              {
+                nativeBuildInputs = [ firefoxCloseReattachTestScript ];
+              }
+              ''
+                export EGL_PLATFORM=wayland
+                export LIBGL_ALWAYS_SOFTWARE=1
+                export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
+                export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+                export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+                export WORKDIR="$TMPDIR/firefox-close-reattach"
+
+                manifold-firefox-close-reattach-test
+
+                mkdir -p "$out"
+                mkdir -p "$out/artifacts/nested"
+                cp "$WORKDIR/test.log" "$out/artifacts/test.log"
+                cp "$WORKDIR"/nested/*.log "$out/artifacts/nested/" 2>/dev/null || true
+                echo "OK" > "$out/result"
+              '';
+        in
+        {
+          default = manifoldd;
+          inherit
+            manifoldd
+            firefoxCloseReattachHarness
+            firefoxCloseReattachTestScript
+            firefoxCloseReattachTest
+            ;
+        }
+      );
+
+      checks = forEachSystem (system: {
+        firefox-close-reattach = self.packages.${system}.firefoxCloseReattachTest;
+      });
+
       formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };
 }

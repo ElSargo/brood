@@ -99,33 +99,45 @@ impl Manifold {
         }
 
         if is_ctrl {
-            self.ctrl_pressed = state == KeyState::Pressed;
-            match (state, self.input_mode, self.ctrl_forwarded_to_client) {
-                (KeyState::Pressed, InputMode::Passthrough, _) => {
-                    self.ctrl_forwarded_to_client = true;
-                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+            match state {
+                KeyState::Pressed => {
+                    self.ctrl_pressed = true;
+                    self.ctrl_pressed_key = Some(key_code);
+                    self.record_consumed_keyboard_input();
                 }
-                (KeyState::Released, _, true) => {
+                KeyState::Released if self.ctrl_forwarded_to_client => {
+                    self.ctrl_pressed = false;
+                    self.ctrl_pressed_key = None;
                     self.ctrl_forwarded_to_client = false;
                     self.forward_keyboard_key_to_focused_client(key_code, state, time);
                 }
-                _ => self.record_consumed_keyboard_input(),
+                KeyState::Released => {
+                    self.ctrl_pressed = false;
+                    self.ctrl_pressed_key = None;
+                    self.record_consumed_keyboard_input();
+                }
             }
             return;
         }
 
         if is_alt {
-            self.alt_pressed = state == KeyState::Pressed;
-            match (state, self.input_mode, self.alt_forwarded_to_client) {
-                (KeyState::Pressed, InputMode::Passthrough, _) => {
-                    self.alt_forwarded_to_client = true;
-                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+            match state {
+                KeyState::Pressed => {
+                    self.alt_pressed = true;
+                    self.alt_pressed_key = Some(key_code);
+                    self.record_consumed_keyboard_input();
                 }
-                (KeyState::Released, _, true) => {
+                KeyState::Released if self.alt_forwarded_to_client => {
+                    self.alt_pressed = false;
+                    self.alt_pressed_key = None;
                     self.alt_forwarded_to_client = false;
                     self.forward_keyboard_key_to_focused_client(key_code, state, time);
                 }
-                _ => self.record_consumed_keyboard_input(),
+                KeyState::Released => {
+                    self.alt_pressed = false;
+                    self.alt_pressed_key = None;
+                    self.record_consumed_keyboard_input();
+                }
             }
             return;
         }
@@ -155,6 +167,9 @@ impl Manifold {
             return;
         }
 
+        if self.input_mode != InputMode::Normal {
+            self.forward_pressed_modifiers_to_focused_client(time);
+        }
         self.forward_keyboard_key_to_focused_client(key_code, state, time);
     }
 
@@ -209,6 +224,21 @@ impl Manifold {
             self.presentation == PresentationStatus::Attached && self.active_window().is_some();
         self.stats.record_input(can_sample_visible_latency);
         self.stats.keyboard_events += 1;
+    }
+
+    fn forward_pressed_modifiers_to_focused_client(&mut self, time: u32) {
+        if self.ctrl_pressed && !self.ctrl_forwarded_to_client {
+            if let Some(key_code) = self.ctrl_pressed_key {
+                self.ctrl_forwarded_to_client = true;
+                self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
+            }
+        }
+        if self.alt_pressed && !self.alt_forwarded_to_client {
+            if let Some(key_code) = self.alt_pressed_key {
+                self.alt_forwarded_to_client = true;
+                self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
+            }
+        }
     }
 
     fn forward_keyboard_key_to_focused_client(

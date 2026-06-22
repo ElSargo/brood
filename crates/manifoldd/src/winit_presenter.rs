@@ -32,7 +32,7 @@ use smithay::{
     },
     utils::{Clock, Monotonic, Physical, Rectangle, Size},
 };
-use tracing::{debug, info_span};
+use tracing::{debug, info_span, warn};
 use wayland_egl as wegl;
 
 pub(crate) type SharedPresenterRuntime = Rc<RefCell<PresenterRuntime>>;
@@ -131,37 +131,57 @@ impl PresenterRuntime {
         }
     }
 
-    pub fn request_window(&mut self) {
+    pub fn request_window(&mut self) -> bool {
         self.want_window = true;
+        self.backend
+            .as_ref()
+            .is_some_and(PresenterBackend::has_frontend)
     }
 
-    pub fn destroy_window(&mut self) {
+    pub fn close_window(&mut self) {
         self.want_window = false;
-        if let Some(backend) = self.backend.take() {
+        if let Some(backend) = self.backend.as_mut() {
             debug!(
-                window_strong_count = Arc::strong_count(&backend.window),
-                "destroying presentation window"
+                window_strong_count = backend
+                    .frontend
+                    .as_ref()
+                    .map_or(0, |frontend| Arc::strong_count(&frontend.window)),
+                "closing presentation window"
             );
-            drop(backend);
+            backend.destroy_frontend();
             self.destroy_flush_pumps = self.destroy_flush_pumps.max(4);
         }
     }
 
     fn ensure_window(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.want_window || self.backend.is_some() {
+        if !self.want_window
+            || self
+                .backend
+                .as_ref()
+                .is_some_and(PresenterBackend::has_frontend)
+        {
             return;
         }
-        match PresenterBackend::new(
-            event_loop,
-            self.attributes.clone(),
-            self.gl_attributes,
-            self._span.clone(),
-        ) {
-            Ok(backend) => {
-                self._span
-                    .record("window", Into::<u64>::into(backend.window().id()));
-                self.pending_events.push(PresenterEvent::Created);
+
+        let result = match self.backend.as_mut() {
+            Some(backend) => backend.create_frontend(event_loop, self.attributes.clone()),
+            None => PresenterBackend::new(
+                event_loop,
+                self.attributes.clone(),
+                self.gl_attributes,
+                self._span.clone(),
+            )
+            .map(|backend| {
                 self.backend = Some(backend);
+            }),
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(window) = self.backend.as_ref().map(PresenterBackend::window) {
+                    self._span.record("window", Into::<u64>::into(window.id()));
+                }
+                self.pending_events.push(PresenterEvent::Created);
             }
             Err(err) => {
                 self.pending_error = Some(err.to_string());
@@ -173,17 +193,30 @@ impl PresenterRuntime {
     }
 
     fn active_window_id(&self) -> Option<WindowId> {
-        self.backend.as_ref().map(|backend| backend.window().id())
+        self.backend.as_ref().and_then(|backend| {
+            backend
+                .frontend
+                .as_ref()
+                .map(|frontend| frontend.window.id())
+        })
     }
 
     fn active_window_size(&self) -> Option<PhysicalSize<u32>> {
-        self.backend
-            .as_ref()
-            .map(|backend| backend.window().inner_size())
+        self.backend.as_ref().and_then(|backend| {
+            backend
+                .frontend
+                .as_ref()
+                .map(|frontend| frontend.window.inner_size())
+        })
     }
 
     fn active_is_x11(&self) -> bool {
-        self.backend.as_ref().is_some_and(|backend| backend.is_x11)
+        self.backend.as_ref().is_some_and(|backend| {
+            backend
+                .frontend
+                .as_ref()
+                .is_some_and(|frontend| frontend.is_x11)
+        })
     }
 }
 
@@ -191,11 +224,16 @@ impl PresenterRuntime {
 pub(crate) struct PresenterBackend {
     renderer: GlesRenderer,
     _display: EGLDisplay,
-    egl_surface: EGLSurface,
-    window: Arc<WinitWindow>,
+    frontend: Option<PresenterFrontend>,
     damage_tracking: bool,
     bind_size: Option<Size<i32, Physical>>,
     _span: tracing::Span,
+}
+
+#[derive(Debug)]
+struct PresenterFrontend {
+    egl_surface: EGLSurface,
+    window: Arc<WinitWindow>,
     is_x11: bool,
 }
 
@@ -231,46 +269,7 @@ impl PresenterBackend {
             EGLContext::new_with_config(&display, gl_attributes, PixelFormatRequirements::_8_bit())
         })?;
 
-        let (egl_surface, is_x11) = match window.window_handle().map(|handle| handle.as_raw()) {
-            Ok(RawWindowHandle::Wayland(handle)) => {
-                let size = window.inner_size();
-                let surface = unsafe {
-                    wegl::WlEglSurface::new_from_raw(
-                        handle.surface.as_ptr().cast(),
-                        size.width as i32,
-                        size.height as i32,
-                    )
-                }
-                .map_err(|err| PresenterBackendError::Surface(err.to_string()))?;
-                unsafe {
-                    (
-                        EGLSurface::new(
-                            &display,
-                            context
-                                .pixel_format()
-                                .expect("EGL context has pixel format"),
-                            context.config_id(),
-                            surface,
-                        )?,
-                        false,
-                    )
-                }
-            }
-            Ok(RawWindowHandle::Xlib(handle)) => unsafe {
-                (
-                    EGLSurface::new(
-                        &display,
-                        context
-                            .pixel_format()
-                            .expect("EGL context has pixel format"),
-                        context.config_id(),
-                        native::XlibWindow(handle.window),
-                    )?,
-                    true,
-                )
-            },
-            _ => return Err(PresenterBackendError::UnsupportedWindowHandle),
-        };
+        let (egl_surface, is_x11) = create_egl_surface(&window, &display, &context)?;
 
         let _ = context.unbind();
         let renderer = unsafe { GlesRenderer::new(context)? };
@@ -280,22 +279,69 @@ impl PresenterBackend {
         Ok(Self {
             renderer,
             _display: display,
-            egl_surface,
-            window,
+            frontend: Some(PresenterFrontend {
+                egl_surface,
+                window,
+                is_x11,
+            }),
             damage_tracking,
             bind_size: None,
             _span: span,
-            is_x11,
         })
     }
 
+    fn create_frontend(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        attributes: WindowAttributes,
+    ) -> Result<(), PresenterBackendError> {
+        let _guard = self._span.enter();
+        let window = Arc::new(event_loop.create_window(attributes)?);
+        debug!("presentation window recreated");
+        let (egl_surface, is_x11) = create_egl_surface(
+            &window,
+            self.renderer.egl_context().display(),
+            self.renderer.egl_context(),
+        )?;
+        self.frontend = Some(PresenterFrontend {
+            egl_surface,
+            window,
+            is_x11,
+        });
+        self.bind_size = None;
+        Ok(())
+    }
+
+    fn destroy_frontend(&mut self) {
+        if let Err(err) = self.renderer.egl_context().unbind() {
+            warn!(
+                ?err,
+                "failed to unbind EGL context before closing presentation window"
+            );
+        }
+        self.frontend = None;
+        self.bind_size = None;
+    }
+
+    fn has_frontend(&self) -> bool {
+        self.frontend.is_some()
+    }
+
     pub fn window_size(&self) -> Size<i32, Physical> {
-        let (w, h): (i32, i32) = self.window.inner_size().into();
+        let frontend = self
+            .frontend
+            .as_ref()
+            .expect("presentation window size requested without frontend");
+        let (w, h): (i32, i32) = frontend.window.inner_size().into();
         (w, h).into()
     }
 
     pub fn window(&self) -> &WinitWindow {
-        &self.window
+        &self
+            .frontend
+            .as_ref()
+            .expect("presentation window requested without frontend")
+            .window
     }
 
     pub fn renderer(&mut self) -> &mut GlesRenderer {
@@ -311,12 +357,19 @@ impl PresenterBackend {
         ),
         SwapBuffersError,
     > {
-        let window_size = self.window_size();
+        let frontend = self
+            .frontend
+            .as_mut()
+            .expect("presentation render requested without frontend");
+        let (w, h): (i32, i32) = frontend.window.inner_size().into();
+        let window_size = Size::from((w, h));
         if Some(window_size) != self.bind_size {
-            self.egl_surface.resize(window_size.w, window_size.h, 0, 0);
+            frontend
+                .egl_surface
+                .resize(window_size.w, window_size.h, 0, 0);
         }
         self.bind_size = Some(window_size);
-        let fb = self.renderer.bind(&mut self.egl_surface)?;
+        let fb = self.renderer.bind(&mut frontend.egl_surface)?;
         Ok((&mut self.renderer, fb))
     }
 
@@ -343,9 +396,60 @@ impl PresenterBackend {
             }
             _ => None,
         };
-        self.window.pre_present_notify();
-        self.egl_surface.swap_buffers(damage.as_deref_mut())?;
+        let frontend = self
+            .frontend
+            .as_mut()
+            .expect("presentation submit requested without frontend");
+        frontend.window.pre_present_notify();
+        frontend.egl_surface.swap_buffers(damage.as_deref_mut())?;
         Ok(())
+    }
+}
+
+fn create_egl_surface(
+    window: &Arc<WinitWindow>,
+    display: &EGLDisplay,
+    context: &EGLContext,
+) -> Result<(EGLSurface, bool), PresenterBackendError> {
+    match window.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Wayland(handle)) => {
+            let size = window.inner_size();
+            let surface = unsafe {
+                wegl::WlEglSurface::new_from_raw(
+                    handle.surface.as_ptr().cast(),
+                    size.width as i32,
+                    size.height as i32,
+                )
+            }
+            .map_err(|err| PresenterBackendError::Surface(err.to_string()))?;
+            unsafe {
+                Ok((
+                    EGLSurface::new(
+                        display,
+                        context
+                            .pixel_format()
+                            .expect("EGL context has pixel format"),
+                        context.config_id(),
+                        surface,
+                    )?,
+                    false,
+                ))
+            }
+        }
+        Ok(RawWindowHandle::Xlib(handle)) => unsafe {
+            Ok((
+                EGLSurface::new(
+                    display,
+                    context
+                        .pixel_format()
+                        .expect("EGL context has pixel format"),
+                    context.config_id(),
+                    native::XlibWindow(handle.window),
+                )?,
+                true,
+            ))
+        },
+        _ => Err(PresenterBackendError::UnsupportedWindowHandle),
     }
 }
 

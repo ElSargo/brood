@@ -127,12 +127,16 @@ pub struct Manifold {
     window_pane_ids: Vec<(WlSurface, u64)>,
     pub(crate) ctrl_pressed: bool,
     pub(crate) alt_pressed: bool,
+    pub(crate) ctrl_pressed_key: Option<smithay::backend::input::Keycode>,
+    pub(crate) alt_pressed_key: Option<smithay::backend::input::Keycode>,
     pub(crate) ctrl_forwarded_to_client: bool,
     pub(crate) alt_forwarded_to_client: bool,
     pub(crate) suppress_mode_toggle_key_release: bool,
     pub input_mode: InputMode,
     managed_fullscreen: bool,
     active_surface_session: SurfaceSessionId,
+    last_interacted_surface_session: SurfaceSessionId,
+    surface_session_interaction_order: Vec<SurfaceSessionId>,
     next_surface_session: u64,
     surface_sessions: Vec<SurfaceSessionId>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
@@ -213,12 +217,16 @@ impl Manifold {
             window_pane_ids: Vec::new(),
             ctrl_pressed: false,
             alt_pressed: false,
+            ctrl_pressed_key: None,
+            alt_pressed_key: None,
             ctrl_forwarded_to_client: false,
             alt_forwarded_to_client: false,
             suppress_mode_toggle_key_release: false,
             input_mode: InputMode::Passthrough,
             managed_fullscreen: false,
             active_surface_session: SurfaceSessionId(1),
+            last_interacted_surface_session: SurfaceSessionId(1),
+            surface_session_interaction_order: vec![SurfaceSessionId(1)],
             next_surface_session: 2,
             surface_sessions: vec![SurfaceSessionId(1)],
             window_surface_sessions: Vec::new(),
@@ -773,6 +781,82 @@ impl Manifold {
         self.active_surface_session
     }
 
+    pub fn restore_last_interacted_surface_session(&mut self) -> bool {
+        let Some(session) = self.most_recent_live_surface_session() else {
+            return false;
+        };
+        if self.active_surface_session == session {
+            return false;
+        }
+        self.active_surface_session = session;
+        self.reconfigure_focus_stack();
+        true
+    }
+
+    fn most_recent_live_surface_session(&self) -> Option<SurfaceSessionId> {
+        self.surface_session_interaction_order
+            .iter()
+            .copied()
+            .find(|session| {
+                self.surface_sessions.contains(session)
+                    && self.space.elements().any(|window| {
+                        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+                            return false;
+                        };
+                        self.session_for_toplevel_surface(&surface)
+                            .unwrap_or(SurfaceSessionId(1))
+                            == *session
+                    })
+            })
+    }
+
+    fn record_surface_session_interaction(&mut self, session: SurfaceSessionId) {
+        if !self.surface_sessions.contains(&session) {
+            return;
+        }
+        self.last_interacted_surface_session = session;
+        self.surface_session_interaction_order
+            .retain(|existing| *existing != session);
+        self.surface_session_interaction_order.insert(0, session);
+    }
+
+    pub fn reset_transient_input_state(&mut self) {
+        if self.ctrl_forwarded_to_client {
+            if let Some(key_code) = self.ctrl_pressed_key {
+                self.seat.get_keyboard().expect("keyboard").input::<(), _>(
+                    self,
+                    key_code,
+                    smithay::backend::input::KeyState::Released,
+                    SERIAL_COUNTER.next_serial(),
+                    0,
+                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
+                );
+            }
+        }
+        if self.alt_forwarded_to_client {
+            if let Some(key_code) = self.alt_pressed_key {
+                self.seat.get_keyboard().expect("keyboard").input::<(), _>(
+                    self,
+                    key_code,
+                    smithay::backend::input::KeyState::Released,
+                    SERIAL_COUNTER.next_serial(),
+                    0,
+                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
+                );
+            }
+        }
+
+        self.ctrl_pressed = false;
+        self.alt_pressed = false;
+        self.ctrl_pressed_key = None;
+        self.alt_pressed_key = None;
+        self.ctrl_forwarded_to_client = false;
+        self.alt_forwarded_to_client = false;
+        self.suppress_mode_toggle_key_release = false;
+        self.pending_pointer_focus_surface = None;
+        self.pointer_hover_toplevel_surface = None;
+    }
+
     pub fn surface_session_count(&self) -> usize {
         self.surface_sessions.len()
     }
@@ -803,6 +887,7 @@ impl Manifold {
         }
         self.active_surface_session =
             self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
+        self.record_surface_session_interaction(self.active_surface_session);
         self.reconfigure_focus_stack();
         true
     }
@@ -812,6 +897,7 @@ impl Manifold {
         self.next_surface_session += 1;
         self.surface_sessions.push(session);
         self.active_surface_session = session;
+        self.record_surface_session_interaction(session);
         self.reconfigure_focus_stack();
         session
     }
@@ -917,6 +1003,12 @@ impl Manifold {
     }
 
     pub fn focus_toplevel_surface(&mut self, active_surface: Option<WlSurface>) {
+        if let Some(session) = active_surface
+            .as_ref()
+            .and_then(|surface| self.session_for_toplevel_surface(surface))
+        {
+            self.record_surface_session_interaction(session);
+        }
         if let Some(leaf) = active_surface
             .as_ref()
             .and_then(|surface| self.leaf_for_toplevel_surface(surface))
@@ -1197,7 +1289,11 @@ impl Manifold {
         let Some(toplevel) = window.toplevel() else {
             return false;
         };
+        self.reset_transient_input_state();
         toplevel.send_close();
+        if let Err(err) = self.display_handle.flush_clients() {
+            warn!(?err, "flush clients after close request failed");
+        }
         true
     }
 
@@ -1229,7 +1325,6 @@ impl Manifold {
     fn refresh_window_state_inner(&mut self) -> WindowRefreshOutcome {
         self.space.refresh();
         self.popups.cleanup();
-        self.reconfigure_focus_stack();
 
         let mut outcome = WindowRefreshOutcome::default();
         let live_toplevel_surfaces = self
@@ -1264,9 +1359,40 @@ impl Manifold {
             self.pointer_hover_toplevel_surface = None;
         }
         let window_count = self.active_surface_session_window_count();
+        let active_surface_is_live = self
+            .active_toplevel_surface
+            .as_ref()
+            .is_some_and(|surface| {
+                live_toplevel_surfaces.iter().any(|live| live == surface)
+                    && self
+                        .session_for_toplevel_surface(surface)
+                        .unwrap_or(SurfaceSessionId(1))
+                        == self.active_surface_session
+            });
 
-        let keyboard = self.seat.get_keyboard().expect("keyboard");
-        if let Some(current_focus) = keyboard.current_focus() {
+        if self.active_toplevel_surface.is_some() && !active_surface_is_live {
+            self.reset_transient_input_state();
+            if let Some(next_focus) = live_toplevel_surfaces
+                .iter()
+                .find(|surface| {
+                    self.session_for_toplevel_surface(surface)
+                        .unwrap_or(SurfaceSessionId(1))
+                        == self.active_surface_session
+                })
+                .cloned()
+            {
+                self.focus_toplevel_surface(Some(next_focus));
+                self.stats.focus_repairs += 1;
+                outcome.focus_repaired = true;
+            } else {
+                self.focus_toplevel_surface(None);
+                self.stats.focus_clears += 1;
+                outcome.focus_cleared = true;
+            }
+        }
+
+        let current_focus = self.seat.get_keyboard().expect("keyboard").current_focus();
+        if let Some(current_focus) = current_focus {
             let focus_is_live = live_toplevel_surfaces.iter().any(|surface| {
                 surface == &current_focus
                     && self
@@ -1275,6 +1401,7 @@ impl Manifold {
                         == self.active_surface_session
             });
             if !focus_is_live {
+                self.reset_transient_input_state();
                 if let Some(next_focus) = live_toplevel_surfaces
                     .iter()
                     .find(|surface| {
@@ -1293,11 +1420,13 @@ impl Manifold {
                     outcome.focus_cleared = true;
                 }
             } else if self.last_window_count > 0 && window_count == 0 {
+                self.reset_transient_input_state();
                 self.focus_toplevel_surface(None);
                 self.stats.focus_clears += 1;
                 outcome.focus_cleared = true;
             }
         }
+        self.reconfigure_focus_stack();
         self.last_window_count = window_count;
         outcome
     }
@@ -1931,5 +2060,11 @@ pub struct ClientState {
 
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
-    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
+        warn!(
+            ?client_id,
+            ?reason,
+            "Wayland client disconnected from Manifold"
+        );
+    }
 }

@@ -58,7 +58,7 @@ use crate::{
     state::{ClientState, Manifold, PresentationStatus},
     wasm_key::WasmKeyHandler,
     wasm_map::WasmMapHook,
-    wasm_test::TestHarnessRuntime,
+    wasm_test::{TestHarnessOutcomeKind, TestHarnessRuntime},
 };
 
 pub fn run(args: RunArgs) -> Result<()> {
@@ -133,6 +133,14 @@ pub fn run(args: RunArgs) -> Result<()> {
             "TEST_HARNESS_RESULT kind={:?} exit_code={} detail={}",
             completion.kind, completion.exit_code, completion.detail
         );
+        if completion.kind != TestHarnessOutcomeKind::Passed {
+            bail!(
+                "test harness exited with {:?} code {}: {}",
+                completion.kind,
+                completion.exit_code,
+                completion.detail
+            );
+        }
     }
 
     Ok(())
