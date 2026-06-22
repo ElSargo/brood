@@ -122,8 +122,8 @@ pub fn run(args: RunArgs) -> Result<()> {
     info!("manifoldd compositor running");
     event_loop.run(None, &mut state, |state| {
         state.service_test_harness();
-        if state.attach_requested && !state.presentation_started {
-            state.attach_requested = false;
+        if state.attach_requested && !state.presentation_started && !state.attach_schedule_pending {
+            state.attach_schedule_pending = true;
             state.schedule_attach();
         }
     })?;

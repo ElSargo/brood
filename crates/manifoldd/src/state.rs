@@ -83,6 +83,18 @@ impl SurfaceSessionId {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SurfaceSessionSummary {
+    pub id: u64,
+    pub name: String,
+    pub active: bool,
+    pub windows: usize,
 }
 
 pub struct Manifold {
@@ -112,6 +124,7 @@ pub struct Manifold {
     pub presentation_runtime_failures: u64,
     pub presentation_last_error: Option<String>,
     pub attach_requested: bool,
+    pub attach_schedule_pending: bool,
     pub detach_requested: bool,
     pub browsers: BrowserManager,
     pub layout: LayoutState,
@@ -139,6 +152,7 @@ pub struct Manifold {
     surface_session_interaction_order: Vec<SurfaceSessionId>,
     next_surface_session: u64,
     surface_sessions: Vec<SurfaceSessionId>,
+    surface_session_names: Vec<(SurfaceSessionId, String)>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
@@ -202,6 +216,7 @@ impl Manifold {
             presentation_runtime_failures: 0,
             presentation_last_error: None,
             attach_requested: false,
+            attach_schedule_pending: false,
             detach_requested: false,
             browsers: BrowserManager::default(),
             layout: LayoutState::default(),
@@ -229,6 +244,7 @@ impl Manifold {
             surface_session_interaction_order: vec![SurfaceSessionId(1)],
             next_surface_session: 2,
             surface_sessions: vec![SurfaceSessionId(1)],
+            surface_session_names: vec![(SurfaceSessionId(1), "session 1".to_string())],
             window_surface_sessions: Vec::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
@@ -378,6 +394,8 @@ impl Manifold {
         self.presentation_attach_failures += 1;
         self.presentation_last_error = Some(crate::presentation::sanitize_status_value(error));
         self.presentation = PresentationStatus::Detached;
+        self.attach_requested = false;
+        self.attach_schedule_pending = false;
     }
 
     pub fn schedule_attach(&mut self) {
@@ -389,6 +407,7 @@ impl Manifold {
                     warn!(?err, "failed to attach presentation");
                     state.record_presentation_attach_failure(&err.to_string());
                 }
+                state.attach_schedule_pending = false;
                 TimeoutAction::Drop
             });
         if let Err(err) = result {
@@ -861,11 +880,53 @@ impl Manifold {
         self.surface_sessions.len()
     }
 
+    pub fn surface_session_summaries(&self) -> Vec<SurfaceSessionSummary> {
+        self.surface_sessions
+            .iter()
+            .copied()
+            .map(|session| SurfaceSessionSummary {
+                id: session.raw(),
+                name: self.surface_session_name(session).to_string(),
+                active: session == self.active_surface_session,
+                windows: self.surface_session_window_count(session),
+            })
+            .collect()
+    }
+
+    fn surface_session_name(&self, session: SurfaceSessionId) -> &str {
+        self.surface_session_names
+            .iter()
+            .rev()
+            .find_map(|(assigned_session, name)| (*assigned_session == session).then_some(name))
+            .map_or("untitled", String::as_str)
+    }
+
     pub fn active_surface_session_window_count(&self) -> usize {
+        self.surface_session_window_count(self.active_surface_session)
+    }
+
+    fn surface_session_window_count(&self, session: SurfaceSessionId) -> usize {
         self.space
             .elements()
-            .filter(|window| self.window_in_active_surface_session(window))
+            .filter(|window| {
+                let Some(surface) = Manifold::window_toplevel_surface(window) else {
+                    return false;
+                };
+                self.session_for_toplevel_surface(&surface)
+                    .unwrap_or(SurfaceSessionId(1))
+                    == session
+            })
             .count()
+    }
+
+    pub fn switch_to_surface_session(&mut self, session: SurfaceSessionId) -> bool {
+        if !self.surface_sessions.contains(&session) || self.active_surface_session == session {
+            return false;
+        }
+        self.active_surface_session = session;
+        self.record_surface_session_interaction(session);
+        self.reconfigure_focus_stack();
+        true
     }
 
     pub fn switch_to_next_surface_session(&mut self) -> bool {
@@ -893,9 +954,21 @@ impl Manifold {
     }
 
     pub fn create_and_attach_surface_session(&mut self) -> SurfaceSessionId {
+        self.create_and_attach_named_surface_session(None)
+    }
+
+    pub fn create_and_attach_named_surface_session(
+        &mut self,
+        name: Option<String>,
+    ) -> SurfaceSessionId {
         let session = SurfaceSessionId(self.next_surface_session);
         self.next_surface_session += 1;
         self.surface_sessions.push(session);
+        self.surface_session_names.push((
+            session,
+            name.filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| format!("session {}", session.raw())),
+        ));
         self.active_surface_session = session;
         self.record_surface_session_interaction(session);
         self.reconfigure_focus_stack();

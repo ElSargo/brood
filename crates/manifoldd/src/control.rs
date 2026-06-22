@@ -3,10 +3,11 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
+    process::{Command as ProcessCommand, Stdio},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState},
     input::pointer::AxisFrame,
@@ -16,11 +17,13 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    CtlArgs, browser,
+    CtlArgs, SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
-    state::{FocusDirection, Manifold},
+    state::{
+        FocusDirection, Manifold, PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
+    },
 };
 
 const MAX_CONTROL_COMMAND_BYTES: usize = 64 * 1024;
@@ -69,6 +72,54 @@ pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, path: &Path) -> Res
 pub fn send(args: CtlArgs) -> Result<()> {
     let response = request_socket_command(&args.control_socket, &args.command, args.json)?;
     print!("{response}");
+    Ok(())
+}
+
+pub fn switch(args: SwitchArgs) -> Result<()> {
+    let list = request_surface_session_list(&args.control_socket)?;
+    ensure!(!list.sessions.is_empty(), "no open sessions");
+    let initial_query = joined_name(&args.query);
+
+    let outcome = match args.session_id {
+        Some(id) => {
+            ensure!(
+                list.sessions.iter().any(|session| session.id == id),
+                "session {id} is not open"
+            );
+            SessionSwitchOutcome::Existing(id)
+        }
+        None => run_skim_session_picker(&args.skim, &list.sessions, initial_query.as_deref())?,
+    };
+
+    match outcome {
+        SessionSwitchOutcome::Existing(selected) => {
+            let response = request_socket_command(
+                &args.control_socket,
+                &[
+                    "surface-session".to_string(),
+                    "switch".to_string(),
+                    selected.to_string(),
+                ],
+                false,
+            )?;
+            ensure_ok_response(&response)?;
+        }
+        SessionSwitchOutcome::Create(name) => {
+            let response = request_socket_command(
+                &args.control_socket,
+                &["surface-session".to_string(), "new".to_string(), name],
+                false,
+            )?;
+            ensure_ok_response(&response)?;
+        }
+    }
+
+    if list.presentation == "Detached" {
+        let response =
+            request_socket_command(&args.control_socket, &["attach".to_string()], false)?;
+        ensure_ok_response(&response)?;
+    }
+
     Ok(())
 }
 
@@ -276,6 +327,10 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             format!("OK layout-action action={action} changed={changed}\n")
         }
         "surface-session" => match args {
+            [subcommand] if subcommand == "list-json" => {
+                let response = SurfaceSessionList::from_state(state);
+                format!("{}\n", serde_json::to_string(&response)?)
+            }
             [subcommand] if subcommand == "next" => {
                 let changed =
                     WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext).apply(state);
@@ -284,14 +339,31 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                     state.active_surface_session().raw()
                 )
             }
-            [subcommand] if subcommand == "new" => {
-                WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
+            [subcommand, name @ ..] if subcommand == "new" => {
+                let name = joined_name(name);
+                if let Some(name) = name {
+                    state.create_and_attach_named_surface_session(Some(name));
+                } else {
+                    WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
+                }
                 format!(
                     "OK surface-session active={} created=true\n",
                     state.active_surface_session().raw()
                 )
             }
-            _ => bail!("usage: surface-session next|new"),
+            [subcommand, id] if subcommand == "switch" => {
+                let id = parse_u64(id, "session id")?;
+                let changed = state.switch_to_surface_session(SurfaceSessionId::from_raw(id));
+                ensure!(
+                    changed || state.active_surface_session().raw() == id,
+                    "unknown surface session {id}"
+                );
+                format!(
+                    "OK surface-session active={} changed={changed}\n",
+                    state.active_surface_session().raw()
+                )
+            }
+            _ => bail!("usage: surface-session list-json|next|new|switch <id>"),
         },
         "browser" => browser::handle_control(args, state)?,
         "harness" => match args {
@@ -750,6 +822,12 @@ fn parse_u32(value: &str, name: &str) -> Result<u32> {
         .with_context(|| format!("{name} must be an unsigned integer"))
 }
 
+fn parse_u64(value: &str, name: &str) -> Result<u64> {
+    value
+        .parse()
+        .with_context(|| format!("{name} must be an unsigned integer"))
+}
+
 fn parse_i32(value: &str, name: &str) -> Result<i32> {
     value
         .parse()
@@ -806,4 +884,223 @@ fn parse_command_tokens(input: &str) -> Result<Vec<String>> {
     }
 
     Ok(input.split_whitespace().map(ToString::to_string).collect())
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct SurfaceSessionList {
+    presentation: String,
+    active: u64,
+    sessions: Vec<SurfaceSessionSummary>,
+}
+
+impl SurfaceSessionList {
+    fn from_state(state: &mut Manifold) -> Self {
+        state.refresh_window_state();
+        Self {
+            presentation: match state.presentation {
+                PresentationStatus::Attached => "Attached".to_string(),
+                PresentationStatus::Detached => "Detached".to_string(),
+            },
+            active: state.active_surface_session().raw(),
+            sessions: state.surface_session_summaries(),
+        }
+    }
+}
+
+fn request_surface_session_list(control_socket: &Path) -> Result<SurfaceSessionList> {
+    let response = request_socket_command(
+        control_socket,
+        &["surface-session".to_string(), "list-json".to_string()],
+        false,
+    )?;
+    serde_json::from_str(response.trim()).context("decode surface-session list")
+}
+
+enum SessionSwitchOutcome {
+    Existing(u64),
+    Create(String),
+}
+
+fn run_skim_session_picker(
+    skim: &std::ffi::OsStr,
+    sessions: &[SurfaceSessionSummary],
+    initial_query: Option<&str>,
+) -> Result<SessionSwitchOutcome> {
+    if let Some(outcome) = resolve_initial_query(sessions, initial_query) {
+        return Ok(outcome);
+    }
+
+    let mut child = ProcessCommand::new(skim)
+        .arg("--prompt")
+        .arg("manifold session> ")
+        .arg("--print-query")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .args(initial_query_args(initial_query))
+        .spawn()
+        .with_context(|| format!("start skim command {}", skim.to_string_lossy()))?;
+
+    {
+        let stdin = child.stdin.as_mut().context("open skim stdin")?;
+        for session in sessions {
+            writeln!(stdin, "{}", format_session_picker_row(session))?;
+        }
+    }
+
+    let output = child.wait_with_output().context("wait for skim")?;
+    let selected = String::from_utf8(output.stdout).context("skim output must be utf-8")?;
+    let outcome = parse_skim_session_output(selected.trim_end())?;
+    ensure!(
+        output.status.success() || matches!(outcome, SessionSwitchOutcome::Create(_)),
+        "skim exited with status {}",
+        output.status
+    );
+    Ok(outcome)
+}
+
+fn initial_query_args(initial_query: Option<&str>) -> Vec<String> {
+    let Some(initial_query) = initial_query else {
+        return Vec::new();
+    };
+    vec!["--query".to_string(), initial_query.to_string()]
+}
+
+fn resolve_initial_query(
+    sessions: &[SurfaceSessionSummary],
+    initial_query: Option<&str>,
+) -> Option<SessionSwitchOutcome> {
+    let query = normalize_session_name(initial_query?)?;
+    let query_lower = query.to_lowercase();
+    let matches = sessions
+        .iter()
+        .filter(|session| session.name.to_lowercase().contains(&query_lower))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Some(SessionSwitchOutcome::Create(query)),
+        [session] => Some(SessionSwitchOutcome::Existing(session.id)),
+        _ => None,
+    }
+}
+
+fn format_session_picker_row(session: &SurfaceSessionSummary) -> String {
+    let marker = if session.active { "*" } else { " " };
+    let windows = match session.windows {
+        1 => "1 window".to_string(),
+        count => format!("{count} windows"),
+    };
+    format!(
+        "{}\t{} {}  {}",
+        session.id,
+        marker,
+        sanitize_session_picker_text(&session.name),
+        windows
+    )
+}
+
+fn parse_skim_session_output(output: &str) -> Result<SessionSwitchOutcome> {
+    let mut lines = output.lines();
+    let query = lines.next().unwrap_or_default().trim();
+    let selected = lines.next().unwrap_or_default().trim();
+    if selected.is_empty() {
+        let name = normalize_session_name(query).context("no session selected")?;
+        return Ok(SessionSwitchOutcome::Create(name));
+    }
+    parse_selected_session_id(selected).map(SessionSwitchOutcome::Existing)
+}
+
+fn parse_selected_session_id(selected: &str) -> Result<u64> {
+    let Some(id) = selected.split('\t').next().filter(|id| !id.is_empty()) else {
+        bail!("no session selected");
+    };
+    parse_u64(id, "selected session id")
+}
+
+fn joined_name(parts: &[String]) -> Option<String> {
+    normalize_session_name(&parts.join(" "))
+}
+
+fn normalize_session_name(name: &str) -> Option<String> {
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!name.is_empty()).then_some(name)
+}
+
+fn sanitize_session_picker_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn ensure_ok_response(response: &str) -> Result<()> {
+    ensure!(
+        response.starts_with("OK "),
+        "control command failed: {}",
+        response.trim()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SessionSwitchOutcome, format_session_picker_row, parse_skim_session_output,
+        resolve_initial_query,
+    };
+    use crate::state::SurfaceSessionSummary;
+
+    fn session(id: u64, name: &str) -> SurfaceSessionSummary {
+        SurfaceSessionSummary {
+            id,
+            name: name.to_string(),
+            active: false,
+            windows: 0,
+        }
+    }
+
+    #[test]
+    fn picker_row_starts_with_machine_readable_session_id() {
+        let row = format_session_picker_row(&SurfaceSessionSummary {
+            id: 7,
+            name: "notes".to_string(),
+            active: true,
+            windows: 2,
+        });
+
+        let output = format!("ignored query\n{row}");
+        let outcome = parse_skim_session_output(&output).unwrap();
+        assert!(matches!(outcome, SessionSwitchOutcome::Existing(7)));
+        assert!(row.contains("* notes"));
+        assert!(row.contains("2 windows"));
+    }
+
+    #[test]
+    fn query_without_selection_creates_named_session() {
+        let outcome = parse_skim_session_output("research notes").unwrap();
+
+        assert!(matches!(
+            outcome,
+            SessionSwitchOutcome::Create(name) if name == "research notes"
+        ));
+    }
+
+    #[test]
+    fn initial_query_selects_single_name_match() {
+        let sessions = vec![session(1, "session 1"), session(2, "research notes")];
+        let outcome = resolve_initial_query(&sessions, Some("research")).unwrap();
+
+        assert!(matches!(outcome, SessionSwitchOutcome::Existing(2)));
+    }
+
+    #[test]
+    fn initial_query_creates_when_name_matches_nothing() {
+        let sessions = vec![session(1, "session 1")];
+        let outcome = resolve_initial_query(&sessions, Some("research notes")).unwrap();
+
+        assert!(matches!(
+            outcome,
+            SessionSwitchOutcome::Create(name) if name == "research notes"
+        ));
+    }
+
+    #[test]
+    fn empty_query_without_selection_is_cancelled_selection() {
+        assert!(parse_skim_session_output("").is_err());
+    }
 }

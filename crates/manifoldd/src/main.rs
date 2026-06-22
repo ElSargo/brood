@@ -35,6 +35,8 @@ enum Command {
     Check,
     /// Run a Manifold session process with an attached presentation by default.
     Run(RunArgs),
+    /// Select a live session with skim and present it.
+    Switch(SwitchArgs),
     /// Run built-in test workflows. Defaults to the nested topology.
     Test(TestArgs),
     /// Send a command to a running manifoldd control socket.
@@ -90,6 +92,22 @@ impl Default for RunArgs {
             no_default_modules: false,
         }
     }
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct SwitchArgs {
+    /// Path for the session control socket.
+    #[arg(long, default_value = "/tmp/manifoldd.sock")]
+    pub(crate) control_socket: PathBuf,
+    /// Skim-compatible selector command.
+    #[arg(long = "skim", default_value = "sk")]
+    pub(crate) skim: OsString,
+    /// Select this session directly instead of opening skim.
+    #[arg(long = "session-id")]
+    pub(crate) session_id: Option<u64>,
+    /// Initial session name/query. If it matches nothing, a new session is created with this name.
+    #[arg(value_name = "NAME")]
+    pub(crate) query: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -160,6 +178,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run(args) => compositor::run(args),
+        Command::Switch(args) => control::switch(args).context("switch session"),
         Command::Test(args) => compositor::run_test(args),
         Command::Ctl(args) => control::send(args).context("send control command"),
     }

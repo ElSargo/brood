@@ -112,8 +112,10 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         return Ok(());
     }
 
-    state.restore_last_interacted_surface_session();
-    state.stats.record_attach_request();
+    if !state.attach_requested {
+        state.restore_last_interacted_surface_session();
+        state.stats.record_attach_request();
+    }
     let mode = Mode {
         size: (1280, 800).into(),
         refresh: PRESENTATION_REFRESH_MILLIHZ,
@@ -782,7 +784,6 @@ fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manif
     }
 
     if state.attach_requested {
-        state.restore_last_interacted_surface_session();
         let has_existing_window = presenter.runtime.borrow_mut().request_window();
         if has_existing_window {
             apply_presenter_created(presenter, state);
