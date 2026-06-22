@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -50,7 +52,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    NestedTestArgs, RunArgs, TestArgs, TestCommand,
+    MANIFOLD_SESSION_ENV, NestedTestArgs, RunArgs, TestArgs, TestCommand,
     browser::BrowserLaunchOptions,
     config, control, presentation,
     state::{ClientState, Manifold, PresentationStatus},
@@ -86,6 +88,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     state.nested_inner_control_socket = args.nested_inner_control_socket.clone();
 
     control::listen(&mut event_loop, &args.control_socket)?;
+    state.manifold_session = Some(format!("control={}", args.control_socket.display()));
 
     println!("WAYLAND_DISPLAY={}", state.socket_name.to_string_lossy());
     println!("MANIFOLDD_CONTROL={}", args.control_socket.display());
@@ -132,16 +135,19 @@ pub fn run(args: RunArgs) -> Result<()> {
 }
 
 pub fn run_test(args: TestArgs) -> Result<()> {
-    match args.command {
+    match args
+        .command
+        .unwrap_or(TestCommand::Nested(NestedTestArgs::default()))
+    {
         TestCommand::Nested(args) => run_nested_test(args),
     }
 }
 
 fn run_nested_test(args: NestedTestArgs) -> Result<()> {
-    let out_dir = match args.out_dir {
+    let out_dir = match args.out_dir.as_ref() {
         Some(dir) => {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            dir
+            dir.clone()
         }
         None => {
             let dir = env::temp_dir().join(format!("manifold-nested-test-{}", std::process::id()));
@@ -155,7 +161,38 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
     let outer_log = out_dir.join("outer.log");
     let inner_log = out_dir.join("inner.log");
     let current_exe = env::current_exe().context("resolve current executable")?;
+    let inherited_session = env::var_os(MANIFOLD_SESSION_ENV);
 
+    match nested_test_topology(&args, inherited_session.as_deref()) {
+        NestedTestTopology::OuterSupervisor => run_nested_test_with_outer(
+            args,
+            out_dir,
+            current_exe,
+            outer_sock,
+            inner_sock,
+            outer_log,
+            inner_log,
+        ),
+        NestedTestTopology::CurrentSession => run_nested_test_in_current_session(
+            args,
+            out_dir,
+            current_exe,
+            inner_sock,
+            inner_log,
+            inherited_session,
+        ),
+    }
+}
+
+fn run_nested_test_with_outer(
+    args: NestedTestArgs,
+    out_dir: PathBuf,
+    current_exe: PathBuf,
+    outer_sock: PathBuf,
+    inner_sock: PathBuf,
+    outer_log: PathBuf,
+    inner_log: PathBuf,
+) -> Result<()> {
     let mut outer_child = spawn_outer(
         &current_exe,
         &outer_sock,
@@ -199,6 +236,7 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
     println!("inner_control={}", inner_sock.display());
     println!("outer_log={}", outer_log.display());
     println!("inner_log={}", inner_log.display());
+    println!("topology=outer-supervisor");
     println!("outer_headless={}", !args.outer_headful);
     println!("inner_headless={}", args.inner_headless);
 
@@ -225,6 +263,94 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
         bail!("outer process exited with {status}");
     }
     Ok(())
+}
+
+fn run_nested_test_in_current_session(
+    args: NestedTestArgs,
+    out_dir: PathBuf,
+    current_exe: PathBuf,
+    subject_sock: PathBuf,
+    subject_log: PathBuf,
+    inherited_session: Option<std::ffi::OsString>,
+) -> Result<()> {
+    let mut subject_child = spawn_subject(
+        &current_exe,
+        &subject_sock,
+        &subject_log,
+        args.inner_headless,
+        args.harness.as_deref(),
+    )?;
+
+    wait_for_control_socket(&subject_sock, &subject_log, &mut subject_child, "subject")?;
+
+    if let Some(command) = args.inner_command.as_deref() {
+        let subject_command = shell_split(command)?;
+        control::request_socket_command(
+            &subject_sock,
+            &[vec!["spawn".to_string()], subject_command].concat(),
+            false,
+        )?;
+    }
+
+    println!("OK nested test ready");
+    println!("out_dir={}", out_dir.display());
+    println!("topology=current-session");
+    println!("subject_control={}", subject_sock.display());
+    println!("subject_log={}", subject_log.display());
+    println!("inner_control={}", subject_sock.display());
+    println!("inner_log={}", subject_log.display());
+    println!("inner_headless={}", args.inner_headless);
+    if let Some(session) = inherited_session {
+        println!(
+            "inherited_{}={}",
+            MANIFOLD_SESSION_ENV,
+            session.to_string_lossy()
+        );
+    }
+
+    if args.keep_running {
+        let status = subject_child.wait().context("wait for subject process")?;
+        if !status.success() {
+            bail!("subject process exited with {status}");
+        }
+        return Ok(());
+    }
+
+    if args.harness.is_some() {
+        let status = subject_child.wait().context("wait for subject process")?;
+        println!("subject_exit={status}");
+        if !status.success() {
+            bail!("subject process exited with {status}");
+        }
+        return Ok(());
+    }
+
+    let _ = control::request_socket_command(&subject_sock, &[String::from("quit")], false);
+    let status = subject_child.wait().context("wait for subject process")?;
+    if !status.success() {
+        bail!("subject process exited with {status}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedTestTopology {
+    OuterSupervisor,
+    CurrentSession,
+}
+
+fn nested_test_topology(
+    args: &NestedTestArgs,
+    inherited_session: Option<&OsStr>,
+) -> NestedTestTopology {
+    let has_inherited_session = inherited_session
+        .map(|session| !session.is_empty())
+        .unwrap_or(false);
+    if args.force_outer || !has_inherited_session {
+        NestedTestTopology::OuterSupervisor
+    } else {
+        NestedTestTopology::CurrentSession
+    }
 }
 
 fn spawn_outer(
@@ -257,6 +383,37 @@ fn spawn_outer(
     command
         .spawn()
         .with_context(|| format!("spawn outer process {}", current_exe.display()))
+}
+
+fn spawn_subject(
+    current_exe: &Path,
+    subject_sock: &Path,
+    subject_log: &Path,
+    subject_headless: bool,
+    harness: Option<&Path>,
+) -> Result<Child> {
+    let mut command = Command::new(current_exe);
+    command.arg("run");
+    command.arg("--control-socket").arg(subject_sock);
+    if subject_headless {
+        command.arg("--headless");
+    }
+    if let Some(harness) = harness {
+        command.arg("--test-harness").arg(harness);
+    }
+    command.stdout(Stdio::from(
+        fs::File::create(subject_log)
+            .with_context(|| format!("create {}", subject_log.display()))?,
+    ));
+    command.stderr(Stdio::from(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(subject_log)
+            .with_context(|| format!("open {}", subject_log.display()))?,
+    ));
+    command
+        .spawn()
+        .with_context(|| format!("spawn subject process {}", current_exe.display()))
 }
 
 fn spawn_inner(
@@ -767,7 +924,10 @@ impl OutputHandler for Manifold {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DmabufBlockerPlan, dmabuf_blocker_plan};
+    use std::ffi::OsStr;
+
+    use super::{DmabufBlockerPlan, NestedTestTopology, dmabuf_blocker_plan, nested_test_topology};
+    use crate::NestedTestArgs;
 
     #[test]
     fn dmabuf_without_explicit_acquire_uses_implicit_readiness_blocker() {
@@ -789,6 +949,36 @@ mod tests {
     fn no_dmabuf_needs_no_dmabuf_blocker() {
         assert_eq!(dmabuf_blocker_plan(false, true), DmabufBlockerPlan::None,);
         assert_eq!(dmabuf_blocker_plan(false, false), DmabufBlockerPlan::None,);
+    }
+
+    #[test]
+    fn nested_test_uses_outer_without_session_marker() {
+        let args = NestedTestArgs::default();
+        assert_eq!(
+            nested_test_topology(&args, None),
+            NestedTestTopology::OuterSupervisor
+        );
+    }
+
+    #[test]
+    fn nested_test_uses_current_session_with_session_marker() {
+        let args = NestedTestArgs::default();
+        assert_eq!(
+            nested_test_topology(&args, Some(OsStr::new("control=/tmp/manifoldd.sock"))),
+            NestedTestTopology::CurrentSession
+        );
+    }
+
+    #[test]
+    fn nested_test_force_outer_overrides_session_marker() {
+        let args = NestedTestArgs {
+            force_outer: true,
+            ..NestedTestArgs::default()
+        };
+        assert_eq!(
+            nested_test_topology(&args, Some(OsStr::new("control=/tmp/manifoldd.sock"))),
+            NestedTestTopology::OuterSupervisor
+        );
     }
 }
 

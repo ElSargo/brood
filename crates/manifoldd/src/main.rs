@@ -20,6 +20,8 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
+pub(crate) const MANIFOLD_SESSION_ENV: &str = "manifold_session";
+
 #[derive(Debug, Parser)]
 #[command(about = "Manifold session process", version)]
 struct Args {
@@ -31,9 +33,9 @@ struct Args {
 enum Command {
     /// Print startup information and exit.
     Check,
-    /// Run a nested Wayland compositor and attach a presentation window.
+    /// Run a Manifold session process with an attached presentation by default.
     Run(RunArgs),
-    /// Run built-in test workflows.
+    /// Run built-in test workflows. Defaults to the nested topology.
     Test(TestArgs),
     /// Send a command to a running manifoldd control socket.
     Ctl(CtlArgs),
@@ -47,7 +49,7 @@ struct RunArgs {
     /// Path for the session control socket.
     #[arg(long, default_value = "/tmp/manifoldd.sock")]
     control_socket: PathBuf,
-    /// Start without an attached presentation window.
+    /// Start the service/runtime process without tying it to a presentation session.
     #[arg(long)]
     headless: bool,
     /// Launch an isolated Chromium browser pane at startup.
@@ -93,7 +95,7 @@ impl Default for RunArgs {
 #[derive(Debug, Parser)]
 struct TestArgs {
     #[command(subcommand)]
-    command: TestCommand,
+    command: Option<TestCommand>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,7 +104,7 @@ enum TestCommand {
     Nested(NestedTestArgs),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Default)]
 struct NestedTestArgs {
     /// Directory for sockets, logs, and artifacts.
     #[arg(long = "out-dir", value_name = "DIR")]
@@ -110,12 +112,15 @@ struct NestedTestArgs {
     /// Keep the nested topology running after startup.
     #[arg(long = "keep-running")]
     keep_running: bool,
-    /// Load the async test harness into the outer supervisor instance.
+    /// Load the async test harness into the test supervisor or subject instance.
     #[arg(long = "harness", value_name = "PATH")]
     harness: Option<PathBuf>,
     /// Start the outer supervisor with a visible presentation window.
     #[arg(long = "outer-headful")]
     outer_headful: bool,
+    /// Start an outer supervisor even when manifold_session says this is already nested.
+    #[arg(long = "force-outer")]
+    force_outer: bool,
     /// Start the inner system under test without an attached presentation window.
     #[arg(long = "inner-headless")]
     inner_headless: bool,

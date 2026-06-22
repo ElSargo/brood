@@ -36,7 +36,7 @@ The current PoC can:
 - run async core-WASM behavior harnesses through `manifoldd run --test-harness`
 - orchestrate nested Manifold-in-Manifold tests through `manifoldd test nested`
 
-The intended default behavior-testing mode is nested Manifold-in-Manifold execution with outer-instance capture and full-path input driving. The built-in `manifoldd test nested` command is the canonical path toward that mode, even though headless outer capture still needs an offscreen presenter to be fully complete.
+The intended default behavior-testing mode is nested Manifold-in-Manifold execution with outer-instance capture and full-path input driving. The built-in `manifoldd test` command defaults to that mode. When it is launched from inside an existing Manifold session, it reuses that session as the outer container and starts only the subject instance.
 
 ## Common Commands
 
@@ -46,13 +46,29 @@ Run the project:
 cargo run
 ```
 
-By default this starts `manifoldd run` and loads enabled modules from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists.
+By default this starts `manifoldd run`, attaches a presentation surface, and loads enabled modules from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists. This is the end-user path.
 
-Run the tests:
+Run Rust unit tests:
 
 ```sh
 cargo test
 ```
+
+Run Manifold behavior tests:
+
+```sh
+cargo run -- test
+```
+
+Behavior tests own their presentation policy. Outside Manifold, the default test topology starts a headless outer supervisor and a normal subject compositor inside it. Inside a managed Manifold session, `manifold_session` is present, so the test command skips the extra outer supervisor and starts only the subject compositor.
+
+Run the session service without attaching it to a desktop presentation:
+
+```sh
+cargo run -- run --headless
+```
+
+`run --headless` is for service managers and long-lived runtime processes, such as a future systemd unit. Use `test` rather than `run --headless` for behavior validation.
 
 The repo also includes `flake.nix` for developers who want a Nix shell. It is optional; the ordinary Cargo commands above are the default project entry points.
 
@@ -60,11 +76,12 @@ Useful variants:
 
 ```sh
 cargo run -- check
-cargo run -- run --headless
 cargo run -- run --no-default-modules
 cargo run -- run --config ./manifold.toml
 cargo run -- ctl status-json
+cargo run -- test
 cargo run -- test nested
+cargo run -- test nested --force-outer
 ```
 
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.

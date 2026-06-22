@@ -29,7 +29,7 @@ Both instances expose their own control sockets:
 The first built-in orchestration path is:
 
 ```sh
-manifoldd test nested
+manifoldd test
 ```
 
 This launches:
@@ -37,7 +37,9 @@ This launches:
 - an outer supervisor instance
 - an inner system-under-test instance hosted inside the outer instance
 
-This nested topology is the intended default test mode for behavior and graphics validation. The outer instance should be the authoritative end-to-end supervisor:
+`manifoldd test` defaults to the nested topology. `manifoldd test nested` is the explicit spelling for the same workflow.
+
+This topology is the intended default test mode for behavior and graphics validation. The outer instance should be the authoritative end-to-end supervisor:
 
 - drive the full outer-to-inner input path
 - capture host-visible or offscreen-composed output
@@ -45,6 +47,8 @@ This nested topology is the intended default test mode for behavior and graphics
 - proxy diagnostic inspection into the inner instance when a deviation appears
 
 By default the outer supervisor runs headless, so the nested topology can start without a host-visible presentation window. The inner instance still attaches a presentation window into the outer nested compositor, which preserves the Manifold-in-Manifold path even though the outer host presentation is detached.
+
+When Manifold launches a hosted app, it sets `manifold_session` in that app's environment. If `manifoldd test` sees that marker, it treats the current Manifold session as the outer container and starts only the subject compositor. Use `manifoldd test nested --force-outer` when a test must create another explicit outer supervisor even though it is already running inside Manifold.
 
 For exact `manifoldd test nested` arguments, see `crates/manifoldd/src/main.rs`.
 
@@ -66,6 +70,10 @@ Planned work:
 - retain the same nested topology, control flow, and latency instrumentation when switching between outer-headful and outer-headless execution
 - make full capture part of the default nested artifact bundle rather than a special-case debugging path
 - keep inner-instance dumps and diagnostics as supporting evidence, while outer composed capture remains the authoritative end-to-end visual record
+
+## Headless Runtime
+
+`manifoldd run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and control socket without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `manifoldd test` so the nesting policy can choose the right topology for the current environment.
 
 ## Harness
 

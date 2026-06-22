@@ -40,6 +40,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
+    MANIFOLD_SESSION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     layout::{
         LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
@@ -142,6 +143,7 @@ pub struct Manifold {
     pub(crate) test_harness: Option<TestHarnessRuntime>,
     pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
     pub(crate) nested_inner_control_socket: Option<PathBuf>,
+    pub(crate) manifold_session: Option<String>,
 }
 
 impl Manifold {
@@ -226,6 +228,7 @@ impl Manifold {
             test_harness: None,
             test_harness_completion: None,
             nested_inner_control_socket: None,
+            manifold_session: None,
         }
     }
 
@@ -292,6 +295,9 @@ impl Manifold {
     pub fn spawn_hosted_app(&self, command: &OsString) -> Result<()> {
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
+        if let Some(session) = self.manifold_session.as_deref() {
+            child.env(MANIFOLD_SESSION_ENV, session);
+        }
         child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
@@ -314,6 +320,9 @@ impl Manifold {
 
         let mut child = Command::new(program);
         child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
+        if let Some(session) = self.manifold_session.as_deref() {
+            child.env(MANIFOLD_SESSION_ENV, session);
+        }
         child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
