@@ -20,3 +20,18 @@ The repo has a Nix flake for development-shell use, but agents should not assume
 ## Testing
 
 Whenever possible prefer to test the changes with a "real" workload. Open the real app and send real keystrokes, clicks and scrolls and record metrics from the nested client as well as manifoldd. Use screenshots to verify any graphical changes.
+
+For agent-driven behavior tests, use the built-in test CLI rather than starting
+a host-visible Manifold presentation yourself. Prefer `cargo run -- test` or
+`target/debug/manifoldd test nested --inner-command '<client command>'` after a
+build. This starts the outer supervisor headlessly by default and avoids
+creating a new OS window in the current desktop session.
+
+Do not use `tools/dev-nested-manifold.sh` for automated agent verification
+unless the task explicitly asks for a host-visible manual development harness.
+That script starts a stable Manifold presentation on the current desktop and is
+not the no-host-window behavior-test path.
+
+Do not use plain `cargo run`, `manifoldd run`, or `manifoldd run --control-socket
+...` as a behavior-test entry point from an existing desktop session. `run` is
+the product/service runtime path; `test` owns test-time nesting policy.

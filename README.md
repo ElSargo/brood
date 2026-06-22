@@ -62,6 +62,16 @@ cargo run -- test
 
 Behavior tests own their presentation policy. Outside Manifold, the default test topology starts a headless outer supervisor and a normal subject compositor inside it. Inside a managed Manifold session, `manifold_session` is present, so the test command skips the extra outer supervisor and starts only the subject compositor.
 
+For automated graphical behavior checks, keep using `test`, for example:
+
+```sh
+cargo run -- test nested --inner-command 'weston-simple-egl -f'
+```
+
+The outer supervisor is headless unless `--outer-headful` is explicitly passed.
+The older helper script `tools/dev-nested-manifold.sh` is for host-visible manual
+development and opens a presentation window on the current desktop.
+
 Run the session service without attaching it to a desktop presentation:
 
 ```sh

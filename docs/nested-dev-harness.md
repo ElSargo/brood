@@ -60,6 +60,20 @@ manifoldd ctl --control-socket /path/to/outer.sock nested-inner status-json
 
 Current limitation: headless outer mode preserves behavior and control-path testing, but it does not yet provide a composed outer framebuffer capture. That still requires either an attached outer presentation window or a future offscreen presenter.
 
+For automated agent verification, this built-in CLI is the default path. Use it
+instead of the helper script when the test should not create an OS window in the
+current desktop session. A typical real-client behavior check starts the nested
+test topology with an inner client command and a temporary artifact directory,
+then inspects the printed control sockets, status, logs, and debug dumps:
+
+```sh
+cargo run -- test nested --out-dir /tmp/manifold-test --inner-command 'weston-simple-egl -f'
+```
+
+Use `--keep-running` only when the verification script also cleans up the
+printed inner and outer control sockets. The outer supervisor remains headless
+unless `--outer-headful` is explicitly passed.
+
 ## Future Work
 
 The most important remaining gap for the intended default nested test mode is full outer capture while staying headless by default.
@@ -82,6 +96,11 @@ Run:
 ```sh
 tools/dev-nested-manifold.sh --keep-running
 ```
+
+This helper is the host-visible manual development harness. It starts the stable
+outer Manifold with a presentation window on the current desktop, then hosts the
+dev Manifold inside that window. Do not use it for automated no-host-window
+behavior tests; use `manifoldd test` for that.
 
 The script:
 
