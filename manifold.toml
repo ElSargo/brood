@@ -5,8 +5,14 @@ path = "examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold
 capabilities = [
   "shortcuts:handle",
   "apps:run-argv",
+  "apps:startup",
+  "workspace:focus-app-id",
   "workspace:close-focused-pane",
 ]
+
+[startup.agent]
+enabled = true
+argv = ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
 
 [module.master-layout]
 enabled = false

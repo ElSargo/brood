@@ -13,6 +13,8 @@ use crate::{state::Manifold, wasm_key::WasmKeyHandler, wasm_map::WasmMapHook};
 pub struct ManifoldConfig {
     #[serde(default)]
     module: BTreeMap<String, ModuleConfig>,
+    #[serde(default)]
+    startup: BTreeMap<String, StartupAppConfig>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -23,6 +25,13 @@ struct ModuleConfig {
     path: PathBuf,
     #[serde(default)]
     capabilities: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StartupAppConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    argv: Vec<String>,
 }
 
 pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<()> {
@@ -99,6 +108,30 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
     Ok(())
 }
 
+pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config = read_config(config_path)?;
+    for (id, app) in config.startup {
+        if !app.enabled {
+            info!(startup_app = %id, "config startup app disabled");
+            continue;
+        }
+        if app.argv.is_empty() {
+            warn!(startup_app = %id, "configured startup app has empty argv; skipping app");
+            continue;
+        }
+        state
+            .spawn_hosted_app_argv(&app.argv)
+            .with_context(|| format!("spawn config startup app {id}"))?;
+        info!(startup_app = %id, argv = ?app.argv, "spawned config startup app");
+    }
+
+    Ok(())
+}
+
 fn read_config(path: &Path) -> Result<ManifoldConfig> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read Manifold config {}", path.display()))?;
@@ -137,6 +170,9 @@ mod tests {
             kind = "fast-map-hook"
             path = "target/layout.wasm"
             capabilities = ["layout:on-map"]
+
+            [startup.agent]
+            argv = ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
             "#,
         )
         .expect("parse config");
@@ -152,6 +188,13 @@ mod tests {
         assert_eq!(module.kind, "fast-map-hook");
         assert_eq!(module.path, PathBuf::from("target/layout.wasm"));
         assert_eq!(module.capabilities, ["layout:on-map"]);
+
+        let app = config.startup.get("agent").expect("agent startup app");
+        assert!(app.enabled);
+        assert_eq!(
+            app.argv,
+            ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
+        );
     }
 
     #[test]

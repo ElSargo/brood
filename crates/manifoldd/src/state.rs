@@ -28,12 +28,12 @@ use smithay::{
     },
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
-        compositor::{CompositorClientState, CompositorState},
+        compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
         drm_syncobj::DrmSyncobjState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
+        shell::xdg::{XdgShellState, XdgToplevelSurfaceData},
         socket::ListeningSocketSource,
     },
 };
@@ -954,6 +954,44 @@ impl Manifold {
         self.focus_toplevel_surface(Manifold::window_toplevel_surface(window));
     }
 
+    pub fn focus_app_id(&mut self, target_app_id: &str) -> bool {
+        let window = self
+            .space
+            .elements()
+            .filter(|window| self.window_in_active_surface_session(window))
+            .find(|window| {
+                window
+                    .toplevel()
+                    .and_then(|toplevel| toplevel_app_id(toplevel.wl_surface()))
+                    .as_deref()
+                    == Some(target_app_id)
+            })
+            .cloned();
+        let Some(window) = window else {
+            return false;
+        };
+        self.focus_window(&window);
+        true
+    }
+
+    pub fn focus_app_id_or_spawn(&mut self, app_id: &str, argv: &[String]) -> bool {
+        if self.focus_app_id(app_id) {
+            return true;
+        }
+        match self.spawn_hosted_app_argv(argv) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    app_id,
+                    ?argv,
+                    "failed to spawn app after app-id focus miss"
+                );
+                false
+            }
+        }
+    }
+
     pub fn window_for_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
@@ -1295,6 +1333,18 @@ fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
 
 fn focus_stack_location(_slot: usize) -> Point<i32, Logical> {
     Point::from((0, 0))
+}
+
+fn toplevel_app_id(surface: &WlSurface) -> Option<String> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()?
+            .lock()
+            .ok()?
+            .app_id
+            .clone()
+    })
 }
 
 #[derive(Default)]

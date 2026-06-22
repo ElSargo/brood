@@ -139,6 +139,14 @@ impl Manifold {
             return;
         }
 
+        if self.input_mode != InputMode::Normal
+            && (self.ctrl_pressed || self.alt_pressed)
+            && self.try_wasm_key_handler(key_code, state) == Some(true)
+        {
+            self.record_consumed_keyboard_input();
+            return;
+        }
+
         if self.input_mode == InputMode::Normal {
             self.record_consumed_keyboard_input();
             if state == KeyState::Pressed {
@@ -151,27 +159,11 @@ impl Manifold {
     }
 
     fn handle_normal_mode_key(&mut self, key_code: Keycode) {
-        if let Some(result) = self.wasm_key_handler.as_mut().map(|handler| {
-            handler.handle_key(
-                key_code,
-                KeyState::Pressed,
-                self.input_mode,
-                self.ctrl_pressed,
-                self.alt_pressed,
-            )
-        }) {
-            match result {
-                Ok(outcome) => {
-                    outcome.apply(self);
-                    return;
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "WASM normal-mode key handler failed; using built-in fallback"
-                    );
-                }
-            }
+        if self
+            .try_wasm_key_handler(key_code, KeyState::Pressed)
+            .is_some()
+        {
+            return;
         }
 
         match key_code {
@@ -186,6 +178,28 @@ impl Manifold {
                 {
                     self.apply_layout_action(action);
                 }
+            }
+        }
+    }
+
+    fn try_wasm_key_handler(&mut self, key_code: Keycode, state: KeyState) -> Option<bool> {
+        let result = self.wasm_key_handler.as_mut().map(|handler| {
+            handler.handle_key(
+                key_code,
+                state,
+                self.input_mode,
+                self.ctrl_pressed,
+                self.alt_pressed,
+            )
+        })?;
+        match result {
+            Ok(outcome) => Some(outcome.apply(self)),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "WASM key handler failed; using built-in fallback when available"
+                );
+                None
             }
         }
     }

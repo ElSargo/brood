@@ -168,6 +168,48 @@ impl WasmKeyHandler {
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.spawn_app import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
+                "focus_or_spawn_app",
+                |mut caller: Caller<'_, WasmKeyStore>,
+                 app_id_ptr: i32,
+                 app_id_len: i32,
+                 command_ptr: i32,
+                 command_len: i32|
+                 -> i32 {
+                    let app_id = match read_guest_string(&mut caller, app_id_ptr, app_id_len) {
+                        Ok(app_id) => app_id,
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "WASM key handler passed invalid focus_or_spawn_app app id"
+                            );
+                            return 0;
+                        }
+                    };
+                    let command = match read_guest_string(&mut caller, command_ptr, command_len) {
+                        Ok(command) => command,
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "WASM key handler passed invalid focus_or_spawn_app command"
+                            );
+                            return 0;
+                        }
+                    };
+                    let argv = parse_spawn_command(&command);
+                    if app_id.is_empty() || argv.is_empty() {
+                        return 0;
+                    }
+                    caller
+                        .data_mut()
+                        .pending_commands
+                        .push(WorkspaceCommand::FocusOrSpawnApp { app_id, argv });
+                    1
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("define manifold.focus_or_spawn_app import: {err}"))?;
 
         let mut store = Store::new(&engine, WasmKeyStore::default());
         let instance = linker

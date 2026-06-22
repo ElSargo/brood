@@ -6,6 +6,7 @@ use crate::{layout::LayoutAction, state::Manifold};
 pub enum WorkspaceCommand {
     Layout(LayoutAction),
     SpawnApp(Vec<String>),
+    FocusOrSpawnApp { app_id: String, argv: Vec<String> },
     Surface(SurfaceCommand),
 }
 
@@ -26,6 +27,7 @@ impl WorkspaceCommand {
                     false
                 }
             },
+            Self::FocusOrSpawnApp { app_id, argv } => state.focus_app_id_or_spawn(&app_id, &argv),
             Self::Surface(command) => command.apply(state),
         }
     }

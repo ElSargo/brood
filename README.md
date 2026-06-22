@@ -46,7 +46,7 @@ Run the project:
 cargo run
 ```
 
-By default this starts `manifoldd run`, attaches a presentation surface, and loads enabled modules from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists. This is the end-user path.
+By default this starts `manifoldd run`, attaches a presentation surface, and loads enabled modules and startup apps from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists and starts the Codex agent workspace pane. This is the end-user path.
 
 Run Rust unit tests:
 

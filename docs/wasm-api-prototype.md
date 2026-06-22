@@ -231,16 +231,21 @@ focus_previous()
 toggle_fullscreen()
 close_active_window()
 spawn_app(ptr: i32, len: i32) -> i32
+focus_or_spawn_app(app_id_ptr: i32, app_id_len: i32, command_ptr: i32, command_len: i32) -> i32
 ```
 
 `spawn_app` reads a UTF-8, whitespace-split command from exported guest memory and launches it as a hosted Wayland app with the session `WAYLAND_DISPLAY`.
 
-When a handler is loaded, normal-mode key presses go to `on_key` first. A successful call replaces the built-in normal-mode map for that key path; if the guest traps, Manifold logs the failure and falls back to the built-in handler so the session remains usable during experiments.
+`focus_or_spawn_app` first looks for a live xdg toplevel in the active surface session whose app ID matches the supplied UTF-8 identifier. If no match exists, it launches the fallback command through the same hosted-app path as `spawn_app`.
 
-The sample handler lives in `examples/wasm-key-handler` and currently maps normal-mode chords:
+When a handler is loaded, normal-mode key presses go to `on_key` first. Modified shortcut chords can also be claimed from passthrough mode, which lets workspace-level bindings work without toggling modes first. A successful normal-mode call replaces the built-in normal-mode map for that key path; if the guest traps, Manifold logs the failure and falls back to the built-in handler so the session remains usable during experiments.
 
-- `Ctrl-O` -> spawn `kitty`
-- `Ctrl-Q` -> `close_active_window`
+The sample handler lives in `examples/wasm-key-handler` and maps a minimal workspace keymap around app-ID-targeted Kitty panes:
+
+- `Ctrl-J` / `Ctrl-K` -> focus next / previous pane
+- `Ctrl-G` -> focus or spawn the LazyGit pane
+- `Ctrl-Enter` -> focus or spawn the Codex agent pane
+- `Ctrl-1` through `Ctrl-5` -> focus or spawn numbered terminal panes
 
 For the example build/run flow, see `examples/wasm-key-handler/README.md`.
 

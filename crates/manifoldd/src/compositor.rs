@@ -103,6 +103,10 @@ pub fn run(args: RunArgs) -> Result<()> {
         }
     }
 
+    if !args.no_default_modules {
+        config::load_startup_apps(&mut state, &args.config)?;
+    }
+
     if let Some(command) = args.command {
         state.spawn_hosted_app(&command)?;
     }

@@ -1,6 +1,6 @@
 # WASM Key Handler Example
 
-This is a minimal core-WASM normal-mode key handler for `manifoldd run --wasm-key-handler`.
+This is a minimal core-WASM key handler for `manifoldd run --wasm-key-handler`.
 
 Build:
 
@@ -20,10 +20,13 @@ For the exact CLI argument definition, see `crates/manifoldd/src/main.rs`.
 
 Default keymap:
 
+- `Ctrl-J`: focus next pane without leaving passthrough mode
+- `Ctrl-K`: focus previous pane without leaving passthrough mode
+- `Ctrl-G`: focus the Kitty LazyGit pane, spawning it if needed
+- `Ctrl-Enter`: focus the Kitty Codex agent pane, spawning it if needed
+- `Ctrl-1` through `Ctrl-5`: focus numbered Kitty terminal panes, spawning them if needed
 - `Ctrl-O`: spawn `kitty`
 - `Ctrl-N`: create and attach a new surface session
-- `Ctrl-J`: focus next pane
-- `Ctrl-K`: focus previous pane
 - `Ctrl-Q`: close the active pane
 - `Ctrl-F`: toggle managed fullscreen
 - `Ctrl-L`: split active pane right
