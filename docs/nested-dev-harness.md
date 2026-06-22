@@ -11,7 +11,7 @@ Manifold should be able to run and test a development instance inside a stable i
 The first version uses two normal `manifoldd` processes:
 
 ```text
-host compositor / WSLg
+host compositor
   -> stable manifoldd presentation window
     -> dev manifoldd presentation window as a stable hosted app
       -> dev nested client, test harness, or WASM-controlled app
@@ -72,7 +72,7 @@ Planned work:
 Run:
 
 ```sh
-tools/dev-nested-manifold.sh --keep-running --capture
+tools/dev-nested-manifold.sh --keep-running
 ```
 
 The script:
@@ -83,7 +83,6 @@ The script:
 4. Waits for stable to map and render the dev presentation window.
 5. Spawns a real client inside the dev instance.
 6. Samples `status-json` from both instances.
-7. Optionally captures the stable host window through WSLg `PrintWindow`.
 
 For exact helper-script arguments, see `tools/dev-nested-manifold.sh`.
 
@@ -93,7 +92,6 @@ The output directory contains:
 - `dev.log`
 - `stable-status.jsonl`
 - `dev-status.jsonl`
-- optional capture PNG
 
 ## Input Testing
 
@@ -103,12 +101,6 @@ There are two useful input paths:
 - Direct dev control-socket injection, validating the inner compositor and client path without depending on outer hit testing.
 
 The long-term benchmark should drive both paths. The full-path benchmark proves Manifold can operate on itself. The direct inner benchmark keeps regressions easier to isolate.
-
-## Output Capture
-
-On WSLg, capture the exported stable presentation window with `tools/wslg-capture-manifold-window.ps1`. This captures what the user sees: stable presentation, dev presentation inside it, and any dev-hosted client.
-
-Later harnesses should also support compositor-local frame capture from the presentation renderer. That would make pixel and latency analysis less dependent on WSLg window export behavior, while the WSLg capture remains useful as an end-to-end proof.
 
 ## Hot Reload Direction
 

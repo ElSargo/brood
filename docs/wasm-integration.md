@@ -6,7 +6,7 @@ It describes the intended Manifold app and module model, not a promise that ever
 
 WASM is Manifold's planned fast-iteration layer for workspace behavior, built-in tools, user apps, extensions, and agents. Manifold should have a workspace and WASM app model; the open question is the exact shape, not whether this direction belongs in the project.
 
-The integration should make behavior reloadable without redeploying WSLg or rebuilding compositor patches, while preserving Manifold's core rule: authoritative workspace, session, and app state live behind the presentation surface, and presentation endpoints render the latest scene and surface state for one session at a time. More native, browser, Wayland, and WSLg experiments are needed before freezing the API, ABI, runtime crate layout, or WIT package shape.
+The integration should make behavior reloadable without rebuilding compositor internals, while preserving Manifold's core rule: authoritative workspace, session, and app state live behind the presentation surface, and presentation endpoints render the latest scene and surface state for one session at a time. More native, browser, and Wayland experiments are needed before freezing the API, ABI, runtime crate layout, or WIT package shape.
 
 ## Goals
 
@@ -16,7 +16,6 @@ The integration should make behavior reloadable without redeploying WSLg or rebu
 - Let one WASM app create any number of panes within its session.
 - Treat session membership as the first-phase trust boundary, so WASM apps in the same session can communicate through session APIs and granted capabilities.
 - Make Linux-native development the first fast-turnaround path.
-- Keep the future WSLg-native implementation compatible through behavior and protocol boundaries rather than shared compositor internals.
 
 ## Non-Goals For The First WASM Pass
 
@@ -25,7 +24,6 @@ The integration should make behavior reloadable without redeploying WSLg or rebu
 - Do not grant unrestricted filesystem, process, network, editor, or shell access.
 - Do not treat same-session trust as internet-safe multi-user isolation.
 - Do not require a virtual filesystem for the first workspace/WASM pass.
-- Do not require the WSLg/Weston experiment to embed the WASM runtime before the WSLg control boundary is understood.
 - Do not split out a separate presentation endpoint just to land the first WASM host.
 
 ## Architectural Rule
@@ -34,7 +32,7 @@ WASM modules talk to Manifold through a stable workspace/app API, not through co
 
 This means the first useful milestone is not the WASM runtime itself. The first milestone is a native session model, with any needed workspace-level model around it, that can represent sessions, panes, pane producers, focus, commands, events, scene state, surface slots, and presentation requests independently from the current Smithay `Space<Window>` representation. Presentation layout, dragging, and animation belong to the presentation surface, not the producer model.
 
-The runtime then becomes an adapter over this model. Linux-native `manifoldd` can host the runtime in-process at first. Future WSLg work can satisfy the same behavior through a protocol-facing session process or another backend-specific adapter.
+The runtime then becomes an adapter over this model. Linux-native `manifoldd` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
 The execution model is recorded in [WASM Execution Model](wasm-execution-model.md). In short, Manifold should keep calloop as the authoritative session/compositor loop, run ordinary plugin work in a separate async lane, and reserve a synchronous fast lane for bounded pre-commit policy hooks.
 
@@ -308,7 +306,7 @@ When a module binary has many live realm instances, reload should restart all li
 
 Keep the shared behavior spec current for pane identity, focus, attach/detach, show/hide, input routing, session persistence, browser testing shape, and window grouping.
 
-This keeps Linux-native WASM work aligned with WSLg-native experiments.
+This keeps Linux-native WASM work aligned with the product behavior model.
 
 ### 1. Add Native Workspace Core
 
@@ -393,18 +391,6 @@ Validation:
 
 - an agent panel observes workspace events
 - a git/status-style app updates scene state without restarting the session
-
-### 6. Revisit WSLg Integration Boundary
-
-After Linux-native WASM proves the model, decide how WSLg participates.
-
-Likely directions:
-
-- keep the WASM host in the Rust session process and let WSLg-native code act as a backend/presentation adapter
-- define an IPC protocol between the WSLg insertion point and the session process
-- embed a runtime in the WSLg path only if the protocol boundary proves too costly or too indirect
-
-This should remain a later decision, because ADR 0004 keeps the Linux/Rust and WSLg/C experiments separate until their shared behavior is clearer.
 
 ## Open Questions
 

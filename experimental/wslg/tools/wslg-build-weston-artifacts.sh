@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 WSLG_DIR="$ROOT/reference/wslg"
 BASE_IMAGE_TAG="${WSLG_WESTON_IMAGE_TAG:-system-distro-x64-weston-build:latest}"
 ARTIFACT_DIR="${WSLG_WESTON_ARTIFACT_DIR:-$WSLG_DIR/tmp/weston-artifacts}"
@@ -38,17 +38,17 @@ EOF
     esac
 done
 
-"$ROOT/tools/wslg-bootstrap-reference.sh"
+"$ROOT/experimental/wslg/tools/wslg-bootstrap-reference.sh"
 
 if [[ ! -d "$WSLG_DIR/vendor/weston/.git" ]]; then
     echo "WSLg vendor sources are missing; bootstrapping them now."
-    "$ROOT/tools/wslg-bootstrap-vendors.sh"
+    "$ROOT/experimental/wslg/tools/wslg-bootstrap-vendors.sh"
 fi
 
 WSLG_APPLY_SHOW_DIFF=0 \
 WSLG_APPLY_PIXMAN_INVERT="${WSLG_APPLY_PIXMAN_INVERT:-0}" \
-    "$ROOT/tools/wslg-apply-manifold-marker.sh"
-"$ROOT/tools/wslg-ensure-build-deps.sh"
+    "$ROOT/experimental/wslg/tools/wslg-apply-manifold-marker.sh"
+"$ROOT/experimental/wslg/tools/wslg-ensure-build-deps.sh"
 
 if [[ ! -f "$WSLG_DIR/vendor/pulseaudio/.tarball-version" ]]; then
     printf '17.0\n' > "$WSLG_DIR/vendor/pulseaudio/.tarball-version"

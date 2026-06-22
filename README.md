@@ -4,8 +4,6 @@ Manifold is a new workspace project for a persistent, graphical developer enviro
 
 The core idea is a local virtual workspace containing isolated sessions. A local session process owns durable session state and can open a native presentation window. The presentation window is not a remote framebuffer viewer. It is a compositor endpoint that presents one session at a time, showing any number of that session's panes with presentation-surface-owned layout, animation, and interaction.
 
-Unless a document explicitly calls out WSLg, Windows, or another backend, implementation prose defaults to the Linux-native Manifold path. When running on Windows, that same default should usually be read as the Windows/WSLg-native path instead.
-
 ## Thesis
 
 Manifold should feel like a native editor while behaving more like a rich tmux session:
@@ -56,6 +54,8 @@ Run the tests:
 cargo test
 ```
 
+The repo also includes `flake.nix` for developers who want a Nix shell. It is optional; the ordinary Cargo commands above are the default project entry points.
+
 Useful variants:
 
 ```sh
@@ -67,7 +67,7 @@ cargo run -- ctl status-json
 cargo run -- test nested
 ```
 
-Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the full v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On the current WSLg backend, the full smoke suite passes and the positive dmabuf/sync checks skip with `rc=77` because WSLg exposes no importable dmabuf formats. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
+Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
 
 Concrete choices for renderer stack, CEF integration, IPC, protocol encoding, WASM runtime, and crate layout are intentionally deferred. Remote presentation is a non-goal for the current prototype.
 

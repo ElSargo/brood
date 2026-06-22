@@ -9,7 +9,9 @@ mod layout;
 mod presentation;
 mod state;
 mod wasm_key;
+mod wasm_map;
 mod wasm_test;
+mod winit_presenter;
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -54,6 +56,9 @@ struct RunArgs {
     /// Load a core-WASM normal-mode key handler.
     #[arg(long = "wasm-key-handler", value_name = "PATH")]
     wasm_key_handler: Option<PathBuf>,
+    /// Load a core-WASM fast map hook.
+    #[arg(long = "wasm-map-hook", value_name = "PATH")]
+    wasm_map_hook: Option<PathBuf>,
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     test_harness: Option<PathBuf>,
@@ -76,6 +81,7 @@ impl Default for RunArgs {
             headless: false,
             browser: None,
             wasm_key_handler: None,
+            wasm_map_hook: None,
             test_harness: None,
             nested_inner_control_socket: None,
             config: PathBuf::from("manifold.toml"),

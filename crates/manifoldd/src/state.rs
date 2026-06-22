@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     ffi::OsString,
     path::PathBuf,
     process::Command,
@@ -12,20 +11,19 @@ use anyhow::{Context, Result};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
-    backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState},
     reexports::{
         calloop::{
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
             generic::Generic,
             timer::{TimeoutAction, Timer},
-            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
+            Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
-            Display, DisplayHandle, Resource,
         },
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -48,9 +46,11 @@ use crate::{
     },
     presentation::PresenterHandle,
     wasm_key::WasmKeyHandler,
+    wasm_map::{MapHookInput, MapHookOutcome, MapHookResponse, MapLayoutPatch, WasmMapHook},
     wasm_test::{
-        service_request, TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime,
+        TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request,
     },
+    winit_presenter::SharedPresenterRuntime,
 };
 
 #[cfg(feature = "shm-fallback")]
@@ -118,7 +118,11 @@ pub struct Manifold {
     next_window_slot: usize,
     last_window_count: usize,
     active_toplevel_surface: Option<WlSurface>,
+    pointer_hover_toplevel_surface: Option<WlSurface>,
+    pending_pointer_focus_surface: Option<WlSurface>,
     window_layout_leaves: Vec<(WlSurface, LayoutLeafId)>,
+    next_pane_id: u64,
+    window_pane_ids: Vec<(WlSurface, u64)>,
     pub(crate) ctrl_pressed: bool,
     pub(crate) alt_pressed: bool,
     pub(crate) ctrl_forwarded_to_client: bool,
@@ -134,6 +138,7 @@ pub struct Manifold {
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
     pub(crate) wasm_key_handler: Option<WasmKeyHandler>,
+    pub(crate) wasm_map_hook: Option<WasmMapHook>,
     pub(crate) test_harness: Option<TestHarnessRuntime>,
     pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
     pub(crate) nested_inner_control_socket: Option<PathBuf>,
@@ -197,7 +202,11 @@ impl Manifold {
             next_window_slot: 0,
             last_window_count: 0,
             active_toplevel_surface: None,
+            pointer_hover_toplevel_surface: None,
+            pending_pointer_focus_surface: None,
             window_layout_leaves: Vec::new(),
+            next_pane_id: 1,
+            window_pane_ids: Vec::new(),
             ctrl_pressed: false,
             alt_pressed: false,
             ctrl_forwarded_to_client: false,
@@ -213,6 +222,7 @@ impl Manifold {
             presentation_skip_post_submit_frame_callbacks: false,
             presenter: None,
             wasm_key_handler: None,
+            wasm_map_hook: None,
             test_harness: None,
             test_harness_completion: None,
             nested_inner_control_socket: None,
@@ -340,6 +350,10 @@ impl Manifold {
         }
     }
 
+    pub fn request_os_window_close(&mut self) {
+        self.request_detach();
+    }
+
     pub fn record_presentation_attach_failure(&mut self, error: &str) {
         self.stats.record_attach_failed();
         self.presentation_attach_failures += 1;
@@ -368,19 +382,50 @@ impl Manifold {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
-            return None;
+        self.window_under_layout_position(pos)
+            .and_then(|(window, location)| {
+                let local_pos =
+                    Point::from((pos.x - f64::from(location.x), pos.y - f64::from(location.y)));
+                window
+                    .surface_under(local_pos, WindowSurfaceType::ALL)
+                    .map(|(surface, point)| (surface, point.to_f64()))
+            })
+    }
+
+    pub fn window_under_layout_position(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(Window, Point<i32, Logical>)> {
+        if let Some(active_window) = self.active_window() {
+            if let Some(location) = self.window_hit_location(&active_window, pos) {
+                return Some((active_window, location));
+            }
         }
-        let rect = self.active_layout_rect()?;
+
+        self.space
+            .elements()
+            .filter(|window| self.window_in_active_surface_session(window))
+            .filter_map(|window| {
+                self.window_hit_location(window, pos)
+                    .map(|location| (window.clone(), location))
+            })
+            .last()
+    }
+
+    fn window_hit_location(
+        &self,
+        window: &Window,
+        pos: Point<f64, Logical>,
+    ) -> Option<Point<i32, Logical>> {
+        let rect = self.window_layout_rect(window)?;
         if !rect.contains_f64(pos.x, pos.y) {
             return None;
         }
         let local_pos = Point::from((pos.x - f64::from(rect.x), pos.y - f64::from(rect.y)));
-        self.active_window().and_then(|window| {
-            window
-                .surface_under(local_pos, WindowSurfaceType::ALL)
-                .map(|(surface, point)| (surface, point.to_f64()))
-        })
+        window
+            .surface_under(local_pos, WindowSurfaceType::ALL)
+            .is_some()
+            .then(|| Point::from((rect.x, rect.y)))
     }
 
     pub fn first_window_center(&self) -> Option<Point<f64, Logical>> {
@@ -495,17 +540,215 @@ impl Manifold {
         self.reconfigure_focus_stack();
     }
 
-    pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) {
+    pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) -> Option<WlSurface> {
         self.window_surface_sessions
             .push((surface.clone(), self.active_surface_session));
+        let pane = self.register_toplevel_pane(surface);
         let leaf = if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
             self.layout.occupy_active_leaf()
         } else {
             Some(self.layout.active_leaf())
         };
         if let Some(leaf) = leaf {
-            self.window_layout_leaves.push((surface.clone(), leaf));
+            self.assign_pane_to_leaf(pane, leaf);
         }
+        self.apply_map_hook_for_pending_pane(pane)
+    }
+
+    fn register_toplevel_pane(&mut self, surface: &WlSurface) -> u64 {
+        if let Some(pane) = self.pane_for_toplevel_surface(surface) {
+            return pane;
+        }
+        let pane = self.next_pane_id;
+        self.next_pane_id += 1;
+        self.window_pane_ids.push((surface.clone(), pane));
+        pane
+    }
+
+    fn pane_for_toplevel_surface(&self, surface: &WlSurface) -> Option<u64> {
+        self.window_pane_ids
+            .iter()
+            .rev()
+            .find_map(|(assigned_surface, pane)| (assigned_surface == surface).then_some(*pane))
+    }
+
+    fn surface_for_pane(&self, target_pane: u64) -> Option<WlSurface> {
+        self.window_pane_ids
+            .iter()
+            .rev()
+            .find_map(|(surface, pane)| (*pane == target_pane).then(|| surface.clone()))
+    }
+
+    fn active_surface_session_panes(&self) -> Vec<u64> {
+        self.window_surface_sessions
+            .iter()
+            .filter(|(_, session)| *session == self.active_surface_session)
+            .filter_map(|(surface, _)| self.pane_for_toplevel_surface(surface))
+            .fold(Vec::new(), |mut panes, pane| {
+                if !panes.contains(&pane) {
+                    panes.push(pane);
+                }
+                panes
+            })
+    }
+
+    fn leaf_for_pane(&self, target_pane: u64) -> Option<LayoutLeafId> {
+        let surface = self.surface_for_pane(target_pane)?;
+        self.leaf_for_toplevel_surface(&surface)
+    }
+
+    fn leaf_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutLeafId> {
+        self.window_layout_leaves
+            .iter()
+            .rev()
+            .find_map(|(assigned_surface, leaf)| (assigned_surface == surface).then_some(*leaf))
+    }
+
+    fn assign_pane_to_leaf(&mut self, pane: u64, leaf: LayoutLeafId) -> bool {
+        let Some(surface) = self.surface_for_pane(pane) else {
+            return false;
+        };
+        self.window_layout_leaves
+            .retain(|(assigned_surface, _)| assigned_surface != &surface);
+        self.window_layout_leaves.push((surface, leaf));
+        true
+    }
+
+    fn apply_map_hook_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
+        let visible_panes = self.active_surface_session_panes();
+        let Some(handler) = self.wasm_map_hook.as_mut() else {
+            return self.surface_for_pane(pending_pane);
+        };
+        let input = MapHookInput {
+            pending_pane,
+            visible_panes,
+        };
+        let outcome = match handler.handle_map(input) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    pending_pane, "WASM map hook failed; using native placement"
+                );
+                return self.surface_for_pane(pending_pane);
+            }
+        };
+        match outcome {
+            MapHookOutcome::Abstain => self.surface_for_pane(pending_pane),
+            MapHookOutcome::Response(response) => self
+                .apply_map_hook_response(pending_pane, response)
+                .or_else(|| self.surface_for_pane(pending_pane)),
+        }
+    }
+
+    fn apply_map_hook_response(
+        &mut self,
+        pending_pane: u64,
+        response: MapHookResponse,
+    ) -> Option<WlSurface> {
+        match response {
+            MapHookResponse::Abstain => None,
+            MapHookResponse::Reject { reason } => {
+                warn!(
+                    pending_pane,
+                    reason, "WASM map hook rejected map; using native placement"
+                );
+                None
+            }
+            MapHookResponse::Patch { patches } => self.apply_map_hook_patches(patches),
+            MapHookResponse::ReplaceVisibleTree { root, focus } => {
+                self.apply_map_hook_visible_tree(root, focus)
+            }
+        }
+    }
+
+    fn apply_map_hook_patches(&mut self, patches: Vec<MapLayoutPatch>) -> Option<WlSurface> {
+        let mut focus_surface = None;
+        for patch in patches {
+            match patch {
+                MapLayoutPatch::PlacePane { pane, after, focus } => {
+                    let Some(target_leaf) = after
+                        .and_then(|anchor| self.leaf_for_pane(anchor))
+                        .or_else(|| Some(self.layout.active_leaf()))
+                    else {
+                        continue;
+                    };
+                    if self.assign_pane_to_leaf(pane, target_leaf) {
+                        if focus {
+                            self.layout.set_active_leaf(target_leaf);
+                            focus_surface = self.surface_for_pane(pane);
+                        }
+                    }
+                }
+            }
+        }
+        self.reconfigure_focus_stack();
+        focus_surface
+    }
+
+    fn apply_map_hook_visible_tree(
+        &mut self,
+        root: crate::layout::VisibleLayoutNode,
+        focus: Option<u64>,
+    ) -> Option<WlSurface> {
+        let expected = self.active_surface_session_panes();
+        let mut next_layout = self.layout.clone();
+        let applied = match next_layout.replace_visible_tree(&root, focus) {
+            Ok(applied) => applied,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "WASM map hook returned invalid visible tree; using native placement"
+                );
+                return None;
+            }
+        };
+
+        let mut assigned = applied
+            .assignments
+            .iter()
+            .map(|assignment| assignment.pane)
+            .collect::<Vec<_>>();
+        assigned.sort_unstable();
+        let mut expected_sorted = expected;
+        expected_sorted.sort_unstable();
+        if assigned != expected_sorted {
+            warn!(
+                assigned = ?assigned,
+                expected = ?expected_sorted,
+                "WASM map hook visible tree must reference exactly the active session panes"
+            );
+            return None;
+        }
+
+        let mut next_window_layout_leaves = self
+            .window_layout_leaves
+            .iter()
+            .filter(|(surface, _)| {
+                self.session_for_toplevel_surface(surface)
+                    .unwrap_or(SurfaceSessionId(1))
+                    != self.active_surface_session
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for assignment in applied.assignments {
+            let Some(surface) = self.surface_for_pane(assignment.pane) else {
+                warn!(
+                    pane = assignment.pane,
+                    "WASM map hook referenced pane without a surface"
+                );
+                return None;
+            };
+            next_window_layout_leaves.push((surface, assignment.leaf));
+        }
+
+        let focus_surface = applied
+            .focused_pane
+            .and_then(|pane| self.surface_for_pane(pane));
+        self.layout = next_layout;
+        self.window_layout_leaves = next_window_layout_leaves;
+        self.reconfigure_focus_stack();
+        focus_surface
     }
 
     pub fn active_surface_session(&self) -> SurfaceSessionId {
@@ -611,6 +854,12 @@ impl Manifold {
     }
 
     pub fn focus_toplevel_surface(&mut self, active_surface: Option<WlSurface>) {
+        if let Some(leaf) = active_surface
+            .as_ref()
+            .and_then(|surface| self.leaf_for_toplevel_surface(surface))
+        {
+            self.layout.set_active_leaf(leaf);
+        }
         self.active_toplevel_surface = active_surface.clone();
         self.activate_window_exclusively(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
@@ -640,6 +889,32 @@ impl Manifold {
     pub fn focus_window(&mut self, window: &Window) {
         self.space.raise_element(window, true);
         self.focus_toplevel_surface(Manifold::window_toplevel_surface(window));
+    }
+
+    pub fn window_for_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.space
+            .elements()
+            .find(|window| {
+                self.window_in_active_surface_session(window)
+                    && Manifold::window_toplevel_surface(window).as_ref() == Some(surface)
+            })
+            .cloned()
+    }
+
+    pub fn set_pending_pointer_focus_surface(&mut self, surface: Option<WlSurface>) {
+        self.pending_pointer_focus_surface = surface;
+    }
+
+    pub fn take_pending_pointer_focus_surface(&mut self) -> Option<WlSurface> {
+        self.pending_pointer_focus_surface.take()
+    }
+
+    pub fn set_pointer_hover_toplevel_surface(&mut self, surface: Option<WlSurface>) {
+        self.pointer_hover_toplevel_surface = surface;
+    }
+
+    pub fn pointer_hover_toplevel_surface(&self) -> Option<WlSurface> {
+        self.pointer_hover_toplevel_surface.clone()
     }
 
     pub fn cycle_focus(&mut self, direction: FocusDirection) -> bool {
@@ -869,6 +1144,22 @@ impl Manifold {
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_surface_sessions
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.window_pane_ids
+            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        if self
+            .pending_pointer_focus_surface
+            .as_ref()
+            .is_some_and(|surface| !live_toplevel_surfaces.iter().any(|live| live == surface))
+        {
+            self.pending_pointer_focus_surface = None;
+        }
+        if self
+            .pointer_hover_toplevel_surface
+            .as_ref()
+            .is_some_and(|surface| !live_toplevel_surfaces.iter().any(|live| live == surface))
+        {
+            self.pointer_hover_toplevel_surface = None;
+        }
         let window_count = self.active_surface_session_window_count();
 
         let keyboard = self.seat.get_keyboard().expect("keyboard");
@@ -1311,19 +1602,25 @@ mod runtime_stats_tests {
     fn input_frame_defer_remaining_only_waits_for_input_without_commit() {
         let mut stats = RuntimeStats::default();
 
-        assert!(stats
-            .input_frame_defer_remaining(Duration::from_millis(3))
-            .is_none());
+        assert!(
+            stats
+                .input_frame_defer_remaining(Duration::from_millis(3))
+                .is_none()
+        );
 
         stats.record_input(true);
-        assert!(stats
-            .input_frame_defer_remaining(Duration::from_millis(3))
-            .is_some());
+        assert!(
+            stats
+                .input_frame_defer_remaining(Duration::from_millis(3))
+                .is_some()
+        );
 
         stats.record_commit(true);
-        assert!(stats
-            .input_frame_defer_remaining(Duration::from_millis(3))
-            .is_none());
+        assert!(
+            stats
+                .input_frame_defer_remaining(Duration::from_millis(3))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1439,7 +1736,7 @@ pub struct DmabufRuntime {
     pub state: DmabufState,
     pub global: Option<DmabufGlobal>,
     pub default_feedback: Option<DmabufFeedback>,
-    pub importer: Option<Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>>,
+    pub importer: Option<SharedPresenterRuntime>,
     pub stats: DmabufStats,
     pub shm_formats: usize,
     pub advertised_formats: usize,

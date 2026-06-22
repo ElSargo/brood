@@ -20,6 +20,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wasmtime.workspace = true
+wayland-egl.workspace = true
 
 [lints.rust]
 unsafe_code = "allow"

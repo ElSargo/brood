@@ -9,7 +9,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$root = Resolve-Path (Join-Path $PSScriptRoot "..\..\..")
 
 Push-Location $root
 try {
@@ -22,12 +22,12 @@ try {
             Write-Output "Building Weston hot-deploy artifacts..."
             $env:WSLG_WESTON_IMAGE_TAG = $WestonImage
             $env:WSLG_WESTON_ARTIFACT_DIR = $WestonArtifactDir
-            bash tools/wslg-build-weston-artifacts.sh
+            bash experimental/wslg/tools/wslg-build-weston-artifacts.sh
             $sourceDir = $WestonArtifactDir
         } else {
             Write-Output "Building private WSLg Docker image..."
             $env:WSLG_IMAGE_TAG = $Image
-            bash tools/wslg-build-private-image.sh
+            bash experimental/wslg/tools/wslg-build-private-image.sh
         }
 
         if ($LASTEXITCODE -ne 0) {
@@ -37,7 +37,7 @@ try {
         $sourceDir = $WestonArtifactDir
     }
 
-    $bashArgs = @("tools/wslg-hot-deploy-weston.sh", "--image", $deployImage, "--source-root", $sourceRoot)
+    $bashArgs = @("experimental/wslg/tools/wslg-hot-deploy-weston.sh", "--image", $deployImage, "--source-root", $sourceRoot)
     if ($sourceDir) {
         $bashArgs += @("--source-dir", $sourceDir)
     }

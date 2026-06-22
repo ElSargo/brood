@@ -6,22 +6,21 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState},
     input::pointer::AxisFrame,
-    reexports::calloop::{generic::Generic, EventLoop, Interest, Mode, PostAction},
+    reexports::calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
     utils::Point,
 };
 use tracing::{info, warn};
 
 use crate::{
-    browser,
+    CtlArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
     state::{FocusDirection, Manifold},
-    CtlArgs,
 };
 
 const MAX_CONTROL_COMMAND_BYTES: usize = 64 * 1024;

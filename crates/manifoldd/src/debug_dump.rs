@@ -43,7 +43,11 @@ impl DumpOptions {
             include_composed: false,
             include_surfaces: false,
         };
-        for token in selector.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+        for token in selector
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
             match token {
                 "state" => options.include_state = true,
                 "composed" | "final" => options.include_composed = true,
@@ -119,7 +123,9 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
         .enumerate()
         .map(|(index, window)| {
             let surface_id = Manifold::window_toplevel_surface(window)
-                .map(|surface| crate::presentation::sanitize_status_value(&format!("{:?}", surface.id())))
+                .map(|surface| {
+                    crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()))
+                })
                 .unwrap_or_else(|| "none".to_string());
             let rect = state
                 .window_layout_rect(window)
@@ -242,7 +248,8 @@ fn capture_shm_buffer(ptr: *const u8, len: usize, data: BufferData) -> Option<Su
     let stride = usize::try_from(data.stride).ok()?;
     let offset = usize::try_from(data.offset).ok()?;
     let bytes_per_pixel = 4;
-    let needed = offset.checked_add(stride.checked_mul(height.saturating_sub(1))?)?
+    let needed = offset
+        .checked_add(stride.checked_mul(height.saturating_sub(1))?)?
         .checked_add(width.checked_mul(bytes_per_pixel)?)?;
     if needed > len {
         return None;

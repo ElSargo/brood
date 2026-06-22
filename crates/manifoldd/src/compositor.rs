@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -56,6 +55,7 @@ use crate::{
     config, control, presentation,
     state::{ClientState, Manifold, PresentationStatus},
     wasm_key::WasmKeyHandler,
+    wasm_map::WasmMapHook,
     wasm_test::TestHarnessRuntime,
 };
 
@@ -71,6 +71,11 @@ pub fn run(args: RunArgs) -> Result<()> {
     if let Some(path) = args.wasm_key_handler.as_deref() {
         state.wasm_key_handler = Some(WasmKeyHandler::load(path)?);
         info!(path = %path.display(), "loaded CLI WASM key handler");
+    }
+
+    if let Some(path) = args.wasm_map_hook.as_deref() {
+        state.wasm_map_hook = Some(WasmMapHook::load(path)?);
+        info!(path = %path.display(), "loaded CLI WASM map hook");
     }
 
     if let Some(path) = args.test_harness.as_deref() {
@@ -181,7 +186,11 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
 
     if let Some(command) = args.inner_command.as_deref() {
         let inner_command = shell_split(command)?;
-        control::request_socket_command(&inner_sock, &[vec!["spawn".to_string()], inner_command].concat(), false)?;
+        control::request_socket_command(
+            &inner_sock,
+            &[vec!["spawn".to_string()], inner_command].concat(),
+            false,
+        )?;
     }
 
     println!("OK nested test ready");
@@ -236,9 +245,18 @@ fn spawn_outer(
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
     }
-    command.stdout(Stdio::from(fs::File::create(outer_log).with_context(|| format!("create {}", outer_log.display()))?));
-    command.stderr(Stdio::from(fs::OpenOptions::new().append(true).open(outer_log).with_context(|| format!("open {}", outer_log.display()))?));
-    command.spawn().with_context(|| format!("spawn outer process {}", current_exe.display()))
+    command.stdout(Stdio::from(
+        fs::File::create(outer_log).with_context(|| format!("create {}", outer_log.display()))?,
+    ));
+    command.stderr(Stdio::from(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(outer_log)
+            .with_context(|| format!("open {}", outer_log.display()))?,
+    ));
+    command
+        .spawn()
+        .with_context(|| format!("spawn outer process {}", current_exe.display()))
 }
 
 fn spawn_inner(
@@ -285,11 +303,9 @@ fn wait_for_control_socket(
             let log_tail = read_log_tail(log_path);
             bail!("{label} failed before control socket ready: {status}\n{log_tail}");
         }
-        if let Ok(response) = control::request_socket_command(
-            control_socket,
-            &[String::from("status-json")],
-            false,
-        ) {
+        if let Ok(response) =
+            control::request_socket_command(control_socket, &[String::from("status-json")], false)
+        {
             if response.trim_start().starts_with('{') {
                 return Ok(());
             }
@@ -313,13 +329,16 @@ fn wait_for_outer_window(
             let log_tail = read_log_tail(log_path);
             bail!("outer exited before inner presentation mapped: {status}\n{log_tail}");
         }
-        if let Ok(response) = control::request_socket_command(
-            outer_sock,
-            &[String::from("status-json")],
-            false,
-        ) {
+        if let Ok(response) =
+            control::request_socket_command(outer_sock, &[String::from("status-json")], false)
+        {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                if json.get("windows").and_then(serde_json::Value::as_u64).unwrap_or(0) >= 1 {
+                if json
+                    .get("windows")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    >= 1
+                {
                     return Ok(());
                 }
             }
@@ -542,10 +561,15 @@ impl DmabufHandler for Manifold {
             return;
         };
 
-        let result = importer
-            .borrow_mut()
-            .renderer()
-            .import_dmabuf(&dmabuf, None);
+        let mut runtime = importer.borrow_mut();
+        let Some(importer) = runtime.backend.as_mut() else {
+            self.dmabuf.stats.rejected += 1;
+            self.dmabuf.stats.last_error = Some("no_presentation_importer".to_string());
+            notifier.failed();
+            return;
+        };
+
+        let result = importer.renderer().import_dmabuf(&dmabuf, None);
 
         match result {
             Ok(_) => {
@@ -635,13 +659,14 @@ impl XdgShellHandler for Manifold {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
         let active_surface = Manifold::window_toplevel_surface(&window);
+        let mut focus_surface = active_surface.clone();
         if let Some(surface) = active_surface.as_ref() {
-            self.assign_new_toplevel_surface(surface);
+            focus_surface = self.assign_new_toplevel_surface(surface);
         }
         let location = self.allocate_toplevel_location();
         self.space.map_element(window, location, true);
         self.record_window_mapped();
-        self.focus_toplevel_surface(active_surface);
+        self.focus_toplevel_surface(focus_surface);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

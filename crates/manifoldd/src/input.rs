@@ -13,7 +13,7 @@ use smithay::{
 use tracing::warn;
 
 use crate::{
-    layout::{LayoutKeymap, LayoutLeafKind},
+    layout::LayoutKeymap,
     state::{InputMode, Manifold, PresentationStatus},
 };
 
@@ -25,6 +25,7 @@ const KEY_B: Keycode = Keycode::new(56);
 const KEY_W: Keycode = Keycode::new(25);
 
 impl Manifold {
+    #[allow(dead_code)]
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
@@ -219,6 +220,10 @@ impl Manifold {
 
     pub fn forward_pointer_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
         let serial = SERIAL_COUNTER.next_serial();
+        let hover_surface = self
+            .window_under_layout_position(pos)
+            .and_then(|(window, _location)| Manifold::window_toplevel_surface(&window));
+        self.set_pointer_hover_toplevel_surface(hover_surface);
         let under = self.surface_under(pos);
         self.stats
             .record_input(self.presentation == PresentationStatus::Attached && under.is_some());
@@ -246,32 +251,7 @@ impl Manifold {
         let pointer = self.seat.get_pointer().expect("pointer");
         let keyboard = self.seat.get_keyboard().expect("keyboard");
         let serial = SERIAL_COUNTER.next_serial();
-        let active_rect = self.active_layout_rect();
-        let target_window: Option<(smithay::desktop::Window, Point<i32, Logical>)> = self
-            .active_window()
-            .filter(|window| {
-                if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
-                    return false;
-                }
-                let Some(rect) = active_rect else {
-                    return false;
-                };
-                let pointer_location = pointer.current_location();
-                if !rect.contains_f64(pointer_location.x, pointer_location.y) {
-                    return false;
-                }
-                let local_location = Point::from((
-                    pointer_location.x - f64::from(rect.x),
-                    pointer_location.y - f64::from(rect.y),
-                ));
-                window
-                    .surface_under(local_location, smithay::desktop::WindowSurfaceType::ALL)
-                    .is_some()
-            })
-            .map(|window| {
-                let loc = active_rect.map_or((0, 0), |rect| (rect.x, rect.y));
-                (window, Point::<i32, Logical>::from(loc))
-            });
+        let target_window = self.window_under_layout_position(pointer.current_location());
         self.stats.record_input(
             self.presentation == PresentationStatus::Attached && target_window.is_some(),
         );
@@ -282,13 +262,33 @@ impl Manifold {
             self.stats.pointer_target_misses += 1;
         }
 
-        if state == ButtonState::Pressed && !pointer.is_grabbed() {
-            if let Some((window, _location)) = target_window {
-                self.focus_window(&window);
-            } else {
-                self.activate_window_exclusively(None);
-                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+        match state {
+            ButtonState::Pressed if !pointer.is_grabbed() => {
+                let focus_surface = self.pointer_hover_toplevel_surface().or_else(|| {
+                    target_window
+                        .as_ref()
+                        .and_then(|(window, _location)| Manifold::window_toplevel_surface(window))
+                });
+                self.set_pending_pointer_focus_surface(focus_surface);
             }
+            ButtonState::Released => {
+                let focus_surface = self.take_pending_pointer_focus_surface().or_else(|| {
+                    target_window
+                        .as_ref()
+                        .and_then(|(window, _location)| Manifold::window_toplevel_surface(window))
+                });
+                if let Some(surface) = focus_surface {
+                    if let Some(window) = self.window_for_toplevel_surface(&surface) {
+                        self.focus_window(&window);
+                    } else {
+                        self.focus_toplevel_surface(Some(surface));
+                    }
+                } else if !pointer.is_grabbed() {
+                    self.activate_window_exclusively(None);
+                    keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+                }
+            }
+            ButtonState::Pressed => {}
         }
 
         pointer.button(

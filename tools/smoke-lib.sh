@@ -10,7 +10,6 @@ describe_host_presentation_environment() {
   echo "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}" >&2
   echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}" >&2
   echo "DISPLAY=${DISPLAY:-unset}" >&2
-  echo "WSL2_GUI_APPS_ENABLED=${WSL2_GUI_APPS_ENABLED:-unset}" >&2
 
   if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" ]]; then
     wayland_socket="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
@@ -27,20 +26,19 @@ describe_host_presentation_environment() {
 
   if [[ "${DISPLAY:-}" =~ ^:([0-9]+) ]]; then
     display_number="${BASH_REMATCH[1]}"
-    for path in "/tmp/.X11-unix/X$display_number" "/mnt/wslg/.X11-unix/X$display_number"; do
-      if [[ -S "$path" ]]; then
-        echo "x11_socket=$path socket=yes" >&2
-      elif [[ -e "$path" ]]; then
-        echo "x11_socket=$path socket=no exists=yes" >&2
-      else
-        echo "x11_socket=$path socket=no exists=no" >&2
-      fi
-    done
+    path="/tmp/.X11-unix/X$display_number"
+    if [[ -S "$path" ]]; then
+      echo "x11_socket=$path socket=yes" >&2
+    elif [[ -e "$path" ]]; then
+      echo "x11_socket=$path socket=no exists=yes" >&2
+    else
+      echo "x11_socket=$path socket=no exists=no" >&2
+    fi
   else
     echo "x11_socket=unknown socket=no reason=display_unset_or_unsupported" >&2
   fi
 
-  for path in "${XDG_RUNTIME_DIR:-}" /mnt/wslg/runtime-dir /tmp/.X11-unix /mnt/wslg/.X11-unix; do
+  for path in "${XDG_RUNTIME_DIR:-}" /tmp/.X11-unix; do
     if [[ -z "$path" || "$listed_dirs" == *" $path "* ]]; then
       continue
     fi
@@ -53,12 +51,6 @@ describe_host_presentation_environment() {
     fi
   done
 
-  if [[ -r /mnt/wslg/weston.log ]]; then
-    echo "wslg_weston_log_tail:" >&2
-    tail -40 /mnt/wslg/weston.log >&2 || true
-  else
-    echo "wslg_weston_log_tail=unavailable" >&2
-  fi
   echo "host_display_diagnostic=end" >&2
 }
 
@@ -79,11 +71,10 @@ require_host_presentation_environment() {
   local x_socket=""
   if [[ "${DISPLAY:-}" =~ ^:([0-9]+) ]]; then
     display_number="${BASH_REMATCH[1]}"
-    for x_socket in "/tmp/.X11-unix/X$display_number" "/mnt/wslg/.X11-unix/X$display_number"; do
-      if [[ -S "$x_socket" ]]; then
-        return 0
-      fi
-    done
+    x_socket="/tmp/.X11-unix/X$display_number"
+    if [[ -S "$x_socket" ]]; then
+      return 0
+    fi
   fi
 
   echo "ERR no host display socket is available for the Winit presentation frontend" >&2

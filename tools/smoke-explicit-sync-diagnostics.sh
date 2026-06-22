@@ -19,7 +19,7 @@ fi
 
 cargo build -p manifoldd --offline >/dev/null
 
-exec 9>/tmp/manifold-wslg-smoke.lock
+exec 9>/tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-explicit-sync-smoke.XXXXXX)"

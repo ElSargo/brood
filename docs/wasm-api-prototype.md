@@ -40,7 +40,7 @@ Initial events:
 - `presentation-attached`
 - `presentation-detached`
 
-The first native implementation can map these to the existing `cycle_focus`, `close_active_window`, `toggle_managed_fullscreen`, `request_attach`, and `request_detach` paths. The API should still use pane/workspace names rather than Wayland window names so the same contract can later apply to WASM panes, browser panes, and WSLg-native managed app surfaces.
+The first native implementation can map these to the existing `cycle_focus`, `close_active_window`, `toggle_managed_fullscreen`, `request_attach`, and `request_detach` paths. The API should still use pane/workspace names rather than Wayland window names so the same contract can later apply to WASM panes, browser panes, and other managed app surfaces.
 
 ## Running Managed Apps
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 WSLG_DIR="$ROOT/reference/wslg"
 VENDOR_DIR="$WSLG_DIR/vendor"
 
 if [[ ! -d "$WSLG_DIR/.git" ]]; then
-    "$ROOT/tools/wslg-bootstrap-reference.sh"
+    "$ROOT/experimental/wslg/tools/wslg-bootstrap-reference.sh"
 fi
 
 mkdir -p "$VENDOR_DIR"

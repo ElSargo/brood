@@ -136,14 +136,10 @@ fn run_harness_thread(
     let mut linker = Linker::new(&engine);
 
     linker
-        .func_wrap(
-            "manifold",
-            "sleep_ms",
-            |millis: i32| {
-                let millis = u64::try_from(millis.max(0)).unwrap_or(0);
-                thread::sleep(Duration::from_millis(millis));
-            },
-        )
+        .func_wrap("manifold", "sleep_ms", |millis: i32| {
+            let millis = u64::try_from(millis.max(0)).unwrap_or(0);
+            thread::sleep(Duration::from_millis(millis));
+        })
         .map_err(|err| anyhow::anyhow!("define manifold.sleep_ms import: {err}"))?;
     linker
         .func_wrap(
@@ -207,10 +203,14 @@ fn run_harness_thread(
                                 input,
                                 response: response_tx,
                             })
-                            .map_err(|err| anyhow::anyhow!("send control command request: {err}"))?;
+                            .map_err(|err| {
+                                anyhow::anyhow!("send control command request: {err}")
+                            })?;
                         response_rx
                             .recv()
-                            .map_err(|err| anyhow::anyhow!("receive control command response: {err}"))?
+                            .map_err(|err| {
+                                anyhow::anyhow!("receive control command response: {err}")
+                            })?
                             .map_err(anyhow::Error::msg)
                     },
                 )
@@ -227,16 +227,16 @@ fn run_harness_thread(
                     resp_ptr,
                     resp_cap,
                     |request_sender, _signal_receiver| {
-                    let (response_tx, response_rx) = mpsc::channel();
-                    request_sender
-                        .send(TestHarnessRequest::StatusJson {
-                            response: response_tx,
-                        })
-                        .map_err(|err| anyhow::anyhow!("send status request: {err}"))?;
-                    response_rx
-                        .recv()
-                        .map_err(|err| anyhow::anyhow!("receive status response: {err}"))?
-                        .map_err(anyhow::Error::msg)
+                        let (response_tx, response_rx) = mpsc::channel();
+                        request_sender
+                            .send(TestHarnessRequest::StatusJson {
+                                response: response_tx,
+                            })
+                            .map_err(|err| anyhow::anyhow!("send status request: {err}"))?;
+                        response_rx
+                            .recv()
+                            .map_err(|err| anyhow::anyhow!("receive status response: {err}"))?
+                            .map_err(anyhow::Error::msg)
                     },
                 )
             },
@@ -282,9 +282,12 @@ fn round_trip_guest_string(
         Ok(input) => input,
         Err(err) => return log_failure(err, "test harness passed invalid request"),
     };
-    write_guest_response(caller, resp_ptr, resp_cap, |request_sender, signal_receiver| {
-        f(input, request_sender, signal_receiver)
-    })
+    write_guest_response(
+        caller,
+        resp_ptr,
+        resp_cap,
+        |request_sender, signal_receiver| f(input, request_sender, signal_receiver),
+    )
 }
 
 fn write_guest_response(
@@ -294,10 +297,16 @@ fn write_guest_response(
     f: impl FnOnce(&Sender<TestHarnessRequest>, &Receiver<TestHarnessSignal>) -> Result<String>,
 ) -> i32 {
     let Some(request_sender) = caller.data().request_sender.as_ref() else {
-        return log_failure(anyhow::anyhow!("missing request sender"), "test harness runtime unavailable");
+        return log_failure(
+            anyhow::anyhow!("missing request sender"),
+            "test harness runtime unavailable",
+        );
     };
     let Some(signal_receiver) = caller.data().signal_receiver.as_ref() else {
-        return log_failure(anyhow::anyhow!("missing signal receiver"), "test harness runtime unavailable");
+        return log_failure(
+            anyhow::anyhow!("missing signal receiver"),
+            "test harness runtime unavailable",
+        );
     };
     let response = match f(request_sender, signal_receiver) {
         Ok(response) => response,
@@ -351,7 +360,9 @@ fn write_guest_bytes(
     );
     let memory = guest_memory(caller)?;
     let ptr = usize::try_from(ptr).context("convert guest buffer pointer")?;
-    memory.write(caller, ptr, bytes).context("write guest memory")?;
+    memory
+        .write(caller, ptr, bytes)
+        .context("write guest memory")?;
     i32::try_from(bytes.len()).context("convert response length to i32")
 }
 
@@ -362,13 +373,11 @@ fn guest_memory(caller: &mut Caller<'_, TestHarnessStore>) -> Result<Memory> {
         .context("guest must export memory")
 }
 
-pub fn service_request(
-    state: &mut crate::state::Manifold,
-    request: TestHarnessRequest,
-) {
+pub fn service_request(state: &mut crate::state::Manifold, request: TestHarnessRequest) {
     match request {
         TestHarnessRequest::CommandJson { input, response } => {
-            let result = control::execute_json_command(&input, state).map_err(|err| err.to_string());
+            let result =
+                control::execute_json_command(&input, state).map_err(|err| err.to_string());
             let _ = response.send(result);
         }
         TestHarnessRequest::StatusJson { response } => {

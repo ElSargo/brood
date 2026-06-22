@@ -12,17 +12,17 @@ if ($WslVhdPath -match '^/mnt/([a-zA-Z])/(.+)$') {
     $rest = $Matches[2].Replace("/", "\")
     $windowsSource = "${drive}:\$rest"
     if (-not (Test-Path -LiteralPath $windowsSource)) {
-        throw "VHD not found at $windowsSource. Run tools/wslg-build-private-system-distro.sh first."
+        throw "VHD not found at $windowsSource. Run experimental/wslg/tools/wslg-build-private-system-distro.sh first."
     }
 } elseif ($WslVhdPath -match '^[a-zA-Z]:\\') {
     $windowsSource = $WslVhdPath
     if (-not (Test-Path -LiteralPath $windowsSource)) {
-        throw "VHD not found at $windowsSource. Run tools/wslg-build-private-system-distro.sh first."
+        throw "VHD not found at $windowsSource. Run experimental/wslg/tools/wslg-build-private-system-distro.sh first."
     }
 } else {
     $exists = wsl -d $Distro -- test -f $WslVhdPath
     if ($LASTEXITCODE -ne 0) {
-        throw "VHD not found in WSL: $WslVhdPath. Run tools/wslg-build-private-system-distro.sh first."
+        throw "VHD not found in WSL: $WslVhdPath. Run experimental/wslg/tools/wslg-build-private-system-distro.sh first."
     }
     $windowsSource = (wsl -d $Distro -- wslpath -w $WslVhdPath).Trim()
 }

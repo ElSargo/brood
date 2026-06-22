@@ -35,16 +35,7 @@ run_step "headless repeated attach-failure smoke" ./tools/smoke-headless-repeate
 run_step "startup attach fallback smoke" ./tools/smoke-startup-attach-fallback.sh
 run_step "nest/detach/reattach smoke" ./tools/smoke-manifoldd.sh
 run_step "input forwarding smoke" ./tools/smoke-input-forwarding.sh
-run_step "WSLg host input smoke" ./tools/smoke-wslg-host-input.sh
 run_step "status-json smoke" ./tools/smoke-status-json.sh
-run_step "WSLg visual smoke" ./tools/smoke-wslg-visual.sh
-run_step "WSLg close/resume smoke" ./tools/smoke-wslg-close-resume.sh
-run_step "WSLg attach/detach idempotency smoke" ./tools/smoke-wslg-attach-detach-idempotent.sh
-run_step "WSLg detached client-exit smoke" ./tools/smoke-wslg-detached-client-exit.sh
-run_step "WSLg detached spawn/resume smoke" ./tools/smoke-wslg-detached-spawn-resume.sh
-run_step "WSLg host-close input smoke" ./tools/smoke-wslg-host-close-input.sh
-run_step "WSLg resume input smoke" ./tools/smoke-wslg-resume-input.sh
-run_step "WSLg resume stress smoke" ./tools/smoke-wslg-resume-stress.sh
 run_step "dmabuf diagnostics smoke" ./tools/smoke-dmabuf-diagnostics.sh
 run_step "explicit sync diagnostics smoke" ./tools/smoke-explicit-sync-diagnostics.sh
 run_step "latency/cadence smoke" ./tools/smoke-latency-cadence.sh

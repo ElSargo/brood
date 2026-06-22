@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 #[cfg(feature = "shm-fallback")]
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
@@ -17,30 +17,25 @@ use smithay::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
+            ExportMem, ImportDma, ImportEgl,
             damage::OutputDamageTracker,
             element::{
-                solid::{SolidColorBuffer, SolidColorRenderElement},
                 Kind,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
             },
-            gles::GlesRenderer,
-            ExportMem, ImportDma, ImportEgl,
         },
-        winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::Space,
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    reexports::{
-        calloop::{
-            timer::{TimeoutAction, Timer},
-            LoopHandle,
-        },
-        winit::{dpi::LogicalSize, window::WindowAttributes},
+    reexports::calloop::{
+        LoopHandle,
+        timer::{TimeoutAction, Timer},
     },
     utils::DeviceFd,
     utils::{Buffer as BufferCoords, Point, Rectangle, Transform},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
-        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState},
+        drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
     },
 };
 use tracing::{info, warn};
@@ -48,37 +43,32 @@ use tracing::{info, warn};
 use crate::{
     layout::{LayoutLeafKind, LayoutRect},
     state::{Manifold, PresentationStatus},
+    winit_presenter::{
+        PresenterBackend, PresenterEvent, PresenterEventSource, PresenterRuntime,
+        SharedPresenterRuntime, axis_frame,
+    },
 };
 
 pub(crate) struct PresenterHandle {
-    pub(crate) backend: Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>,
+    pub(crate) runtime: SharedPresenterRuntime,
     pub(crate) output: Output,
     pub(crate) damage_tracker: RefCell<OutputDamageTracker>,
 }
 
-const PRESENTATION_REFRESH_MILLIHZ: i32 = 60_000;
-const TEMP_AGGRESSIVE_PRESENTATION_POLL: bool = false;
-const CLIENT_FRAME_DEFER: Duration = Duration::from_millis(2);
-const INPUT_FRAME_DEFER_MAX: Duration = Duration::from_millis(3);
-const INPUT_FRAME_DEFER_MIN: Duration = Duration::from_micros(500);
-
-pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold) -> Result<()> {
-    if state.presentation_started {
-        state.request_attach();
-        return Ok(());
-    }
-
-    state.stats.record_attach_request();
-    let attributes = WindowAttributes::default()
-        .with_title("Manifold")
-        .with_inner_size(LogicalSize::new(1280.0, 800.0))
-        .with_visible(true);
-    let (mut backend, winit) = winit::init_from_attributes::<GlesRenderer>(attributes)
-        .map_err(|err| anyhow!("init winit presentation: {err}"))?;
+fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold) {
+    let mut runtime = presenter.runtime.borrow_mut();
+    let Some(backend) = runtime.backend.as_mut() else {
+        return;
+    };
     let mode = Mode {
         size: backend.window_size(),
         refresh: PRESENTATION_REFRESH_MILLIHZ,
     };
+    presenter
+        .output
+        .change_current_state(Some(mode), None, None, None);
+    presenter.output.set_preferred(mode);
+
     #[cfg(feature = "shm-fallback")]
     {
         let shm_formats = backend.renderer().shm_formats().collect::<Vec<_>>();
@@ -95,8 +85,37 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
             warn!(?err, "failed to bind EGL display to nested Wayland display");
         }
     }
-    initialize_dmabuf(state, &mut backend);
+    if state.dmabuf.protocol_version.is_none() {
+        initialize_dmabuf(state, backend);
+    }
 
+    state.space.map_output(&presenter.output, (0, 0));
+    state.presentation = PresentationStatus::Attached;
+    state.presentation_last_error = None;
+    state.attach_requested = false;
+    state.stats.record_attach_applied();
+    state.stats.attach_count += 1;
+    backend.window().request_redraw();
+    info!("presentation attached");
+}
+
+const PRESENTATION_REFRESH_MILLIHZ: i32 = 60_000;
+const TEMP_AGGRESSIVE_PRESENTATION_POLL: bool = false;
+const CLIENT_FRAME_DEFER: Duration = Duration::from_millis(2);
+const INPUT_FRAME_DEFER_MAX: Duration = Duration::from_millis(3);
+const INPUT_FRAME_DEFER_MIN: Duration = Duration::from_micros(500);
+
+pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold) -> Result<()> {
+    if state.presentation_started {
+        state.request_attach();
+        return Ok(());
+    }
+
+    state.stats.record_attach_request();
+    let mode = Mode {
+        size: (1280, 800).into(),
+        refresh: PRESENTATION_REFRESH_MILLIHZ,
+    };
     let output = Output::new(
         "manifold-winit".to_string(),
         PhysicalProperties {
@@ -114,26 +133,18 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    state.space.map_output(&output, (0, 0));
 
     let damage_tracker = OutputDamageTracker::from_output(&output);
-    let backend = Rc::new(RefCell::new(backend));
-    state.dmabuf.importer = Some(Rc::clone(&backend));
+    let runtime = Rc::new(RefCell::new(PresenterRuntime::new()));
+    state.dmabuf.importer = Some(Rc::clone(&runtime));
     let presenter = Rc::new(PresenterHandle {
-        backend,
+        runtime: Rc::clone(&runtime),
         output,
         damage_tracker: RefCell::new(damage_tracker),
     });
     state.presenter = Some(Rc::clone(&presenter));
 
-    state.presentation = PresentationStatus::Attached;
     state.presentation_started = true;
-    state.presentation_last_error = None;
-    state.stats.record_attach_applied();
-    state.stats.attach_count += 1;
-    info!("presentation attached");
-
-    presenter.backend.borrow().window().request_redraw();
 
     let timer_presenter = Rc::clone(&presenter);
     loop_handle
@@ -155,55 +166,126 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         .map_err(|err| anyhow!("insert presentation control timer: {err}"))?;
 
     let event_presenter = Rc::clone(&presenter);
+    let event_source = PresenterEventSource::new(runtime)
+        .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
     loop_handle
-        .insert_source(winit, move |event, _, state| {
+        .insert_source(event_source, move |event, _, state| {
             apply_pending_attach_state(&event_presenter, state);
-
-            match event {
-                WinitEvent::Resized { size, .. } => {
-                    event_presenter.output.change_current_state(
-                        Some(Mode {
-                            size,
-                            refresh: PRESENTATION_REFRESH_MILLIHZ,
-                        }),
-                        None,
-                        None,
-                        None,
-                    );
-                    state.reconfigure_focus_stack();
-                }
-                WinitEvent::Input(event) => {
-                    state.process_input_event(event);
-                    if let Err(err) = state.display_handle.flush_clients() {
-                        warn!(?err, "flush clients after presentation input failed");
-                    }
-                    if !schedule_deferred_client_frame(&event_presenter, state) {
-                        event_presenter.backend.borrow().window().request_redraw();
-                    }
-                }
-                WinitEvent::Redraw => {
-                    if state.presentation == PresentationStatus::Detached {
-                        return;
-                    }
-                    if schedule_deferred_client_frame(&event_presenter, state) {
-                        return;
-                    }
-
-                    if let Err(failure) = render_presenter_frame(&event_presenter, state) {
-                        record_presentation_runtime_failure(state, &failure);
-                        apply_pending_attach_state(&event_presenter, state);
-                    }
-                }
-                WinitEvent::CloseRequested => {
-                    state.request_detach();
-                    apply_pending_attach_state(&event_presenter, state);
-                }
-                _ => {}
-            }
+            handle_presenter_event(&event_presenter, state, event);
         })
         .map_err(|err| anyhow!("insert winit source: {err}"))?;
 
     Ok(())
+}
+
+fn handle_presenter_event(
+    event_presenter: &Rc<PresenterHandle>,
+    state: &mut Manifold,
+    event: PresenterEvent,
+) {
+    match event {
+        PresenterEvent::Created => {
+            apply_presenter_created(event_presenter, state);
+        }
+        PresenterEvent::CreationFailed(error) => {
+            state.record_presentation_attach_failure(&error);
+        }
+        PresenterEvent::Resized { size } => {
+            event_presenter.output.change_current_state(
+                Some(Mode {
+                    size,
+                    refresh: PRESENTATION_REFRESH_MILLIHZ,
+                }),
+                None,
+                None,
+                None,
+            );
+            state.reconfigure_focus_stack();
+        }
+        PresenterEvent::Keyboard {
+            key_code,
+            state: key_state,
+            time,
+        } => {
+            state.forward_keyboard_key(key_code, key_state, time);
+            if let Err(err) = state.display_handle.flush_clients() {
+                warn!(?err, "flush clients after presentation input failed");
+            }
+            if !schedule_deferred_client_frame(&event_presenter, state) {
+                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
+                    backend.window().request_redraw();
+                }
+            }
+        }
+        PresenterEvent::PointerMotion { position, time } => {
+            state.forward_pointer_motion(position, time);
+            if let Err(err) = state.display_handle.flush_clients() {
+                warn!(?err, "flush clients after presentation input failed");
+            }
+            if !schedule_deferred_client_frame(&event_presenter, state) {
+                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
+                    backend.window().request_redraw();
+                }
+            }
+        }
+        PresenterEvent::PointerButton {
+            button,
+            state: button_state,
+            time,
+        } => {
+            state.forward_pointer_button(button, button_state, time);
+            if let Err(err) = state.display_handle.flush_clients() {
+                warn!(?err, "flush clients after presentation input failed");
+            }
+            if !schedule_deferred_client_frame(&event_presenter, state) {
+                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
+                    backend.window().request_redraw();
+                }
+            }
+        }
+        PresenterEvent::PointerAxis {
+            horizontal_amount,
+            vertical_amount,
+            horizontal_v120,
+            vertical_v120,
+            source,
+            time,
+        } => {
+            state.forward_pointer_axis(axis_frame(
+                horizontal_amount,
+                vertical_amount,
+                horizontal_v120,
+                vertical_v120,
+                source,
+                time,
+            ));
+            if let Err(err) = state.display_handle.flush_clients() {
+                warn!(?err, "flush clients after presentation input failed");
+            }
+            if !schedule_deferred_client_frame(&event_presenter, state) {
+                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
+                    backend.window().request_redraw();
+                }
+            }
+        }
+        PresenterEvent::Redraw => {
+            if state.presentation == PresentationStatus::Detached {
+                return;
+            }
+            if schedule_deferred_client_frame(&event_presenter, state) {
+                return;
+            }
+
+            if let Err(failure) = render_presenter_frame(&event_presenter, state) {
+                record_presentation_runtime_failure(state, &failure);
+                apply_pending_attach_state(&event_presenter, state);
+            }
+        }
+        PresenterEvent::CloseRequested => {
+            state.request_os_window_close();
+        }
+        PresenterEvent::Focus => {}
+    }
 }
 
 fn schedule_deferred_client_frame(presenter: &Rc<PresenterHandle>, state: &mut Manifold) -> bool {
@@ -295,7 +377,10 @@ fn render_presenter_frame_with_capture(
     capture_path: Option<&Path>,
 ) -> std::result::Result<(), PresentationRuntimeFailure> {
     let frame_started = Instant::now();
-    let mut backend = presenter.backend.borrow_mut();
+    let mut runtime = presenter.runtime.borrow_mut();
+    let Some(backend) = runtime.backend.as_mut() else {
+        return Ok(());
+    };
     let output = presenter.output.clone();
     let mut damage_tracker = presenter.damage_tracker.borrow_mut();
     let size = backend.window_size();
@@ -489,7 +574,7 @@ fn send_active_client_frame_callbacks(
     client_frame_callbacks
 }
 
-fn initialize_dmabuf(state: &mut Manifold, backend: &mut WinitGraphicsBackend<GlesRenderer>) {
+fn initialize_dmabuf(state: &mut Manifold, backend: &mut PresenterBackend) {
     let dmabuf_formats = backend.renderer().dmabuf_formats();
     state.dmabuf.advertised_formats = dmabuf_formats.indexset().len();
     let advertisement = dmabuf_advertisement_for(state.dmabuf.advertised_formats, None);
@@ -744,7 +829,7 @@ pub(crate) fn sanitize_status_value(value: &str) -> String {
 fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manifold) {
     if state.detach_requested {
         state.detach_requested = false;
-        presenter.backend.borrow().window().set_visible(false);
+        presenter.runtime.borrow_mut().destroy_window();
         state.space.unmap_output(&presenter.output);
         state.presentation = PresentationStatus::Detached;
         state.stats.record_detach_applied();
@@ -753,14 +838,7 @@ fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manif
     }
 
     if state.attach_requested {
-        state.attach_requested = false;
-        presenter.backend.borrow().window().set_visible(true);
-        state.space.map_output(&presenter.output, (0, 0));
-        state.presentation = PresentationStatus::Attached;
-        state.stats.record_attach_applied();
-        state.stats.attach_count += 1;
-        presenter.backend.borrow().window().request_redraw();
-        info!("presentation reattached");
+        presenter.runtime.borrow_mut().request_window();
     }
 }
 
@@ -781,9 +859,9 @@ fn presentation_control_poll_interval(
 #[cfg(test)]
 mod tests {
     use super::{
-        dmabuf_advertisement_for, explicit_sync_disabled_reason_for,
-        presentation_control_poll_interval, presentation_runtime_error_status,
-        sanitize_status_value, DmabufAdvertisement, RenderNodeProbe,
+        DmabufAdvertisement, RenderNodeProbe, dmabuf_advertisement_for,
+        explicit_sync_disabled_reason_for, presentation_control_poll_interval,
+        presentation_runtime_error_status, sanitize_status_value,
     };
 
     #[test]

@@ -1,6 +1,62 @@
 use smithay::backend::input::Keycode;
 use std::{fmt, str::FromStr};
 
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum VisibleLayoutNode {
+    Pane {
+        pane: u64,
+    },
+    Stack {
+        panes: Vec<u64>,
+    },
+    Split {
+        axis: VisibleLayoutAxis,
+        children: Vec<VisibleLayoutNode>,
+        #[serde(default)]
+        flexes: Option<Vec<f32>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VisibleLayoutAxis {
+    Horizontal,
+    Vertical,
+}
+
+impl From<VisibleLayoutAxis> for LayoutAxis {
+    fn from(axis: VisibleLayoutAxis) -> Self {
+        match axis {
+            VisibleLayoutAxis::Horizontal => Self::Horizontal,
+            VisibleLayoutAxis::Vertical => Self::Vertical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneLeafAssignment {
+    pub pane: u64,
+    pub leaf: LayoutLeafId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleLayoutApply {
+    pub assignments: Vec<PaneLeafAssignment>,
+    pub focused_pane: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleLayoutError(String);
+
+impl fmt::Display for VisibleLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VisibleLayoutError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutAction {
     FocusNext,
@@ -143,6 +199,14 @@ impl LayoutState {
         self.active_leaf
     }
 
+    pub fn set_active_leaf(&mut self, leaf: LayoutLeafId) -> bool {
+        if self.root.leaf_kind(leaf).is_none() {
+            return false;
+        }
+        self.active_leaf = leaf;
+        true
+    }
+
     pub fn occupy_active_leaf(&mut self) -> Option<LayoutLeafId> {
         self.root
             .set_leaf_kind(self.active_leaf, LayoutLeafKind::Client)
@@ -195,6 +259,41 @@ impl LayoutState {
         regions
     }
 
+    pub fn replace_visible_tree(
+        &mut self,
+        root: &VisibleLayoutNode,
+        focus_pane: Option<u64>,
+    ) -> Result<VisibleLayoutApply, VisibleLayoutError> {
+        let mut builder = VisibleTreeBuilder {
+            next_leaf: 1,
+            assignments: Vec::new(),
+            seen_panes: Vec::new(),
+            focus_pane,
+            focused_leaf: None,
+        };
+        let root = builder.build_node(root)?;
+        let active_leaf = builder
+            .focused_leaf
+            .or_else(|| {
+                builder
+                    .assignments
+                    .first()
+                    .map(|assignment| assignment.leaf)
+            })
+            .ok_or_else(|| VisibleLayoutError("visible layout tree contains no panes".into()))?;
+
+        self.root = root;
+        self.next_leaf = builder.next_leaf;
+        self.active_leaf = active_leaf;
+
+        let focused_pane = focus_pane.filter(|pane| builder.seen_panes.contains(pane));
+
+        Ok(VisibleLayoutApply {
+            assignments: builder.assignments,
+            focused_pane,
+        })
+    }
+
     fn allocate_leaf(&mut self) -> LayoutLeafId {
         let id = LayoutLeafId(self.next_leaf);
         self.next_leaf += 1;
@@ -219,6 +318,88 @@ impl LayoutState {
         }
         self.active_leaf = next;
         true
+    }
+}
+
+struct VisibleTreeBuilder {
+    next_leaf: u64,
+    assignments: Vec<PaneLeafAssignment>,
+    seen_panes: Vec<u64>,
+    focus_pane: Option<u64>,
+    focused_leaf: Option<LayoutLeafId>,
+}
+
+impl VisibleTreeBuilder {
+    fn build_node(&mut self, node: &VisibleLayoutNode) -> Result<LayoutNode, VisibleLayoutError> {
+        match node {
+            VisibleLayoutNode::Pane { pane } => self.build_leaf(&[*pane]),
+            VisibleLayoutNode::Stack { panes } => {
+                if panes.is_empty() {
+                    return Err(VisibleLayoutError(
+                        "visible layout stack must contain at least one pane".into(),
+                    ));
+                }
+                self.build_leaf(panes)
+            }
+            VisibleLayoutNode::Split {
+                axis,
+                children,
+                flexes,
+            } => {
+                if children.len() < 2 {
+                    return Err(VisibleLayoutError(
+                        "visible layout split must contain at least two children".into(),
+                    ));
+                }
+                if let Some(flexes) = flexes {
+                    if flexes.len() != children.len() {
+                        return Err(VisibleLayoutError(
+                            "visible layout split flex count must match child count".into(),
+                        ));
+                    }
+                    if flexes.iter().any(|flex| !flex.is_finite() || *flex <= 0.0) {
+                        return Err(VisibleLayoutError(
+                            "visible layout split flexes must be finite positive numbers".into(),
+                        ));
+                    }
+                }
+                let mut built = children
+                    .iter()
+                    .map(|child| self.build_node(child))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter();
+                let first = built.next().expect("children length checked");
+                Ok(built.fold(first, |left, right| LayoutNode::Split {
+                    axis: (*axis).into(),
+                    first: Box::new(left),
+                    second: Box::new(right),
+                }))
+            }
+        }
+    }
+
+    fn build_leaf(&mut self, panes: &[u64]) -> Result<LayoutNode, VisibleLayoutError> {
+        let leaf = LayoutLeafId(self.next_leaf);
+        self.next_leaf += 1;
+
+        for pane in panes {
+            if self.seen_panes.contains(pane) {
+                return Err(VisibleLayoutError(format!(
+                    "visible layout references pane {pane} more than once"
+                )));
+            }
+            self.seen_panes.push(*pane);
+            self.assignments
+                .push(PaneLeafAssignment { pane: *pane, leaf });
+            if self.focus_pane == Some(*pane) {
+                self.focused_leaf = Some(leaf);
+            }
+        }
+
+        Ok(LayoutNode::Leaf(LayoutLeaf {
+            id: leaf,
+            kind: LayoutLeafKind::Client,
+        }))
     }
 }
 
@@ -486,7 +667,7 @@ impl LayoutKeymap {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutAction, LayoutKeymap};
+    use super::{LayoutAction, LayoutKeymap, VisibleLayoutAxis, VisibleLayoutNode};
     use smithay::backend::input::Keycode;
 
     #[test]
@@ -599,5 +780,43 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn replaces_visible_tree_with_master_and_stack() {
+        let mut layout = super::LayoutState::default();
+        let tree = VisibleLayoutNode::Split {
+            axis: VisibleLayoutAxis::Horizontal,
+            flexes: Some(vec![1.0, 2.0]),
+            children: vec![
+                VisibleLayoutNode::Pane { pane: 1 },
+                VisibleLayoutNode::Stack { panes: vec![2, 3] },
+            ],
+        };
+
+        let applied = layout
+            .replace_visible_tree(&tree, Some(2))
+            .expect("replace visible tree");
+        let regions = layout.resolve(super::LayoutSize { w: 120, h: 80 });
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!(applied.focused_pane, Some(2));
+        assert_eq!(applied.assignments.len(), 3);
+        assert_eq!(applied.assignments[0].pane, 1);
+        assert_eq!(applied.assignments[1].pane, 2);
+        assert_eq!(applied.assignments[1].leaf, applied.assignments[2].leaf);
+        assert_eq!(layout.active_leaf(), applied.assignments[1].leaf);
+    }
+
+    #[test]
+    fn rejects_duplicate_visible_tree_panes() {
+        let mut layout = super::LayoutState::default();
+        let tree = VisibleLayoutNode::Stack { panes: vec![1, 1] };
+
+        let err = layout
+            .replace_visible_tree(&tree, None)
+            .expect_err("duplicate panes should be rejected");
+
+        assert!(err.to_string().contains("more than once"));
     }
 }

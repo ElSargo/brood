@@ -7,3 +7,11 @@ capabilities = [
   "apps:run-argv",
   "workspace:close-focused-pane",
 ]
+
+[module.master-layout]
+enabled = false
+kind = "fast-map-hook"
+path = "examples/wasm-map-hook/target/wasm32-unknown-unknown/release/manifold_wasm_map_hook.wasm"
+capabilities = [
+  "layout:on-map",
+]

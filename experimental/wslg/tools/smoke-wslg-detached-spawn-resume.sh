@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
@@ -21,7 +21,7 @@ fi
 
 cargo build -p manifoldd --offline >/dev/null
 
-exec 9>/tmp/manifold-wslg-smoke.lock
+exec 9>/tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-detached-spawn-resume.XXXXXX)"
@@ -30,7 +30,7 @@ LOG="$TMPDIR/manifoldd.log"
 TRACE="$TMPDIR/client-wayland.log"
 CLIENT_PIDFILE="$TMPDIR/client.pid"
 WRAPPER="$TMPDIR/client-wrapper.sh"
-CAPTURE_PS1="$ROOT/tools/wslg-capture-manifold-window.ps1"
+CAPTURE_PS1="$ROOT/experimental/wslg/tools/wslg-capture-manifold-window.ps1"
 PNG_REATTACHED="$TMPDIR/manifold-window-detached-spawn-resume.png"
 
 cleanup() {

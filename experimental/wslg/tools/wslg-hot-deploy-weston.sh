@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 WSLG_DIR="$ROOT/reference/wslg"
 IMAGE_TAG="${WSLG_IMAGE_TAG:-system-distro-x64:latest}"
 SOURCE_ROOT="/"
@@ -35,10 +35,10 @@ directly into the active private WSLg system distro. Restart WSL after a real
 deploy so WSLg loads the new binaries.
 
 Use --source-root /work/build when deploying from the Weston build-stage image
-created by tools/wslg-build-weston-artifacts.sh.
+created by experimental/wslg/tools/wslg-build-weston-artifacts.sh.
 
 Use --source-dir reference/wslg/tmp/weston-artifacts to deploy local artifacts
-created by tools/wslg-build-weston-artifacts.sh without extracting from Docker.
+created by experimental/wslg/tools/wslg-build-weston-artifacts.sh without extracting from Docker.
 EOF
             exit 0
             ;;
@@ -72,7 +72,7 @@ FILES=(
     /usr/libexec/weston-rdprail-shell
 )
 
-"$ROOT/tools/wslg-ensure-build-deps.sh" >/dev/null
+"$ROOT/experimental/wslg/tools/wslg-ensure-build-deps.sh" >/dev/null
 
 if ! command -v wsl.exe >/dev/null 2>&1; then
     echo "ERROR: wsl.exe is required so this script can write to the active WSLg system distro." >&2
@@ -98,7 +98,7 @@ EOF
 chmod +x "$wrapper_dir/docker"
 
 if [[ -z "$SOURCE_DIR" ]] && ! PATH="$wrapper_dir:$PATH" docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
-    echo "ERROR: Docker image '$IMAGE_TAG' does not exist. Run tools/wslg-build-private-image.sh first." >&2
+    echo "ERROR: Docker image '$IMAGE_TAG' does not exist. Run experimental/wslg/tools/wslg-build-private-image.sh first." >&2
     exit 1
 fi
 
@@ -125,7 +125,7 @@ for file in "${FILES[@]}"; do
     if [[ -n "$SOURCE_DIR" ]]; then
         source_file="$SOURCE_DIR$file"
         if [[ ! -f "$source_file" ]]; then
-            echo "ERROR: local artifact '$source_file' does not exist. Run tools/wslg-build-weston-artifacts.sh first." >&2
+            echo "ERROR: local artifact '$source_file' does not exist. Run experimental/wslg/tools/wslg-build-weston-artifacts.sh first." >&2
             exit 1
         fi
         cp -a "$source_file" "$extract_dir$file"

@@ -25,7 +25,7 @@ def classify(
             "fallback_no_dmabuf_import",
             "presentation renderer reported no importable dmabuf formats; "
             "Manifold must not advertise linux-dmabuf or syncobj",
-            "Use WSLg for fallback correctness; validate positive dmabuf on native/DRM Linux "
+            "Use this backend for fallback correctness; validate positive dmabuf on native/DRM Linux "
             "with ./tools/validate-dmabuf-positive.sh",
         )
     if dmabuf == "v4" and explicit_sync == "v1":

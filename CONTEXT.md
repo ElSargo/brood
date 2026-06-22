@@ -50,7 +50,7 @@ _Avoid_: captured window, child window, remote app
 
 **Hosted Wayland app**:
 A managed app launched under Manifold's nested Wayland compositor.
-_Avoid_: generic hosted app when discussing WSLg-native behavior
+_Avoid_: treating every managed app as a nested Wayland app
 
 **Presentation window**:
 The normal desktop window opened by a presentation endpoint to show a session on the user's current compositor.
@@ -96,20 +96,12 @@ _Avoid_: quit, close app
 The extra local layer between managed app content and the user's desktop compositor, intended to preserve app/session state while still feeling like native windows.
 _Avoid_: remote desktop, streaming
 
-**Backend implementation**:
-A platform-specific way to host surfaces, route input, pace frames, and present Manifold sessions while preserving the same session semantics.
-_Avoid_: fallback path, workaround
-
 **Default implementation assumption**:
-In durable prose, unqualified references to "the implementation", "the backend", or default behavior mean the Linux-native Manifold path unless the document is explicitly about Windows/WSLg. On Windows, that same default should usually be read as the Windows/WSLg-native path.
-_Avoid_: treating Linux and WSLg as equal implicit defaults in the same sentence
-
-**WSLg-native implementation**:
-A Windows Subsystem for Linux implementation that integrates Manifold's pane/session behavior at the WSLg compositor layer so managed apps can keep WSLg's accelerated presentation path.
-_Avoid_: WSL fallback, SHM-only WSL path
+In durable prose, unqualified references to "the implementation", "the backend", or default behavior mean the Linux-native Manifold path.
+_Avoid_: treating experimental backend notes as supported defaults
 
 **Shared behavior spec**:
-The product-level Manifold semantics that both implementation experiments should try to satisfy, such as pane identity, focus rules, attach/detach behavior, show/hide, session persistence, and window grouping.
+The product-level Manifold semantics that backend work should try to satisfy, such as pane identity, focus rules, attach/detach behavior, show/hide, session persistence, and window grouping.
 _Avoid_: shared runtime, common compositor abstraction
 
 **Capability grant**:
@@ -140,17 +132,11 @@ _Avoid_: ambient permission, unrestricted access
 - A **WASM pane app** can create any number of **panes** without being one pane itself.
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
 - **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with correctness fallbacks.
-- A **backend implementation** may be a nested compositor on normal Linux or a WSLg-integrated compositor/shell on WSL.
-- The **default implementation assumption** for docs is Linux-native unless the doc explicitly switches to Windows/WSLg context. On Windows, that default usually flips to the WSLg-native path.
-- The **WSLg-native implementation** should avoid forcing GPU-capable managed apps through Manifold's SHM-only nested compositor path.
-- The Linux/Rust nested compositor and the WSLg/C Weston implementation are separate experiments for now. Share behavior notes and test intent first; defer shared runtime code until the WSLg insertion point and control surface are clearer.
-- A **shared behavior spec** is the near-term unification target. The Linux implementation can remain the clean Rust reference while WSLg proves the Windows/RAIL compositor path in C.
-- WSLg transport internals do not make Manifold a remote-display product; the goal is GPU-resident local presentation with Manifold session behavior and minimal added latency.
 - The **WASM app host** should talk to Manifold through workspace, scene, event, storage, and capability APIs rather than Smithay, Weston, or renderer internals.
 
 ## Flagged Ambiguities
 
-- "hosted app" was too narrow for WSLg-native work. Use **managed app** for the cross-backend product concept, and **hosted Wayland app** for the nested Wayland implementation.
+- "hosted app" is too narrow. Use **managed app** for the product concept, and **hosted Wayland app** for the nested Wayland implementation.
 - "managed app" should not be used for WASM-hosted UI. Use **WASM pane app** for sandboxed UI modules whose state lives in the session process.
 - "pane" should not imply the state owner. A pane is the presentation unit; the state may live in a WASM module, external process, session model, browser runtime, or other producer behind indirection.
 - "layout" should not imply session-owned pane state. Layout, visibility, dragging, and animation are presentation-surface concerns unless explicitly saved as workspace preferences.
@@ -165,7 +151,5 @@ _Avoid_: ambient permission, unrestricted access
 - "client" previously meant a Wayland client, a future detachable display process, and sometimes the current presentation window. Use **Wayland client**, **presentation endpoint**, or **presentation window** instead of bare "client" in durable prose.
 - "frontend" remains a legacy/control-command spelling in the MVP tools. In docs, use **presentation endpoint** for the component and **presentation window** for the desktop window.
 - "server" and "daemon" are implementation-adjacent. Use **session process** for Manifold's authoritative state owner unless discussing protocol direction or process names.
-- "WSL path" is ambiguous. Use **WSLg-native implementation** when discussing a compositor-layer integration with WSLg, and use "WSL SHM fallback" only for the current nested `manifoldd` behavior on WSLg.
-- Unqualified "default" or "the implementation" is ambiguous across platforms. Default to the Linux-native path in general docs unless the Windows/WSLg context is explicit; on Windows-focused docs, default to the WSLg-native path instead.
-- "shared implementation" is premature. Use **shared behavior spec** when we mean common Manifold semantics across Linux and WSLg, and reserve shared code for a later decision.
+- "shared implementation" is premature. Use **shared behavior spec** when we mean common Manifold semantics across backend work, and reserve shared code for a later decision.
 - "workspace" can be ambiguous between the product umbrella and the concrete durable runtime object. Prefer **workspace** for the product-level environment and **session** for the implementation-level durable unit unless the document is explicitly talking about both layers at once.

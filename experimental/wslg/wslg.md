@@ -1,8 +1,8 @@
 # WSLg Implementation Workspace
 
-This page tracks the WSLg-specific implementation path for Manifold.
+This page tracks the WSLg-specific implementation path that was explored for Manifold.
 
-This page is one of the explicit exceptions to the usual doc default: here, unqualified implementation language means the Windows/WSLg-native path, not the Linux-native path.
+This is experimental, not an officially supported backend. The supported default documentation path remains the Linux-native Manifold workflow from the repo root.
 
 ## Thesis
 
@@ -69,25 +69,25 @@ manifold-wslg-impl
 Bootstrap or refresh it with:
 
 ```bash
-./tools/wslg-bootstrap-reference.sh
+./experimental/wslg/tools/wslg-bootstrap-reference.sh
 ```
 
 Clone or refresh the WSLg vendor sources with:
 
 ```bash
-./tools/wslg-bootstrap-vendors.sh
+./experimental/wslg/tools/wslg-bootstrap-vendors.sh
 ```
 
 Prepare local build prerequisites and start a Docker daemon inside Ubuntu WSL with:
 
 ```bash
-./tools/wslg-ensure-build-deps.sh
+./experimental/wslg/tools/wslg-ensure-build-deps.sh
 ```
 
 Build a private WSLg system distro VHD with:
 
 ```bash
-./tools/wslg-build-private-system-distro.sh
+./experimental/wslg/tools/wslg-build-private-system-distro.sh
 ```
 
 ### Fast Iteration Deploy
@@ -96,7 +96,7 @@ For a reliable one-command redeploy of the WSLg path and the two-Chrome
 composite smoke setup, run:
 
 ```powershell
-.\tools\wslg-redeploy-two-chrome.ps1
+.\experimental\wslg\tools\wslg-redeploy-two-chrome.ps1
 ```
 
 That rebuilds the private WSLg system distro VHD, installs it through
@@ -109,7 +109,7 @@ For Weston/WSLg iteration, the experimental hot-deploy loop can rebuild just the
 Weston artifacts:
 
 ```powershell
-.\tools\wslg-hot-deploy-weston.ps1 -WestonOnly
+.\experimental\wslg\tools\wslg-hot-deploy-weston.ps1 -WestonOnly
 ```
 
 That command uses a cached WSLg dev-stage image as the build environment,
@@ -129,13 +129,13 @@ verification needs a clean WSLg restart.
 Use the full-image hot deploy when you need the final runtime image rebuilt as well:
 
 ```powershell
-.\tools\wslg-hot-deploy-weston.ps1
+.\experimental\wslg\tools\wslg-hot-deploy-weston.ps1
 ```
 
 If the Docker image is already current, skip the rebuild and only copy the binaries:
 
 ```powershell
-.\tools\wslg-hot-deploy-weston.ps1 -WestonOnly -SkipBuild
+.\experimental\wslg\tools\wslg-hot-deploy-weston.ps1 -WestonOnly -SkipBuild
 ```
 
 Use `-NoShutdown` to copy binaries without immediately restarting WSL, and
@@ -150,19 +150,19 @@ artifact, or when the test must survive `wsl --shutdown`.
 Install the built VHD as the private WSLg system distro from PowerShell with:
 
 ```powershell
-.\tools\wslg-install-private-system-distro.ps1 -Shutdown
+.\experimental\wslg\tools\wslg-install-private-system-distro.ps1 -Shutdown
 ```
 
 After WSL restarts, verify the private system distro marker with:
 
 ```powershell
-.\tools\wslg-verify-private-system-distro.ps1
+.\experimental\wslg\tools\wslg-verify-private-system-distro.ps1
 ```
 
 Return to stock WSLg with:
 
 ```powershell
-.\tools\wslg-use-stock-system-distro.ps1 -Shutdown
+.\experimental\wslg\tools\wslg-use-stock-system-distro.ps1 -Shutdown
 ```
 
 ## Useful Upstream Paths
@@ -183,7 +183,7 @@ The first pass should focus on WSLg's documented private system distro flow befo
 ## Local Bring-Up Status
 
 - Ubuntu WSL has `docker.io` and `golang-go` installed for private WSLg builds.
-- The Docker daemon is not managed by a normal WSL service in this distro, so `tools/wslg-ensure-build-deps.sh` starts `dockerd` manually when needed.
+- The Docker daemon is not managed by a normal WSL service in this distro, so `experimental/wslg/tools/wslg-ensure-build-deps.sh` starts `dockerd` manually when needed.
 - Current user group membership may not include the `docker` group until a fresh login; build scripts use a temporary `docker` wrapper that calls `sudo docker`.
 - `reference/wslg` is checked out on local branch `manifold-wslg-impl`.
 - WSLg vendor sources have been bootstrapped under `reference/wslg/vendor`.
@@ -194,7 +194,7 @@ The first pass should focus on WSLg's documented private system distro flow befo
 - `wayland-info` from Ubuntu connects to the modified WSLg instance and reports `weston_rdprail_shell`.
 - The GL compositor negative-effect shader was removed from the local Weston
   source and from the Manifold patch application flow. Private WSLg rebuilds no
-  longer apply `tools/patches/wslg-invert-shader-poc.patch`, and the Pixman
+  longer apply `experimental/wslg/patches/wslg-invert-shader-poc.patch`, and the Pixman
   inversion hook is now opt-in through `WSLG_APPLY_PIXMAN_INVERT=1`.
 - A two-Chrome validation with red and green app windows proved the current
   hot-deploy reload problem. After copying clean non-inverting renderer
@@ -224,11 +224,11 @@ The first pass should focus on WSLg's documented private system distro flow befo
 
 The private WSLg experiment must fail loudly if the RDP backend cannot use graphics redirection shared memory. The stock upstream path treats `WESTON_RDP_SHARED_MEMORY=true` as a preference: it probes `WSL2_SHARED_MEMORY_MOUNT_POINT`, FreeRDP gfxredir support, and a tiny `/mnt/shared_memory` allocation, then silently falls back to copy-heavy RDPGFX surface commands when any probe fails. It also allows the slow path when `WESTON_RDP_SHARED_MEMORY=false`; Manifold does not.
 
-Manifold patches this into a hard startup/runtime failure with `tools/patches/wslg-require-gfxredir-fastpath.patch`. `tools/patches/wslg-retry-gfxredir-shm-open.patch` also gives the real gfxredir shared-memory allocation a bounded wait for the Windows-side namespace to become usable. A Weston log line with `refusing slow RDPGFX fallback` is therefore intentional: fix the shared-memory path before benchmarking or using fullscreen app workloads.
+Manifold patches this into a hard startup/runtime failure with `experimental/wslg/patches/wslg-require-gfxredir-fastpath.patch`. `experimental/wslg/patches/wslg-retry-gfxredir-shm-open.patch` also gives the real gfxredir shared-memory allocation a bounded wait for the Windows-side namespace to become usable. A Weston log line with `refusing slow RDPGFX fallback` is therefore intentional: fix the shared-memory path before benchmarking or using fullscreen app workloads.
 
 ## Two-Client Composite PoC
 
-`tools/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own, both surfaces are server-resized into adjacent borderless cells, and shell window geometry is used when copying so compositor-managed borders are skipped. Pointer input is translated from the exported presentation surface into the matching client cell before Weston dispatch. This is intentionally scoped to the triangle/cube and two-Chrome proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
+`experimental/wslg/patches/wslg-composite-two-clients-poc.patch` adds the first WSLg compositor-side composition experiment. The first normal RAIL toplevel becomes a two-cell composite host window; the next normal toplevel is kept compositor-local with no Windows/RAIL window of its own, both surfaces are server-resized into adjacent borderless cells, and shell window geometry is used when copying so compositor-managed borders are skipped. Pointer input is translated from the exported presentation surface into the matching client cell before Weston dispatch. This is intentionally scoped to the triangle/cube and two-Chrome proof: it is enabled by default in the private WSLg build and can be disabled with `MANIFOLD_WSLG_COMPOSITE=0`.
 
 ## Dev Container Goal
 
@@ -248,7 +248,7 @@ The environment should include the normal Manifold Rust toolchain plus WSLg-spec
 
 ## First Patch Marker
 
-`tools/wslg-apply-manifold-marker.sh` applies a tiny Dockerfile patch to the ignored WSLg checkout. The patch writes `/etc/manifold-wslg.txt` into the private system distro and appends a marker to `/etc/versions.txt`.
+`experimental/wslg/tools/wslg-apply-manifold-marker.sh` applies a tiny Dockerfile patch to the ignored WSLg checkout. The patch writes `/etc/manifold-wslg.txt` into the private system distro and appends a marker to `/etc/versions.txt`.
 
 This is intentionally small: it proves that a modified WSLg VHD is being built, installed, and run before we start changing Weston behavior.
 

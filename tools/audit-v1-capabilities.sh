@@ -202,16 +202,7 @@ echo "check=host_presentation_preflight result=pass rc=0 log=$HOST_PREFLIGHT_LOG
 run_check dmabuf_backend_diagnostic ./tools/diagnose-dmabuf-backend.sh
 run_check host_nest_resume ./tools/smoke-manifoldd.sh
 run_check host_input_forwarding ./tools/smoke-input-forwarding.sh
-run_check wslg_host_input ./tools/smoke-wslg-host-input.sh
 run_check host_status_json ./tools/smoke-status-json.sh
-run_check wslg_visual ./tools/smoke-wslg-visual.sh
-run_check wslg_close_resume ./tools/smoke-wslg-close-resume.sh
-run_check wslg_attach_detach_idempotent ./tools/smoke-wslg-attach-detach-idempotent.sh
-run_check wslg_detached_client_exit ./tools/smoke-wslg-detached-client-exit.sh
-run_check wslg_detached_spawn_resume ./tools/smoke-wslg-detached-spawn-resume.sh
-run_check wslg_host_close_input ./tools/smoke-wslg-host-close-input.sh
-run_check wslg_resume_input ./tools/smoke-wslg-resume-input.sh
-run_check wslg_resume_stress ./tools/smoke-wslg-resume-stress.sh
 run_check dmabuf_diagnostics ./tools/smoke-dmabuf-diagnostics.sh
 run_check explicit_sync_diagnostics ./tools/smoke-explicit-sync-diagnostics.sh
 run_check latency_cadence ./tools/smoke-latency-cadence.sh
@@ -222,18 +213,18 @@ emit_aggregate_requirement rust_baseline "cargo fmt/check/test" \
   cargo_fmt cargo_check cargo_test
 emit_aggregate_requirement nested_wayland_globals "headless Wayland globals smoke" \
   headless_wayland_globals
-emit_aggregate_requirement native_wayland_client_nesting "headless native/status/exit/multi/attach/startup smokes; host nest/detach/reattach; detached spawn/resume" \
-  headless_native_client headless_control_errors headless_status_json headless_status_parity headless_client_exit headless_multi_client headless_multi_client_input_focus headless_attach_diagnostics headless_frontend_close_idempotent headless_repeated_attach_failure startup_attach_fallback host_nest_resume wslg_detached_spawn_resume
-emit_aggregate_requirement frontend_window_rendering "host nest/detach/reattach; status-json; WSLg visual capture" \
-  host_nest_resume host_status_json wslg_visual
-emit_aggregate_requirement input_forwarding "headless control injection; host control injection; real WSLg pointer/button/key input; resume input" \
-  headless_input_forwarding headless_multi_client_input_focus host_input_forwarding wslg_host_input wslg_host_close_input wslg_resume_input
-emit_aggregate_requirement close_frontend_keep_client_alive "startup attach fallback; close/resume; detached client exit; host-close input" \
-  headless_frontend_close_idempotent headless_repeated_attach_failure startup_attach_fallback wslg_close_resume wslg_attach_detach_idempotent wslg_detached_client_exit wslg_host_close_input
-emit_aggregate_requirement reopen_frontend_resume_client "close/resume; attach/detach idempotency; detached client exit/spawn; host-close input; resume input/stress" \
-  wslg_close_resume wslg_attach_detach_idempotent wslg_detached_client_exit wslg_detached_spawn_resume wslg_host_close_input wslg_resume_input wslg_resume_stress
-emit_aggregate_requirement low_latency_cadence "latency/cadence smoke plus close/resume, attach/detach idempotency, host-close input, resume input, and resume stress lifecycle latency budgets" \
-  latency_cadence wslg_close_resume wslg_attach_detach_idempotent wslg_host_close_input wslg_resume_input wslg_resume_stress
+emit_aggregate_requirement native_wayland_client_nesting "headless native/status/exit/multi/attach/startup smokes; host nest/detach/reattach" \
+  headless_native_client headless_control_errors headless_status_json headless_status_parity headless_client_exit headless_multi_client headless_multi_client_input_focus headless_attach_diagnostics headless_frontend_close_idempotent headless_repeated_attach_failure startup_attach_fallback host_nest_resume
+emit_aggregate_requirement frontend_window_rendering "host nest/detach/reattach; status-json" \
+  host_nest_resume host_status_json
+emit_aggregate_requirement input_forwarding "headless control injection; host control injection" \
+  headless_input_forwarding headless_multi_client_input_focus host_input_forwarding
+emit_aggregate_requirement close_frontend_keep_client_alive "headless frontend-close idempotency and startup attach fallback" \
+  headless_frontend_close_idempotent headless_repeated_attach_failure startup_attach_fallback
+emit_aggregate_requirement reopen_frontend_resume_client "host nest/detach/reattach smoke" \
+  host_nest_resume
+emit_aggregate_requirement low_latency_cadence "latency/cadence smoke lifecycle budgets" \
+  latency_cadence
 emit_aggregate_requirement dmabuf_validator_logic "dmabuf status validator and backend classifier fixture tests" \
   dmabuf_status_validator dmabuf_backend_classifier
 emit_aggregate_requirement dmabuf_advertisement_correctness "dmabuf diagnostics smoke; explicit sync diagnostics smoke" \

@@ -6,14 +6,13 @@ cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
 KEEP_RUNNING=0
-CAPTURE=0
 SAMPLE_SECONDS="${MANIFOLD_NESTED_SAMPLE_SECONDS:-2}"
 DEV_CLIENT="${MANIFOLD_NESTED_DEV_CLIENT:-kitty}"
 OUT_DIR="${MANIFOLD_NESTED_OUT_DIR:-}"
 
 usage() {
   cat <<'EOF'
-usage: tools/dev-nested-manifold.sh [--keep-running] [--capture] [--out-dir DIR] [--dev-client CMD]
+usage: tools/dev-nested-manifold.sh [--keep-running] [--out-dir DIR] [--dev-client CMD]
 
 Starts a stable Manifold instance on the host display, then starts a dev
 Manifold instance as a hosted app inside the stable instance. The dev instance
@@ -22,8 +21,7 @@ from both instances for basic frame/latency analysis.
 
 Options:
   --keep-running    leave both instances running and print control sockets
-  --capture         save a WSLg PrintWindow PNG of the stable presentation window
-  --out-dir DIR     write logs/status/captures under DIR instead of mktemp
+  --out-dir DIR     write logs/status under DIR instead of mktemp
   --dev-client CMD  command to spawn inside the dev Manifold instance
 
 Environment:
@@ -37,10 +35,6 @@ while (($#)); do
   case "$1" in
     --keep-running)
       KEEP_RUNNING=1
-      shift
-      ;;
-    --capture)
-      CAPTURE=1
       shift
       ;;
     --out-dir)
@@ -90,8 +84,6 @@ STABLE_LOG="$OUT_DIR/stable.log"
 DEV_LOG="$OUT_DIR/dev.log"
 STABLE_STATUS_JSONL="$OUT_DIR/stable-status.jsonl"
 DEV_STATUS_JSONL="$OUT_DIR/dev-status.jsonl"
-CAPTURE_PS1="$ROOT/tools/wslg-capture-manifold-window.ps1"
-CAPTURE_PNG="$OUT_DIR/stable-hosting-dev.png"
 
 cleanup() {
   if [[ "$KEEP_RUNNING" == "1" ]]; then
@@ -201,34 +193,6 @@ sample_statuses() {
   done
 }
 
-capture_stable_window() {
-  if [[ "$CAPTURE" != "1" ]]; then
-    return
-  fi
-  if ! command -v powershell.exe >/dev/null 2>&1; then
-    echo "capture=skipped reason=powershell.exe_missing"
-    return
-  fi
-
-  local result
-  local rc
-  set +e
-  result="$(
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$(wslpath -w "$CAPTURE_PS1")" "$(wslpath -w "$CAPTURE_PNG")" 2>&1 |
-      tr -d '\r'
-  )"
-  rc=$?
-  set -e
-  if [[ "$rc" == "0" && -s "$CAPTURE_PNG" ]]; then
-    echo "capture=$CAPTURE_PNG"
-    echo "capture_result=$result"
-  else
-    echo "capture=failed"
-    echo "$result" >&2
-  fi
-}
-
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
   target/debug/manifoldd run --control-socket "$STABLE_SOCK" >"$STABLE_LOG" 2>&1 &
 STABLE_PID=$!
@@ -285,7 +249,6 @@ DEV_READY="$(
 )"
 
 sample_statuses
-capture_stable_window
 
 echo "OK nested Manifold dev harness ready"
 echo "out_dir=$OUT_DIR"

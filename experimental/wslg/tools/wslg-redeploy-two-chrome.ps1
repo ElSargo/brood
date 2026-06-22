@@ -13,10 +13,10 @@ copying Weston binaries into the running system distro does not survive
 wsl --shutdown.
 
 .EXAMPLE
-.\tools\wslg-redeploy-two-chrome.ps1
+.\experimental\wslg\tools\wslg-redeploy-two-chrome.ps1
 
 .EXAMPLE
-.\tools\wslg-redeploy-two-chrome.ps1 -SkipBuild -SkipInstall
+.\experimental\wslg\tools\wslg-redeploy-two-chrome.ps1 -SkipBuild -SkipInstall
 #>
 param(
     [string]$Distro = "Ubuntu-24.04",
@@ -33,7 +33,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 $vhdPath = Join-Path $root "reference\wslg\system_x64.vhd"
 
 function Invoke-NativeStep {
@@ -65,7 +65,7 @@ Push-Location $root
 try {
     if (-not $SkipBuild) {
         Invoke-NativeStep "Build private WSLg system distro VHD" {
-            bash tools/wslg-build-private-system-distro.sh
+            bash experimental/wslg/tools/wslg-build-private-system-distro.sh
         }
     } elseif (-not $SkipInstall -and -not (Test-Path -LiteralPath $vhdPath)) {
         throw "SkipBuild was requested, but no VHD exists at $vhdPath"

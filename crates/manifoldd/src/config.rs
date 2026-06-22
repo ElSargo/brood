@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::{state::Manifold, wasm_key::WasmKeyHandler};
+use crate::{state::Manifold, wasm_key::WasmKeyHandler, wasm_map::WasmMapHook};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ManifoldConfig {
@@ -65,6 +65,27 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                     "loaded config WASM key handler"
                 );
             }
+            "fast-map-hook" => {
+                let module_path = resolve_path(config_dir, &module.path);
+                if !module_path.exists() {
+                    warn!(
+                        module = %id,
+                        path = %module_path.display(),
+                        "configured WASM map hook does not exist; skipping module"
+                    );
+                    continue;
+                }
+                state.wasm_map_hook = Some(
+                    WasmMapHook::load(&module_path)
+                        .with_context(|| format!("load config module {id}"))?,
+                );
+                info!(
+                    module = %id,
+                    path = %module_path.display(),
+                    capabilities = ?module.capabilities,
+                    "loaded config WASM map hook"
+                );
+            }
             unsupported => {
                 warn!(
                     module = %id,
@@ -111,6 +132,11 @@ mod tests {
             kind = "fast-key-handler"
             path = "target/dev.wasm"
             capabilities = ["apps:run-argv"]
+
+            [module.layout]
+            kind = "fast-map-hook"
+            path = "target/layout.wasm"
+            capabilities = ["layout:on-map"]
             "#,
         )
         .expect("parse config");
@@ -120,6 +146,12 @@ mod tests {
         assert_eq!(module.kind, "fast-key-handler");
         assert_eq!(module.path, PathBuf::from("target/dev.wasm"));
         assert_eq!(module.capabilities, ["apps:run-argv"]);
+
+        let module = config.module.get("layout").expect("layout module");
+        assert!(module.enabled);
+        assert_eq!(module.kind, "fast-map-hook");
+        assert_eq!(module.path, PathBuf::from("target/layout.wasm"));
+        assert_eq!(module.capabilities, ["layout:on-map"]);
     }
 
     #[test]

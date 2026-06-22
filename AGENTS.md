@@ -13,12 +13,9 @@ Only describe the current state when it materially affects usability, operator w
 
 Do not duplicate CLI argument lists in prose. For exact flags, subcommands, and parser behavior, point readers to the code that defines them.
 
-## WSLg Wayland Screenshots
+## Development Environment
 
-Native Wayland apps work under WSLg. For screenshots, prefer capturing the exported Windows window with `PrintWindow` from PowerShell. This successfully captured WSLg native Wayland windows such as `Flower (Ubuntu-24.04)` and `simple-egl (Ubuntu-24.04)`.
-
-Do not rely on the usual in-WSL Wayland screenshot tools in this environment:weston-screenshooter grim and plain GDI all fail for various reasons
-
+The repo has a Nix flake for development-shell use, but agents should not assume it is required. Prefer the normal checked-in Cargo and script entry points unless the task specifically needs the flake or the local environment is missing dependencies.
 
 ## Testing
 

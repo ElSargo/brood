@@ -1,10 +1,8 @@
 # Shared Behavior Spec
 
-This document records the Manifold behavior that backend implementations should satisfy, even when their compositor, renderer, windowing, or presentation mechanisms differ.
+This document records the Manifold behavior that supported backend work should satisfy, even when compositor, renderer, windowing, or presentation mechanisms differ.
 
-The Linux/Rust nested compositor remains the clean reference path for now. The WSLg-native path may satisfy the same behavior through Weston, RDPRAIL, and Windows window integration rather than through Manifold-owned Winit presentation.
-
-Unless a section explicitly switches to Windows/WSLg context, references here to the implementation, backend, or default behavior mean the Linux-native path. When this spec is read for Windows behavior, that default usually maps to the WSLg-native path instead.
+Unless a section explicitly says otherwise, references here to the implementation, backend, or default behavior mean the Linux-native Manifold path.
 
 ## Principles
 
@@ -86,7 +84,6 @@ Expected behavior:
 - Repeated attach or detach commands are idempotent.
 - The presentation surface decides which panes are visible and how they are arranged, dragged, animated, stacked, or hidden.
 - The presentation surface may save its layout or visibility preferences into the workspace.
-- Hide/show semantics for WSLg-native host windows should preserve the same product meaning even if implemented through RDPRAIL or Weston-specific mechanisms.
 
 ## Presentation Requests
 
@@ -109,7 +106,6 @@ Expected behavior:
 - A multi-window app can create multiple panes or be associated with one workspace group when that best matches user intent.
 - Popups, auxiliary windows, and browser-created windows should not escape Manifold placement policy by default.
 - Backend-specific host windows may differ, but workspace commands should see a coherent pane or group identity.
-- The WSLg two-client composite PoC is treated as an implementation experiment toward this behavior, not the final grouping model.
 
 ## Session Persistence
 
@@ -128,7 +124,7 @@ Native feel depends on staying close to platform presentation paths.
 
 Expected behavior:
 
-- Prefer GPU-resident surfaces through DMA-BUF, WSLg graphics redirection, or equivalent platform-native handles.
+- Prefer GPU-resident surfaces through DMA-BUF or equivalent platform-native handles.
 - Avoid full-frame CPU streaming as the primary local presentation path.
 - Keep input-to-visible-result and commit-to-visible-result latency within a frame whenever practical.
 - For native nested clients, prefer a late-latched ordering where host input is forwarded, the client commits, Manifold composites, and Manifold submits within one output frame when the client can meet the deadline.

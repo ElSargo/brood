@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 WSLG_DIR="$ROOT/reference/wslg"
-MARKER_PATCH="$ROOT/tools/patches/wslg-manifold-marker.patch"
-WSLG_LOCAL_EXPORT_PATCH="$ROOT/tools/patches/wslg-speed-up-local-export.patch"
-WESTON_FASTPATH_PATCH="$ROOT/tools/patches/wslg-require-gfxredir-fastpath.patch"
-WESTON_SHM_RETRY_PATCH="$ROOT/tools/patches/wslg-retry-gfxredir-shm-open.patch"
-WESTON_PIXMAN_PATCH="$ROOT/tools/patches/wslg-invert-pixman-control.patch"
-WESTON_COMPOSITE_PATCH="$ROOT/tools/patches/wslg-composite-two-clients-poc.patch"
+MARKER_PATCH="$ROOT/experimental/wslg/patches/wslg-manifold-marker.patch"
+WSLG_LOCAL_EXPORT_PATCH="$ROOT/experimental/wslg/patches/wslg-speed-up-local-export.patch"
+WESTON_FASTPATH_PATCH="$ROOT/experimental/wslg/patches/wslg-require-gfxredir-fastpath.patch"
+WESTON_SHM_RETRY_PATCH="$ROOT/experimental/wslg/patches/wslg-retry-gfxredir-shm-open.patch"
+WESTON_PIXMAN_PATCH="$ROOT/experimental/wslg/patches/wslg-invert-pixman-control.patch"
+WESTON_COMPOSITE_PATCH="$ROOT/experimental/wslg/patches/wslg-composite-two-clients-poc.patch"
 MARKER_VALUE="manifold-wslg-fastpath-required"
 
 apply_patch_if_missing() {
@@ -28,7 +28,7 @@ apply_patch_if_missing() {
 }
 
 if [[ ! -d "$WSLG_DIR/.git" ]]; then
-    "$ROOT/tools/wslg-bootstrap-reference.sh"
+    "$ROOT/experimental/wslg/tools/wslg-bootstrap-reference.sh"
 fi
 
 if grep -q "MANIFOLD_WSLG_MARKER" "$WSLG_DIR/Dockerfile"; then
@@ -85,7 +85,7 @@ if [[ -d "$WSLG_DIR/vendor/weston/.git" ]]; then
         "rdp_rail_translate_manifold_pointer" \
         "WSLg Weston two-client composite PoC"
 else
-    echo "WSLg Weston vendor checkout is missing; run tools/wslg-bootstrap-vendors.sh before applying Weston patches." >&2
+    echo "WSLg Weston vendor checkout is missing; run experimental/wslg/tools/wslg-bootstrap-vendors.sh before applying Weston patches." >&2
     exit 1
 fi
 
