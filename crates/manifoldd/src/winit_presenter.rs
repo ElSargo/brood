@@ -507,12 +507,16 @@ impl<F: FnMut(PresenterEvent)> PresenterApp<'_, F> {
 
 impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        self.runtime.borrow_mut().ensure_window(event_loop);
+        {
+            self.runtime.borrow_mut().ensure_window(event_loop);
+        }
         self.emit_pending();
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.runtime.borrow_mut().ensure_window(event_loop);
+        {
+            self.runtime.borrow_mut().ensure_window(event_loop);
+        }
         self.emit_pending();
     }
 
@@ -522,7 +526,8 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if self.runtime.borrow().active_window_id() != Some(window_id) {
+        let active_window_id = { self.runtime.borrow().active_window_id() };
+        if active_window_id != Some(window_id) {
             return;
         }
 
@@ -555,7 +560,8 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 });
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(size) = self.runtime.borrow().active_window_size() {
+                let active_window_size = { self.runtime.borrow().active_window_size() };
+                if let Some(size) = active_window_size {
                     let position = pointer_position(position, size);
                     let time = self.timestamp();
                     (self.callback)(PresenterEvent::PointerMotion { position, time });
@@ -575,7 +581,7 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 });
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let is_x11 = self.runtime.borrow().active_is_x11();
+                let is_x11 = { self.runtime.borrow().active_is_x11() };
                 let button = button_code(button, is_x11);
                 let state = button_state(state);
                 let time = self.timestamp();
@@ -590,7 +596,8 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 location,
                 ..
             }) => {
-                if let Some(size) = self.runtime.borrow().active_window_size() {
+                let active_window_size = { self.runtime.borrow().active_window_size() };
+                if let Some(size) = active_window_size {
                     let position = pointer_position(location, size);
                     let time = self.timestamp();
                     (self.callback)(PresenterEvent::PointerMotion { position, time });

@@ -23,7 +23,7 @@ use smithay::{
         wayland_server::{
             Display, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::wl_surface::WlSurface,
+            protocol::{wl_output, wl_surface::WlSurface},
         },
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -122,6 +122,7 @@ pub struct Manifold {
     pointer_hover_toplevel_surface: Option<WlSurface>,
     pending_pointer_focus_surface: Option<WlSurface>,
     window_layout_leaves: Vec<(WlSurface, LayoutLeafId)>,
+    fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
     pub(crate) ctrl_pressed: bool,
@@ -207,6 +208,7 @@ impl Manifold {
             pointer_hover_toplevel_surface: None,
             pending_pointer_focus_surface: None,
             window_layout_leaves: Vec::new(),
+            fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
             ctrl_pressed: false,
@@ -511,6 +513,13 @@ impl Manifold {
             let Some(toplevel) = window.toplevel() else {
                 return;
             };
+            let is_fullscreen = self
+                .toplevel_fullscreen_output(toplevel.wl_surface())
+                .is_some();
+            let fullscreen_output = self
+                .toplevel_fullscreen_output(toplevel.wl_surface())
+                .cloned()
+                .flatten();
             let client_size = self.window_layout_rect(window).map_or_else(
                 || self.presentation_size(),
                 |rect| (rect.w.max(1), rect.h.max(1)),
@@ -519,7 +528,7 @@ impl Manifold {
             toplevel.with_pending_state(|state| {
                 state.size = Some(client_size.into());
                 state.bounds = Some(client_size.into());
-                if self.managed_fullscreen {
+                if is_fullscreen || self.managed_fullscreen {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                     state.states.unset(xdg_toplevel::State::Maximized);
                 } else {
@@ -531,7 +540,7 @@ impl Manifold {
                 } else {
                     state.states.unset(xdg_toplevel::State::Activated);
                 }
-                state.fullscreen_output = None;
+                state.fullscreen_output = fullscreen_output;
             });
             window.set_activated(is_active);
             toplevel.send_pending_configure();
@@ -830,12 +839,57 @@ impl Manifold {
             return None;
         }
         let surface = Manifold::window_toplevel_surface(window)?;
+        if self.toplevel_fullscreen_output(&surface).is_some() {
+            return Some(fullscreen_layout_rect(self.presentation_layout_size()));
+        }
         let leaf = self
             .window_layout_leaves
             .iter()
             .rev()
             .find_map(|(assigned_surface, leaf)| (assigned_surface == &surface).then_some(*leaf))?;
         self.layout.leaf_rect(leaf, self.presentation_layout_size())
+    }
+
+    pub fn request_toplevel_fullscreen(
+        &mut self,
+        surface: WlSurface,
+        output: Option<wl_output::WlOutput>,
+    ) {
+        self.fullscreen_toplevels
+            .retain(|(fullscreen_surface, _)| fullscreen_surface != &surface);
+        self.fullscreen_toplevels.push((surface.clone(), output));
+        self.focus_toplevel_surface(Some(surface));
+        self.reconfigure_focus_stack();
+    }
+
+    pub fn request_toplevel_unfullscreen(&mut self, surface: &WlSurface) {
+        self.fullscreen_toplevels
+            .retain(|(fullscreen_surface, _)| fullscreen_surface != surface);
+        self.reconfigure_focus_stack();
+    }
+
+    pub fn requested_fullscreen_count(&self) -> usize {
+        self.fullscreen_toplevels.len()
+    }
+
+    pub fn focused_window_fullscreen(&self) -> bool {
+        self.managed_fullscreen
+            || self
+                .active_toplevel_surface
+                .as_ref()
+                .is_some_and(|surface| self.toplevel_fullscreen_output(surface).is_some())
+    }
+
+    fn toplevel_fullscreen_output(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<&Option<wl_output::WlOutput>> {
+        self.fullscreen_toplevels
+            .iter()
+            .rev()
+            .find_map(|(fullscreen_surface, output)| {
+                (fullscreen_surface == surface).then_some(output)
+            })
     }
 
     fn surface_for_layout_leaf(&self, target_leaf: LayoutLeafId) -> Option<WlSurface> {
@@ -1151,6 +1205,8 @@ impl Manifold {
             .collect::<Vec<_>>();
         self.window_layout_leaves
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.fullscreen_toplevels
+            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_surface_sessions
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_pane_ids
@@ -1228,6 +1284,15 @@ impl Manifold {
     }
 }
 
+fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
+    LayoutRect {
+        x: 0,
+        y: 0,
+        w: size.w.max(1),
+        h: size.h.max(1),
+    }
+}
+
 fn focus_stack_location(_slot: usize) -> Point<i32, Logical> {
     Point::from((0, 0))
 }
@@ -1240,7 +1305,8 @@ struct WindowRefreshOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::focus_stack_location;
+    use super::{focus_stack_location, fullscreen_layout_rect};
+    use crate::layout::LayoutSize;
 
     #[test]
     fn focus_stack_places_every_window_at_origin() {
@@ -1249,6 +1315,20 @@ mod tests {
 
         assert_eq!((first.x, first.y), (0, 0));
         assert_eq!((later.x, later.y), (0, 0));
+    }
+
+    #[test]
+    fn fullscreen_layout_covers_the_presentation_from_origin() {
+        let rect = fullscreen_layout_rect(LayoutSize { w: 1920, h: 1080 });
+
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn fullscreen_layout_clamps_empty_presentation_size() {
+        let rect = fullscreen_layout_rect(LayoutSize { w: 0, h: -4 });
+
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (0, 0, 1, 1));
     }
 }
 

@@ -22,7 +22,7 @@ use smithay::{
         calloop::{EventLoop, Interest},
         wayland_server::{
             Client, Display, Resource,
-            protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+            protocol::{wl_buffer, wl_output, wl_seat, wl_surface::WlSurface},
         },
     },
     utils::Serial,
@@ -828,6 +828,18 @@ impl XdgShellHandler for Manifold {
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        output: Option<wl_output::WlOutput>,
+    ) {
+        self.request_toplevel_fullscreen(surface.wl_surface().clone(), output);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.request_toplevel_unfullscreen(surface.wl_surface());
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
