@@ -40,6 +40,10 @@ The layout policy boundary is recorded in [Layout Mould](layout-mould.md). In sh
 
 The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md). In short, modules should target `global`, `session`, or `surface` realms, with mostly shared host APIs plus realm-local convenience bindings and lifetimes.
 
+The native UI backend experiment is recorded in [Session Switcher UI Experiment](session-switcher-ui-experiment.md). In short, WASM should write a flat host-validated UI tree, while native backends such as Iced or GPUI render the accepted tree without becoming the plugin ABI.
+
+The entered session environment model is recorded in [Session Environments](session-environments.md). In short, `manifold enter` should bind shells, commands, GUI apps, agents, and optional filesystem/network/DBus isolation layers to one session context.
+
 This boundary is recorded in [ADR 0005](decisions/0005-wasm-through-workspace-api.md).
 
 ## Module Roles
@@ -401,4 +405,4 @@ Validation:
 - What is the smallest real app that proves the API: settings, git status, or an agent inspector?
 - Where should user-installed WASM modules live on disk?
 - How should capability grants be edited and audited?
-- What concrete problem would justify adding a session virtual filesystem layer?
+- Which session isolation profile should agent-facing WASM and command workflows use by default?

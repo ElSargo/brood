@@ -11,6 +11,8 @@ The long-term architecture may split presentation into a separate endpoint proce
 The session process owns durable session truth and the wider workspace-level environment around it:
 
 - sessions, session lifecycle, environment, cwd, capabilities, and producer membership
+- entered session environments, including command context, GUI launch context, and optional isolation profile
+- session filesystem overlays, network namespace metadata, PID/IPC namespace metadata, and DBus proxy configuration
 - documents, buffers, selections, modes, commands, and pane records
 - focus and input routing policy between panes and producers
 - terminals, browser pane clients, Wayland app hosts, agents, and git models
@@ -55,12 +57,23 @@ See [WASM Integration](wasm-integration.md) for the planned host boundary, modul
 
 See [Layout Mould](layout-mould.md) for the planned split between reloadable layout policy and native presentation rendering.
 
+See [Session Environments](session-environments.md) for the planned `enter`, `show`, command-context, filesystem overlay, network namespace, and DBus proxy model.
+
 ## MVP Data Flow
 
 1. Hosted Wayland apps connect to the nested Wayland compositor owned by `manifoldd`.
 2. `manifoldd` keeps hosted Wayland app connections and surface state alive across presentation window close/reopen.
 3. The presentation endpoint imports managed app surfaces, updates scene caches, and composites the latest committed state at refresh rate.
 4. Closing the presentation window detaches by default when there is state worth preserving.
+
+## Entered Session Data Flow
+
+1. `manifold enter` resolves or creates a session and builds an entered environment for a shell or command.
+2. The entered environment carries the session control socket and points GUI clients at the session's nested Wayland display.
+3. Optional isolation profiles create or join session-local filesystem, network, PID/IPC, and DBus boundaries.
+4. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
+5. `manifold show` presents the entered session without changing its process, filesystem, or network state.
+6. Control commands and aliases such as `mdctl` default to the entered session unless a command explicitly targets another session.
 
 ## Core Rule
 

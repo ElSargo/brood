@@ -29,11 +29,40 @@ Expected behavior:
 - WASM apps inside a session may communicate with each other through session APIs and granted capabilities.
 - External apps may use a session-scoped DBus proxy for desktop-style communication inside the session.
 - The session DBus proxy should not expose ambient host-wide or cross-session DBus access by default.
-- First-phase sessions use the real host/project filesystem through session cwd, environment, and granted capabilities.
-- A virtual filesystem may become useful later, but it is not required for the current workspace and session model.
+- Plain first-phase sessions may use the real host/project filesystem through session cwd, environment, and granted capabilities.
+- Isolated sessions should be able to add filesystem overlays, network namespaces, PID/IPC namespaces, and DBus proxies without changing the pane or presentation model.
 - Manifold uses power-user defaults: explicit session actions should not trigger confirmation prompts by default.
 - Prefer observable effects, logs, history, undo/recovery where practical, and opt-in guardrails over nagging confirmations.
 - Agents are same-session apps for trust and capability purposes, but their requested and performed actions should be logged inside the session for traceability.
+
+See [Session Environments](session-environments.md) for the target `enter`, `show`, filesystem overlay, network namespace, and DBus proxy model.
+
+## Entered Session Environment
+
+An entered session is a shell or command environment bound to one Manifold session.
+
+Expected behavior:
+
+- `manifold enter` resolves or creates a session, sets the session command context, points GUI clients at the session's nested Wayland display, and then starts a shell or requested command.
+- Session-aware commands infer their target from the entered environment unless explicitly overridden.
+- `manifold show` fronts, attaches, or switches presentation to the entered session without changing the shell environment.
+- A thin control alias such as `mdctl` may exist, but it should use the same command semantics and default target as Manifold control commands.
+- Entered shells should make the active control socket, session id, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
+- Entering a session should not by itself require filesystem, network, or PID isolation; those are profiles layered on top.
+
+## Session Isolation
+
+Session isolation is for reducing accidental interference between local development tasks and parallel agents. It is not a promise of internet-safe multi-user security.
+
+Expected behavior:
+
+- A filesystem-isolated session writes through a session-owned overlay and can report changed files, diffs, promoted paths, discarded paths, and system-path writes separately from repo writes.
+- A network-isolated session has its own loopback namespace so multiple sessions can bind the same local ports.
+- Containers or tools launched with host networking from inside a network-isolated entered session should share the session network namespace rather than the ambient host namespace.
+- A DBus-isolated session uses a session-local bus or filtered proxy; access to host bus names and cross-session bus names requires explicit grants.
+- A PID/IPC-isolated session can report and clean up processes that belong to the session without relying on ambient host process discovery.
+- Deleting, exporting, or archiving a session should preserve enough metadata to understand its filesystem, process, DBus, and network effects.
+- Isolation failures and fallbacks should be visible in status and logs.
 
 ## Pane Identity
 
