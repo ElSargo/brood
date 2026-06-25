@@ -1,12 +1,15 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
-    process::Command,
+    fs,
+    path::PathBuf,
+    process::{Command, Stdio},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
@@ -96,6 +99,77 @@ pub struct SurfaceSessionSummary {
     pub windows: usize,
 }
 
+pub type ExtensionMetadata = BTreeMap<String, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionSummary {
+    pub id: String,
+    pub role: String,
+    pub sender: String,
+    pub metadata: ExtensionMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSummary {
+    pub id: String,
+    pub extension_id: String,
+    pub kind: String,
+    pub sender: String,
+    pub active: bool,
+    pub detail: ExtensionMetadata,
+}
+
+#[derive(Default)]
+struct ExtensionRegistry {
+    extensions: Vec<ExtensionRecord>,
+    windows: Vec<WindowRecord>,
+    grants: Vec<GrantRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtensionRecord {
+    id: String,
+    role: String,
+    metadata: ExtensionMetadata,
+    sender: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowRecord {
+    id: String,
+    extension_id: String,
+    identity: ExtensionMetadata,
+    role: String,
+    sender: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrantRecord {
+    id: String,
+    extension_id: String,
+    kind: String,
+    detail: ExtensionMetadata,
+    sender: String,
+    active: bool,
+}
+
+struct SessionDbusBus {
+    session: SurfaceSessionId,
+    address: String,
+    daemon_pid: u32,
+    dir: PathBuf,
+}
+
+impl Drop for SessionDbusBus {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.daemon_pid.to_string())
+            .status();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 pub struct Manifold {
     pub start_time: Instant,
     pub socket_name: OsString,
@@ -153,6 +227,9 @@ pub struct Manifold {
     surface_sessions: Vec<SurfaceSessionId>,
     surface_session_names: Vec<(SurfaceSessionId, String)>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
+    presentation_member_surfaces: Vec<WlSurface>,
+    extension_registry: ExtensionRegistry,
+    session_dbus_buses: Vec<SessionDbusBus>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
@@ -248,6 +325,9 @@ impl Manifold {
             surface_sessions: vec![SurfaceSessionId(1)],
             surface_session_names: vec![(SurfaceSessionId(1), "session 1".to_string())],
             window_surface_sessions: Vec::new(),
+            presentation_member_surfaces: Vec::new(),
+            extension_registry: ExtensionRegistry::default(),
+            session_dbus_buses: Vec::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             presenter: None,
@@ -323,7 +403,7 @@ impl Manifold {
             .expect("insert window lifecycle timer");
     }
 
-    pub fn spawn_hosted_app(&self, command: &OsString) -> Result<()> {
+    pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
         self.apply_control_environment(&mut child);
@@ -342,7 +422,7 @@ impl Manifold {
         Ok(())
     }
 
-    pub fn spawn_hosted_app_argv(&self, argv: &[String]) -> Result<()> {
+    pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<()> {
         let Some((program, args)) = argv.split_first() else {
             anyhow::bail!("spawn requires a command");
         };
@@ -372,16 +452,98 @@ impl Manifold {
         self.browsers.spawn(options, &self.socket_name)
     }
 
-    fn apply_control_environment(&self, child: &mut Command) {
+    fn apply_control_environment(&mut self, child: &mut Command) {
         if let Some(session) = self.manifold_session.as_deref() {
             child.env(MANIFOLD_SESSION_ENV, session);
         }
         if let Some(destination) = self.manifold_dbus_destination.as_deref() {
             child.env(MANIFOLDD_DBUS_DESTINATION_ENV, destination);
         }
-        if let Some(address) = self.manifold_dbus_address.as_deref() {
-            child.env(MANIFOLDD_DBUS_ADDRESS_ENV, address);
+        if let Some(address) = self.manifold_dbus_address.clone() {
+            child.env(MANIFOLDD_DBUS_ADDRESS_ENV, &address);
+            let session = self.active_surface_session;
+            match self.ensure_session_dbus_bus(session) {
+                Ok(session_bus_address) => {
+                    child.env("DBUS_SESSION_BUS_ADDRESS", session_bus_address);
+                    child.env("MANIFOLD_SURFACE_SESSION_ID", session.raw().to_string());
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        session = session.raw(),
+                        "failed to start session DBus bus; managed client inherits Manifold control bus"
+                    );
+                    child.env("DBUS_SESSION_BUS_ADDRESS", &address);
+                }
+            }
+        } else {
+            warn!(
+                "managed client inherits host DBUS_SESSION_BUS_ADDRESS; DBus policy modes off/proxy/private are not enforced yet"
+            );
         }
+    }
+
+    fn ensure_session_dbus_bus(&mut self, session: SurfaceSessionId) -> Result<String> {
+        if let Some(bus) = self
+            .session_dbus_buses
+            .iter()
+            .find(|bus| bus.session == session)
+        {
+            return Ok(bus.address.clone());
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "manifold-session-dbus-{}-{}",
+            std::process::id(),
+            session.raw()
+        ));
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let config = dir.join("session.conf");
+        let bus_info = dir.join("bus.info");
+        let config_text = format!(
+            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+"#,
+            dir.display()
+        );
+        fs::write(&config, config_text).with_context(|| format!("write {}", config.display()))?;
+
+        let output = fs::File::create(&bus_info)
+            .with_context(|| format!("create {}", bus_info.display()))?;
+        let mut child = Command::new("dbus-daemon")
+            .arg(format!("--config-file={}", config.display()))
+            .arg("--fork")
+            .arg("--print-address=1")
+            .arg("--print-pid=1")
+            .stdout(Stdio::from(output))
+            .spawn()
+            .context("spawn session DBus daemon")?;
+
+        let (address, daemon_pid) = wait_for_dbus_info(&bus_info)?;
+        let _ = child.wait();
+        self.session_dbus_buses.push(SessionDbusBus {
+            session,
+            address: address.clone(),
+            daemon_pid,
+            dir,
+        });
+        info!(
+            session = session.raw(),
+            dbus_address = %address,
+            daemon_pid,
+            "started session-local DBus bus"
+        );
+        Ok(address)
     }
 
     pub fn request_attach(&mut self) {
@@ -906,7 +1068,79 @@ impl Manifold {
             .collect()
     }
 
-    fn surface_session_name(&self, session: SurfaceSessionId) -> &str {
+    pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: String) -> bool {
+        let name = name.trim();
+        if name.is_empty() || !self.surface_sessions.contains(&session) {
+            return false;
+        }
+        self.surface_session_names
+            .retain(|(assigned_session, _)| *assigned_session != session);
+        self.surface_session_names.push((session, name.to_string()));
+        true
+    }
+
+    pub fn close_surface_session(&mut self, session: SurfaceSessionId) -> bool {
+        if self.surface_sessions.len() <= 1 || !self.surface_sessions.contains(&session) {
+            return false;
+        }
+
+        let surfaces = self
+            .window_surface_sessions
+            .iter()
+            .filter_map(|(surface, assigned_session)| {
+                (*assigned_session == session).then(|| surface.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for surface in &surfaces {
+            if let Some(window) = self.window_for_any_toplevel_surface(surface)
+                && let Some(toplevel) = window.toplevel()
+            {
+                toplevel.send_close();
+            }
+        }
+
+        self.surface_sessions
+            .retain(|existing| *existing != session);
+        self.surface_session_names
+            .retain(|(assigned_session, _)| *assigned_session != session);
+        self.surface_session_interaction_order
+            .retain(|existing| *existing != session);
+        self.window_surface_sessions
+            .retain(|(_, assigned_session)| *assigned_session != session);
+        self.window_layout_leaves
+            .retain(|(surface, _)| !surfaces.iter().any(|closed| closed == surface));
+        if self.active_surface_session == session {
+            self.active_surface_session = self
+                .surface_session_interaction_order
+                .iter()
+                .copied()
+                .find(|candidate| self.surface_sessions.contains(candidate))
+                .or_else(|| self.surface_sessions.first().copied())
+                .unwrap_or(SurfaceSessionId(1));
+        }
+        self.reconfigure_focus_stack();
+        true
+    }
+
+    pub fn resolve_surface_session(&self, query: &str) -> Option<SurfaceSessionId> {
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        if let Ok(raw) = query.parse::<u64>() {
+            let session = SurfaceSessionId(raw);
+            if self.surface_sessions.contains(&session) {
+                return Some(session);
+            }
+        }
+        self.surface_sessions.iter().copied().find(|session| {
+            self.surface_session_name(*session)
+                .eq_ignore_ascii_case(query)
+        })
+    }
+
+    pub fn surface_session_name(&self, session: SurfaceSessionId) -> &str {
         self.surface_session_names
             .iter()
             .rev()
@@ -925,9 +1159,15 @@ impl Manifold {
                 let Some(surface) = Manifold::window_toplevel_surface(window) else {
                     return false;
                 };
-                self.session_for_toplevel_surface(&surface)
-                    .unwrap_or(SurfaceSessionId(1))
-                    == session
+                let assigned_session = self
+                    .session_for_toplevel_surface(&surface)
+                    .unwrap_or(SurfaceSessionId(1));
+                let presentation_member = self
+                    .presentation_member_surfaces
+                    .iter()
+                    .any(|member| member == &surface);
+                assigned_session == session
+                    || (session == self.active_surface_session && presentation_member)
             })
             .count()
     }
@@ -1001,6 +1241,13 @@ impl Manifold {
         let Some(surface) = Manifold::window_toplevel_surface(window) else {
             return false;
         };
+        if self
+            .presentation_member_surfaces
+            .iter()
+            .any(|member| member == &surface)
+        {
+            return true;
+        }
         self.session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
             == self.active_surface_session
@@ -1170,6 +1417,256 @@ impl Manifold {
         }
     }
 
+    pub fn register_extension(
+        &mut self,
+        role: String,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<String> {
+        let role = normalize_registry_value(&role).context("extension role must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let id = stable_registry_id("ext", [&role], &metadata);
+        if let Some(record) = self
+            .extension_registry
+            .extensions
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            record.role = role;
+            record.metadata = metadata;
+            record.sender = sender;
+        } else {
+            self.extension_registry.extensions.push(ExtensionRecord {
+                id: id.clone(),
+                role,
+                metadata,
+                sender,
+            });
+        }
+        Ok(id)
+    }
+
+    pub fn unregister_extension(&mut self, extension_id: &str) -> bool {
+        let before = self.extension_registry.extensions.len();
+        self.extension_registry
+            .extensions
+            .retain(|extension| extension.id != extension_id);
+        if before == self.extension_registry.extensions.len() {
+            return false;
+        }
+        self.extension_registry
+            .windows
+            .retain(|window| window.extension_id != extension_id);
+        self.extension_registry
+            .grants
+            .retain(|grant| grant.extension_id != extension_id);
+        true
+    }
+
+    pub fn extension_summaries(&self) -> Vec<ExtensionSummary> {
+        self.extension_registry
+            .extensions
+            .iter()
+            .map(|record| ExtensionSummary {
+                id: record.id.clone(),
+                role: record.role.clone(),
+                sender: record.sender.clone(),
+                metadata: record.metadata.clone(),
+            })
+            .collect()
+    }
+
+    pub fn grant_summaries(&self, extension_id: &str) -> Vec<GrantSummary> {
+        self.extension_registry
+            .grants
+            .iter()
+            .filter(|grant| extension_id.is_empty() || grant.extension_id == extension_id)
+            .map(|grant| GrantSummary {
+                id: grant.id.clone(),
+                extension_id: grant.extension_id.clone(),
+                kind: grant.kind.clone(),
+                sender: grant.sender.clone(),
+                active: grant.active,
+                detail: grant.detail.clone(),
+            })
+            .collect()
+    }
+
+    pub fn release_grant(&mut self, grant_id: &str) -> bool {
+        let Some(grant) = self
+            .extension_registry
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == grant_id && grant.active)
+        else {
+            return false;
+        };
+        grant.active = false;
+        true
+    }
+
+    pub fn register_extension_window(
+        &mut self,
+        extension_id: String,
+        identity: ExtensionMetadata,
+        role: String,
+        sender: String,
+    ) -> Result<String> {
+        self.ensure_extension_exists(&extension_id)?;
+        let role = normalize_registry_value(&role).context("window role must not be empty")?;
+        ensure_metadata(&identity)?;
+        let id = stable_registry_id("win", [&extension_id, &role], &identity);
+        if let Some(record) = self
+            .extension_registry
+            .windows
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            record.identity = identity;
+            record.role = role;
+            record.sender = sender;
+        } else {
+            self.extension_registry.windows.push(WindowRecord {
+                id: id.clone(),
+                extension_id,
+                identity,
+                role,
+                sender,
+            });
+        }
+        Ok(id)
+    }
+
+    pub fn request_window_placement(
+        &mut self,
+        window_id: &str,
+        placement: ExtensionMetadata,
+        sender: String,
+    ) -> Result<String> {
+        ensure_metadata(&placement)?;
+        let window = self.window_record(window_id)?;
+        let mut detail = placement.clone();
+        detail.insert("window_id".to_string(), window_id.to_string());
+        let grant_id = self.record_grant(&window.extension_id, "placement", detail, sender);
+
+        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
+            warn!(
+                window_id,
+                identity = ?window.identity,
+                "DBus placement request granted but no matching toplevel is mapped yet"
+            );
+            return Ok(grant_id);
+        };
+
+        if let Some(session) = placement
+            .get("surface_session")
+            .or_else(|| placement.get("session_id"))
+            .and_then(|value| self.resolve_surface_session(value))
+        {
+            self.assign_toplevel_surface_session(&surface, session);
+        }
+        if placement
+            .get("focus")
+            .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"))
+        {
+            if let Some(session) = self.session_for_toplevel_surface(&surface) {
+                self.switch_to_surface_session(session);
+            }
+            self.focus_toplevel_surface(Some(surface));
+        } else {
+            self.reconfigure_focus_stack();
+        }
+        Ok(grant_id)
+    }
+
+    pub fn request_presentation_membership(
+        &mut self,
+        window_id: &str,
+        membership: ExtensionMetadata,
+        sender: String,
+    ) -> Result<String> {
+        ensure_metadata(&membership)?;
+        let window = self.window_record(window_id)?;
+        let mut detail = membership.clone();
+        detail.insert("window_id".to_string(), window_id.to_string());
+        let grant_id = self.record_grant(
+            &window.extension_id,
+            "presentation-membership",
+            detail,
+            sender,
+        );
+
+        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
+            warn!(
+                window_id,
+                identity = ?window.identity,
+                "DBus presentation membership granted but no matching toplevel is mapped yet"
+            );
+            return Ok(grant_id);
+        };
+
+        if !self
+            .presentation_member_surfaces
+            .iter()
+            .any(|member| member == &surface)
+        {
+            self.presentation_member_surfaces.push(surface);
+        }
+        self.reconfigure_focus_stack();
+        Ok(grant_id)
+    }
+
+    pub fn request_shortcut_grant(
+        &mut self,
+        extension_id: String,
+        shortcut: String,
+        scope: String,
+        label: String,
+        sender: String,
+    ) -> Result<String> {
+        self.ensure_extension_exists(&extension_id)?;
+        let shortcut = normalize_registry_value(&shortcut).context("shortcut must not be empty")?;
+        ensure!(
+            !manifold_owned_shortcut(&shortcut),
+            "shortcut conflicts with an existing Manifold-owned shortcut"
+        );
+        let mut detail = ExtensionMetadata::new();
+        detail.insert("shortcut".to_string(), shortcut);
+        detail.insert("scope".to_string(), scope);
+        detail.insert("label".to_string(), label);
+        Ok(self.record_grant(&extension_id, "shortcut", detail, sender))
+    }
+
+    pub fn request_extension_window_focus(&mut self, window_id: &str) -> Result<bool> {
+        let window = self.window_record(window_id)?;
+        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
+            return Ok(false);
+        };
+        if let Some(session) = self.session_for_toplevel_surface(&surface) {
+            self.switch_to_surface_session(session);
+        }
+        self.focus_toplevel_surface(Some(surface));
+        Ok(true)
+    }
+
+    pub fn dismiss_extension_window(&mut self, window_id: &str) -> Result<bool> {
+        let window = self.window_record(window_id)?;
+        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
+            return Ok(false);
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            return Ok(false);
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return Ok(false);
+        };
+        toplevel.send_close();
+        if let Err(err) = self.display_handle.flush_clients() {
+            warn!(?err, "flush clients after DBus dismiss request failed");
+        }
+        Ok(true)
+    }
+
     pub fn window_for_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
@@ -1178,6 +1675,86 @@ impl Manifold {
                     && Manifold::window_toplevel_surface(window).as_ref() == Some(surface)
             })
             .cloned()
+    }
+
+    fn window_for_any_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.space
+            .elements()
+            .find(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(surface))
+            .cloned()
+    }
+
+    fn ensure_extension_exists(&self, extension_id: &str) -> Result<()> {
+        ensure!(
+            self.extension_registry
+                .extensions
+                .iter()
+                .any(|extension| extension.id == extension_id),
+            "unknown extension {extension_id}"
+        );
+        Ok(())
+    }
+
+    fn window_record(&self, window_id: &str) -> Result<WindowRecord> {
+        self.extension_registry
+            .windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .cloned()
+            .with_context(|| format!("unknown extension window {window_id}"))
+    }
+
+    fn record_grant(
+        &mut self,
+        extension_id: &str,
+        kind: &str,
+        detail: ExtensionMetadata,
+        sender: String,
+    ) -> String {
+        let id = stable_registry_id("grant", [extension_id, kind], &detail);
+        if let Some(record) = self
+            .extension_registry
+            .grants
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            record.detail = detail;
+            record.sender = sender;
+            record.active = true;
+        } else {
+            self.extension_registry.grants.push(GrantRecord {
+                id: id.clone(),
+                extension_id: extension_id.to_string(),
+                kind: kind.to_string(),
+                detail,
+                sender,
+                active: true,
+            });
+        }
+        id
+    }
+
+    fn assign_toplevel_surface_session(
+        &mut self,
+        surface: &WlSurface,
+        session: SurfaceSessionId,
+    ) -> bool {
+        if !self.surface_sessions.contains(&session) {
+            return false;
+        }
+        self.window_surface_sessions
+            .retain(|(assigned_surface, _)| assigned_surface != surface);
+        self.window_surface_sessions
+            .push((surface.clone(), session));
+        self.reconfigure_focus_stack();
+        true
+    }
+
+    fn find_surface_for_window_identity(&self, identity: &ExtensionMetadata) -> Option<WlSurface> {
+        self.space.elements().find_map(|window| {
+            let surface = Manifold::window_toplevel_surface(window)?;
+            toplevel_matches_identity(self, &surface, identity).then_some(surface)
+        })
     }
 
     pub fn set_pending_pointer_focus_surface(&mut self, surface: Option<WlSurface>) {
@@ -1383,7 +1960,7 @@ impl Manifold {
         true
     }
 
-    pub fn spawn_wezterm_pane(&self) -> Result<()> {
+    pub fn spawn_wezterm_pane(&mut self) -> Result<()> {
         self.spawn_hosted_app_argv(&[
             "flatpak".to_string(),
             "run".to_string(),
@@ -1428,6 +2005,8 @@ impl Manifold {
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_surface_sessions
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.presentation_member_surfaces
+            .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_pane_ids
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         if self
@@ -1560,6 +2139,173 @@ fn toplevel_app_id(surface: &WlSurface) -> Option<String> {
             .app_id
             .clone()
     })
+}
+
+fn toplevel_title(surface: &WlSurface) -> Option<String> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()?
+            .lock()
+            .ok()?
+            .title
+            .clone()
+    })
+}
+
+fn toplevel_pid(state: &Manifold, surface: &WlSurface) -> Option<String> {
+    surface
+        .client()
+        .and_then(|client| client.get_credentials(&state.display_handle).ok())
+        .map(|credentials| credentials.pid.to_string())
+}
+
+fn toplevel_matches_identity(
+    state: &Manifold,
+    surface: &WlSurface,
+    identity: &ExtensionMetadata,
+) -> bool {
+    let mut matched = false;
+    if let Some(expected) = identity.get("app_id").filter(|value| !value.is_empty()) {
+        if toplevel_app_id(surface).as_deref() != Some(expected.as_str()) {
+            return false;
+        }
+        matched = true;
+    }
+    if let Some(expected) = identity.get("title").filter(|value| !value.is_empty()) {
+        if toplevel_title(surface).as_deref() != Some(expected.as_str()) {
+            return false;
+        }
+        matched = true;
+    }
+    if let Some(expected) = identity.get("pid").filter(|value| !value.is_empty()) {
+        if toplevel_pid(state, surface).as_deref() != Some(expected.as_str()) {
+            return false;
+        }
+        matched = true;
+    }
+    matched
+}
+
+fn normalize_registry_value(value: &str) -> Option<String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!value.is_empty()).then_some(value)
+}
+
+fn ensure_metadata(metadata: &ExtensionMetadata) -> Result<()> {
+    ensure!(
+        metadata.keys().all(|key| !key.trim().is_empty()),
+        "metadata keys must not be empty"
+    );
+    Ok(())
+}
+
+fn stable_registry_id<'a, S>(
+    prefix: &str,
+    parts: impl IntoIterator<Item = &'a S>,
+    metadata: &ExtensionMetadata,
+) -> String
+where
+    S: AsRef<str> + 'a + ?Sized,
+{
+    let mut hash = 0xcbf29ce484222325_u64;
+    for part in parts {
+        fnv1a(&mut hash, part.as_ref().as_bytes());
+        fnv1a(&mut hash, b"\0");
+    }
+    for (key, value) in metadata {
+        fnv1a(&mut hash, key.as_bytes());
+        fnv1a(&mut hash, b"=");
+        fnv1a(&mut hash, value.as_bytes());
+        fnv1a(&mut hash, b"\0");
+    }
+    format!("{prefix}-{hash:016x}")
+}
+
+fn fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn manifold_owned_shortcut(shortcut: &str) -> bool {
+    let normalized = shortcut
+        .split_whitespace()
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .replace('-', "+");
+    matches!(
+        normalized.as_str(),
+        "ctrl+b"
+            | "control+b"
+            | "w"
+            | "ctrl+j"
+            | "control+j"
+            | "ctrl+k"
+            | "control+k"
+            | "ctrl+g"
+            | "control+g"
+            | "ctrl+enter"
+            | "control+enter"
+            | "ctrl+return"
+            | "control+return"
+            | "ctrl+1"
+            | "control+1"
+            | "ctrl+2"
+            | "control+2"
+            | "ctrl+3"
+            | "control+3"
+            | "ctrl+4"
+            | "control+4"
+            | "ctrl+5"
+            | "control+5"
+            | "ctrl+o"
+            | "control+o"
+            | "ctrl+n"
+            | "control+n"
+            | "ctrl+q"
+            | "control+q"
+            | "ctrl+f"
+            | "control+f"
+            | "ctrl+l"
+            | "control+l"
+            | "ctrl+h"
+            | "control+h"
+            | "ctrl+d"
+            | "control+d"
+            | "ctrl+p"
+            | "control+p"
+            | "alt+space"
+    )
+}
+
+fn wait_for_dbus_info(path: &std::path::Path) -> Result<(String, u32)> {
+    let start = Instant::now();
+    loop {
+        if let Ok(contents) = fs::read_to_string(path)
+            && let Some(info) = parse_dbus_info(&contents)
+        {
+            return Ok(info);
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            anyhow::bail!(
+                "timed out waiting for DBus daemon info at {}",
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn parse_dbus_info(contents: &str) -> Option<(String, u32)> {
+    let mut lines = contents.lines();
+    let address = lines.next()?.trim();
+    if address.is_empty() {
+        return None;
+    }
+    let daemon_pid = lines.next()?.trim().parse().ok()?;
+    Some((address.to_string(), daemon_pid))
 }
 
 #[derive(Default)]

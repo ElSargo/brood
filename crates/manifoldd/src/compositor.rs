@@ -92,16 +92,20 @@ pub fn run(args: RunArgs) -> Result<()> {
     let control_target =
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
     control::listen(&mut event_loop, control_target.clone())?;
+    let control_dbus_address = control_target
+        .address
+        .clone()
+        .or_else(|| env::var("DBUS_SESSION_BUS_ADDRESS").ok());
     state.manifold_session = Some(control_target.session_marker());
     state.manifold_dbus_destination = Some(control_target.destination.clone());
-    state.manifold_dbus_address = control_target.address.clone();
+    state.manifold_dbus_address = control_dbus_address.clone();
 
     println!("WAYLAND_DISPLAY={}", state.socket_name.to_string_lossy());
     println!(
         "{MANIFOLDD_DBUS_DESTINATION_ENV}={}",
         control_target.destination
     );
-    if let Some(address) = control_target.address.as_deref() {
+    if let Some(address) = control_dbus_address.as_deref() {
         println!("{MANIFOLDD_DBUS_ADDRESS_ENV}={address}");
     }
 

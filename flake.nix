@@ -42,6 +42,7 @@
           };
 
           nativeLibs = with pkgs; [
+            gtk3
             libGL
             libgbm
             libinput
@@ -69,12 +70,19 @@
             go
             jq
             pkg-config
-            python3
+            (python3.withPackages (
+              ps: with ps; [
+                dbus-python
+                pygobject3
+              ]
+            ))
             ripgrep
             rustToolchain
           ];
 
           smokeTools = with pkgs; [
+            dbus
+            gobject-introspection
             glmark2
             kitty
             mesa-demos

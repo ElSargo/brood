@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     io::Write,
     path::Path,
@@ -19,7 +20,7 @@ use smithay::{
     utils::Point,
 };
 use tracing::{info, warn};
-use zbus::{fdo, proxy};
+use zbus::{fdo, message::Header, proxy};
 
 use crate::{
     CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV,
@@ -33,8 +34,18 @@ use crate::{
 };
 
 const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
+const MANAGER_OBJECT_PATH: &str = "/org/manifold/Manager";
+const EXTENSION_OBJECT_PATH: &str = "/org/manifold/Extension";
+const COMPOSITOR_OBJECT_PATH: &str = "/org/manifold/Compositor";
 const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
+const MANAGER_INTERFACE: &str = "org.manifold.Manager";
+const EXTENSION_INTERFACE: &str = "org.manifold.Extension";
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+type DbusMetadata = BTreeMap<String, String>;
+type DbusSurfaceSession = (u64, String, bool, u64);
+type DbusExtension = (String, String, String, DbusMetadata);
+type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ControlTarget {
@@ -61,36 +72,360 @@ impl ControlTarget {
 }
 
 type ControlResponse = mpsc::Sender<std::result::Result<String, String>>;
+type BoolResponse = mpsc::Sender<std::result::Result<bool, String>>;
+type U64Response = mpsc::Sender<std::result::Result<u64, String>>;
+type SessionListResponse = mpsc::Sender<std::result::Result<Vec<DbusSurfaceSession>, String>>;
+type ExtensionListResponse = mpsc::Sender<std::result::Result<Vec<DbusExtension>, String>>;
+type GrantListResponse = mpsc::Sender<std::result::Result<Vec<DbusGrant>, String>>;
 
-struct ControlRequest {
-    command: Vec<String>,
-    json: bool,
-    response: ControlResponse,
+enum DbusStateRequest {
+    ControlCommand {
+        command: Vec<String>,
+        json: bool,
+        response: ControlResponse,
+    },
+    CurrentStatus {
+        response: ControlResponse,
+    },
+    ListSurfaceSessions {
+        response: SessionListResponse,
+    },
+    ActiveSession {
+        response: U64Response,
+    },
+    ResolveSession {
+        query: String,
+        response: U64Response,
+    },
+    ActivateSurfaceSession {
+        id: u64,
+        response: BoolResponse,
+    },
+    CreateSurfaceSession {
+        name: String,
+        response: U64Response,
+    },
+    RenameSurfaceSession {
+        id: u64,
+        name: String,
+        response: BoolResponse,
+    },
+    CloseSurfaceSession {
+        id: u64,
+        response: BoolResponse,
+    },
+    ListExtensions {
+        response: ExtensionListResponse,
+    },
+    RegisterExtension {
+        role: String,
+        metadata: DbusMetadata,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    UnregisterExtension {
+        extension_id: String,
+        response: BoolResponse,
+    },
+    ListGrants {
+        extension_id: String,
+        response: GrantListResponse,
+    },
+    ReleaseGrant {
+        grant_id: String,
+        response: BoolResponse,
+    },
+    RegisterWindow {
+        extension_id: String,
+        window_identity: DbusMetadata,
+        role: String,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    RequestPlacement {
+        window_id: String,
+        placement: DbusMetadata,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    RequestPresentationMembership {
+        window_id: String,
+        membership: DbusMetadata,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    RequestShortcut {
+        extension_id: String,
+        shortcut: String,
+        scope: String,
+        label: String,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    RequestFocus {
+        window_id: String,
+        response: BoolResponse,
+    },
+    Dismiss {
+        window_id: String,
+        response: BoolResponse,
+    },
 }
 
 #[derive(Clone)]
 struct ControlDbus {
-    sender: channel::Sender<ControlRequest>,
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct ManagerDbus {
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct SessionDbus {
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct ExtensionDbus {
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct CompositorDbus {
+    sender: channel::Sender<DbusStateRequest>,
 }
 
 #[zbus::interface(name = "org.manifold.Session.Control")]
 impl ControlDbus {
     async fn command(&self, argv: Vec<String>, json: bool) -> fdo::Result<String> {
-        let (response_tx, response_rx) = mpsc::channel();
-        self.sender
-            .send(ControlRequest {
-                command: argv,
-                json,
-                response: response_tx,
-            })
-            .map_err(|_| fdo::Error::Failed("Manifold session loop is not running".to_string()))?;
-        response_rx
-            .recv_timeout(CONTROL_REPLY_TIMEOUT)
-            .map_err(|_| {
-                fdo::Error::Failed("timed out waiting for Manifold control response".to_string())
-            })?
-            .map_err(fdo::Error::Failed)
+        request_state(&self.sender, |response| DbusStateRequest::ControlCommand {
+            command: argv,
+            json,
+            response,
+        })
     }
+}
+
+#[zbus::interface(name = "org.manifold.Manager")]
+impl ManagerDbus {
+    async fn list_sessions(&self) -> fdo::Result<Vec<DbusSurfaceSession>> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ListSurfaceSessions { response }
+        })
+    }
+
+    async fn active_session(&self) -> fdo::Result<u64> {
+        request_state(&self.sender, |response| DbusStateRequest::ActiveSession {
+            response,
+        })
+    }
+
+    async fn resolve_session(&self, session: String) -> fdo::Result<u64> {
+        request_state(&self.sender, |response| DbusStateRequest::ResolveSession {
+            query: session,
+            response,
+        })
+    }
+
+    async fn list_extensions(&self) -> fdo::Result<Vec<DbusExtension>> {
+        request_state(&self.sender, |response| DbusStateRequest::ListExtensions {
+            response,
+        })
+    }
+}
+
+#[zbus::interface(name = "org.manifold.Session")]
+impl SessionDbus {
+    async fn current_status(&self) -> fdo::Result<String> {
+        request_state(&self.sender, |response| DbusStateRequest::CurrentStatus {
+            response,
+        })
+    }
+
+    async fn list_surface_sessions(&self) -> fdo::Result<Vec<DbusSurfaceSession>> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ListSurfaceSessions { response }
+        })
+    }
+
+    async fn activate_surface_session(&self, id: u64) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ActivateSurfaceSession { id, response }
+        })
+    }
+
+    async fn create_surface_session(&self, name: String) -> fdo::Result<u64> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::CreateSurfaceSession { name, response }
+        })
+    }
+
+    async fn rename_surface_session(&self, id: u64, name: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::RenameSurfaceSession { id, name, response }
+        })
+    }
+
+    async fn close_surface_session(&self, id: u64) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::CloseSurfaceSession { id, response }
+        })
+    }
+}
+
+#[zbus::interface(name = "org.manifold.Extension")]
+impl ExtensionDbus {
+    async fn register_extension(
+        &self,
+        role: String,
+        metadata: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| {
+            DbusStateRequest::RegisterExtension {
+                role,
+                metadata,
+                sender_name,
+                response,
+            }
+        })
+    }
+
+    async fn unregister_extension(&self, extension_id: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::UnregisterExtension {
+                extension_id,
+                response,
+            }
+        })
+    }
+
+    async fn list_grants(&self, extension_id: String) -> fdo::Result<Vec<DbusGrant>> {
+        request_state(&self.sender, |response| DbusStateRequest::ListGrants {
+            extension_id,
+            response,
+        })
+    }
+
+    async fn release_grant(&self, grant_id: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| DbusStateRequest::ReleaseGrant {
+            grant_id,
+            response,
+        })
+    }
+}
+
+#[zbus::interface(name = "org.manifold.Compositor")]
+impl CompositorDbus {
+    async fn register_window(
+        &self,
+        extension_id: String,
+        window_identity: DbusMetadata,
+        role: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| DbusStateRequest::RegisterWindow {
+            extension_id,
+            window_identity,
+            role,
+            sender_name,
+            response,
+        })
+    }
+
+    async fn request_placement(
+        &self,
+        window_id: String,
+        placement: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| {
+            DbusStateRequest::RequestPlacement {
+                window_id,
+                placement,
+                sender_name,
+                response,
+            }
+        })
+    }
+
+    async fn request_presentation_membership(
+        &self,
+        window_id: String,
+        membership: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| {
+            DbusStateRequest::RequestPresentationMembership {
+                window_id,
+                membership,
+                sender_name,
+                response,
+            }
+        })
+    }
+
+    async fn request_shortcut(
+        &self,
+        extension_id: String,
+        shortcut: String,
+        scope: String,
+        label: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| DbusStateRequest::RequestShortcut {
+            extension_id,
+            shortcut,
+            scope,
+            label,
+            sender_name,
+            response,
+        })
+    }
+
+    async fn request_focus(&self, window_id: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| DbusStateRequest::RequestFocus {
+            window_id,
+            response,
+        })
+    }
+
+    async fn dismiss(&self, window_id: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| DbusStateRequest::Dismiss {
+            window_id,
+            response,
+        })
+    }
+}
+
+fn request_state<T>(
+    sender: &channel::Sender<DbusStateRequest>,
+    build: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> DbusStateRequest,
+) -> fdo::Result<T> {
+    let (response_tx, response_rx) = mpsc::channel();
+    sender
+        .send(build(response_tx))
+        .map_err(|_| fdo::Error::Failed("Manifold session loop is not running".to_string()))?;
+    response_rx
+        .recv_timeout(CONTROL_REPLY_TIMEOUT)
+        .map_err(|_| {
+            fdo::Error::Failed("timed out waiting for Manifold control response".to_string())
+        })?
+        .map_err(fdo::Error::Failed)
+}
+
+fn header_sender(header: &Header<'_>) -> String {
+    header
+        .sender()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[proxy(
@@ -101,20 +436,79 @@ trait ManifoldControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
 }
 
+#[proxy(
+    interface = "org.manifold.Manager",
+    default_path = "/org/manifold/Manager"
+)]
+trait ManifoldManager {
+    fn list_sessions(&self) -> zbus::Result<Vec<DbusSurfaceSession>>;
+    fn active_session(&self) -> zbus::Result<u64>;
+    fn resolve_session(&self, session: String) -> zbus::Result<u64>;
+    fn list_extensions(&self) -> zbus::Result<Vec<DbusExtension>>;
+}
+
+#[proxy(
+    interface = "org.manifold.Session",
+    default_path = "/org/manifold/Session"
+)]
+trait ManifoldSession {
+    fn current_status(&self) -> zbus::Result<String>;
+    fn list_surface_sessions(&self) -> zbus::Result<Vec<DbusSurfaceSession>>;
+    fn activate_surface_session(&self, id: u64) -> zbus::Result<bool>;
+    fn create_surface_session(&self, name: String) -> zbus::Result<u64>;
+    fn rename_surface_session(&self, id: u64, name: String) -> zbus::Result<bool>;
+    fn close_surface_session(&self, id: u64) -> zbus::Result<bool>;
+}
+
+#[proxy(
+    interface = "org.manifold.Extension",
+    default_path = "/org/manifold/Extension"
+)]
+trait ManifoldExtension {
+    fn register_extension(&self, role: String, metadata: DbusMetadata) -> zbus::Result<String>;
+    fn unregister_extension(&self, extension_id: String) -> zbus::Result<bool>;
+    fn list_grants(&self, extension_id: String) -> zbus::Result<Vec<DbusGrant>>;
+    fn release_grant(&self, grant_id: String) -> zbus::Result<bool>;
+}
+
+#[proxy(
+    interface = "org.manifold.Compositor",
+    default_path = "/org/manifold/Compositor"
+)]
+trait ManifoldCompositor {
+    fn register_window(
+        &self,
+        extension_id: String,
+        window_identity: DbusMetadata,
+        role: String,
+    ) -> zbus::Result<String>;
+    fn request_placement(&self, window_id: String, placement: DbusMetadata)
+    -> zbus::Result<String>;
+    fn request_presentation_membership(
+        &self,
+        window_id: String,
+        membership: DbusMetadata,
+    ) -> zbus::Result<String>;
+    fn request_shortcut(
+        &self,
+        extension_id: String,
+        shortcut: String,
+        scope: String,
+        label: String,
+    ) -> zbus::Result<String>;
+    fn request_focus(&self, window_id: String) -> zbus::Result<bool>;
+    fn dismiss(&self, window_id: String) -> zbus::Result<bool>;
+}
+
 pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarget) -> Result<()> {
-    let (sender, receiver) = channel::channel::<ControlRequest>();
+    let (sender, receiver) = channel::channel::<DbusStateRequest>();
     event_loop
         .handle()
         .insert_source(receiver, |event, _, state| {
             let Event::Msg(request) = event else {
                 return;
             };
-            let response = execute_dbus_request(request.command, request.json, state)
-                .map_err(|err| err.to_string());
-            if response.is_err() {
-                warn!(?response, "control command failed");
-            }
-            let _ = request.response.send(response);
+            execute_state_request(request, state);
         })
         .map_err(|err| anyhow::anyhow!("insert DBus control request channel: {err:?}"))?;
 
@@ -130,6 +524,9 @@ pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarg
 
 pub fn send(args: CtlArgs) -> Result<()> {
     let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    if !args.json && handle_typed_ctl_command(&target, &args.command)? {
+        return Ok(());
+    }
     let response = request_dbus_command(&target, &args.command, args.json)?;
     print!("{response}");
     Ok(())
@@ -218,7 +615,7 @@ fn session_marker_value(marker: &str, key: &str) -> Option<String> {
 
 fn start_dbus_service(
     target: ControlTarget,
-    sender: channel::Sender<ControlRequest>,
+    sender: channel::Sender<DbusStateRequest>,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
     thread::Builder::new()
@@ -232,7 +629,31 @@ fn start_dbus_service(
                 };
                 let _connection = builder
                     .name(target.destination.as_str())?
-                    .serve_at(CONTROL_OBJECT_PATH, ControlDbus { sender })?
+                    .serve_at(
+                        CONTROL_OBJECT_PATH,
+                        ControlDbus {
+                            sender: sender.clone(),
+                        },
+                    )?
+                    .serve_at(
+                        CONTROL_OBJECT_PATH,
+                        SessionDbus {
+                            sender: sender.clone(),
+                        },
+                    )?
+                    .serve_at(
+                        MANAGER_OBJECT_PATH,
+                        ManagerDbus {
+                            sender: sender.clone(),
+                        },
+                    )?
+                    .serve_at(
+                        EXTENSION_OBJECT_PATH,
+                        ExtensionDbus {
+                            sender: sender.clone(),
+                        },
+                    )?
+                    .serve_at(COMPOSITOR_OBJECT_PATH, CompositorDbus { sender })?
                     .build()
                     .await?;
                 service_ready_tx.send(Ok::<(), String>(())).ok();
@@ -284,6 +705,113 @@ pub fn request_dbus_command(
     })
 }
 
+fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Result<bool> {
+    let Some((command_name, args)) = command.split_first() else {
+        return Ok(false);
+    };
+    if command_name != "extensions" {
+        return Ok(false);
+    }
+
+    match args {
+        [subcommand] if subcommand == "list" => {
+            for (id, role, sender, metadata) in request_extension_list(target)? {
+                println!(
+                    "extension id={} role={} sender={} metadata={}",
+                    id,
+                    role,
+                    sender,
+                    format_metadata(&metadata)
+                );
+            }
+        }
+        [subcommand] if subcommand == "grants" => {
+            for grant in request_grant_list(target, "")? {
+                print_grant(&grant);
+            }
+        }
+        [subcommand, extension_id] if subcommand == "grants" => {
+            for grant in request_grant_list(target, extension_id)? {
+                print_grant(&grant);
+            }
+        }
+        _ => bail!("usage: extensions list | extensions grants [extension_id]"),
+    }
+
+    Ok(true)
+}
+
+fn typed_connection(target: &ControlTarget) -> Result<zbus::blocking::Connection> {
+    match target.address.as_deref() {
+        Some(address) => zbus::blocking::connection::Builder::address(address)
+            .with_context(|| format!("parse DBus address {address}"))?
+            .build()
+            .with_context(|| format!("connect DBus address {address}")),
+        None => zbus::blocking::Connection::session().context("connect session DBus"),
+    }
+}
+
+fn request_extension_list(target: &ControlTarget) -> Result<Vec<DbusExtension>> {
+    let connection = typed_connection(target)?;
+    let proxy = ManifoldManagerProxyBlocking::builder(&connection)
+        .destination(target.destination.as_str())?
+        .path(MANAGER_OBJECT_PATH)?
+        .interface(MANAGER_INTERFACE)?
+        .build()
+        .context("build Manifold Manager DBus proxy")?;
+    proxy.list_extensions().with_context(|| {
+        format!(
+            "call Manifold Manager.ListExtensions on {}",
+            target.destination
+        )
+    })
+}
+
+fn request_grant_list(target: &ControlTarget, extension_id: &str) -> Result<Vec<DbusGrant>> {
+    let connection = typed_connection(target)?;
+    let proxy = ManifoldExtensionProxyBlocking::builder(&connection)
+        .destination(target.destination.as_str())?
+        .path(EXTENSION_OBJECT_PATH)?
+        .interface(EXTENSION_INTERFACE)?
+        .build()
+        .context("build Manifold Extension DBus proxy")?;
+    proxy
+        .list_grants(extension_id.to_string())
+        .with_context(|| {
+            format!(
+                "call Manifold Extension.ListGrants on {}",
+                target.destination
+            )
+        })
+}
+
+fn print_grant((id, extension_id, kind, sender, active, detail): &DbusGrant) {
+    println!(
+        "grant id={} extension_id={} kind={} sender={} active={} detail={}",
+        id,
+        extension_id,
+        kind,
+        sender,
+        active,
+        format_metadata(detail)
+    );
+}
+
+fn format_metadata(metadata: &DbusMetadata) -> String {
+    if metadata.is_empty() {
+        return "{}".to_string();
+    }
+    let fields = metadata
+        .iter()
+        .map(|(key, value)| format!("{key}={}", sanitize_ctl_field(value)))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", fields.join(","))
+}
+
+fn sanitize_ctl_field(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join("_")
+}
+
 pub fn execute_json_command(input: &str, state: &mut Manifold) -> Result<String> {
     let tokens = parse_command_tokens(input.trim())?;
     execute_tokens(&tokens, state)
@@ -303,6 +831,179 @@ fn execute_dbus_request(command: Vec<String>, json: bool, state: &mut Manifold) 
     }
 
     Ok(response)
+}
+
+fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
+    match request {
+        DbusStateRequest::ControlCommand {
+            command,
+            json,
+            response,
+        } => send_response(response, execute_dbus_request(command, json, state)),
+        DbusStateRequest::CurrentStatus { response } => {
+            send_response(response, status_json_string(state))
+        }
+        DbusStateRequest::ListSurfaceSessions { response } => {
+            state.refresh_window_state();
+            let sessions = dbus_surface_sessions(state.surface_session_summaries());
+            send_response(response, Ok(sessions));
+        }
+        DbusStateRequest::ActiveSession { response } => {
+            send_response(response, Ok(state.active_surface_session().raw()));
+        }
+        DbusStateRequest::ResolveSession { query, response } => {
+            let result = state
+                .resolve_surface_session(&query)
+                .map(SurfaceSessionId::raw)
+                .with_context(|| format!("unknown session {query:?}"));
+            send_response(response, result);
+        }
+        DbusStateRequest::ActivateSurfaceSession { id, response } => {
+            let changed = state.switch_to_surface_session(SurfaceSessionId::from_raw(id));
+            send_response(
+                response,
+                Ok(changed || state.active_surface_session().raw() == id),
+            );
+        }
+        DbusStateRequest::CreateSurfaceSession { name, response } => {
+            let id = state
+                .create_and_attach_named_surface_session(normalize_session_name(&name))
+                .raw();
+            send_response(response, Ok(id));
+        }
+        DbusStateRequest::RenameSurfaceSession { id, name, response } => {
+            let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), name);
+            send_response(response, Ok(changed));
+        }
+        DbusStateRequest::CloseSurfaceSession { id, response } => {
+            let changed = state.close_surface_session(SurfaceSessionId::from_raw(id));
+            send_response(response, Ok(changed));
+        }
+        DbusStateRequest::ListExtensions { response } => {
+            let extensions = state
+                .extension_summaries()
+                .into_iter()
+                .map(|extension| {
+                    (
+                        extension.id,
+                        extension.role,
+                        extension.sender,
+                        extension.metadata,
+                    )
+                })
+                .collect();
+            send_response(response, Ok(extensions));
+        }
+        DbusStateRequest::RegisterExtension {
+            role,
+            metadata,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.register_extension(role, metadata, sender_name),
+        ),
+        DbusStateRequest::UnregisterExtension {
+            extension_id,
+            response,
+        } => send_response(response, Ok(state.unregister_extension(&extension_id))),
+        DbusStateRequest::ListGrants {
+            extension_id,
+            response,
+        } => {
+            let grants = state
+                .grant_summaries(&extension_id)
+                .into_iter()
+                .map(|grant| {
+                    (
+                        grant.id,
+                        grant.extension_id,
+                        grant.kind,
+                        grant.sender,
+                        grant.active,
+                        grant.detail,
+                    )
+                })
+                .collect();
+            send_response(response, Ok(grants));
+        }
+        DbusStateRequest::ReleaseGrant { grant_id, response } => {
+            send_response(response, Ok(state.release_grant(&grant_id)));
+        }
+        DbusStateRequest::RegisterWindow {
+            extension_id,
+            window_identity,
+            role,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.register_extension_window(extension_id, window_identity, role, sender_name),
+        ),
+        DbusStateRequest::RequestPlacement {
+            window_id,
+            placement,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.request_window_placement(&window_id, placement, sender_name),
+        ),
+        DbusStateRequest::RequestPresentationMembership {
+            window_id,
+            membership,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.request_presentation_membership(&window_id, membership, sender_name),
+        ),
+        DbusStateRequest::RequestShortcut {
+            extension_id,
+            shortcut,
+            scope,
+            label,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.request_shortcut_grant(extension_id, shortcut, scope, label, sender_name),
+        ),
+        DbusStateRequest::RequestFocus {
+            window_id,
+            response,
+        } => send_response(response, state.request_extension_window_focus(&window_id)),
+        DbusStateRequest::Dismiss {
+            window_id,
+            response,
+        } => send_response(response, state.dismiss_extension_window(&window_id)),
+    }
+
+    if let Err(err) = state.display_handle.flush_clients() {
+        warn!(?err, "flush clients after DBus request failed");
+    }
+}
+
+fn send_response<T>(response: mpsc::Sender<std::result::Result<T, String>>, result: Result<T>) {
+    let response_result = result.map_err(|err| err.to_string());
+    if let Err(err) = &response_result {
+        warn!(error = %err, "DBus request failed");
+    }
+    let _ = response.send(response_result);
+}
+
+fn dbus_surface_sessions(sessions: Vec<SurfaceSessionSummary>) -> Vec<DbusSurfaceSession> {
+    sessions
+        .into_iter()
+        .map(|session| {
+            (
+                session.id,
+                session.name,
+                session.active,
+                u64::try_from(session.windows).unwrap_or(u64::MAX),
+            )
+        })
+        .collect()
 }
 
 pub fn status_json_string(state: &mut Manifold) -> Result<String> {
