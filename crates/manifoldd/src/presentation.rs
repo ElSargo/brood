@@ -17,7 +17,7 @@ use smithay::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
-            ExportMem, ImportDma, ImportEgl,
+            ExportMem, ImportDma,
             damage::OutputDamageTracker,
             element::{
                 Kind,
@@ -45,7 +45,7 @@ use crate::{
     state::{Manifold, PresentationStatus},
     winit_presenter::{
         PresenterBackend, PresenterEvent, PresenterEventSource, PresenterRuntime,
-        SharedPresenterRuntime, axis_frame,
+        SharedPresenterRuntime, WaylandEglBind, axis_frame,
     },
 };
 
@@ -76,10 +76,14 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
         state.dmabuf.shm_formats = shm_formats.len();
         state.shm_state.update_formats(shm_formats);
     }
-    match backend.renderer().bind_wl_display(&state.display_handle) {
-        Ok(()) => {
-            state.dmabuf.egl_wl_bind_status = "ok".to_string();
-            info!("EGL wl_display binding enabled");
+    match backend.bind_wl_display(&state.display_handle) {
+        Ok(WaylandEglBind::RendererDisplay) => {
+            state.dmabuf.egl_wl_bind_status = "renderer".to_string();
+            info!("EGL wl_display binding enabled through presentation renderer display");
+        }
+        Ok(WaylandEglBind::Unsupported) => {
+            state.dmabuf.egl_wl_bind_status = "unsupported".to_string();
+            info!("legacy EGL wl_display binding unavailable; continuing with linux dmabuf");
         }
         Err(err) => {
             state.dmabuf.egl_wl_bind_status = sanitize_status_value(&format!("{err:?}"));
@@ -116,6 +120,10 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         state.restore_last_interacted_surface_session();
         state.stats.record_attach_request();
     }
+    let runtime = Rc::new(RefCell::new(PresenterRuntime::new()));
+    let event_source = PresenterEventSource::new(Rc::clone(&runtime))
+        .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
+
     let mode = Mode {
         size: (1280, 800).into(),
         refresh: PRESENTATION_REFRESH_MILLIHZ,
@@ -139,7 +147,6 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
     output.set_preferred(mode);
 
     let damage_tracker = OutputDamageTracker::from_output(&output);
-    let runtime = Rc::new(RefCell::new(PresenterRuntime::new()));
     state.dmabuf.importer = Some(Rc::clone(&runtime));
     let presenter = Rc::new(PresenterHandle {
         runtime: Rc::clone(&runtime),
@@ -170,8 +177,6 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         .map_err(|err| anyhow!("insert presentation control timer: {err}"))?;
 
     let event_presenter = Rc::clone(&presenter);
-    let event_source = PresenterEventSource::new(runtime)
-        .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
     loop_handle
         .insert_source(event_source, move |event, _, state| {
             apply_pending_attach_state(&event_presenter, state);
@@ -189,7 +194,9 @@ fn handle_presenter_event(
 ) {
     match event {
         PresenterEvent::Created => {
-            apply_presenter_created(event_presenter, state);
+            if state.presentation != PresentationStatus::Attached || state.attach_requested {
+                apply_presenter_created(event_presenter, state);
+            }
         }
         PresenterEvent::CreationFailed(error) => {
             state.record_presentation_attach_failure(&error);
@@ -215,7 +222,7 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state) {
+            if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
                     backend.window().request_redraw();
                 }
@@ -226,7 +233,7 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state) {
+            if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
                     backend.window().request_redraw();
                 }
@@ -241,7 +248,7 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state) {
+            if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
                     backend.window().request_redraw();
                 }
@@ -266,7 +273,7 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state) {
+            if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
                     backend.window().request_redraw();
                 }
@@ -276,7 +283,10 @@ fn handle_presenter_event(
             if state.presentation == PresentationStatus::Detached {
                 return;
             }
-            if schedule_deferred_client_frame(&event_presenter, state) {
+            if state.active_surface_session_window_count() == 0 {
+                return;
+            }
+            if schedule_deferred_client_frame(&event_presenter, state, false) {
                 return;
             }
 
@@ -292,11 +302,33 @@ fn handle_presenter_event(
     }
 }
 
-fn schedule_deferred_client_frame(presenter: &Rc<PresenterHandle>, state: &mut Manifold) -> bool {
+pub(crate) fn request_presenter_redraw_after_client_commit(state: &mut Manifold) {
+    if state.presentation != PresentationStatus::Attached {
+        return;
+    }
+    if state.active_surface_session_window_count() == 0 {
+        return;
+    }
+    let Some(presenter) = state.presenter.as_ref().cloned() else {
+        return;
+    };
+    if state.presentation_redraw_deferred {
+        return;
+    }
+    if let Some(backend) = presenter.runtime.borrow().backend.as_ref() {
+        backend.window().request_redraw();
+    }
+}
+
+fn schedule_deferred_client_frame(
+    presenter: &Rc<PresenterHandle>,
+    state: &mut Manifold,
+    send_early_callbacks: bool,
+) -> bool {
     if state.presentation_redraw_deferred {
         return true;
     }
-    if state.active_window().is_none() {
+    if state.active_surface_session_window_count() == 0 {
         return false;
     }
 
@@ -312,9 +344,11 @@ fn schedule_deferred_client_frame(presenter: &Rc<PresenterHandle>, state: &mut M
     if deferred_for_input {
         state.stats.record_input_frame_deferred();
     }
-    let early_callbacks = send_active_client_frame_callbacks(presenter, state);
-    if early_callbacks > 0 {
-        state.presentation_skip_post_submit_frame_callbacks = true;
+    if send_early_callbacks {
+        let early_callbacks = send_active_client_frame_callbacks(presenter, state);
+        if early_callbacks > 0 {
+            state.presentation_skip_post_submit_frame_callbacks = true;
+        }
     }
     let timer_presenter = Rc::clone(presenter);
     let result =
@@ -554,9 +588,14 @@ fn send_active_client_frame_callbacks(
     state: &mut Manifold,
 ) -> u64 {
     let output = presenter.output.clone();
-    let active_window = state.active_window();
     let mut client_frame_callbacks = 0;
-    active_window.iter().for_each(|window| {
+    let windows = state
+        .space
+        .elements()
+        .filter(|window| state.window_in_active_surface_session(window))
+        .cloned()
+        .collect::<Vec<_>>();
+    windows.iter().for_each(|window| {
         window.send_frame(
             &output,
             state.start_time.elapsed(),

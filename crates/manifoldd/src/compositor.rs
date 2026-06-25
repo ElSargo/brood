@@ -252,6 +252,9 @@ fn run_nested_test_with_outer(
             &[vec!["spawn".to_string()], inner_command].concat(),
             false,
         )?;
+        if !args.inner_headless {
+            wait_for_hosted_inner_command(&inner_target, &inner_log, &mut outer_child)?;
+        }
     }
 
     println!("OK nested test ready");
@@ -555,6 +558,42 @@ fn wait_for_outer_window(
     }
 }
 
+fn wait_for_hosted_inner_command(
+    inner_target: &control::ControlTarget,
+    log_path: &Path,
+    outer_child: &mut Child,
+) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = outer_child.try_wait().context("poll outer process")? {
+            let log_tail = read_log_tail(log_path);
+            bail!("outer exited before inner command rendered: {status}\n{log_tail}");
+        }
+        if let Ok(response) =
+            control::request_dbus_command(inner_target, &[String::from("status-json")], false)
+        {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
+                let windows = json
+                    .get("windows")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let frames = json
+                    .get("frames")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if windows >= 2 && frames >= 2 {
+                    return Ok(());
+                }
+            }
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            let log_tail = read_log_tail(log_path);
+            bail!("timed out waiting for inner command to render\n{log_tail}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn shell_split(command: &str) -> Result<Vec<String>> {
     let command = command.trim();
     if command.is_empty() {
@@ -729,6 +768,7 @@ impl CompositorHandler for Manifold {
         }
 
         handle_xdg_commit(self, surface);
+        presentation::request_presenter_redraw_after_client_commit(self);
     }
 }
 

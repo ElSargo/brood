@@ -3,6 +3,7 @@ use std::{cell::RefCell, ffi::c_void, io::Error as IoError, rc::Rc, sync::Arc, t
 use calloop::{
     EventSource, Interest, PostAction, Readiness, Token, TokenFactory, generic::Generic,
 };
+use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::{
     backend::{
         SwapBuffersError,
@@ -14,7 +15,7 @@ use smithay::{
         },
         input::{Axis, AxisSource, ButtonState, KeyState, Keycode},
         renderer::{
-            Bind, RendererSuper,
+            Bind, ImportEgl, RendererSuper,
             gles::{GlesError, GlesRenderer},
         },
     },
@@ -227,7 +228,14 @@ pub(crate) struct PresenterBackend {
     frontend: Option<PresenterFrontend>,
     damage_tracking: bool,
     bind_size: Option<Size<i32, Physical>>,
+    gl_attributes: GlAttributes,
     _span: tracing::Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaylandEglBind {
+    RendererDisplay,
+    Unsupported,
 }
 
 #[derive(Debug)]
@@ -244,31 +252,23 @@ impl PresenterBackend {
         gl_attributes: GlAttributes,
         span: tracing::Span,
     ) -> Result<Self, PresenterBackendError> {
-        let _guard = span.enter();
+        let span_for_guard = span.clone();
+        let _guard = span_for_guard.enter();
         let window = Arc::new(event_loop.create_window(attributes)?);
         debug!("presentation window created");
 
-        let display = match window.display_handle().map(|handle| handle.as_raw()) {
-            Ok(RawDisplayHandle::Wayland(handle)) => unsafe {
-                EGLDisplay::new(RawWaylandDisplay(handle.display.as_ptr().cast()))?
-            },
-            Ok(RawDisplayHandle::Xlib(handle)) => {
-                let display = handle
-                    .display
-                    .ok_or(PresenterBackendError::MissingXlibDisplay)?;
-                unsafe { EGLDisplay::new(RawXlibDisplay(display.as_ptr().cast()))? }
-            }
-            _ => unsafe { EGLDisplay::new(window.clone())? },
-        };
-        let context = EGLContext::new_with_config(
-            &display,
-            gl_attributes,
-            PixelFormatRequirements::_10_bit(),
-        )
-        .or_else(|_| {
-            EGLContext::new_with_config(&display, gl_attributes, PixelFormatRequirements::_8_bit())
-        })?;
+        Self::from_window(window, gl_attributes, span)
+    }
 
+    fn from_window(
+        window: Arc<WinitWindow>,
+        gl_attributes: GlAttributes,
+        span: tracing::Span,
+    ) -> Result<Self, PresenterBackendError> {
+        let span_for_guard = span.clone();
+        let _guard = span_for_guard.enter();
+        let display = display_for_window(&window)?;
+        let context = create_egl_context(&display, gl_attributes)?;
         let (egl_surface, is_x11) = create_egl_surface(&window, &display, &context)?;
 
         let _ = context.unbind();
@@ -286,6 +286,7 @@ impl PresenterBackend {
             }),
             damage_tracking,
             bind_size: None,
+            gl_attributes,
             _span: span,
         })
     }
@@ -295,23 +296,94 @@ impl PresenterBackend {
         event_loop: &ActiveEventLoop,
         attributes: WindowAttributes,
     ) -> Result<(), PresenterBackendError> {
-        let _guard = self._span.enter();
+        let span_for_guard = self._span.clone();
+        let _guard = span_for_guard.enter();
         let window = Arc::new(event_loop.create_window(attributes)?);
         debug!("presentation window recreated");
-        let (egl_surface, is_x11) = create_egl_surface(
+        match create_egl_surface(
             &window,
             self.renderer.egl_context().display(),
             self.renderer.egl_context(),
-        )?;
-        self.frontend = Some(PresenterFrontend {
-            egl_surface,
-            window,
-            is_x11,
-        });
-        self.bind_size = None;
-        Ok(())
+        ) {
+            Ok((egl_surface, is_x11)) => {
+                self.frontend = Some(PresenterFrontend {
+                    egl_surface,
+                    window,
+                    is_x11,
+                });
+                self.bind_size = None;
+                Ok(())
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to recreate presentation EGL surface with existing display; rebuilding presenter backend"
+                );
+                if let Err(unbind_err) = self.renderer.egl_context().unbind() {
+                    warn!(
+                        ?unbind_err,
+                        "failed to unbind EGL context before rebuilding presenter backend"
+                    );
+                }
+                let rebuilt = Self::from_window(window, self.gl_attributes, self._span.clone())?;
+                *self = rebuilt;
+                Ok(())
+            }
+        }
     }
 
+    pub fn bind_wl_display(
+        &mut self,
+        display_handle: &DisplayHandle,
+    ) -> Result<WaylandEglBind, smithay::backend::egl::Error> {
+        match self.renderer.bind_wl_display(display_handle) {
+            Ok(()) => Ok(WaylandEglBind::RendererDisplay),
+            Err(smithay::backend::egl::Error::EglExtensionNotSupported(extensions)) => {
+                debug!(
+                    ?extensions,
+                    "presentation renderer EGL display cannot bind wl_display; continuing without legacy wl_drm"
+                );
+                Ok(WaylandEglBind::Unsupported)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn display_for_window(window: &Arc<WinitWindow>) -> Result<EGLDisplay, PresenterBackendError> {
+    match window.display_handle().map(|handle| handle.as_raw()) {
+        Ok(RawDisplayHandle::Wayland(handle)) => unsafe {
+            Ok(EGLDisplay::new(RawWaylandDisplay(
+                handle.display.as_ptr().cast(),
+            ))?)
+        },
+        Ok(RawDisplayHandle::Xlib(handle)) => {
+            let display = handle
+                .display
+                .ok_or(PresenterBackendError::MissingXlibDisplay)?;
+            unsafe { Ok(EGLDisplay::new(RawXlibDisplay(display.as_ptr().cast()))?) }
+        }
+        _ => unsafe { Ok(EGLDisplay::new(window.clone())?) },
+    }
+}
+
+fn create_egl_context(
+    display: &EGLDisplay,
+    gl_attributes: GlAttributes,
+) -> Result<EGLContext, PresenterBackendError> {
+    Ok(
+        EGLContext::new_with_config(display, gl_attributes, PixelFormatRequirements::_10_bit())
+            .or_else(|_| {
+                EGLContext::new_with_config(
+                    display,
+                    gl_attributes,
+                    PixelFormatRequirements::_8_bit(),
+                )
+            })?,
+    )
+}
+
+impl PresenterBackend {
     fn destroy_frontend(&mut self) {
         if let Err(err) = self.renderer.egl_context().unbind() {
             warn!(
