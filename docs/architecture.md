@@ -69,7 +69,7 @@ See [Session Environments](session-environments.md) for the planned `enter`, `sh
 ## Entered Session Data Flow
 
 1. `manifold enter` resolves or creates a session and builds an entered environment for a shell or command.
-2. The entered environment carries the session control socket and points GUI clients at the session's nested Wayland display.
+2. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
 3. Optional isolation profiles create or join session-local filesystem, network, PID/IPC, and DBus boundaries.
 4. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
 5. `manifold show` presents the entered session without changing its process, filesystem, or network state.

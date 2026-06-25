@@ -33,7 +33,7 @@ fi
 
 SITE_DIR="$TMPDIR/site"
 START_FLAG="$TMPDIR/start-scroll"
-SOCK="$TMPDIR/control.sock"
+DBUS_NAME="org.manifold.Test.p$$"
 LOG="$TMPDIR/manifoldd.log"
 HTTP_LOG="$TMPDIR/http.log"
 SAMPLES="$TMPDIR/samples.jsonl"
@@ -44,7 +44,7 @@ BROWSER_PROFILE="$TMPDIR/browser-profile"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --control-socket "$SOCK" quit >/dev/null 2>&1 || true
+    target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -222,13 +222,13 @@ exec 9>/tmp/manifold-native-scroll.lock
 flock 9
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --control-socket "$SOCK" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifoldd run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
 PID=$!
 
-wait_for_manifoldd_control "$SOCK" "$PID" "$LOG"
+wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifoldd ctl --control-socket "$SOCK" "$@"
+  target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 READY=0
@@ -266,19 +266,19 @@ fi
 
 ctl inject center-motion >/dev/null
 
-python3 - "$SOCK" "$ROOT/target/debug/manifoldd" "$SAMPLES" "$DURATION_SECONDS" <<'PY' &
+python3 - "$DBUS_NAME" "$ROOT/target/debug/manifoldd" "$SAMPLES" "$DURATION_SECONDS" <<'PY' &
 import json
 import subprocess
 import sys
 import time
 
-sock, ctl, out, duration = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+dbus_name, ctl, out, duration = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 start = time.monotonic_ns()
 last = None
 with open(out, "w", encoding="utf-8") as handle:
     while (time.monotonic_ns() - start) < duration * 1_000_000_000:
         raw = subprocess.check_output(
-            [ctl, "ctl", "--control-socket", sock, "status-json"],
+            [ctl, "ctl", "--dbus-name", dbus_name, "status-json"],
             text=True,
         )
         now = time.monotonic_ns()

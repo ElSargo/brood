@@ -17,12 +17,12 @@ host compositor
       -> dev nested client, test harness, or WASM-controlled app
 ```
 
-The stable instance owns the host-facing presentation window. The dev instance is launched through the stable control socket, so its presentation endpoint connects to the stable nested Wayland display and appears as a pane inside the stable workspace.
+The stable instance owns the host-facing presentation window. The dev instance is launched through the stable DBus control endpoint, so its presentation endpoint connects to the stable nested Wayland display and appears as a pane inside the stable workspace.
 
-Both instances expose their own control sockets:
+Both instances expose their own DBus control endpoints:
 
-- stable control socket: drives the outer workspace, captures host-visible presentation, injects input into the dev presentation window
-- dev control socket: drives the inner workspace, launches test clients, samples inner frame/input/commit status
+- stable DBus control endpoint: drives the outer workspace, captures host-visible presentation, injects input into the dev presentation window
+- dev DBus control endpoint: drives the inner workspace, launches test clients, samples inner frame/input/commit status
 
 ## Built-In CLI
 
@@ -55,7 +55,7 @@ For exact `manifoldd test nested` arguments, see `crates/manifoldd/src/main.rs`.
 When the topology is running, the outer instance can proxy control requests to the inner instance:
 
 ```sh
-manifoldd ctl --control-socket /path/to/outer.sock nested-inner status-json
+manifoldd ctl --dbus-name <outer-destination> nested-inner status-json
 ```
 
 Current limitation: headless outer mode preserves behavior and control-path testing, but it does not yet provide a composed outer framebuffer capture. That still requires either an attached outer presentation window or a future offscreen presenter.
@@ -64,14 +64,14 @@ For automated agent verification, this built-in CLI is the default path. Use it
 instead of the helper script when the test should not create an OS window in the
 current desktop session. A typical real-client behavior check starts the nested
 test topology with an inner client command and a temporary artifact directory,
-then inspects the printed control sockets, status, logs, and debug dumps:
+then inspects the printed DBus control endpoints, status, logs, and debug dumps:
 
 ```sh
 cargo run -- test nested --out-dir /tmp/manifold-test --inner-command 'weston-simple-egl -f'
 ```
 
 Use `--keep-running` only when the verification script also cleans up the
-printed inner and outer control sockets. The outer supervisor remains headless
+printed inner and outer DBus control endpoints. The outer supervisor remains headless
 unless `--outer-headful` is explicitly passed.
 
 ## Future Work
@@ -87,7 +87,7 @@ Planned work:
 
 ## Headless Runtime
 
-`manifoldd run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and control socket without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `manifoldd test` so the nesting policy can choose the right topology for the current environment.
+`manifoldd run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and DBus control endpoint without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `manifoldd test` so the nesting policy can choose the right topology for the current environment.
 
 ## Harness
 
@@ -125,7 +125,7 @@ The output directory contains:
 There are two useful input paths:
 
 - Host or stable input into the dev presentation window, validating the full outer-to-inner routing path.
-- Direct dev control-socket injection, validating the inner compositor and client path without depending on outer hit testing.
+- Direct dev DBus control endpoint injection, validating the inner compositor and client path without depending on outer hit testing.
 
 The long-term benchmark should drive both paths. The full-path benchmark proves Manifold can operate on itself. The direct inner benchmark keeps regressions easier to isolate.
 
@@ -143,7 +143,7 @@ First useful reload targets:
 Reload validation should record:
 
 - whether pane identity survived
-- whether control sockets stayed responsive
+- whether DBus control endpoints stayed responsive
 - whether frame counters continued after reload
 - whether input-to-frame and commit-to-frame telemetry stayed within budget
 - whether stale module state or failed reloads appeared in status/logs

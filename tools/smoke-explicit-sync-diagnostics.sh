@@ -23,13 +23,13 @@ exec 9>/tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-explicit-sync-smoke.XXXXXX)"
-SOCK="$TMPDIR/control.sock"
+DBUS_NAME="org.manifold.Test.p$$"
 LOG="$TMPDIR/manifoldd.log"
 INFO="$TMPDIR/wayland-info.txt"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --control-socket "$SOCK" quit >/dev/null 2>&1 || true
+    target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -37,13 +37,13 @@ cleanup() {
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --control-socket "$SOCK" >"$LOG" 2>&1 &
+  target/debug/manifoldd run --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
 PID=$!
 
-wait_for_manifoldd_control "$SOCK" "$PID" "$LOG"
+wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifoldd ctl --control-socket "$SOCK" "$@"
+  target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 field() {

@@ -143,7 +143,7 @@ pub enum WorkspaceCommand {
 }
 ```
 
-The command executor should be the only layer that calls current `manifoldd` implementation details. WASM, native controllers, control socket commands, and tests should converge on this command model as it matures.
+The command executor should be the only layer that calls current `manifoldd` implementation details. WASM, native controllers, DBus control endpoint commands, and tests should converge on this command model as it matures.
 
 ## WIT Sketch
 

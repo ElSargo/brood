@@ -20,7 +20,7 @@ can then host its own nested client. The harness records status-json samples
 from both instances for basic frame/latency analysis.
 
 Options:
-  --keep-running    leave both instances running and print control sockets
+  --keep-running    leave both instances running and print DBus destinations
   --out-dir DIR     write logs/status under DIR instead of mktemp
   --dev-client CMD  command to spawn inside the dev Manifold instance
 
@@ -78,8 +78,8 @@ else
   mkdir -p "$OUT_DIR"
 fi
 
-STABLE_SOCK="$OUT_DIR/stable.sock"
-DEV_SOCK="$OUT_DIR/dev.sock"
+STABLE_DBUS_DESTINATION="org.manifold.Dev.p$$.stable"
+DEV_DBUS_DESTINATION="org.manifold.Dev.p$$.dev"
 STABLE_LOG="$OUT_DIR/stable.log"
 DEV_LOG="$OUT_DIR/dev.log"
 STABLE_STATUS_JSONL="$OUT_DIR/stable-status.jsonl"
@@ -89,12 +89,8 @@ cleanup() {
   if [[ "$KEEP_RUNNING" == "1" ]]; then
     return
   fi
-  if [[ -S "$DEV_SOCK" ]]; then
-    target/debug/manifoldd ctl --control-socket "$DEV_SOCK" quit >/dev/null 2>&1 || true
-  fi
-  if [[ -S "$STABLE_SOCK" ]]; then
-    target/debug/manifoldd ctl --control-socket "$STABLE_SOCK" quit >/dev/null 2>&1 || true
-  fi
+  target/debug/manifoldd ctl --dbus-name "$DEV_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+  target/debug/manifoldd ctl --dbus-name "$STABLE_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
   sleep 0.4
   if [[ -n "${DEV_PID:-}" ]] && kill -0 "$DEV_PID" 2>/dev/null; then
     kill "$DEV_PID" >/dev/null 2>&1 || true
@@ -106,19 +102,19 @@ cleanup() {
 trap cleanup EXIT
 
 ctl_stable() {
-  target/debug/manifoldd ctl --control-socket "$STABLE_SOCK" "$@"
+  target/debug/manifoldd ctl --dbus-name "$STABLE_DBUS_DESTINATION" "$@"
 }
 
 ctl_dev() {
-  target/debug/manifoldd ctl --control-socket "$DEV_SOCK" "$@"
+  target/debug/manifoldd ctl --dbus-name "$DEV_DBUS_DESTINATION" "$@"
 }
 
 ctl_stable_json() {
-  target/debug/manifoldd ctl --control-socket "$STABLE_SOCK" --json "$1"
+  target/debug/manifoldd ctl --dbus-name "$STABLE_DBUS_DESTINATION" --json "$1"
 }
 
 ctl_dev_json() {
-  target/debug/manifoldd ctl --control-socket "$DEV_SOCK" --json "$1"
+  target/debug/manifoldd ctl --dbus-name "$DEV_DBUS_DESTINATION" --json "$1"
 }
 
 json_field() {
@@ -194,20 +190,20 @@ sample_statuses() {
 }
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --control-socket "$STABLE_SOCK" >"$STABLE_LOG" 2>&1 &
+  target/debug/manifoldd run --dbus-name "$STABLE_DBUS_DESTINATION" >"$STABLE_LOG" 2>&1 &
 STABLE_PID=$!
 
-wait_for_manifoldd_control "$STABLE_SOCK" "$STABLE_PID" "$STABLE_LOG"
+wait_for_manifoldd_control "$STABLE_DBUS_DESTINATION" "$STABLE_PID" "$STABLE_LOG"
 
-DEV_SPAWN_JSON="$(python - "$DEV_SOCK" "$DEV_LOG" <<'PY'
+DEV_SPAWN_JSON="$(python - "$DEV_DBUS_DESTINATION" "$DEV_LOG" <<'PY'
 import json
 import shlex
 import sys
 
-sock, log = sys.argv[1], sys.argv[2]
+destination, log = sys.argv[1], sys.argv[2]
 command = (
     "exec target/debug/manifoldd run "
-    f"--control-socket {shlex.quote(sock)} "
+    f"--dbus-name {shlex.quote(destination)} "
     f">{shlex.quote(log)} 2>&1"
 )
 print(json.dumps([
@@ -220,7 +216,7 @@ PY
 )"
 ctl_stable_json "$DEV_SPAWN_JSON" >/dev/null
 
-wait_for_manifoldd_control "$DEV_SOCK" "$STABLE_PID" "$STABLE_LOG"
+wait_for_manifoldd_control "$DEV_DBUS_DESTINATION" "$STABLE_PID" "$STABLE_LOG"
 
 STABLE_READY="$(
   wait_status_json \
@@ -252,8 +248,8 @@ sample_statuses
 
 echo "OK nested Manifold dev harness ready"
 echo "out_dir=$OUT_DIR"
-echo "stable_control=$STABLE_SOCK"
-echo "dev_control=$DEV_SOCK"
+echo "stable_dbus_destination=$STABLE_DBUS_DESTINATION"
+echo "dev_dbus_destination=$DEV_DBUS_DESTINATION"
 echo "stable_log=$STABLE_LOG"
 echo "dev_log=$DEV_LOG"
 echo "stable_status_jsonl=$STABLE_STATUS_JSONL"
@@ -268,8 +264,8 @@ if [[ "$KEEP_RUNNING" == "1" ]]; then
   echo "keep_running=1"
   echo "stable_pid=$STABLE_PID"
   echo "Stop with:"
-  echo "  target/debug/manifoldd ctl --control-socket $DEV_SOCK quit"
-  echo "  target/debug/manifoldd ctl --control-socket $STABLE_SOCK quit"
+  echo "  target/debug/manifoldd ctl --dbus-name $DEV_DBUS_DESTINATION quit"
+  echo "  target/debug/manifoldd ctl --dbus-name $STABLE_DBUS_DESTINATION quit"
   wait "$STABLE_PID"
 else
   ctl_dev quit >/dev/null || true

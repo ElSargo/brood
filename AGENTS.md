@@ -32,6 +32,6 @@ unless the task explicitly asks for a host-visible manual development harness.
 That script starts a stable Manifold presentation on the current desktop and is
 not the no-host-window behavior-test path.
 
-Do not use plain `cargo run`, `manifoldd run`, or `manifoldd run --control-socket
+Do not use plain `cargo run`, `manifoldd run`, or `manifoldd run --dbus-name
 ...` as a behavior-test entry point from an existing desktop session. `run` is
 the product/service runtime path; `test` owns test-time nesting policy.

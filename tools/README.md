@@ -22,9 +22,9 @@ Run `./tools/profile-native-scroll.sh` on a native Linux Wayland session to prof
 
 Run `./tools/smoke-manifoldd.sh` to build `manifoldd`, launch a real nested Wayland client, verify frame/commit progress, detach the presentation window without closing the nested window, reattach it, and validate dmabuf advertisement diagnostics.
 
-Run `./tools/smoke-input-forwarding.sh` to launch `weston-eventdemo`, inject pointer/key/axis events through Manifold's control socket, and assert that the nested Wayland client logs the forwarded events.
+Run `./tools/smoke-input-forwarding.sh` to launch `weston-eventdemo`, inject pointer/key/axis events through Manifold's DBus control endpoint, and assert that the nested Wayland client logs the forwarded events.
 
-Run `./tools/smoke-status-json.sh` to launch a real nested Wayland client, inject targeted pointer input, request both `status` and `status-json` over the control socket, and validate attached schema parity, visible input-to-frame telemetry, core runtime invariants, and dmabuf diagnostic invariants.
+Run `./tools/smoke-status-json.sh` to launch a real nested Wayland client, inject targeted pointer input, request both `status` and `status-json` over the DBus control endpoint, and validate attached schema parity, visible input-to-frame telemetry, core runtime invariants, and dmabuf diagnostic invariants.
 
 Run `./tools/smoke-dmabuf-diagnostics.sh` to compare Manifold's dmabuf status fields with a nested client's `WAYLAND_DEBUG` trace.
 

@@ -50,7 +50,7 @@ Native child windows are explicitly not the desired model.
 
 ## Current Prototype
 
-`manifoldd` can currently launch Chromium as a hosted Wayland managed app through the local control socket.
+`manifoldd` can currently launch Chromium as a hosted Wayland managed app through the local DBus control endpoint.
 
 For exact startup and control arguments, see:
 
@@ -61,7 +61,7 @@ If no extensions are configured, Manifold passes `--disable-extensions` for a li
 
 New browser toplevels are placed by Manifold's temporary pane allocator instead of all being mapped at the origin. The current allocator is a deterministic cascade bounded by the presentation size; it is intentionally small and will be replaced as the workspace/session model and presentation-surface behavior mature.
 
-The current browser control surface bridges to Chromium's local DevTools HTTP endpoint through Manifold's Unix control socket. This keeps browser control local and per-instance while avoiding a global remote debugging port.
+The current browser control surface bridges to Chromium's local DevTools HTTP endpoint through Manifold's DBus control endpoint. This keeps browser control local and per-instance while avoiding a global remote debugging port.
 
 `browser list-json` and `browser inspect-json` return machine-readable browser state with exact Chromium argv and redacted environment keys. `browser close`, `browser close-all`, and session `quit` terminate browser processes tracked by Manifold, so managed Chromium panes are not left behind when the session exits.
 

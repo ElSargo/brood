@@ -1,6 +1,5 @@
 use std::{
     ffi::OsString,
-    path::PathBuf,
     process::Command,
     rc::Rc,
     sync::Arc,
@@ -40,7 +39,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    MANIFOLD_SESSION_ENV,
+    MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     layout::{
         LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
@@ -161,8 +160,11 @@ pub struct Manifold {
     pub(crate) wasm_map_hook: Option<WasmMapHook>,
     pub(crate) test_harness: Option<TestHarnessRuntime>,
     pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
-    pub(crate) nested_inner_control_socket: Option<PathBuf>,
+    pub(crate) nested_inner_dbus_destination: Option<String>,
+    pub(crate) nested_inner_dbus_address: Option<String>,
     pub(crate) manifold_session: Option<String>,
+    pub(crate) manifold_dbus_destination: Option<String>,
+    pub(crate) manifold_dbus_address: Option<String>,
 }
 
 impl Manifold {
@@ -253,8 +255,11 @@ impl Manifold {
             wasm_map_hook: None,
             test_harness: None,
             test_harness_completion: None,
-            nested_inner_control_socket: None,
+            nested_inner_dbus_destination: None,
+            nested_inner_dbus_address: None,
             manifold_session: None,
+            manifold_dbus_destination: None,
+            manifold_dbus_address: None,
         }
     }
 
@@ -321,9 +326,7 @@ impl Manifold {
     pub fn spawn_hosted_app(&self, command: &OsString) -> Result<()> {
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
-        if let Some(session) = self.manifold_session.as_deref() {
-            child.env(MANIFOLD_SESSION_ENV, session);
-        }
+        self.apply_control_environment(&mut child);
         child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
@@ -346,9 +349,7 @@ impl Manifold {
 
         let mut child = Command::new(program);
         child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
-        if let Some(session) = self.manifold_session.as_deref() {
-            child.env(MANIFOLD_SESSION_ENV, session);
-        }
+        self.apply_control_environment(&mut child);
         child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
@@ -369,6 +370,18 @@ impl Manifold {
         options: BrowserLaunchOptions,
     ) -> Result<&BrowserInstanceSummary> {
         self.browsers.spawn(options, &self.socket_name)
+    }
+
+    fn apply_control_environment(&self, child: &mut Command) {
+        if let Some(session) = self.manifold_session.as_deref() {
+            child.env(MANIFOLD_SESSION_ENV, session);
+        }
+        if let Some(destination) = self.manifold_dbus_destination.as_deref() {
+            child.env(MANIFOLDD_DBUS_DESTINATION_ENV, destination);
+        }
+        if let Some(address) = self.manifold_dbus_address.as_deref() {
+            child.env(MANIFOLDD_DBUS_ADDRESS_ENV, address);
+        }
     }
 
     pub fn request_attach(&mut self) {

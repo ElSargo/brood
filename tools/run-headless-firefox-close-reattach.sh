@@ -61,12 +61,7 @@ export RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-120s}"
 
 cleanup() {
-  if [[ -S "$OUT_DIR/inner.sock" ]]; then
-    "$MANIFOLDD_BIN" ctl --control-socket "$OUT_DIR/inner.sock" quit >/dev/null 2>&1 || true
-  fi
-  if [[ -S "$OUT_DIR/outer.sock" ]]; then
-    "$MANIFOLDD_BIN" ctl --control-socket "$OUT_DIR/outer.sock" quit >/dev/null 2>&1 || true
-  fi
+  :
 }
 trap cleanup EXIT
 

@@ -21,6 +21,9 @@ use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 pub(crate) const MANIFOLD_SESSION_ENV: &str = "manifold_session";
+pub(crate) const DEFAULT_MANIFOLD_DBUS_NAME: &str = "org.manifold.Session";
+pub(crate) const MANIFOLDD_DBUS_ADDRESS_ENV: &str = "MANIFOLDD_DBUS_ADDRESS";
+pub(crate) const MANIFOLDD_DBUS_DESTINATION_ENV: &str = "MANIFOLDD_DBUS_DESTINATION";
 
 #[derive(Debug, Parser)]
 #[command(about = "Manifold session process", version)]
@@ -39,7 +42,7 @@ enum Command {
     Switch(SwitchArgs),
     /// Run built-in test workflows. Defaults to the nested topology.
     Test(TestArgs),
-    /// Send a command to a running manifoldd control socket.
+    /// Send a command to a running manifoldd DBus control endpoint.
     Ctl(CtlArgs),
 }
 
@@ -48,9 +51,12 @@ struct RunArgs {
     /// Command to launch as a hosted Wayland app inside the nested compositor.
     #[arg(short = 'c', long = "command")]
     command: Option<OsString>,
-    /// Path for the session control socket.
-    #[arg(long, default_value = "/tmp/manifoldd.sock")]
-    control_socket: PathBuf,
+    /// DBus destination name for this session control endpoint.
+    #[arg(long = "dbus-destination", alias = "dbus-name", default_value = DEFAULT_MANIFOLD_DBUS_NAME)]
+    dbus_name: String,
+    /// DBus bus address for this session control endpoint.
+    #[arg(long = "dbus-address")]
+    dbus_address: Option<String>,
     /// Start the service/runtime process without tying it to a presentation session.
     #[arg(long)]
     headless: bool,
@@ -66,12 +72,24 @@ struct RunArgs {
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     test_harness: Option<PathBuf>,
-    /// Inner control socket used by nested test supervisors.
-    #[arg(long = "nested-inner-control-socket", value_name = "PATH", hide = true)]
-    nested_inner_control_socket: Option<PathBuf>,
+    /// Inner DBus control destination used by nested test supervisors.
+    #[arg(
+        long = "nested-inner-dbus-destination",
+        alias = "nested-inner-dbus-name",
+        value_name = "NAME",
+        hide = true
+    )]
+    nested_inner_dbus_name: Option<String>,
+    /// Inner DBus bus address used by nested test supervisors.
+    #[arg(
+        long = "nested-inner-dbus-address",
+        value_name = "ADDRESS",
+        hide = true
+    )]
+    nested_inner_dbus_address: Option<String>,
     /// Project/session config file to load at startup.
     #[arg(long = "config", value_name = "PATH", default_value = "manifold.toml")]
-    config: PathBuf,
+    config: std::path::PathBuf,
     /// Start without loading modules from the config file.
     #[arg(long = "no-default-modules")]
     no_default_modules: bool,
@@ -81,13 +99,15 @@ impl Default for RunArgs {
     fn default() -> Self {
         Self {
             command: None,
-            control_socket: PathBuf::from("/tmp/manifoldd.sock"),
+            dbus_name: DEFAULT_MANIFOLD_DBUS_NAME.to_string(),
+            dbus_address: None,
             headless: false,
             browser: None,
             wasm_key_handler: None,
             wasm_map_hook: None,
             test_harness: None,
-            nested_inner_control_socket: None,
+            nested_inner_dbus_name: None,
+            nested_inner_dbus_address: None,
             config: PathBuf::from("manifold.toml"),
             no_default_modules: false,
         }
@@ -96,9 +116,12 @@ impl Default for RunArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct SwitchArgs {
-    /// Path for the session control socket.
-    #[arg(long, default_value = "/tmp/manifoldd.sock")]
-    pub(crate) control_socket: PathBuf,
+    /// DBus destination name for the session control endpoint.
+    #[arg(long = "dbus-destination", alias = "dbus-name")]
+    pub(crate) dbus_name: Option<String>,
+    /// DBus bus address for the session control endpoint.
+    #[arg(long = "dbus-address")]
+    pub(crate) dbus_address: Option<String>,
     /// Skim-compatible selector command.
     #[arg(long = "skim", default_value = "sk")]
     pub(crate) skim: OsString,
@@ -149,9 +172,12 @@ struct NestedTestArgs {
 
 #[derive(Debug, Parser)]
 struct CtlArgs {
-    /// Path for the session control socket.
-    #[arg(long, default_value = "/tmp/manifoldd.sock")]
-    control_socket: PathBuf,
+    /// DBus destination name for the session control endpoint.
+    #[arg(long = "dbus-destination", alias = "dbus-name")]
+    dbus_name: Option<String>,
+    /// DBus bus address for the session control endpoint.
+    #[arg(long = "dbus-address")]
+    dbus_address: Option<String>,
     /// Send COMMAND as a raw JSON argv array instead of parsing command-line words.
     #[arg(long)]
     json: bool,

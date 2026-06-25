@@ -13,14 +13,14 @@ fi
 cargo build -p manifoldd --offline >/dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-control-errors.XXXXXX)"
-SOCK="$TMPDIR/control.sock"
+DBUS_NAME="org.manifold.Test.p$$"
 LOG="$TMPDIR/manifoldd.log"
 CLIENT_LOG="$TMPDIR/client.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --control-socket "$SOCK" quit >/dev/null 2>&1 || true
+    target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -32,13 +32,13 @@ chmod +x "$WRAPPER"
 
 env WAYLAND_DISPLAY=manifold-missing-wayland DISPLAY= \
   RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --control-socket "$SOCK" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifoldd run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
 PID=$!
 
-wait_for_manifoldd_control "$SOCK" "$PID" "$LOG"
+wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifoldd ctl --control-socket "$SOCK" "$@"
+  target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 field() {
@@ -77,82 +77,29 @@ wait_status() {
   exit 1
 }
 
-send_raw() {
+expect_ctl_error() {
   local name="$1"
-  local payload_hex="$2"
+  shift
   local output
 
-  output="$(python3 - "$SOCK" "$payload_hex" <<'PY'
-import socket
-import sys
-
-sock_path = sys.argv[1]
-payload = bytes.fromhex(sys.argv[2])
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-    sock.connect(sock_path)
-    sock.sendall(payload)
-    sock.shutdown(socket.SHUT_WR)
-    response = sock.recv(4096)
-sys.stdout.buffer.write(response)
-PY
-)"
-  output="$(tr -d '\r' <<<"$output")"
-  [[ "$output" == ERR* ]] || {
-    echo "ERR $name expected an ERR response, got: $output" >&2
+  if output="$(target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@" 2>&1)"; then
+    echo "ERR $name expected ctl failure, got success: $output" >&2
     tail -120 "$LOG" >&2 || true
     exit 1
-  }
+  fi
   printf '%s\n' "$output"
 }
 
-send_oversized_raw() {
+expect_json_error() {
+  local name="$1"
+  local payload="$2"
   local output
 
-  output="$(python3 - "$SOCK" <<'PY'
-import socket
-import sys
-
-sock_path = sys.argv[1]
-payload = b"x" * (70 * 1024) + b"\n"
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-    sock.connect(sock_path)
-    sock.sendall(payload)
-    sock.shutdown(socket.SHUT_WR)
-    response = sock.recv(4096)
-sys.stdout.buffer.write(response)
-PY
-)"
-  output="$(tr -d '\r' <<<"$output")"
-  [[ "$output" == ERR*control\ command\ too\ long* ]] || {
-    echo "ERR oversized command expected a size-limit ERR response, got: $output" >&2
+  if output="$(target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" --json "$payload" 2>&1)"; then
+    echo "ERR $name expected JSON ctl failure, got success: $output" >&2
     tail -120 "$LOG" >&2 || true
     exit 1
-  }
-  printf '%s\n' "$output"
-}
-
-send_idle_raw() {
-  local output
-
-  output="$(python3 - "$SOCK" <<'PY'
-import socket
-import sys
-import time
-
-sock_path = sys.argv[1]
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-    sock.connect(sock_path)
-    time.sleep(0.5)
-    response = sock.recv(4096)
-sys.stdout.buffer.write(response)
-PY
-)"
-  output="$(tr -d '\r' <<<"$output")"
-  [[ "$output" == ERR*timed\ out\ reading\ control\ command* ]] || {
-    echo "ERR idle command expected a read-timeout ERR response, got: $output" >&2
-    tail -120 "$LOG" >&2 || true
-    exit 1
-  }
+  fi
   printf '%s\n' "$output"
 }
 
@@ -163,16 +110,13 @@ WINDOWS_BEFORE="$(numeric_field "$STATUS_BEFORE" windows)"
 COMMITS_BEFORE="$(numeric_field "$STATUS_BEFORE" commits)"
 INPUT_BEFORE="$(numeric_field "$STATUS_BEFORE" input_events)"
 
-EMPTY_RESPONSE="$(send_raw empty-line 0a)"
-MALFORMED_JSON_RESPONSE="$(send_raw malformed-json 5b0a)"
-BAD_JSON_TYPE_RESPONSE="$(send_raw bad-json-type 7b7d0a)"
-BAD_UTF8_RESPONSE="$(send_raw bad-utf8 ff0a)"
-UNKNOWN_RESPONSE="$(send_raw unknown-command 5b226e6f2d737563682d636f6d6d616e64225d0a)"
-SPAWN_RESPONSE="$(send_raw spawn-missing-command 5b22737061776e225d0a)"
-INJECT_RESPONSE="$(send_raw bad-inject 5b22696e6a656374222c226d6f74696f6e222c226e61222c2231225d0a)"
-ATTACH_ARGS_RESPONSE="$(send_raw attach-extra-arg 5b22617474616368222c226e6f7065225d0a)"
-OVERSIZED_RESPONSE="$(send_oversized_raw)"
-IDLE_RESPONSE="$(send_idle_raw)"
+EMPTY_RESPONSE="$(expect_json_error empty-json '')"
+MALFORMED_JSON_RESPONSE="$(expect_json_error malformed-json '[')"
+BAD_JSON_TYPE_RESPONSE="$(expect_json_error bad-json-type '{}')"
+UNKNOWN_RESPONSE="$(expect_ctl_error unknown-command no-such-command)"
+SPAWN_RESPONSE="$(expect_ctl_error spawn-missing-command spawn)"
+INJECT_RESPONSE="$(expect_ctl_error bad-inject inject motion na 1)"
+ATTACH_ARGS_RESPONSE="$(expect_ctl_error attach-extra-arg attach nope)"
 
 STATUS_AFTER="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= WINDOWS_BEFORE )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= COMMITS_BEFORE ))')"
 
@@ -199,13 +143,10 @@ echo "status_after=$STATUS_AFTER"
 echo "empty_response=$EMPTY_RESPONSE"
 echo "malformed_json_response=$MALFORMED_JSON_RESPONSE"
 echo "bad_json_type_response=$BAD_JSON_TYPE_RESPONSE"
-echo "bad_utf8_response=$BAD_UTF8_RESPONSE"
 echo "unknown_response=$UNKNOWN_RESPONSE"
 echo "spawn_response=$SPAWN_RESPONSE"
 echo "inject_response=$INJECT_RESPONSE"
 echo "attach_args_response=$ATTACH_ARGS_RESPONSE"
-echo "oversized_response=$OVERSIZED_RESPONSE"
-echo "idle_response=$IDLE_RESPONSE"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 

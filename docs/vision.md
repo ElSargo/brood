@@ -14,7 +14,7 @@ Sessions should also become enterable development environments. A developer or a
 - Render with native smoothness: high-refresh compositing, smooth scrolling, animations, and low input latency.
 - Treat browser and Wayland surfaces as first-class composited surfaces, not native child windows.
 - Allow built-in and user apps to run outside the core binary, preferably as sandboxed WASM modules using host capabilities.
-- Make `manifold enter` the path for shells, agents, and commands to inherit a session context, including the control socket and GUI launch environment.
+- Make `manifold enter` the path for shells, agents, and commands to inherit a session context, including the DBus control endpoint and GUI launch environment.
 - Let `manifold show` front or attach the session that an entered shell is already working in.
 - Support optional session isolation profiles for filesystem overlays, network namespaces, PID/IPC namespaces, and DBus proxies.
 - Make parallel agents practical by giving each agent a coherent session capsule with its own panes, ports, DBus scope, filesystem writes, logs, and change export path.

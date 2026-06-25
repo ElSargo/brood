@@ -1,9 +1,10 @@
 use std::{
-    fs,
-    io::{ErrorKind, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    env,
+    io::Write,
     path::Path,
     process::{Command as ProcessCommand, Stdio},
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 
@@ -11,13 +12,18 @@ use anyhow::{Context, Result, bail, ensure};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState},
     input::pointer::AxisFrame,
-    reexports::calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
+    reexports::calloop::{
+        EventLoop,
+        channel::{self, Event},
+    },
     utils::Point,
 };
 use tracing::{info, warn};
+use zbus::{fdo, proxy};
 
 use crate::{
-    CtlArgs, SwitchArgs, browser,
+    CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV,
+    MANIFOLDD_DBUS_DESTINATION_ENV, SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
@@ -26,57 +32,112 @@ use crate::{
     },
 };
 
-const MAX_CONTROL_COMMAND_BYTES: usize = 64 * 1024;
-const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
+const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("remove stale socket {}", path.display()))?;
+#[derive(Clone, Debug)]
+pub(crate) struct ControlTarget {
+    pub(crate) destination: String,
+    pub(crate) address: Option<String>,
+}
+
+impl ControlTarget {
+    pub(crate) fn new(destination: String, address: Option<String>) -> Self {
+        Self {
+            destination,
+            address,
+        }
     }
 
-    let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
-    listener
-        .set_nonblocking(true)
-        .context("set control socket nonblocking")?;
+    pub(crate) fn session_marker(&self) -> String {
+        let mut marker = format!("dbus-destination={}", self.destination);
+        if let Some(address) = self.address.as_deref() {
+            marker.push_str(" dbus-address=");
+            marker.push_str(address);
+        }
+        marker
+    }
+}
 
+type ControlResponse = mpsc::Sender<std::result::Result<String, String>>;
+
+struct ControlRequest {
+    command: Vec<String>,
+    json: bool,
+    response: ControlResponse,
+}
+
+#[derive(Clone)]
+struct ControlDbus {
+    sender: channel::Sender<ControlRequest>,
+}
+
+#[zbus::interface(name = "org.manifold.Session.Control")]
+impl ControlDbus {
+    async fn command(&self, argv: Vec<String>, json: bool) -> fdo::Result<String> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.sender
+            .send(ControlRequest {
+                command: argv,
+                json,
+                response: response_tx,
+            })
+            .map_err(|_| fdo::Error::Failed("Manifold session loop is not running".to_string()))?;
+        response_rx
+            .recv_timeout(CONTROL_REPLY_TIMEOUT)
+            .map_err(|_| {
+                fdo::Error::Failed("timed out waiting for Manifold control response".to_string())
+            })?
+            .map_err(fdo::Error::Failed)
+    }
+}
+
+#[proxy(
+    interface = "org.manifold.Session.Control",
+    default_path = "/org/manifold/Session"
+)]
+trait ManifoldControl {
+    fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
+}
+
+pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarget) -> Result<()> {
+    let (sender, receiver) = channel::channel::<ControlRequest>();
     event_loop
         .handle()
-        .insert_source(
-            Generic::new(listener, Interest::READ, Mode::Level),
-            |_, listener, state| {
-                loop {
-                    let accepted = listener.accept();
-                    let Ok((mut stream, _addr)) = accepted else {
-                        break;
-                    };
-                    if let Err(err) = stream.set_read_timeout(Some(CONTROL_STREAM_TIMEOUT)) {
-                        warn!(?err, "failed to set control stream read timeout");
-                    }
-                    if let Err(err) = stream.set_write_timeout(Some(CONTROL_STREAM_TIMEOUT)) {
-                        warn!(?err, "failed to set control stream write timeout");
-                    }
-                    if let Err(err) = handle_stream(&mut stream, state) {
-                        warn!(?err, "control command failed");
-                        let _ = writeln!(stream, "ERR {err}");
-                    }
-                }
-                Ok(PostAction::Continue)
-            },
-        )
-        .context("insert control listener")?;
+        .insert_source(receiver, |event, _, state| {
+            let Event::Msg(request) = event else {
+                return;
+            };
+            let response = execute_dbus_request(request.command, request.json, state)
+                .map_err(|err| err.to_string());
+            if response.is_err() {
+                warn!(?response, "control command failed");
+            }
+            let _ = request.response.send(response);
+        })
+        .map_err(|err| anyhow::anyhow!("insert DBus control request channel: {err:?}"))?;
 
-    info!(path = %path.display(), "control socket listening");
+    start_dbus_service(target.clone(), sender)?;
+
+    info!(
+        dbus_destination = %target.destination,
+        dbus_address = ?target.address,
+        "DBus control service listening"
+    );
     Ok(())
 }
 
 pub fn send(args: CtlArgs) -> Result<()> {
-    let response = request_socket_command(&args.control_socket, &args.command, args.json)?;
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let response = request_dbus_command(&target, &args.command, args.json)?;
     print!("{response}");
     Ok(())
 }
 
 pub fn switch(args: SwitchArgs) -> Result<()> {
-    let list = request_surface_session_list(&args.control_socket)?;
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let list = request_surface_session_list(&target)?;
     ensure!(!list.sessions.is_empty(), "no open sessions");
     let initial_query = joined_name(&args.query);
 
@@ -93,8 +154,8 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
 
     match outcome {
         SessionSwitchOutcome::Existing(selected) => {
-            let response = request_socket_command(
-                &args.control_socket,
+            let response = request_dbus_command(
+                &target,
                 &[
                     "surface-session".to_string(),
                     "switch".to_string(),
@@ -105,8 +166,8 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
             ensure_ok_response(&response)?;
         }
         SessionSwitchOutcome::Create(name) => {
-            let response = request_socket_command(
-                &args.control_socket,
+            let response = request_dbus_command(
+                &target,
                 &["surface-session".to_string(), "new".to_string(), name],
                 false,
             )?;
@@ -115,35 +176,112 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
     }
 
     if list.presentation == "Detached" {
-        let response =
-            request_socket_command(&args.control_socket, &["attach".to_string()], false)?;
+        let response = request_dbus_command(&target, &["attach".to_string()], false)?;
         ensure_ok_response(&response)?;
     }
 
     Ok(())
 }
 
-pub fn request_socket_command(
-    control_socket: &Path,
+pub(crate) fn resolve_control_target(
+    destination: Option<String>,
+    address: Option<String>,
+) -> ControlTarget {
+    let marker = env::var(MANIFOLD_SESSION_ENV).ok();
+    let destination = destination
+        .or_else(|| env::var(MANIFOLDD_DBUS_DESTINATION_ENV).ok())
+        .or_else(|| {
+            marker
+                .as_deref()
+                .and_then(|value| session_marker_value(value, "dbus-destination"))
+        })
+        .unwrap_or_else(|| DEFAULT_MANIFOLD_DBUS_NAME.to_string());
+    let address = address
+        .or_else(|| env::var(MANIFOLDD_DBUS_ADDRESS_ENV).ok())
+        .or_else(|| {
+            marker
+                .as_deref()
+                .and_then(|value| session_marker_value(value, "dbus-address"))
+        });
+    ControlTarget::new(destination, address)
+}
+
+fn session_marker_value(marker: &str, key: &str) -> Option<String> {
+    marker.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix(key)
+            .and_then(|value| value.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn start_dbus_service(
+    target: ControlTarget,
+    sender: channel::Sender<ControlRequest>,
+) -> Result<()> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("manifold-dbus-control".to_string())
+        .spawn(move || {
+            let service_ready_tx = ready_tx.clone();
+            let result = zbus::block_on(async move {
+                let builder = match target.address.as_deref() {
+                    Some(address) => zbus::connection::Builder::address(address)?,
+                    None => zbus::connection::Builder::session()?,
+                };
+                let _connection = builder
+                    .name(target.destination.as_str())?
+                    .serve_at(CONTROL_OBJECT_PATH, ControlDbus { sender })?
+                    .build()
+                    .await?;
+                service_ready_tx.send(Ok::<(), String>(())).ok();
+                std::future::pending::<zbus::Result<()>>().await
+            });
+            let message = match result {
+                Ok(()) => "DBus control service exited".to_string(),
+                Err(err) => err.to_string(),
+            };
+            ready_tx.send(Err(message)).ok();
+        })
+        .context("spawn DBus control service thread")?;
+
+    ready_rx
+        .recv_timeout(CONTROL_REPLY_TIMEOUT)
+        .context("DBus control service did not report readiness")?
+        .map_err(anyhow::Error::msg)
+}
+
+pub fn request_dbus_command(
+    target: &ControlTarget,
     command: &[String],
     json: bool,
 ) -> Result<String> {
-    let mut stream = UnixStream::connect(control_socket)
-        .with_context(|| format!("connect {}", control_socket.display()))?;
-    let encoded = if json {
-        command.join(" ")
-    } else {
-        serde_json::to_string(command).context("encode control command")?
-    };
     if json {
+        let encoded = command.join(" ");
         let _: Vec<String> =
             serde_json::from_str(&encoded).context("validate JSON control argv")?;
     }
-    writeln!(stream, "{encoded}")?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
+    let connection = match target.address.as_deref() {
+        Some(address) => zbus::blocking::connection::Builder::address(address)
+            .with_context(|| format!("parse DBus address {address}"))?
+            .build()
+            .with_context(|| format!("connect DBus address {address}"))?,
+        None => zbus::blocking::Connection::session().context("connect session DBus")?,
+    };
+    let proxy = ManifoldControlProxyBlocking::builder(&connection)
+        .destination(target.destination.as_str())?
+        .path(CONTROL_OBJECT_PATH)?
+        .interface(CONTROL_INTERFACE)?
+        .build()
+        .context("build Manifold DBus control proxy")?;
+    proxy.command(command.to_vec(), json).with_context(|| {
+        format!(
+            "call Manifold DBus control command on {}",
+            target.destination
+        )
+    })
 }
 
 pub fn execute_json_command(input: &str, state: &mut Manifold) -> Result<String> {
@@ -151,21 +289,25 @@ pub fn execute_json_command(input: &str, state: &mut Manifold) -> Result<String>
     execute_tokens(&tokens, state)
 }
 
-pub fn status_json_string(state: &mut Manifold) -> Result<String> {
-    let snapshot = StatusSnapshot::from_state(state);
-    serde_json::to_string(&snapshot.to_json()).context("serialize status snapshot")
-}
-
-fn handle_stream(stream: &mut UnixStream, state: &mut Manifold) -> Result<()> {
-    let input = read_command_line(stream)?;
-    let response = execute_json_command(&input, state)?;
-    write!(stream, "{response}")?;
+fn execute_dbus_request(command: Vec<String>, json: bool, state: &mut Manifold) -> Result<String> {
+    let tokens = if json {
+        let encoded = command.join(" ");
+        parse_command_tokens(encoded.trim())?
+    } else {
+        command
+    };
+    let response = execute_tokens(&tokens, state)?;
 
     if let Err(err) = state.display_handle.flush_clients() {
         warn!(?err, "flush clients after control command failed");
     }
 
-    Ok(())
+    Ok(response)
+}
+
+pub fn status_json_string(state: &mut Manifold) -> Result<String> {
+    let snapshot = StatusSnapshot::from_state(state);
+    serde_json::to_string(&snapshot.to_json()).context("serialize status snapshot")
 }
 
 fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
@@ -374,14 +516,15 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             _ => bail!("usage: harness signal <name>"),
         },
         "nested-inner" => {
-            let socket = state
-                .nested_inner_control_socket
+            let destination = state
+                .nested_inner_dbus_destination
                 .clone()
-                .context("nested inner control socket not configured")?;
+                .context("nested inner DBus destination not configured")?;
             if args.is_empty() {
                 bail!("usage: nested-inner <command...>");
             }
-            request_socket_command(&socket, args, false)?
+            let target = ControlTarget::new(destination, state.nested_inner_dbus_address.clone());
+            request_dbus_command(&target, args, false)?
         }
         "debug" => match args {
             [subcommand, dir] if subcommand == "dump" => {
@@ -850,29 +993,6 @@ fn parse_key_state(value: &str) -> Result<KeyState> {
     }
 }
 
-fn read_command_line(stream: &mut UnixStream) -> Result<String> {
-    let mut bytes = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        let read = match stream.read(&mut byte) {
-            Ok(read) => read,
-            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                bail!("timed out reading control command");
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if read == 0 || byte[0] == b'\n' {
-            break;
-        }
-        if bytes.len() >= MAX_CONTROL_COMMAND_BYTES {
-            bail!("control command too long");
-        }
-        bytes.push(byte[0]);
-    }
-
-    String::from_utf8(bytes).context("control command must be utf-8")
-}
-
 fn parse_command_tokens(input: &str) -> Result<Vec<String>> {
     if input.starts_with('[') {
         let tokens: Vec<String> =
@@ -907,9 +1027,9 @@ impl SurfaceSessionList {
     }
 }
 
-fn request_surface_session_list(control_socket: &Path) -> Result<SurfaceSessionList> {
-    let response = request_socket_command(
-        control_socket,
+fn request_surface_session_list(target: &ControlTarget) -> Result<SurfaceSessionList> {
+    let response = request_dbus_command(
+        target,
         &["surface-session".to_string(), "list-json".to_string()],
         false,
     )?;

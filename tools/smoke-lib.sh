@@ -83,24 +83,23 @@ require_host_presentation_environment() {
 }
 
 wait_for_manifoldd_control() {
-  local sock="$1"
+  local dbus_name="$1"
   local pid="$2"
   local log="$3"
 
   for _ in $(seq 1 120); do
     if ! kill -0 "$pid" 2>/dev/null; then
-      echo "ERR manifoldd exited before control socket became responsive" >&2
+      echo "ERR manifoldd exited before DBus control became responsive" >&2
       tail -120 "$log" >&2 || true
       return 1
     fi
-    if [[ -S "$sock" ]] &&
-      target/debug/manifoldd ctl --control-socket "$sock" status >/dev/null 2>&1; then
+    if target/debug/manifoldd ctl --dbus-name "$dbus_name" status >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.1
   done
 
-  echo "ERR control socket did not become responsive" >&2
+  echo "ERR DBus control did not become responsive" >&2
   tail -120 "$log" >&2 || true
   return 1
 }

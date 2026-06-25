@@ -28,7 +28,7 @@ start an interactive shell or a requested command inside that context.
 The entered environment should provide:
 
 - the Manifold session id and optional display name
-- the session control socket
+- the session DBus control endpoint
 - the nested Wayland display used by GUI apps in that session
 - the session cwd and inherited environment
 - the session DBus address when DBus isolation is enabled
@@ -56,7 +56,7 @@ internal marker while the public contract is developed.
 Expected public values:
 
 - session identity
-- session control socket
+- session DBus control endpoint
 - presentation or surface identity when relevant
 - session Wayland display
 - session DBus address

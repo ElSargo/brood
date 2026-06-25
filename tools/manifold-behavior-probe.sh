@@ -6,7 +6,7 @@ cd "$ROOT"
 
 DURATION_SECONDS="${MANIFOLD_PROBE_DURATION_SECONDS:-10}"
 SAMPLE_INTERVAL_SECONDS="${MANIFOLD_PROBE_SAMPLE_INTERVAL_SECONDS:-0.05}"
-CONTROL_SOCKET="${MANIFOLD_PROBE_CONTROL_SOCKET:-}"
+DBUS_DESTINATION="${MANIFOLD_PROBE_DBUS_DESTINATION:-}"
 OUTPUT_DIR="${MANIFOLD_PROBE_OUTPUT_DIR:-}"
 CLIENT_LOG="${MANIFOLD_PROBE_CLIENT_LOG:-}"
 WAYLAND_TRACE="${MANIFOLD_PROBE_WAYLAND_TRACE:-}"
@@ -27,7 +27,7 @@ Environment overrides:
   MANIFOLD_PROBE_DURATION_SECONDS
   MANIFOLD_PROBE_SAMPLE_INTERVAL_SECONDS
   MANIFOLD_PROBE_OUTPUT_DIR
-  MANIFOLD_PROBE_CONTROL_SOCKET
+  MANIFOLD_PROBE_DBUS_DESTINATION
   MANIFOLD_PROBE_CLIENT_LOG
   MANIFOLD_PROBE_WAYLAND_TRACE
   MANIFOLD_PROBE_MANIFOLDD_LOG
@@ -88,7 +88,7 @@ if [[ -z "$OUTPUT_DIR" ]]; then
 else
   mkdir -p "$OUTPUT_DIR"
 fi
-CONTROL_SOCKET="${CONTROL_SOCKET:-$OUTPUT_DIR/control.sock}"
+DBUS_DESTINATION="${DBUS_DESTINATION:-org.manifold.Probe.p$$}"
 CLIENT_LOG="${CLIENT_LOG:-$OUTPUT_DIR/client.log}"
 WAYLAND_TRACE="${WAYLAND_TRACE:-$OUTPUT_DIR/client-wayland.log}"
 MANIFOLDD_LOG="${MANIFOLDD_LOG:-$OUTPUT_DIR/manifoldd.log}"
@@ -114,7 +114,7 @@ chmod +x "$WRAPPER"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --control-socket "$CONTROL_SOCKET" quit >/dev/null 2>&1 || true
+    target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
     sleep 0.2
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -122,12 +122,14 @@ cleanup() {
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --control-socket "$CONTROL_SOCKET" -c "$WRAPPER" \
+  target/debug/manifoldd run --dbus-name "$DBUS_DESTINATION" -c "$WRAPPER" \
   >"$MANIFOLDD_LOG" 2>&1 &
 PID=$!
 
 for _ in $(seq 1 100); do
-  [[ -S "$CONTROL_SOCKET" ]] && break
+  if target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" status >/dev/null 2>&1; then
+    break
+  fi
   kill -0 "$PID" 2>/dev/null || {
     sed -n '1,200p' "$MANIFOLDD_LOG" >&2 || true
     sed -n '1,200p' "$CLIENT_LOG" >&2 || true
@@ -166,12 +168,12 @@ PY
 }
 
 emit_event "probe_started" "$(
-  python3 - "$OUTPUT_DIR" "$CONTROL_SOCKET" "$MANIFOLDD_LOG" "$CLIENT_LOG" "$WAYLAND_TRACE" "${CLIENT[@]}" <<'PY'
+  python3 - "$OUTPUT_DIR" "$DBUS_DESTINATION" "$MANIFOLDD_LOG" "$CLIENT_LOG" "$WAYLAND_TRACE" "${CLIENT[@]}" <<'PY'
 import json
 import sys
 print(json.dumps({
     "output_dir": sys.argv[1],
-    "control_socket": sys.argv[2],
+    "dbus_destination": sys.argv[2],
     "manifoldd_log": sys.argv[3],
     "client_log": sys.argv[4],
     "wayland_trace": sys.argv[5],
@@ -230,7 +232,7 @@ while true; do
     break
   fi
 
-  STATUS="$(target/debug/manifoldd ctl --control-socket "$CONTROL_SOCKET" status-json)"
+  STATUS="$(target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" status-json)"
   SAMPLE_NS="$(date +%s%N)"
   SAMPLE_DELTA_US="$(((SAMPLE_NS - LAST_SAMPLE_NS) / 1000))"
   python3 - "$STATUS" "$LAST_STATUS" "$SAMPLE_DELTA_US" <<'PY' | while IFS= read -r event_line; do
@@ -350,6 +352,6 @@ print(json.dumps({"final_status": status}))
 PY
 )"
 
-target/debug/manifoldd ctl --control-socket "$CONTROL_SOCKET" quit >/dev/null || true
+target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null || true
 wait "$PID" || true
 trap - EXIT

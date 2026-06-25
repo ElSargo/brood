@@ -13,7 +13,7 @@ The lanes should share the same workspace command and event model, but they shou
 
 ## Current Runtime Boundary
 
-The current `manifoldd` prototype is built around Smithay and calloop. The calloop event loop owns Wayland dispatch, input routing, timers, control socket handling, presentation attach/detach, and authoritative `Manifold` state.
+The current `manifoldd` prototype is built around Smithay and calloop. The calloop event loop owns Wayland dispatch, input routing, timers, DBus control endpoint handling, presentation attach/detach, and authoritative `Manifold` state.
 
 That loop should remain the session process authority. Async plugin work can live in a separate runtime, likely Tokio-backed, connected to the calloop thread by bounded channels. Returned command requests must re-enter the calloop/session thread before mutating workspace state.
 

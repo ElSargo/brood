@@ -47,7 +47,7 @@ Expected behavior:
 - Session-aware commands infer their target from the entered environment unless explicitly overridden.
 - `manifold show` fronts, attaches, or switches presentation to the entered session without changing the shell environment.
 - A thin control alias such as `mdctl` may exist, but it should use the same command semantics and default target as Manifold control commands.
-- Entered shells should make the active control socket, session id, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
+- Entered shells should make the active DBus control endpoint, session id, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
 - Entering a session should not by itself require filesystem, network, or PID isolation; those are profiles layered on top.
 
 ## Session Isolation
@@ -166,7 +166,7 @@ Manifold should be able to host a development Manifold instance inside a stable 
 Expected behavior:
 
 - A stable instance can launch a dev instance as a managed app.
-- The dev instance can expose its own control socket and nested Wayland display.
+- The dev instance can expose its own DBus control endpoint and nested Wayland display.
 - The dev instance can launch and interact with its own managed apps while presented inside the stable instance.
 - Stable and dev status streams can be sampled together for frame, input, commit, and latency analysis.
 - Host-visible captures can include the stable presentation surface with the dev presentation inside it.

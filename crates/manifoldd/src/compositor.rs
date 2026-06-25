@@ -52,7 +52,8 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    MANIFOLD_SESSION_ENV, NestedTestArgs, RunArgs, TestArgs, TestCommand,
+    MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
+    NestedTestArgs, RunArgs, TestArgs, TestCommand,
     browser::BrowserLaunchOptions,
     config, control, presentation,
     state::{ClientState, Manifold, PresentationStatus},
@@ -85,13 +86,24 @@ pub fn run(args: RunArgs) -> Result<()> {
         info!(path = %path.display(), "loaded CLI test harness");
     }
 
-    state.nested_inner_control_socket = args.nested_inner_control_socket.clone();
+    state.nested_inner_dbus_destination = args.nested_inner_dbus_name.clone();
+    state.nested_inner_dbus_address = args.nested_inner_dbus_address.clone();
 
-    control::listen(&mut event_loop, &args.control_socket)?;
-    state.manifold_session = Some(format!("control={}", args.control_socket.display()));
+    let control_target =
+        control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
+    control::listen(&mut event_loop, control_target.clone())?;
+    state.manifold_session = Some(control_target.session_marker());
+    state.manifold_dbus_destination = Some(control_target.destination.clone());
+    state.manifold_dbus_address = control_target.address.clone();
 
     println!("WAYLAND_DISPLAY={}", state.socket_name.to_string_lossy());
-    println!("MANIFOLDD_CONTROL={}", args.control_socket.display());
+    println!(
+        "{MANIFOLDD_DBUS_DESTINATION_ENV}={}",
+        control_target.destination
+    );
+    if let Some(address) = control_target.address.as_deref() {
+        println!("{MANIFOLDD_DBUS_ADDRESS_ENV}={address}");
+    }
 
     if !args.headless {
         if let Err(err) = presentation::attach(&event_loop.handle(), &mut state) {
@@ -168,8 +180,8 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
         }
     };
 
-    let outer_sock = out_dir.join("outer.sock");
-    let inner_sock = out_dir.join("inner.sock");
+    let outer_target = control::ControlTarget::new(nested_dbus_destination("outer"), None);
+    let inner_target = control::ControlTarget::new(nested_dbus_destination("inner"), None);
     let outer_log = out_dir.join("outer.log");
     let inner_log = out_dir.join("inner.log");
     let current_exe = env::current_exe().context("resolve current executable")?;
@@ -180,8 +192,8 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
             args,
             out_dir,
             current_exe,
-            outer_sock,
-            inner_sock,
+            outer_target,
+            inner_target,
             outer_log,
             inner_log,
         ),
@@ -189,7 +201,7 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
             args,
             out_dir,
             current_exe,
-            inner_sock,
+            inner_target,
             inner_log,
             inherited_session,
         ),
@@ -200,43 +212,43 @@ fn run_nested_test_with_outer(
     args: NestedTestArgs,
     out_dir: PathBuf,
     current_exe: PathBuf,
-    outer_sock: PathBuf,
-    inner_sock: PathBuf,
+    outer_target: control::ControlTarget,
+    inner_target: control::ControlTarget,
     outer_log: PathBuf,
     inner_log: PathBuf,
 ) -> Result<()> {
     let mut outer_child = spawn_outer(
         &current_exe,
-        &outer_sock,
-        &inner_sock,
+        &outer_target,
+        &inner_target,
         &outer_log,
         args.outer_headful,
         args.harness.as_deref(),
     )?;
 
     let cleanup = NestedCleanup {
-        outer_sock: outer_sock.clone(),
-        inner_sock: inner_sock.clone(),
+        outer_target: outer_target.clone(),
+        inner_target: inner_target.clone(),
     };
 
-    wait_for_control_socket(&outer_sock, &outer_log, &mut outer_child, "outer")?;
+    wait_for_control_bus(&outer_target, &outer_log, &mut outer_child, "outer")?;
     spawn_inner(
-        &outer_sock,
+        &outer_target,
         &current_exe,
-        &inner_sock,
+        &inner_target,
         &inner_log,
         args.inner_headless,
     )?;
-    wait_for_control_socket(&inner_sock, &inner_log, &mut outer_child, "inner")?;
+    wait_for_control_bus(&inner_target, &inner_log, &mut outer_child, "inner")?;
 
     if !args.inner_headless {
-        wait_for_outer_window(&outer_sock, &outer_log, &mut outer_child)?;
+        wait_for_outer_window(&outer_target, &outer_log, &mut outer_child)?;
     }
 
     if let Some(command) = args.inner_command.as_deref() {
         let inner_command = shell_split(command)?;
-        control::request_socket_command(
-            &inner_sock,
+        control::request_dbus_command(
+            &inner_target,
             &[vec!["spawn".to_string()], inner_command].concat(),
             false,
         )?;
@@ -244,8 +256,8 @@ fn run_nested_test_with_outer(
 
     println!("OK nested test ready");
     println!("out_dir={}", out_dir.display());
-    println!("outer_control={}", outer_sock.display());
-    println!("inner_control={}", inner_sock.display());
+    println!("outer_dbus_destination={}", outer_target.destination);
+    println!("inner_dbus_destination={}", inner_target.destination);
     println!("outer_log={}", outer_log.display());
     println!("inner_log={}", inner_log.display());
     println!("topology=outer-supervisor");
@@ -281,24 +293,24 @@ fn run_nested_test_in_current_session(
     args: NestedTestArgs,
     out_dir: PathBuf,
     current_exe: PathBuf,
-    subject_sock: PathBuf,
+    subject_target: control::ControlTarget,
     subject_log: PathBuf,
     inherited_session: Option<std::ffi::OsString>,
 ) -> Result<()> {
     let mut subject_child = spawn_subject(
         &current_exe,
-        &subject_sock,
+        &subject_target,
         &subject_log,
         args.inner_headless,
         args.harness.as_deref(),
     )?;
 
-    wait_for_control_socket(&subject_sock, &subject_log, &mut subject_child, "subject")?;
+    wait_for_control_bus(&subject_target, &subject_log, &mut subject_child, "subject")?;
 
     if let Some(command) = args.inner_command.as_deref() {
         let subject_command = shell_split(command)?;
-        control::request_socket_command(
-            &subject_sock,
+        control::request_dbus_command(
+            &subject_target,
             &[vec!["spawn".to_string()], subject_command].concat(),
             false,
         )?;
@@ -307,9 +319,9 @@ fn run_nested_test_in_current_session(
     println!("OK nested test ready");
     println!("out_dir={}", out_dir.display());
     println!("topology=current-session");
-    println!("subject_control={}", subject_sock.display());
+    println!("subject_dbus_destination={}", subject_target.destination);
     println!("subject_log={}", subject_log.display());
-    println!("inner_control={}", subject_sock.display());
+    println!("inner_dbus_destination={}", subject_target.destination);
     println!("inner_log={}", subject_log.display());
     println!("inner_headless={}", args.inner_headless);
     if let Some(session) = inherited_session {
@@ -337,7 +349,7 @@ fn run_nested_test_in_current_session(
         return Ok(());
     }
 
-    let _ = control::request_socket_command(&subject_sock, &[String::from("quit")], false);
+    let _ = control::request_dbus_command(&subject_target, &[String::from("quit")], false);
     let status = subject_child.wait().context("wait for subject process")?;
     if !status.success() {
         bail!("subject process exited with {status}");
@@ -365,18 +377,32 @@ fn nested_test_topology(
     }
 }
 
+fn nested_dbus_destination(label: &str) -> String {
+    format!("org.manifold.Test.p{}.{}", std::process::id(), label)
+}
+
 fn spawn_outer(
     current_exe: &Path,
-    outer_sock: &Path,
-    inner_sock: &Path,
+    outer_target: &control::ControlTarget,
+    inner_target: &control::ControlTarget,
     outer_log: &Path,
     outer_headful: bool,
     harness: Option<&Path>,
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
-    command.arg("--control-socket").arg(outer_sock);
-    command.arg("--nested-inner-control-socket").arg(inner_sock);
+    command
+        .arg("--dbus-destination")
+        .arg(&outer_target.destination);
+    if let Some(address) = outer_target.address.as_deref() {
+        command.arg("--dbus-address").arg(address);
+    }
+    command
+        .arg("--nested-inner-dbus-destination")
+        .arg(&inner_target.destination);
+    if let Some(address) = inner_target.address.as_deref() {
+        command.arg("--nested-inner-dbus-address").arg(address);
+    }
     if !outer_headful {
         command.arg("--headless");
     }
@@ -399,14 +425,19 @@ fn spawn_outer(
 
 fn spawn_subject(
     current_exe: &Path,
-    subject_sock: &Path,
+    subject_target: &control::ControlTarget,
     subject_log: &Path,
     subject_headless: bool,
     harness: Option<&Path>,
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
-    command.arg("--control-socket").arg(subject_sock);
+    command
+        .arg("--dbus-destination")
+        .arg(&subject_target.destination);
+    if let Some(address) = subject_target.address.as_deref() {
+        command.arg("--dbus-address").arg(address);
+    }
     if subject_headless {
         command.arg("--headless");
     }
@@ -429,17 +460,21 @@ fn spawn_subject(
 }
 
 fn spawn_inner(
-    outer_sock: &Path,
+    outer_target: &control::ControlTarget,
     current_exe: &Path,
-    inner_sock: &Path,
+    inner_target: &control::ControlTarget,
     inner_log: &Path,
     inner_headless: bool,
 ) -> Result<()> {
     let mut command = format!(
-        "exec {} run --control-socket {}",
+        "exec {} run --dbus-destination {}",
         shell_quote(&current_exe.display().to_string()),
-        shell_quote(&inner_sock.display().to_string()),
+        shell_quote(&inner_target.destination),
     );
+    if let Some(address) = inner_target.address.as_deref() {
+        command.push_str(" --dbus-address ");
+        command.push_str(&shell_quote(address));
+    }
     if inner_headless {
         command.push_str(" --headless");
     }
@@ -453,15 +488,15 @@ fn spawn_inner(
         "-lc".to_string(),
         command,
     ];
-    let response = control::request_socket_command(outer_sock, &inner_args, false)?;
+    let response = control::request_dbus_command(outer_target, &inner_args, false)?;
     if !response.starts_with("OK ") {
         bail!("spawn inner failed: {}", response.trim());
     }
     Ok(())
 }
 
-fn wait_for_control_socket(
-    control_socket: &Path,
+fn wait_for_control_bus(
+    target: &control::ControlTarget,
     log_path: &Path,
     outer_child: &mut Child,
     label: &str,
@@ -470,10 +505,10 @@ fn wait_for_control_socket(
     loop {
         if let Some(status) = outer_child.try_wait().context("poll outer process")? {
             let log_tail = read_log_tail(log_path);
-            bail!("{label} failed before control socket ready: {status}\n{log_tail}");
+            bail!("{label} failed before DBus control service ready: {status}\n{log_tail}");
         }
         if let Ok(response) =
-            control::request_socket_command(control_socket, &[String::from("status-json")], false)
+            control::request_dbus_command(target, &[String::from("status-json")], false)
         {
             if response.trim_start().starts_with('{') {
                 return Ok(());
@@ -481,14 +516,14 @@ fn wait_for_control_socket(
         }
         if start.elapsed() > Duration::from_secs(15) {
             let log_tail = read_log_tail(log_path);
-            bail!("timed out waiting for {label} control socket\n{log_tail}");
+            bail!("timed out waiting for {label} DBus control service\n{log_tail}");
         }
         thread::sleep(Duration::from_millis(100));
     }
 }
 
 fn wait_for_outer_window(
-    outer_sock: &Path,
+    outer_target: &control::ControlTarget,
     log_path: &Path,
     outer_child: &mut Child,
 ) -> Result<()> {
@@ -499,7 +534,7 @@ fn wait_for_outer_window(
             bail!("outer exited before inner presentation mapped: {status}\n{log_tail}");
         }
         if let Ok(response) =
-            control::request_socket_command(outer_sock, &[String::from("status-json")], false)
+            control::request_dbus_command(outer_target, &[String::from("status-json")], false)
         {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
                 if json
@@ -546,14 +581,14 @@ fn read_log_tail(path: &Path) -> String {
 }
 
 struct NestedCleanup {
-    outer_sock: PathBuf,
-    inner_sock: PathBuf,
+    outer_target: control::ControlTarget,
+    inner_target: control::ControlTarget,
 }
 
 impl NestedCleanup {
     fn stop_all(&self) {
-        let _ = control::request_socket_command(&self.inner_sock, &[String::from("quit")], false);
-        let _ = control::request_socket_command(&self.outer_sock, &[String::from("quit")], false);
+        let _ = control::request_dbus_command(&self.inner_target, &[String::from("quit")], false);
+        let _ = control::request_dbus_command(&self.outer_target, &[String::from("quit")], false);
     }
 }
 
@@ -988,7 +1023,10 @@ mod tests {
     fn nested_test_uses_current_session_with_session_marker() {
         let args = NestedTestArgs::default();
         assert_eq!(
-            nested_test_topology(&args, Some(OsStr::new("control=/tmp/manifoldd.sock"))),
+            nested_test_topology(
+                &args,
+                Some(OsStr::new("dbus-destination=org.manifold.Session"))
+            ),
             NestedTestTopology::CurrentSession
         );
     }
@@ -1000,7 +1038,10 @@ mod tests {
             ..NestedTestArgs::default()
         };
         assert_eq!(
-            nested_test_topology(&args, Some(OsStr::new("control=/tmp/manifoldd.sock"))),
+            nested_test_topology(
+                &args,
+                Some(OsStr::new("dbus-destination=org.manifold.Session"))
+            ),
             NestedTestTopology::OuterSupervisor
         );
     }

@@ -287,7 +287,7 @@ RPC can remain a later addition if real workloads prove it necessary.
 
 Linux-native development should make reload cheap.
 
-The target usability is a host-managed load, reload, inspect, and unload loop for modules and pane apps. The exact CLI or control-socket surface is intentionally not frozen here.
+The target usability is a host-managed load, reload, inspect, and unload loop for modules and pane apps. The exact CLI or DBus control endpoint surface is intentionally not frozen here.
 
 Current usability note:
 
