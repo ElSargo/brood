@@ -104,6 +104,16 @@ wait_for_active_session() {
 
 wait_for_control
 
+assert_no_spawned_session_dbus_daemon() {
+  local matches
+  matches="$(pgrep -af "dbus-daemon.*manifold-session-dbus-${MANIFOLD_PID}-" || true)"
+  if [[ -n "$matches" ]]; then
+    echo "ERR Manifold spawned a per-session dbus-daemon:" >&2
+    echo "$matches" >&2
+    exit 1
+  fi
+}
+
 SESSION_TWO="$(call /org/manifold/Session org.manifold.Session CreateSurfaceSession s dbus-other | sed -n 's/^t //p')"
 [[ -n "$SESSION_TWO" ]] || {
   echo "ERR failed to create second session" >&2
@@ -119,6 +129,13 @@ ctl spawn python3 "$ROOT/tools/dbus-session-server-gtk.py" \
   --ready-file "$SERVER_READY" \
   --click-file "$SERVER_CLICK" >/dev/null
 wait_for_file_matching "$SERVER_READY" "ready=true" "GTK DBus server registration"
+SERVER_SESSION_DBUS_ADDRESS="$(sed -n 's/^session_bus_address=//p' "$SERVER_READY")"
+[[ "$SERVER_SESSION_DBUS_ADDRESS" == unix:path=*manifold-inprocess-dbus-* ]] || {
+  echo "ERR GTK server did not receive a Manifold in-process DBus address" >&2
+  cat "$SERVER_READY" >&2
+  exit 1
+}
+assert_no_spawned_session_dbus_daemon
 
 call /org/manifold/Session org.manifold.Session ActivateSurfaceSession t "$SESSION_TWO" >/dev/null
 wait_for_active_session "$SESSION_TWO"
@@ -133,6 +150,7 @@ ctl spawn python3 "$ROOT/tools/dbus-session-client.py" \
   --service-name "$SERVICE_NAME" \
   --out-file "$CLIENT_SAME" >/dev/null
 wait_for_file_matching "$CLIENT_SAME" "has_owner=true" "same-session client hit"
+wait_for_file_matching "$CLIENT_SAME" "ping=pong" "same-session client Ping"
 
 ctl inject center-motion >/dev/null
 ctl inject button 272 pressed >/dev/null

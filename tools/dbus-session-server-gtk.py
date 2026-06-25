@@ -127,6 +127,7 @@ class SwitcherApp:
                         "ready=true",
                         f"service_name={self.args.service_name}",
                         f"pid={os.getpid()}",
+                        f"session_bus_address={os.environ.get('DBUS_SESSION_BUS_ADDRESS', '')}",
                         f"extension_id={extension_id}",
                         f"window_id={window_id}",
                         f"membership_grant={membership_grant}",

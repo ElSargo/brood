@@ -12,10 +12,16 @@ def main():
 
     bus = dbus.SessionBus()
     has_owner = bus.name_has_owner(args.service_name)
+    ping = "skipped"
+    if has_owner:
+        service = bus.get_object(args.service_name, "/org/manifold/TestSessionServer")
+        iface = dbus.Interface(service, "org.manifold.TestSessionServer")
+        ping = str(iface.Ping())
     text = "\n".join(
         [
             f"service_name={args.service_name}",
             f"has_owner={str(bool(has_owner)).lower()}",
+            f"ping={ping}",
         ]
     )
     with open(args.out_file, "w", encoding="utf-8") as handle:

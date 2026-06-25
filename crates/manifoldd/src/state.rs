@@ -1,9 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs,
-    path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -48,6 +46,7 @@ use crate::{
         LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
     },
     presentation::PresenterHandle,
+    session_bus::{SessionBusHandle, SessionBusRealm},
     wasm_key::WasmKeyHandler,
     wasm_map::{MapHookInput, MapHookOutcome, MapHookResponse, MapLayoutPatch, WasmMapHook},
     wasm_test::{
@@ -153,23 +152,6 @@ struct GrantRecord {
     active: bool,
 }
 
-struct SessionDbusBus {
-    session: SurfaceSessionId,
-    address: String,
-    daemon_pid: u32,
-    dir: PathBuf,
-}
-
-impl Drop for SessionDbusBus {
-    fn drop(&mut self) {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(self.daemon_pid.to_string())
-            .status();
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
 pub struct Manifold {
     pub start_time: Instant,
     pub socket_name: OsString,
@@ -229,7 +211,7 @@ pub struct Manifold {
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
     presentation_member_surfaces: Vec<WlSurface>,
     extension_registry: ExtensionRegistry,
-    session_dbus_buses: Vec<SessionDbusBus>,
+    session_dbus_buses: Vec<(SessionBusRealm, SessionBusHandle)>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
@@ -484,64 +466,22 @@ impl Manifold {
     }
 
     fn ensure_session_dbus_bus(&mut self, session: SurfaceSessionId) -> Result<String> {
+        let realm = SessionBusRealm::Surface(session.raw());
         if let Some(bus) = self
             .session_dbus_buses
             .iter()
-            .find(|bus| bus.session == session)
+            .find(|(bus_realm, _)| *bus_realm == realm)
         {
-            return Ok(bus.address.clone());
+            return Ok(bus.1.address().to_string());
         }
 
-        let dir = std::env::temp_dir().join(format!(
-            "manifold-session-dbus-{}-{}",
-            std::process::id(),
-            session.raw()
-        ));
-        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let config = dir.join("session.conf");
-        let bus_info = dir.join("bus.info");
-        let config_text = format!(
-            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:tmpdir={}</listen>
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow user="*"/>
-    <allow own="*"/>
-    <allow send_destination="*"/>
-    <allow receive_sender="*"/>
-  </policy>
-</busconfig>
-"#,
-            dir.display()
-        );
-        fs::write(&config, config_text).with_context(|| format!("write {}", config.display()))?;
-
-        let output = fs::File::create(&bus_info)
-            .with_context(|| format!("create {}", bus_info.display()))?;
-        let mut child = Command::new("dbus-daemon")
-            .arg(format!("--config-file={}", config.display()))
-            .arg("--fork")
-            .arg("--print-address=1")
-            .arg("--print-pid=1")
-            .stdout(Stdio::from(output))
-            .spawn()
-            .context("spawn session DBus daemon")?;
-
-        let (address, daemon_pid) = wait_for_dbus_info(&bus_info)?;
-        let _ = child.wait();
-        self.session_dbus_buses.push(SessionDbusBus {
-            session,
-            address: address.clone(),
-            daemon_pid,
-            dir,
-        });
+        let handle = SessionBusHandle::start(realm).context("start in-process session DBus bus")?;
+        let address = handle.address().to_string();
+        self.session_dbus_buses.push((realm, handle));
         info!(
             session = session.raw(),
             dbus_address = %address,
-            daemon_pid,
-            "started session-local DBus bus"
+            "started in-process session-local DBus bus"
         );
         Ok(address)
     }
@@ -2278,34 +2218,6 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
             | "control+p"
             | "alt+space"
     )
-}
-
-fn wait_for_dbus_info(path: &std::path::Path) -> Result<(String, u32)> {
-    let start = Instant::now();
-    loop {
-        if let Ok(contents) = fs::read_to_string(path)
-            && let Some(info) = parse_dbus_info(&contents)
-        {
-            return Ok(info);
-        }
-        if start.elapsed() > Duration::from_secs(5) {
-            anyhow::bail!(
-                "timed out waiting for DBus daemon info at {}",
-                path.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn parse_dbus_info(contents: &str) -> Option<(String, u32)> {
-    let mut lines = contents.lines();
-    let address = lines.next()?.trim();
-    if address.is_empty() {
-        return None;
-    }
-    let daemon_pid = lines.next()?.trim().parse().ok()?;
-    Some((address.to_string(), daemon_pid))
 }
 
 #[derive(Default)]

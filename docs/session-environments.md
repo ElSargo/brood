@@ -133,8 +133,11 @@ proven.
 
 ## DBus Isolation
 
-Each isolated session should have a session-local DBus address. That can be a
-fresh bus or a filtered proxy over selected host services.
+Each isolated session should have a Manifold-owned session-local DBus address.
+The default shape is an in-process bus/proxy realm per session. Same-session
+clients can use familiar DBus name ownership and method calls, while Manifold
+keeps the routing point in-process so traffic can be logged, bridged, or denied
+by later policy profiles.
 
 Expected behavior:
 
@@ -145,6 +148,8 @@ Expected behavior:
 - allowed host service names are explicit and auditable
 - DBus traffic that matters to agent behavior can be logged at the Manifold
   session boundary
+- selected host services can be bridged through the same in-process boundary
+  when a session policy explicitly allows them
 
 This gives GUI apps and desktop-style services a familiar communication path
 without making the global user bus ambient authority for every session.

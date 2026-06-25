@@ -7,6 +7,7 @@ mod debug_dump;
 mod input;
 mod layout;
 mod presentation;
+mod session_bus;
 mod state;
 mod wasm_key;
 mod wasm_map;

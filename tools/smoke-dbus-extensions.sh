@@ -106,6 +106,16 @@ wait_for_probe() {
   exit 1
 }
 
+assert_no_spawned_session_dbus_daemon() {
+  local matches
+  matches="$(pgrep -af "dbus-daemon.*manifold-session-dbus-${MANIFOLD_PID}-" || true)"
+  if [[ -n "$matches" ]]; then
+    echo "ERR Manifold spawned a per-session dbus-daemon:" >&2
+    echo "$matches" >&2
+    exit 1
+  fi
+}
+
 wait_for_control
 wait_for_client_window
 CLIENT_PID="$(cat "$CLIENT_PID_FILE")"
@@ -205,6 +215,12 @@ SESSION_DBUS_ADDRESS="$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' "$PROBE_ENV")"
   cat "$PROBE_ENV" >&2
   exit 1
 }
+[[ "$SESSION_DBUS_ADDRESS" == unix:path=*manifold-inprocess-dbus-* ]] || {
+  echo "ERR managed client did not receive a Manifold in-process DBus address" >&2
+  cat "$PROBE_ENV" >&2
+  exit 1
+}
+assert_no_spawned_session_dbus_daemon
 python3 - "$PROBE_STATUS" <<'PY'
 import json
 import sys
