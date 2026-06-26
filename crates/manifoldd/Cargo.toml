@@ -3,6 +3,14 @@ name = "manifoldd"
 version = "0.1.0"
 edition.workspace = true
 
+[[bin]]
+name = "manifoldd"
+path = "src/main.rs"
+
+[[bin]]
+name = "mctl"
+path = "src/bin/mctl.rs"
+
 [features]
 default = ["shm-fallback"]
 shm-fallback = []

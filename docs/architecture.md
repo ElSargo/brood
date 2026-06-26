@@ -68,12 +68,15 @@ See [Session Environments](session-environments.md) for the planned `enter`, `sh
 
 ## Entered Session Data Flow
 
-1. `manifold enter` resolves or creates a session and builds an entered environment for a shell or command.
+1. `manifold enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
 2. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
-3. Optional isolation profiles create or join session-local filesystem, network, PID/IPC, and DBus boundaries.
-4. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
-5. `manifold show` presents the entered session without changing its process, filesystem, or network state.
-6. Control commands and aliases such as `mdctl` default to the entered session unless a command explicitly targets another session.
+3. The control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
+4. Optional isolation profiles create or join session-local filesystem, network, PID/IPC, and DBus boundaries.
+5. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
+6. `manifold show` presents the directory-bound or explicitly selected session without changing its process, filesystem, or network state, and can create an empty session when invoked outside one.
+7. `manifold hide` resolves the same target shape and detaches the presentation surface without closing the session.
+8. `manifold list` reports the directory-associated sessions by default and can report all live sessions globally.
+9. Control commands and aliases such as `mctl` default to the entered session unless a command explicitly targets another session.
 
 ## Core Rule
 

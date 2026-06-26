@@ -43,11 +43,15 @@ An entered session is a shell or command environment bound to one Manifold sessi
 
 Expected behavior:
 
-- `manifold enter` resolves or creates a session, sets the session command context, points GUI clients at the session's nested Wayland display, and then starts a shell or requested command.
+- `manifold enter` creates or reuses a session environment when invoked from outside an entered session, sets the session command context, points GUI clients at the session's nested Wayland display, and then starts a shell or requested command.
+- The session server records directory-associated sessions and a directory default so repeated `enter` and `show` calls from the same directory reuse the same session by default.
+- Bare `enter` should refuse to nest when the shell is already inside a session; `enter --new` should force a new session and print an easy session identifier without moving the directory default unless requested.
 - Session-aware commands infer their target from the entered environment unless explicitly overridden.
-- `manifold show` fronts, attaches, or switches presentation to the entered session without changing the shell environment.
-- A thin control alias such as `mdctl` may exist, but it should use the same command semantics and default target as Manifold control commands.
-- Entered shells should make the active DBus control endpoint, session id, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
+- `manifold show` fronts, attaches, or switches presentation to the directory-bound or explicitly selected session, or creates an empty session when invoked outside one and no binding exists, without changing the shell environment.
+- `manifold hide` resolves the same session target shape as `show` and detaches the presentation surface when one exists, without closing the session.
+- Session listing should show the live sessions associated with the current directory by default and all live sessions when requested globally.
+- A thin control alias such as `mctl` may exist, but it should use the same command semantics and default target as Manifold control commands.
+- Entered shells should make the active DBus control endpoint, session id, session name, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
 - Entering a session should not by itself require filesystem, network, or PID isolation; those are profiles layered on top.
 
 ## Session Isolation
@@ -110,6 +114,7 @@ Expected behavior:
 - Closing a presentation window detaches when there is session or managed-app state worth preserving.
 - Detach keeps managed apps and pane producers alive when their own lifecycle allows it.
 - Reattach presents the latest pane state without requiring managed apps to relaunch.
+- Hide is a session-preserving detach operation, not a quit or close operation.
 - Repeated attach or detach commands are idempotent.
 - The presentation surface decides which panes are visible and how they are arranged, dragged, animated, stacked, or hidden.
 - The presentation surface may save its layout or visibility preferences into the workspace.

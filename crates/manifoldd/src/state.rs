@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    path::{Path, PathBuf},
     process::Command,
     rc::Rc,
     sync::Arc,
@@ -58,6 +59,24 @@ use crate::{
 #[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
 const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const SESSION_NAME_ADJECTIVES: &[&str] = &[
+    "amber", "brisk", "calm", "dusk", "eager", "fern", "glad", "hazel", "ivory", "jolly", "keen",
+    "lucid", "mellow", "nimble", "olive", "plain", "quiet", "radiant", "steady", "tidy", "umber",
+    "vivid", "warm", "zephyr", "bright", "cobalt", "drift", "ember", "frost", "golden", "hardy",
+    "swift",
+];
+const SESSION_NAME_NOUNS: &[&str] = &[
+    "arch", "bay", "cove", "delta", "field", "grove", "hill", "inlet", "junction", "knoll",
+    "ledge", "meadow", "notch", "oak", "pass", "quay", "ridge", "stream", "trail", "vale", "wharf",
+    "yard", "zone", "basin", "bridge", "cairn", "dune", "harbor", "island", "lantern", "mound",
+    "path",
+];
+const SESSION_NAME_ACTIONS: &[&str] = &[
+    "bind", "carry", "drift", "gather", "glide", "hover", "join", "kindle", "lift", "map", "note",
+    "open", "pulse", "quiet", "rise", "settle", "shine", "shift", "span", "trace", "turn",
+    "unfold", "vault", "weave", "anchor", "bloom", "cross", "dwell", "echo", "forge", "hinge",
+    "ripple",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationStatus {
@@ -208,6 +227,8 @@ pub struct Manifold {
     next_surface_session: u64,
     surface_sessions: Vec<SurfaceSessionId>,
     surface_session_names: Vec<(SurfaceSessionId, String)>,
+    surface_session_directories: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
+    surface_session_directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
     presentation_member_surfaces: Vec<WlSurface>,
     extension_registry: ExtensionRegistry,
@@ -305,7 +326,12 @@ impl Manifold {
             surface_session_interaction_order: vec![SurfaceSessionId(1)],
             next_surface_session: 2,
             surface_sessions: vec![SurfaceSessionId(1)],
-            surface_session_names: vec![(SurfaceSessionId(1), "session 1".to_string())],
+            surface_session_names: vec![(
+                SurfaceSessionId(1),
+                default_surface_session_name(SurfaceSessionId(1)),
+            )],
+            surface_session_directories: BTreeMap::new(),
+            surface_session_directory_defaults: BTreeMap::new(),
             window_surface_sessions: Vec::new(),
             presentation_member_surfaces: Vec::new(),
             extension_registry: ExtensionRegistry::default(),
@@ -999,13 +1025,22 @@ impl Manifold {
         self.surface_sessions
             .iter()
             .copied()
-            .map(|session| SurfaceSessionSummary {
+            .filter_map(|session| self.surface_session_summary(session))
+            .collect()
+    }
+
+    pub fn surface_session_summary(
+        &self,
+        session: SurfaceSessionId,
+    ) -> Option<SurfaceSessionSummary> {
+        self.surface_sessions
+            .contains(&session)
+            .then(|| SurfaceSessionSummary {
                 id: session.raw(),
                 name: self.surface_session_name(session).to_string(),
                 active: session == self.active_surface_session,
                 windows: self.surface_session_window_count(session),
             })
-            .collect()
     }
 
     pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: String) -> bool {
@@ -1017,6 +1052,85 @@ impl Manifold {
             .retain(|(assigned_session, _)| *assigned_session != session);
         self.surface_session_names.push((session, name.to_string()));
         true
+    }
+
+    pub fn active_surface_session_name(&self) -> &str {
+        self.surface_session_name(self.active_surface_session)
+    }
+
+    pub fn resolve_directory_surface_session(
+        &mut self,
+        directory: &Path,
+    ) -> Option<SurfaceSessionId> {
+        self.prune_directory_surface_sessions(directory);
+        let session = self
+            .surface_session_directory_defaults
+            .get(directory)
+            .copied()?;
+        if self.surface_sessions.contains(&session) {
+            Some(session)
+        } else {
+            self.surface_session_directory_defaults.remove(directory);
+            None
+        }
+    }
+
+    pub fn directory_surface_session_summaries(
+        &mut self,
+        directory: &Path,
+    ) -> Vec<SurfaceSessionSummary> {
+        self.prune_directory_surface_sessions(directory);
+        self.surface_session_directories
+            .get(directory)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter_map(|session| self.surface_session_summary(session))
+            .collect()
+    }
+
+    pub fn remember_directory_surface_session(
+        &mut self,
+        directory: PathBuf,
+        session: SurfaceSessionId,
+        set_default: bool,
+    ) -> bool {
+        if !self.surface_sessions.contains(&session) {
+            return false;
+        }
+        let sessions = self
+            .surface_session_directories
+            .entry(directory.clone())
+            .or_default();
+        if !sessions.contains(&session) {
+            sessions.push(session);
+        }
+        if set_default
+            || !self
+                .surface_session_directory_defaults
+                .get(&directory)
+                .is_some_and(|default| self.surface_sessions.contains(default))
+        {
+            self.surface_session_directory_defaults
+                .insert(directory, session);
+        }
+        true
+    }
+
+    fn prune_directory_surface_sessions(&mut self, directory: &Path) {
+        if let Some(sessions) = self.surface_session_directories.get_mut(directory) {
+            sessions.retain(|session| self.surface_sessions.contains(session));
+            if sessions.is_empty() {
+                self.surface_session_directories.remove(directory);
+            }
+        }
+        if self
+            .surface_session_directory_defaults
+            .get(directory)
+            .is_some_and(|session| !self.surface_sessions.contains(session))
+        {
+            self.surface_session_directory_defaults.remove(directory);
+        }
     }
 
     pub fn close_surface_session(&mut self, session: SurfaceSessionId) -> bool {
@@ -1046,6 +1160,13 @@ impl Manifold {
             .retain(|(assigned_session, _)| *assigned_session != session);
         self.surface_session_interaction_order
             .retain(|existing| *existing != session);
+        self.surface_session_directories
+            .retain(|_, assigned_sessions| {
+                assigned_sessions.retain(|assigned_session| *assigned_session != session);
+                !assigned_sessions.is_empty()
+            });
+        self.surface_session_directory_defaults
+            .retain(|_, assigned_session| *assigned_session != session);
         self.window_surface_sessions
             .retain(|(_, assigned_session)| *assigned_session != session);
         self.window_layout_leaves
@@ -1160,7 +1281,7 @@ impl Manifold {
         self.surface_session_names.push((
             session,
             name.filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| format!("session {}", session.raw())),
+                .unwrap_or_else(|| default_surface_session_name(session)),
         ));
         self.active_surface_session = session;
         self.record_surface_session_interaction(session);
@@ -2054,6 +2175,16 @@ impl Manifold {
     pub fn active_layout_rect(&self) -> Option<LayoutRect> {
         self.layout.active_rect(self.presentation_layout_size())
     }
+}
+
+fn default_surface_session_name(session: SurfaceSessionId) -> String {
+    let n = session.raw().saturating_sub(1) as usize;
+    let adjective = SESSION_NAME_ADJECTIVES[n % SESSION_NAME_ADJECTIVES.len()];
+    let noun = SESSION_NAME_NOUNS[(n / SESSION_NAME_ADJECTIVES.len()) % SESSION_NAME_NOUNS.len()];
+    let action = SESSION_NAME_ACTIONS[(n
+        / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
+        % SESSION_NAME_ACTIONS.len()];
+    format!("{adjective}-{noun}-{action}")
 }
 
 fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {

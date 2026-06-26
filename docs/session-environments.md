@@ -21,9 +21,21 @@ This should make parallel development agents practical:
 
 ## Command Model
 
-`manifold enter` is the shell-facing entry point. It should resolve or create a
-session, set the session command context, set the GUI launch context, and then
-start an interactive shell or a requested command inside that context.
+`manifold enter` is the shell-facing entry point. It should create or reuse a
+session environment when invoked from outside an entered session, set the
+session command context, set the GUI launch context, and then start an
+interactive shell or a requested command inside that context. The server should
+record which sessions are tied to each directory, plus which of those sessions
+is the directory default. Repeated `enter` and `show` calls from the same
+directory should reuse the default session. When a shell is already inside a
+session, the default `enter` path should refuse to nest and should direct the
+user toward `mctl show` or `mctl enter --new`.
+
+`mctl enter --new` should always create a fresh session environment, even when
+the command is already running inside one, and should print the session's easy
+identifier so the session can be shown explicitly later. Creating that extra
+session should not move the directory default unless the user asks to set the
+default.
 
 The entered environment should provide:
 
@@ -36,11 +48,22 @@ The entered environment should provide:
   enabled
 
 `manifold show` should be a presentation command. It should front or attach the
-current entered session, or a named session when invoked outside an entered
-environment. It should not be required for non-graphical work inside an entered
-session.
+session bound to the current directory, or create an empty session when invoked
+outside an entered environment and no directory binding exists. An explicit
+session id should be able to override that lookup. `mctl show --id <id>` should
+target a specific session, and bare `show` in a directory should reuse the last
+default session tied to that directory. Showing an explicit session should not
+move the directory default unless the user asks to set the default.
 
-`mdctl` should be a thin control alias for Manifold commands in the current
+`manifold hide` should be the matching presentation command for removing the
+session surface from view without closing the session. It should resolve the
+same directory-bound or explicit session target as `show`, then detach the
+presentation surface if one exists.
+
+`manifold list` should show the live sessions associated with the current
+directory. A global listing mode should show all live sessions in the server.
+
+`mctl` should be a thin control alias for Manifold commands in the current
 entered context. Its default target should come from the entered session
 environment, while explicit targeting remains available for scripts and tests.
 
@@ -71,6 +94,11 @@ GUI programs launched from an entered shell must connect to the session's
 nested Wayland display by default. Setting only a Manifold session id is not
 enough; the GUI launch environment must also point toolkit clients at the
 session compositor.
+
+The default entered environment should capture graphical apps into Manifold by
+pointing toolkit clients at the session compositor. A non-capturing entered
+environment should still export the Manifold command context, but leave GUI
+launches on the inherited host display when one is available.
 
 ## Isolation Layers
 
@@ -199,7 +227,7 @@ each other.
   launch into the host desktop.
 - Do not expose the host DBus session bus by default.
 - Do not hide writes to system paths; record and report them distinctly.
-- Do not make `mdctl` a separate product surface with different semantics from
+- Do not make `mctl` a separate product surface with different semantics from
   Manifold control commands.
 - Do not require a virtual filesystem before the plain session and command
   context model works.
@@ -211,7 +239,5 @@ each other.
 - How should overlay changes be promoted back into a dirty Git worktree?
 - How should Manifold represent system-path writes that are not owned by a
   project repository?
-- Should `manifold enter` create a new session by default, reuse by name, or
-  require an explicit creation mode?
 - How should session-local network namespaces get outbound connectivity?
 - Which host DBus names should be allowed through the first proxy profile?

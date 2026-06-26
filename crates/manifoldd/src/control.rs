@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::mpsc,
     thread,
@@ -23,8 +24,8 @@ use tracing::{info, warn};
 use zbus::{fdo, message::Header, proxy};
 
 use crate::{
-    CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV,
-    MANIFOLDD_DBUS_DESTINATION_ENV, SwitchArgs, browser,
+    CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
+    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, ShowArgs, SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
@@ -62,10 +63,18 @@ impl ControlTarget {
     }
 
     pub(crate) fn session_marker(&self) -> String {
+        self.session_marker_with_session(None)
+    }
+
+    pub(crate) fn session_marker_with_session(&self, surface_session_id: Option<u64>) -> String {
         let mut marker = format!("dbus-destination={}", self.destination);
         if let Some(address) = self.address.as_deref() {
             marker.push_str(" dbus-address=");
             marker.push_str(address);
+        }
+        if let Some(session_id) = surface_session_id {
+            marker.push_str(" surface-session-id=");
+            marker.push_str(&session_id.to_string());
         }
         marker
     }
@@ -532,6 +541,272 @@ pub fn send(args: CtlArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn enter(args: EnterArgs) -> Result<()> {
+    let already_entered = entered_session_marker().is_some();
+    if already_entered && !args.new {
+        bail!(
+            "already inside a Manifold session; use `mctl show` to present it or `mctl enter --new` to create a separate session"
+        );
+    }
+
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let current_directory = current_directory()?;
+    let existing_default = resolve_directory_surface_session(&target, &current_directory)?;
+    let (session_id, set_default) = if args.new {
+        let session_id = create_surface_session(&target, None)?;
+        let status = status_snapshot(&target)?;
+        eprintln!(
+            "created Manifold session: {}",
+            status.active_surface_session_name
+        );
+        (session_id, args.set_default || existing_default.is_none())
+    } else {
+        match existing_default {
+            Some(session_id) => (session_id, false),
+            None => (create_surface_session(&target, None)?, true),
+        }
+    };
+    remember_directory_surface_session(&target, &current_directory, session_id, set_default)?;
+
+    let status = status_snapshot(&target)?;
+
+    let mut command = entered_command(args.command);
+    command.env(
+        MANIFOLD_SESSION_ENV,
+        target.session_marker_with_session(Some(session_id)),
+    );
+    command.env(MANIFOLDD_DBUS_DESTINATION_ENV, &target.destination);
+    command.env("MANIFOLD_SURFACE_SESSION_ID", session_id.to_string());
+    if let Some(address) = target.address.as_deref() {
+        command.env(MANIFOLDD_DBUS_ADDRESS_ENV, address);
+    }
+
+    if args.no_capture {
+        if env::var_os("WAYLAND_DISPLAY").as_deref() == Some(status.wayland_display.as_ref()) {
+            command.env_remove("WAYLAND_DISPLAY");
+        }
+    } else {
+        command.env("WAYLAND_DISPLAY", &status.wayland_display);
+    }
+
+    let status = command.status().context("run entered command")?;
+    match status.code() {
+        Some(code) => std::process::exit(code),
+        None => bail!("entered command terminated by signal"),
+    }
+}
+
+pub fn show(args: ShowArgs) -> Result<()> {
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let (session_id, current_directory, set_default) =
+        resolve_cli_surface_session(&target, args.id, true, args.set_default)?;
+    remember_directory_surface_session(&target, &current_directory, session_id, set_default)?;
+
+    let status = status_snapshot(&target)?;
+    switch_surface_session(&target, session_id)?;
+
+    if status.presentation == "Detached" {
+        let response = request_dbus_command(&target, &["attach".to_string()], false)?;
+        ensure_ok_response(&response)?;
+    }
+    Ok(())
+}
+
+pub fn hide(args: HideArgs) -> Result<()> {
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let (session_id, current_directory, set_default) =
+        resolve_cli_surface_session(&target, args.id, false, false)?;
+    remember_directory_surface_session(&target, &current_directory, session_id, set_default)?;
+
+    let status = status_snapshot(&target)?;
+    switch_surface_session(&target, session_id)?;
+
+    if status.presentation == "Attached" {
+        let response = request_dbus_command(&target, &["detach".to_string()], false)?;
+        ensure_ok_response(&response)?;
+    }
+    Ok(())
+}
+
+pub fn list(args: ListArgs) -> Result<()> {
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    if args.global {
+        let list = request_surface_session_list(&target)?;
+        print_surface_sessions(&list.sessions, None);
+        return Ok(());
+    }
+
+    let current_directory = current_directory()?;
+    let list = request_directory_surface_session_list(&target, &current_directory)?;
+    print_surface_sessions(&list.sessions, list.default);
+    Ok(())
+}
+
+fn resolve_cli_surface_session(
+    target: &ControlTarget,
+    query: Option<String>,
+    create_if_missing: bool,
+    set_default_requested: bool,
+) -> Result<(u64, PathBuf, bool)> {
+    let current_directory = current_directory()?;
+    let existing_default = resolve_directory_surface_session(target, &current_directory)?;
+    let (session_id, set_default) = if let Some(query) = query {
+        (
+            resolve_surface_session(target, &query)?,
+            set_default_requested,
+        )
+    } else if let Some(session_id) = existing_default {
+        (session_id, false)
+    } else if let Some(session_id) = entered_surface_session_id() {
+        (session_id, true)
+    } else if create_if_missing {
+        (create_surface_session(target, None)?, true)
+    } else {
+        (status_snapshot(target)?.active_surface_session, false)
+    };
+    Ok((session_id, current_directory, set_default))
+}
+
+fn switch_surface_session(target: &ControlTarget, session_id: u64) -> Result<()> {
+    let response = request_dbus_command(
+        target,
+        &[
+            "surface-session".to_string(),
+            "switch".to_string(),
+            session_id.to_string(),
+        ],
+        false,
+    )?;
+    ensure_ok_response(&response)
+}
+
+fn current_directory() -> Result<PathBuf> {
+    let directory = env::current_dir().context("determine current directory")?;
+    Ok(directory.canonicalize().unwrap_or(directory))
+}
+
+fn create_surface_session(target: &ControlTarget, name: Option<String>) -> Result<u64> {
+    let mut command = vec!["surface-session".to_string(), "new".to_string()];
+    if let Some(name) = name {
+        command.push(name);
+    }
+    let response = request_dbus_command(target, &command, false)?;
+    ensure_ok_response(&response)?;
+
+    let response = request_dbus_command(target, &[String::from("status-json")], false)?;
+    let status: EnterStatusSnapshot =
+        serde_json::from_str(response.trim()).context("decode Manifold status-json")?;
+    Ok(status.active_surface_session)
+}
+
+fn status_snapshot(target: &ControlTarget) -> Result<EnterStatusSnapshot> {
+    let response = request_dbus_command(target, &[String::from("status-json")], false)?;
+    serde_json::from_str(response.trim()).context("decode Manifold status-json")
+}
+
+fn resolve_surface_session(target: &ControlTarget, query: &str) -> Result<u64> {
+    let response = request_dbus_command(
+        target,
+        &[
+            "surface-session".to_string(),
+            "switch".to_string(),
+            query.to_string(),
+        ],
+        false,
+    )?;
+    ensure_ok_response(&response)?;
+    status_snapshot(target).map(|status| status.active_surface_session)
+}
+
+fn resolve_directory_surface_session(
+    target: &ControlTarget,
+    directory: &Path,
+) -> Result<Option<u64>> {
+    let response = request_dbus_command(
+        target,
+        &[
+            "surface-session".to_string(),
+            "dir-get".to_string(),
+            directory.to_string_lossy().into_owned(),
+        ],
+        false,
+    )?;
+    parse_surface_session_lookup_response(&response)
+}
+
+fn remember_directory_surface_session(
+    target: &ControlTarget,
+    directory: &Path,
+    session_id: u64,
+    set_default: bool,
+) -> Result<()> {
+    let response = request_dbus_command(
+        target,
+        &[
+            "surface-session".to_string(),
+            "dir-set".to_string(),
+            directory.to_string_lossy().into_owned(),
+            session_id.to_string(),
+            if set_default {
+                "default"
+            } else {
+                "keep-default"
+            }
+            .to_string(),
+        ],
+        false,
+    )?;
+    ensure_ok_response(&response)
+}
+
+fn parse_surface_session_lookup_response(response: &str) -> Result<Option<u64>> {
+    let response = response.trim();
+    ensure!(
+        response.starts_with("OK "),
+        "control command failed: {response}"
+    );
+    let value = session_marker_value(response, "session")
+        .context("surface-session dir-get response missing session marker")?;
+    if value == "none" {
+        return Ok(None);
+    }
+    let session_id = value
+        .parse()
+        .with_context(|| format!("parse surface session id {value:?}"))?;
+    Ok(Some(session_id))
+}
+
+fn entered_session_marker() -> Option<String> {
+    env::var(MANIFOLD_SESSION_ENV).ok().or_else(|| {
+        env::var("MANIFOLD_SURFACE_SESSION_ID")
+            .ok()
+            .map(|session_id| format!("surface-session-id={session_id}"))
+    })
+}
+
+fn entered_surface_session_id() -> Option<u64> {
+    env::var("MANIFOLD_SURFACE_SESSION_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            entered_session_marker().and_then(|value| {
+                session_marker_value(&value, "surface-session-id")
+                    .and_then(|value| value.parse().ok())
+            })
+        })
+}
+
+fn entered_command(argv: Vec<OsString>) -> ProcessCommand {
+    let mut argv = argv.into_iter();
+    let program = argv
+        .next()
+        .or_else(|| env::var_os("SHELL"))
+        .unwrap_or_else(|| OsString::from("/bin/sh"));
+    let mut command = ProcessCommand::new(&program);
+    command.args(argv);
+    command
+}
+
 pub fn switch(args: SwitchArgs) -> Result<()> {
     let target = resolve_control_target(args.dbus_name, args.dbus_address);
     let list = request_surface_session_list(&target)?;
@@ -611,6 +886,14 @@ fn session_marker_value(marker: &str, key: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
     })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EnterStatusSnapshot {
+    wayland_display: String,
+    active_surface_session: u64,
+    active_surface_session_name: String,
+    presentation: String,
 }
 
 fn start_dbus_service(
@@ -1174,6 +1457,44 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 let response = SurfaceSessionList::from_state(state);
                 format!("{}\n", serde_json::to_string(&response)?)
             }
+            [subcommand, directory] if subcommand == "dir-list-json" => {
+                let response = DirectorySurfaceSessionList::from_state(state, Path::new(directory));
+                format!("{}\n", serde_json::to_string(&response)?)
+            }
+            [subcommand, directory] if subcommand == "dir-get" => {
+                let session = state
+                    .resolve_directory_surface_session(Path::new(directory))
+                    .map(|session| session.raw());
+                match session {
+                    Some(session) => format!("OK surface-session session={session}\n"),
+                    None => "OK surface-session session=none\n".to_string(),
+                }
+            }
+            [subcommand, directory, id] if subcommand == "dir-set" => {
+                let session = parse_u64(id, "session id")?;
+                let changed = state.remember_directory_surface_session(
+                    Path::new(directory).to_path_buf(),
+                    SurfaceSessionId::from_raw(session),
+                    true,
+                );
+                ensure!(changed, "unknown surface session {session}");
+                format!("OK surface-session changed={changed} session={session}\n")
+            }
+            [subcommand, directory, id, mode] if subcommand == "dir-set" => {
+                let session = parse_u64(id, "session id")?;
+                let set_default = match mode.as_str() {
+                    "default" | "set-default" => true,
+                    "keep-default" | "no-default" => false,
+                    _ => bail!("dir-set mode must be default or keep-default"),
+                };
+                let changed = state.remember_directory_surface_session(
+                    Path::new(directory).to_path_buf(),
+                    SurfaceSessionId::from_raw(session),
+                    set_default,
+                );
+                ensure!(changed, "unknown surface session {session}");
+                format!("OK surface-session changed={changed} session={session}\n")
+            }
             [subcommand] if subcommand == "next" => {
                 let changed =
                     WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext).apply(state);
@@ -1194,19 +1515,23 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                     state.active_surface_session().raw()
                 )
             }
-            [subcommand, id] if subcommand == "switch" => {
-                let id = parse_u64(id, "session id")?;
-                let changed = state.switch_to_surface_session(SurfaceSessionId::from_raw(id));
+            [subcommand, query] if subcommand == "switch" => {
+                let session = state
+                    .resolve_surface_session(query)
+                    .with_context(|| format!("unknown surface session {query:?}"))?;
+                let changed = state.switch_to_surface_session(session);
                 ensure!(
-                    changed || state.active_surface_session().raw() == id,
-                    "unknown surface session {id}"
+                    changed || state.active_surface_session() == session,
+                    "unknown surface session {query}"
                 );
                 format!(
                     "OK surface-session active={} changed={changed}\n",
                     state.active_surface_session().raw()
                 )
             }
-            _ => bail!("usage: surface-session list-json|next|new|switch <id>"),
+            _ => bail!(
+                "usage: surface-session list-json|dir-list-json <dir>|dir-get <dir>|dir-set <dir> <id> [default|keep-default]|next|new|switch <query>"
+            ),
         },
         "browser" => browser::handle_control(args, state)?,
         "harness" => match args {
@@ -1266,6 +1591,7 @@ struct StatusSnapshot {
     windows: usize,
     total_windows: usize,
     active_surface_session: u64,
+    active_surface_session_name: String,
     surface_sessions: usize,
     focused_windows: usize,
     focused_window_index: Option<usize>,
@@ -1427,6 +1753,7 @@ impl StatusSnapshot {
             windows: state.active_surface_session_window_count(),
             total_windows: state.space.elements().count(),
             active_surface_session: state.active_surface_session().raw(),
+            active_surface_session_name: state.active_surface_session_name().to_string(),
             surface_sessions: state.surface_session_count(),
             focused_windows: state.focused_window_count(),
             focused_window_index: state.focused_window_index(),
@@ -1728,6 +2055,26 @@ impl SurfaceSessionList {
     }
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct DirectorySurfaceSessionList {
+    directory: String,
+    default: Option<u64>,
+    sessions: Vec<SurfaceSessionSummary>,
+}
+
+impl DirectorySurfaceSessionList {
+    fn from_state(state: &mut Manifold, directory: &Path) -> Self {
+        state.refresh_window_state();
+        Self {
+            directory: directory.to_string_lossy().into_owned(),
+            default: state
+                .resolve_directory_surface_session(directory)
+                .map(SurfaceSessionId::raw),
+            sessions: state.directory_surface_session_summaries(directory),
+        }
+    }
+}
+
 fn request_surface_session_list(target: &ControlTarget) -> Result<SurfaceSessionList> {
     let response = request_dbus_command(
         target,
@@ -1735,6 +2082,44 @@ fn request_surface_session_list(target: &ControlTarget) -> Result<SurfaceSession
         false,
     )?;
     serde_json::from_str(response.trim()).context("decode surface-session list")
+}
+
+fn request_directory_surface_session_list(
+    target: &ControlTarget,
+    directory: &Path,
+) -> Result<DirectorySurfaceSessionList> {
+    let response = request_dbus_command(
+        target,
+        &[
+            "surface-session".to_string(),
+            "dir-list-json".to_string(),
+            directory.to_string_lossy().into_owned(),
+        ],
+        false,
+    )?;
+    serde_json::from_str(response.trim()).context("decode directory surface-session list")
+}
+
+fn print_surface_sessions(sessions: &[SurfaceSessionSummary], default: Option<u64>) {
+    if sessions.is_empty() {
+        println!("no sessions");
+        return;
+    }
+    println!("ID\tNAME\tACTIVE\tWINDOWS\tDEFAULT");
+    for session in sessions {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            session.id,
+            session.name,
+            if session.active { "yes" } else { "no" },
+            session.windows,
+            if Some(session.id) == default {
+                "yes"
+            } else {
+                "no"
+            },
+        );
+    }
 }
 
 enum SessionSwitchOutcome {
@@ -1861,8 +2246,8 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionSwitchOutcome, format_session_picker_row, parse_skim_session_output,
-        resolve_initial_query,
+        ControlTarget, SessionSwitchOutcome, format_session_picker_row, parse_skim_session_output,
+        resolve_initial_query, session_marker_value,
     };
     use crate::state::SurfaceSessionSummary;
 
@@ -1923,5 +2308,16 @@ mod tests {
     #[test]
     fn empty_query_without_selection_is_cancelled_selection() {
         assert!(parse_skim_session_output("").is_err());
+    }
+
+    #[test]
+    fn session_marker_includes_surface_session_id() {
+        let marker = ControlTarget::new("org.manifold.Session".to_string(), None)
+            .session_marker_with_session(Some(42));
+
+        assert_eq!(
+            session_marker_value(&marker, "surface-session-id"),
+            Some("42".to_string())
+        );
     }
 }
