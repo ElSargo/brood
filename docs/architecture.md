@@ -12,7 +12,9 @@ The session process owns durable session truth and the wider workspace-level env
 
 - sessions, session lifecycle, environment, cwd, capabilities, and producer membership
 - entered session environments, including command context, GUI launch context, and optional isolation profile
-- session filesystem overlays, network namespace metadata, PID/IPC namespace metadata, and DBus proxy configuration
+- managed session isolation state: filesystem copy-on-write metadata, runtime
+  IPC roots, network namespace metadata, PID/IPC namespace metadata, and DBus
+  proxy configuration
 - documents, buffers, selections, modes, commands, and pane records
 - focus and input routing policy between panes and producers
 - terminals, browser pane clients, Wayland app hosts, agents, and git models
@@ -57,7 +59,10 @@ See [WASM Integration](wasm-integration.md) for the planned host boundary, modul
 
 See [Layout Mould](layout-mould.md) for the planned split between reloadable layout policy and native presentation rendering.
 
-See [Session Environments](session-environments.md) for the planned `enter`, `show`, command-context, filesystem overlay, network namespace, and DBus proxy model.
+See [Session Environments](session-environments.md) for the planned `enter`,
+`show`, command-context, managed filesystem/runtime IPC, network namespace, and
+DBus proxy model. See [Managed Session Isolation Plan](managed-session-isolation-plan.md)
+for the staged implementation plan.
 
 ## MVP Data Flow
 
@@ -71,7 +76,10 @@ See [Session Environments](session-environments.md) for the planned `enter`, `sh
 1. `manifold enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
 2. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
 3. The control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
-4. Optional isolation profiles create or join session-local filesystem, network, PID/IPC, and DBus boundaries.
+4. Optional isolation profiles create or join session-local filesystem, runtime
+   IPC, network, PID/IPC, and DBus boundaries. The target `managed` profile
+   captures regular writes by default, redirects runtime paths into the session,
+   and keeps host bridges explicit.
 5. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
 6. `manifold show` presents the directory-bound or explicitly selected session without changing its process, filesystem, or network state, and can create an empty session when invoked outside one.
 7. `manifold hide` resolves the same target shape and detaches the presentation surface without closing the session.

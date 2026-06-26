@@ -30,12 +30,17 @@ Expected behavior:
 - External apps may use a session-scoped DBus proxy for desktop-style communication inside the session.
 - The session DBus proxy should not expose ambient host-wide or cross-session DBus access by default.
 - Plain first-phase sessions may use the real host/project filesystem through session cwd, environment, and granted capabilities.
-- Isolated sessions should be able to add filesystem overlays, network namespaces, PID/IPC namespaces, and DBus proxies without changing the pane or presentation model.
+- Isolated sessions should be able to add managed filesystem copy-on-write
+  views, session-local runtime IPC paths, network namespaces, PID/IPC
+  namespaces, and DBus proxies without changing the pane or presentation model.
 - Manifold uses power-user defaults: explicit session actions should not trigger confirmation prompts by default.
 - Prefer observable effects, logs, history, undo/recovery where practical, and opt-in guardrails over nagging confirmations.
 - Agents are same-session apps for trust and capability purposes, but their requested and performed actions should be logged inside the session for traceability.
 
-See [Session Environments](session-environments.md) for the target `enter`, `show`, filesystem overlay, network namespace, and DBus proxy model.
+See [Session Environments](session-environments.md) for the target `enter`,
+`show`, managed filesystem/runtime IPC, network namespace, and DBus proxy model.
+See [Managed Session Isolation Plan](managed-session-isolation-plan.md) for the
+staged implementation plan.
 
 ## Entered Session Environment
 
@@ -60,8 +65,17 @@ Session isolation is for reducing accidental interference between local developm
 
 Expected behavior:
 
-- A filesystem-isolated session writes through a session-owned overlay and can report changed files, diffs, promoted paths, discarded paths, and system-path writes separately from repo writes.
-- A network-isolated session has its own loopback namespace so multiple sessions can bind the same local ports.
+- A managed filesystem session captures regular writes into a session-owned
+  copy-on-write backend while preserving original view paths for programs inside
+  the session.
+- Captured effects are classified as project, external, runtime, bridge, or
+  denied so source edits, host config writes, sockets, and explicit host access
+  are not conflated.
+- A managed runtime session gives entered commands and managed apps
+  session-owned runtime and temporary paths so filesystem sockets, pid files,
+  lock files, and caches do not leak across sessions by default.
+- A network-isolated session has its own loopback namespace so multiple sessions
+  can bind the same local ports.
 - Containers or tools launched with host networking from inside a network-isolated entered session should share the session network namespace rather than the ambient host namespace.
 - A DBus-isolated session uses a session-local bus or filtered proxy; access to host bus names and cross-session bus names requires explicit grants.
 - A PID/IPC-isolated session can report and clean up processes that belong to the session without relying on ambient host process discovery.

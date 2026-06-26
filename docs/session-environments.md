@@ -100,14 +100,14 @@ pointing toolkit clients at the session compositor. A non-capturing entered
 environment should still export the Manifold command context, but leave GUI
 launches on the inherited host display when one is available.
 
-## Isolation Layers
+## Isolation Profiles
 
 Isolation should be opt-in or profile-driven at first. A plain session can use
 the real host filesystem and network. An isolated session can add any of these
 layers:
 
 - mount/filesystem namespace
-- filesystem overlay
+- managed filesystem copy-on-write view
 - network namespace
 - PID namespace
 - IPC namespace
@@ -117,20 +117,75 @@ These layers are meant to prevent accidental cross-contamination between local
 development agents. They are not a replacement for internet-safe multi-user
 sandboxing.
 
+The useful target profile is `managed`: a coherent session capsule that captures
+regular filesystem writes by default, provides a session runtime directory,
+routes same-session DBus clients to a Manifold-owned bus or proxy, and gives the
+session its own local network namespace. `managed` should be the default
+isolated profile once the required pieces exist. More restrictive profiles can
+exist for tests or special cases, but the normal agent workflow should not
+require predeclaring every path an old tool might try to write.
+
+Initial profile shape:
+
+- `plain`: no filesystem, DBus, IPC, or network isolation beyond the normal
+  Manifold command and GUI launch context
+- `managed`: capture regular file writes by default, use session-local runtime
+  paths, use the session DBus bus or proxy, and use a session network namespace
+- `strict`: capture only declared path prefixes, useful for tests and debugging
+- `host-write`: explicit escape hatch for commands that really should modify
+  the host filesystem
+
 ## Filesystem Virtualization
 
-The filesystem target is a per-session overlay that keeps writes in a discrete
-session-owned location.
+The filesystem target is a per-session copy-on-write view that keeps writes in a
+discrete session-owned location while programs still see the original path
+names. A process that enters `/home/user/project` should continue to see that
+path as its current working directory. If the process writes `/etc/whatever` in
+a managed session, it should also continue to see `/etc/whatever`; Manifold
+should redirect the modified data into the session backend.
+
+The path model has three names:
+
+- `view path`: the path visible to the process inside the session
+- `lower path`: the host path that provides the read-through base
+- `upper path`: the session-owned path that stores captured writes
+
+The first storage backend can materialize an upper tree under
+`~/.manifold/worktrees/<session-id>/`. Project trees should prefer reflink or
+another zero-copy copy-on-write mechanism when the host filesystem supports it,
+then fall back to a normal copy. The backend is an implementation detail; the
+entered environment should expose the view path as the normal path and expose
+the upper path only through diagnostics such as status output.
 
 The useful first scope is:
 
 - the repo or worktree being edited
-- selected XDG config, cache, and data roots
-- session-local temporary directories
-- selected system paths when an agent intentionally edits system-facing config
+- regular file and directory writes under arbitrary absolute paths, captured by
+  default in the `managed` profile
+- selected XDG config, cache, data, and runtime roots
+- session-local temporary directories and runtime directories
+- selected system paths when an agent or old program writes system-facing config
 
 The session should record enough metadata to explain where writes landed and
 which lower paths they came from.
+
+Captured filesystem effects should be classified:
+
+- `project`: writes under the session project or worktree, promotable through
+  git-aware diff and apply logic
+- `external`: durable writes outside the project, visible and promotable only
+  path by path
+- `runtime`: sockets, pid files, lock files, temporary files, caches, and other
+  session-local state that is normally discarded with the session
+- `bridge`: explicit access to a host service path or socket
+- `denied`: paths blocked even in managed mode
+
+The default policy should capture writes to ordinary files and directories, not
+grant real host writes. Sensitive or special paths should be denied or bridged
+explicitly. Examples include `/proc`, `/sys`, `/dev`, `/boot`, `/nix/store`,
+`/etc/shadow`, `/etc/sudoers`, and host SSH private keys. Runtime paths such as
+`/run` and `/run/user/<uid>` need finer policy because they contain sockets,
+locks, pid files, portals, and service state rather than only durable files.
 
 Useful commands and APIs should eventually support:
 
@@ -143,6 +198,34 @@ Useful commands and APIs should eventually support:
 
 This makes system-file edits visible instead of allowing agents to silently
 contaminate the host or another agent's run.
+
+Promotion should be explicit. Project changes can be promoted with git-aware
+conflict checks against the lower tree. External changes should default to
+export or path-by-path promotion because a write to host config has a different
+risk profile than a source-file edit.
+
+## Runtime IPC Virtualization
+
+Many troublesome GUI and service-style applications communicate through
+filesystem sockets, pid files, lock files, abstract Unix sockets, DBus names, and
+loopback ports. The `managed` profile should treat runtime IPC as part of the
+same session capsule as filesystem isolation rather than as an unrelated later
+feature.
+
+Expected behavior:
+
+- `XDG_RUNTIME_DIR`, `TMPDIR`, and similar runtime variables point to
+  session-owned locations
+- Unix sockets created in managed runtime paths are session-local
+- runtime files are classified as `runtime` and discarded by default
+- host sockets and services are reachable only through explicit bridges
+- abstract Unix sockets require IPC namespace support or app-specific handling,
+  because they are not filesystem paths
+
+This prevents applications that use ad hoc sockets or lock files from leaking
+state into another Manifold session or into the host. Host integrations such as
+Wayland, PipeWire, portals, notifications, clipboard, and credential helpers can
+be bridged later as named capabilities.
 
 ## Network Virtualization
 
@@ -197,7 +280,7 @@ The session process should be able to report:
 - cleanup failures
 
 Closing or deleting a session should have a clear policy for terminating
-processes, preserving overlays, and exporting diagnostics.
+processes, preserving managed backends, and exporting diagnostics.
 
 ## Relationship To Agents
 
@@ -210,7 +293,7 @@ agent session
   -> entered shell or command runner
   -> isolated network namespace
   -> DBus proxy or session bus
-  -> repo/worktree overlay
+  -> managed repo/worktree view
   -> Manifold control context
   -> GUI panes and screenshots scoped to that session
 ```
@@ -235,8 +318,8 @@ each other.
 ## Open Questions
 
 - Which isolation profiles should be built in?
-- Which paths belong in the first filesystem overlay by default?
-- How should overlay changes be promoted back into a dirty Git worktree?
+- Which paths belong in the first managed filesystem view by default?
+- How should managed project changes be promoted back into a dirty Git worktree?
 - How should Manifold represent system-path writes that are not owned by a
   project repository?
 - How should session-local network namespaces get outbound connectivity?
