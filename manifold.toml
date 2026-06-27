@@ -14,6 +14,10 @@ capabilities = [
 enabled = true
 argv = ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
 
+[session.runner]
+enabled = true
+kind = "nix-develop"
+
 [module.master-layout]
 enabled = false
 kind = "fast-map-hook"

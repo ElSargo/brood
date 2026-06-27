@@ -53,9 +53,9 @@ use tracing::{info, warn};
 
 use crate::{
     MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
-    NestedTestArgs, RunArgs, TestArgs, TestCommand,
+    NestedTestArgs, RunArgs, SessionArgs, TestArgs, TestCommand,
     browser::BrowserLaunchOptions,
-    config, control, presentation,
+    config, control, presentation, session_runner,
     state::{ClientState, Manifold, PresentationStatus},
     wasm_key::WasmKeyHandler,
     wasm_map::WasmMapHook,
@@ -63,6 +63,14 @@ use crate::{
 };
 
 pub fn run(args: RunArgs) -> Result<()> {
+    if session_runner::run_if_configured(&args)? {
+        return Ok(());
+    }
+
+    serve_session(args.session)
+}
+
+pub fn serve_session(args: SessionArgs) -> Result<()> {
     let mut event_loop: EventLoop<'static, Manifold> = EventLoop::try_new()?;
     let display: Display<Manifold> = Display::new()?;
     let mut state = Manifold::new(&mut event_loop, display);
