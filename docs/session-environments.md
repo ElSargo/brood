@@ -100,6 +100,114 @@ pointing toolkit clients at the session compositor. A non-capturing entered
 environment should still export the Manifold command context, but leave GUI
 launches on the inherited host display when one is available.
 
+## Session Runner
+
+Project environment activation should be owned by the session lifecycle rather
+than by `mctl` or by shell startup files. The target primitive is a session
+runner: Manifold creates a session cache directory, creates or joins a process
+scope for the session, writes a launch record keyed by that scope, resolves the
+configured runner command, then starts the runner from the original working
+directory. Manifold passes the runner the resolved project directory, original
+working directory, session cache directory, persistent runner cache root, and
+inner binary path as positional arguments.
+
+This keeps Manifold's contract narrow. Manifold owns lifecycle, process
+grouping, cache paths, readiness, control endpoints, and cleanup. The runner
+owns project-specific activation policy. A runner can be a native binary, a
+script, or any other executable. Common integrations should prefer small native
+runner binaries when that keeps quoting, process replacement, and diagnostics
+clear. A runner can use `nix develop`, `direnv`, `devenv`, `mise`, `flox`,
+`devbox`, `uv`, language package managers, or a custom site executable without
+Manifold needing native support for each tool.
+
+The runner contract is:
+
+- Manifold resolves the project directory from the session launch cwd and keeps
+  the original command working directory separately.
+- Manifold creates a cache directory for session-local activation state and
+  provides a persistent runner cache root for tool-specific reuse across
+  launches.
+- Manifold creates a transient user scope for the runner.
+- Manifold writes a launch record keyed by that scope's launch id.
+- Manifold resolves configured runner command paths relative to the project
+  directory when they contain a path separator.
+- Manifold starts the runner from the original working directory so activation
+  scripts and the inner binary run where the user invoked `mctl enter`.
+- Manifold invokes the configured runner as
+  `runner <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>`.
+- The runner activates its environment, exports environment variables that name
+  the project directory, working directory, and cache directory, runs the inner
+  binary, then exits with the inner binary's status.
+- The inner binary resolves its launch record from `/proc/self/cgroup`. For
+  session startup this is `manifold-sessiond`; for entered shell or command
+  execution this is `manifold-runner-exec`.
+- The runner resumes after the inner binary exits and can perform any
+  tool-specific cleanup before returning the preserved status.
+- Manifold removes the cache directory after the runner process exits when the
+  runner did not already remove it.
+
+The first built-in runner kind is `nix-develop`. The native
+`manifold-runner-nix-develop` runner caches the sourceable activation script
+from `nix print-dev-env --profile` under the persistent runner cache root. The
+cache record includes the `flake.nix` and `flake.lock` checksums, so unchanged
+projects can source the cached activation script and run the explicit inner
+binary without evaluating the flake again. The Nix runner owns Nix activation
+only; the inner binary owns cgroup launch-record decoding. Custom runners
+should use the same lifecycle shape but can compose multiple tools in any order.
+
+The normal user entry point remains `mctl`. Directory-scoped commands such as
+`mctl enter`, `mctl show`, and `mctl list` should discover the project root,
+resolve a project-specific control target, start the runner-managed session
+server when it is not already running, and then operate on that project server.
+This keeps the workflow independent of whatever environment originally launched
+any ambient Manifold process.
+
+Runner discovery is priority ordered:
+
+- priority 0: walk upward for `manifold.toml`; an enabled `[session.runner]`
+  selects that runner, and `enabled = false` disables runner discovery for that
+  project
+- priority 1: walk upward for `flake.nix`; synthesize a `nix-develop` runner for
+  that project root
+
+The runner catalog should remain data-shaped so new detector entries can be
+added without changing the session lifecycle model. A detector needs a priority,
+a set of files that prove the project root, and the runner kind or command it
+selects. When a detector does not declare a priority, Manifold should treat it
+as priority 1.
+
+Example project config:
+
+```toml
+[session.runner]
+enabled = true
+kind = "nix-develop"
+```
+
+Example custom runner:
+
+```toml
+[session.runner]
+enabled = true
+kind = "custom"
+command = ["./tools/manifold-session-runner"]
+cache_root = ".manifold/cache"
+```
+
+Custom runners do not receive project, cache, or program arguments. They should
+activate their environment and then run a helper such as `manifold-runner-exec`,
+which resolves and execs the assigned program from the current cgroup. This lets
+users add new activation tools by editing an executable or config rather than
+changing Manifold.
+
+Runner disable points should be layered:
+
+- ad hoc launch disable for debugging or host-environment use
+- persistent project config disable
+- per-session metadata recording which runner was used
+- per-program launch policy for commands that must run in the host environment
+- future user-level defaults for all projects
+
 ## Isolation Profiles
 
 Isolation should be opt-in or profile-driven at first. A plain session can use

@@ -73,18 +73,27 @@ for the staged implementation plan.
 
 ## Entered Session Data Flow
 
-1. `manifold enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
-2. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
-3. The control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
-4. Optional isolation profiles create or join session-local filesystem, runtime
+1. `mctl enter`, `mctl show`, and related directory-scoped commands discover a
+   project runner from the current directory, first through an ancestor
+   `manifold.toml` and then through lower-priority project markers such as
+   `flake.nix`, and resolve that project root to a project control target.
+2. If the project session server is not already running, `mctl` starts it
+   through the configured session runner before issuing the control command.
+3. The session runner starts in a transient user scope, activates project tools
+   such as `nix develop`, then resolves the launch record for its current
+   cgroup to start the assigned session server or entered command.
+4. `mctl enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
+5. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
+6. The control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
+7. Optional isolation profiles create or join session-local filesystem, runtime
    IPC, network, PID/IPC, and DBus boundaries. The target `managed` profile
    captures regular writes by default, redirects runtime paths into the session,
    and keeps host bridges explicit.
-5. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
-6. `manifold show` presents the directory-bound or explicitly selected session without changing its process, filesystem, or network state, and can create an empty session when invoked outside one.
-7. `manifold hide` resolves the same target shape and detaches the presentation surface without closing the session.
-8. `manifold list` reports the directory-associated sessions by default and can report all live sessions globally.
-9. Control commands and aliases such as `mctl` default to the entered session unless a command explicitly targets another session.
+8. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
+9. `mctl show` presents the directory-bound or explicitly selected session without changing its process, filesystem, or network state, and can create an empty session when invoked outside one.
+10. `mctl hide` resolves the same target shape and detaches the presentation surface without closing the session.
+11. `mctl list` reports the directory-associated sessions by default and can report all live sessions globally.
+12. Control commands and aliases such as `mctl` default to the entered session unless a command explicitly targets another session.
 
 ## Core Rule
 

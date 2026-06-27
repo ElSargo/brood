@@ -5,9 +5,11 @@ mod config;
 mod control;
 mod debug_dump;
 mod input;
+pub mod launch_context;
 mod layout;
 mod presentation;
 mod session_bus;
+mod session_runner;
 mod state;
 mod wasm_key;
 mod wasm_map;
@@ -55,35 +57,47 @@ enum Command {
     Ctl(CtlArgs),
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 struct RunArgs {
+    #[command(flatten)]
+    session: SessionArgs,
+    /// Bypass the configured session runner for this launch.
+    #[arg(long = "no-session-runner")]
+    no_session_runner: bool,
+    /// Override the configured session runner for this launch.
+    #[arg(long = "session-runner", value_name = "KIND")]
+    session_runner: Option<String>,
+}
+
+#[derive(Debug, Clone, Parser, serde::Deserialize, serde::Serialize)]
+pub struct SessionArgs {
     /// Command to launch as a hosted Wayland app inside the nested compositor.
     #[arg(short = 'c', long = "command")]
-    command: Option<OsString>,
+    pub(crate) command: Option<OsString>,
     /// DBus destination name for this session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name", default_value = DEFAULT_MANIFOLD_DBUS_NAME)]
-    dbus_name: String,
+    pub(crate) dbus_name: String,
     /// DBus bus address for this session control endpoint.
     #[arg(long = "dbus-address")]
-    dbus_address: Option<String>,
+    pub(crate) dbus_address: Option<String>,
     /// Start the service/runtime process without tying it to a presentation session.
     #[arg(long)]
-    headless: bool,
+    pub(crate) headless: bool,
     /// Start with an attached offscreen presentation target. Used by nested tests.
     #[arg(long = "offscreen-presentation", hide = true)]
-    offscreen_presentation: bool,
+    pub(crate) offscreen_presentation: bool,
     /// Launch an isolated Chromium browser pane at startup.
     #[arg(long = "browser", value_name = "URL", num_args = 0..=1, default_missing_value = "about:blank")]
-    browser: Option<String>,
+    pub(crate) browser: Option<String>,
     /// Load a core-WASM normal-mode key handler.
     #[arg(long = "wasm-key-handler", value_name = "PATH")]
-    wasm_key_handler: Option<PathBuf>,
+    pub(crate) wasm_key_handler: Option<PathBuf>,
     /// Load a core-WASM fast map hook.
     #[arg(long = "wasm-map-hook", value_name = "PATH")]
-    wasm_map_hook: Option<PathBuf>,
+    pub(crate) wasm_map_hook: Option<PathBuf>,
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
-    test_harness: Option<PathBuf>,
+    pub(crate) test_harness: Option<PathBuf>,
     /// Inner DBus control destination used by nested test supervisors.
     #[arg(
         long = "nested-inner-dbus-destination",
@@ -91,23 +105,23 @@ struct RunArgs {
         value_name = "NAME",
         hide = true
     )]
-    nested_inner_dbus_name: Option<String>,
+    pub(crate) nested_inner_dbus_name: Option<String>,
     /// Inner DBus bus address used by nested test supervisors.
     #[arg(
         long = "nested-inner-dbus-address",
         value_name = "ADDRESS",
         hide = true
     )]
-    nested_inner_dbus_address: Option<String>,
+    pub(crate) nested_inner_dbus_address: Option<String>,
     /// Project/session config file to load at startup.
     #[arg(long = "config", value_name = "PATH", default_value = "manifold.toml")]
-    config: std::path::PathBuf,
+    pub(crate) config: std::path::PathBuf,
     /// Start without loading modules from the config file.
     #[arg(long = "no-default-modules")]
-    no_default_modules: bool,
+    pub(crate) no_default_modules: bool,
 }
 
-impl Default for RunArgs {
+impl Default for SessionArgs {
     fn default() -> Self {
         Self {
             command: None,
@@ -123,6 +137,16 @@ impl Default for RunArgs {
             nested_inner_dbus_address: None,
             config: PathBuf::from("manifold.toml"),
             no_default_modules: false,
+        }
+    }
+}
+
+impl Default for RunArgs {
+    fn default() -> Self {
+        Self {
+            session: SessionArgs::default(),
+            no_session_runner: false,
+            session_runner: None,
         }
     }
 }
@@ -306,4 +330,18 @@ pub fn run_cli() -> Result<()> {
         Command::Test(args) => compositor::run_test(args),
         Command::Ctl(args) => control::send(args).context("send control command"),
     }
+}
+
+pub fn run_session_cli() -> Result<()> {
+    fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init()
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    let args = match launch_context::current_launch_record() {
+        Ok(record) => record.session_args.unwrap_or_default(),
+        Err(_) => SessionArgs::parse(),
+    };
+    info!(?args, "starting manifold session server");
+    compositor::serve_session(args)
 }

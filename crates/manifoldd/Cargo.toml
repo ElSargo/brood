@@ -9,7 +9,15 @@ path = "src/main.rs"
 
 [[bin]]
 name = "mctl"
-path = "src/bin/mctl.rs"
+Path = "src/bin/mctl.rs"
+
+[[bin]]
+name = "manifold-sessiond"
+path = "src/bin/manifold-sessiond.rs"
+
+[[bin]]
+name = "manifold-runner-nix-develop"
+path = "src/bin/manifold-runner-nix-develop.rs"
 
 [features]
 default = ["shm-fallback"]

@@ -19,6 +19,10 @@ enabled = true
 realm = "presentation"
 argv = ["python3", "apps/manifold-session-switcher.py", "--width", "300"]
 
+[session.runner]
+enabled = true
+kind = "nix-develop"
+
 [module.master-layout]
 enabled = false
 kind = "fast-map-hook"

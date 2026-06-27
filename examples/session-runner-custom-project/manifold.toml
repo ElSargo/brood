@@ -1,0 +1,9 @@
+[session.runner]
+enabled = true
+kind = "custom"
+command = ["./scripts/runner.sh"]
+cache_root = ".manifold/cache"
+
+[startup.env-proof]
+enabled = true
+argv = ["./scripts/write-env-proof.sh"]

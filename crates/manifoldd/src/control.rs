@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -9,6 +10,9 @@ use std::{
     thread,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail, ensure};
 use smithay::{
@@ -27,8 +31,10 @@ use crate::{
     CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, ShowArgs, SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
+    config,
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
+    session_runner,
     state::{
         FocusDirection, Manifold, PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
     },
@@ -787,8 +793,10 @@ pub fn enter(args: EnterArgs) -> Result<()> {
         );
     }
 
-    let target = resolve_control_target(args.dbus_name, args.dbus_address);
     let current_directory = current_directory()?;
+    let runner = config::discover_session_runner(&current_directory)?;
+    let target = resolve_project_control_target(args.dbus_name, args.dbus_address, runner.as_ref());
+    ensure_project_control_target_running(&target, runner.as_ref())?;
     let existing_default = resolve_directory_surface_session(&target, &current_directory)?;
     let (session_id, set_default) = if args.new {
         let session_id = create_surface_session(&target, None)?;
@@ -808,26 +816,61 @@ pub fn enter(args: EnterArgs) -> Result<()> {
 
     let status = status_snapshot(&target)?;
 
-    let mut command = entered_command(args.command);
-    command.env(
-        MANIFOLD_SESSION_ENV,
-        target.session_marker_with_session(Some(session_id)),
-    );
-    command.env(MANIFOLDD_DBUS_DESTINATION_ENV, &target.destination);
-    command.env("MANIFOLD_SURFACE_SESSION_ID", session_id.to_string());
+    let (program, command_args) = entered_argv(args.command);
+    let mut command_env = vec![
+        (
+            MANIFOLD_SESSION_ENV.to_string(),
+            OsString::from(target.session_marker_with_session(Some(session_id))),
+        ),
+        (
+            MANIFOLDD_DBUS_DESTINATION_ENV.to_string(),
+            OsString::from(&target.destination),
+        ),
+        (
+            "MANIFOLD_SURFACE_SESSION_ID".to_string(),
+            OsString::from(session_id.to_string()),
+        ),
+    ];
     if let Some(address) = target.address.as_deref() {
-        command.env(MANIFOLDD_DBUS_ADDRESS_ENV, address);
+        command_env.push((
+            MANIFOLDD_DBUS_ADDRESS_ENV.to_string(),
+            OsString::from(address),
+        ));
     }
 
+    let mut remove_env = Vec::new();
     if args.no_capture {
         if env::var_os("WAYLAND_DISPLAY").as_deref() == Some(status.wayland_display.as_ref()) {
-            command.env_remove("WAYLAND_DISPLAY");
+            remove_env.push("WAYLAND_DISPLAY");
         }
     } else {
-        command.env("WAYLAND_DISPLAY", &status.wayland_display);
+        command_env.push((
+            "WAYLAND_DISPLAY".to_string(),
+            OsString::from(&status.wayland_display),
+        ));
     }
 
-    let status = command.status().context("run entered command")?;
+    let mut entered_command_argv = vec![program.clone()];
+    entered_command_argv.extend(command_args.iter().cloned());
+    let status = match session_runner::run_project_command_if_configured(
+        runner.as_ref(),
+        &entered_command_argv,
+        &command_env,
+        &remove_env,
+    )? {
+        Some(status) => status,
+        None => {
+            let mut command = ProcessCommand::new(&program);
+            command
+                .args(&command_args)
+                .envs(command_env.iter().map(|(key, value)| (key, value)));
+            for key in &remove_env {
+                command.env_remove(key);
+            }
+            command.status().context("run entered command")?
+        }
+    };
+
     match status.code() {
         Some(code) => std::process::exit(code),
         None => bail!("entered command terminated by signal"),
@@ -835,7 +878,10 @@ pub fn enter(args: EnterArgs) -> Result<()> {
 }
 
 pub fn show(args: ShowArgs) -> Result<()> {
-    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let current_directory = current_directory()?;
+    let runner = config::discover_session_runner(&current_directory)?;
+    let target = resolve_project_control_target(args.dbus_name, args.dbus_address, runner.as_ref());
+    ensure_project_control_target_running(&target, runner.as_ref())?;
     let (session_id, current_directory, set_default) =
         resolve_cli_surface_session(&target, args.id, true, args.set_default)?;
     remember_directory_surface_session(&target, &current_directory, session_id, set_default)?;
@@ -851,7 +897,10 @@ pub fn show(args: ShowArgs) -> Result<()> {
 }
 
 pub fn hide(args: HideArgs) -> Result<()> {
-    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let current_directory = current_directory()?;
+    let runner = config::discover_session_runner(&current_directory)?;
+    let target = resolve_project_control_target(args.dbus_name, args.dbus_address, runner.as_ref());
+    ensure_project_control_target_running(&target, runner.as_ref())?;
     let (session_id, current_directory, set_default) =
         resolve_cli_surface_session(&target, args.id, false, false)?;
     remember_directory_surface_session(&target, &current_directory, session_id, set_default)?;
@@ -867,14 +916,16 @@ pub fn hide(args: HideArgs) -> Result<()> {
 }
 
 pub fn list(args: ListArgs) -> Result<()> {
-    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let current_directory = current_directory()?;
+    let runner = config::discover_session_runner(&current_directory)?;
+    let target = resolve_project_control_target(args.dbus_name, args.dbus_address, runner.as_ref());
+    ensure_project_control_target_running(&target, runner.as_ref())?;
     if args.global {
         let list = request_surface_session_list(&target)?;
         print_surface_sessions(&list.sessions, None);
         return Ok(());
     }
 
-    let current_directory = current_directory()?;
     let list = request_directory_surface_session_list(&target, &current_directory)?;
     print_surface_sessions(&list.sessions, list.default);
     Ok(())
@@ -921,6 +972,150 @@ fn switch_surface_session(target: &ControlTarget, session_id: u64) -> Result<()>
 fn current_directory() -> Result<PathBuf> {
     let directory = env::current_dir().context("determine current directory")?;
     Ok(directory.canonicalize().unwrap_or(directory))
+}
+
+fn resolve_project_control_target(
+    destination: Option<String>,
+    address: Option<String>,
+    runner: Option<&config::SessionRunnerSelection>,
+) -> ControlTarget {
+    if destination.is_some()
+        || address.is_some()
+        || env::var_os(MANIFOLDD_DBUS_DESTINATION_ENV).is_some()
+        || env::var_os(MANIFOLDD_DBUS_ADDRESS_ENV).is_some()
+        || env::var_os(MANIFOLD_SESSION_ENV).is_some()
+    {
+        return resolve_control_target(destination, address);
+    }
+
+    let Some(runner) = runner else {
+        return resolve_control_target(destination, address);
+    };
+
+    ControlTarget::new(project_control_destination(&runner.project_dir), None)
+}
+
+fn ensure_project_control_target_running(
+    target: &ControlTarget,
+    runner: Option<&config::SessionRunnerSelection>,
+) -> Result<()> {
+    let Some(runner) = runner else {
+        return Ok(());
+    };
+
+    if target.destination != project_control_destination(&runner.project_dir) {
+        return Ok(());
+    }
+    if target_has_owner(target)? {
+        return Ok(());
+    }
+
+    let log_path = spawn_project_server(target, runner)?;
+    for _ in 0..1800 {
+        if target_has_owner(target)? && status_snapshot(target).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "project Manifold session server did not become ready for {}; see {}",
+        target.destination,
+        log_path.display()
+    )
+}
+
+fn spawn_project_server(
+    target: &ControlTarget,
+    runner: &config::SessionRunnerSelection,
+) -> Result<PathBuf> {
+    let current_exe = env::current_exe().context("resolve current executable")?;
+    let manifoldd = sidecar_binary_path(&current_exe, "manifoldd");
+    let log_dir = project_server_log_dir(&runner.project_dir)?;
+    fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
+    let log_path = log_dir.join(format!("{}.log", target.destination));
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open {}", log_path.display()))?;
+    let log_err = log.try_clone().context("clone project server log")?;
+
+    let mut command = ProcessCommand::new(&manifoldd);
+    command
+        .arg("run")
+        .arg("--headless")
+        .arg("--dbus-destination")
+        .arg(&target.destination)
+        .arg("--config")
+        .arg(&runner.config_path)
+        .current_dir(&runner.project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    detach_project_server(&mut command);
+    command.spawn().with_context(|| {
+        format!(
+            "start project Manifold server {} in {}",
+            manifoldd.display(),
+            runner.project_dir.display()
+        )
+    })?;
+    Ok(log_path)
+}
+
+fn detach_project_server(command: &mut ProcessCommand) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn target_has_owner(target: &ControlTarget) -> Result<bool> {
+    let connection = typed_connection(target)?;
+    let proxy =
+        zbus::blocking::fdo::DBusProxy::new(&connection).context("build DBus daemon proxy")?;
+    let name = zbus::names::BusName::try_from(target.destination.as_str())
+        .with_context(|| format!("parse DBus bus name {}", target.destination))?;
+    proxy
+        .name_has_owner(name)
+        .with_context(|| format!("check DBus owner for {}", target.destination))
+}
+
+fn sidecar_binary_path(current_exe: &Path, name: &str) -> PathBuf {
+    let mut path = current_exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(name);
+    if let Some(extension) = current_exe.extension() {
+        path.set_extension(extension);
+    }
+    path
+}
+
+fn project_server_log_dir(project_dir: &Path) -> Result<PathBuf> {
+    let root = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(env::temp_dir)
+        .join("manifold")
+        .join("project-servers");
+    Ok(root.join(format!("{:016x}", stable_path_hash(project_dir))))
+}
+
+fn project_control_destination(project_dir: &Path) -> String {
+    format!(
+        "org.manifold.Project.p{:016x}",
+        stable_path_hash(project_dir)
+    )
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn create_surface_session(target: &ControlTarget, name: Option<String>) -> Result<u64> {
@@ -1034,15 +1229,13 @@ fn entered_surface_session_id() -> Option<u64> {
         })
 }
 
-fn entered_command(argv: Vec<OsString>) -> ProcessCommand {
+fn entered_argv(argv: Vec<OsString>) -> (OsString, Vec<OsString>) {
     let mut argv = argv.into_iter();
     let program = argv
         .next()
         .or_else(|| env::var_os("SHELL"))
         .unwrap_or_else(|| OsString::from("/bin/sh"));
-    let mut command = ProcessCommand::new(&program);
-    command.args(argv);
-    command
+    (program, argv.collect())
 }
 
 pub fn switch(args: SwitchArgs) -> Result<()> {
