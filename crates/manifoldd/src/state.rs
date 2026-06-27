@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     process::{Child, Command},
     rc::Rc,
@@ -160,11 +161,28 @@ pub struct GrantSummary {
     pub detail: ExtensionMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AgentSummary {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub sender: String,
+    pub session: u64,
+    pub attention: bool,
+    pub unread_notifications: u64,
+    pub notification_count: u64,
+    pub last_notification_title: Option<String>,
+    pub last_notification_body: Option<String>,
+    pub metadata: ExtensionMetadata,
+}
+
 #[derive(Default)]
 struct ExtensionRegistry {
     extensions: Vec<ExtensionRecord>,
     windows: Vec<WindowRecord>,
     grants: Vec<GrantRecord>,
+    agents: Vec<AgentRecord>,
+    notifications: Vec<AgentNotificationRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +210,30 @@ struct GrantRecord {
     detail: ExtensionMetadata,
     sender: String,
     active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentRecord {
+    id: String,
+    kind: String,
+    status: String,
+    metadata: ExtensionMetadata,
+    sender: String,
+    session: SurfaceSessionId,
+    attention: bool,
+    unread_notifications: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentNotificationRecord {
+    id: String,
+    agent_id: String,
+    title: String,
+    subtitle: String,
+    body: String,
+    level: String,
+    metadata: ExtensionMetadata,
+    unread: bool,
 }
 
 pub struct Manifold {
@@ -1627,6 +1669,24 @@ impl Manifold {
         true
     }
 
+    pub fn focus_window_identity(&mut self, identity: &ExtensionMetadata) -> bool {
+        let window = self
+            .space
+            .elements()
+            .filter(|window| self.window_belongs_to_active_surface_session(window))
+            .find(|window| {
+                Manifold::window_toplevel_surface(window).is_some_and(|surface| {
+                    toplevel_matches_agent_identity(self, &surface, identity)
+                })
+            })
+            .cloned();
+        let Some(window) = window else {
+            return false;
+        };
+        self.focus_window(&window);
+        true
+    }
+
     pub fn focus_app_id_or_spawn(&mut self, app_id: &str, argv: &[String]) -> bool {
         if self.focus_app_id(app_id) {
             return true;
@@ -1731,6 +1791,201 @@ impl Manifold {
         };
         grant.active = false;
         true
+    }
+
+    pub fn register_agent(
+        &mut self,
+        kind: String,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<String> {
+        let kind = normalize_registry_value(&kind).context("agent kind must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let session = metadata
+            .get("surface_session")
+            .or_else(|| metadata.get("session_id"))
+            .and_then(|value| self.resolve_surface_session(value))
+            .unwrap_or(self.active_surface_session);
+        let id = stable_registry_id("agent", [&kind], &metadata);
+        if let Some(record) = self
+            .extension_registry
+            .agents
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            record.kind = kind;
+            record.metadata = metadata;
+            record.sender = sender;
+            record.session = session;
+        } else {
+            self.extension_registry.agents.push(AgentRecord {
+                id: id.clone(),
+                kind,
+                status: "unknown".to_string(),
+                metadata,
+                sender,
+                session,
+                attention: false,
+                unread_notifications: 0,
+            });
+        }
+        Ok(id)
+    }
+
+    pub fn update_agent(
+        &mut self,
+        agent_id: &str,
+        status: String,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<bool> {
+        let status = normalize_registry_value(&status).context("agent status must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let Some(record) = self
+            .extension_registry
+            .agents
+            .iter_mut()
+            .find(|record| record.id == agent_id)
+        else {
+            return Ok(false);
+        };
+        record.status = status;
+        for (key, value) in metadata {
+            if key == "first_user_message"
+                && record
+                    .metadata
+                    .get("first_user_message")
+                    .is_some_and(|existing| !existing.is_empty())
+            {
+                continue;
+            }
+            record.metadata.insert(key, value);
+        }
+        record.sender = sender;
+        Ok(true)
+    }
+
+    pub fn notify_agent(
+        &mut self,
+        agent_id: &str,
+        title: String,
+        subtitle: String,
+        body: String,
+        level: String,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<String> {
+        let title =
+            normalize_registry_value(&title).context("notification title must not be empty")?;
+        let level = normalize_registry_value(&level).unwrap_or_else(|| "info".to_string());
+        ensure_metadata(&metadata)?;
+        let Some(record) = self
+            .extension_registry
+            .agents
+            .iter_mut()
+            .find(|record| record.id == agent_id)
+        else {
+            anyhow::bail!("unknown agent {agent_id}");
+        };
+        record.sender = sender;
+        record.attention = true;
+        record.unread_notifications = record.unread_notifications.saturating_add(1);
+        if matches!(level.as_str(), "waiting" | "blocked" | "error") {
+            record.status = level.clone();
+        }
+
+        let mut id_metadata = metadata.clone();
+        id_metadata.insert("agent_id".to_string(), agent_id.to_string());
+        id_metadata.insert("title".to_string(), title.clone());
+        id_metadata.insert("body".to_string(), body.clone());
+        let id = stable_registry_id("agent-notification", [&level], &id_metadata);
+        self.extension_registry
+            .notifications
+            .push(AgentNotificationRecord {
+                id: id.clone(),
+                agent_id: agent_id.to_string(),
+                title,
+                subtitle,
+                body,
+                level,
+                metadata,
+                unread: true,
+            });
+        Ok(id)
+    }
+
+    pub fn clear_agent_attention(&mut self, agent_id: &str) -> bool {
+        let Some(record) = self
+            .extension_registry
+            .agents
+            .iter_mut()
+            .find(|record| record.id == agent_id)
+        else {
+            return false;
+        };
+        record.attention = false;
+        record.unread_notifications = 0;
+        for notification in self
+            .extension_registry
+            .notifications
+            .iter_mut()
+            .filter(|notification| notification.agent_id == agent_id)
+        {
+            notification.unread = false;
+        }
+        true
+    }
+
+    pub fn unregister_agent(&mut self, agent_id: &str) -> bool {
+        let before = self.extension_registry.agents.len();
+        self.extension_registry
+            .agents
+            .retain(|agent| agent.id != agent_id);
+        if before == self.extension_registry.agents.len() {
+            return false;
+        }
+        self.extension_registry
+            .notifications
+            .retain(|notification| notification.agent_id != agent_id);
+        true
+    }
+
+    pub fn agent_summaries(&self) -> Vec<AgentSummary> {
+        self.extension_registry
+            .agents
+            .iter()
+            .map(|record| {
+                let notifications = self
+                    .extension_registry
+                    .notifications
+                    .iter()
+                    .filter(|notification| notification.agent_id == record.id)
+                    .collect::<Vec<_>>();
+                let last_notification = notifications.last().copied();
+                AgentSummary {
+                    id: record.id.clone(),
+                    kind: record.kind.clone(),
+                    status: record.status.clone(),
+                    sender: record.sender.clone(),
+                    session: record.session.raw(),
+                    attention: record.attention,
+                    unread_notifications: record.unread_notifications,
+                    notification_count: u64::try_from(notifications.len()).unwrap_or(u64::MAX),
+                    last_notification_title: last_notification
+                        .map(|notification| notification.title.clone()),
+                    last_notification_body: last_notification.map(|notification| {
+                        if notification.subtitle.is_empty() {
+                            notification.body.clone()
+                        } else if notification.body.is_empty() {
+                            notification.subtitle.clone()
+                        } else {
+                            format!("{}: {}", notification.subtitle, notification.body)
+                        }
+                    }),
+                    metadata: record.metadata.clone(),
+                }
+            })
+            .collect()
     }
 
     pub fn register_extension_window(
@@ -2560,6 +2815,66 @@ fn toplevel_matches_identity(
         matched = true;
     }
     matched
+}
+
+fn toplevel_matches_agent_identity(
+    state: &Manifold,
+    surface: &WlSurface,
+    identity: &ExtensionMetadata,
+) -> bool {
+    let mut matched = false;
+    if let Some(expected) = identity.get("app_id").filter(|value| !value.is_empty()) {
+        if toplevel_app_id(surface).as_deref() != Some(expected.as_str()) {
+            return false;
+        }
+        matched = true;
+    }
+    if let Some(expected) = identity.get("title").filter(|value| !value.is_empty()) {
+        if toplevel_title(surface).as_deref() != Some(expected.as_str()) {
+            return false;
+        }
+        matched = true;
+    }
+    if let Some(expected) = identity.get("pid").filter(|value| !value.is_empty()) {
+        let Some(window_pid) = toplevel_pid(state, surface) else {
+            return false;
+        };
+        if window_pid != *expected && !process_is_ancestor(&window_pid, expected) {
+            return false;
+        }
+        matched = true;
+    }
+    matched
+}
+
+fn process_is_ancestor(parent_pid: &str, child_pid: &str) -> bool {
+    let Ok(parent_pid) = parent_pid.parse::<u32>() else {
+        return false;
+    };
+    let Ok(mut pid) = child_pid.parse::<u32>() else {
+        return false;
+    };
+    for _ in 0..64 {
+        if pid == parent_pid {
+            return true;
+        }
+        let Some(ppid) = process_parent_pid(pid) else {
+            return false;
+        };
+        if ppid == 0 || ppid == pid {
+            return false;
+        }
+        pid = ppid;
+    }
+    false
+}
+
+fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    let mut fields = after_name.split_whitespace();
+    fields.next()?;
+    fields.next()?.parse().ok()
 }
 
 fn placement_requests_left_panel(placement: &ExtensionMetadata) -> bool {

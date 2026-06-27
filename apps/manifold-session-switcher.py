@@ -15,7 +15,7 @@ try:
         raise ValueError("GTK3 fallback forced")
     gi.require_version("Gdk", "4.0")
     gi.require_version("Gtk", "4.0")
-    from gi.repository import Gdk, Gio, GLib, Gtk
+    from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
     try:
         if disable_adwaita:
@@ -30,13 +30,14 @@ except (ImportError, ValueError):
     Adw = None
     gi.require_version("Gdk", "3.0")
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gdk, Gio, GLib, Gtk
+    from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
     GTK4 = False
 
 
 APP_ID = "org.manifold.SessionSwitcher"
 DEFAULT_DESTINATION = "org.manifold.Session"
+DISCLOSURE_COLUMN_WIDTH = 28
 
 
 def metadata(**items):
@@ -82,6 +83,10 @@ class ManifoldBus:
             self.bus.get_object(self.destination, "/org/manifold/Compositor"),
             "org.manifold.Compositor",
         )
+        self.agent = dbus.Interface(
+            self.bus.get_object(self.destination, "/org/manifold/Agent"),
+            "org.manifold.Agent",
+        )
 
     def list_sessions(self):
         rows = []
@@ -92,6 +97,41 @@ class ManifoldBus:
                     "name": str(name),
                     "active": bool(active),
                     "windows": int(windows),
+                }
+            )
+        return rows
+
+    def list_agents(self):
+        rows = []
+        for raw in self.agent.ListAgents():
+            (
+                agent_id,
+                kind,
+                status,
+                sender,
+                session,
+                attention,
+                unread,
+                notifications,
+                last_title,
+                last_body,
+                metadata,
+            ) = raw
+            rows.append(
+                {
+                    "id": str(agent_id),
+                    "kind": str(kind),
+                    "status": str(status),
+                    "sender": str(sender),
+                    "session": int(session),
+                    "attention": bool(attention),
+                    "unread": int(unread),
+                    "notifications": int(notifications),
+                    "last_title": str(last_title),
+                    "last_body": str(last_body),
+                    "metadata": {
+                        str(key): str(value) for key, value in dict(metadata).items()
+                    },
                 }
             )
         return rows
@@ -107,6 +147,27 @@ class ManifoldBus:
         if not response.startswith("OK "):
             raise RuntimeError(response.strip())
         return int(self.manager.ActiveSession())
+
+    def focus_app_id(self, app_id):
+        return str(
+            self.control.Command(
+                dbus.Array(["focus-app-id", str(app_id)], signature="s"),
+                False,
+            )
+        )
+
+    def focus_window(self, identity):
+        argv = ["focus-window"]
+        for key in ("pid", "app_id", "title"):
+            value = identity.get(key, "")
+            if value:
+                argv.append(f"{key}={value}")
+        if len(argv) == 1:
+            return "OK focus-window changed=false missing-identity"
+        return str(self.control.Command(dbus.Array(argv, signature="s"), False))
+
+    def clear_agent_attention(self, agent_id):
+        return bool(self.agent.ClearAgentAttention(str(agent_id)))
 
     def register_sidebar(self, width):
         extension_id = self.extension.RegisterExtension(
@@ -149,7 +210,12 @@ class SessionSwitcher:
         self.args = args
         self.bus = ManifoldBus(args.dbus_address, args.dbus_name)
         self.sessions = []
+        self.agents = []
         self.filtered_sessions = []
+        self.expanded_sessions = set()
+        self.session_order = []
+        self.session_rows = {}
+        self.animation_tick = 0
         self.registered = False
         self.last_error = None
 
@@ -162,6 +228,7 @@ class SessionSwitcher:
             self.present_window()
             GLib.timeout_add(250, self.register_with_manifold)
             GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
+            GLib.timeout_add(450, self.animate_working_agents)
             Gtk.main()
             return 0
 
@@ -185,6 +252,7 @@ class SessionSwitcher:
         self.present_window()
         GLib.timeout_add(250, self.register_with_manifold)
         GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
+        GLib.timeout_add(450, self.animate_working_agents)
 
     def make_window(self, app):
         if GTK4:
@@ -203,6 +271,7 @@ class SessionSwitcher:
             self.window.show_all()
 
     def build_ui(self):
+        self.install_css()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         outer.set_margin_top(10)
         outer.set_margin_bottom(10)
@@ -265,6 +334,53 @@ class SessionSwitcher:
             self.window.connect("button-release-event", self.activate_session_from_gtk3_click)
             self.window.add(outer)
 
+    def install_css(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b"""
+            button.session-select,
+            button.dropdown-toggle {
+              background: transparent;
+              border: 1px solid transparent;
+              box-shadow: none;
+              text-shadow: none;
+              padding: 3px 5px;
+              min-height: 28px;
+              min-width: 28px;
+            }
+            button.session-select.active-session {
+              border-color: rgba(90, 150, 190, 0.85);
+              background: rgba(90, 150, 190, 0.10);
+            }
+            button.agent-select {
+              padding: 2px 6px;
+              min-height: 24px;
+            }
+            button.session-select:hover,
+            button.dropdown-toggle:hover {
+              background: rgba(120, 120, 120, 0.14);
+            }
+            .agent-dot-working {
+              opacity: 0.30;
+            }
+            .agent-dot-working.pulse {
+              opacity: 1.0;
+            }
+            """
+        )
+        if GTK4:
+            display = Gdk.Display.get_default()
+            if display is not None:
+                Gtk.StyleContext.add_provider_for_display(
+                    display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+        else:
+            screen = Gdk.Screen.get_default()
+            if screen is not None:
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+
     def pack(self, box, child, expand):
         if GTK4:
             if expand:
@@ -297,9 +413,22 @@ class SessionSwitcher:
     def refresh_sessions(self):
         try:
             sessions = self.bus.list_sessions()
+            agents = self.bus.list_agents()
+            self.animation_tick = (self.animation_tick + 1) % 2
             self.last_error = None
-            if sessions != self.sessions:
+            live_session_ids = {session["id"] for session in sessions}
+            self.session_order = [
+                session_id
+                for session_id in self.session_order
+                if session_id in live_session_ids
+            ]
+            for session in sessions:
+                if session["id"] not in self.session_order:
+                    self.session_order.append(session["id"])
+            self.expanded_sessions.intersection_update(live_session_ids)
+            if sessions != self.sessions or agents != self.agents:
                 self.sessions = sessions
+                self.agents = agents
                 self.filter_sessions()
         except Exception as err:
             self.last_error = str(err)
@@ -316,19 +445,37 @@ class SessionSwitcher:
             ]
         else:
             self.filtered_sessions = list(self.sessions)
+        order = {session_id: index for index, session_id in enumerate(self.session_order)}
+        self.filtered_sessions.sort(
+            key=lambda session: (order.get(session["id"], len(order)), session["id"])
+        )
         self.render_sessions()
 
     def render_sessions(self):
-        self.clear_listbox()
+        self.agents_by_session = {}
+        for agent in self.agents:
+            self.agents_by_session.setdefault(agent["session"], []).append(agent)
+        visible_session_ids = {session["id"] for session in self.filtered_sessions}
+        live_session_ids = {session["id"] for session in self.sessions}
+
         for session in self.filtered_sessions:
             self.add_session_row(session)
+            self.session_rows[session["id"]]["root"].set_visible(True)
+
+        for session_id, widgets in list(self.session_rows.items()):
+            if session_id not in live_session_ids:
+                self.listbox.remove(widgets["root"])
+                del self.session_rows[session_id]
+            elif session_id not in visible_session_ids:
+                widgets["root"].set_visible(False)
+
         write_status(
             self.args.event_file,
             event="render",
             sessions=len(self.sessions),
+            agents=len(self.agents),
             rows=len(self.filtered_sessions),
         )
-        self.present_window()
 
     def clear_listbox(self):
         if GTK4:
@@ -343,64 +490,276 @@ class SessionSwitcher:
 
     def add_session_row(self, session):
         label = f"{session['name']}  {session['windows']}w"
-        if session["active"]:
-            label = f"* {label}"
-        if not GTK4:
-            button = Gtk.Button(label=label)
-            button.set_size_request(-1, 42)
-            button.connect("clicked", self.activate_session, session["id"])
-            self.listbox.pack_start(button, False, False, 0)
-            button.show_all()
+        agents = self.agents_by_session.get(session["id"], [])
+        if agents:
+            label = f"{label}  {len(agents)}a"
+
+        if session["id"] in self.session_rows:
+            widgets = self.session_rows[session["id"]]
+            widgets["label"].set_text(label)
+            button_context = widgets["button"].get_style_context()
+            if session["active"]:
+                button_context.add_class("active-session")
+            else:
+                button_context.remove_class("active-session")
+            widgets["toggle"].set_label(
+                "v" if session["id"] in self.expanded_sessions else ">"
+            )
+            widgets["toggle"].set_sensitive(bool(agents))
+            widgets["agent_box"].set_visible(session["id"] in self.expanded_sessions)
+            agent_signature = tuple(
+                (
+                    agent["id"],
+                    agent["status"],
+                    agent["attention"],
+                    agent["last_title"],
+                    agent["last_body"],
+                    tuple(sorted(agent["metadata"].items())),
+                )
+                for agent in agents
+            )
+            if agent_signature != widgets["agent_signature"]:
+                self.replace_agent_items(widgets["agent_box"], agents)
+                widgets["agent_signature"] = agent_signature
             return
 
-        label_widget = Gtk.Label(label=label, xalign=0)
-        label_widget.set_size_request(-1, 42)
-        label_widget.set_hexpand(True)
-        label_widget.set_margin_start(8)
-        label_widget.set_margin_end(8)
-        row = Gtk.ListBoxRow()
-        row.session_id = session["id"]
-        row.set_activatable(True)
+        row_shell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row_shell.set_hexpand(True)
+        row_shell.set_opacity(0.0)
+        toggle_label = "v" if session["id"] in self.expanded_sessions else ">"
+        toggle_button = Gtk.Button(label=toggle_label)
+        toggle_button.get_style_context().add_class("dropdown-toggle")
+        toggle_button.set_sensitive(bool(agents))
+        toggle_button.set_hexpand(False)
+        toggle_button.set_vexpand(False)
+        toggle_button.set_valign(Gtk.Align.START)
+        toggle_button.set_size_request(DISCLOSURE_COLUMN_WIDTH, -1)
+        self.pack(row_shell, toggle_button, expand=False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        content.set_hexpand(True)
+        content.set_vexpand(False)
+
+        session_button = Gtk.Button()
+        session_button.get_style_context().add_class("session-select")
+        if session["active"]:
+            session_button.get_style_context().add_class("active-session")
+        session_button.set_size_request(-1, 28)
+        session_button.set_hexpand(True)
+        session_button.connect("clicked", self.activate_session, session["id"])
+        session_label = Gtk.Label(label=label)
+        session_label.set_xalign(0)
+        session_label.set_hexpand(True)
+        session_label.set_ellipsize(Pango.EllipsizeMode.END)
         if GTK4:
-            click = Gtk.GestureClick()
-            click.set_button(0)
-            click.connect(
-                "pressed",
-                lambda _gesture, _n_press, _x, _y, session_id=session["id"]: self.activate_session(
-                    None, session_id
-                ),
-            )
-            click.connect(
-                "released",
-                lambda _gesture, _n_press, _x, _y, session_id=session["id"]: self.activate_session(
-                    None, session_id
-                ),
-            )
-            row.add_controller(click)
-            row.set_child(label_widget)
+            session_button.set_child(session_label)
         else:
-            row.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
-            row.connect(
-                "button-release-event",
-                lambda _row, _event, session_id=session["id"]: self.activate_session(
-                    None, session_id
+            session_button.add(session_label)
+        self.pack(content, session_button, expand=False)
+
+        agent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        agent_box.set_hexpand(True)
+        self.replace_agent_items(agent_box, agents)
+        agent_box.set_visible(session["id"] in self.expanded_sessions)
+        toggle_button.connect(
+            "clicked",
+            self.toggle_session_agents,
+            session["id"],
+            agent_box,
+            toggle_button,
+        )
+
+        self.pack(content, agent_box, expand=False)
+        self.pack(row_shell, content, expand=True)
+
+        if GTK4:
+            row = Gtk.ListBoxRow()
+            row.session_id = session["id"]
+            row.set_activatable(False)
+            row.set_child(row_shell)
+            self.listbox.append(row)
+            root = row
+        else:
+            self.listbox.pack_start(row_shell, False, False, 0)
+            row_shell.show_all()
+            agent_box.set_visible(session["id"] in self.expanded_sessions)
+            root = row_shell
+
+        self.fade_in(row_shell)
+        self.session_rows[session["id"]] = {
+            "root": root,
+            "button": session_button,
+            "label": session_label,
+            "toggle": toggle_button,
+            "agent_box": agent_box,
+            "agent_signature": tuple(
+                (
+                    agent["id"],
+                    agent["status"],
+                    agent["attention"],
+                    agent["last_title"],
+                    agent["last_body"],
+                    tuple(sorted(agent["metadata"].items())),
                 )
-                or False,
-            )
-            label_widget.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
-            label_widget.connect(
-                "button-release-event",
-                lambda _label, _event, session_id=session["id"]: self.activate_session(
-                    None, session_id
-                )
-                or False,
-            )
-            row.add(label_widget)
-            row.show_all()
-        self.listbox.append(row) if GTK4 else self.listbox.add(row)
+                for agent in agents
+            ),
+        }
+
+    def replace_agent_items(self, agent_box, agents):
+        if GTK4:
+            child = agent_box.get_first_child()
+            while child is not None:
+                next_child = child.get_next_sibling()
+                agent_box.remove(child)
+                child = next_child
+        else:
+            for child in agent_box.get_children():
+                agent_box.remove(child)
+        if agents:
+            for agent in agents:
+                self.pack(agent_box, self.make_agent_button(agent), expand=False)
+        else:
+            empty = Gtk.Label(label="No agents")
+            empty.set_xalign(0)
+            empty.set_margin_start(0)
+            empty.set_margin_bottom(4)
+            self.pack(agent_box, empty, expand=False)
+        if not GTK4:
+            agent_box.show_all()
+
+    def fade_in(self, widget, step=0):
+        opacity = min(1.0, 0.20 + step * 0.20)
+        widget.set_opacity(opacity)
+        if opacity >= 1.0:
+            return False
+        GLib.timeout_add(16, self.fade_in, widget, step + 1)
+        return False
+
+    def fade_out_then_hide(self, widget, step=0):
+        opacity = max(0.0, 1.0 - step * 0.25)
+        widget.set_opacity(opacity)
+        if opacity <= 0.0:
+            widget.set_visible(False)
+            widget.set_opacity(1.0)
+            return False
+        GLib.timeout_add(16, self.fade_out_then_hide, widget, step + 1)
+        return False
+
+    def animate_working_agents(self):
+        self.animation_tick = (self.animation_tick + 1) % 2
+        for widgets in self.session_rows.values():
+            agent_box = widgets.get("agent_box")
+            if agent_box is None:
+                continue
+            if GTK4:
+                child = agent_box.get_first_child()
+                while child is not None:
+                    self.update_agent_dot_pulse(child)
+                    child = child.get_next_sibling()
+            else:
+                for child in agent_box.get_children():
+                    self.update_agent_dot_pulse(child)
+        return True
+
+    def update_agent_dot_pulse(self, widget):
+        dot = getattr(widget, "agent_dot", None)
+        if dot is None and hasattr(widget, "get_child"):
+            child = widget.get_child()
+            dot = getattr(child, "agent_dot", None)
+        if dot is None:
+            return
+        context = dot.get_style_context()
+        if self.animation_tick:
+            context.add_class("pulse")
+        else:
+            context.remove_class("pulse")
+
+    def toggle_session_agents(self, _button, session_id, agent_box, toggle_button):
+        if session_id in self.expanded_sessions:
+            self.expanded_sessions.remove(session_id)
+            self.fade_out_then_hide(agent_box)
+            toggle_button.set_label(">")
+        else:
+            self.expanded_sessions.add(session_id)
+            agent_box.set_visible(True)
+            agent_box.set_opacity(0.0)
+            self.fade_in(agent_box)
+            toggle_button.set_label("v")
+
+    def make_agent_button(self, agent):
+        button = Gtk.Button()
+        button.get_style_context().add_class("agent-select")
+        button.set_tooltip_text(agent["id"])
+        button.connect("clicked", self.activate_agent, agent)
+        button.set_hexpand(True)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.set_hexpand(True)
+        row.set_margin_start(0)
+        row.set_margin_end(0)
+        row.set_margin_top(0)
+        row.set_margin_bottom(0)
+
+        dot = Gtk.Label()
+        color = "#2ea043" if self.agent_is_done(agent) else "#1f6feb"
+        dot.set_markup(f"<span foreground='{color}'>●</span>")
+        if not self.agent_is_done(agent):
+            dot.get_style_context().add_class("agent-dot-working")
+            if self.animation_tick:
+                dot.get_style_context().add_class("pulse")
+        self.pack(row, dot, expand=False)
+        row.agent_dot = dot
+
+        text = self.agent_label(agent)
+        label = Gtk.Label(label=text)
+        label.set_xalign(0)
+        label.set_hexpand(True)
+        label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.pack(row, label, expand=True)
+
+        if GTK4:
+            button.set_child(row)
+        else:
+            button.add(row)
+        return button
+
+    def agent_is_done(self, agent):
+        return agent["status"].lower() in {
+            "done",
+            "complete",
+            "completed",
+            "finished",
+            "idle",
+        }
+
+    def agent_label(self, agent):
+        metadata = agent["metadata"]
+        detail = (
+            metadata.get("first_user_message")
+            or metadata.get("prompt")
+            or metadata.get("userPrompt")
+            or metadata.get("last_event")
+            or metadata.get("task")
+            or metadata.get("cwd")
+            or metadata.get("terminal")
+            or ""
+        )
+        if detail:
+            return self.clean_agent_detail(detail)
+        return "Agent"
+
+    def clean_agent_detail(self, detail):
+        detail = " ".join(str(detail).split())
+        if detail.startswith("{") or detail.startswith("["):
+            return "event"
+        if len(detail) > 80:
+            return detail[:77] + "..."
+        return detail
 
     def activate_row(self, _listbox, row):
-        self.activate_session(None, row.session_id)
+        session_id = getattr(row, "session_id", None)
+        if session_id is not None:
+            self.activate_session(None, session_id)
 
     def activate_session(self, _button, session_id):
         try:
@@ -414,6 +773,42 @@ class SessionSwitcher:
             self.refresh_sessions()
         except Exception as err:
             write_status(self.args.event_file, event="activate-error", error=err)
+
+    def activate_agent(self, _button, agent):
+        try:
+            changed = self.bus.activate(agent["session"])
+            metadata = agent["metadata"]
+            app_id = metadata.get("app_id", "")
+            try:
+                focus_response = self.bus.focus_window(metadata).strip()
+            except Exception as err:
+                focus_response = f"focus-window-error:{err}"
+            if (
+                ("changed=false" in focus_response or focus_response.startswith("focus-window-error:"))
+                and app_id
+            ):
+                try:
+                    focus_response = self.bus.focus_app_id(app_id).strip()
+                except Exception as err:
+                    focus_response = f"focus-app-id-error:{err}"
+            self.bus.clear_agent_attention(agent["id"])
+            write_status(
+                self.args.event_file,
+                event="activate-agent",
+                agent=agent["id"],
+                session=agent["session"],
+                changed=str(changed).lower(),
+                app_id=app_id or "none",
+                focus=focus_response,
+            )
+            self.refresh_sessions()
+        except Exception as err:
+            write_status(
+                self.args.event_file,
+                event="activate-agent-error",
+                agent=agent.get("id", "unknown"),
+                error=err,
+            )
 
     def activate_session_from_panel_press(self, _gesture, _n_press, x, y):
         self.activate_session_at_position(x, y, event_name="panel-press")
@@ -468,18 +863,12 @@ class SessionSwitcher:
         row_height = 42
         if y < list_top:
             return
-        index = int((y - list_top) // row_height)
-        if index < 0 or index >= len(self.filtered_sessions):
-            return
-        session_id = self.filtered_sessions[index]["id"]
         write_status(
             self.args.event_file,
-            event=event_name,
+            event=f"{event_name}-ignored-list",
             x=round(x, 1),
             y=round(y, 1),
-            session=session_id,
         )
-        self.activate_session(None, session_id)
 
     def create_session(self, *_args):
         name = self.create_entry.get_text().strip() or None

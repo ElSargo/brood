@@ -21,7 +21,7 @@ use smithay::{
     utils::Point,
 };
 use tracing::{info, warn};
-use zbus::{fdo, message::Header, proxy};
+use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy};
 
 use crate::{
     CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
@@ -38,15 +38,30 @@ const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 const MANAGER_OBJECT_PATH: &str = "/org/manifold/Manager";
 const EXTENSION_OBJECT_PATH: &str = "/org/manifold/Extension";
 const COMPOSITOR_OBJECT_PATH: &str = "/org/manifold/Compositor";
+const AGENT_OBJECT_PATH: &str = "/org/manifold/Agent";
 const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
 const MANAGER_INTERFACE: &str = "org.manifold.Manager";
 const EXTENSION_INTERFACE: &str = "org.manifold.Extension";
+const AGENT_INTERFACE: &str = "org.manifold.Agent";
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 type DbusMetadata = BTreeMap<String, String>;
 type DbusSurfaceSession = (u64, String, bool, u64);
 type DbusExtension = (String, String, String, DbusMetadata);
 type DbusGrant = (String, String, String, String, bool, DbusMetadata);
+type DbusAgent = (
+    String,
+    String,
+    String,
+    String,
+    u64,
+    bool,
+    u64,
+    u64,
+    String,
+    String,
+    DbusMetadata,
+);
 
 #[derive(Clone, Debug)]
 pub(crate) struct ControlTarget {
@@ -86,6 +101,7 @@ type U64Response = mpsc::Sender<std::result::Result<u64, String>>;
 type SessionListResponse = mpsc::Sender<std::result::Result<Vec<DbusSurfaceSession>, String>>;
 type ExtensionListResponse = mpsc::Sender<std::result::Result<Vec<DbusExtension>, String>>;
 type GrantListResponse = mpsc::Sender<std::result::Result<Vec<DbusGrant>, String>>;
+type AgentListResponse = mpsc::Sender<std::result::Result<Vec<DbusAgent>, String>>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -144,6 +160,40 @@ enum DbusStateRequest {
         grant_id: String,
         response: BoolResponse,
     },
+    ListAgents {
+        response: AgentListResponse,
+    },
+    RegisterAgent {
+        kind: String,
+        metadata: DbusMetadata,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    UpdateAgent {
+        agent_id: String,
+        status: String,
+        metadata: DbusMetadata,
+        sender_name: String,
+        response: BoolResponse,
+    },
+    NotifyAgent {
+        agent_id: String,
+        title: String,
+        subtitle: String,
+        body: String,
+        level: String,
+        metadata: DbusMetadata,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    ClearAgentAttention {
+        agent_id: String,
+        response: BoolResponse,
+    },
+    UnregisterAgent {
+        agent_id: String,
+        response: BoolResponse,
+    },
     RegisterWindow {
         extension_id: String,
         window_identity: DbusMetadata,
@@ -198,6 +248,11 @@ struct SessionDbus {
 
 #[derive(Clone)]
 struct ExtensionDbus {
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct AgentDbus {
     sender: channel::Sender<DbusStateRequest>,
 }
 
@@ -325,6 +380,166 @@ impl ExtensionDbus {
             response,
         })
     }
+}
+
+#[zbus::interface(name = "org.manifold.Agent")]
+impl AgentDbus {
+    async fn list_agents(&self) -> fdo::Result<Vec<DbusAgent>> {
+        request_state(&self.sender, |response| DbusStateRequest::ListAgents {
+            response,
+        })
+    }
+
+    async fn register_agent(
+        &self,
+        kind: String,
+        metadata: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        let agent_id = request_state(&self.sender, |response| DbusStateRequest::RegisterAgent {
+            kind,
+            metadata,
+            sender_name: sender_name.clone(),
+            response,
+        })?;
+        Self::agent_registered(&emitter, &agent_id, &sender_name)
+            .await
+            .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        Ok(agent_id)
+    }
+
+    async fn update_agent(
+        &self,
+        agent_id: String,
+        status: String,
+        metadata: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let sender_name = header_sender(&header);
+        let changed = request_state(&self.sender, |response| DbusStateRequest::UpdateAgent {
+            agent_id: agent_id.clone(),
+            status,
+            metadata,
+            sender_name: sender_name.clone(),
+            response,
+        })?;
+        if changed {
+            Self::agent_updated(&emitter, &agent_id, &sender_name)
+                .await
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        }
+        Ok(changed)
+    }
+
+    async fn notify_agent(
+        &self,
+        agent_id: String,
+        title: String,
+        subtitle: String,
+        body: String,
+        level: String,
+        metadata: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        let notification_id =
+            request_state(&self.sender, |response| DbusStateRequest::NotifyAgent {
+                agent_id: agent_id.clone(),
+                title: title.clone(),
+                subtitle,
+                body: body.clone(),
+                level: level.clone(),
+                metadata,
+                sender_name: sender_name.clone(),
+                response,
+            })?;
+        Self::agent_notification(
+            &emitter,
+            &agent_id,
+            &notification_id,
+            &title,
+            &body,
+            &level,
+            &sender_name,
+        )
+        .await
+        .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        Ok(notification_id)
+    }
+
+    async fn clear_agent_attention(
+        &self,
+        agent_id: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let changed = request_state(&self.sender, |response| {
+            DbusStateRequest::ClearAgentAttention {
+                agent_id: agent_id.clone(),
+                response,
+            }
+        })?;
+        if changed {
+            Self::agent_attention_cleared(&emitter, &agent_id)
+                .await
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        }
+        Ok(changed)
+    }
+
+    async fn unregister_agent(
+        &self,
+        agent_id: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let changed = request_state(&self.sender, |response| DbusStateRequest::UnregisterAgent {
+            agent_id: agent_id.clone(),
+            response,
+        })?;
+        if changed {
+            Self::agent_unregistered(&emitter, &agent_id)
+                .await
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        }
+        Ok(changed)
+    }
+
+    #[zbus(signal)]
+    async fn agent_registered(
+        emitter: &SignalEmitter<'_>,
+        agent_id: &str,
+        sender: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn agent_updated(
+        emitter: &SignalEmitter<'_>,
+        agent_id: &str,
+        sender: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn agent_notification(
+        emitter: &SignalEmitter<'_>,
+        agent_id: &str,
+        notification_id: &str,
+        title: &str,
+        body: &str,
+        level: &str,
+        sender: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn agent_attention_cleared(
+        emitter: &SignalEmitter<'_>,
+        agent_id: &str,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn agent_unregistered(emitter: &SignalEmitter<'_>, agent_id: &str) -> zbus::Result<()>;
 }
 
 #[zbus::interface(name = "org.manifold.Compositor")]
@@ -478,6 +693,29 @@ trait ManifoldExtension {
     fn unregister_extension(&self, extension_id: String) -> zbus::Result<bool>;
     fn list_grants(&self, extension_id: String) -> zbus::Result<Vec<DbusGrant>>;
     fn release_grant(&self, grant_id: String) -> zbus::Result<bool>;
+}
+
+#[proxy(interface = "org.manifold.Agent", default_path = "/org/manifold/Agent")]
+trait ManifoldAgent {
+    fn list_agents(&self) -> zbus::Result<Vec<DbusAgent>>;
+    fn register_agent(&self, kind: String, metadata: DbusMetadata) -> zbus::Result<String>;
+    fn update_agent(
+        &self,
+        agent_id: String,
+        status: String,
+        metadata: DbusMetadata,
+    ) -> zbus::Result<bool>;
+    fn notify_agent(
+        &self,
+        agent_id: String,
+        title: String,
+        subtitle: String,
+        body: String,
+        level: String,
+        metadata: DbusMetadata,
+    ) -> zbus::Result<String>;
+    fn clear_agent_attention(&self, agent_id: String) -> zbus::Result<bool>;
+    fn unregister_agent(&self, agent_id: String) -> zbus::Result<bool>;
 }
 
 #[proxy(
@@ -936,6 +1174,12 @@ fn start_dbus_service(
                             sender: sender.clone(),
                         },
                     )?
+                    .serve_at(
+                        AGENT_OBJECT_PATH,
+                        AgentDbus {
+                            sender: sender.clone(),
+                        },
+                    )?
                     .serve_at(COMPOSITOR_OBJECT_PATH, CompositorDbus { sender })?
                     .build()
                     .await?;
@@ -992,33 +1236,76 @@ fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Resul
     let Some((command_name, args)) = command.split_first() else {
         return Ok(false);
     };
-    if command_name != "extensions" {
-        return Ok(false);
-    }
-
-    match args {
-        [subcommand] if subcommand == "list" => {
-            for (id, role, sender, metadata) in request_extension_list(target)? {
-                println!(
-                    "extension id={} role={} sender={} metadata={}",
-                    id,
-                    role,
-                    sender,
-                    format_metadata(&metadata)
-                );
+    match command_name.as_str() {
+        "extensions" => match args {
+            [subcommand] if subcommand == "list" => {
+                for (id, role, sender, metadata) in request_extension_list(target)? {
+                    println!(
+                        "extension id={} role={} sender={} metadata={}",
+                        id,
+                        role,
+                        sender,
+                        format_metadata(&metadata)
+                    );
+                }
             }
-        }
-        [subcommand] if subcommand == "grants" => {
-            for grant in request_grant_list(target, "")? {
-                print_grant(&grant);
+            [subcommand] if subcommand == "grants" => {
+                for grant in request_grant_list(target, "")? {
+                    print_grant(&grant);
+                }
             }
-        }
-        [subcommand, extension_id] if subcommand == "grants" => {
-            for grant in request_grant_list(target, extension_id)? {
-                print_grant(&grant);
+            [subcommand, extension_id] if subcommand == "grants" => {
+                for grant in request_grant_list(target, extension_id)? {
+                    print_grant(&grant);
+                }
             }
-        }
-        _ => bail!("usage: extensions list | extensions grants [extension_id]"),
+            _ => bail!("usage: extensions list | extensions grants [extension_id]"),
+        },
+        "agents" => match args {
+            [subcommand] if subcommand == "list" => {
+                for agent in request_agent_list(target)? {
+                    print_agent(&agent);
+                }
+            }
+            [subcommand, kind, metadata @ ..] if subcommand == "register" => {
+                let id = request_agent_register(target, kind, &parse_metadata_args(metadata)?)?;
+                println!("agent id={id}");
+            }
+            [subcommand, agent_id, status, metadata @ ..] if subcommand == "status" => {
+                let changed = request_agent_update(
+                    target,
+                    agent_id,
+                    status,
+                    &parse_metadata_args(metadata)?,
+                )?;
+                println!("agent id={} changed={changed}", agent_id);
+            }
+            [subcommand, agent_id, title, body @ ..] if subcommand == "notify" => {
+                let body = joined_name(body).unwrap_or_default();
+                let id = request_agent_notify(
+                    target,
+                    agent_id,
+                    title,
+                    "",
+                    &body,
+                    "waiting",
+                    &DbusMetadata::new(),
+                )?;
+                println!("notification id={id}");
+            }
+            [subcommand, agent_id] if subcommand == "clear" => {
+                let changed = request_agent_clear(target, agent_id)?;
+                println!("agent id={} changed={changed}", agent_id);
+            }
+            [subcommand, agent_id] if subcommand == "unregister" => {
+                let changed = request_agent_unregister(target, agent_id)?;
+                println!("agent id={} changed={changed}", agent_id);
+            }
+            _ => bail!(
+                "usage: agents list | agents register <kind> [key=value...] | agents status <id> <status> [key=value...] | agents notify <id> <title> [body...] | agents clear <id> | agents unregister <id>"
+            ),
+        },
+        _ => return Ok(false),
     }
 
     Ok(true)
@@ -1068,6 +1355,136 @@ fn request_grant_list(target: &ControlTarget, extension_id: &str) -> Result<Vec<
         })
 }
 
+fn agent_proxy<'a>(
+    connection: &'a zbus::blocking::Connection,
+    target: &'a ControlTarget,
+) -> Result<ManifoldAgentProxyBlocking<'a>> {
+    ManifoldAgentProxyBlocking::builder(connection)
+        .destination(target.destination.as_str())?
+        .path(AGENT_OBJECT_PATH)?
+        .interface(AGENT_INTERFACE)?
+        .build()
+        .context("build Manifold Agent DBus proxy")
+}
+
+fn request_agent_list(target: &ControlTarget) -> Result<Vec<DbusAgent>> {
+    let connection = typed_connection(target)?;
+    let proxy = agent_proxy(&connection, target)?;
+    proxy
+        .list_agents()
+        .with_context(|| format!("call Manifold Agent.ListAgents on {}", target.destination))
+}
+
+fn request_agent_register(
+    target: &ControlTarget,
+    kind: &str,
+    metadata: &DbusMetadata,
+) -> Result<String> {
+    let connection = typed_connection(target)?;
+    let proxy = agent_proxy(&connection, target)?;
+    proxy
+        .register_agent(kind.to_string(), metadata.clone())
+        .with_context(|| {
+            format!(
+                "call Manifold Agent.RegisterAgent on {}",
+                target.destination
+            )
+        })
+}
+
+fn request_agent_update(
+    target: &ControlTarget,
+    agent_id: &str,
+    status: &str,
+    metadata: &DbusMetadata,
+) -> Result<bool> {
+    let connection = typed_connection(target)?;
+    let proxy = agent_proxy(&connection, target)?;
+    proxy
+        .update_agent(agent_id.to_string(), status.to_string(), metadata.clone())
+        .with_context(|| format!("call Manifold Agent.UpdateAgent on {}", target.destination))
+}
+
+fn request_agent_notify(
+    target: &ControlTarget,
+    agent_id: &str,
+    title: &str,
+    subtitle: &str,
+    body: &str,
+    level: &str,
+    metadata: &DbusMetadata,
+) -> Result<String> {
+    let connection = typed_connection(target)?;
+    let proxy = agent_proxy(&connection, target)?;
+    proxy
+        .notify_agent(
+            agent_id.to_string(),
+            title.to_string(),
+            subtitle.to_string(),
+            body.to_string(),
+            level.to_string(),
+            metadata.clone(),
+        )
+        .with_context(|| format!("call Manifold Agent.NotifyAgent on {}", target.destination))
+}
+
+fn request_agent_clear(target: &ControlTarget, agent_id: &str) -> Result<bool> {
+    let connection = typed_connection(target)?;
+    let proxy = agent_proxy(&connection, target)?;
+    proxy
+        .clear_agent_attention(agent_id.to_string())
+        .with_context(|| {
+            format!(
+                "call Manifold Agent.ClearAgentAttention on {}",
+                target.destination
+            )
+        })
+}
+
+fn request_agent_unregister(target: &ControlTarget, agent_id: &str) -> Result<bool> {
+    let connection = typed_connection(target)?;
+    let proxy = agent_proxy(&connection, target)?;
+    proxy
+        .unregister_agent(agent_id.to_string())
+        .with_context(|| {
+            format!(
+                "call Manifold Agent.UnregisterAgent on {}",
+                target.destination
+            )
+        })
+}
+
+fn print_agent(
+    (
+        id,
+        kind,
+        status,
+        sender,
+        session,
+        attention,
+        unread,
+        notifications,
+        last_title,
+        last_body,
+        metadata,
+    ): &DbusAgent,
+) {
+    println!(
+        "agent id={} kind={} status={} sender={} session={} attention={} unread={} notifications={} last_title={} last_body={} metadata={}",
+        id,
+        kind,
+        status,
+        sender,
+        session,
+        attention,
+        unread,
+        notifications,
+        last_title,
+        last_body,
+        format_metadata(metadata)
+    );
+}
+
 fn print_grant((id, extension_id, kind, sender, active, detail): &DbusGrant) {
     println!(
         "grant id={} extension_id={} kind={} sender={} active={} detail={}",
@@ -1078,6 +1495,18 @@ fn print_grant((id, extension_id, kind, sender, active, detail): &DbusGrant) {
         active,
         format_metadata(detail)
     );
+}
+
+fn parse_metadata_args(args: &[String]) -> Result<DbusMetadata> {
+    let mut metadata = DbusMetadata::new();
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            bail!("metadata argument must be key=value: {arg}");
+        };
+        ensure!(!key.trim().is_empty(), "metadata key must not be empty");
+        metadata.insert(key.trim().to_string(), value.to_string());
+    }
+    Ok(metadata)
 }
 
 fn format_metadata(metadata: &DbusMetadata) -> String {
@@ -1216,6 +1645,52 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::ReleaseGrant { grant_id, response } => {
             send_response(response, Ok(state.release_grant(&grant_id)));
         }
+        DbusStateRequest::ListAgents { response } => {
+            send_response(response, Ok(dbus_agents(state.agent_summaries())));
+        }
+        DbusStateRequest::RegisterAgent {
+            kind,
+            metadata,
+            sender_name,
+            response,
+        } => send_response(response, state.register_agent(kind, metadata, sender_name)),
+        DbusStateRequest::UpdateAgent {
+            agent_id,
+            status,
+            metadata,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.update_agent(&agent_id, status, metadata, sender_name),
+        ),
+        DbusStateRequest::NotifyAgent {
+            agent_id,
+            title,
+            subtitle,
+            body,
+            level,
+            metadata,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.notify_agent(
+                &agent_id,
+                title,
+                subtitle,
+                body,
+                level,
+                metadata,
+                sender_name,
+            ),
+        ),
+        DbusStateRequest::ClearAgentAttention { agent_id, response } => {
+            send_response(response, Ok(state.clear_agent_attention(&agent_id)));
+        }
+        DbusStateRequest::UnregisterAgent { agent_id, response } => {
+            send_response(response, Ok(state.unregister_agent(&agent_id)));
+        }
         DbusStateRequest::RegisterWindow {
             extension_id,
             window_identity,
@@ -1287,6 +1762,27 @@ fn dbus_surface_sessions(sessions: Vec<SurfaceSessionSummary>) -> Vec<DbusSurfac
                 session.name,
                 session.active,
                 u64::try_from(session.windows).unwrap_or(u64::MAX),
+            )
+        })
+        .collect()
+}
+
+fn dbus_agents(agents: Vec<crate::state::AgentSummary>) -> Vec<DbusAgent> {
+    agents
+        .into_iter()
+        .map(|agent| {
+            (
+                agent.id,
+                agent.kind,
+                agent.status,
+                agent.sender,
+                agent.session,
+                agent.attention,
+                agent.unread_notifications,
+                agent.notification_count,
+                agent.last_notification_title.unwrap_or_default(),
+                agent.last_notification_body.unwrap_or_default(),
+                agent.metadata,
             )
         })
         .collect()
@@ -1452,6 +1948,18 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             };
             let changed = state.cycle_focus(direction);
             format!("OK focus changed={changed}\n")
+        }
+        "focus-app-id" => {
+            let [app_id] = args else {
+                bail!("focus-app-id requires exactly one app id");
+            };
+            let changed = state.focus_app_id(app_id);
+            format!("OK focus-app-id app_id={} changed={changed}\n", app_id)
+        }
+        "focus-window" => {
+            let identity = parse_metadata_args(args)?;
+            let changed = state.focus_window_identity(&identity);
+            format!("OK focus-window changed={changed}\n")
         }
         "layout-action" | "layout" => {
             let [action] = args else {
@@ -1621,6 +2129,7 @@ struct StatusSnapshot {
     left_panel_visible: bool,
     left_panel_width: i32,
     browsers: usize,
+    agents: Vec<crate::state::AgentSummary>,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -1813,6 +2322,7 @@ impl StatusSnapshot {
             left_panel_visible: state.left_panel_reserved_width() > 0,
             left_panel_width: state.left_panel_reserved_width(),
             browsers: state.browsers.len(),
+            agents: state.agent_summaries(),
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),
