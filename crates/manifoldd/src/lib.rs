@@ -69,6 +69,9 @@ struct RunArgs {
     /// Start the service/runtime process without tying it to a presentation session.
     #[arg(long)]
     headless: bool,
+    /// Start with an attached offscreen presentation target. Used by nested tests.
+    #[arg(long = "offscreen-presentation", hide = true)]
+    offscreen_presentation: bool,
     /// Launch an isolated Chromium browser pane at startup.
     #[arg(long = "browser", value_name = "URL", num_args = 0..=1, default_missing_value = "about:blank")]
     browser: Option<String>,
@@ -111,6 +114,7 @@ impl Default for RunArgs {
             dbus_name: DEFAULT_MANIFOLD_DBUS_NAME.to_string(),
             dbus_address: None,
             headless: false,
+            offscreen_presentation: false,
             browser: None,
             wasm_key_handler: None,
             wasm_map_hook: None,

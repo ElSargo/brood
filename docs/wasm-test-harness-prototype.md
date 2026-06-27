@@ -62,6 +62,13 @@ test harness thread
 
 This keeps `Manifold` state authoritative on the session thread while still allowing the harness to block synchronously on host responses from its own thread.
 
+When the harness is used with the nested test topology, native client launch
+details should live in normal executable wrappers. The harness remains the
+controller/assertion layer and can either observe a wrapper started by
+`manifoldd test nested` or spawn wrapper executables through the control surface.
+See [Nested Development Harness](nested-dev-harness.md) for the wrapper and
+success-criteria model.
+
 ## Scope Of This Prototype
 
 This is a bootstrap lane, not the final async module runtime.

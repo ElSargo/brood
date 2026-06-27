@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow};
 #[cfg(feature = "shm-fallback")]
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
+    backend::SwapBuffersError,
     backend::allocator::Fourcc,
     backend::{
         drm::{DrmDeviceFd, DrmNode},
@@ -100,7 +101,7 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
     state.attach_requested = false;
     state.stats.record_attach_applied();
     state.stats.attach_count += 1;
-    backend.window().request_redraw();
+    backend.request_redraw();
     info!("presentation attached");
 }
 
@@ -110,7 +111,28 @@ const CLIENT_FRAME_DEFER: Duration = Duration::from_millis(2);
 const INPUT_FRAME_DEFER_MAX: Duration = Duration::from_millis(3);
 const INPUT_FRAME_DEFER_MIN: Duration = Duration::from_micros(500);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationTarget {
+    Winit,
+    Offscreen,
+}
+
 pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold) -> Result<()> {
+    attach_target(loop_handle, state, PresentationTarget::Winit)
+}
+
+pub fn attach_offscreen(
+    loop_handle: &LoopHandle<'static, Manifold>,
+    state: &mut Manifold,
+) -> Result<()> {
+    attach_target(loop_handle, state, PresentationTarget::Offscreen)
+}
+
+fn attach_target(
+    loop_handle: &LoopHandle<'static, Manifold>,
+    state: &mut Manifold,
+    target: PresentationTarget,
+) -> Result<()> {
     if state.presentation_started {
         state.request_attach();
         return Ok(());
@@ -120,21 +142,29 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         state.restore_last_interacted_surface_session();
         state.stats.record_attach_request();
     }
-    let runtime = Rc::new(RefCell::new(PresenterRuntime::new()));
-    let event_source = PresenterEventSource::new(Rc::clone(&runtime))
-        .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
-
     let mode = Mode {
         size: (1280, 800).into(),
         refresh: PRESENTATION_REFRESH_MILLIHZ,
     };
+    let runtime = match target {
+        PresentationTarget::Winit => Rc::new(RefCell::new(PresenterRuntime::new())),
+        PresentationTarget::Offscreen => {
+            Rc::new(RefCell::new(PresenterRuntime::new_offscreen(mode.size)))
+        }
+    };
     let output = Output::new(
-        "manifold-winit".to_string(),
+        match target {
+            PresentationTarget::Winit => "manifold-winit".to_string(),
+            PresentationTarget::Offscreen => "manifold-offscreen".to_string(),
+        },
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
             make: "Manifold".into(),
-            model: "Winit".into(),
+            model: match target {
+                PresentationTarget::Winit => "Winit".into(),
+                PresentationTarget::Offscreen => "Offscreen".into(),
+            },
         },
     );
     let _global = output.create_global::<Manifold>(&state.display_handle);
@@ -161,6 +191,16 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
     loop_handle
         .insert_source(Timer::immediate(), move |_, _, state| {
             apply_pending_attach_state(&timer_presenter, state);
+            if target == PresentationTarget::Offscreen {
+                timer_presenter.runtime.borrow_mut().ensure_offscreen();
+                drain_pending_presenter_events(&timer_presenter, state);
+                if offscreen_frame_requested(&timer_presenter, state) {
+                    if let Err(failure) = render_presenter_frame(&timer_presenter, state) {
+                        record_presentation_runtime_failure(state, &failure);
+                        apply_pending_attach_state(&timer_presenter, state);
+                    }
+                }
+            }
             if TEMP_AGGRESSIVE_PRESENTATION_POLL
                 && state.presentation == PresentationStatus::Attached
             {
@@ -176,15 +216,43 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
         })
         .map_err(|err| anyhow!("insert presentation control timer: {err}"))?;
 
-    let event_presenter = Rc::clone(&presenter);
-    loop_handle
-        .insert_source(event_source, move |event, _, state| {
-            apply_pending_attach_state(&event_presenter, state);
-            handle_presenter_event(&event_presenter, state, event);
-        })
-        .map_err(|err| anyhow!("insert winit source: {err}"))?;
+    if target == PresentationTarget::Winit {
+        let event_source = PresenterEventSource::new(Rc::clone(&runtime))
+            .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
+        let event_presenter = Rc::clone(&presenter);
+        loop_handle
+            .insert_source(event_source, move |event, _, state| {
+                apply_pending_attach_state(&event_presenter, state);
+                handle_presenter_event(&event_presenter, state, event);
+            })
+            .map_err(|err| anyhow!("insert winit source: {err}"))?;
+    }
 
     Ok(())
+}
+
+fn drain_pending_presenter_events(presenter: &Rc<PresenterHandle>, state: &mut Manifold) {
+    let events = presenter
+        .runtime
+        .borrow_mut()
+        .pending_events
+        .drain(..)
+        .collect::<Vec<_>>();
+    for event in events {
+        handle_presenter_event(presenter, state, event);
+    }
+}
+
+fn offscreen_frame_requested(presenter: &Rc<PresenterHandle>, state: &Manifold) -> bool {
+    if state.presentation != PresentationStatus::Attached {
+        return false;
+    }
+    presenter
+        .runtime
+        .borrow()
+        .backend
+        .as_ref()
+        .is_some_and(PresenterBackend::take_redraw_requested)
 }
 
 fn handle_presenter_event(
@@ -224,7 +292,7 @@ fn handle_presenter_event(
             }
             if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.window().request_redraw();
+                    backend.request_redraw();
                 }
             }
         }
@@ -235,7 +303,7 @@ fn handle_presenter_event(
             }
             if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.window().request_redraw();
+                    backend.request_redraw();
                 }
             }
         }
@@ -250,7 +318,7 @@ fn handle_presenter_event(
             }
             if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.window().request_redraw();
+                    backend.request_redraw();
                 }
             }
         }
@@ -275,7 +343,7 @@ fn handle_presenter_event(
             }
             if !schedule_deferred_client_frame(&event_presenter, state, true) {
                 if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.window().request_redraw();
+                    backend.request_redraw();
                 }
             }
         }
@@ -316,7 +384,7 @@ pub(crate) fn request_presenter_redraw_after_client_commit(state: &mut Manifold)
         return;
     }
     if let Some(backend) = presenter.runtime.borrow().backend.as_ref() {
-        backend.window().request_redraw();
+        backend.request_redraw();
     }
 }
 
@@ -480,18 +548,35 @@ fn render_presenter_frame_with_capture(
             .map_err(|err| PresentationRuntimeFailure::new("save_buffer", err))?;
         }
     }
-    backend
-        .submit(Some(&[damage]))
-        .map_err(|err| PresentationRuntimeFailure::new("submit_winit_frame", err))?;
+    let submitted = match backend.submit(Some(&[damage])) {
+        Ok(()) => true,
+        Err(err) => {
+            let failure = PresentationRuntimeFailure::new("submit_winit_frame", &err);
+            if matches!(err, SwapBuffersError::ContextLost(_)) {
+                backend.reset_target_after_context_loss();
+            }
+            if capture_path.is_some() {
+                warn!(
+                    detail = %failure.detail,
+                    "presentation submit failed after composed frame capture; keeping capture result"
+                );
+                false
+            } else {
+                return Err(failure);
+            }
+        }
+    };
     state.stats.record_frame(frame_started.elapsed());
 
-    if state.presentation_skip_post_submit_frame_callbacks {
+    if !submitted {
+        state.presentation_skip_post_submit_frame_callbacks = false;
+    } else if state.presentation_skip_post_submit_frame_callbacks {
         state.presentation_skip_post_submit_frame_callbacks = false;
     } else {
         send_active_client_frame_callbacks(presenter, state);
     }
 
-    backend.window().request_redraw();
+    backend.request_redraw();
     Ok(())
 }
 

@@ -109,7 +109,15 @@ pub fn run(args: RunArgs) -> Result<()> {
         println!("{MANIFOLDD_DBUS_ADDRESS_ENV}={address}");
     }
 
-    if !args.headless {
+    if args.offscreen_presentation {
+        if let Err(err) = presentation::attach_offscreen(&event_loop.handle(), &mut state) {
+            warn!(
+                ?err,
+                "failed to attach initial offscreen presentation; continuing detached"
+            );
+            state.record_presentation_attach_failure(&err.to_string());
+        }
+    } else if !args.headless {
         if let Err(err) = presentation::attach(&event_loop.handle(), &mut state) {
             warn!(
                 ?err,
@@ -184,8 +192,13 @@ fn run_nested_test(args: NestedTestArgs) -> Result<()> {
         }
     };
 
-    let outer_target = control::ControlTarget::new(nested_dbus_destination("outer"), None);
-    let inner_target = control::ControlTarget::new(nested_dbus_destination("inner"), None);
+    let control_bus_address = env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+    let outer_target = control::ControlTarget::new(
+        nested_dbus_destination("outer"),
+        control_bus_address.clone(),
+    );
+    let inner_target =
+        control::ControlTarget::new(nested_dbus_destination("inner"), control_bus_address);
     let outer_log = out_dir.join("outer.log");
     let inner_log = out_dir.join("inner.log");
     let current_exe = env::current_exe().context("resolve current executable")?;
@@ -251,15 +264,22 @@ fn run_nested_test_with_outer(
 
     if let Some(command) = args.inner_command.as_deref() {
         let inner_command = shell_split(command)?;
+        let child_counts_before = hosted_child_counts(&inner_target).unwrap_or_default();
         control::request_dbus_command(
             &inner_target,
             &[vec!["spawn".to_string()], inner_command].concat(),
             false,
         )?;
         if !args.inner_headless {
-            wait_for_hosted_inner_command(&inner_target, &inner_log, &mut outer_child)?;
+            wait_for_hosted_inner_command(
+                &inner_target,
+                &inner_log,
+                &mut outer_child,
+                child_counts_before,
+            )?;
         }
     }
+    let outer_dump = capture_outer_debug_dump(&outer_target, &out_dir)?;
 
     println!("OK nested test ready");
     println!("out_dir={}", out_dir.display());
@@ -267,8 +287,17 @@ fn run_nested_test_with_outer(
     println!("inner_dbus_destination={}", inner_target.destination);
     println!("outer_log={}", outer_log.display());
     println!("inner_log={}", inner_log.display());
+    println!("outer_dump={}", outer_dump.display());
     println!("topology=outer-supervisor");
-    println!("outer_headless={}", !args.outer_headful);
+    println!(
+        "outer_presentation={}",
+        if args.outer_headful {
+            "winit"
+        } else {
+            "offscreen"
+        }
+    );
+    println!("outer_headless=false");
     println!("inner_headless={}", args.inner_headless);
 
     if args.keep_running {
@@ -411,7 +440,7 @@ fn spawn_outer(
         command.arg("--nested-inner-dbus-address").arg(address);
     }
     if !outer_headful {
-        command.arg("--headless");
+        command.arg("--offscreen-presentation");
     }
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
@@ -566,6 +595,7 @@ fn wait_for_hosted_inner_command(
     inner_target: &control::ControlTarget,
     log_path: &Path,
     outer_child: &mut Child,
+    child_counts_before: HostedChildCounts,
 ) -> Result<()> {
     let start = Instant::now();
     loop {
@@ -588,6 +618,17 @@ fn wait_for_hosted_inner_command(
                 if windows >= 2 && frames >= 2 {
                     return Ok(());
                 }
+                let child_counts = HostedChildCounts::from_json(&json);
+                if child_counts.failures > child_counts_before.failures {
+                    let last_status = json
+                        .get("hosted_child_last_status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    bail!("inner command exited unsuccessfully: {last_status}");
+                }
+                if child_counts.exits > child_counts_before.exits {
+                    return Ok(());
+                }
             }
         }
         if start.elapsed() > Duration::from_secs(15) {
@@ -596,6 +637,55 @@ fn wait_for_hosted_inner_command(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HostedChildCounts {
+    exits: u64,
+    failures: u64,
+}
+
+impl HostedChildCounts {
+    fn from_json(json: &serde_json::Value) -> Self {
+        Self {
+            exits: json
+                .get("hosted_child_exits")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            failures: json
+                .get("hosted_child_failures")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
+fn hosted_child_counts(target: &control::ControlTarget) -> Result<HostedChildCounts> {
+    let response = control::request_dbus_command(target, &[String::from("status-json")], false)?;
+    let json = serde_json::from_str::<serde_json::Value>(&response)?;
+    Ok(HostedChildCounts::from_json(&json))
+}
+
+fn capture_outer_debug_dump(
+    outer_target: &control::ControlTarget,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    let dump_dir = out_dir.join("outer-dump");
+    fs::create_dir_all(&dump_dir).with_context(|| format!("create {}", dump_dir.display()))?;
+    let response = control::request_dbus_command(
+        outer_target,
+        &[
+            "debug".to_string(),
+            "dump".to_string(),
+            dump_dir.display().to_string(),
+            "state,composed,surfaces".to_string(),
+        ],
+        false,
+    )?;
+    if !response.starts_with("OK ") {
+        bail!("outer debug dump failed: {}", response.trim());
+    }
+    Ok(dump_dir)
 }
 
 fn shell_split(command: &str) -> Result<Vec<String>> {
@@ -632,6 +722,12 @@ impl NestedCleanup {
     fn stop_all(&self) {
         let _ = control::request_dbus_command(&self.inner_target, &[String::from("quit")], false);
         let _ = control::request_dbus_command(&self.outer_target, &[String::from("quit")], false);
+    }
+}
+
+impl Drop for NestedCleanup {
+    fn drop(&mut self) {
+        self.stop_all();
     }
 }
 
@@ -705,10 +801,8 @@ impl CompositorHandler for Manifold {
                                     state.record_dmabuf_blocker_failure("explicit_sync_no_client");
                                 }
                             }
-                            Err(err) => {
-                                state.record_dmabuf_blocker_failure(&format!(
-                                    "explicit_sync_generate_blocker:{err:?}"
-                                ));
+                            Err(_already_ready) => {
+                                state.dmabuf.stats.last_blocker_error = None;
                             }
                         }
                         return;
@@ -743,10 +837,8 @@ impl CompositorHandler for Manifold {
                             state.record_dmabuf_blocker_failure("implicit_dmabuf_no_client");
                         }
                     }
-                    Err(err) => {
-                        state.record_dmabuf_blocker_failure(&format!(
-                            "implicit_dmabuf_generate_blocker:{err:?}"
-                        ));
+                    Err(_already_ready) => {
+                        state.dmabuf.stats.last_blocker_error = None;
                     }
                 }
             }

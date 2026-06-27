@@ -1,4 +1,15 @@
-use std::{cell::RefCell, ffi::c_void, io::Error as IoError, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    env,
+    ffi::c_void,
+    fs,
+    io::Error as IoError,
+    os::fd::OwnedFd,
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use calloop::{
     EventSource, Interest, PostAction, Readiness, Token, TokenFactory, generic::Generic,
@@ -7,16 +18,18 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::{
     backend::{
         SwapBuffersError,
+        allocator::{Fourcc, gbm::GbmDevice},
+        drm::DrmDeviceFd,
         egl::{
-            EGLContext, EGLSurface,
+            EGLContext, EGLDevice, EGLSurface,
             context::{GlAttributes, PixelFormatRequirements},
             display::EGLDisplay,
             ffi, native,
         },
         input::{Axis, AxisSource, ButtonState, KeyState, Keycode},
         renderer::{
-            Bind, ImportEgl, RendererSuper,
-            gles::{GlesError, GlesRenderer},
+            Bind, ImportEgl, Offscreen, RendererSuper,
+            gles::{GlesError, GlesRenderbuffer, GlesRenderer},
         },
     },
     reexports::winit::{
@@ -31,7 +44,7 @@ use smithay::{
         raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle},
         window::{Window as WinitWindow, WindowAttributes, WindowId},
     },
-    utils::{Clock, Monotonic, Physical, Rectangle, Size},
+    utils::{Buffer as BufferCoords, Clock, DeviceFd, Monotonic, Physical, Rectangle, Size},
 };
 use tracing::{debug, info_span, warn};
 use wayland_egl as wegl;
@@ -103,20 +116,33 @@ pub(crate) struct PresenterRuntime {
     pub want_window: bool,
     pub pending_events: Vec<PresenterEvent>,
     pub pending_error: Option<String>,
+    target: PresenterTarget,
     destroy_flush_pumps: u8,
     gl_attributes: GlAttributes,
     attributes: WindowAttributes,
+    offscreen_size: Size<i32, Physical>,
     _span: tracing::Span,
 }
 
 impl PresenterRuntime {
     pub fn new() -> Self {
+        Self::new_for_target(PresenterTarget::Window)
+    }
+
+    pub fn new_offscreen(size: Size<i32, Physical>) -> Self {
+        let mut runtime = Self::new_for_target(PresenterTarget::Offscreen);
+        runtime.offscreen_size = size;
+        runtime
+    }
+
+    fn new_for_target(target: PresenterTarget) -> Self {
         let span = info_span!("presentation_winit", window = tracing::field::Empty);
         Self {
             backend: None,
             want_window: true,
             pending_events: Vec::new(),
             pending_error: None,
+            target,
             destroy_flush_pumps: 0,
             gl_attributes: GlAttributes {
                 version: (3, 0),
@@ -128,6 +154,7 @@ impl PresenterRuntime {
                 .with_title("Manifold")
                 .with_inner_size(LogicalSize::new(1280.0, 800.0))
                 .with_visible(true),
+            offscreen_size: (1280, 800).into(),
             _span: span,
         }
     }
@@ -136,17 +163,14 @@ impl PresenterRuntime {
         self.want_window = true;
         self.backend
             .as_ref()
-            .is_some_and(PresenterBackend::has_frontend)
+            .is_some_and(PresenterBackend::has_target)
     }
 
     pub fn close_window(&mut self) {
         self.want_window = false;
         if let Some(backend) = self.backend.as_mut() {
             debug!(
-                window_strong_count = backend
-                    .frontend
-                    .as_ref()
-                    .map_or(0, |frontend| Arc::strong_count(&frontend.window)),
+                window_strong_count = backend.window_strong_count(),
                 "closing presentation window"
             );
             backend.destroy_frontend();
@@ -159,27 +183,42 @@ impl PresenterRuntime {
             || self
                 .backend
                 .as_ref()
-                .is_some_and(PresenterBackend::has_frontend)
+                .is_some_and(PresenterBackend::has_target)
         {
             return;
         }
 
         let result = match self.backend.as_mut() {
-            Some(backend) => backend.create_frontend(event_loop, self.attributes.clone()),
-            None => PresenterBackend::new(
-                event_loop,
-                self.attributes.clone(),
-                self.gl_attributes,
-                self._span.clone(),
-            )
-            .map(|backend| {
-                self.backend = Some(backend);
-            }),
+            Some(backend) => match self.target {
+                PresenterTarget::Window => {
+                    backend.create_frontend(event_loop, self.attributes.clone())
+                }
+                PresenterTarget::Offscreen => backend.create_offscreen_target(self.offscreen_size),
+            },
+            None => match self.target {
+                PresenterTarget::Window => PresenterBackend::new(
+                    event_loop,
+                    self.attributes.clone(),
+                    self.gl_attributes,
+                    self._span.clone(),
+                )
+                .map(|backend| {
+                    self.backend = Some(backend);
+                }),
+                PresenterTarget::Offscreen => PresenterBackend::new_offscreen(
+                    self.offscreen_size,
+                    self.gl_attributes,
+                    self._span.clone(),
+                )
+                .map(|backend| {
+                    self.backend = Some(backend);
+                }),
+            },
         };
 
         match result {
             Ok(()) => {
-                if let Some(window) = self.backend.as_ref().map(PresenterBackend::window) {
+                if let Some(window) = self.backend.as_ref().and_then(PresenterBackend::window) {
                     self._span.record("window", Into::<u64>::into(window.id()));
                 }
                 self.pending_events.push(PresenterEvent::Created);
@@ -193,42 +232,78 @@ impl PresenterRuntime {
         }
     }
 
-    fn active_window_id(&self) -> Option<WindowId> {
-        self.backend.as_ref().and_then(|backend| {
-            backend
-                .frontend
+    pub fn ensure_offscreen(&mut self) {
+        if self.target != PresenterTarget::Offscreen {
+            return;
+        }
+        self.ensure_windowless_target();
+    }
+
+    fn ensure_windowless_target(&mut self) {
+        if !self.want_window
+            || self
+                .backend
                 .as_ref()
-                .map(|frontend| frontend.window.id())
-        })
+                .is_some_and(PresenterBackend::has_target)
+        {
+            return;
+        }
+
+        let result = match self.backend.as_mut() {
+            Some(backend) => backend.create_offscreen_target(self.offscreen_size),
+            None => PresenterBackend::new_offscreen(
+                self.offscreen_size,
+                self.gl_attributes,
+                self._span.clone(),
+            )
+            .map(|backend| {
+                self.backend = Some(backend);
+            }),
+        };
+
+        match result {
+            Ok(()) => self.pending_events.push(PresenterEvent::Created),
+            Err(err) => {
+                self.pending_error = Some(err.to_string());
+                self.want_window = false;
+                self.pending_events
+                    .push(PresenterEvent::CreationFailed(err.to_string()));
+            }
+        }
+    }
+
+    fn active_window_id(&self) -> Option<WindowId> {
+        self.backend.as_ref().and_then(PresenterBackend::window_id)
     }
 
     fn active_window_size(&self) -> Option<PhysicalSize<u32>> {
-        self.backend.as_ref().and_then(|backend| {
-            backend
-                .frontend
-                .as_ref()
-                .map(|frontend| frontend.window.inner_size())
-        })
+        self.backend
+            .as_ref()
+            .and_then(PresenterBackend::window_inner_size)
     }
 
     fn active_is_x11(&self) -> bool {
-        self.backend.as_ref().is_some_and(|backend| {
-            backend
-                .frontend
-                .as_ref()
-                .is_some_and(|frontend| frontend.is_x11)
-        })
+        self.backend
+            .as_ref()
+            .is_some_and(PresenterBackend::window_is_x11)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenterTarget {
+    Window,
+    Offscreen,
 }
 
 #[derive(Debug)]
 pub(crate) struct PresenterBackend {
     renderer: GlesRenderer,
     _display: EGLDisplay,
-    frontend: Option<PresenterFrontend>,
+    target: Option<PresenterRenderTarget>,
     damage_tracking: bool,
     bind_size: Option<Size<i32, Physical>>,
     gl_attributes: GlAttributes,
+    redraw_requested: Cell<bool>,
     _span: tracing::Span,
 }
 
@@ -243,6 +318,18 @@ struct PresenterFrontend {
     egl_surface: EGLSurface,
     window: Arc<WinitWindow>,
     is_x11: bool,
+}
+
+#[derive(Debug)]
+struct PresenterOffscreenTarget {
+    renderbuffer: GlesRenderbuffer,
+    size: Size<i32, Physical>,
+}
+
+#[derive(Debug)]
+enum PresenterRenderTarget {
+    Window(PresenterFrontend),
+    Offscreen(PresenterOffscreenTarget),
 }
 
 impl PresenterBackend {
@@ -279,14 +366,44 @@ impl PresenterBackend {
         Ok(Self {
             renderer,
             _display: display,
-            frontend: Some(PresenterFrontend {
+            target: Some(PresenterRenderTarget::Window(PresenterFrontend {
                 egl_surface,
                 window,
                 is_x11,
-            }),
+            })),
             damage_tracking,
             bind_size: None,
             gl_attributes,
+            redraw_requested: Cell::new(false),
+            _span: span,
+        })
+    }
+
+    pub fn new_offscreen(
+        size: Size<i32, Physical>,
+        gl_attributes: GlAttributes,
+        span: tracing::Span,
+    ) -> Result<Self, PresenterBackendError> {
+        let span_for_guard = span.clone();
+        let _guard = span_for_guard.enter();
+        let display = offscreen_egl_display()?;
+        let context = create_egl_context(&display, gl_attributes)?;
+        let _ = context.unbind();
+        let mut renderer = unsafe { GlesRenderer::new(context)? };
+        let renderbuffer = create_offscreen_renderbuffer(&mut renderer, size)?;
+        drop(_guard);
+
+        Ok(Self {
+            renderer,
+            _display: display,
+            target: Some(PresenterRenderTarget::Offscreen(PresenterOffscreenTarget {
+                renderbuffer,
+                size,
+            })),
+            damage_tracking: false,
+            bind_size: None,
+            gl_attributes,
+            redraw_requested: Cell::new(true),
             _span: span,
         })
     }
@@ -306,11 +423,11 @@ impl PresenterBackend {
             self.renderer.egl_context(),
         ) {
             Ok((egl_surface, is_x11)) => {
-                self.frontend = Some(PresenterFrontend {
+                self.target = Some(PresenterRenderTarget::Window(PresenterFrontend {
                     egl_surface,
                     window,
                     is_x11,
-                });
+                }));
                 self.bind_size = None;
                 Ok(())
             }
@@ -330,6 +447,20 @@ impl PresenterBackend {
                 Ok(())
             }
         }
+    }
+
+    fn create_offscreen_target(
+        &mut self,
+        size: Size<i32, Physical>,
+    ) -> Result<(), PresenterBackendError> {
+        let renderbuffer = create_offscreen_renderbuffer(&mut self.renderer, size)?;
+        self.target = Some(PresenterRenderTarget::Offscreen(PresenterOffscreenTarget {
+            renderbuffer,
+            size,
+        }));
+        self.bind_size = None;
+        self.redraw_requested.set(true);
+        Ok(())
     }
 
     pub fn bind_wl_display(
@@ -391,33 +522,94 @@ impl PresenterBackend {
                 "failed to unbind EGL context before closing presentation window"
             );
         }
-        self.frontend = None;
+        self.target = None;
         self.bind_size = None;
     }
 
-    fn has_frontend(&self) -> bool {
-        self.frontend.is_some()
+    fn has_target(&self) -> bool {
+        self.target.is_some()
+    }
+
+    fn window(&self) -> Option<&WinitWindow> {
+        match self.target.as_ref() {
+            Some(PresenterRenderTarget::Window(frontend)) => Some(&frontend.window),
+            _ => None,
+        }
+    }
+
+    fn window_id(&self) -> Option<WindowId> {
+        self.window().map(WinitWindow::id)
+    }
+
+    fn window_inner_size(&self) -> Option<PhysicalSize<u32>> {
+        self.window().map(WinitWindow::inner_size)
+    }
+
+    fn window_is_x11(&self) -> bool {
+        matches!(
+            self.target.as_ref(),
+            Some(PresenterRenderTarget::Window(PresenterFrontend {
+                is_x11: true,
+                ..
+            }))
+        )
+    }
+
+    fn window_strong_count(&self) -> usize {
+        match self.target.as_ref() {
+            Some(PresenterRenderTarget::Window(frontend)) => Arc::strong_count(&frontend.window),
+            _ => 0,
+        }
     }
 
     pub fn window_size(&self) -> Size<i32, Physical> {
-        let frontend = self
-            .frontend
+        match self
+            .target
             .as_ref()
-            .expect("presentation window size requested without frontend");
-        let (w, h): (i32, i32) = frontend.window.inner_size().into();
-        (w, h).into()
+            .expect("presentation size requested without render target")
+        {
+            PresenterRenderTarget::Window(frontend) => {
+                let (w, h): (i32, i32) = frontend.window.inner_size().into();
+                (w, h).into()
+            }
+            PresenterRenderTarget::Offscreen(target) => target.size,
+        }
     }
 
-    pub fn window(&self) -> &WinitWindow {
-        &self
-            .frontend
-            .as_ref()
-            .expect("presentation window requested without frontend")
-            .window
+    pub fn request_redraw(&self) {
+        match self.target.as_ref() {
+            Some(PresenterRenderTarget::Window(frontend)) => frontend.window.request_redraw(),
+            Some(PresenterRenderTarget::Offscreen(_)) => self.redraw_requested.set(true),
+            None => {}
+        }
+    }
+
+    pub fn take_redraw_requested(&self) -> bool {
+        self.redraw_requested.replace(false)
+    }
+
+    pub fn target_name(&self) -> &'static str {
+        match self.target.as_ref() {
+            Some(PresenterRenderTarget::Window(_)) => "winit",
+            Some(PresenterRenderTarget::Offscreen(_)) => "offscreen",
+            None => "none",
+        }
     }
 
     pub fn renderer(&mut self) -> &mut GlesRenderer {
         &mut self.renderer
+    }
+
+    pub fn reset_target_after_context_loss(&mut self) {
+        if let Err(err) = self.renderer.egl_context().unbind() {
+            warn!(
+                ?err,
+                "failed to unbind EGL context before resetting presentation target"
+            );
+        }
+        self.target = None;
+        self.bind_size = None;
+        self.redraw_requested.set(true);
     }
 
     pub fn bind(
@@ -429,20 +621,29 @@ impl PresenterBackend {
         ),
         SwapBuffersError,
     > {
-        let frontend = self
-            .frontend
+        match self
+            .target
             .as_mut()
-            .expect("presentation render requested without frontend");
-        let (w, h): (i32, i32) = frontend.window.inner_size().into();
-        let window_size = Size::from((w, h));
-        if Some(window_size) != self.bind_size {
-            frontend
-                .egl_surface
-                .resize(window_size.w, window_size.h, 0, 0);
+            .expect("presentation render requested without render target")
+        {
+            PresenterRenderTarget::Window(frontend) => {
+                let (w, h): (i32, i32) = frontend.window.inner_size().into();
+                let window_size = Size::from((w, h));
+                if Some(window_size) != self.bind_size {
+                    frontend
+                        .egl_surface
+                        .resize(window_size.w, window_size.h, 0, 0);
+                }
+                self.bind_size = Some(window_size);
+                let fb = self.renderer.bind(&mut frontend.egl_surface)?;
+                Ok((&mut self.renderer, fb))
+            }
+            PresenterRenderTarget::Offscreen(target) => {
+                self.bind_size = Some(target.size);
+                let fb = self.renderer.bind(&mut target.renderbuffer)?;
+                Ok((&mut self.renderer, fb))
+            }
         }
-        self.bind_size = Some(window_size);
-        let fb = self.renderer.bind(&mut frontend.egl_surface)?;
-        Ok((&mut self.renderer, fb))
     }
 
     pub fn submit(
@@ -468,14 +669,81 @@ impl PresenterBackend {
             }
             _ => None,
         };
-        let frontend = self
-            .frontend
-            .as_mut()
-            .expect("presentation submit requested without frontend");
-        frontend.window.pre_present_notify();
-        frontend.egl_surface.swap_buffers(damage.as_deref_mut())?;
+        if let Some(PresenterRenderTarget::Window(frontend)) = self.target.as_mut() {
+            frontend.window.pre_present_notify();
+            frontend.egl_surface.swap_buffers(damage.as_deref_mut())?;
+        }
         Ok(())
     }
+}
+
+fn create_offscreen_renderbuffer(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+) -> Result<GlesRenderbuffer, GlesError> {
+    let buffer_size: Size<i32, BufferCoords> = (size.w, size.h).into();
+    renderer.create_buffer(Fourcc::Abgr8888, buffer_size)
+}
+
+fn offscreen_egl_display() -> Result<EGLDisplay, PresenterBackendError> {
+    let mut failures = Vec::new();
+    for path in render_node_candidates() {
+        match gbm_egl_display_from_path(&path) {
+            Ok(display) => return Ok(display),
+            Err(err) => failures.push(format!("{}:{err}", path.display())),
+        }
+    }
+
+    match unsafe { EGLDisplay::new(native::EGLSurfacelessDisplay) } {
+        Ok(display) => Ok(display),
+        Err(err) => {
+            if failures.is_empty() {
+                Err(err.into())
+            } else {
+                Err(PresenterBackendError::OffscreenRenderer(format!(
+                    "gbm render-node attempts failed [{}]; surfaceless fallback failed: {err}",
+                    failures.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+fn gbm_egl_display_from_path(path: &PathBuf) -> Result<EGLDisplay, PresenterBackendError> {
+    let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let owned_fd: OwnedFd = file.into();
+    let drm_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
+    let gbm = GbmDevice::new(drm_fd)?;
+    Ok(unsafe { EGLDisplay::new(gbm)? })
+}
+
+fn render_node_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("MANIFOLD_RENDER_NODE") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(devices) = EGLDevice::enumerate() {
+        for device in devices {
+            if let Ok(path) = device.render_device_path() {
+                candidates.push(path);
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir("/dev/dri") {
+        let mut paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("renderD"))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        candidates.extend(paths);
+    }
+    candidates.dedup();
+    candidates
 }
 
 fn create_egl_surface(
@@ -535,6 +803,10 @@ pub(crate) enum PresenterBackendError {
     EglSurface(#[from] smithay::backend::egl::EGLError),
     #[error("create EGL renderer: {0}")]
     Renderer(#[from] GlesError),
+    #[error("create GBM offscreen display: {0}")]
+    Gbm(#[from] IoError),
+    #[error("create offscreen presentation renderer: {0}")]
+    OffscreenRenderer(String),
     #[error("create Wayland EGL surface: {0}")]
     Surface(String),
     #[error("unsupported window handle")]

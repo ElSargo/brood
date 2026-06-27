@@ -8,20 +8,20 @@ Manifold should be able to run and test a development instance inside a stable i
 
 ## Shape
 
-The first version uses two normal `manifoldd` processes:
+The nested test topology uses two normal `manifoldd` processes:
 
 ```text
 host compositor
-  -> stable manifoldd presentation window
+  -> stable manifoldd presentation target
     -> dev manifoldd presentation window as a stable hosted app
       -> dev nested client, test harness, or WASM-controlled app
 ```
 
-The stable instance owns the host-facing presentation window. The dev instance is launched through the stable DBus control endpoint, so its presentation endpoint connects to the stable nested Wayland display and appears as a pane inside the stable workspace.
+The stable instance owns the outer presentation target. In automated nested tests that target is an offscreen framebuffer rather than a host OS window. The dev instance is launched through the stable DBus control endpoint, so its presentation endpoint connects to the stable nested Wayland display and appears as a pane inside the stable workspace.
 
 Both instances expose their own DBus control endpoints:
 
-- stable DBus control endpoint: drives the outer workspace, captures host-visible presentation, injects input into the dev presentation window
+- stable DBus control endpoint: drives the outer workspace, captures composed presentation output, injects input into the dev presentation window
 - dev DBus control endpoint: drives the inner workspace, launches test clients, samples inner frame/input/commit status
 
 ## Built-In CLI
@@ -46,7 +46,7 @@ This topology is the intended default test mode for behavior and graphics valida
 - record outer-visible latency and frame metrics
 - proxy diagnostic inspection into the inner instance when a deviation appears
 
-By default the outer supervisor runs headless, so the nested topology can start without a host-visible presentation window. The inner instance still attaches a presentation window into the outer nested compositor, which preserves the Manifold-in-Manifold path even though the outer host presentation is detached.
+By default the outer supervisor uses an attached offscreen presentation target, so the nested topology can start without a host-visible presentation window while still running composition, frame callbacks, capture, layout, focus, and nested Wayland behavior through the presentation path. The inner instance still attaches a normal presentation window into the outer nested compositor.
 
 When Manifold launches a hosted app, it sets `manifold_session` in that app's environment. If `manifoldd test` sees that marker, it treats the current Manifold session as the outer container and starts only the subject compositor. Use `manifoldd test nested --force-outer` when a test must create another explicit outer supervisor even though it is already running inside Manifold.
 
@@ -57,8 +57,6 @@ When the topology is running, the outer instance can proxy control requests to t
 ```sh
 manifoldd ctl --dbus-name <outer-destination> nested-inner status-json
 ```
-
-Current limitation: headless outer mode preserves behavior and control-path testing, but it does not yet provide a composed outer framebuffer capture. That still requires either an attached outer presentation window or a future offscreen presenter.
 
 For automated agent verification, this built-in CLI is the default path. Use it
 instead of the helper script when the test should not create an OS window in the
@@ -71,19 +69,94 @@ cargo run -- test nested --out-dir /tmp/manifold-test --inner-command 'weston-si
 ```
 
 Use `--keep-running` only when the verification script also cleans up the
-printed inner and outer DBus control endpoints. The outer supervisor remains headless
-unless `--outer-headful` is explicitly passed.
+printed inner and outer DBus control endpoints. The outer supervisor remains
+offscreen-attached unless the headful outer presentation mode is explicitly
+requested. The artifact directory includes an outer debug dump with the composed
+framebuffer capture.
 
-## Future Work
+## Inner Command Wrappers
 
-The most important remaining gap for the intended default nested test mode is full outer capture while staying headless by default.
+`--inner-command` is for the native client or helper executable that should run
+inside the subject compositor's nested Wayland display. The built-in test
+orchestrator splits this command into argv words and sends it through the normal
+DBus `spawn` path; it is not a shell script parser.
 
-Planned work:
+For anything beyond a single executable with simple flags, put the behavior in a
+temporary executable wrapper and pass the wrapper path as the inner command. A
+wrapper is the right place to set client-specific environment variables, redirect
+logs, enable line buffering, choose a private profile directory, or preserve
+shell quoting that would otherwise be lost before the command reaches `spawn`.
 
-- add an offscreen outer presenter so `manifoldd test nested` can capture the composed outer framebuffer without opening a host-visible window
-- retain the same nested topology, control flow, and latency instrumentation when switching between outer-headful and outer-headless execution
-- make full capture part of the default nested artifact bundle rather than a special-case debugging path
-- keep inner-instance dumps and diagnostics as supporting evidence, while outer composed capture remains the authoritative end-to-end visual record
+Typical wrapper shape:
+
+```sh
+#!/usr/bin/env sh
+exec stdbuf -oL -eL weston-eventdemo \
+  --log-motion --log-button --log-key --log-axis \
+  >"$ARTIFACT_DIR/weston-eventdemo.log" 2>&1
+```
+
+The wrapper runs as the hosted client process. It inherits the subject
+compositor's nested Wayland environment from Manifold, so it does not need to
+discover or set `WAYLAND_DISPLAY` itself unless the test is intentionally
+overriding that environment.
+
+Wrappers also keep failure attribution clearer. If the wrapper exits nonzero,
+the nested test reports a failed hosted child. If it exits zero without mapping a
+window, the run can still succeed for protocol-only clients such as
+`wayland-info`. If a GUI client is expected to stay alive and render, the test
+should assert mapped windows, frame progress, and any client log markers it cares
+about.
+
+## WASM Harness Composition
+
+The WASM test harness is the controller and assertion layer; an inner-command
+wrapper is just one possible workload launched inside the subject compositor.
+They compose in two useful ways:
+
+- Start the wrapper with `--inner-command`, then let the WASM harness inspect
+  status, inject input, send control commands, wait for signals, and decide
+  pass/fail.
+- Put wrappers on `PATH` or pass their paths through harness-specific config, so
+  the WASM harness can spawn native clients itself during the scenario.
+
+In the outer-supervisor topology, the harness is loaded into the outer process.
+It can drive the full stable-to-subject path and use the `nested-inner` control
+proxy when it needs to inspect or command the subject instance. In the
+current-session topology, there is no extra outer process, so the harness runs in
+the subject process and controls that instance directly.
+
+This separation is intentional. Native wrappers cover messy process-launch
+details for real clients; the WASM harness owns scenario policy, synchronization,
+status checks, and pass/fail reporting. A harness should not depend on fragile
+inline shell quoting to create the client process it wants to test.
+
+## Success Criteria
+
+For `manifoldd test nested`, success starts with the command exiting zero, but a
+useful behavior test should also validate the artifacts that match its topology:
+
+- outer-supervisor tests should record an outer debug dump, a nonempty composed
+  capture, attached presentation status, frame progress, and the expected
+  presentation target
+- offscreen tests should show `presentation_target=offscreen` for the outer
+  supervisor
+- visible outer tests should show `presentation_target=winit` for the outer
+  supervisor
+- GUI-client tests should prove that the expected windows mapped and frames
+  advanced
+- protocol-only client tests should prove the client exited successfully and
+  produced the expected protocol/status output
+- input tests should compare outer and inner input counters and, when possible,
+  client-visible logs
+- WASM harness tests should contain a passing `TEST_HARNESS_RESULT` and no
+  failed or paused harness result
+
+Logs are diagnostic evidence, not the only success oracle. A visible Winit run
+can recover from a transient host EGL surface loss while still producing a valid
+capture and clean status sample. Treat repeated presentation runtime failures,
+missing captures, missing frame progress, child-process failures, protocol
+errors, or failed harness results as test failures.
 
 ## Headless Runtime
 

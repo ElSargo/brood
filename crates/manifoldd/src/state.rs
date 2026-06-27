@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -88,6 +88,11 @@ pub enum PresentationStatus {
 pub enum FocusDirection {
     Next,
     Previous,
+}
+
+struct HostedChild {
+    command: String,
+    child: Child,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -245,6 +250,10 @@ pub struct Manifold {
     pub(crate) manifold_session: Option<String>,
     pub(crate) manifold_dbus_destination: Option<String>,
     pub(crate) manifold_dbus_address: Option<String>,
+    hosted_children: Vec<HostedChild>,
+    hosted_child_exits: u64,
+    hosted_child_failures: u64,
+    hosted_child_last_status: Option<String>,
 }
 
 impl Manifold {
@@ -348,6 +357,10 @@ impl Manifold {
             manifold_session: None,
             manifold_dbus_destination: None,
             manifold_dbus_address: None,
+            hosted_children: Vec::new(),
+            hosted_child_exits: 0,
+            hosted_child_failures: 0,
+            hosted_child_last_status: None,
         }
     }
 
@@ -404,6 +417,7 @@ impl Manifold {
             .insert_source(
                 Timer::from_duration(WINDOW_LIFECYCLE_REFRESH_INTERVAL),
                 |_, _, state| {
+                    state.refresh_hosted_children();
                     state.refresh_window_state_from_lifecycle_timer();
                     TimeoutAction::ToDuration(WINDOW_LIFECYCLE_REFRESH_INTERVAL)
                 },
@@ -415,7 +429,7 @@ impl Manifold {
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
         self.apply_control_environment(&mut child);
-        child.spawn().with_context(|| {
+        let child = child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
                 command,
@@ -427,6 +441,10 @@ impl Manifold {
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
         );
+        self.hosted_children.push(HostedChild {
+            command: command.to_string_lossy().into_owned(),
+            child,
+        });
         Ok(())
     }
 
@@ -438,7 +456,7 @@ impl Manifold {
         let mut child = Command::new(program);
         child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
         self.apply_control_environment(&mut child);
-        child.spawn().with_context(|| {
+        let child = child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
                 argv,
@@ -450,7 +468,64 @@ impl Manifold {
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
         );
+        self.hosted_children.push(HostedChild {
+            command: argv.join(" "),
+            child,
+        });
         Ok(())
+    }
+
+    pub fn refresh_hosted_children(&mut self) {
+        let mut active = Vec::with_capacity(self.hosted_children.len());
+        for mut hosted in self.hosted_children.drain(..) {
+            match hosted.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.hosted_child_exits += 1;
+                    if !status.success() {
+                        self.hosted_child_failures += 1;
+                    }
+                    let detail = match status.code() {
+                        Some(code) => format!("exit:{code}"),
+                        None => "signal".to_string(),
+                    };
+                    self.hosted_child_last_status = Some(format!("{}:{detail}", hosted.command));
+                    info!(
+                        command = %hosted.command,
+                        status = %detail,
+                        success = status.success(),
+                        "hosted Wayland app exited"
+                    );
+                }
+                Ok(None) => active.push(hosted),
+                Err(err) => {
+                    self.hosted_child_exits += 1;
+                    self.hosted_child_failures += 1;
+                    self.hosted_child_last_status = Some(format!("{}:poll_error", hosted.command));
+                    warn!(
+                        ?err,
+                        command = %hosted.command,
+                        "failed to poll hosted Wayland app"
+                    );
+                }
+            }
+        }
+        self.hosted_children = active;
+    }
+
+    pub fn hosted_child_count(&self) -> usize {
+        self.hosted_children.len()
+    }
+
+    pub fn hosted_child_exits(&self) -> u64 {
+        self.hosted_child_exits
+    }
+
+    pub fn hosted_child_failures(&self) -> u64 {
+        self.hosted_child_failures
+    }
+
+    pub fn hosted_child_last_status(&self) -> &str {
+        self.hosted_child_last_status.as_deref().unwrap_or("none")
     }
 
     pub fn spawn_browser_pane(
