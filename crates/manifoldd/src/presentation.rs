@@ -351,7 +351,7 @@ fn handle_presenter_event(
             if state.presentation == PresentationStatus::Detached {
                 return;
             }
-            if state.active_surface_session_window_count() == 0 {
+            if state.presentation_visible_window_count() == 0 {
                 return;
             }
             if schedule_deferred_client_frame(&event_presenter, state, false) {
@@ -374,7 +374,7 @@ pub(crate) fn request_presenter_redraw_after_client_commit(state: &mut Manifold)
     if state.presentation != PresentationStatus::Attached {
         return;
     }
-    if state.active_surface_session_window_count() == 0 {
+    if state.presentation_visible_window_count() == 0 {
         return;
     }
     let Some(presenter) = state.presenter.as_ref().cloned() else {
@@ -396,7 +396,7 @@ fn schedule_deferred_client_frame(
     if state.presentation_redraw_deferred {
         return true;
     }
-    if state.active_surface_session_window_count() == 0 {
+    if state.presentation_visible_window_count() == 0 {
         return false;
     }
 
@@ -503,7 +503,7 @@ fn render_presenter_frame_with_capture(
             .map_or((0, 0), |rect| (rect.x, rect.y));
         render_space.map_element(window.clone(), loc, true);
     }
-    if let Some(active_window) = state.active_window() {
+    if let Some(active_window) = state.active_presentation_window() {
         let loc = state
             .window_layout_rect(&active_window)
             .map_or((0, 0), |rect| (rect.x, rect.y));
@@ -678,12 +678,25 @@ fn send_active_client_frame_callbacks(
 ) -> u64 {
     let output = presenter.output.clone();
     let mut client_frame_callbacks = 0;
-    let windows = state
-        .space
-        .elements()
-        .filter(|window| state.window_visible_in_presentation(window))
-        .cloned()
-        .collect::<Vec<_>>();
+    let active_window = state.active_presentation_window();
+    let active_surface = active_window
+        .as_ref()
+        .and_then(Manifold::window_toplevel_surface);
+    let mut windows = Vec::new();
+    if let Some(active_window) = active_window {
+        windows.push(active_window);
+    }
+    windows.extend(
+        state
+            .space
+            .elements()
+            .filter(|window| state.window_visible_in_presentation(window))
+            .filter(|window| {
+                active_surface.as_ref()
+                    != Manifold::window_toplevel_surface(window).as_ref()
+            })
+            .cloned(),
+    );
     windows.iter().for_each(|window| {
         window.send_frame(
             &output,

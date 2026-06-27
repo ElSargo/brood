@@ -1448,6 +1448,13 @@ impl Manifold {
         self.window_belongs_to_active_surface_session(window)
     }
 
+    pub fn presentation_visible_window_count(&self) -> usize {
+        self.space
+            .elements()
+            .filter(|window| self.window_visible_in_presentation(window))
+            .count()
+    }
+
     pub fn window_layout_rect(&self, window: &Window) -> Option<LayoutRect> {
         if !self.window_visible_in_presentation(window) {
             return None;
@@ -1587,6 +1594,12 @@ impl Manifold {
                 })
                 .cloned()
         })
+    }
+
+    pub fn active_presentation_window(&self) -> Option<Window> {
+        self.active_toplevel_surface
+            .as_ref()
+            .and_then(|active| self.window_for_toplevel_surface(active))
     }
 
     pub fn focus_window(&mut self, window: &Window) {
