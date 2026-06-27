@@ -14,6 +14,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState},
+    output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
@@ -27,7 +28,7 @@ use smithay::{
             protocol::{wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{Logical, Point, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
@@ -59,6 +60,8 @@ use crate::{
 #[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
 const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
+const SESSION_OUTPUT_SIZE: (i32, i32) = (1280, 800);
 const SESSION_NAME_ADJECTIVES: &[&str] = &[
     "amber", "brisk", "calm", "dusk", "eager", "fern", "glad", "hazel", "ivory", "jolly", "keen",
     "lucid", "mellow", "nimble", "olive", "plain", "quiet", "radiant", "steady", "tidy", "umber",
@@ -178,6 +181,7 @@ pub struct Manifold {
     pub loop_handle: LoopHandle<'static, Manifold>,
     pub loop_signal: LoopSignal,
 
+    pub(crate) session_output: Output,
     pub space: Space<Window>,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -264,6 +268,10 @@ impl Manifold {
             .expect("keyboard capability");
         seat.add_pointer();
 
+        let session_output = Self::init_session_output(&display_handle);
+        let mut space = Space::default();
+        space.map_output(&session_output, (0, 0));
+
         let socket_name = Self::init_wayland_listener(display, event_loop);
         Self::init_window_lifecycle_timer(event_loop);
         let loop_handle = event_loop.handle();
@@ -281,7 +289,8 @@ impl Manifold {
             display_handle,
             loop_handle,
             loop_signal,
-            space: Space::default(),
+            session_output,
+            space,
             compositor_state,
             xdg_shell_state,
             #[cfg(feature = "shm-fallback")]
@@ -349,6 +358,31 @@ impl Manifold {
             manifold_dbus_destination: None,
             manifold_dbus_address: None,
         }
+    }
+
+    fn init_session_output(display_handle: &DisplayHandle) -> Output {
+        let output = Output::new(
+            "manifold-session".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Manifold".into(),
+                model: "Session".into(),
+            },
+        );
+        let mode = OutputMode {
+            size: SESSION_OUTPUT_SIZE.into(),
+            refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
+        };
+        output.create_global::<Self>(display_handle);
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Flipped180),
+            None,
+            Some((0, 0).into()),
+        );
+        output.set_preferred(mode);
+        output
     }
 
     fn init_wayland_listener(
@@ -2359,8 +2393,12 @@ struct WindowRefreshOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{focus_stack_location, fullscreen_layout_rect};
+    use super::{
+        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, focus_stack_location,
+        fullscreen_layout_rect,
+    };
     use crate::layout::LayoutSize;
+    use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 
     #[test]
     fn focus_stack_places_every_window_at_origin() {
@@ -2383,6 +2421,24 @@ mod tests {
         let rect = fullscreen_layout_rect(LayoutSize { w: 0, h: -4 });
 
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn detached_session_starts_with_mapped_output() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let state = Manifold::new(&mut event_loop, display);
+
+        assert_eq!(state.presentation, PresentationStatus::Detached);
+        assert_eq!(state.space.outputs().count(), 1);
+        let geometry = state
+            .space
+            .output_geometry(&state.session_output)
+            .expect("session output geometry");
+        assert_eq!(
+            (geometry.size.w, geometry.size.h),
+            (SESSION_OUTPUT_SIZE.0, SESSION_OUTPUT_SIZE.1)
+        );
     }
 }
 

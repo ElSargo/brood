@@ -26,13 +26,13 @@ use smithay::{
         },
     },
     desktop::Space,
-    output::{Mode, Output, PhysicalProperties, Subpixel},
+    output::{Mode, Output},
     reexports::calloop::{
         LoopHandle,
         timer::{TimeoutAction, Timer},
     },
     utils::DeviceFd,
-    utils::{Buffer as BufferCoords, Point, Rectangle, Transform},
+    utils::{Buffer as BufferCoords, Point, Rectangle},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -42,7 +42,7 @@ use tracing::{info, warn};
 
 use crate::{
     layout::{LayoutLeafKind, LayoutRect},
-    state::{Manifold, PresentationStatus},
+    state::{Manifold, PresentationStatus, SESSION_OUTPUT_REFRESH_MILLIHZ},
     winit_presenter::{
         PresenterBackend, PresenterEvent, PresenterEventSource, PresenterRuntime,
         SharedPresenterRuntime, WaylandEglBind, axis_frame,
@@ -63,7 +63,7 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
     state.dmabuf.importer = Some(Rc::clone(&presenter.runtime));
     let mode = Mode {
         size: backend.window_size(),
-        refresh: PRESENTATION_REFRESH_MILLIHZ,
+        refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
     };
     presenter
         .output
@@ -104,7 +104,6 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
     info!("presentation attached");
 }
 
-const PRESENTATION_REFRESH_MILLIHZ: i32 = 60_000;
 const TEMP_AGGRESSIVE_PRESENTATION_POLL: bool = false;
 const CLIENT_FRAME_DEFER: Duration = Duration::from_millis(2);
 const INPUT_FRAME_DEFER_MAX: Duration = Duration::from_millis(3);
@@ -124,28 +123,7 @@ pub fn attach(loop_handle: &LoopHandle<'static, Manifold>, state: &mut Manifold)
     let event_source = PresenterEventSource::new(Rc::clone(&runtime))
         .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
 
-    let mode = Mode {
-        size: (1280, 800).into(),
-        refresh: PRESENTATION_REFRESH_MILLIHZ,
-    };
-    let output = Output::new(
-        "manifold-winit".to_string(),
-        PhysicalProperties {
-            size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
-            make: "Manifold".into(),
-            model: "Winit".into(),
-        },
-    );
-    let _global = output.create_global::<Manifold>(&state.display_handle);
-    output.change_current_state(
-        Some(mode),
-        Some(Transform::Flipped180),
-        None,
-        Some((0, 0).into()),
-    );
-    output.set_preferred(mode);
-
+    let output = state.session_output.clone();
     let damage_tracker = OutputDamageTracker::from_output(&output);
     state.dmabuf.importer = Some(Rc::clone(&runtime));
     let presenter = Rc::new(PresenterHandle {
@@ -205,7 +183,7 @@ fn handle_presenter_event(
             event_presenter.output.change_current_state(
                 Some(Mode {
                     size,
-                    refresh: PRESENTATION_REFRESH_MILLIHZ,
+                    refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
                 }),
                 None,
                 None,
@@ -815,7 +793,6 @@ fn apply_pending_attach_state(presenter: &Rc<PresenterHandle>, state: &mut Manif
         state.detach_requested = false;
         state.reset_transient_input_state();
         presenter.runtime.borrow_mut().close_window();
-        state.space.unmap_output(&presenter.output);
         state.presentation = PresentationStatus::Detached;
         state.stats.record_detach_applied();
         state.stats.detach_count += 1;

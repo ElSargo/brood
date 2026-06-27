@@ -12,6 +12,11 @@ Applications launched inside a Manifold session should create panes through thei
 
 A separate presentation endpoint process is deferred until Manifold needs process isolation or multi-endpoint presentation.
 
+The nested compositor should advertise a stable virtual output as part of the
+session runtime, even while no presentation surface is attached. `show` may
+resize or render against that output, but clients launched through `enter`
+should be able to create windows before any presentation window exists.
+
 The current implementation uses Smithay for the Linux/Rust nested compositor path. That does not make Smithay part of the future WASM or workspace API surface.
 
 ## Surface Sharing

@@ -18,6 +18,8 @@ pub struct LaunchRecord {
     pub project_dir: PathBuf,
     pub working_dir: PathBuf,
     pub cache_dir: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_cache_root: Option<PathBuf>,
     pub runner_kind: String,
     pub program_argv: Vec<OsString>,
     pub session_args: Option<SessionArgs>,
@@ -113,7 +115,7 @@ pub fn os_args(args: &[OsString]) -> impl Iterator<Item = &OsStr> {
 
 #[cfg(test)]
 mod tests {
-    use super::launch_id_from_cgroup_line;
+    use super::{LaunchRecord, launch_id_from_cgroup_line};
 
     #[test]
     fn extracts_launch_id_from_systemd_scope_cgroup() {
@@ -122,5 +124,23 @@ mod tests {
             launch_id_from_cgroup_line(line),
             Some("p123t456".to_string())
         );
+    }
+
+    #[test]
+    fn launch_record_without_runner_cache_root_decodes() {
+        let json = r#"{
+            "id": "p123t456",
+            "project_dir": "/tmp/project",
+            "working_dir": "/tmp/project",
+            "cache_dir": "/tmp/cache/sessions/p123",
+            "runner_kind": "nix-develop",
+            "program_argv": [],
+            "session_args": null
+        }"#;
+
+        let record: LaunchRecord = serde_json::from_str(json).expect("decode launch record");
+
+        assert_eq!(record.id, "p123t456");
+        assert_eq!(record.runner_cache_root, None);
     }
 }

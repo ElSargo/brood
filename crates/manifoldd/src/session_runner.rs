@@ -27,8 +27,10 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
         return Ok(false);
     };
 
-    let cache_dir = create_cache_dir(selection.runner.cache_root.as_deref())?;
+    let cache_root = runner_cache_root(selection.runner.cache_root.as_deref());
+    let cache_dir = create_cache_dir(&cache_root)?;
     let current_exe = env::current_exe().context("resolve current exe")?;
+    let inner_binary = session_server_path(&current_exe);
     let mut session_args = args.session.clone();
     session_args.config = selection.config_path.clone();
     let record = LaunchRecord {
@@ -36,11 +38,13 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
         project_dir: selection.project_dir.clone(),
         working_dir: selection.project_dir.clone(),
         cache_dir: cache_dir.clone(),
+        runner_cache_root: Some(cache_root),
         runner_kind: selection.runner.kind.clone(),
-        program_argv: vec![session_server_path(&current_exe).into_os_string()],
+        program_argv: vec![inner_binary.clone().into_os_string()],
         session_args: Some(session_args),
     };
-    let mut command = runner_scope_command(&selection.runner, &current_exe, &record)?;
+    let mut command =
+        runner_scope_command(&selection.runner, &current_exe, &record, &inner_binary)?;
 
     info!(
         runner = %selection.runner.kind,
@@ -78,18 +82,22 @@ pub(crate) fn run_project_command_if_configured(
     }
 
     let working_dir = current_project_dir()?;
-    let cache_dir = create_cache_dir(selection.runner.cache_root.as_deref())?;
+    let cache_root = runner_cache_root(selection.runner.cache_root.as_deref());
+    let cache_dir = create_cache_dir(&cache_root)?;
     let current_exe = env::current_exe().context("resolve current exe")?;
+    let inner_binary = runner_exec_path(&current_exe);
     let record = LaunchRecord {
         id: launch_context::new_launch_id(),
         project_dir: selection.project_dir.clone(),
         working_dir,
         cache_dir: cache_dir.clone(),
+        runner_cache_root: Some(cache_root),
         runner_kind: selection.runner.kind.clone(),
         program_argv: argv.to_vec(),
         session_args: None,
     };
-    let mut command = runner_scope_command(&selection.runner, &current_exe, &record)?;
+    let mut command =
+        runner_scope_command(&selection.runner, &current_exe, &record, &inner_binary)?;
     command
         .env(RUNNER_ACTIVE_ENV, "1")
         .envs(extra_env.iter().map(|(key, value)| (key, value)));
@@ -123,8 +131,11 @@ fn runner_scope_command(
     runner: &config::SessionRunnerConfig,
     current_exe: &Path,
     record: &LaunchRecord,
+    inner_binary: &Path,
 ) -> Result<Command> {
-    let (program, args) = runner_program(runner, current_exe)?;
+    let (program, configured_args) = runner_program(runner, current_exe, &record.project_dir)?;
+    let mut args = runner_activation_args(record, inner_binary);
+    args.extend(configured_args);
     launch_context::write_launch_record(record)?;
 
     let mut command = Command::new("systemd-run");
@@ -142,13 +153,29 @@ fn runner_scope_command(
     Ok(command)
 }
 
+fn runner_activation_args(record: &LaunchRecord, inner_binary: &Path) -> Vec<OsString> {
+    let runner_cache_root = record
+        .runner_cache_root
+        .as_deref()
+        .unwrap_or(&record.cache_dir);
+
+    vec![
+        record.project_dir.clone().into_os_string(),
+        record.working_dir.clone().into_os_string(),
+        record.cache_dir.clone().into_os_string(),
+        runner_cache_root.as_os_str().to_owned(),
+        inner_binary.as_os_str().to_owned(),
+    ]
+}
+
 fn runner_program(
     runner: &config::SessionRunnerConfig,
     current_exe: &Path,
+    project_dir: &Path,
 ) -> Result<(OsString, Vec<OsString>)> {
     if let Some((program, args)) = runner.command.split_first() {
         return Ok((
-            OsString::from(program.as_str()),
+            runner_command_program(program, project_dir),
             args.iter()
                 .map(|arg| OsString::from(arg.as_str()))
                 .collect(),
@@ -168,8 +195,20 @@ fn runner_program(
     }
 }
 
+fn runner_command_program(program: &str, project_dir: &Path) -> OsString {
+    if Path::new(program).is_absolute() || !program.contains('/') {
+        OsString::from(program)
+    } else {
+        project_dir.join(program).into_os_string()
+    }
+}
+
 fn session_server_path(current_exe: &Path) -> PathBuf {
     sidecar_binary_path(current_exe, "manifold-sessiond")
+}
+
+fn runner_exec_path(current_exe: &Path) -> PathBuf {
+    sidecar_binary_path(current_exe, "manifold-runner-exec")
 }
 
 fn sidecar_binary_path(current_exe: &Path, name: &str) -> PathBuf {
@@ -188,18 +227,21 @@ fn current_project_dir() -> Result<PathBuf> {
     Ok(directory.canonicalize().unwrap_or(directory))
 }
 
-fn create_cache_dir(cache_root: Option<&Path>) -> Result<PathBuf> {
-    let root = cache_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_cache_root);
+fn create_cache_dir(cache_root: &Path) -> Result<PathBuf> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
-    let cache_dir = root
+    let cache_dir = cache_root
         .join("sessions")
         .join(format!("{}-{stamp}", std::process::id()));
     fs::create_dir_all(&cache_dir).with_context(|| format!("create {}", cache_dir.display()))?;
     Ok(cache_dir)
+}
+
+fn runner_cache_root(configured_cache_root: Option<&Path>) -> PathBuf {
+    configured_cache_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_cache_root)
 }
 
 fn default_cache_root() -> PathBuf {

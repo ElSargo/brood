@@ -1,0 +1,4 @@
+MANIFOLD_DUMMY_NIX_ENV=active
+MANIFOLD_DUMMY_PROJECT_NAME=session-runner-nix-project
+MANIFOLD_SESSION_PROJECT_DIR=/home/sargo/butter/manifold-devenv/examples/session-runner-nix-project
+MANIFOLD_SESSION_CACHE_DIR=/home/sargo/butter/manifold-devenv/examples/session-runner-nix-project/.manifold/cache/sessions/725106-1782597913999

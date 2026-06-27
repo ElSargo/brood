@@ -105,9 +105,11 @@ launches on the inherited host display when one is available.
 Project environment activation should be owned by the session lifecycle rather
 than by `mctl` or by shell startup files. The target primitive is a session
 runner: Manifold creates a session cache directory, creates or joins a process
-scope for the session, writes a launch record keyed by that scope, then starts a
-configurable runner. The runner and any helper it execs resolve the project
-directory, cache directory, and program to run from their current cgroup.
+scope for the session, writes a launch record keyed by that scope, resolves the
+configured runner command, then starts the runner from the original working
+directory. Manifold passes the runner the resolved project directory, original
+working directory, session cache directory, persistent runner cache root, and
+inner binary path as positional arguments.
 
 This keeps Manifold's contract narrow. Manifold owns lifecycle, process
 grouping, cache paths, readiness, control endpoints, and cleanup. The runner
@@ -122,27 +124,36 @@ The runner contract is:
 
 - Manifold resolves the project directory from the session launch cwd and keeps
   the original command working directory separately.
-- Manifold creates a cache directory for session-local activation state.
+- Manifold creates a cache directory for session-local activation state and
+  provides a persistent runner cache root for tool-specific reuse across
+  launches.
 - Manifold creates a transient user scope for the runner.
 - Manifold writes a launch record keyed by that scope's launch id.
-- Manifold invokes the configured runner without project, cache, or program
-  arguments.
-- The runner activates its environment and execs a helper or target program
-  that resolves its launch record from `/proc/self/cgroup`.
-- The helper exports environment variables that name the project directory,
-  working directory, and cache directory so the activated process tree can
-  inspect them.
-- The runner waits for the session server to exit when it cannot use direct
-  process replacement, then performs any tool-specific cleanup.
+- Manifold resolves configured runner command paths relative to the project
+  directory when they contain a path separator.
+- Manifold starts the runner from the original working directory so activation
+  scripts and the inner binary run where the user invoked `mctl enter`.
+- Manifold invokes the configured runner as
+  `runner <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>`.
+- The runner activates its environment, exports environment variables that name
+  the project directory, working directory, and cache directory, runs the inner
+  binary, then exits with the inner binary's status.
+- The inner binary resolves its launch record from `/proc/self/cgroup`. For
+  session startup this is `manifold-sessiond`; for entered shell or command
+  execution this is `manifold-runner-exec`.
+- The runner resumes after the inner binary exits and can perform any
+  tool-specific cleanup before returning the preserved status.
 - Manifold removes the cache directory after the runner process exits when the
   runner did not already remove it.
 
-The first built-in runner kind is `nix-develop`. It enters `nix develop` for the
-project directory using the native `manifold-runner-nix-develop` runner, then
-chains to `manifold-runner-exec` inside that environment. The Nix runner owns
-Nix activation only; the generic exec helper owns decoding and execing the
-assigned target program. Custom runners should use the same lifecycle shape but
-can compose multiple tools in any order.
+The first built-in runner kind is `nix-develop`. The native
+`manifold-runner-nix-develop` runner caches the sourceable activation script
+from `nix print-dev-env --profile` under the persistent runner cache root. The
+cache record includes the `flake.nix` and `flake.lock` checksums, so unchanged
+projects can source the cached activation script and run the explicit inner
+binary without evaluating the flake again. The Nix runner owns Nix activation
+only; the inner binary owns cgroup launch-record decoding. Custom runners
+should use the same lifecycle shape but can compose multiple tools in any order.
 
 The normal user entry point remains `mctl`. Directory-scoped commands such as
 `mctl enter`, `mctl show`, and `mctl list` should discover the project root,

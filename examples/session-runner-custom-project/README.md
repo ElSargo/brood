@@ -4,11 +4,13 @@ This project tests the `mctl enter` workflow without depending on Nix downloads.
 It uses the same runner ABI as the Nix runner:
 
 ```text
-runner
+runner <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>
 ```
 
-The runner exports marker variables and then execs `manifold-runner-exec`,
-which resolves the assigned program from its current cgroup.
+The runner exports marker variables, runs the supplied inner binary, and exits
+with the inner binary's status. The supplied inner binary resolves the assigned
+program or session arguments from its current cgroup. Manifold starts the
+runner from the directory where `mctl enter` was invoked.
 
 Build Manifold first:
 

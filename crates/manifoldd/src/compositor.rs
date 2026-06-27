@@ -406,6 +406,8 @@ fn spawn_outer(
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
+    command.arg("--no-session-runner");
+    command.arg("--no-default-modules");
     command
         .arg("--dbus-destination")
         .arg(&outer_target.destination);
@@ -447,6 +449,8 @@ fn spawn_subject(
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
+    command.arg("--no-session-runner");
+    command.arg("--no-default-modules");
     command
         .arg("--dbus-destination")
         .arg(&subject_target.destination);
@@ -482,7 +486,7 @@ fn spawn_inner(
     inner_headless: bool,
 ) -> Result<()> {
     let mut command = format!(
-        "exec {} run --dbus-destination {}",
+        "exec {} run --no-session-runner --no-default-modules --dbus-destination {}",
         shell_quote(&current_exe.display().to_string()),
         shell_quote(&inner_target.destination),
     );
