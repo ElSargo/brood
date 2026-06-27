@@ -272,7 +272,7 @@ fn run_nested_test_with_outer(
 
     if let Some(command) = args.inner_command.as_deref() {
         let inner_command = shell_split(command)?;
-        let child_counts_before = hosted_child_counts(&inner_target).unwrap_or_default();
+        let status_before = hosted_inner_status(&inner_target).unwrap_or_default();
         control::request_dbus_command(
             &inner_target,
             &[vec!["spawn".to_string()], inner_command].concat(),
@@ -283,7 +283,7 @@ fn run_nested_test_with_outer(
                 &inner_target,
                 &inner_log,
                 &mut outer_child,
-                child_counts_before,
+                status_before,
             )?;
         }
     }
@@ -607,7 +607,7 @@ fn wait_for_hosted_inner_command(
     inner_target: &control::ControlTarget,
     log_path: &Path,
     outer_child: &mut Child,
-    child_counts_before: HostedChildCounts,
+    status_before: HostedInnerStatus,
 ) -> Result<()> {
     let start = Instant::now();
     loop {
@@ -627,18 +627,18 @@ fn wait_for_hosted_inner_command(
                     .get("frames")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                if windows >= 2 && frames >= 2 {
+                if windows > status_before.windows && frames >= 2 {
                     return Ok(());
                 }
-                let child_counts = HostedChildCounts::from_json(&json);
-                if child_counts.failures > child_counts_before.failures {
+                let status = HostedInnerStatus::from_json(&json);
+                if status.failures > status_before.failures {
                     let last_status = json
                         .get("hosted_child_last_status")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown");
                     bail!("inner command exited unsuccessfully: {last_status}");
                 }
-                if child_counts.exits > child_counts_before.exits {
+                if status.exits > status_before.exits {
                     return Ok(());
                 }
             }
@@ -652,14 +652,19 @@ fn wait_for_hosted_inner_command(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct HostedChildCounts {
+struct HostedInnerStatus {
+    windows: u64,
     exits: u64,
     failures: u64,
 }
 
-impl HostedChildCounts {
+impl HostedInnerStatus {
     fn from_json(json: &serde_json::Value) -> Self {
         Self {
+            windows: json
+                .get("windows")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
             exits: json
                 .get("hosted_child_exits")
                 .and_then(serde_json::Value::as_u64)
@@ -672,10 +677,10 @@ impl HostedChildCounts {
     }
 }
 
-fn hosted_child_counts(target: &control::ControlTarget) -> Result<HostedChildCounts> {
+fn hosted_inner_status(target: &control::ControlTarget) -> Result<HostedInnerStatus> {
     let response = control::request_dbus_command(target, &[String::from("status-json")], false)?;
     let json = serde_json::from_str::<serde_json::Value>(&response)?;
-    Ok(HostedChildCounts::from_json(&json))
+    Ok(HostedInnerStatus::from_json(&json))
 }
 
 fn capture_outer_debug_dump(
