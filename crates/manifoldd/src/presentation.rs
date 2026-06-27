@@ -496,7 +496,7 @@ fn render_presenter_frame_with_capture(
     for window in state
         .space
         .elements()
-        .filter(|window| state.window_in_active_surface_session(window))
+        .filter(|window| state.window_visible_in_presentation(window))
     {
         let loc = state
             .window_layout_rect(window)
@@ -587,8 +587,12 @@ fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
     const ACTIVE_BORDER: [f32; 4] = [0.36, 0.64, 0.78, 1.0];
 
     let mut elements = Vec::new();
-    for region in state.layout.resolve(state.presentation_layout_size()) {
-        if region.kind == LayoutLeafKind::Placeholder {
+    for mut region in state.layout.resolve(state.presentation_layout_size()) {
+        region.rect.x += state.left_panel_reserved_width();
+        let active_session_placeholder =
+            region.kind == LayoutLeafKind::Placeholder
+                || !state.layout_leaf_has_active_session_window(region.leaf);
+        if active_session_placeholder {
             push_rect(&mut elements, inset(region.rect, 10), PLACEHOLDER_FILL);
             push_rect(&mut elements, inset(region.rect, 18), PLACEHOLDER_INSET);
         }
@@ -677,7 +681,7 @@ fn send_active_client_frame_callbacks(
     let windows = state
         .space
         .elements()
-        .filter(|window| state.window_in_active_surface_session(window))
+        .filter(|window| state.window_visible_in_presentation(window))
         .cloned()
         .collect::<Vec<_>>();
     windows.iter().for_each(|window| {

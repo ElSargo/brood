@@ -263,6 +263,14 @@ impl Manifold {
     }
 
     pub fn forward_pointer_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
+        if self.resize_left_panel_to_pointer(pos.x) {
+            self.reconfigure_focus_stack();
+            self.stats
+                .record_input(self.presentation == PresentationStatus::Attached);
+            self.stats.pointer_motion_events += 1;
+            return;
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         let hover_surface = self
             .window_under_layout_position(pos)
@@ -293,6 +301,27 @@ impl Manifold {
 
     pub fn forward_pointer_button(&mut self, button_code: u32, state: ButtonState, time: u32) {
         let pointer = self.seat.get_pointer().expect("pointer");
+        if button_code == 0x110 {
+            match state {
+                ButtonState::Pressed
+                    if self.left_panel_splitter_hit(
+                        pointer.current_location().x,
+                        pointer.current_location().y,
+                    ) =>
+                {
+                    self.begin_left_panel_resize();
+                    self.record_consumed_pointer_button();
+                    return;
+                }
+                ButtonState::Released if self.end_left_panel_resize() => {
+                    self.record_consumed_pointer_button();
+                    self.reconfigure_focus_stack();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let keyboard = self.seat.get_keyboard().expect("keyboard");
         let serial = SERIAL_COUNTER.next_serial();
         let target_window = self.window_under_layout_position(pointer.current_location());
@@ -345,6 +374,12 @@ impl Manifold {
             },
         );
         pointer.frame(self);
+    }
+
+    fn record_consumed_pointer_button(&mut self) {
+        self.stats
+            .record_input(self.presentation == PresentationStatus::Attached);
+        self.stats.pointer_button_events += 1;
     }
 
     pub fn forward_pointer_axis(&mut self, frame: AxisFrame) {

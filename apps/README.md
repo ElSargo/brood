@@ -1,13 +1,7 @@
 # Apps
 
-Built-in WASM apps will live here.
+Repo-local apps that run inside Manifold's nested compositor.
 
-Candidate apps:
+- `manifold-session-switcher.py`: GTK/libadwaita session switcher. It registers over Manifold DBus as presentation chrome, requests left-sidebar placement, lists sessions, creates sessions, and activates sessions.
 
-- git status, diff, commit, and tree editor
-- settings
-- agent dashboard
-- project explorer
-- command and task dashboards
-
-Apps should use host capabilities and emit scene patches rather than drawing pixels directly.
+Built-in WASM apps will live here later. They should use host capabilities and emit scene patches rather than drawing pixels directly.

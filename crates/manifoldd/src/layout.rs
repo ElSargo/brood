@@ -73,6 +73,8 @@ pub enum LayoutAction {
     ToggleLeftDock,
     ToggleRightDock,
     ToggleBottomDock,
+    IncreaseLeftDockWidth,
+    DecreaseLeftDockWidth,
 }
 
 impl LayoutAction {
@@ -92,6 +94,8 @@ impl LayoutAction {
             12 => Self::ToggleLeftDock,
             13 => Self::ToggleRightDock,
             14 => Self::ToggleBottomDock,
+            15 => Self::IncreaseLeftDockWidth,
+            16 => Self::DecreaseLeftDockWidth,
             _ => return None,
         })
     }
@@ -112,6 +116,8 @@ impl LayoutAction {
             Self::ToggleLeftDock => "toggle-left-dock",
             Self::ToggleRightDock => "toggle-right-dock",
             Self::ToggleBottomDock => "toggle-bottom-dock",
+            Self::IncreaseLeftDockWidth => "increase-left-dock-width",
+            Self::DecreaseLeftDockWidth => "decrease-left-dock-width",
         }
     }
 }
@@ -141,6 +147,8 @@ impl FromStr for LayoutAction {
             "toggle-left-dock" => Self::ToggleLeftDock,
             "toggle-right-dock" => Self::ToggleRightDock,
             "toggle-bottom-dock" => Self::ToggleBottomDock,
+            "increase-left-dock-width" | "left-dock-width-up" => Self::IncreaseLeftDockWidth,
+            "decrease-left-dock-width" | "left-dock-width-down" => Self::DecreaseLeftDockWidth,
             _ => return Err(LayoutActionParseError),
         })
     }
@@ -651,6 +659,16 @@ impl Default for LayoutKeymap {
                     ctrl: false,
                     action: LayoutAction::ToggleBottomDock,
                 },
+                LayoutKeyBinding {
+                    key: Keycode::new(27),
+                    ctrl: true,
+                    action: LayoutAction::DecreaseLeftDockWidth,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(28),
+                    ctrl: true,
+                    action: LayoutAction::IncreaseLeftDockWidth,
+                },
             ],
         }
     }
@@ -676,6 +694,10 @@ mod tests {
         assert_eq!(
             LayoutAction::from_abi(14),
             Some(LayoutAction::ToggleBottomDock)
+        );
+        assert_eq!(
+            LayoutAction::from_abi(16),
+            Some(LayoutAction::DecreaseLeftDockWidth)
         );
         assert_eq!(LayoutAction::from_abi(99), None);
     }

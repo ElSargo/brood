@@ -59,6 +59,11 @@ use crate::{
 #[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
 const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const LEFT_PANEL_DEFAULT_WIDTH: i32 = 280;
+const LEFT_PANEL_MIN_WIDTH: i32 = 180;
+const LEFT_PANEL_MAX_WIDTH: i32 = 560;
+const LEFT_PANEL_KEYBOARD_STEP: i32 = 32;
+const LEFT_PANEL_SPLITTER_HITBOX: f64 = 8.0;
 const SESSION_NAME_ADJECTIVES: &[&str] = &[
     "amber", "brisk", "calm", "dusk", "eager", "fern", "glad", "hazel", "ivory", "jolly", "keen",
     "lucid", "mellow", "nimble", "olive", "plain", "quiet", "radiant", "steady", "tidy", "umber",
@@ -93,6 +98,19 @@ pub enum FocusDirection {
 struct HostedChild {
     command: String,
     child: Child,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelReservation {
+    surface: WlSurface,
+    edge: PanelEdge,
+    width: i32,
+    visible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelEdge {
+    Left,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -236,6 +254,8 @@ pub struct Manifold {
     surface_session_directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
     presentation_member_surfaces: Vec<WlSurface>,
+    panel_reservations: Vec<PanelReservation>,
+    left_panel_resizing: bool,
     extension_registry: ExtensionRegistry,
     session_dbus_buses: Vec<(SessionBusRealm, SessionBusHandle)>,
     pub(crate) presentation_redraw_deferred: bool,
@@ -343,6 +363,8 @@ impl Manifold {
             surface_session_directory_defaults: BTreeMap::new(),
             window_surface_sessions: Vec::new(),
             presentation_member_surfaces: Vec::new(),
+            panel_reservations: Vec::new(),
+            left_panel_resizing: false,
             extension_registry: ExtensionRegistry::default(),
             session_dbus_buses: Vec::new(),
             presentation_redraw_deferred: false,
@@ -467,6 +489,36 @@ impl Manifold {
             argv = ?argv,
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
+        );
+        self.hosted_children.push(HostedChild {
+            command: argv.join(" "),
+            child,
+        });
+        Ok(())
+    }
+
+    pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<()> {
+        let Some((program, args)) = argv.split_first() else {
+            anyhow::bail!("spawn requires a command");
+        };
+
+        let mut child = Command::new(program);
+        child
+            .args(args)
+            .env("WAYLAND_DISPLAY", &self.socket_name)
+            .env(MANIFOLD_SESSION_ENV, "presentation");
+        self.apply_control_environment(&mut child);
+        let child = child.spawn().with_context(|| {
+            format!(
+                "spawn presentation app {:?} with WAYLAND_DISPLAY={}",
+                argv,
+                self.socket_name.to_string_lossy()
+            )
+        })?;
+        info!(
+            argv = ?argv,
+            wayland_display = %self.socket_name.to_string_lossy(),
+            "spawned presentation app"
         );
         self.hosted_children.push(HostedChild {
             command: argv.join(" "),
@@ -658,7 +710,7 @@ impl Manifold {
 
         self.space
             .elements()
-            .filter(|window| self.window_in_active_surface_session(window))
+            .filter(|window| self.window_visible_in_presentation(window))
             .filter_map(|window| {
                 self.window_hit_location(window, pos)
                     .map(|location| (window.clone(), location))
@@ -1298,12 +1350,7 @@ impl Manifold {
                 let assigned_session = self
                     .session_for_toplevel_surface(&surface)
                     .unwrap_or(SurfaceSessionId(1));
-                let presentation_member = self
-                    .presentation_member_surfaces
-                    .iter()
-                    .any(|member| member == &surface);
                 assigned_session == session
-                    || (session == self.active_surface_session && presentation_member)
             })
             .count()
     }
@@ -1373,7 +1420,16 @@ impl Manifold {
             })
     }
 
-    pub fn window_in_active_surface_session(&self, window: &Window) -> bool {
+    pub fn window_belongs_to_active_surface_session(&self, window: &Window) -> bool {
+        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+            return false;
+        };
+        self.session_for_toplevel_surface(&surface)
+            .unwrap_or(SurfaceSessionId(1))
+            == self.active_surface_session
+    }
+
+    pub fn window_visible_in_presentation(&self, window: &Window) -> bool {
         let Some(surface) = Manifold::window_toplevel_surface(window) else {
             return false;
         };
@@ -1382,27 +1438,39 @@ impl Manifold {
             .iter()
             .any(|member| member == &surface)
         {
-            return true;
+            return self
+                .panel_reservations
+                .iter()
+                .rev()
+                .find(|panel| panel.surface == surface)
+                .is_none_or(|panel| panel.visible);
         }
-        self.session_for_toplevel_surface(&surface)
-            .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+        self.window_belongs_to_active_surface_session(window)
     }
 
     pub fn window_layout_rect(&self, window: &Window) -> Option<LayoutRect> {
-        if !self.window_in_active_surface_session(window) {
+        if !self.window_visible_in_presentation(window) {
             return None;
         }
         let surface = Manifold::window_toplevel_surface(window)?;
+        if let Some(rect) = self.panel_rect_for_surface(&surface) {
+            return Some(rect);
+        }
         if self.toplevel_fullscreen_output(&surface).is_some() {
-            return Some(fullscreen_layout_rect(self.presentation_layout_size()));
+            return Some(
+                self.translate_content_rect(fullscreen_layout_rect(
+                    self.presentation_layout_size(),
+                )),
+            );
         }
         let leaf = self
             .window_layout_leaves
             .iter()
             .rev()
             .find_map(|(assigned_surface, leaf)| (assigned_surface == &surface).then_some(*leaf))?;
-        self.layout.leaf_rect(leaf, self.presentation_layout_size())
+        self.layout
+            .leaf_rect(leaf, self.presentation_layout_size())
+            .map(|rect| self.translate_content_rect(rect))
     }
 
     pub fn request_toplevel_fullscreen(
@@ -1461,6 +1529,17 @@ impl Manifold {
             })
     }
 
+    pub fn layout_leaf_has_active_session_window(&self, target_leaf: LayoutLeafId) -> bool {
+        self.window_layout_leaves.iter().any(|(surface, leaf)| {
+            *leaf == target_leaf
+                && self
+                    .session_for_toplevel_surface(surface)
+                    .unwrap_or(SurfaceSessionId(1))
+                    == self.active_surface_session
+                && self.window_for_any_toplevel_surface(surface).is_some()
+        })
+    }
+
     fn focus_active_layout_leaf(&mut self) {
         let active_surface = if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
             self.surface_for_layout_leaf(self.layout.active_leaf())
@@ -1503,7 +1582,7 @@ impl Manifold {
             self.space
                 .elements()
                 .find(|window| {
-                    self.window_in_active_surface_session(window)
+                    self.window_belongs_to_active_surface_session(window)
                         && Manifold::window_toplevel_surface(window).as_ref() == Some(active)
                 })
                 .cloned()
@@ -1519,7 +1598,7 @@ impl Manifold {
         let window = self
             .space
             .elements()
-            .filter(|window| self.window_in_active_surface_session(window))
+            .filter(|window| self.window_belongs_to_active_surface_session(window))
             .find(|window| {
                 window
                     .toplevel()
@@ -1701,6 +1780,14 @@ impl Manifold {
         {
             self.assign_toplevel_surface_session(&surface, session);
         }
+        if placement_requests_left_panel(&placement) {
+            let width = placement_panel_width(&placement).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
+            let visible = placement
+                .get("visible")
+                .and_then(|value| parse_boolish(value))
+                .unwrap_or(true);
+            self.reserve_left_panel(surface.clone(), width, visible);
+        }
         if placement
             .get("focus")
             .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"))
@@ -1713,6 +1800,22 @@ impl Manifold {
             self.reconfigure_focus_stack();
         }
         Ok(grant_id)
+    }
+
+    fn reserve_left_panel(&mut self, surface: WlSurface, width: i32, visible: bool) {
+        self.panel_reservations
+            .retain(|panel| panel.edge != PanelEdge::Left || panel.surface != surface);
+        let (presentation_w, _) = self.presentation_size();
+        let max_width = LEFT_PANEL_MAX_WIDTH.min((presentation_w - 120).max(LEFT_PANEL_MIN_WIDTH));
+        let width = width.clamp(LEFT_PANEL_MIN_WIDTH, max_width);
+        self.panel_reservations.push(PanelReservation {
+            surface,
+            edge: PanelEdge::Left,
+            width,
+            visible,
+        });
+        self.layout.left_dock_visible = visible;
+        self.reconfigure_focus_stack();
     }
 
     pub fn request_presentation_membership(
@@ -1807,7 +1910,7 @@ impl Manifold {
         self.space
             .elements()
             .find(|window| {
-                self.window_in_active_surface_session(window)
+                self.window_visible_in_presentation(window)
                     && Manifold::window_toplevel_surface(window).as_ref() == Some(surface)
             })
             .cloned()
@@ -1913,7 +2016,7 @@ impl Manifold {
         let windows = self
             .space
             .elements()
-            .filter(|window| self.window_in_active_surface_session(window))
+            .filter(|window| self.window_belongs_to_active_surface_session(window))
             .cloned()
             .collect::<Vec<_>>();
         let window_count = windows.len();
@@ -1946,7 +2049,7 @@ impl Manifold {
         let active = self.active_toplevel_surface.as_ref()?;
         self.space
             .elements()
-            .filter(|window| self.window_in_active_surface_session(window))
+            .filter(|window| self.window_belongs_to_active_surface_session(window))
             .position(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
     }
 
@@ -1970,7 +2073,7 @@ impl Manifold {
         let windows = self
             .space
             .elements()
-            .filter(|window| self.window_in_active_surface_session(window))
+            .filter(|window| self.window_belongs_to_active_surface_session(window))
             .cloned()
             .collect::<Vec<_>>();
         for window in &windows {
@@ -2067,7 +2170,8 @@ impl Manifold {
                 false
             }
             LayoutAction::ToggleLeftDock => {
-                self.layout.left_dock_visible = !self.layout.left_dock_visible;
+                self.toggle_left_panel_visibility();
+                self.reconfigure_focus_stack();
                 true
             }
             LayoutAction::ToggleRightDock => {
@@ -2076,6 +2180,16 @@ impl Manifold {
             }
             LayoutAction::ToggleBottomDock => {
                 self.layout.bottom_dock_visible = !self.layout.bottom_dock_visible;
+                true
+            }
+            LayoutAction::IncreaseLeftDockWidth => {
+                self.adjust_left_panel_width(LEFT_PANEL_KEYBOARD_STEP);
+                self.reconfigure_focus_stack();
+                true
+            }
+            LayoutAction::DecreaseLeftDockWidth => {
+                self.adjust_left_panel_width(-LEFT_PANEL_KEYBOARD_STEP);
+                self.reconfigure_focus_stack();
                 true
             }
         }
@@ -2143,6 +2257,8 @@ impl Manifold {
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.presentation_member_surfaces
             .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.panel_reservations
+            .retain(|panel| live_toplevel_surfaces.iter().any(|live| live == &panel.surface));
         self.window_pane_ids
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         if self
@@ -2244,11 +2360,111 @@ impl Manifold {
 
     pub fn presentation_layout_size(&self) -> LayoutSize {
         let (w, h) = self.presentation_size();
-        LayoutSize { w, h }
+        let left = self.left_panel_reserved_width();
+        LayoutSize {
+            w: (w - left).max(1),
+            h,
+        }
     }
 
     pub fn active_layout_rect(&self) -> Option<LayoutRect> {
-        self.layout.active_rect(self.presentation_layout_size())
+        self.layout
+            .active_rect(self.presentation_layout_size())
+            .map(|rect| self.translate_content_rect(rect))
+    }
+
+    fn translate_content_rect(&self, rect: LayoutRect) -> LayoutRect {
+        LayoutRect {
+            x: rect.x + self.left_panel_reserved_width(),
+            ..rect
+        }
+    }
+
+    fn panel_rect_for_surface(&self, surface: &WlSurface) -> Option<LayoutRect> {
+        let panel = self
+            .panel_reservations
+            .iter()
+            .rev()
+            .find(|panel| panel.visible && panel.surface == *surface)?;
+        let (_, h) = self.presentation_size();
+        match panel.edge {
+            PanelEdge::Left => Some(LayoutRect {
+                x: 0,
+                y: 0,
+                w: panel.width,
+                h,
+            }),
+        }
+    }
+
+    pub fn left_panel_reserved_width(&self) -> i32 {
+        self.panel_reservations
+            .iter()
+            .rev()
+            .find(|panel| panel.edge == PanelEdge::Left && panel.visible)
+            .map_or(0, |panel| panel.width)
+    }
+
+    pub fn left_panel_splitter_hit(&self, x: f64, y: f64) -> bool {
+        let width = f64::from(self.left_panel_reserved_width());
+        if width <= 0.0 {
+            return false;
+        }
+        let (_, h) = self.presentation_size();
+        y >= 0.0 && y < f64::from(h) && (x - width).abs() <= LEFT_PANEL_SPLITTER_HITBOX
+    }
+
+    pub fn begin_left_panel_resize(&mut self) {
+        self.left_panel_resizing = self.left_panel_reserved_width() > 0;
+    }
+
+    pub fn end_left_panel_resize(&mut self) -> bool {
+        let was_resizing = self.left_panel_resizing;
+        self.left_panel_resizing = false;
+        was_resizing
+    }
+
+    pub fn resize_left_panel_to_pointer(&mut self, x: f64) -> bool {
+        if !self.left_panel_resizing {
+            return false;
+        }
+        let target = x.round() as i32;
+        self.set_left_panel_width(target);
+        true
+    }
+
+    fn toggle_left_panel_visibility(&mut self) {
+        self.layout.left_dock_visible = !self.layout.left_dock_visible;
+        for panel in self
+            .panel_reservations
+            .iter_mut()
+            .filter(|panel| panel.edge == PanelEdge::Left)
+        {
+            panel.visible = self.layout.left_dock_visible;
+        }
+    }
+
+    fn adjust_left_panel_width(&mut self, delta: i32) {
+        let width = self
+            .panel_reservations
+            .iter()
+            .rev()
+            .find(|panel| panel.edge == PanelEdge::Left)
+            .map_or(LEFT_PANEL_DEFAULT_WIDTH, |panel| panel.width);
+        self.set_left_panel_width(width + delta);
+    }
+
+    fn set_left_panel_width(&mut self, width: i32) {
+        let (presentation_w, _) = self.presentation_size();
+        let max_width = LEFT_PANEL_MAX_WIDTH.min((presentation_w - 120).max(LEFT_PANEL_MIN_WIDTH));
+        let width = width.clamp(LEFT_PANEL_MIN_WIDTH, max_width);
+        for panel in self
+            .panel_reservations
+            .iter_mut()
+            .filter(|panel| panel.edge == PanelEdge::Left)
+        {
+            panel.width = width;
+        }
     }
 }
 
@@ -2331,6 +2547,41 @@ fn toplevel_matches_identity(
         matched = true;
     }
     matched
+}
+
+fn placement_requests_left_panel(placement: &ExtensionMetadata) -> bool {
+    let edge = placement
+        .get("edge")
+        .or_else(|| placement.get("side"))
+        .map(|value| value.eq_ignore_ascii_case("left"))
+        .unwrap_or(false);
+    let panel_mode = placement
+        .get("mode")
+        .or_else(|| placement.get("kind"))
+        .or_else(|| placement.get("placement"))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "panel" | "sidebar" | "dock" | "left-panel" | "left-sidebar"
+            )
+        })
+        .unwrap_or(false);
+    edge || panel_mode
+}
+
+fn placement_panel_width(placement: &ExtensionMetadata) -> Option<i32> {
+    placement
+        .get("width")
+        .or_else(|| placement.get("size"))
+        .and_then(|value| value.parse().ok())
+}
+
+fn parse_boolish(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "visible" | "show" | "shown" => Some(true),
+        "false" | "0" | "no" | "off" | "hidden" | "hide" => Some(false),
+        _ => None,
+    }
 }
 
 fn normalize_registry_value(value: &str) -> Option<String> {

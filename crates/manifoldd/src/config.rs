@@ -31,7 +31,17 @@ struct ModuleConfig {
 struct StartupAppConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    realm: StartupRealm,
     argv: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StartupRealm {
+    #[default]
+    Session,
+    Presentation,
 }
 
 pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<()> {
@@ -123,10 +133,15 @@ pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()>
             warn!(startup_app = %id, "configured startup app has empty argv; skipping app");
             continue;
         }
-        state
-            .spawn_hosted_app_argv(&app.argv)
-            .with_context(|| format!("spawn config startup app {id}"))?;
-        info!(startup_app = %id, argv = ?app.argv, "spawned config startup app");
+        match app.realm {
+            StartupRealm::Session => state
+                .spawn_hosted_app_argv(&app.argv)
+                .with_context(|| format!("spawn config startup app {id}"))?,
+            StartupRealm::Presentation => state
+                .spawn_presentation_app_argv(&app.argv)
+                .with_context(|| format!("spawn config presentation startup app {id}"))?,
+        }
+        info!(startup_app = %id, realm = ?app.realm, argv = ?app.argv, "spawned config startup app");
     }
 
     Ok(())
@@ -172,7 +187,12 @@ mod tests {
             capabilities = ["layout:on-map"]
 
             [startup.agent]
+            realm = "session"
             argv = ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
+
+            [startup.switcher]
+            realm = "presentation"
+            argv = ["python3", "apps/manifold-session-switcher.py"]
             "#,
         )
         .expect("parse config");
@@ -195,6 +215,12 @@ mod tests {
             app.argv,
             ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
         );
+        assert_eq!(app.realm, super::StartupRealm::Session);
+
+        let app = config.startup.get("switcher").expect("switcher startup app");
+        assert!(app.enabled);
+        assert_eq!(app.realm, super::StartupRealm::Presentation);
+        assert_eq!(app.argv, ["python3", "apps/manifold-session-switcher.py"]);
     }
 
     #[test]
