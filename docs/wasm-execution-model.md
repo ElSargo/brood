@@ -89,6 +89,69 @@ The async lane should support:
 
 Async module code should not run on the calloop thread. A Tokio runtime can own this lane, but Manifold state remains authoritative on the calloop/session thread.
 
+## Published Fast-Path State
+
+Async plugin work often needs to prepare state that a synchronous fast hook can use without replaying events or waiting on async code.
+
+Manifold should provide a host-owned publication area for this. The publication area is not shared mutable WASM memory and it is not a message queue. It is an immutable latest-state surface maintained by the host for a plugin instance.
+
+The target shape is:
+
+```text
+async plugin worker
+  -> processes workspace events
+  -> publishes immutable payload to a slot
+  -> host atomically publishes a new composite root
+
+fast hook
+  -> receives the current root reference
+  -> reads the default slot or a named slot
+  -> returns a bounded decision immediately
+```
+
+The public API should be the small general form:
+
+```text
+publish(name: option<string>, payload) -> generation
+read(root, name: option<string>) -> option<published-record>
+```
+
+`none` names the plugin instance's default slot. `some(name)` names a plugin-scoped slot. Named slots are just a generalization of the default slot, so simple plugins can publish one materialized decision state while more complex plugins can let multiple async workers publish independent state.
+
+For example, a navigation controller may publish one default state:
+
+```text
+publish(none, NavState {
+  terminal-target,
+  agent-target,
+  editor-target,
+  git-target,
+})
+```
+
+Or split those into worker-owned slots:
+
+```text
+publish(some("terminal"), TerminalNavState { target })
+publish(some("agent"), AgentNavState { target })
+publish(some("editor"), EditorNavState { target })
+publish(some("git"), GitNavState { target })
+```
+
+The host should internally retain enough old generations to keep fast-hook references valid for the duration of a call. The internal representation may use a publication log, linked nodes, or another RCU-like structure, but the fast hook should only see the current immutable root.
+
+Host guarantees:
+
+- publish is atomic
+- published records are immutable
+- fast-hook references remain valid for the hook call
+- each publish receives a monotonic generation
+- payload size, slot count, and reference depth are bounded
+- malformed payloads are rejected before becoming visible
+- trapping plugin code cannot corrupt host or plugin publication state
+
+Published fast-path state should contain materialized decisions, not event history. Events remain the ordered stream of what happened. Published slots are the latest cache of what the plugin wants latency-sensitive hooks to see.
+
 ## Transactions And Events
 
 Manifold should treat backend observations and user input as candidate workspace transactions.

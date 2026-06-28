@@ -119,6 +119,52 @@ Capability requirements:
 - `shortcuts:override` to replace an existing binding with equal or higher priority.
 - `input:observe-keyboard` only for future raw key observation.
 
+## Event Stream And Fast-Path Publication
+
+The shortcut API should not force every fast-path key handler to replay workspace events. Plugins should be able to process events asynchronously, publish a compact latest-state payload, and let the fast hook read that payload when a shortcut is pressed.
+
+Initial workspace events for navigation policy:
+
+- `pane-opened`
+- `pane-closed`
+- `pane-focused`
+- `pane-client-input`
+- `pane-metadata-changed`
+- `active-session-changed`
+
+`pane-client-input` means input that Manifold actually forwarded to a client pane, such as keyboard, pointer button, or axis input. It should not be emitted for Manifold-consumed shortcut keys, focus-only changes, or pointer motion that is not delivered as client input.
+
+The host should expose a current-state snapshot plus ordered event polling:
+
+```text
+workspace-snapshot() -> snapshot
+poll-workspace-events(after-seq, max-events) -> event-batch
+```
+
+The snapshot is the recovery and reload path. The event stream is the incremental update path. If an event batch overflows or the plugin reloads, the plugin rebuilds from `workspace-snapshot`.
+
+For fast-path state, the host should expose plugin-scoped publication slots:
+
+```text
+publish(name: option<string>, payload) -> generation
+read-published(root, name: option<string>) -> option<published-record>
+```
+
+The unnamed slot is the plugin's default slot. Named slots let multiple async workers publish independent state without coordinating through plugin-managed shared memory.
+
+For example, the default navigation plugin can process pane events asynchronously and publish:
+
+```text
+NavState {
+  terminal-target: option<pane-id>,
+  agent-target: option<pane-id>,
+  editor-target: option<pane-id>,
+  git-target: option<pane-id>,
+}
+```
+
+The fast shortcut hook then receives the current publication root and resolves `Ctrl+O`, `Ctrl+Enter`, `Ctrl+E`, or `Ctrl+G` by reading this latest state. If the target pane is absent or stale, it can request `run-managed-app` instead.
+
 ## Rust Trait Sketch
 
 The native Rust API can prove command semantics before WIT is frozen:
