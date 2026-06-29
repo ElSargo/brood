@@ -770,7 +770,9 @@ impl Manifold {
                     Point::from((pos.x - f64::from(location.x), pos.y - f64::from(location.y)));
                 window
                     .surface_under(local_pos, WindowSurfaceType::ALL)
-                    .map(|(surface, point)| (surface, point.to_f64()))
+                    .map(|(surface, point)| {
+                        (surface, surface_origin_in_compositor_space(location, point))
+                    })
             })
     }
 
@@ -2789,6 +2791,13 @@ fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
     }
 }
 
+fn surface_origin_in_compositor_space(
+    window_location: Point<i32, Logical>,
+    surface_location: Point<i32, Logical>,
+) -> Point<f64, Logical> {
+    (window_location + surface_location).to_f64()
+}
+
 fn focus_stack_location(_slot: usize) -> Point<i32, Logical> {
     Point::from((0, 0))
 }
@@ -3049,10 +3058,13 @@ struct WindowRefreshOutcome {
 mod tests {
     use super::{
         Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, focus_stack_location,
-        fullscreen_layout_rect,
+        fullscreen_layout_rect, surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
-    use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
+    use smithay::{
+        reexports::{calloop::EventLoop, wayland_server::Display},
+        utils::Point,
+    };
 
     #[test]
     fn focus_stack_places_every_window_at_origin() {
@@ -3075,6 +3087,15 @@ mod tests {
         let rect = fullscreen_layout_rect(LayoutSize { w: 0, h: -4 });
 
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn surface_under_returns_compositor_space_surface_origin() {
+        let window_location = Point::from((280, 0));
+        let surface_location = Point::from((640, 12));
+        let origin = surface_origin_in_compositor_space(window_location, surface_location);
+
+        assert_eq!((origin.x, origin.y), (920.0, 12.0));
     }
 
     #[test]
