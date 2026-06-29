@@ -223,6 +223,7 @@ pub struct StatusItemSummary {
 struct ExtensionRegistry {
     extensions: Vec<ExtensionRecord>,
     windows: Vec<WindowRecord>,
+    active_window_roles: BTreeMap<String, ActiveWindowRole>,
     grants: Vec<GrantRecord>,
     agents: Vec<AgentRecord>,
     notifications: Vec<AgentNotificationRecord>,
@@ -245,6 +246,12 @@ struct WindowRecord {
     identity: ExtensionMetadata,
     role: String,
     sender: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveWindowRole {
+    window_id: String,
+    extension_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2229,6 +2236,9 @@ impl Manifold {
         self.extension_registry
             .grants
             .retain(|grant| grant.extension_id != extension_id);
+        self.extension_registry
+            .active_window_roles
+            .retain(|_, active| active.extension_id != extension_id);
         true
     }
 
@@ -2671,6 +2681,77 @@ impl Manifold {
             self.reconfigure_focus_stack();
         }
         Ok(grant_id)
+    }
+
+    pub fn replace_window_role(
+        &mut self,
+        window_id: &str,
+        role: String,
+        options: ExtensionMetadata,
+        _sender: String,
+    ) -> Result<bool> {
+        let window = self.window_record(window_id)?;
+        let role = normalize_registry_value(&role).context("replacement role must not be empty")?;
+        ensure_metadata(&options)?;
+        let dismiss_replaced = options
+            .get("dismiss_replaced")
+            .or_else(|| options.get("dismiss-replaced"))
+            .and_then(|value| parse_boolish(value))
+            .unwrap_or(true);
+
+        let previous = self.extension_registry.active_window_roles.insert(
+            role,
+            ActiveWindowRole {
+                window_id: window.id.clone(),
+                extension_id: window.extension_id,
+            },
+        );
+        let Some(previous) = previous else {
+            return Ok(true);
+        };
+        if previous.window_id == window.id {
+            return Ok(false);
+        }
+
+        self.deactivate_replaced_window(&previous.window_id, dismiss_replaced);
+        Ok(true)
+    }
+
+    fn deactivate_replaced_window(&mut self, window_id: &str, dismiss: bool) {
+        for grant in self.extension_registry.grants.iter_mut().filter(|grant| {
+            grant
+                .detail
+                .get("window_id")
+                .is_some_and(|id| id == window_id)
+        }) {
+            grant.active = false;
+        }
+
+        let Ok(window) = self.window_record(window_id) else {
+            return;
+        };
+        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
+            return;
+        };
+
+        self.presentation_member_surfaces
+            .retain(|member| member != &surface);
+        self.panel_reservations
+            .retain(|panel| panel.surface != surface);
+
+        if self.active_toplevel_surface.as_ref() == Some(&surface) {
+            self.focus_toplevel_surface(None);
+        }
+
+        if dismiss
+            && let Some(window) = self.window_for_any_toplevel_surface(&surface)
+            && let Some(toplevel) = window.toplevel()
+        {
+            toplevel.send_close();
+        }
+
+        self.repair_resolved_layout_for_current_inventory();
+        self.reconfigure_focus_stack();
     }
 
     fn reserve_left_panel(&mut self, surface: WlSurface, width: i32, visible: bool) {

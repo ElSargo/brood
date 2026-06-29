@@ -241,6 +241,13 @@ enum DbusStateRequest {
         sender_name: String,
         response: ControlResponse,
     },
+    ReplaceRole {
+        window_id: String,
+        role: String,
+        options: DbusMetadata,
+        sender_name: String,
+        response: BoolResponse,
+    },
     RequestPlacement {
         window_id: String,
         placement: DbusMetadata,
@@ -757,6 +764,23 @@ impl CompositorDbus {
         })
     }
 
+    async fn replace_role(
+        &self,
+        window_id: String,
+        role: String,
+        options: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<bool> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| DbusStateRequest::ReplaceRole {
+            window_id,
+            role,
+            options,
+            sender_name,
+            response,
+        })
+    }
+
     async fn request_presentation_membership(
         &self,
         window_id: String,
@@ -946,6 +970,12 @@ trait ManifoldCompositor {
         window_identity: DbusMetadata,
         role: String,
     ) -> zbus::Result<String>;
+    fn replace_role(
+        &self,
+        window_id: String,
+        role: String,
+        options: DbusMetadata,
+    ) -> zbus::Result<bool>;
     fn request_placement(&self, window_id: String, placement: DbusMetadata)
     -> zbus::Result<String>;
     fn request_presentation_membership(
@@ -2151,6 +2181,16 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         } => send_response(
             response,
             state.register_extension_window(extension_id, window_identity, role, sender_name),
+        ),
+        DbusStateRequest::ReplaceRole {
+            window_id,
+            role,
+            options,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.replace_window_role(&window_id, role, options, sender_name),
         ),
         DbusStateRequest::RequestPlacement {
             window_id,

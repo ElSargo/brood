@@ -54,7 +54,7 @@ EOF
 chmod +x "$CLIENT_WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" -c "$CLIENT_WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifoldd run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" -c "$CLIENT_WRAPPER" >"$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 ctl() {
@@ -148,9 +148,15 @@ EXT_ID_AGAIN="$(call /org/manifold/Extension org.manifold.Extension RegisterExte
   exit 1
 }
 
-WINDOW_ID="$(call /org/manifold/Compositor org.manifold.Compositor RegisterWindow 'sa{ss}s' "$EXT_ID" 1 pid "$CLIENT_PID" session-switcher | extract_string)"
+WINDOW_ID="$(call /org/manifold/Compositor org.manifold.Compositor RegisterWindow 'sa{ss}s' "$EXT_ID" 1 pane_id 1 session-switcher | extract_string)"
 [[ -n "$WINDOW_ID" ]] || {
   echo "ERR RegisterWindow did not return a window id" >&2
+  exit 1
+}
+
+REPLACE_OUT="$(call /org/manifold/Compositor org.manifold.Compositor ReplaceRole 'ssa{ss}' "$WINDOW_ID" presentation.session-switcher 1 dismiss_replaced false)"
+[[ "$REPLACE_OUT" == "b true" ]] || {
+  echo "ERR first ReplaceRole did not claim the role: $REPLACE_OUT" >&2
   exit 1
 }
 
@@ -189,10 +195,24 @@ grep -q "grant id=$PLACEMENT_GRANT .* active=false" <<<"$GRANTS_AFTER" || {
 }
 
 call /org/manifold/Session org.manifold.Session ActivateSurfaceSession t "$CREATED_ID" >/dev/null
-WINDOWS_AFTER_SWITCH="$(ctl status-json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("windows", 0))')"
-[[ "$WINDOWS_AFTER_SWITCH" -ge 1 ]] || {
-  echo "ERR presentation member window disappeared after session switch" >&2
-  ctl status-json >&2 || true
+
+REPLACEMENT_WINDOW_ID="$(call /org/manifold/Compositor org.manifold.Compositor RegisterWindow 'sa{ss}s' "$EXT_ID" 1 pid "$$-replacement" session-switcher | extract_string)"
+[[ -n "$REPLACEMENT_WINDOW_ID" && "$REPLACEMENT_WINDOW_ID" != "$WINDOW_ID" ]] || {
+  echo "ERR replacement RegisterWindow did not return a distinct window id: old=$WINDOW_ID replacement=$REPLACEMENT_WINDOW_ID" >&2
+  exit 1
+}
+REPLACE_AGAIN_OUT="$(call /org/manifold/Compositor org.manifold.Compositor ReplaceRole 'ssa{ss}' "$REPLACEMENT_WINDOW_ID" presentation.session-switcher 1 dismiss_replaced false)"
+[[ "$REPLACE_AGAIN_OUT" == "b true" ]] || {
+  echo "ERR second ReplaceRole did not replace the old role owner: $REPLACE_AGAIN_OUT" >&2
+  exit 1
+}
+GRANTS_AFTER_REPLACE="$(ctl extensions grants "$EXT_ID")"
+grep -q "grant id=$MEMBERSHIP_GRANT .* active=false" <<<"$GRANTS_AFTER_REPLACE" || {
+  echo "ERR replaced window membership grant was not marked inactive: $GRANTS_AFTER_REPLACE" >&2
+  exit 1
+}
+grep -q "grant id=$SHORTCUT_GRANT .* active=true" <<<"$GRANTS_AFTER_REPLACE" || {
+  echo "ERR replace role should not revoke extension-level shortcut grant: $GRANTS_AFTER_REPLACE" >&2
   exit 1
 }
 
@@ -244,6 +264,7 @@ trap - EXIT
 echo "OK DBus extension smoke passed"
 echo "extension_id=$EXT_ID"
 echo "window_id=$WINDOW_ID"
+echo "replacement_window_id=$REPLACEMENT_WINDOW_ID"
 echo "membership_grant=$MEMBERSHIP_GRANT"
 echo "placement_grant=$PLACEMENT_GRANT"
 echo "shortcut_grant=$SHORTCUT_GRANT"

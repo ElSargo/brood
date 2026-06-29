@@ -217,6 +217,11 @@ class ManifoldBus:
             metadata(pid=os.getpid()),
             "session-switcher",
         )
+        replaced = self.compositor.ReplaceRole(
+            window_id,
+            "presentation.session-switcher",
+            metadata(dismiss_replaced="true"),
+        )
         membership_grant = self.compositor.RequestPresentationMembership(
             window_id,
             metadata(audience="Presentation"),
@@ -240,7 +245,14 @@ class ManifoldBus:
             )
         except dbus.DBusException as err:
             shortcut_grant = f"ungranted:{err.get_dbus_name()}"
-        return extension_id, window_id, membership_grant, placement_grant, shortcut_grant
+        return (
+            extension_id,
+            window_id,
+            replaced,
+            membership_grant,
+            placement_grant,
+            shortcut_grant,
+        )
 
 
 class SessionSwitcher:
@@ -494,7 +506,7 @@ class SessionSwitcher:
 
     def register_with_manifold(self):
         try:
-            extension_id, window_id, membership, placement, shortcut = (
+            extension_id, window_id, replaced, membership, placement, shortcut = (
                 self.bus.register_sidebar(self.args.width)
             )
             self.registered = True
@@ -504,6 +516,7 @@ class SessionSwitcher:
                 pid=os.getpid(),
                 extension_id=extension_id,
                 window_id=window_id,
+                replaced=replaced,
                 membership_grant=membership,
                 placement_grant=placement,
                 shortcut_grant=shortcut,
