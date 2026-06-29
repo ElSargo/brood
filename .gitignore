@@ -2,6 +2,7 @@
 /target/
 **/target/
 **/*.rs.bk
+/Cargo.nix
 /.cargo/
 /vendor/
 

@@ -12,6 +12,15 @@ let
   gtkTypelibPath = lib.makeSearchPath "lib/girepository-1.0" profiles.gtkRuntime;
   gtkDataDirs = lib.makeSearchPath "share" profiles.gtkRuntime;
   gsettingsSchemaDir = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}/glib-2.0/schemas";
+  src = lib.cleanSourceWith {
+    src = ../.;
+    filter =
+      path: type:
+      let
+        base = baseNameOf path;
+      in
+      base != "Cargo.nix" && base != "target";
+  };
   nativePkgConfigPath = lib.concatStringsSep ":" [
     (lib.makeSearchPathOutput "dev" "lib/pkgconfig" profiles.nativeLibs)
     (lib.makeSearchPath "lib/pkgconfig" profiles.nativeLibs)
@@ -19,7 +28,37 @@ let
     (lib.makeSearchPath "share/pkgconfig" profiles.nativeLibs)
   ];
 
-  cargoNix = pkgs.callPackage ../Cargo.nix {
+  cargoVendor = pkgs.rustPlatform.importCargoLock {
+    lockFile = ../Cargo.lock;
+  };
+
+  generatedCargoNix = pkgs.runCommand "manifold-generated-cargo-nix" {
+    nativeBuildInputs = [ pkgs.crate2nix ];
+  } ''
+    export HOME="$TMPDIR/home"
+    mkdir -p "$HOME" "$out"
+
+    cp -R ${src}/. "$out/"
+    chmod -R u+w "$out"
+
+    cd "$out"
+    mkdir -p .cargo
+    cat > .cargo/config.toml <<EOF
+    [source.crates-io]
+    replace-with = "vendored-sources"
+
+    [source.vendored-sources]
+    directory = "${cargoVendor}"
+
+    [net]
+    offline = true
+    EOF
+
+    export CARGO_NET_OFFLINE=true
+    crate2nix generate
+  '';
+
+  cargoNix = pkgs.callPackage "${generatedCargoNix}/Cargo.nix" {
     defaultCrateOverrides = pkgs.defaultCrateOverrides // {
       "av-scenechange" = attrs: {
         CARGO_ENCODED_RUSTFLAGS = attrs.CARGO_ENCODED_RUSTFLAGS or "";
@@ -40,7 +79,7 @@ let
 
   wasmExamples = pkgs.stdenvNoCC.mkDerivation {
     name = "manifold-wasm-examples";
-    src = ../.;
+    inherit src;
     nativeBuildInputs = [ profiles.rustToolchain ];
 
     buildPhase = ''
