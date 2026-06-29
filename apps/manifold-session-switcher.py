@@ -167,7 +167,7 @@ class ManifoldBus:
 
     def focus_window(self, identity):
         argv = ["focus-window"]
-        for key in ("pid", "app_id", "title"):
+        for key in ("pane_id", "pid", "app_id", "title"):
             value = identity.get(key, "")
             if value:
                 argv.append(f"{key}={value}")

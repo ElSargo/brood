@@ -3906,6 +3906,7 @@ mod tests {
         first.insert("pane_id".to_string(), "7".to_string());
         first.insert("status".to_string(), "running".to_string());
         first.insert("cwd".to_string(), "/tmp/first".to_string());
+        first.insert("first_user_message".to_string(), "first prompt".to_string());
         let first_id = state
             .register_agent("codex".to_string(), first, ":test.sender".to_string())
             .expect("register first agent state");
@@ -3914,6 +3915,10 @@ mod tests {
         second.insert("pane_id".to_string(), "7".to_string());
         second.insert("status".to_string(), "done".to_string());
         second.insert("cwd".to_string(), "/tmp/second".to_string());
+        second.insert(
+            "first_user_message".to_string(),
+            "second prompt".to_string(),
+        );
         let second_id = state
             .register_agent("codex".to_string(), second, ":test.sender".to_string())
             .expect("register second agent state");
@@ -3925,6 +3930,13 @@ mod tests {
         assert_eq!(
             agents[0].metadata.get("cwd").map(String::as_str),
             Some("/tmp/second")
+        );
+        assert_eq!(
+            agents[0]
+                .metadata
+                .get("first_user_message")
+                .map(String::as_str),
+            Some("first prompt")
         );
     }
 }
