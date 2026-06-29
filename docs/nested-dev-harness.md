@@ -170,7 +170,7 @@ Run:
 tools/dev-nested-manifold.sh --keep-running
 ```
 
-This helper is the host-visible manual development harness. It starts the stable
+This helper is the repo-local host-visible manual development harness. It starts the stable
 outer Manifold with a presentation window on the current desktop, then hosts the
 dev Manifold inside that window. Do not use it for automated no-host-window
 behavior tests; use `manifoldd test` for that.

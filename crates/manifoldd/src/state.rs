@@ -347,10 +347,13 @@ pub struct Manifold {
     pending_child_panes: Vec<PendingChildPane>,
     pub(crate) ctrl_pressed: bool,
     pub(crate) alt_pressed: bool,
+    pub(crate) shift_pressed: bool,
     pub(crate) ctrl_pressed_key: Option<smithay::backend::input::Keycode>,
     pub(crate) alt_pressed_key: Option<smithay::backend::input::Keycode>,
+    pub(crate) shift_pressed_key: Option<smithay::backend::input::Keycode>,
     pub(crate) ctrl_forwarded_to_client: bool,
     pub(crate) alt_forwarded_to_client: bool,
+    pub(crate) shift_forwarded_to_client: bool,
     pub(crate) suppress_mode_toggle_key_release: bool,
     pub(crate) shortcut_prefix_active: bool,
     pub(crate) suppress_shortcut_prefix_key_release: Option<smithay::backend::input::Keycode>,
@@ -467,10 +470,13 @@ impl Manifold {
             pending_child_panes: Vec::new(),
             ctrl_pressed: false,
             alt_pressed: false,
+            shift_pressed: false,
             ctrl_pressed_key: None,
             alt_pressed_key: None,
+            shift_pressed_key: None,
             ctrl_forwarded_to_client: false,
             alt_forwarded_to_client: false,
+            shift_forwarded_to_client: false,
             suppress_mode_toggle_key_release: false,
             shortcut_prefix_active: false,
             suppress_shortcut_prefix_key_release: None,
@@ -1470,13 +1476,28 @@ impl Manifold {
                 );
             }
         }
+        if self.shift_forwarded_to_client {
+            if let Some(key_code) = self.shift_pressed_key {
+                self.seat.get_keyboard().expect("keyboard").input::<(), _>(
+                    self,
+                    key_code,
+                    smithay::backend::input::KeyState::Released,
+                    SERIAL_COUNTER.next_serial(),
+                    0,
+                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
+                );
+            }
+        }
 
         self.ctrl_pressed = false;
         self.alt_pressed = false;
+        self.shift_pressed = false;
         self.ctrl_pressed_key = None;
         self.alt_pressed_key = None;
+        self.shift_pressed_key = None;
         self.ctrl_forwarded_to_client = false;
         self.alt_forwarded_to_client = false;
+        self.shift_forwarded_to_client = false;
         self.suppress_mode_toggle_key_release = false;
         self.shortcut_prefix_active = false;
         self.suppress_shortcut_prefix_key_release = None;
@@ -3953,6 +3974,10 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
         normalized.as_str(),
         "ctrl+b"
             | "control+b"
+            | "ctrl+shift+esc"
+            | "control+shift+esc"
+            | "ctrl+shift+escape"
+            | "control+shift+escape"
             | "w"
             | "ctrl+j"
             | "control+j"

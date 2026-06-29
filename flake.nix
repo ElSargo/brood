@@ -121,11 +121,6 @@
             targets = [ "wasm32-unknown-unknown" ];
           };
 
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = rustToolchain;
-            rustc = rustToolchain;
-          };
-
           nativeLibs = with pkgs; [
             libGL
             libgbm
@@ -144,37 +139,216 @@
             ) old.mesonFlags;
           });
 
-          source = lib.cleanSourceWith {
-            src = ./.;
-            filter =
-              path: type:
-              let
-                base = baseNameOf path;
-              in
-              !(
-                type == "directory"
-                && builtins.elem base [
-                  "target"
-                  ".git"
-                ]
-              );
+          devTools = with pkgs; [
+            bashInteractive
+            coreutils
+            docker
+            docker-buildx
+            findutils
+            git
+            go
+            jq
+            pkg-config
+            firefox
+            (python3.withPackages (
+              ps: with ps; [
+                dbus-python
+                pygobject3
+              ]
+            ))
+            ripgrep
+            rustToolchain
+          ];
+
+          smokeTools = with pkgs; [
+            dbus
+            gobject-introspection
+            glmark2
+            kitty
+            mesa-demos
+            vulkan-tools
+            wayland-utils
+            westonWithSimpleClients
+          ];
+
+          devToolPath = lib.makeBinPath (devTools ++ smokeTools);
+          nativeLibraryPath = lib.makeLibraryPath nativeLibs;
+          nativePkgConfigPath = lib.concatStringsSep ":" [
+            (lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs)
+            (lib.makeSearchPath "lib/pkgconfig" nativeLibs)
+            (lib.makeSearchPathOutput "dev" "share/pkgconfig" nativeLibs)
+            (lib.makeSearchPath "share/pkgconfig" nativeLibs)
+          ];
+
+          cargoNix = pkgs.callPackage ./Cargo.nix {
+            defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+              "av-scenechange" = attrs: {
+                CARGO_ENCODED_RUSTFLAGS = attrs.CARGO_ENCODED_RUSTFLAGS or "";
+              };
+              rav1e = attrs: {
+                CARGO_ENCODED_RUSTFLAGS = attrs.CARGO_ENCODED_RUSTFLAGS or "";
+              };
+              manifoldd = attrs: {
+                nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
+                buildInputs = (attrs.buildInputs or [ ]) ++ nativeLibs;
+              };
+            };
           };
 
-          manifoldd = rustPlatform.buildRustPackage {
-            pname = "manifoldd";
-            version = "0.1.0";
-            src = source;
-            cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = with pkgs; [ pkg-config ];
-            buildInputs = nativeLibs;
-            cargoBuildFlags = [
-              "-p"
-              "manifoldd"
+          manifoldd = cargoNix.workspaceMembers."manifoldd".build.override {
+            runTests = false;
+          };
+
+          devWorkflow = pkgs.writeShellApplication {
+            name = "manifold-dev-workflow";
+            runtimeInputs = with pkgs; [
+              bash
+              coreutils
+              findutils
+              git
+              util-linux
             ];
-            cargoTestFlags = [
-              "-p"
-              "manifoldd"
-            ];
+            text = ''
+              set -euo pipefail
+
+              MANIFOLDD_BIN="''${MANIFOLDD_BIN:-${manifoldd}/bin/manifoldd}"
+              REPO_URL="''${MANIFOLD_DEV_REPO_URL:-https://github.com/ElSargo/manifold.git}"
+              CACHE_HOME="''${XDG_CACHE_HOME:-$HOME/.cache}"
+              CACHE_ROOT="''${MANIFOLD_DEV_CACHE_DIR:-$CACHE_HOME/manifold/dev-workflow}"
+              SOURCE_DIR="''${MANIFOLD_DEV_SOURCE_DIR:-$CACHE_ROOT/source}"
+              RUN_ROOT="''${MANIFOLD_DEV_RUN_ROOT:-$CACHE_ROOT/runs}"
+              RUST_LOG="''${RUST_LOG:-manifoldd=info,smithay=warn}"
+
+              export PATH="${devToolPath}:$PATH"
+              export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
+              export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
+              export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
+              export MANIFOLD_DEV_SHELL=1
+
+              if [[ -z "''${WAYLAND_DISPLAY:-}" && -z "''${DISPLAY:-}" ]]; then
+                echo "ERR this workflow needs a host graphical session (WAYLAND_DISPLAY or DISPLAY)" >&2
+                exit 2
+              fi
+
+              ensure_source() {
+                mkdir -p "$(dirname "$SOURCE_DIR")"
+                if [[ -d "$SOURCE_DIR/.git" ]]; then
+                  echo "source=$SOURCE_DIR"
+                  return
+                fi
+                if [[ -e "$SOURCE_DIR" ]] && [[ -n "$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+                  echo "ERR MANIFOLD_DEV_SOURCE_DIR exists but is not a git checkout: $SOURCE_DIR" >&2
+                  exit 2
+                fi
+                git clone "$REPO_URL" "$SOURCE_DIR"
+                if [[ -n "''${MANIFOLD_DEV_REF:-}" ]]; then
+                  git -C "$SOURCE_DIR" checkout "$MANIFOLD_DEV_REF"
+                fi
+                echo "source=$SOURCE_DIR"
+              }
+
+              shell_quote() {
+                printf "%q" "$1"
+              }
+
+              wait_for_control() {
+                local name="$1"
+                local owner_pid="$2"
+                local log="$3"
+                local label="$4"
+                for _ in $(seq 1 200); do
+                  if "$MANIFOLDD_BIN" ctl --dbus-name "$name" status-json >/dev/null 2>&1; then
+                    return 0
+                  fi
+                  if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+                    echo "ERR $label exited before its control endpoint was ready" >&2
+                    tail -120 "$log" >&2 || true
+                    exit 1
+                  fi
+                  sleep 0.1
+                done
+                echo "ERR timed out waiting for $label control endpoint" >&2
+                tail -120 "$log" >&2 || true
+                exit 1
+              }
+
+              build_wasm_examples() {
+                local found=0
+                local manifest
+                while IFS= read -r manifest; do
+                  found=1
+                  echo "building_wasm=$manifest"
+                  cargo build --manifest-path "$manifest" --target wasm32-unknown-unknown --release
+                done < <(find "$SOURCE_DIR/examples" -mindepth 2 -maxdepth 2 -path "$SOURCE_DIR/examples/wasm-*/Cargo.toml" -print | sort)
+
+                if [[ "$found" != "1" ]]; then
+                  echo "ERR no WASM example Cargo.toml files found under $SOURCE_DIR/examples" >&2
+                  return 2
+                fi
+              }
+
+              spawn_default_dev_client() {
+                if [[ -n "''${MANIFOLD_DEV_CLIENT:-}" ]]; then
+                  local q_source
+                  q_source="$(shell_quote "$SOURCE_DIR")"
+                  "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
+                    bash -lc "cd $q_source && exec ''${MANIFOLD_DEV_CLIENT}" >/dev/null
+                else
+                  "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
+                    "${pkgs.kitty}/bin/kitty" --working-directory "$SOURCE_DIR" >/dev/null
+                fi
+              }
+
+              cleanup() {
+                if [[ "''${MANIFOLD_DEV_KEEP_RUNNING:-0}" == "1" ]]; then
+                  return
+                fi
+                if [[ -n "''${DBUS_DESTINATION:-}" ]]; then
+                  "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+                fi
+                if [[ -n "''${SESSION_PID:-}" ]] && kill -0 "$SESSION_PID" 2>/dev/null; then
+                  kill "$SESSION_PID" >/dev/null 2>&1 || true
+                fi
+              }
+              trap cleanup EXIT INT TERM
+
+              ensure_source
+
+              mkdir -p "$RUN_ROOT"
+              RUN_DIR="$(mktemp -d "$RUN_ROOT/run.XXXXXX")"
+              exec 9>"$CACHE_ROOT/workflow.lock"
+              flock 9
+
+              DBUS_DESTINATION="org.manifold.DevWorkflow.p$$"
+              SESSION_LOG="$RUN_DIR/session.log"
+              WASM_BUILD_LOG="$RUN_DIR/wasm-build.log"
+
+              if ! build_wasm_examples >"$WASM_BUILD_LOG" 2>&1; then
+                echo "ERR failed to build WASM examples" >&2
+                tail -120 "$WASM_BUILD_LOG" >&2 || true
+                exit 1
+              fi
+
+              (
+                cd "$SOURCE_DIR"
+                RUST_LOG="$RUST_LOG" "$MANIFOLDD_BIN" run --no-session-runner --dbus-name "$DBUS_DESTINATION" --config "$SOURCE_DIR/manifold.toml"
+              ) >"$SESSION_LOG" 2>&1 &
+              SESSION_PID=$!
+
+              wait_for_control "$DBUS_DESTINATION" "$SESSION_PID" "$SESSION_LOG" "Manifold session"
+
+              spawn_default_dev_client
+
+              echo "OK Manifold developer workflow ready"
+              echo "source=$SOURCE_DIR"
+              echo "run_dir=$RUN_DIR"
+              echo "dbus_destination=$DBUS_DESTINATION"
+              echo "wasm_build_log=$WASM_BUILD_LOG"
+              echo "session_log=$SESSION_LOG"
+              echo "Stop with Ctrl-C or close the Manifold presentation."
+
+              wait "$SESSION_PID"
+            '';
           };
 
           firefoxCloseReattachHarness =
@@ -244,7 +418,9 @@
         in
         {
           default = manifoldd;
+          "dev-workflow" = devWorkflow;
           inherit
+            devWorkflow
             manifoldd
             firefoxCloseReattachHarness
             firefoxCloseReattachTestScript

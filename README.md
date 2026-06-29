@@ -83,6 +83,17 @@ cargo run -- run --headless
 
 The repo also includes `flake.nix` for developers who want a Nix shell. It is optional; the ordinary Cargo commands above are the default project entry points.
 
+Start the one-line development workflow from Nix:
+
+```sh
+nix run github:ElSargo/manifold#dev-workflow
+```
+
+This clones a writable checkout under `~/.cache`, builds the WASM example
+artifacts used by the normal config, starts a normal Manifold session from the
+crate2nix-built binary, and opens a terminal in that checkout. See
+[Development Environment](docs/dev-environment.md).
+
 Useful variants:
 
 ```sh

@@ -19,8 +19,11 @@ use crate::{
 
 const KEY_LEFTCTRL: Keycode = Keycode::new(37);
 const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
+const KEY_LEFTSHIFT: Keycode = Keycode::new(42);
+const KEY_RIGHTSHIFT: Keycode = Keycode::new(54);
 const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
+const KEY_ESC: Keycode = Keycode::new(1);
 const KEY_B: Keycode = Keycode::new(56);
 const KEY_COMMA: Keycode = Keycode::new(59);
 const KEY_DOT: Keycode = Keycode::new(60);
@@ -98,6 +101,7 @@ impl Manifold {
 
     pub fn forward_keyboard_key(&mut self, key_code: Keycode, state: KeyState, time: u32) {
         let is_ctrl = matches!(key_code, KEY_LEFTCTRL | KEY_RIGHTCTRL);
+        let is_shift = matches!(key_code, KEY_LEFTSHIFT | KEY_RIGHTSHIFT);
         let is_alt = matches!(key_code, KEY_LEFTALT | KEY_RIGHTALT);
 
         if key_code == KEY_B && state == KeyState::Released && self.suppress_mode_toggle_key_release
@@ -159,16 +163,44 @@ impl Manifold {
             return;
         }
 
-        if self.ctrl_pressed && key_code == KEY_B {
+        if is_shift {
+            match state {
+                KeyState::Pressed => {
+                    self.shift_pressed = true;
+                    self.shift_pressed_key = Some(key_code);
+                    self.record_consumed_keyboard_input();
+                }
+                KeyState::Released if self.shift_forwarded_to_client => {
+                    self.shift_pressed = false;
+                    self.shift_pressed_key = None;
+                    self.shift_forwarded_to_client = false;
+                    self.forward_keyboard_key_to_focused_client(key_code, state, time);
+                }
+                KeyState::Released => {
+                    self.shift_pressed = false;
+                    self.shift_pressed_key = None;
+                    self.record_consumed_keyboard_input();
+                }
+            }
+            return;
+        }
+
+        if self.ctrl_pressed && self.shift_pressed && key_code == KEY_ESC {
+            self.record_consumed_keyboard_input();
+            if state == KeyState::Pressed {
+                self.shortcut_prefix_active = false;
+                self.suppress_shortcut_prefix_key_release = Some(key_code);
+                self.toggle_shortcut_passthrough();
+            }
+            return;
+        }
+
+        if self.ctrl_pressed && key_code == KEY_B && !self.shortcut_passthrough() {
             self.record_consumed_keyboard_input();
             if state == KeyState::Pressed {
                 self.suppress_mode_toggle_key_release = true;
-                if self.shortcut_passthrough() {
-                    self.set_shortcut_passthrough(false);
-                } else {
-                    self.shortcut_prefix_active = true;
-                    self.toggle_input_mode();
-                }
+                self.shortcut_prefix_active = true;
+                self.toggle_input_mode();
             }
             return;
         }
@@ -290,6 +322,12 @@ impl Manifold {
         if self.alt_pressed && !self.alt_forwarded_to_client {
             if let Some(key_code) = self.alt_pressed_key {
                 self.alt_forwarded_to_client = true;
+                self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
+            }
+        }
+        if self.shift_pressed && !self.shift_forwarded_to_client {
+            if let Some(key_code) = self.shift_pressed_key {
+                self.shift_forwarded_to_client = true;
                 self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
             }
         }
