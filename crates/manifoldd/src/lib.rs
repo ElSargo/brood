@@ -51,6 +51,8 @@ enum Command {
     List(ListArgs),
     /// Run a Manifold session process with an attached presentation by default.
     Run(RunArgs),
+    /// Hot-load a WASM module into a running Manifold session.
+    Plug(PlugArgs),
     /// Select a live session with skim and present it.
     Switch(SwitchArgs),
     /// Run built-in test workflows. Defaults to the nested topology.
@@ -218,6 +220,22 @@ pub(crate) struct ListArgs {
 }
 
 #[derive(Debug, Parser)]
+pub(crate) struct PlugArgs {
+    /// DBus destination name for the session control endpoint.
+    #[arg(long = "dbus-destination", alias = "dbus-name")]
+    pub(crate) dbus_name: Option<String>,
+    /// DBus bus address for the session control endpoint.
+    #[arg(long = "dbus-address")]
+    pub(crate) dbus_address: Option<String>,
+    /// WASM lane to replace. Auto tries the key handler ABI, then the map hook ABI.
+    #[arg(long = "kind", value_name = "KIND", default_value = "auto")]
+    pub(crate) kind: String,
+    /// WASM module path to load into the running session.
+    #[arg(value_name = "PATH")]
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Parser)]
 pub(crate) struct SwitchArgs {
     /// DBus destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
@@ -334,6 +352,7 @@ pub fn run_cli() -> Result<()> {
         Command::Hide(args) => control::hide(args).context("hide session environment"),
         Command::List(args) => control::list(args).context("list session environments"),
         Command::Run(args) => compositor::run(args),
+        Command::Plug(args) => control::plug(args).context("plug WASM module"),
         Command::Switch(args) => control::switch(args).context("switch session"),
         Command::Test(args) => compositor::run_test(args),
         Command::Ctl(args) => control::send(args).context("send control command"),

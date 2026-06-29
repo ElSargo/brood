@@ -19,8 +19,8 @@ use crate::{
 
 const KEY_LEFTCTRL: Keycode = Keycode::new(37);
 const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
-const KEY_LEFTSHIFT: Keycode = Keycode::new(42);
-const KEY_RIGHTSHIFT: Keycode = Keycode::new(54);
+const KEY_LEFTSHIFT: Keycode = Keycode::new(50);
+const KEY_RIGHTSHIFT: Keycode = Keycode::new(62);
 const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
 const KEY_ESC: Keycode = Keycode::new(1);
@@ -197,9 +197,9 @@ impl Manifold {
 
         if self.ctrl_pressed && key_code == KEY_B && !self.shortcut_passthrough() {
             self.record_consumed_keyboard_input();
-            if state == KeyState::Pressed {
+            if state == KeyState::Pressed && !self.suppress_mode_toggle_key_release {
                 self.suppress_mode_toggle_key_release = true;
-                self.shortcut_prefix_active = true;
+                self.shortcut_prefix_active = false;
                 self.toggle_input_mode();
             }
             return;
@@ -528,5 +528,19 @@ fn built_in_ctrl_layout_action(key_code: Keycode) -> Option<LayoutAction> {
         KEY_DOT => Some(LayoutAction::FocusNextSplit),
         KEY_COMMA => Some(LayoutAction::FocusPreviousSplit),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY_C: Keycode = Keycode::new(54);
+    const KEY_G: Keycode = Keycode::new(42);
+
+    #[test]
+    fn shift_modifiers_do_not_collide_with_plain_letters() {
+        assert_ne!(KEY_LEFTSHIFT, KEY_G);
+        assert_ne!(KEY_RIGHTSHIFT, KEY_C);
     }
 }

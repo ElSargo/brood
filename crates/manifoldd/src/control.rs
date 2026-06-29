@@ -29,7 +29,8 @@ use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy};
 
 use crate::{
     CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
-    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, ShowArgs, SwitchArgs, browser,
+    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs, ShowArgs, SwitchArgs,
+    browser,
     command::{SurfaceCommand, WorkspaceCommand},
     config,
     debug_dump::{self, DumpOptions},
@@ -1027,6 +1028,30 @@ pub fn send(args: CtlArgs) -> Result<()> {
         return Ok(());
     }
     let response = request_dbus_command(&target, &args.command, args.json)?;
+    print!("{response}");
+    Ok(())
+}
+
+pub fn plug(args: PlugArgs) -> Result<()> {
+    let current_directory = current_directory()?;
+    let runner = config::discover_session_runner(&current_directory)?;
+    let target = resolve_project_control_target(args.dbus_name, args.dbus_address, runner.as_ref());
+    ensure_project_control_target_running(&target, runner.as_ref())?;
+    let path = args
+        .path
+        .canonicalize()
+        .with_context(|| format!("resolve WASM module {}", args.path.display()))?;
+    let response = request_dbus_command(
+        &target,
+        &[
+            "plug".to_string(),
+            "--kind".to_string(),
+            args.kind,
+            path.display().to_string(),
+        ],
+        false,
+    )?;
+    ensure_ok_response(&response)?;
     print!("{response}");
     Ok(())
 }
@@ -2462,6 +2487,11 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             state.spawn_hosted_app_argv(args)?;
             format!("OK spawned {}\n", args.join(" "))
         }
+        "plug" => {
+            let (kind, path) = parse_plug_args(args)?;
+            let loaded_kind = plug_wasm_module(state, &path, kind)?;
+            format!("OK plug kind={} path={}\n", loaded_kind, path.display())
+        }
         "focus" => {
             let direction = match args {
                 [arg] if arg == "next" => FocusDirection::Next,
@@ -2641,6 +2671,87 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
     };
 
     Ok(response)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasmPlugKind {
+    Auto,
+    FastKeyHandler,
+    FastMapHook,
+}
+
+impl WasmPlugKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "fast-key-handler" | "key" | "key-handler" => Ok(Self::FastKeyHandler),
+            "fast-map-hook" | "map" | "map-hook" => Ok(Self::FastMapHook),
+            _ => bail!("plug kind must be auto, fast-key-handler, or fast-map-hook"),
+        }
+    }
+}
+
+fn parse_plug_args(args: &[String]) -> Result<(WasmPlugKind, PathBuf)> {
+    let mut kind = WasmPlugKind::Auto;
+    let mut path = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--kind" | "-k" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    bail!("plug --kind requires a value");
+                };
+                kind = WasmPlugKind::parse(value)?;
+            }
+            arg if arg.starts_with("--kind=") => {
+                let value = arg.trim_start_matches("--kind=");
+                kind = WasmPlugKind::parse(value)?;
+            }
+            arg if arg.starts_with('-') => {
+                bail!("unknown plug option {arg}");
+            }
+            arg => {
+                ensure!(path.is_none(), "plug accepts exactly one WASM module path");
+                path = Some(PathBuf::from(arg));
+            }
+        }
+        index += 1;
+    }
+
+    let path = path.context("usage: plug [--kind auto|fast-key-handler|fast-map-hook] <path>")?;
+    Ok((kind, path))
+}
+
+fn plug_wasm_module(state: &mut Manifold, path: &Path, kind: WasmPlugKind) -> Result<&'static str> {
+    ensure!(
+        path.exists(),
+        "WASM module does not exist: {}",
+        path.display()
+    );
+    match kind {
+        WasmPlugKind::FastKeyHandler => {
+            state.replace_wasm_key_handler(path)?;
+            Ok("fast-key-handler")
+        }
+        WasmPlugKind::FastMapHook => {
+            state.replace_wasm_map_hook(path)?;
+            Ok("fast-map-hook")
+        }
+        WasmPlugKind::Auto => {
+            let key_error = match state.replace_wasm_key_handler(path) {
+                Ok(()) => return Ok("fast-key-handler"),
+                Err(err) => err,
+            };
+            match state.replace_wasm_map_hook(path) {
+                Ok(()) => Ok("fast-map-hook"),
+                Err(map_error) => Err(anyhow::anyhow!(
+                    "could not plug {} as fast-key-handler ({key_error}) or fast-map-hook ({map_error})",
+                    path.display()
+                )),
+            }
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -3359,8 +3470,8 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlTarget, SessionSwitchOutcome, format_session_picker_row, parse_skim_session_output,
-        resolve_initial_query, session_marker_value,
+        ControlTarget, SessionSwitchOutcome, WasmPlugKind, format_session_picker_row,
+        parse_plug_args, parse_skim_session_output, resolve_initial_query, session_marker_value,
     };
     use crate::state::SurfaceSessionSummary;
 
@@ -3405,6 +3516,27 @@ mod tests {
         let outcome = resolve_initial_query(&sessions, Some("research")).unwrap();
 
         assert!(matches!(outcome, SessionSwitchOutcome::Existing(2)));
+    }
+
+    #[test]
+    fn plug_args_default_to_auto_kind() {
+        let (kind, path) = parse_plug_args(&["module.wasm".to_string()]).unwrap();
+
+        assert_eq!(kind, WasmPlugKind::Auto);
+        assert_eq!(path, std::path::PathBuf::from("module.wasm"));
+    }
+
+    #[test]
+    fn plug_args_accept_kind_option() {
+        let (kind, path) = parse_plug_args(&[
+            "--kind".to_string(),
+            "fast-map-hook".to_string(),
+            "layout.wasm".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(kind, WasmPlugKind::FastMapHook);
+        assert_eq!(path, std::path::PathBuf::from("layout.wasm"));
     }
 
     #[test]

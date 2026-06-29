@@ -2601,6 +2601,18 @@ impl Manifold {
         enabled
     }
 
+    pub(crate) fn replace_wasm_key_handler(&mut self, path: &Path) -> Result<()> {
+        let handler = WasmKeyHandler::load(path)?;
+        self.wasm_key_handler = Some(handler);
+        Ok(())
+    }
+
+    pub(crate) fn replace_wasm_map_hook(&mut self, path: &Path) -> Result<()> {
+        let hook = WasmMapHook::load(path)?;
+        self.wasm_map_hook = Some(hook);
+        Ok(())
+    }
+
     pub fn register_extension_window(
         &mut self,
         extension_id: String,
