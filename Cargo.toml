@@ -27,6 +27,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wasmtime = "43.0.2"
 wayland-egl = "0.32.11"
+wayland-client = { version = "0.31.14", features = ["system"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 zbus = "5.13.2"
 
 [workspace.lints.rust]

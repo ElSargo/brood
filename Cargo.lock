@@ -1827,7 +1827,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasmtime",
+ "wayland-client",
  "wayland-egl",
+ "wayland-protocols",
  "zbus",
 ]
 

@@ -345,7 +345,9 @@ fn handle_presenter_event(
         PresenterEvent::CloseRequested => {
             state.request_os_window_close();
         }
-        PresenterEvent::Focus => {}
+        PresenterEvent::Focus { focused } => {
+            state.set_presentation_window_focused(focused);
+        }
     }
 }
 
