@@ -53,6 +53,7 @@ use crate::{
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
     wasm_key::WasmKeyHandler,
+    wasm_key::WasmKeyPane,
     wasm_map::{MapHookInput, MapHookOutcome, MapHookResponse, WasmMapHook},
     wasm_test::{
         TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request,
@@ -135,6 +136,12 @@ enum ResolvedLayoutSource {
 struct ResolvedPresentationHit {
     layout_hit: HitResult,
     window_hit: Option<(Window, Point<i32, Logical>)>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeSessionLayout {
+    layout: LayoutState,
+    leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -294,6 +301,7 @@ pub struct Manifold {
     pointer_hover_toplevel_surface: Option<WlSurface>,
     pending_pointer_focus_surface: Option<WlSurface>,
     layout_leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
+    native_session_layouts: BTreeMap<SurfaceSessionId, NativeSessionLayout>,
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
@@ -407,6 +415,7 @@ impl Manifold {
             pointer_hover_toplevel_surface: None,
             pending_pointer_focus_surface: None,
             layout_leaf_selected_panes: Vec::new(),
+            native_session_layouts: BTreeMap::new(),
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
@@ -1445,6 +1454,34 @@ impl Manifold {
         self.active_surface_session
     }
 
+    fn save_active_native_session_layout(&mut self) {
+        self.native_session_layouts.insert(
+            self.active_surface_session,
+            NativeSessionLayout {
+                layout: self.layout.clone(),
+                leaf_selected_panes: self.layout_leaf_selected_panes.clone(),
+            },
+        );
+    }
+
+    fn restore_native_session_layout(&mut self, session: SurfaceSessionId) {
+        let left_dock_visible = self.layout.left_dock_visible;
+        let right_dock_visible = self.layout.right_dock_visible;
+        let bottom_dock_visible = self.layout.bottom_dock_visible;
+        let center_visible = self.layout.center_visible;
+        if let Some(saved) = self.native_session_layouts.get(&session).cloned() {
+            self.layout = saved.layout;
+            self.layout_leaf_selected_panes = saved.leaf_selected_panes;
+        } else {
+            self.layout = LayoutState::default();
+            self.layout_leaf_selected_panes.clear();
+        }
+        self.layout.left_dock_visible = left_dock_visible;
+        self.layout.right_dock_visible = right_dock_visible;
+        self.layout.bottom_dock_visible = bottom_dock_visible;
+        self.layout.center_visible = center_visible;
+    }
+
     pub fn restore_last_interacted_surface_session(&mut self) -> bool {
         let Some(session) = self.most_recent_live_surface_session() else {
             return false;
@@ -1452,7 +1489,9 @@ impl Manifold {
         if self.active_surface_session == session {
             return false;
         }
+        self.save_active_native_session_layout();
         self.active_surface_session = session;
+        self.restore_native_session_layout(session);
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
@@ -1642,6 +1681,9 @@ impl Manifold {
         if self.surface_sessions.len() <= 1 || !self.surface_sessions.contains(&session) {
             return false;
         }
+        if self.active_surface_session != session {
+            self.save_active_native_session_layout();
+        }
 
         let surfaces = self
             .window_surface_sessions
@@ -1674,6 +1716,7 @@ impl Manifold {
             .retain(|_, assigned_session| *assigned_session != session);
         self.window_surface_sessions
             .retain(|(_, assigned_session)| *assigned_session != session);
+        self.native_session_layouts.remove(&session);
         if self.active_surface_session == session {
             self.active_surface_session = self
                 .surface_session_interaction_order
@@ -1683,6 +1726,7 @@ impl Manifold {
                 .or_else(|| self.surface_sessions.first().copied())
                 .unwrap_or(SurfaceSessionId(1));
         }
+        self.restore_native_session_layout(self.active_surface_session);
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
@@ -1736,7 +1780,9 @@ impl Manifold {
         if !self.surface_sessions.contains(&session) || self.active_surface_session == session {
             return false;
         }
+        self.save_active_native_session_layout();
         self.active_surface_session = session;
+        self.restore_native_session_layout(session);
         self.record_surface_session_interaction(session);
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
@@ -1754,14 +1800,17 @@ impl Manifold {
                 .first()
                 .copied()
                 .unwrap_or(SurfaceSessionId(1));
+            self.restore_native_session_layout(self.active_surface_session);
             self.reconfigure_focus_stack();
             return true;
         };
         if self.surface_sessions.len() <= 1 {
             return false;
         }
+        self.save_active_native_session_layout();
         self.active_surface_session =
             self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
+        self.restore_native_session_layout(self.active_surface_session);
         self.record_surface_session_interaction(self.active_surface_session);
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
@@ -1784,7 +1833,9 @@ impl Manifold {
             name.filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| default_surface_session_name(session)),
         ));
+        self.save_active_native_session_layout();
         self.active_surface_session = session;
+        self.restore_native_session_layout(session);
         self.record_surface_session_interaction(session);
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
@@ -1994,6 +2045,37 @@ impl Manifold {
             .set_focus(self, keyboard_focus, serial);
     }
 
+    fn fallback_focus_leaf_for_surface(&self, surface: &WlSurface) -> Option<LayoutLeafId> {
+        self.leaf_for_toplevel_surface(surface).or_else(|| {
+            self.layout
+                .active_kind()
+                .is_some()
+                .then_some(self.layout.active_leaf())
+        })
+    }
+
+    pub fn focus_pane(&mut self, pane: u64) -> bool {
+        let Some(surface) = self.active_session_content_surface_for_pane(pane) else {
+            return false;
+        };
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            let Some(leaf) = self.fallback_focus_leaf_for_surface(&surface) else {
+                return false;
+            };
+            self.layout.set_active_leaf(leaf);
+            self.set_layout_leaf_selected_pane(leaf, pane);
+            self.refresh_resolved_layout_from_native_policy();
+        } else if !self.surface_has_visible_pane_item(&surface) {
+            return false;
+        }
+        if let Some(window) = self.window_for_any_toplevel_surface(&surface) {
+            self.space.raise_element(&window, true);
+        }
+        self.focus_toplevel_surface(Some(surface));
+        self.reconfigure_focus_stack();
+        true
+    }
+
     pub fn active_window(&self) -> Option<Window> {
         self.active_toplevel_surface.as_ref().and_then(|active| {
             self.space
@@ -2014,7 +2096,21 @@ impl Manifold {
 
     pub fn focus_window(&mut self, window: &Window) {
         self.space.raise_element(window, true);
-        self.focus_toplevel_surface(Manifold::window_toplevel_surface(window));
+        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+            self.focus_toplevel_surface(None);
+            return;
+        };
+        if self
+            .session_for_toplevel_surface(&surface)
+            .unwrap_or(SurfaceSessionId(1))
+            == self.active_surface_session
+            && self.surface_participates_in_resolved_layout(&surface)
+            && let Some(pane) = self.pane_for_toplevel_surface(&surface)
+            && self.focus_pane(pane)
+        {
+            return;
+        }
+        self.focus_toplevel_surface(Some(surface));
     }
 
     pub fn focus_app_id(&mut self, target_app_id: &str) -> bool {
@@ -2071,6 +2167,30 @@ impl Manifold {
                 false
             }
         }
+    }
+
+    pub fn focused_pane(&self) -> Option<u64> {
+        let surface = self.active_toplevel_surface.as_ref()?;
+        self.surface_has_visible_pane_item(surface)
+            .then(|| self.pane_for_toplevel_surface(surface))
+            .flatten()
+    }
+
+    pub fn active_session_wasm_key_panes(&self) -> Vec<WasmKeyPane> {
+        self.space
+            .elements()
+            .filter(|window| self.window_belongs_to_active_surface_session(window))
+            .filter_map(|window| {
+                let surface = Manifold::window_toplevel_surface(window)?;
+                if !self.surface_participates_in_resolved_layout(&surface) {
+                    return None;
+                }
+                Some(WasmKeyPane {
+                    pane: self.pane_for_toplevel_surface(&surface)?,
+                    app_id: toplevel_app_id(&surface),
+                })
+            })
+            .collect()
     }
 
     pub fn register_extension(
@@ -2522,7 +2642,11 @@ impl Manifold {
         if let Some(session) = self.session_for_toplevel_surface(&surface) {
             self.switch_to_surface_session(session);
         }
-        self.focus_toplevel_surface(Some(surface));
+        if let Some(window) = self.window_for_any_toplevel_surface(&surface) {
+            self.focus_window(&window);
+        } else {
+            self.focus_toplevel_surface(Some(surface));
+        }
         Ok(true)
     }
 
@@ -2717,6 +2841,9 @@ impl Manifold {
     }
 
     fn split_active_content_leaf(&mut self, axis: LayoutAxis) -> bool {
+        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
+            return false;
+        }
         let Some(active_surface) = self.active_toplevel_surface.clone() else {
             return false;
         };
@@ -2747,6 +2874,90 @@ impl Manifold {
 
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
+        true
+    }
+
+    fn split_active_content_leaf_smart(&mut self) -> bool {
+        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
+            return false;
+        }
+        let Some(active_surface) = self.active_toplevel_surface.as_ref() else {
+            return false;
+        };
+        if !self.surface_has_visible_pane_item(active_surface) {
+            return false;
+        }
+        let rect = self
+            .layout
+            .active_rect(self.presentation_layout_size())
+            .unwrap_or_else(|| fullscreen_layout_rect(self.presentation_layout_size()));
+        let axis = if rect.w >= rect.h {
+            LayoutAxis::Horizontal
+        } else {
+            LayoutAxis::Vertical
+        };
+        self.split_active_content_leaf(axis)
+    }
+
+    fn focus_layout_leaf_by_offset(&mut self, offset: isize) -> bool {
+        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
+            return false;
+        }
+        if self
+            .active_toplevel_surface
+            .as_ref()
+            .is_some_and(|surface| {
+                !self.surface_has_visible_pane_item(surface)
+                    && (self.surface_is_visible_presentation_member(surface)
+                        || self.surface_has_visible_panel(surface))
+            })
+        {
+            return false;
+        }
+        let previous_leaf = self.layout.active_leaf();
+        let Some(next_leaf) = self.layout.focus_leaf_by_offset(offset) else {
+            return false;
+        };
+        if next_leaf == previous_leaf {
+            return false;
+        }
+        self.refresh_resolved_layout_from_native_policy();
+        if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
+            self.focus_toplevel_surface(Some(next_surface));
+        } else {
+            self.focus_toplevel_surface(None);
+            self.reconfigure_focus_stack();
+        }
+        true
+    }
+
+    fn remove_active_split(&mut self) -> bool {
+        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
+            return false;
+        }
+        if self
+            .active_toplevel_surface
+            .as_ref()
+            .is_some_and(|surface| {
+                !self.surface_has_visible_pane_item(surface)
+                    && (self.surface_is_visible_presentation_member(surface)
+                        || self.surface_has_visible_panel(surface))
+            })
+        {
+            return false;
+        }
+        let Some((removed_leaf, next_leaf)) = self.layout.remove_active_leaf() else {
+            return false;
+        };
+        self.layout_leaf_selected_panes
+            .retain(|(leaf, _)| *leaf != removed_leaf);
+        self.refresh_resolved_layout_from_native_policy();
+        if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
+            self.focus_toplevel_surface(Some(next_surface));
+        } else {
+            self.focus_toplevel_surface(None);
+            self.reconfigure_focus_stack();
+        }
         true
     }
 
@@ -2807,7 +3018,10 @@ impl Manifold {
             self.space.map_element(window.clone(), location, false);
         }
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-            && self.layout.active_kind() == Some(LayoutLeafKind::Placeholder)
+            && self.layout.active_kind().is_some()
+            && self
+                .surface_for_layout_leaf(self.layout.active_leaf())
+                .is_none()
         {
             self.focus_toplevel_surface(None);
             return;
@@ -2869,8 +3083,11 @@ impl Manifold {
                 self.split_active_content_leaf(LayoutAxis::Horizontal)
             }
             LayoutAction::SplitActiveDown => self.split_active_content_leaf(LayoutAxis::Vertical),
-            LayoutAction::JoinActivePane
-            | LayoutAction::MoveActiveToLeftDock
+            LayoutAction::JoinActivePane => self.remove_active_split(),
+            LayoutAction::SplitActiveSmart => self.split_active_content_leaf_smart(),
+            LayoutAction::FocusNextSplit => self.focus_layout_leaf_by_offset(1),
+            LayoutAction::FocusPreviousSplit => self.focus_layout_leaf_by_offset(-1),
+            LayoutAction::MoveActiveToLeftDock
             | LayoutAction::MoveActiveToRightDock
             | LayoutAction::MoveActiveToBottomDock
             | LayoutAction::MoveActiveToCenter => {
@@ -3163,7 +3380,14 @@ impl Manifold {
         }
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             return match self.layout.active_kind() {
-                Some(LayoutLeafKind::Client) => "client",
+                Some(LayoutLeafKind::Client)
+                    if self
+                        .surface_for_layout_leaf(self.layout.active_leaf())
+                        .is_some() =>
+                {
+                    "client"
+                }
+                Some(LayoutLeafKind::Client) => "placeholder",
                 Some(LayoutLeafKind::Placeholder) => "placeholder",
                 None => "none",
             };

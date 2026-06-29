@@ -21,11 +21,19 @@ const MAX_SPAWN_COMMAND_BYTES: usize = 4096;
 #[derive(Default)]
 struct WasmKeyStore {
     pending_commands: Vec<WorkspaceCommand>,
+    focused_pane: Option<u64>,
+    panes: Vec<WasmKeyPane>,
 }
 
 pub struct WasmKeyHandler {
     store: Store<WasmKeyStore>,
     on_key: WasmKeyEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmKeyPane {
+    pub pane: u64,
+    pub app_id: Option<String>,
 }
 
 enum WasmKeyEntry {
@@ -107,6 +115,63 @@ impl WasmKeyHandler {
                 },
             )
             .map_err(|err| anyhow::anyhow!("define manifold.layout_action import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
+                "focused_pane_id",
+                |caller: Caller<'_, WasmKeyStore>| -> i64 {
+                    caller
+                        .data()
+                        .focused_pane
+                        .and_then(|pane| i64::try_from(pane).ok())
+                        .unwrap_or(-1)
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("define manifold.focused_pane_id import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
+                "pane_for_app_id",
+                |mut caller: Caller<'_, WasmKeyStore>, ptr: i32, len: i32| -> i64 {
+                    let app_id = match read_guest_string(&mut caller, ptr, len) {
+                        Ok(app_id) => app_id,
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "WASM key handler passed invalid pane_for_app_id string"
+                            );
+                            return -1;
+                        }
+                    };
+                    caller
+                        .data()
+                        .panes
+                        .iter()
+                        .find(|pane| pane.app_id.as_deref() == Some(app_id.as_str()))
+                        .and_then(|pane| i64::try_from(pane.pane).ok())
+                        .unwrap_or(-1)
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("define manifold.pane_for_app_id import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
+                "focus_pane",
+                |mut caller: Caller<'_, WasmKeyStore>, pane: i64| -> i32 {
+                    let Ok(pane) = u64::try_from(pane) else {
+                        return 0;
+                    };
+                    if pane == 0 {
+                        return 0;
+                    }
+                    caller
+                        .data_mut()
+                        .pending_commands
+                        .push(WorkspaceCommand::FocusPane(pane));
+                    1
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("define manifold.focus_pane import: {err}"))?;
         linker
             .func_wrap(
                 "manifold",
@@ -241,8 +306,12 @@ impl WasmKeyHandler {
         input_mode: InputMode,
         ctrl_pressed: bool,
         alt_pressed: bool,
+        focused_pane: Option<u64>,
+        panes: Vec<WasmKeyPane>,
     ) -> Result<WasmKeyOutcome> {
         self.store.data_mut().pending_commands.clear();
+        self.store.data_mut().focused_pane = focused_pane;
+        self.store.data_mut().panes = panes;
         let key_args = (
             i32::try_from(key_code.raw()).unwrap_or(i32::MAX),
             abi_key_state(key_state),

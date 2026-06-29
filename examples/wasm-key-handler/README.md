@@ -1,6 +1,8 @@
 # WASM Key Handler Example
 
 This is a minimal core-WASM key handler for `manifoldd run --wasm-key-handler`.
+The example keeps app-id navigation policy in the guest: it looks up panes by
+app id, calls exact pane focus, and tracks when no content pane is focused.
 
 Build:
 
@@ -31,6 +33,10 @@ Default keymap:
 - `Ctrl-F`: toggle managed fullscreen
 - `Ctrl-L`: split active pane right
 - `Ctrl-H`: split active pane down
+- `Ctrl-S`: split active pane using the active slot's wider axis
+- `Ctrl-U`: remove the active split
+- `Ctrl-.`: focus the next split slot
+- `Ctrl-,`: focus the previous split slot
 - `Ctrl-D`: toggle bottom dock
 - `Ctrl-P`: toggle left and right docks
 - `Alt-Space`: switch the active surface to the next session

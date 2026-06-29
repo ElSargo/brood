@@ -269,6 +269,9 @@ struct NestedTestArgs {
     /// Load a core-WASM map hook into the inner system under test.
     #[arg(long = "inner-wasm-map-hook", value_name = "PATH")]
     inner_wasm_map_hook: Option<PathBuf>,
+    /// Load a core-WASM key handler into the inner system under test.
+    #[arg(long = "inner-wasm-key-handler", value_name = "PATH")]
+    inner_wasm_key_handler: Option<PathBuf>,
     /// Spawn a hosted Wayland app inside the inner instance after startup.
     #[arg(long = "inner-command", value_name = "CMD")]
     inner_command: Option<String>,

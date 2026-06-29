@@ -20,8 +20,12 @@ const KEY_H: i32 = 43;
 const KEY_J: i32 = 44;
 const KEY_K: i32 = 45;
 const KEY_L: i32 = 46;
+const KEY_S: i32 = 39;
+const KEY_U: i32 = 30;
 const KEY_N: i32 = 57;
 const KEY_P: i32 = 33;
+const KEY_COMMA: i32 = 59;
+const KEY_DOT: i32 = 60;
 const KEY_SPACE: i32 = 65;
 
 const MOD_CTRL: i32 = 1;
@@ -43,26 +47,29 @@ const TERMINAL_4_COMMAND: &[u8] = b"kitty --class manifold-terminal-4";
 const TERMINAL_5_APP_ID: &[u8] = b"manifold-terminal-5";
 const TERMINAL_5_COMMAND: &[u8] = b"kitty --class manifold-terminal-5";
 
+static mut FOCUSED_PANE: i64 = -1;
+
 const ACTION_FOCUS_NEXT: i32 = 1;
 const ACTION_FOCUS_PREVIOUS: i32 = 2;
 const ACTION_CLOSE_ACTIVE_PANE: i32 = 3;
 const ACTION_TOGGLE_MANAGED_FULLSCREEN: i32 = 4;
 const ACTION_SPLIT_ACTIVE_RIGHT: i32 = 5;
 const ACTION_SPLIT_ACTIVE_DOWN: i32 = 6;
+const ACTION_JOIN_ACTIVE_PANE: i32 = 7;
 const ACTION_TOGGLE_LEFT_DOCK: i32 = 12;
 const ACTION_TOGGLE_RIGHT_DOCK: i32 = 13;
 const ACTION_TOGGLE_BOTTOM_DOCK: i32 = 14;
+const ACTION_SPLIT_ACTIVE_SMART: i32 = 17;
+const ACTION_FOCUS_NEXT_SPLIT: i32 = 18;
+const ACTION_FOCUS_PREVIOUS_SPLIT: i32 = 19;
 
 #[link(wasm_import_module = "manifold")]
 unsafe extern "C" {
     fn layout_action(action: i32) -> i32;
+    fn focused_pane_id() -> i64;
+    fn pane_for_app_id(app_id_ptr: *const u8, app_id_len: usize) -> i64;
+    fn focus_pane(pane: i64) -> i32;
     fn spawn_app(ptr: *const u8, len: usize) -> i32;
-    fn focus_or_spawn_app(
-        app_id_ptr: *const u8,
-        app_id_len: usize,
-        command_ptr: *const u8,
-        command_len: usize,
-    ) -> i32;
     fn switch_active_session_next() -> i32;
     fn create_and_attach_session() -> i32;
 }
@@ -81,6 +88,8 @@ pub extern "C" fn on_key_v2(
     ctrl_pressed: i32,
     modifiers: i32,
 ) -> i32 {
+    sync_focused_pane_model();
+
     if modifiers & MOD_ALT != 0 && key_code == KEY_SPACE && input_mode == INPUT_MODE_NORMAL {
         return if key_state == KEY_STATE_PRESSED {
             unsafe { switch_active_session_next() }
@@ -110,6 +119,10 @@ pub extern "C" fn on_key_v2(
         KEY_F => unsafe { layout_action(ACTION_TOGGLE_MANAGED_FULLSCREEN) },
         KEY_L => unsafe { layout_action(ACTION_SPLIT_ACTIVE_RIGHT) },
         KEY_H => unsafe { layout_action(ACTION_SPLIT_ACTIVE_DOWN) },
+        KEY_S => unsafe { layout_action(ACTION_SPLIT_ACTIVE_SMART) },
+        KEY_U => unsafe { layout_action(ACTION_JOIN_ACTIVE_PANE) },
+        KEY_DOT => unsafe { layout_action(ACTION_FOCUS_NEXT_SPLIT) },
+        KEY_COMMA => unsafe { layout_action(ACTION_FOCUS_PREVIOUS_SPLIT) },
         KEY_D => unsafe { layout_action(ACTION_TOGGLE_BOTTOM_DOCK) },
         KEY_P => unsafe {
             layout_action(ACTION_TOGGLE_LEFT_DOCK);
@@ -122,7 +135,21 @@ pub extern "C" fn on_key_v2(
 fn is_global_ctrl_workspace_key(key_code: i32) -> bool {
     matches!(
         key_code,
-        KEY_J | KEY_K | KEY_G | KEY_ENTER | KEY_1 | KEY_2 | KEY_3 | KEY_4 | KEY_5
+        KEY_J
+            | KEY_K
+            | KEY_G
+            | KEY_H
+            | KEY_L
+            | KEY_S
+            | KEY_U
+            | KEY_COMMA
+            | KEY_DOT
+            | KEY_ENTER
+            | KEY_1
+            | KEY_2
+            | KEY_3
+            | KEY_4
+            | KEY_5
     )
 }
 
@@ -130,6 +157,12 @@ fn handle_global_ctrl_workspace_key(key_code: i32) -> i32 {
     match key_code {
         KEY_J => unsafe { layout_action(ACTION_FOCUS_NEXT) },
         KEY_K => unsafe { layout_action(ACTION_FOCUS_PREVIOUS) },
+        KEY_H => unsafe { layout_action(ACTION_SPLIT_ACTIVE_DOWN) },
+        KEY_L => unsafe { layout_action(ACTION_SPLIT_ACTIVE_RIGHT) },
+        KEY_S => unsafe { layout_action(ACTION_SPLIT_ACTIVE_SMART) },
+        KEY_U => unsafe { layout_action(ACTION_JOIN_ACTIVE_PANE) },
+        KEY_DOT => unsafe { layout_action(ACTION_FOCUS_NEXT_SPLIT) },
+        KEY_COMMA => unsafe { layout_action(ACTION_FOCUS_PREVIOUS_SPLIT) },
         KEY_G => focus_or_spawn(LAZYGIT_APP_ID, LAZYGIT_COMMAND),
         KEY_ENTER => focus_or_spawn(AGENT_APP_ID, AGENT_COMMAND),
         KEY_1 => focus_or_spawn(TERMINAL_1_APP_ID, TERMINAL_1_COMMAND),
@@ -142,13 +175,24 @@ fn handle_global_ctrl_workspace_key(key_code: i32) -> i32 {
 }
 
 fn focus_or_spawn(app_id: &[u8], command: &[u8]) -> i32 {
+    let pane = unsafe { pane_for_app_id(app_id.as_ptr(), app_id.len()) };
+    if pane > 0 {
+        let changed = unsafe { focus_pane(pane) };
+        if changed != 0 {
+            unsafe {
+                FOCUSED_PANE = pane;
+            }
+        }
+        changed
+    } else {
+        unsafe { spawn_app(command.as_ptr(), command.len()) }
+    }
+}
+
+fn sync_focused_pane_model() {
+    let pane = unsafe { focused_pane_id() };
     unsafe {
-        focus_or_spawn_app(
-            app_id.as_ptr(),
-            app_id.len(),
-            command.as_ptr(),
-            command.len(),
-        )
+        FOCUSED_PANE = pane;
     }
 }
 

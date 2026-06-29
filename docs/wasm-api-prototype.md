@@ -29,6 +29,12 @@ Initial commands:
 - `focus-pane(pane-id)`
 - `close-focused-pane`
 - `toggle-focused-fullscreen`
+- `split-active-right`
+- `split-active-down`
+- `split-active-smart`
+- `remove-active-split`
+- `focus-next-split`
+- `focus-previous-split`
 - `attach-presentation`
 - `detach-presentation`
 
@@ -221,6 +227,12 @@ interface commands {
     focus-previous,
     close-focused-pane,
     toggle-focused-fullscreen,
+    split-active-right,
+    split-active-down,
+    split-active-smart,
+    remove-active-split,
+    focus-next-split,
+    focus-previous-split,
     attach-presentation,
     detach-presentation,
   }
@@ -276,19 +288,32 @@ focus_next()
 focus_previous()
 toggle_fullscreen()
 close_active_window()
+focused_pane_id() -> i64
+pane_for_app_id(app_id_ptr: i32, app_id_len: i32) -> i64
+focus_pane(pane: i64) -> i32
 spawn_app(ptr: i32, len: i32) -> i32
 focus_or_spawn_app(app_id_ptr: i32, app_id_len: i32, command_ptr: i32, command_len: i32) -> i32
 ```
 
 `spawn_app` reads a UTF-8, whitespace-split command from exported guest memory and launches it as a hosted Wayland app with the session `WAYLAND_DISPLAY`.
 
-`focus_or_spawn_app` first looks for a live xdg toplevel in the active surface session whose app ID matches the supplied UTF-8 identifier. If no match exists, it launches the fallback command through the same hosted-app path as `spawn_app`.
+`focused_pane_id` returns the currently focused content pane, or `-1` when no
+content pane owns focus, such as when presentation UI or the sidebar is focused.
+`pane_for_app_id` lets the guest map its own app-id model to a live pane in the
+active surface session. `focus_pane` requests exact pane focus; native fallback
+layout treats this as selecting that pane in the current split slot. A guest that
+owns navigation policy should build focus-or-spawn behavior from these primitive
+calls so it can update its own model before requesting host focus. The older
+`focus_or_spawn_app` import remains a compatibility helper.
 
 When a handler is loaded, normal-mode key presses go to `on_key` first. Modified shortcut chords can also be claimed from passthrough mode, which lets workspace-level bindings work without toggling modes first. A successful normal-mode call replaces the built-in normal-mode map for that key path; if the guest traps, Manifold logs the failure and falls back to the built-in handler so the session remains usable during experiments.
 
 The sample handler lives in `examples/wasm-key-handler` and maps a minimal workspace keymap around app-ID-targeted Kitty panes:
 
 - `Ctrl-J` / `Ctrl-K` -> focus next / previous pane
+- `Ctrl-L` / `Ctrl-H` / `Ctrl-S` -> split right, split down, or smart split
+- `Ctrl-U` -> remove the active split
+- `Ctrl-.` / `Ctrl-,` -> focus next / previous split slot
 - `Ctrl-G` -> focus or spawn the LazyGit pane
 - `Ctrl-Enter` -> focus or spawn the Codex agent pane
 - `Ctrl-1` through `Ctrl-5` -> focus or spawn numbered terminal panes

@@ -295,6 +295,9 @@ pub enum LayoutAction {
     SplitActiveRight,
     SplitActiveDown,
     JoinActivePane,
+    SplitActiveSmart,
+    FocusNextSplit,
+    FocusPreviousSplit,
     MoveActiveToLeftDock,
     MoveActiveToRightDock,
     MoveActiveToBottomDock,
@@ -325,6 +328,9 @@ impl LayoutAction {
             14 => Self::ToggleBottomDock,
             15 => Self::IncreaseLeftDockWidth,
             16 => Self::DecreaseLeftDockWidth,
+            17 => Self::SplitActiveSmart,
+            18 => Self::FocusNextSplit,
+            19 => Self::FocusPreviousSplit,
             _ => return None,
         })
     }
@@ -338,6 +344,9 @@ impl LayoutAction {
             Self::SplitActiveRight => "split-active-right",
             Self::SplitActiveDown => "split-active-down",
             Self::JoinActivePane => "join-active-pane",
+            Self::SplitActiveSmart => "split-active-smart",
+            Self::FocusNextSplit => "focus-next-split",
+            Self::FocusPreviousSplit => "focus-previous-split",
             Self::MoveActiveToLeftDock => "move-active-to-left-dock",
             Self::MoveActiveToRightDock => "move-active-to-right-dock",
             Self::MoveActiveToBottomDock => "move-active-to-bottom-dock",
@@ -367,8 +376,20 @@ impl FromStr for LayoutAction {
             "close-active-pane" | "close-active-window" => Self::CloseActivePane,
             "toggle-managed-fullscreen" | "toggle-fullscreen" => Self::ToggleManagedFullscreen,
             "split-active-right" | "split-right" => Self::SplitActiveRight,
-            "split-active-down" | "split-down" => Self::SplitActiveDown,
-            "join-active-pane" | "join-pane" => Self::JoinActivePane,
+            "split-active-down" | "split-down" | "split-active-vertical" | "split-vertical" => {
+                Self::SplitActiveDown
+            }
+            "join-active-pane"
+            | "join-pane"
+            | "remove-active-split"
+            | "remove-split"
+            | "unsplit" => Self::JoinActivePane,
+            "split-active-smart" | "split-smart" | "smart-split" => Self::SplitActiveSmart,
+            "focus-next-split" | "focus-split-next" => Self::FocusNextSplit,
+            "focus-previous-split"
+            | "focus-prev-split"
+            | "focus-split-previous"
+            | "focus-split-prev" => Self::FocusPreviousSplit,
             "move-active-to-left-dock" => Self::MoveActiveToLeftDock,
             "move-active-to-right-dock" => Self::MoveActiveToRightDock,
             "move-active-to-bottom-dock" => Self::MoveActiveToBottomDock,
@@ -447,6 +468,28 @@ impl LayoutState {
         true
     }
 
+    pub fn focus_leaf_by_offset(&mut self, offset: isize) -> Option<LayoutLeafId> {
+        let leaves = self.leaf_ids();
+        let leaf_count = leaves.len();
+        if leaf_count == 0 {
+            return None;
+        }
+        let active_index = leaves
+            .iter()
+            .position(|leaf| *leaf == self.active_leaf)
+            .unwrap_or(0);
+        let next_index = (active_index as isize + offset).rem_euclid(leaf_count as isize) as usize;
+        self.active_leaf = leaves[next_index];
+        Some(self.active_leaf)
+    }
+
+    pub fn remove_active_leaf(&mut self) -> Option<(LayoutLeafId, LayoutLeafId)> {
+        let removed_leaf = self.active_leaf;
+        let next_active_leaf = self.root.remove_leaf(removed_leaf)?;
+        self.active_leaf = next_active_leaf;
+        Some((removed_leaf, next_active_leaf))
+    }
+
     pub fn occupy_active_leaf(&mut self) -> Option<LayoutLeafId> {
         self.root
             .set_leaf_kind(self.active_leaf, LayoutLeafKind::Client)
@@ -481,6 +524,12 @@ impl LayoutState {
             &mut regions,
         );
         regions
+    }
+
+    pub fn leaf_ids(&self) -> Vec<LayoutLeafId> {
+        let mut leaves = Vec::new();
+        self.root.collect_leaf_ids(&mut leaves);
+        leaves
     }
 
     fn allocate_leaf(&mut self) -> LayoutLeafId {
@@ -602,6 +651,50 @@ impl LayoutNode {
         }
     }
 
+    fn remove_leaf(&mut self, target: LayoutLeafId) -> Option<LayoutLeafId> {
+        match self {
+            Self::Leaf(_) => None,
+            Self::Split { first, second, .. } => {
+                if first.is_leaf(target) {
+                    let replacement = (**second).clone();
+                    let next_active_leaf = replacement.first_leaf_id();
+                    *self = replacement;
+                    return Some(next_active_leaf);
+                }
+                if second.is_leaf(target) {
+                    let replacement = (**first).clone();
+                    let next_active_leaf = replacement.first_leaf_id();
+                    *self = replacement;
+                    return Some(next_active_leaf);
+                }
+                first
+                    .remove_leaf(target)
+                    .or_else(|| second.remove_leaf(target))
+            }
+        }
+    }
+
+    fn is_leaf(&self, target: LayoutLeafId) -> bool {
+        matches!(self, Self::Leaf(leaf) if leaf.id == target)
+    }
+
+    fn first_leaf_id(&self) -> LayoutLeafId {
+        match self {
+            Self::Leaf(leaf) => leaf.id,
+            Self::Split { first, .. } => first.first_leaf_id(),
+        }
+    }
+
+    fn collect_leaf_ids(&self, leaves: &mut Vec<LayoutLeafId>) {
+        match self {
+            Self::Leaf(leaf) => leaves.push(leaf.id),
+            Self::Split { first, second, .. } => {
+                first.collect_leaf_ids(leaves);
+                second.collect_leaf_ids(leaves);
+            }
+        }
+    }
+
     fn resolve(
         &self,
         rect: LayoutRect,
@@ -714,6 +807,36 @@ impl Default for LayoutKeymap {
                     action: LayoutAction::SplitActiveDown,
                 },
                 LayoutKeyBinding {
+                    key: Keycode::new(39),
+                    ctrl: false,
+                    action: LayoutAction::SplitActiveSmart,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(30),
+                    ctrl: false,
+                    action: LayoutAction::JoinActivePane,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(60),
+                    ctrl: false,
+                    action: LayoutAction::FocusNextSplit,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(60),
+                    ctrl: true,
+                    action: LayoutAction::FocusNextSplit,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(59),
+                    ctrl: false,
+                    action: LayoutAction::FocusPreviousSplit,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(59),
+                    ctrl: true,
+                    action: LayoutAction::FocusPreviousSplit,
+                },
+                LayoutKeyBinding {
                     key: Keycode::new(23),
                     ctrl: false,
                     action: LayoutAction::ToggleLeftDock,
@@ -755,8 +878,8 @@ impl LayoutKeymap {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputBehavior, LayoutAction, LayoutItemId, LayoutItemKind, LayoutKeymap, LayoutSize,
-        LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+        InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutKeymap,
+        LayoutSize, LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     };
     use smithay::backend::input::Keycode;
 
@@ -771,6 +894,18 @@ mod tests {
             LayoutAction::from_abi(16),
             Some(LayoutAction::DecreaseLeftDockWidth)
         );
+        assert_eq!(
+            LayoutAction::from_abi(17),
+            Some(LayoutAction::SplitActiveSmart)
+        );
+        assert_eq!(
+            LayoutAction::from_abi(18),
+            Some(LayoutAction::FocusNextSplit)
+        );
+        assert_eq!(
+            LayoutAction::from_abi(19),
+            Some(LayoutAction::FocusPreviousSplit)
+        );
         assert_eq!(LayoutAction::from_abi(99), None);
     }
 
@@ -779,6 +914,18 @@ mod tests {
         assert_eq!(
             "split-right".parse::<LayoutAction>(),
             Ok(LayoutAction::SplitActiveRight)
+        );
+        assert_eq!(
+            "remove-split".parse::<LayoutAction>(),
+            Ok(LayoutAction::JoinActivePane)
+        );
+        assert_eq!(
+            "split-vertical".parse::<LayoutAction>(),
+            Ok(LayoutAction::SplitActiveDown)
+        );
+        assert_eq!(
+            "focus-split-next".parse::<LayoutAction>(),
+            Ok(LayoutAction::FocusNextSplit)
         );
         assert!("bogus".parse::<LayoutAction>().is_err());
     }
@@ -798,6 +945,61 @@ mod tests {
         assert_eq!(
             keymap.action_for_key(Keycode::new(43), true),
             Some(LayoutAction::SplitActiveDown)
+        );
+        assert_eq!(
+            keymap.action_for_key(Keycode::new(39), false),
+            Some(LayoutAction::SplitActiveSmart)
+        );
+        assert_eq!(
+            keymap.action_for_key(Keycode::new(30), false),
+            Some(LayoutAction::JoinActivePane)
+        );
+        assert_eq!(
+            keymap.action_for_key(Keycode::new(60), true),
+            Some(LayoutAction::FocusNextSplit)
+        );
+        assert_eq!(
+            keymap.action_for_key(Keycode::new(59), true),
+            Some(LayoutAction::FocusPreviousSplit)
+        );
+    }
+
+    #[test]
+    fn split_focus_cycles_layout_leaves_without_changing_tree() {
+        let mut layout = LayoutState::default();
+        let first_leaf = layout.active_leaf();
+        let second_leaf = layout
+            .split_active(LayoutAxis::Horizontal)
+            .expect("split creates second leaf");
+
+        assert_eq!(layout.focus_leaf_by_offset(1), Some(second_leaf));
+        assert_eq!(layout.active_leaf(), second_leaf);
+        assert_eq!(layout.focus_leaf_by_offset(1), Some(first_leaf));
+        assert_eq!(layout.active_leaf(), first_leaf);
+    }
+
+    #[test]
+    fn removing_active_leaf_collapses_to_the_surviving_sibling() {
+        let mut layout = LayoutState::default();
+        let first_leaf = layout.active_leaf();
+        let second_leaf = layout
+            .split_active(LayoutAxis::Horizontal)
+            .expect("split creates second leaf");
+        assert!(layout.set_active_leaf(second_leaf));
+
+        assert_eq!(layout.remove_active_leaf(), Some((second_leaf, first_leaf)));
+        let regions = layout.resolve(LayoutSize { w: 1280, h: 800 });
+
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].leaf, first_leaf);
+        assert_eq!(
+            (
+                regions[0].rect.x,
+                regions[0].rect.y,
+                regions[0].rect.w,
+                regions[0].rect.h
+            ),
+            (0, 0, 1280, 800)
         );
     }
 

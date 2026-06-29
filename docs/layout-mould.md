@@ -191,3 +191,9 @@ layout from pane inventory and presentation constraints.
 The fallback should be simple and deterministic. It does not need to model every
 WASM policy feature; it only needs to keep panes visible enough for recovery and
 preserve session usability when policy code fails.
+
+The native fallback may keep a small session-local content layout so users can
+recover without a layout module. In that fallback, panes still live in the
+session inventory and split slots are pointers into that inventory. Removing or
+cycling a split changes the slot state, not pane ownership, and switching surface
+sessions restores that session's own slot layout.

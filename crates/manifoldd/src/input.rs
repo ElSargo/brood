@@ -22,10 +22,14 @@ const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
 const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
 const KEY_B: Keycode = Keycode::new(56);
+const KEY_COMMA: Keycode = Keycode::new(59);
+const KEY_DOT: Keycode = Keycode::new(60);
 const KEY_H: Keycode = Keycode::new(43);
 const KEY_J: Keycode = Keycode::new(44);
 const KEY_K: Keycode = Keycode::new(45);
 const KEY_L: Keycode = Keycode::new(46);
+const KEY_S: Keycode = Keycode::new(39);
+const KEY_U: Keycode = Keycode::new(30);
 const KEY_W: Keycode = Keycode::new(25);
 
 impl Manifold {
@@ -212,6 +216,8 @@ impl Manifold {
     }
 
     fn try_wasm_key_handler(&mut self, key_code: Keycode, state: KeyState) -> Option<bool> {
+        let focused_pane = self.focused_pane();
+        let panes = self.active_session_wasm_key_panes();
         let result = self.wasm_key_handler.as_mut().map(|handler| {
             handler.handle_key(
                 key_code,
@@ -219,6 +225,8 @@ impl Manifold {
                 self.input_mode,
                 self.ctrl_pressed,
                 self.alt_pressed,
+                focused_pane,
+                panes,
             )
         })?;
         match result {
@@ -445,6 +453,10 @@ fn built_in_ctrl_layout_action(key_code: Keycode) -> Option<LayoutAction> {
         KEY_K => Some(LayoutAction::FocusPrevious),
         KEY_L => Some(LayoutAction::SplitActiveRight),
         KEY_H => Some(LayoutAction::SplitActiveDown),
+        KEY_S => Some(LayoutAction::SplitActiveSmart),
+        KEY_U => Some(LayoutAction::JoinActivePane),
+        KEY_DOT => Some(LayoutAction::FocusNextSplit),
+        KEY_COMMA => Some(LayoutAction::FocusPreviousSplit),
         _ => None,
     }
 }
