@@ -196,6 +196,10 @@ enum DbusStateRequest {
         agent_id: String,
         response: BoolResponse,
     },
+    ShouldNotifyAgentDesktop {
+        agent_id: String,
+        response: BoolResponse,
+    },
     UnregisterAgent {
         agent_id: String,
         response: BoolResponse,
@@ -229,6 +233,9 @@ enum DbusStateRequest {
     },
     RequestFocus {
         window_id: String,
+        response: BoolResponse,
+    },
+    FocusPresentationWindow {
         response: BoolResponse,
     },
     Dismiss {
@@ -496,6 +503,12 @@ impl AgentDbus {
         Ok(changed)
     }
 
+    async fn should_notify_agent_desktop(&self, agent_id: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ShouldNotifyAgentDesktop { agent_id, response }
+        })
+    }
+
     async fn unregister_agent(
         &self,
         agent_id: String,
@@ -627,6 +640,12 @@ impl CompositorDbus {
         })
     }
 
+    async fn focus_presentation_window(&self) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::FocusPresentationWindow { response }
+        })
+    }
+
     async fn dismiss(&self, window_id: String) -> fdo::Result<bool> {
         request_state(&self.sender, |response| DbusStateRequest::Dismiss {
             window_id,
@@ -721,6 +740,7 @@ trait ManifoldAgent {
         metadata: DbusMetadata,
     ) -> zbus::Result<String>;
     fn clear_agent_attention(&self, agent_id: String) -> zbus::Result<bool>;
+    fn should_notify_agent_desktop(&self, agent_id: String) -> zbus::Result<bool>;
     fn unregister_agent(&self, agent_id: String) -> zbus::Result<bool>;
 }
 
@@ -750,6 +770,7 @@ trait ManifoldCompositor {
         label: String,
     ) -> zbus::Result<String>;
     fn request_focus(&self, window_id: String) -> zbus::Result<bool>;
+    fn focus_presentation_window(&self) -> zbus::Result<bool>;
     fn dismiss(&self, window_id: String) -> zbus::Result<bool>;
 }
 
@@ -1772,7 +1793,9 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         }
         DbusStateRequest::CreateSurfaceSession { name, response } => {
             let id = if let Some(name) = normalize_session_name(&name) {
-                state.create_and_attach_named_surface_session(Some(name)).raw()
+                state
+                    .create_and_attach_named_surface_session(Some(name))
+                    .raw()
             } else {
                 WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
                 state.active_surface_session().raw()
@@ -1881,6 +1904,9 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::ClearAgentAttention { agent_id, response } => {
             send_response(response, Ok(state.clear_agent_attention(&agent_id)));
         }
+        DbusStateRequest::ShouldNotifyAgentDesktop { agent_id, response } => {
+            send_response(response, Ok(state.should_notify_agent_desktop(&agent_id)));
+        }
         DbusStateRequest::UnregisterAgent { agent_id, response } => {
             send_response(response, Ok(state.unregister_agent(&agent_id)));
         }
@@ -1927,6 +1953,9 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             window_id,
             response,
         } => send_response(response, state.request_extension_window_focus(&window_id)),
+        DbusStateRequest::FocusPresentationWindow { response } => {
+            send_response(response, Ok(state.focus_presentation_window()));
+        }
         DbusStateRequest::Dismiss {
             window_id,
             response,
@@ -2007,13 +2036,14 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
             format!(
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_window_focused={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
                 snapshot.xdg_configure_errors,
                 snapshot.presentation,
                 snapshot.presentation_target,
+                snapshot.presentation_window_focused,
                 snapshot.presentation_attach_failures,
                 snapshot.presentation_runtime_failures,
                 snapshot.presentation_last_error,
@@ -2298,6 +2328,7 @@ struct StatusSnapshot {
     xdg_configure_errors: u64,
     presentation: &'static str,
     presentation_target: &'static str,
+    presentation_window_focused: bool,
     presentation_attach_failures: u64,
     presentation_runtime_failures: u64,
     presentation_last_error: String,
@@ -2477,6 +2508,7 @@ impl StatusSnapshot {
             xdg_configure_errors: state.stats.xdg_configure_errors,
             presentation,
             presentation_target,
+            presentation_window_focused: state.presentation_window_focused(),
             presentation_attach_failures: state.presentation_attach_failures,
             presentation_runtime_failures: state.presentation_runtime_failures,
             presentation_last_error: state

@@ -25,6 +25,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 pub(crate) const MANIFOLD_SESSION_ENV: &str = "manifold_session";
 pub(crate) const DEFAULT_MANIFOLD_DBUS_NAME: &str = "org.manifold.Session";
+pub(crate) const MANIFOLD_HOST_DBUS_ADDRESS_ENV: &str = "MANIFOLD_HOST_DBUS_ADDRESS";
 pub(crate) const MANIFOLDD_DBUS_ADDRESS_ENV: &str = "MANIFOLDD_DBUS_ADDRESS";
 pub(crate) const MANIFOLDD_DBUS_DESTINATION_ENV: &str = "MANIFOLDD_DBUS_DESTINATION";
 

@@ -17,9 +17,10 @@ use anyhow::{Context, Result, anyhow};
 use tracing::{debug, warn};
 use zbus::{
     Message,
+    blocking::{Proxy, connection::Builder as ConnectionBuilder},
     message::Type,
     zvariant::{
-        Endian,
+        Endian, OwnedValue,
         serialized::{Context as SerializedContext, Data},
     },
 };
@@ -27,6 +28,51 @@ use zbus::{
 const DBUS_DESTINATION: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
+const NOTIFICATIONS_DESTINATION: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_UNIQUE_NAME: &str = ":1.999999";
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
+const INTROSPECTABLE_INTERFACE: &str = "org.freedesktop.DBus.Introspectable";
+const NOTIFICATIONS_INTROSPECTION_XML: &str = r#"<node>
+  <interface name="org.freedesktop.Notifications">
+    <method name="GetCapabilities">
+      <arg direction="out" type="as"/>
+    </method>
+    <method name="Notify">
+      <arg direction="in" type="s"/>
+      <arg direction="in" type="u"/>
+      <arg direction="in" type="s"/>
+      <arg direction="in" type="s"/>
+      <arg direction="in" type="s"/>
+      <arg direction="in" type="as"/>
+      <arg direction="in" type="a{sv}"/>
+      <arg direction="in" type="i"/>
+      <arg direction="out" type="u"/>
+    </method>
+    <method name="CloseNotification">
+      <arg direction="in" type="u"/>
+    </method>
+    <method name="GetServerInformation">
+      <arg direction="out" type="s"/>
+      <arg direction="out" type="s"/>
+      <arg direction="out" type="s"/>
+      <arg direction="out" type="s"/>
+    </method>
+    <signal name="NotificationClosed">
+      <arg type="u"/>
+      <arg type="u"/>
+    </signal>
+    <signal name="ActionInvoked">
+      <arg type="u"/>
+      <arg type="s"/>
+    </signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect">
+      <arg direction="out" type="s"/>
+    </method>
+  </interface>
+</node>"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SessionBusRealm {
@@ -44,7 +90,7 @@ pub(crate) struct SessionBusHandle {
 }
 
 impl SessionBusHandle {
-    pub(crate) fn start(realm: SessionBusRealm) -> Result<Self> {
+    pub(crate) fn start(realm: SessionBusRealm, host_bus_address: Option<String>) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!(
             "manifold-inprocess-dbus-{}-{}",
             std::process::id(),
@@ -61,7 +107,7 @@ impl SessionBusHandle {
 
         let guid = make_guid(realm);
         let address = format!("unix:path={}", socket_path.display());
-        let state = Arc::new(Mutex::new(RealmState::new(realm, guid)));
+        let state = Arc::new(Mutex::new(RealmState::new(realm, guid, host_bus_address)));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread_state = Arc::clone(&state);
@@ -98,16 +144,18 @@ impl Drop for SessionBusHandle {
 struct RealmState {
     realm: SessionBusRealm,
     guid: String,
+    host_bus_address: Option<String>,
     next_connection: u64,
     connections: BTreeMap<u64, ConnectionState>,
     names: BTreeMap<String, u64>,
 }
 
 impl RealmState {
-    fn new(realm: SessionBusRealm, guid: String) -> Self {
+    fn new(realm: SessionBusRealm, guid: String, host_bus_address: Option<String>) -> Self {
         Self {
             realm,
             guid,
+            host_bus_address,
             next_connection: 1,
             connections: BTreeMap::new(),
             names: BTreeMap::new(),
@@ -141,6 +189,11 @@ impl RealmState {
 
     fn name_owner(&self, name: &str) -> Option<u64> {
         if name == DBUS_DESTINATION {
+            return Some(0);
+        }
+        if matches!(name, NOTIFICATIONS_DESTINATION | NOTIFICATIONS_UNIQUE_NAME)
+            && self.host_bus_address.is_some()
+        {
             return Some(0);
         }
         if let Some(stripped) = name.strip_prefix(':') {
@@ -247,11 +300,31 @@ fn authenticate(reader: &mut BufReader<UnixStream>, guid: &str) -> Result<()> {
             return Err(anyhow!("DBus auth stream closed"));
         }
         let command = line.trim_end_matches(['\r', '\n']);
-        if command.starts_with("AUTH EXTERNAL") || command.starts_with("AUTH ANONYMOUS") {
+        if command == "AUTH" {
+            reader
+                .get_mut()
+                .write_all(b"REJECTED EXTERNAL ANONYMOUS\r\n")
+                .context("write DBus auth mechanisms")?;
+        } else if command == "AUTH EXTERNAL" {
+            reader
+                .get_mut()
+                .write_all(b"DATA\r\n")
+                .context("write DBus external auth data challenge")?;
+        } else if command.starts_with("DATA") {
+            reader
+                .get_mut()
+                .write_all(format!("OK {guid}\r\n").as_bytes())
+                .context("write DBus auth data ok")?;
+        } else if command.starts_with("AUTH EXTERNAL ") || command.starts_with("AUTH ANONYMOUS") {
             reader
                 .get_mut()
                 .write_all(format!("OK {guid}\r\n").as_bytes())
                 .context("write DBus auth ok")?;
+        } else if command.starts_with("AUTH ") {
+            reader
+                .get_mut()
+                .write_all(b"REJECTED EXTERNAL ANONYMOUS\r\n")
+                .context("write DBus auth rejected mechanisms")?;
         } else if command == "NEGOTIATE_UNIX_FD" {
             reader
                 .get_mut()
@@ -326,6 +399,17 @@ fn route_message(
         && interface.as_deref() == Some(DBUS_INTERFACE)
     {
         return handle_dbus_method(connection_id, &message, member.as_deref(), state);
+    }
+
+    if header.message_type() == Type::MethodCall
+        && is_notifications_destination(destination.as_deref())
+        && path.as_deref() == Some(NOTIFICATIONS_PATH)
+        && matches!(
+            interface.as_deref(),
+            Some(NOTIFICATIONS_INTERFACE | INTROSPECTABLE_INTERFACE)
+        )
+    {
+        return handle_notifications_method(connection_id, &message, member.as_deref(), state);
     }
 
     let unique = ensure_unique(connection_id, &state)?;
@@ -432,7 +516,14 @@ fn handle_dbus_method(
         }
         Some("GetNameOwner") => {
             let (name,): (String,) = message.body().deserialize()?;
-            if let Some(owner) = state.name_owner(&name) {
+            if name == NOTIFICATIONS_DESTINATION && state.host_bus_address.is_some() {
+                send_reply(
+                    &mut state,
+                    connection_id,
+                    message,
+                    &(NOTIFICATIONS_UNIQUE_NAME,),
+                )?;
+            } else if let Some(owner) = state.name_owner(&name) {
                 let owner_name = state
                     .connections
                     .get(&owner)
@@ -449,8 +540,26 @@ fn handle_dbus_method(
                 )?;
             }
         }
+        Some("StartServiceByName") => {
+            let (name, _flags): (String, u32) = message.body().deserialize()?;
+            if name == NOTIFICATIONS_DESTINATION && state.host_bus_address.is_some() {
+                send_reply(&mut state, connection_id, message, &(2u32,))?;
+            } else {
+                send_error(
+                    &mut state,
+                    connection_id,
+                    message,
+                    "org.freedesktop.DBus.Error.ServiceUnknown",
+                    "service activation is unavailable",
+                )?;
+            }
+        }
         Some("ListNames") => {
             let mut names = vec![DBUS_DESTINATION.to_string()];
+            if state.host_bus_address.is_some() {
+                names.push(NOTIFICATIONS_DESTINATION.to_string());
+                names.push(NOTIFICATIONS_UNIQUE_NAME.to_string());
+            }
             names.extend(state.names.keys().cloned());
             send_reply(&mut state, connection_id, message, &(names,))?;
         }
@@ -488,6 +597,294 @@ fn handle_dbus_method(
     Ok(())
 }
 
+enum NotificationMethodReply {
+    Unit,
+    Capabilities(Vec<String>),
+    Introspection(&'static str),
+    ServerInformation((String, String, String, String)),
+    NotificationId(u32),
+}
+
+fn handle_notifications_method(
+    connection_id: u64,
+    message: &Message,
+    member: Option<&str>,
+    state: Arc<Mutex<RealmState>>,
+) -> Result<()> {
+    let host_bus_address = state
+        .lock()
+        .map_err(|_| anyhow!("DBus realm state poisoned"))?
+        .host_bus_address
+        .clone();
+    let Some(host_bus_address) = host_bus_address else {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+        return send_error(
+            &mut state,
+            connection_id,
+            message,
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "notification service is unavailable",
+        );
+    };
+
+    let reply = match call_host_notifications_method(&host_bus_address, message, member) {
+        Ok(reply) => reply,
+        Err(err) => {
+            warn!(
+                ?err,
+                ?member,
+                "failed to proxy notification method to host session bus"
+            );
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+            return send_error(
+                &mut state,
+                connection_id,
+                message,
+                "org.freedesktop.DBus.Error.Failed",
+                &err.to_string(),
+            );
+        }
+    };
+
+    if let NotificationMethodReply::NotificationId(notification_id) = reply {
+        spawn_notification_signal_forwarder(
+            host_bus_address,
+            Arc::clone(&state),
+            connection_id,
+            notification_id,
+        );
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+        return send_reply_from(
+            &mut state,
+            connection_id,
+            message,
+            NOTIFICATIONS_UNIQUE_NAME,
+            &(notification_id,),
+        );
+    }
+
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+    match reply {
+        NotificationMethodReply::Unit => send_reply_from(
+            &mut state,
+            connection_id,
+            message,
+            NOTIFICATIONS_UNIQUE_NAME,
+            &(),
+        ),
+        NotificationMethodReply::Capabilities(capabilities) => send_reply_from(
+            &mut state,
+            connection_id,
+            message,
+            NOTIFICATIONS_UNIQUE_NAME,
+            &(capabilities,),
+        ),
+        NotificationMethodReply::Introspection(xml) => send_reply_from(
+            &mut state,
+            connection_id,
+            message,
+            NOTIFICATIONS_UNIQUE_NAME,
+            &(xml,),
+        ),
+        NotificationMethodReply::ServerInformation(info) => send_reply_from(
+            &mut state,
+            connection_id,
+            message,
+            NOTIFICATIONS_UNIQUE_NAME,
+            &info,
+        ),
+        NotificationMethodReply::NotificationId(_) => unreachable!(),
+    }
+}
+
+fn call_host_notifications_method(
+    host_bus_address: &str,
+    message: &Message,
+    member: Option<&str>,
+) -> Result<NotificationMethodReply> {
+    let connection = ConnectionBuilder::address(host_bus_address)?
+        .build()
+        .context("connect host session bus")?;
+    let proxy = Proxy::new(
+        &connection,
+        NOTIFICATIONS_DESTINATION,
+        NOTIFICATIONS_PATH,
+        NOTIFICATIONS_INTERFACE,
+    )
+    .context("build host notification proxy")?;
+
+    match member {
+        Some("Introspect") => Ok(NotificationMethodReply::Introspection(
+            NOTIFICATIONS_INTROSPECTION_XML,
+        )),
+        Some("GetCapabilities") => {
+            let capabilities: Vec<String> = proxy
+                .call("GetCapabilities", &())
+                .context("call host notification GetCapabilities")?;
+            Ok(NotificationMethodReply::Capabilities(capabilities))
+        }
+        Some("GetServerInformation") => {
+            let info: (String, String, String, String) = proxy
+                .call("GetServerInformation", &())
+                .context("call host notification GetServerInformation")?;
+            Ok(NotificationMethodReply::ServerInformation(info))
+        }
+        Some("CloseNotification") => {
+            let (notification_id,): (u32,) = message.body().deserialize()?;
+            proxy
+                .call::<_, _, ()>("CloseNotification", &(notification_id,))
+                .context("call host notification CloseNotification")?;
+            Ok(NotificationMethodReply::Unit)
+        }
+        Some("Notify") => {
+            let (app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout): (
+                String,
+                u32,
+                String,
+                String,
+                String,
+                Vec<String>,
+                BTreeMap<String, OwnedValue>,
+                i32,
+            ) = message.body().deserialize()?;
+            let notification_id: u32 = proxy
+                .call(
+                    "Notify",
+                    &(
+                        app_name,
+                        replaces_id,
+                        app_icon,
+                        summary,
+                        body,
+                        actions,
+                        hints,
+                        expire_timeout,
+                    ),
+                )
+                .context("call host notification Notify")?;
+            Ok(NotificationMethodReply::NotificationId(notification_id))
+        }
+        Some(other) => Err(anyhow!("unsupported notification method {other}")),
+        None => Err(anyhow!("missing notification method")),
+    }
+}
+
+fn is_notifications_destination(destination: Option<&str>) -> bool {
+    matches!(
+        destination,
+        Some(NOTIFICATIONS_DESTINATION | NOTIFICATIONS_UNIQUE_NAME)
+    )
+}
+
+fn spawn_notification_signal_forwarder(
+    host_bus_address: String,
+    state: Arc<Mutex<RealmState>>,
+    connection_id: u64,
+    notification_id: u32,
+) {
+    let result = thread::Builder::new()
+        .name(format!("manifold-notify-{notification_id}"))
+        .spawn(move || {
+            if let Err(err) = forward_notification_signals(
+                &host_bus_address,
+                state,
+                connection_id,
+                notification_id,
+            ) {
+                debug!(
+                    ?err,
+                    notification_id, "host notification signal forwarding stopped"
+                );
+            }
+        });
+    if let Err(err) = result {
+        warn!(
+            ?err,
+            notification_id, "failed to spawn host notification signal forwarder"
+        );
+    }
+}
+
+fn forward_notification_signals(
+    host_bus_address: &str,
+    state: Arc<Mutex<RealmState>>,
+    connection_id: u64,
+    notification_id: u32,
+) -> Result<()> {
+    let connection = ConnectionBuilder::address(host_bus_address)?
+        .build()
+        .context("connect host session bus for notification signals")?;
+    let proxy = Proxy::new(
+        &connection,
+        NOTIFICATIONS_DESTINATION,
+        NOTIFICATIONS_PATH,
+        NOTIFICATIONS_INTERFACE,
+    )
+    .context("build host notification signal proxy")?;
+    let mut signals = proxy
+        .receive_all_signals()
+        .context("subscribe to host notification signals")?;
+
+    for signal in &mut signals {
+        let member = signal.header().member().map(ToString::to_string);
+        match member.as_deref() {
+            Some("ActionInvoked") => {
+                let (id, action_key): (u32, String) = signal.body().deserialize()?;
+                if id == notification_id {
+                    send_notification_signal(
+                        &state,
+                        connection_id,
+                        "ActionInvoked",
+                        &(id, action_key),
+                    )?;
+                    return Ok(());
+                }
+            }
+            Some("NotificationClosed") => {
+                let (id, reason): (u32, u32) = signal.body().deserialize()?;
+                if id == notification_id {
+                    send_notification_signal(
+                        &state,
+                        connection_id,
+                        "NotificationClosed",
+                        &(id, reason),
+                    )?;
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn send_notification_signal<B>(
+    state: &Arc<Mutex<RealmState>>,
+    connection_id: u64,
+    member: &str,
+    body: &B,
+) -> Result<()>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    let signal = Message::signal(NOTIFICATIONS_PATH, NOTIFICATIONS_INTERFACE, member)?
+        .sender(NOTIFICATIONS_UNIQUE_NAME)?
+        .build(body)?;
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+    send_to(&mut state, connection_id, signal.data().to_vec());
+    Ok(())
+}
+
 fn emit_name_owner_changed(
     state: &mut RealmState,
     name: &str,
@@ -510,8 +907,21 @@ fn send_reply<B>(
 where
     B: serde::Serialize + zbus::zvariant::DynamicType,
 {
+    send_reply_from(state, connection_id, message, ":1.0", body)
+}
+
+fn send_reply_from<B>(
+    state: &mut RealmState,
+    connection_id: u64,
+    message: &Message,
+    sender: &str,
+    body: &B,
+) -> Result<()>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
     let reply = Message::method_return(&message.header())?
-        .sender(":1.0")?
+        .sender(sender)?
         .build(body)?;
     send_to(state, connection_id, reply.data().to_vec());
     Ok(())
@@ -661,7 +1071,9 @@ impl SessionBusRealm {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionBusHandle, SessionBusRealm};
+    use super::{
+        NOTIFICATIONS_DESTINATION, NOTIFICATIONS_UNIQUE_NAME, SessionBusHandle, SessionBusRealm,
+    };
     use zbus::{
         blocking::{connection::Builder as ConnectionBuilder, fdo::DBusProxy},
         fdo::RequestNameReply,
@@ -670,7 +1082,7 @@ mod tests {
 
     #[test]
     fn realm_bus_tracks_names_on_in_process_socket() {
-        let bus = SessionBusHandle::start(SessionBusRealm::Surface(7)).unwrap();
+        let bus = SessionBusHandle::start(SessionBusRealm::Surface(7), None).unwrap();
         assert!(bus.address().starts_with("unix:path="));
         assert!(!bus.address().contains("tmpdir="));
 
@@ -692,8 +1104,8 @@ mod tests {
 
     #[test]
     fn separate_realms_do_not_share_well_known_names() {
-        let first = SessionBusHandle::start(SessionBusRealm::Surface(11)).unwrap();
-        let second = SessionBusHandle::start(SessionBusRealm::Surface(12)).unwrap();
+        let first = SessionBusHandle::start(SessionBusRealm::Surface(11), None).unwrap();
+        let second = SessionBusHandle::start(SessionBusRealm::Surface(12), None).unwrap();
 
         let first_connection = ConnectionBuilder::address(first.address())
             .unwrap()
@@ -714,5 +1126,27 @@ mod tests {
         second_proxy.hello().unwrap();
         let second_name = BusName::try_from("org.manifold.Test.SessionScoped").unwrap();
         assert!(!second_proxy.name_has_owner(second_name).unwrap());
+    }
+
+    #[test]
+    fn realm_bus_advertises_virtual_notifications_owner() {
+        let bus = SessionBusHandle::start(
+            SessionBusRealm::Surface(13),
+            Some("unix:path=/tmp/manifold-unused-host-bus".to_string()),
+        )
+        .unwrap();
+        let connection = ConnectionBuilder::address(bus.address())
+            .unwrap()
+            .build()
+            .unwrap();
+        let proxy = DBusProxy::new(&connection).unwrap();
+        proxy.hello().unwrap();
+
+        let notifications = BusName::try_from(NOTIFICATIONS_DESTINATION).unwrap();
+        assert!(proxy.name_has_owner(notifications.clone()).unwrap());
+        assert_eq!(
+            proxy.get_name_owner(notifications).unwrap().as_str(),
+            NOTIFICATIONS_UNIQUE_NAME
+        );
     }
 }

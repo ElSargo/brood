@@ -42,7 +42,7 @@ use smithay::{
         event_loop::{ActiveEventLoop, EventLoop},
         platform::{pump_events::EventLoopExtPumpEvents, scancode::PhysicalKeyExtScancode},
         raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle},
-        window::{Window as WinitWindow, WindowAttributes, WindowId},
+        window::{UserAttentionType, Window as WinitWindow, WindowAttributes, WindowId},
     },
     utils::{Buffer as BufferCoords, Clock, DeviceFd, Monotonic, Physical, Rectangle, Size},
 };
@@ -584,6 +584,16 @@ impl PresenterBackend {
         }
     }
 
+    pub fn focus_window(&self) -> bool {
+        let Some(window) = self.window() else {
+            return false;
+        };
+        window.set_visible(true);
+        window.request_user_attention(Some(UserAttentionType::Critical));
+        window.focus_window();
+        true
+    }
+
     pub fn take_redraw_requested(&self) -> bool {
         self.redraw_requested.replace(false)
     }
@@ -824,7 +834,9 @@ pub(crate) enum PresenterEvent {
     },
     Redraw,
     CloseRequested,
-    Focus,
+    Focus {
+        focused: bool,
+    },
     Keyboard {
         key_code: Keycode,
         state: KeyState,
@@ -987,7 +999,7 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
             }
             WindowEvent::RedrawRequested => (self.callback)(PresenterEvent::Redraw),
             WindowEvent::CloseRequested => (self.callback)(PresenterEvent::CloseRequested),
-            WindowEvent::Focused(_) => (self.callback)(PresenterEvent::Focus),
+            WindowEvent::Focused(focused) => (self.callback)(PresenterEvent::Focus { focused }),
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,

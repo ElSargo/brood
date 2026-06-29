@@ -4,8 +4,10 @@ import os
 import sys
 
 import dbus
+import dbus.mainloop.glib
 import gi
 
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
 force_gtk3 = os.environ.get("MANIFOLD_SESSION_SWITCHER_FORCE_GTK3") == "1"
 disable_adwaita = os.environ.get("MANIFOLD_SESSION_SWITCHER_DISABLE_ADWAITA") == "1"
@@ -38,6 +40,9 @@ except (ImportError, ValueError):
 APP_ID = "org.manifold.SessionSwitcher"
 DEFAULT_DESTINATION = "org.manifold.Session"
 DISCLOSURE_COLUMN_WIDTH = 28
+NOTIFICATIONS_DESTINATION = "org.freedesktop.Notifications"
+NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
+NOTIFICATION_ACTION_DEFAULT = "default"
 
 
 def metadata(**items):
@@ -86,6 +91,10 @@ class ManifoldBus:
         self.agent = dbus.Interface(
             self.bus.get_object(self.destination, "/org/manifold/Agent"),
             "org.manifold.Agent",
+        )
+        self.notifications = dbus.Interface(
+            self.bus.get_object(NOTIFICATIONS_DESTINATION, NOTIFICATIONS_PATH),
+            NOTIFICATIONS_DESTINATION,
         )
 
     def list_sessions(self):
@@ -169,6 +178,25 @@ class ManifoldBus:
     def clear_agent_attention(self, agent_id):
         return bool(self.agent.ClearAgentAttention(str(agent_id)))
 
+    def should_notify_agent_desktop(self, agent_id):
+        return bool(self.agent.ShouldNotifyAgentDesktop(str(agent_id)))
+
+    def notify_agent_finished(self, summary, body, timeout_ms):
+        notification_id = self.notifications.Notify(
+            APP_ID,
+            dbus.UInt32(0),
+            "",
+            summary,
+            body,
+            dbus.Array([NOTIFICATION_ACTION_DEFAULT, "Open"], signature="s"),
+            dbus.Dictionary({}, signature="sv"),
+            dbus.Int32(timeout_ms),
+        )
+        return int(notification_id)
+
+    def focus_presentation_window(self):
+        return bool(self.compositor.FocusPresentationWindow())
+
     def register_sidebar(self, width):
         extension_id = self.extension.RegisterExtension(
             "session-switcher",
@@ -215,6 +243,9 @@ class SessionSwitcher:
         self.expanded_sessions = set()
         self.session_order = []
         self.session_rows = {}
+        self.agent_done_state = {}
+        self.agent_done_state_initialized = False
+        self.notification_agents = {}
         self.animation_tick = 0
         self.registered = False
         self.last_error = None
@@ -224,6 +255,7 @@ class SessionSwitcher:
             self.window = self.make_window(None)
             self.window.connect("destroy", Gtk.main_quit)
             self.build_ui()
+            self.setup_notifications()
             self.refresh_sessions()
             self.present_window()
             GLib.timeout_add(250, self.register_with_manifold)
@@ -248,6 +280,7 @@ class SessionSwitcher:
     def on_activate(self, app):
         self.window = self.make_window(app)
         self.build_ui()
+        self.setup_notifications()
         self.refresh_sessions()
         self.present_window()
         GLib.timeout_add(250, self.register_with_manifold)
@@ -263,6 +296,20 @@ class SessionSwitcher:
             window.set_default_size(self.args.width, 720)
         window.set_title("Manifold Sessions")
         return window
+
+    def setup_notifications(self):
+        self.bus.bus.add_signal_receiver(
+            self.handle_notification_action,
+            signal_name="ActionInvoked",
+            dbus_interface=NOTIFICATIONS_DESTINATION,
+            path=NOTIFICATIONS_PATH,
+        )
+        self.bus.bus.add_signal_receiver(
+            self.handle_notification_closed,
+            signal_name="NotificationClosed",
+            dbus_interface=NOTIFICATIONS_DESTINATION,
+            path=NOTIFICATIONS_PATH,
+        )
 
     def present_window(self):
         if GTK4:
@@ -425,6 +472,7 @@ class SessionSwitcher:
             for session in sessions:
                 if session["id"] not in self.session_order:
                     self.session_order.append(session["id"])
+            self.update_finished_agents(agents)
             self.expanded_sessions.intersection_update(live_session_ids)
             if sessions != self.sessions or agents != self.agents:
                 self.sessions = sessions
@@ -434,6 +482,62 @@ class SessionSwitcher:
             self.last_error = str(err)
             write_status(self.args.event_file, event="refresh-error", error=err)
         return True
+
+    def update_finished_agents(self, agents):
+        current_done_state = {agent["id"]: self.agent_is_done(agent) for agent in agents}
+        if not self.agent_done_state_initialized:
+            self.agent_done_state = current_done_state
+            self.agent_done_state_initialized = True
+            return
+
+        for agent in agents:
+            agent_id = agent["id"]
+            done = current_done_state.get(agent_id, False)
+            if not done or self.agent_done_state.get(agent_id, False):
+                continue
+            self.expanded_sessions.add(agent["session"])
+            self.maybe_notify_agent_finished(agent)
+        self.agent_done_state = current_done_state
+
+    def maybe_notify_agent_finished(self, agent):
+        try:
+            should_notify = self.bus.should_notify_agent_desktop(agent["id"])
+        except Exception as err:
+            should_notify = True
+            write_status(
+                self.args.event_file,
+                event="notify-condition-error",
+                agent=agent["id"],
+                error=err,
+            )
+        if not should_notify:
+            write_status(
+                self.args.event_file,
+                event="notify-suppressed",
+                agent=agent["id"],
+            )
+            return
+
+        try:
+            notification_id = self.bus.notify_agent_finished(
+                "Agent finished",
+                self.agent_label(agent),
+                self.args.notification_timeout_ms,
+            )
+            self.notification_agents[notification_id] = agent
+            write_status(
+                self.args.event_file,
+                event="notify-finished",
+                agent=agent["id"],
+                notification=notification_id,
+            )
+        except Exception as err:
+            write_status(
+                self.args.event_file,
+                event="notify-error",
+                agent=agent["id"],
+                error=err,
+            )
 
     def filter_sessions(self, *_args):
         query = self.search_entry.get_text().strip().lower()
@@ -776,6 +880,16 @@ class SessionSwitcher:
 
     def activate_agent(self, _button, agent):
         try:
+            if _button is None:
+                try:
+                    self.bus.focus_presentation_window()
+                except Exception as err:
+                    write_status(
+                        self.args.event_file,
+                        event="focus-presentation-error",
+                        agent=agent["id"],
+                        error=err,
+                    )
             changed = self.bus.activate(agent["session"])
             metadata = agent["metadata"]
             app_id = metadata.get("app_id", "")
@@ -809,6 +923,17 @@ class SessionSwitcher:
                 agent=agent.get("id", "unknown"),
                 error=err,
             )
+
+    def handle_notification_action(self, notification_id, action_key):
+        agent = self.notification_agents.get(int(notification_id))
+        if agent is None:
+            return
+        if str(action_key) != NOTIFICATION_ACTION_DEFAULT:
+            return
+        self.activate_agent(None, agent)
+
+    def handle_notification_closed(self, notification_id, _reason):
+        self.notification_agents.pop(int(notification_id), None)
 
     def activate_session_from_panel_press(self, _gesture, _n_press, x, y):
         self.activate_session_at_position(x, y, event_name="panel-press")
@@ -892,6 +1017,7 @@ def main():
     parser.add_argument("--dbus-address")
     parser.add_argument("--width", type=int, default=300)
     parser.add_argument("--refresh-ms", type=int, default=500)
+    parser.add_argument("--notification-timeout-ms", type=int, default=300000)
     parser.add_argument("--ready-file")
     parser.add_argument("--event-file")
     args = parser.parse_args()

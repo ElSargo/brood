@@ -43,7 +43,8 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
+    MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV,
+    MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     layout::{
         LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
@@ -266,6 +267,7 @@ pub struct Manifold {
     pub presentation_attach_failures: u64,
     pub presentation_runtime_failures: u64,
     pub presentation_last_error: Option<String>,
+    presentation_window_focused: bool,
     pub attach_requested: bool,
     pub attach_schedule_pending: bool,
     pub detach_requested: bool,
@@ -314,6 +316,7 @@ pub struct Manifold {
     pub(crate) nested_inner_dbus_destination: Option<String>,
     pub(crate) nested_inner_dbus_address: Option<String>,
     pub(crate) manifold_session: Option<String>,
+    pub(crate) host_dbus_address: Option<String>,
     pub(crate) manifold_dbus_destination: Option<String>,
     pub(crate) manifold_dbus_address: Option<String>,
     hosted_children: Vec<HostedChild>,
@@ -377,6 +380,7 @@ impl Manifold {
             presentation_attach_failures: 0,
             presentation_runtime_failures: 0,
             presentation_last_error: None,
+            presentation_window_focused: false,
             attach_requested: false,
             attach_schedule_pending: false,
             detach_requested: false,
@@ -428,6 +432,9 @@ impl Manifold {
             nested_inner_dbus_destination: None,
             nested_inner_dbus_address: None,
             manifold_session: None,
+            host_dbus_address: std::env::var(MANIFOLD_HOST_DBUS_ADDRESS_ENV)
+                .ok()
+                .or_else(|| std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()),
             manifold_dbus_destination: None,
             manifold_dbus_address: None,
             hosted_children: Vec::new(),
@@ -704,7 +711,8 @@ impl Manifold {
             return Ok(bus.1.address().to_string());
         }
 
-        let handle = SessionBusHandle::start(realm).context("start in-process session DBus bus")?;
+        let handle = SessionBusHandle::start(realm, self.host_dbus_address.clone())
+            .context("start in-process session DBus bus")?;
         let address = handle.address().to_string();
         self.session_dbus_buses.push((realm, handle));
         info!(
@@ -1723,6 +1731,57 @@ impl Manifold {
         true
     }
 
+    pub fn set_presentation_window_focused(&mut self, focused: bool) {
+        self.presentation_window_focused = focused;
+    }
+
+    pub fn presentation_window_focused(&self) -> bool {
+        self.presentation_window_focused
+    }
+
+    pub fn agent_has_focused_window(&self, agent_id: &str) -> bool {
+        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+            return false;
+        }
+        let Some(record) = self
+            .extension_registry
+            .agents
+            .iter()
+            .find(|record| record.id == agent_id)
+        else {
+            return false;
+        };
+        if record.session != self.active_surface_session {
+            return false;
+        }
+        let Some(surface) = self.active_toplevel_surface.as_ref() else {
+            return false;
+        };
+        if self
+            .session_for_toplevel_surface(surface)
+            .unwrap_or(SurfaceSessionId(1))
+            != record.session
+        {
+            return false;
+        }
+        toplevel_matches_agent_identity(self, surface, &record.metadata)
+    }
+
+    pub fn should_notify_agent_desktop(&self, agent_id: &str) -> bool {
+        !self.presentation_window_focused() || !self.agent_has_focused_window(agent_id)
+    }
+
+    pub fn focus_presentation_window(&self) -> bool {
+        self.presenter.as_ref().is_some_and(|presenter| {
+            presenter
+                .runtime
+                .borrow()
+                .backend
+                .as_ref()
+                .is_some_and(crate::winit_presenter::PresenterBackend::focus_window)
+        })
+    }
+
     pub fn focus_app_id_or_spawn(&mut self, app_id: &str, argv: &[String]) -> bool {
         if self.focus_app_id(app_id) {
             return true;
@@ -2561,8 +2620,11 @@ impl Manifold {
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.presentation_member_surfaces
             .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
-        self.panel_reservations
-            .retain(|panel| live_toplevel_surfaces.iter().any(|live| live == &panel.surface));
+        self.panel_reservations.retain(|panel| {
+            live_toplevel_surfaces
+                .iter()
+                .any(|live| live == &panel.surface)
+        });
         self.window_pane_ids
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         if self
@@ -3065,6 +3127,7 @@ mod tests {
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn focus_stack_places_every_window_at_origin() {
@@ -3114,6 +3177,23 @@ mod tests {
             (geometry.size.w, geometry.size.h),
             (SESSION_OUTPUT_SIZE.0, SESSION_OUTPUT_SIZE.1)
         );
+    }
+
+    #[test]
+    fn agent_desktop_notification_still_sends_when_presentation_focused_but_agent_is_not() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("app_id".to_string(), "smoke-agent".to_string());
+        let agent_id = state
+            .register_agent("codex".to_string(), metadata, ":test.sender".to_string())
+            .expect("register agent");
+
+        assert!(state.should_notify_agent_desktop(&agent_id));
+        state.set_presentation_window_focused(true);
+        assert!(state.should_notify_agent_desktop(&agent_id));
     }
 }
 

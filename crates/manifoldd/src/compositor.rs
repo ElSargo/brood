@@ -107,6 +107,7 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
     state.manifold_session = Some(control_target.session_marker());
     state.manifold_dbus_destination = Some(control_target.destination.clone());
     state.manifold_dbus_address = control_dbus_address.clone();
+    state.host_dbus_address = control_dbus_address.clone();
 
     println!("WAYLAND_DISPLAY={}", state.socket_name.to_string_lossy());
     println!(
