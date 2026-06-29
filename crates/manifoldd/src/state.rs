@@ -43,8 +43,8 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV,
-    MANIFOLDD_DBUS_DESTINATION_ENV,
+    MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_PANE_ID_ENV, MANIFOLD_SESSION_ENV,
+    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     layout::{
         HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind,
@@ -106,6 +106,13 @@ pub enum FocusDirection {
 struct HostedChild {
     command: String,
     child: Child,
+    pane_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingChildPane {
+    pid: u32,
+    pane_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +314,7 @@ pub struct Manifold {
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
+    pending_child_panes: Vec<PendingChildPane>,
     pub(crate) ctrl_pressed: bool,
     pub(crate) alt_pressed: bool,
     pub(crate) ctrl_pressed_key: Option<smithay::backend::input::Keycode>,
@@ -423,6 +431,7 @@ impl Manifold {
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
+            pending_child_panes: Vec::new(),
             ctrl_pressed: false,
             alt_pressed: false,
             ctrl_pressed_key: None,
@@ -558,8 +567,10 @@ impl Manifold {
     }
 
     pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
+        let pane_id = self.allocate_pane_id();
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
+        child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
         self.apply_control_environment(&mut child);
         let child = child.spawn().with_context(|| {
             format!(
@@ -568,14 +579,20 @@ impl Manifold {
                 self.socket_name.to_string_lossy()
             )
         })?;
+        self.pending_child_panes.push(PendingChildPane {
+            pid: child.id(),
+            pane_id,
+        });
         info!(
             command = ?command,
+            pane_id,
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
         );
         self.hosted_children.push(HostedChild {
             command: command.to_string_lossy().into_owned(),
             child,
+            pane_id: Some(pane_id),
         });
         Ok(())
     }
@@ -585,8 +602,10 @@ impl Manifold {
             anyhow::bail!("spawn requires a command");
         };
 
+        let pane_id = self.allocate_pane_id();
         let mut child = Command::new(program);
         child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
+        child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
         self.apply_control_environment(&mut child);
         let child = child.spawn().with_context(|| {
             format!(
@@ -595,14 +614,20 @@ impl Manifold {
                 self.socket_name.to_string_lossy()
             )
         })?;
+        self.pending_child_panes.push(PendingChildPane {
+            pid: child.id(),
+            pane_id,
+        });
         info!(
             argv = ?argv,
+            pane_id,
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
         );
         self.hosted_children.push(HostedChild {
             command: argv.join(" "),
             child,
+            pane_id: Some(pane_id),
         });
         Ok(())
     }
@@ -612,10 +637,12 @@ impl Manifold {
             anyhow::bail!("spawn requires a command");
         };
 
+        let pane_id = self.allocate_pane_id();
         let mut child = Command::new(program);
         child
             .args(args)
             .env("WAYLAND_DISPLAY", &self.socket_name)
+            .env(MANIFOLD_PANE_ID_ENV, pane_id.to_string())
             .env(MANIFOLD_SESSION_ENV, "presentation");
         self.apply_control_environment(&mut child);
         let child = child.spawn().with_context(|| {
@@ -625,14 +652,20 @@ impl Manifold {
                 self.socket_name.to_string_lossy()
             )
         })?;
+        self.pending_child_panes.push(PendingChildPane {
+            pid: child.id(),
+            pane_id,
+        });
         info!(
             argv = ?argv,
+            pane_id,
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned presentation app"
         );
         self.hosted_children.push(HostedChild {
             command: argv.join(" "),
             child,
+            pane_id: Some(pane_id),
         });
         Ok(())
     }
@@ -653,6 +686,7 @@ impl Manifold {
                     self.hosted_child_last_status = Some(format!("{}:{detail}", hosted.command));
                     info!(
                         command = %hosted.command,
+                        pane_id = ?hosted.pane_id,
                         status = %detail,
                         success = status.success(),
                         "hosted Wayland app exited"
@@ -666,6 +700,7 @@ impl Manifold {
                     warn!(
                         ?err,
                         command = %hosted.command,
+                        pane_id = ?hosted.pane_id,
                         "failed to poll hosted Wayland app"
                     );
                 }
@@ -1053,10 +1088,28 @@ impl Manifold {
         if let Some(pane) = self.pane_for_toplevel_surface(surface) {
             return pane;
         }
-        let pane = self.next_pane_id;
-        self.next_pane_id += 1;
+        let pane = self
+            .claim_pending_child_pane(surface)
+            .unwrap_or_else(|| self.allocate_pane_id());
         self.window_pane_ids.push((surface.clone(), pane));
         pane
+    }
+
+    fn allocate_pane_id(&mut self) -> u64 {
+        let pane = self.next_pane_id;
+        self.next_pane_id += 1;
+        pane
+    }
+
+    fn claim_pending_child_pane(&mut self, surface: &WlSurface) -> Option<u64> {
+        let surface_pid = toplevel_pid(self, surface)?;
+        let index = self.pending_child_panes.iter().position(|pending| {
+            let pending_pid = pending.pid.to_string();
+            surface_pid == pending_pid
+                || process_is_ancestor(&surface_pid, &pending_pid)
+                || process_is_ancestor(&pending_pid, &surface_pid)
+        })?;
+        Some(self.pending_child_panes.remove(index).pane_id)
     }
 
     fn pane_for_toplevel_surface(&self, surface: &WlSurface) -> Option<u64> {
@@ -2175,7 +2228,10 @@ impl Manifold {
             .or_else(|| metadata.get("session_id"))
             .and_then(|value| self.resolve_surface_session(value))
             .unwrap_or(self.active_surface_session);
-        let id = stable_registry_id("agent", [&kind], &metadata);
+        let id = stable_agent_registry_id(&kind, &metadata);
+        let status = metadata
+            .get("status")
+            .and_then(|value| normalize_registry_value(value));
         if let Some(record) = self
             .extension_registry
             .agents
@@ -2183,14 +2239,17 @@ impl Manifold {
             .find(|record| record.id == id)
         {
             record.kind = kind;
-            record.metadata = metadata;
+            if let Some(status) = status {
+                record.status = status;
+            }
+            merge_agent_metadata(&mut record.metadata, metadata);
             record.sender = sender;
             record.session = session;
         } else {
             self.extension_registry.agents.push(AgentRecord {
                 id: id.clone(),
                 kind,
-                status: "unknown".to_string(),
+                status: status.unwrap_or_else(|| "unknown".to_string()),
                 metadata,
                 sender,
                 session,
@@ -2219,17 +2278,7 @@ impl Manifold {
             return Ok(false);
         };
         record.status = status;
-        for (key, value) in metadata {
-            if key == "first_user_message"
-                && record
-                    .metadata
-                    .get("first_user_message")
-                    .is_some_and(|existing| !existing.is_empty())
-            {
-                continue;
-            }
-            record.metadata.insert(key, value);
-        }
+        merge_agent_metadata(&mut record.metadata, metadata);
         record.sender = sender;
         Ok(true)
     }
@@ -3071,6 +3120,18 @@ impl Manifold {
         });
         self.window_pane_ids
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        let live_toplevel_pids = live_toplevel_surfaces
+            .iter()
+            .filter_map(|surface| toplevel_pid(self, surface))
+            .collect::<Vec<_>>();
+        self.pending_child_panes.retain(|pending| {
+            let pid = pending.pid.to_string();
+            live_toplevel_pids.iter().any(|surface_pid| {
+                surface_pid == &pid
+                    || process_is_ancestor(surface_pid, &pid)
+                    || process_is_ancestor(&pid, surface_pid)
+            }) || process_parent_pid(pending.pid).is_some()
+        });
         self.repair_resolved_layout_for_current_inventory();
         if self
             .pending_pointer_focus_surface
@@ -3505,6 +3566,15 @@ fn toplevel_matches_identity(
     identity: &ExtensionMetadata,
 ) -> bool {
     let mut matched = false;
+    if let Some(expected) = identity.get("pane_id").filter(|value| !value.is_empty()) {
+        let Some(pane) = state.pane_for_toplevel_surface(surface) else {
+            return false;
+        };
+        if expected.parse::<u64>().ok() != Some(pane) {
+            return false;
+        }
+        matched = true;
+    }
     if let Some(expected) = identity.get("app_id").filter(|value| !value.is_empty()) {
         if toplevel_app_id(surface).as_deref() != Some(expected.as_str()) {
             return false;
@@ -3532,6 +3602,15 @@ fn toplevel_matches_agent_identity(
     identity: &ExtensionMetadata,
 ) -> bool {
     let mut matched = false;
+    if let Some(expected) = identity.get("pane_id").filter(|value| !value.is_empty()) {
+        let Some(pane) = state.pane_for_toplevel_surface(surface) else {
+            return false;
+        };
+        if expected.parse::<u64>().ok() != Some(pane) {
+            return false;
+        }
+        matched = true;
+    }
     if let Some(expected) = identity.get("app_id").filter(|value| !value.is_empty()) {
         if toplevel_app_id(surface).as_deref() != Some(expected.as_str()) {
             return false;
@@ -3632,6 +3711,32 @@ fn ensure_metadata(metadata: &ExtensionMetadata) -> Result<()> {
         "metadata keys must not be empty"
     );
     Ok(())
+}
+
+fn stable_agent_registry_id(kind: &str, metadata: &ExtensionMetadata) -> String {
+    if let Some((key, value)) = ["pane_id", "pidfd", "pid"]
+        .into_iter()
+        .find_map(|key| metadata.get(key).map(|value| (key, value)))
+        .filter(|(_, value)| !value.is_empty())
+    {
+        let mut identity = ExtensionMetadata::new();
+        identity.insert(key.to_string(), value.clone());
+        return stable_registry_id("agent", [&kind], &identity);
+    }
+    stable_registry_id("agent", [&kind], metadata)
+}
+
+fn merge_agent_metadata(target: &mut ExtensionMetadata, metadata: ExtensionMetadata) {
+    for (key, value) in metadata {
+        if key == "first_user_message"
+            && target
+                .get("first_user_message")
+                .is_some_and(|existing| !existing.is_empty())
+        {
+            continue;
+        }
+        target.insert(key, value);
+    }
 }
 
 fn stable_registry_id<'a, S>(
@@ -3789,6 +3894,38 @@ mod tests {
         assert!(state.should_notify_agent_desktop(&agent_id));
         state.set_presentation_window_focused(true);
         assert!(state.should_notify_agent_desktop(&agent_id));
+    }
+
+    #[test]
+    fn agent_registration_uses_pane_id_as_stable_identity() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+
+        let mut first = BTreeMap::new();
+        first.insert("pane_id".to_string(), "7".to_string());
+        first.insert("status".to_string(), "running".to_string());
+        first.insert("cwd".to_string(), "/tmp/first".to_string());
+        let first_id = state
+            .register_agent("codex".to_string(), first, ":test.sender".to_string())
+            .expect("register first agent state");
+
+        let mut second = BTreeMap::new();
+        second.insert("pane_id".to_string(), "7".to_string());
+        second.insert("status".to_string(), "done".to_string());
+        second.insert("cwd".to_string(), "/tmp/second".to_string());
+        let second_id = state
+            .register_agent("codex".to_string(), second, ":test.sender".to_string())
+            .expect("register second agent state");
+
+        let agents = state.agent_summaries();
+        assert_eq!(first_id, second_id);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, "done");
+        assert_eq!(
+            agents[0].metadata.get("cwd").map(String::as_str),
+            Some("/tmp/second")
+        );
     }
 }
 

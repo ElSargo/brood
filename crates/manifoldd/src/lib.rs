@@ -28,6 +28,7 @@ pub(crate) const DEFAULT_MANIFOLD_DBUS_NAME: &str = "org.manifold.Session";
 pub(crate) const MANIFOLD_HOST_DBUS_ADDRESS_ENV: &str = "MANIFOLD_HOST_DBUS_ADDRESS";
 pub(crate) const MANIFOLDD_DBUS_ADDRESS_ENV: &str = "MANIFOLDD_DBUS_ADDRESS";
 pub(crate) const MANIFOLDD_DBUS_DESTINATION_ENV: &str = "MANIFOLDD_DBUS_DESTINATION";
+pub(crate) const MANIFOLD_PANE_ID_ENV: &str = "MANIFOLD_PANE_ID";
 
 #[derive(Debug, Parser)]
 #[command(about = "Manifold session process", version)]

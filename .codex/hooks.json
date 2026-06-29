@@ -5,9 +5,21 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/.codex/hooks/btrfs-pre-prompt-snapshot.sh\"",
-            "timeout": 30,
-            "statusMessage": "Snapshotting repo"
+            "command": "if [ -n \"${MANIFOLD_PANE_ID:-}\" ] && [ -n \"${MANIFOLDD_DBUS_ADDRESS:-}\" ]; then busctl --quiet --address=\"$MANIFOLDD_DBUS_ADDRESS\" call \"${MANIFOLDD_DBUS_DESTINATION:-org.manifold.Session}\" /org/manifold/Agent org.manifold.Agent RegisterAgent \"sa{ss}\" codex 5 pane_id \"$MANIFOLD_PANE_ID\" status running cwd \"${PWD:-}\" source codex-hook surface_session \"${MANIFOLD_SURFACE_SESSION_ID:-1}\" >/dev/null || true; fi",
+            "timeout": 5,
+            "statusMessage": "Updating Manifold agent"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"${MANIFOLD_PANE_ID:-}\" ] && [ -n \"${MANIFOLDD_DBUS_ADDRESS:-}\" ]; then busctl --quiet --address=\"$MANIFOLDD_DBUS_ADDRESS\" call \"${MANIFOLDD_DBUS_DESTINATION:-org.manifold.Session}\" /org/manifold/Agent org.manifold.Agent RegisterAgent \"sa{ss}\" codex 5 pane_id \"$MANIFOLD_PANE_ID\" status done cwd \"${PWD:-}\" source codex-hook surface_session \"${MANIFOLD_SURFACE_SESSION_ID:-1}\" >/dev/null || true; fi",
+            "timeout": 5,
+            "statusMessage": "Updating Manifold agent"
           }
         ]
       }
