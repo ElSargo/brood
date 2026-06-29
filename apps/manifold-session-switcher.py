@@ -289,6 +289,7 @@ class SessionSwitcher:
                 application_id=APP_ID,
                 flags=Gio.ApplicationFlags.NON_UNIQUE,
             )
+        self.configure_style()
         app.connect("activate", self.on_activate)
         return app.run([])
 
@@ -313,6 +314,10 @@ class SessionSwitcher:
             window.set_default_size(self.args.width, 720)
         window.set_title("Manifold Sessions")
         return window
+
+    def configure_style(self):
+        manager = Adw.StyleManager.get_default()
+        manager.set_color_scheme(Adw.ColorScheme.PREFER_DARK)
 
     def setup_notifications(self):
         self.bus.bus.add_signal_receiver(
@@ -405,16 +410,6 @@ class SessionSwitcher:
         self.pack(outer, self.status_box, expand=False)
 
         if GTK4:
-            window_legacy = Gtk.EventControllerLegacy.new()
-            window_legacy.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-            window_legacy.connect("event", self.handle_legacy_event)
-            self.window.add_controller(window_legacy)
-
-            click = Gtk.GestureClick()
-            click.set_button(0)
-            click.connect("pressed", self.activate_session_from_panel_press)
-            click.connect("released", self.activate_session_from_panel_click)
-            outer.add_controller(click)
             if hasattr(self.window, "set_content"):
                 self.window.set_content(outer)
             else:
@@ -487,9 +482,12 @@ class SessionSwitcher:
 
     def pack(self, box, child, expand):
         if GTK4:
-            if expand:
-                child.set_vexpand(True)
+            if box.get_orientation() == Gtk.Orientation.VERTICAL:
+                child.set_vexpand(expand)
                 child.set_hexpand(True)
+            else:
+                child.set_hexpand(expand)
+                child.set_vexpand(False)
             box.append(child)
         else:
             box.pack_start(child, expand, expand, 0)
@@ -1061,41 +1059,6 @@ class SessionSwitcher:
         self.notification_agents.pop(notification_id, None)
         self.notification_tokens.pop(notification_id, None)
         self.activated_notifications.discard(notification_id)
-
-    def activate_session_from_panel_press(self, _gesture, _n_press, x, y):
-        self.activate_session_at_position(x, y, event_name="panel-press")
-
-    def activate_session_from_panel_click(self, _gesture, _n_press, x, y):
-        self.activate_session_at_position(x, y, event_name="panel-click")
-
-    def handle_legacy_event(self, _controller, event):
-        if event is None:
-            event = _controller.get_current_event()
-        if event is None:
-            write_status(self.args.event_file, event="legacy-empty")
-            return False
-        event_type = event.get_event_type()
-        if event_type not in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE):
-            return False
-        position = event.get_position()
-        if isinstance(position, tuple) and len(position) == 3:
-            ok, x, y = position
-            if not ok:
-                return False
-        elif isinstance(position, tuple) and len(position) == 2:
-            x, y = position
-        else:
-            return False
-        event_name = "legacy-press" if event_type == Gdk.EventType.BUTTON_PRESS else "legacy-release"
-        write_status(
-            self.args.event_file,
-            event=event_name,
-            x=round(x, 1),
-            y=round(y, 1),
-        )
-        if event_type == Gdk.EventType.BUTTON_RELEASE:
-            self.activate_session_at_position(x, y, event_name=event_name)
-        return True
 
     def activate_session_from_gtk3_click(self, _widget, event):
         self.activate_session_at_position(event.x, event.y, event_name="panel-click")

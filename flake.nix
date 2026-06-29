@@ -64,9 +64,11 @@
           ];
 
           gtkRuntime = with pkgs; [
+            adwaita-icon-theme
             cairo
             gdk-pixbuf
             glib
+            gnome-themes-extra
             gobject-introspection-unwrapped
             graphene
             gsettings-desktop-schemas
@@ -75,6 +77,7 @@
             hicolor-icon-theme
             libadwaita
             pango.out
+            shared-mime-info
           ];
 
           westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
@@ -158,9 +161,11 @@
           ];
 
           gtkRuntime = with pkgs; [
+            adwaita-icon-theme
             cairo
             gdk-pixbuf
             glib
+            gnome-themes-extra
             gobject-introspection-unwrapped
             graphene
             gsettings-desktop-schemas
@@ -169,6 +174,7 @@
             hicolor-icon-theme
             libadwaita
             pango.out
+            shared-mime-info
           ];
 
           westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
@@ -216,6 +222,7 @@
           nativeLibraryPath = lib.makeLibraryPath (nativeLibs ++ gtkRuntime);
           gtkTypelibPath = lib.makeSearchPath "lib/girepository-1.0" gtkRuntime;
           gtkDataDirs = lib.makeSearchPath "share" gtkRuntime;
+          gsettingsSchemaDir = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}/glib-2.0/schemas";
           nativePkgConfigPath = lib.concatStringsSep ":" [
             (lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs)
             (lib.makeSearchPath "lib/pkgconfig" nativeLibs)
@@ -266,6 +273,7 @@
               export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
               export GI_TYPELIB_PATH="${gtkTypelibPath}:''${GI_TYPELIB_PATH:-}"
               export XDG_DATA_DIRS="${gtkDataDirs}:''${XDG_DATA_DIRS:-}"
+              export GSETTINGS_SCHEMA_DIR="${gsettingsSchemaDir}"
               export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
               export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
               export MANIFOLD_DEV_SHELL=1
