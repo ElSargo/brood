@@ -28,6 +28,7 @@ const KEY_H: Keycode = Keycode::new(43);
 const KEY_J: Keycode = Keycode::new(44);
 const KEY_K: Keycode = Keycode::new(45);
 const KEY_L: Keycode = Keycode::new(46);
+const KEY_P: Keycode = Keycode::new(33);
 const KEY_S: Keycode = Keycode::new(39);
 const KEY_U: Keycode = Keycode::new(30);
 const KEY_W: Keycode = Keycode::new(25);
@@ -106,6 +107,14 @@ impl Manifold {
             return;
         }
 
+        if self.suppress_shortcut_prefix_key_release == Some(key_code)
+            && state == KeyState::Released
+        {
+            self.suppress_shortcut_prefix_key_release = None;
+            self.record_consumed_keyboard_input();
+            return;
+        }
+
         if is_ctrl {
             match state {
                 KeyState::Pressed => {
@@ -154,8 +163,31 @@ impl Manifold {
             self.record_consumed_keyboard_input();
             if state == KeyState::Pressed {
                 self.suppress_mode_toggle_key_release = true;
-                self.toggle_input_mode();
+                if self.shortcut_passthrough() {
+                    self.set_shortcut_passthrough(false);
+                } else {
+                    self.shortcut_prefix_active = true;
+                    self.toggle_input_mode();
+                }
             }
+            return;
+        }
+
+        if self.shortcut_prefix_active {
+            self.record_consumed_keyboard_input();
+            if state == KeyState::Pressed {
+                self.shortcut_prefix_active = false;
+                self.suppress_shortcut_prefix_key_release = Some(key_code);
+                if key_code == KEY_P {
+                    self.set_shortcut_passthrough(true);
+                }
+            }
+            return;
+        }
+
+        if self.shortcut_passthrough() {
+            self.forward_pressed_modifiers_to_focused_client(time);
+            self.forward_keyboard_key_to_focused_client(key_code, state, time);
             return;
         }
 

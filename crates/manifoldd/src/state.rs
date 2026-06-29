@@ -174,6 +174,8 @@ pub struct SurfaceSessionSummary {
 }
 
 pub type ExtensionMetadata = BTreeMap<String, String>;
+pub const PASSTHROUGH_STATUS_CHANNEL: &str = "workspace.input.passthrough";
+pub const MANIFOLD_STATUS_PUBLISHER: &str = "manifold";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionSummary {
@@ -208,6 +210,15 @@ pub struct AgentSummary {
     pub metadata: ExtensionMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StatusItemSummary {
+    pub channel: String,
+    pub state: String,
+    pub label: String,
+    pub publisher: String,
+    pub metadata: ExtensionMetadata,
+}
+
 #[derive(Default)]
 struct ExtensionRegistry {
     extensions: Vec<ExtensionRecord>,
@@ -215,6 +226,8 @@ struct ExtensionRegistry {
     grants: Vec<GrantRecord>,
     agents: Vec<AgentRecord>,
     notifications: Vec<AgentNotificationRecord>,
+    status_publishers: Vec<StatusPublisherRecord>,
+    status_items: Vec<StatusItemRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +279,23 @@ struct AgentNotificationRecord {
     level: String,
     metadata: ExtensionMetadata,
     unread: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusPublisherRecord {
+    id: String,
+    role: String,
+    metadata: ExtensionMetadata,
+    sender: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusItemRecord {
+    channel: String,
+    state: String,
+    label: String,
+    publisher: String,
+    metadata: ExtensionMetadata,
 }
 
 pub struct Manifold {
@@ -322,7 +352,10 @@ pub struct Manifold {
     pub(crate) ctrl_forwarded_to_client: bool,
     pub(crate) alt_forwarded_to_client: bool,
     pub(crate) suppress_mode_toggle_key_release: bool,
+    pub(crate) shortcut_prefix_active: bool,
+    pub(crate) suppress_shortcut_prefix_key_release: Option<smithay::backend::input::Keycode>,
     pub input_mode: InputMode,
+    shortcut_passthrough: bool,
     managed_fullscreen: bool,
     active_surface_session: SurfaceSessionId,
     last_interacted_surface_session: SurfaceSessionId,
@@ -439,7 +472,10 @@ impl Manifold {
             ctrl_forwarded_to_client: false,
             alt_forwarded_to_client: false,
             suppress_mode_toggle_key_release: false,
+            shortcut_prefix_active: false,
+            suppress_shortcut_prefix_key_release: None,
             input_mode: InputMode::Passthrough,
+            shortcut_passthrough: false,
             managed_fullscreen: false,
             active_surface_session: SurfaceSessionId(1),
             last_interacted_surface_session: SurfaceSessionId(1),
@@ -1442,6 +1478,8 @@ impl Manifold {
         self.ctrl_forwarded_to_client = false;
         self.alt_forwarded_to_client = false;
         self.suppress_mode_toggle_key_release = false;
+        self.shortcut_prefix_active = false;
+        self.suppress_shortcut_prefix_key_release = None;
         self.pending_pointer_focus_surface = None;
         self.pointer_hover_toplevel_surface = None;
     }
@@ -2368,6 +2406,100 @@ impl Manifold {
         true
     }
 
+    pub fn register_status_publisher(
+        &mut self,
+        role: String,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<String> {
+        let role =
+            normalize_registry_value(&role).context("status publisher role must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let id = stable_registry_id("status-pub", [&role], &metadata);
+        if let Some(record) = self
+            .extension_registry
+            .status_publishers
+            .iter_mut()
+            .find(|record| record.id == id)
+        {
+            record.role = role;
+            record.metadata = metadata;
+            record.sender = sender;
+        } else {
+            self.extension_registry
+                .status_publishers
+                .push(StatusPublisherRecord {
+                    id: id.clone(),
+                    role,
+                    metadata,
+                    sender,
+                });
+        }
+        Ok(id)
+    }
+
+    pub fn publish_status(
+        &mut self,
+        publisher: String,
+        channel: String,
+        state: String,
+        label: String,
+        metadata: ExtensionMetadata,
+    ) -> Result<bool> {
+        let publisher =
+            normalize_registry_value(&publisher).context("status publisher must not be empty")?;
+        if publisher != MANIFOLD_STATUS_PUBLISHER {
+            self.ensure_status_publisher_exists(&publisher)?;
+        }
+        let channel =
+            normalize_registry_value(&channel).context("status channel must not be empty")?;
+        let state = normalize_registry_value(&state).context("status state must not be empty")?;
+        let label = normalize_registry_value(&label).unwrap_or_else(|| channel.clone());
+        ensure_metadata(&metadata)?;
+
+        let next = StatusItemRecord {
+            channel: channel.clone(),
+            state,
+            label,
+            publisher,
+            metadata,
+        };
+        if let Some(record) = self
+            .extension_registry
+            .status_items
+            .iter_mut()
+            .find(|record| record.channel == channel)
+        {
+            let changed = record != &next;
+            *record = next;
+            return Ok(changed);
+        }
+        self.extension_registry.status_items.push(next);
+        Ok(true)
+    }
+
+    pub fn clear_status(&mut self, publisher: &str, channel: &str) -> bool {
+        let before = self.extension_registry.status_items.len();
+        self.extension_registry
+            .status_items
+            .retain(|item| !(item.publisher == publisher && item.channel == channel));
+        before != self.extension_registry.status_items.len()
+    }
+
+    pub fn status_summaries(&self) -> Vec<StatusItemSummary> {
+        self.extension_registry
+            .status_items
+            .iter()
+            .map(|record| StatusItemSummary {
+                channel: record.channel.clone(),
+                state: record.state.clone(),
+                label: record.label.clone(),
+                publisher: record.publisher.clone(),
+                metadata: record.metadata.clone(),
+            })
+            .collect()
+    }
+
     pub fn agent_summaries(&self) -> Vec<AgentSummary> {
         self.extension_registry
             .agents
@@ -2404,6 +2536,38 @@ impl Manifold {
                 }
             })
             .collect()
+    }
+
+    pub fn shortcut_passthrough(&self) -> bool {
+        self.shortcut_passthrough
+    }
+
+    pub fn set_shortcut_passthrough(&mut self, enabled: bool) -> bool {
+        if self.shortcut_passthrough == enabled {
+            return false;
+        }
+        self.shortcut_passthrough = enabled;
+        if enabled {
+            let mut metadata = ExtensionMetadata::new();
+            metadata.insert("scope".to_string(), "workspace".to_string());
+            metadata.insert("click_action".to_string(), "disable".to_string());
+            let _ = self.publish_status(
+                MANIFOLD_STATUS_PUBLISHER.to_string(),
+                PASSTHROUGH_STATUS_CHANNEL.to_string(),
+                "active".to_string(),
+                "Passthrough".to_string(),
+                metadata,
+            );
+        } else {
+            self.clear_status(MANIFOLD_STATUS_PUBLISHER, PASSTHROUGH_STATUS_CHANNEL);
+        }
+        true
+    }
+
+    pub fn toggle_shortcut_passthrough(&mut self) -> bool {
+        let enabled = !self.shortcut_passthrough;
+        self.set_shortcut_passthrough(enabled);
+        enabled
     }
 
     pub fn register_extension_window(
@@ -2622,6 +2786,17 @@ impl Manifold {
                 .iter()
                 .any(|extension| extension.id == extension_id),
             "unknown extension {extension_id}"
+        );
+        Ok(())
+    }
+
+    fn ensure_status_publisher_exists(&self, publisher: &str) -> Result<()> {
+        ensure!(
+            self.extension_registry
+                .status_publishers
+                .iter()
+                .any(|record| record.id == publisher),
+            "unknown status publisher {publisher}"
         );
         Ok(())
     }

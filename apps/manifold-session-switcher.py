@@ -40,6 +40,7 @@ except (ImportError, ValueError):
 APP_ID = "org.manifold.SessionSwitcher"
 DEFAULT_DESTINATION = "org.manifold.Session"
 DISCLOSURE_COLUMN_WIDTH = 28
+PASSTHROUGH_STATUS_CHANNEL = "workspace.input.passthrough"
 NOTIFICATIONS_DESTINATION = "org.freedesktop.Notifications"
 NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
 NOTIFICATION_ACTION_DEFAULT = "default"
@@ -91,6 +92,10 @@ class ManifoldBus:
         self.agent = dbus.Interface(
             self.bus.get_object(self.destination, "/org/manifold/Agent"),
             "org.manifold.Agent",
+        )
+        self.status = dbus.Interface(
+            self.bus.get_object(self.destination, "/org/manifold/Status"),
+            "org.manifold.Status",
         )
         self.notifications = dbus.Interface(
             self.bus.get_object(NOTIFICATIONS_DESTINATION, NOTIFICATIONS_PATH),
@@ -144,6 +149,25 @@ class ManifoldBus:
                 }
             )
         return rows
+
+    def list_status(self):
+        rows = []
+        for channel, state, label, publisher, metadata in self.status.ListStatus():
+            rows.append(
+                {
+                    "channel": str(channel),
+                    "state": str(state),
+                    "label": str(label),
+                    "publisher": str(publisher),
+                    "metadata": {
+                        str(key): str(value) for key, value in dict(metadata).items()
+                    },
+                }
+            )
+        return rows
+
+    def set_passthrough_mode(self, enabled):
+        return bool(self.status.SetPassthroughMode(bool(enabled)))
 
     def activate(self, session_id):
         return bool(self.session.ActivateSurfaceSession(dbus.UInt64(session_id)))
@@ -245,6 +269,7 @@ class SessionSwitcher:
         self.bus = ManifoldBus(args.dbus_address, args.dbus_name)
         self.sessions = []
         self.agents = []
+        self.status_items = {}
         self.filtered_sessions = []
         self.expanded_sessions = set()
         self.session_order = []
@@ -265,9 +290,11 @@ class SessionSwitcher:
             self.build_ui()
             self.setup_notifications()
             self.refresh_sessions()
+            self.refresh_statuses()
             self.present_window()
             GLib.timeout_add(250, self.register_with_manifold)
             GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
+            GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
             GLib.timeout_add(450, self.animate_working_agents)
             Gtk.main()
             return 0
@@ -290,9 +317,11 @@ class SessionSwitcher:
         self.build_ui()
         self.setup_notifications()
         self.refresh_sessions()
+        self.refresh_statuses()
         self.present_window()
         GLib.timeout_add(250, self.register_with_manifold)
         GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
+        GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
         GLib.timeout_add(450, self.animate_working_agents)
 
     def make_window(self, app):
@@ -306,6 +335,18 @@ class SessionSwitcher:
         return window
 
     def setup_notifications(self):
+        self.bus.bus.add_signal_receiver(
+            self.handle_status_changed,
+            signal_name="StatusChanged",
+            dbus_interface="org.manifold.Status",
+            path="/org/manifold/Status",
+        )
+        self.bus.bus.add_signal_receiver(
+            self.handle_status_cleared,
+            signal_name="StatusCleared",
+            dbus_interface="org.manifold.Status",
+            path="/org/manifold/Status",
+        )
         self.bus.bus.add_signal_receiver(
             self.handle_notification_action,
             signal_name="ActionInvoked",
@@ -373,6 +414,16 @@ class SessionSwitcher:
             scroller.add(self.listbox)
         self.pack(outer, scroller, expand=True)
 
+        self.status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.status_box.set_hexpand(True)
+        self.passthrough_button = Gtk.Button(label="Passthrough Off")
+        self.passthrough_button.get_style_context().add_class("status-indicator")
+        self.passthrough_button.set_tooltip_text("Toggle passthrough")
+        self.passthrough_button.connect("clicked", self.toggle_passthrough_mode)
+        self.passthrough_button.set_hexpand(True)
+        self.pack(self.status_box, self.passthrough_button, expand=True)
+        self.pack(outer, self.status_box, expand=False)
+
         if GTK4:
             window_legacy = Gtk.EventControllerLegacy.new()
             window_legacy.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
@@ -426,6 +477,18 @@ class SessionSwitcher:
             }
             .agent-dot-working.pulse {
               opacity: 1.0;
+            }
+            button.status-indicator {
+              background: rgba(120, 120, 120, 0.10);
+              border: 1px solid rgba(120, 120, 120, 0.45);
+              box-shadow: none;
+              text-shadow: none;
+              padding: 6px 8px;
+              min-height: 32px;
+            }
+            button.status-indicator.passthrough-active {
+              background: rgba(210, 135, 40, 0.16);
+              border-color: rgba(210, 135, 40, 0.85);
             }
             """
         )
@@ -496,6 +559,59 @@ class SessionSwitcher:
             self.last_error = str(err)
             write_status(self.args.event_file, event="refresh-error", error=err)
         return True
+
+    def refresh_statuses(self):
+        try:
+            self.status_items = {
+                item["channel"]: item for item in self.bus.list_status()
+            }
+            self.render_status_indicators()
+        except Exception as err:
+            write_status(self.args.event_file, event="status-refresh-error", error=err)
+        return True
+
+    def handle_status_changed(self, channel, state, label, publisher, metadata):
+        self.status_items[str(channel)] = {
+            "channel": str(channel),
+            "state": str(state),
+            "label": str(label),
+            "publisher": str(publisher),
+            "metadata": {str(key): str(value) for key, value in dict(metadata).items()},
+        }
+        GLib.idle_add(self.render_status_indicators)
+
+    def handle_status_cleared(self, channel, _publisher):
+        self.status_items.pop(str(channel), None)
+        GLib.idle_add(self.render_status_indicators)
+
+    def render_status_indicators(self):
+        item = self.status_items.get(PASSTHROUGH_STATUS_CHANNEL)
+        passthrough_active = item is not None and item["state"] == "active"
+        self.passthrough_button.set_label(
+            "Passthrough On" if passthrough_active else "Passthrough Off"
+        )
+        context = self.passthrough_button.get_style_context()
+        if passthrough_active:
+            context.add_class("passthrough-active")
+        else:
+            context.remove_class("passthrough-active")
+        return False
+
+    def toggle_passthrough_mode(self, *_args):
+        try:
+            item = self.status_items.get(PASSTHROUGH_STATUS_CHANNEL)
+            passthrough_active = item is not None and item["state"] == "active"
+            next_enabled = not passthrough_active
+            changed = self.bus.set_passthrough_mode(next_enabled)
+            write_status(
+                self.args.event_file,
+                event="toggle-passthrough",
+                enabled=str(next_enabled).lower(),
+                changed=str(changed).lower(),
+            )
+            self.refresh_statuses()
+        except Exception as err:
+            write_status(self.args.event_file, event="toggle-passthrough-error", error=err)
 
     def update_finished_agents(self, agents):
         current_done_state = {agent["id"]: self.agent_is_done(agent) for agent in agents}

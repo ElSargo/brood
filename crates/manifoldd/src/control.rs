@@ -36,7 +36,8 @@ use crate::{
     layout::LayoutAction,
     session_runner,
     state::{
-        FocusDirection, Manifold, PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
+        FocusDirection, MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL,
+        PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
     },
 };
 
@@ -45,6 +46,7 @@ const MANAGER_OBJECT_PATH: &str = "/org/manifold/Manager";
 const EXTENSION_OBJECT_PATH: &str = "/org/manifold/Extension";
 const COMPOSITOR_OBJECT_PATH: &str = "/org/manifold/Compositor";
 const AGENT_OBJECT_PATH: &str = "/org/manifold/Agent";
+const STATUS_OBJECT_PATH: &str = "/org/manifold/Status";
 const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
 const MANAGER_INTERFACE: &str = "org.manifold.Manager";
 const EXTENSION_INTERFACE: &str = "org.manifold.Extension";
@@ -55,6 +57,7 @@ type DbusMetadata = BTreeMap<String, String>;
 type DbusSurfaceSession = (u64, String, bool, u64);
 type DbusExtension = (String, String, String, DbusMetadata);
 type DbusGrant = (String, String, String, String, bool, DbusMetadata);
+type DbusStatusItem = (String, String, String, String, DbusMetadata);
 type DbusAgent = (
     String,
     String,
@@ -107,6 +110,7 @@ type U64Response = mpsc::Sender<std::result::Result<u64, String>>;
 type SessionListResponse = mpsc::Sender<std::result::Result<Vec<DbusSurfaceSession>, String>>;
 type ExtensionListResponse = mpsc::Sender<std::result::Result<Vec<DbusExtension>, String>>;
 type GrantListResponse = mpsc::Sender<std::result::Result<Vec<DbusGrant>, String>>;
+type StatusListResponse = mpsc::Sender<std::result::Result<Vec<DbusStatusItem>, String>>;
 type AgentListResponse = mpsc::Sender<std::result::Result<Vec<DbusAgent>, String>>;
 
 enum DbusStateRequest {
@@ -164,6 +168,32 @@ enum DbusStateRequest {
     },
     ReleaseGrant {
         grant_id: String,
+        response: BoolResponse,
+    },
+    ListStatus {
+        response: StatusListResponse,
+    },
+    RegisterStatusPublisher {
+        role: String,
+        metadata: DbusMetadata,
+        sender_name: String,
+        response: ControlResponse,
+    },
+    PublishStatus {
+        publisher: String,
+        channel: String,
+        state: String,
+        label: String,
+        metadata: DbusMetadata,
+        response: BoolResponse,
+    },
+    ClearStatus {
+        publisher: String,
+        channel: String,
+        response: BoolResponse,
+    },
+    SetPassthroughMode {
+        enabled: bool,
         response: BoolResponse,
     },
     ListAgents {
@@ -270,6 +300,11 @@ struct ExtensionDbus {
 
 #[derive(Clone)]
 struct AgentDbus {
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct StatusDbus {
     sender: channel::Sender<DbusStateRequest>,
 }
 
@@ -565,6 +600,127 @@ impl AgentDbus {
     async fn agent_unregistered(emitter: &SignalEmitter<'_>, agent_id: &str) -> zbus::Result<()>;
 }
 
+#[zbus::interface(name = "org.manifold.Status")]
+impl StatusDbus {
+    async fn list_status(&self) -> fdo::Result<Vec<DbusStatusItem>> {
+        request_state(&self.sender, |response| DbusStateRequest::ListStatus {
+            response,
+        })
+    }
+
+    async fn register_publisher(
+        &self,
+        role: String,
+        metadata: DbusMetadata,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<String> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| {
+            DbusStateRequest::RegisterStatusPublisher {
+                role,
+                metadata,
+                sender_name,
+                response,
+            }
+        })
+    }
+
+    async fn publish(
+        &self,
+        publisher: String,
+        channel: String,
+        state: String,
+        label: String,
+        metadata: DbusMetadata,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let changed = request_state(&self.sender, |response| DbusStateRequest::PublishStatus {
+            publisher: publisher.clone(),
+            channel: channel.clone(),
+            state: state.clone(),
+            label: label.clone(),
+            metadata: metadata.clone(),
+            response,
+        })?;
+        if changed {
+            Self::status_changed(&emitter, &channel, &state, &label, &publisher, &metadata)
+                .await
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        }
+        Ok(changed)
+    }
+
+    async fn clear(
+        &self,
+        publisher: String,
+        channel: String,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let changed = request_state(&self.sender, |response| DbusStateRequest::ClearStatus {
+            publisher: publisher.clone(),
+            channel: channel.clone(),
+            response,
+        })?;
+        if changed {
+            Self::status_cleared(&emitter, &channel, &publisher)
+                .await
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        }
+        Ok(changed)
+    }
+
+    async fn set_passthrough_mode(
+        &self,
+        enabled: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let changed = request_state(&self.sender, |response| {
+            DbusStateRequest::SetPassthroughMode { enabled, response }
+        })?;
+        if changed && enabled {
+            let mut metadata = DbusMetadata::new();
+            metadata.insert("scope".to_string(), "workspace".to_string());
+            metadata.insert("click_action".to_string(), "disable".to_string());
+            Self::status_changed(
+                &emitter,
+                PASSTHROUGH_STATUS_CHANNEL,
+                "active",
+                "Passthrough",
+                MANIFOLD_STATUS_PUBLISHER,
+                &metadata,
+            )
+            .await
+            .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        } else if changed {
+            Self::status_cleared(
+                &emitter,
+                PASSTHROUGH_STATUS_CHANNEL,
+                MANIFOLD_STATUS_PUBLISHER,
+            )
+            .await
+            .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+        }
+        Ok(changed)
+    }
+
+    #[zbus(signal)]
+    async fn status_changed(
+        emitter: &SignalEmitter<'_>,
+        channel: &str,
+        state: &str,
+        label: &str,
+        publisher: &str,
+        metadata: &DbusMetadata,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn status_cleared(
+        emitter: &SignalEmitter<'_>,
+        channel: &str,
+        publisher: &str,
+    ) -> zbus::Result<()>;
+}
+
 #[zbus::interface(name = "org.manifold.Compositor")]
 impl CompositorDbus {
     async fn register_window(
@@ -758,6 +914,25 @@ trait ManifoldAgent {
     fn clear_agent_attention(&self, agent_id: String) -> zbus::Result<bool>;
     fn should_notify_agent_desktop(&self, agent_id: String) -> zbus::Result<bool>;
     fn unregister_agent(&self, agent_id: String) -> zbus::Result<bool>;
+}
+
+#[proxy(
+    interface = "org.manifold.Status",
+    default_path = "/org/manifold/Status"
+)]
+trait ManifoldStatus {
+    fn list_status(&self) -> zbus::Result<Vec<DbusStatusItem>>;
+    fn register_publisher(&self, role: String, metadata: DbusMetadata) -> zbus::Result<String>;
+    fn publish(
+        &self,
+        publisher: String,
+        channel: String,
+        state: String,
+        label: String,
+        metadata: DbusMetadata,
+    ) -> zbus::Result<bool>;
+    fn clear(&self, publisher: String, channel: String) -> zbus::Result<bool>;
+    fn set_passthrough_mode(&self, enabled: bool) -> zbus::Result<bool>;
 }
 
 #[proxy(
@@ -1414,6 +1589,12 @@ fn start_dbus_service(
                             sender: sender.clone(),
                         },
                     )?
+                    .serve_at(
+                        STATUS_OBJECT_PATH,
+                        StatusDbus {
+                            sender: sender.clone(),
+                        },
+                    )?
                     .serve_at(COMPOSITOR_OBJECT_PATH, CompositorDbus { sender })?
                     .build()
                     .await?;
@@ -1881,6 +2062,37 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::ReleaseGrant { grant_id, response } => {
             send_response(response, Ok(state.release_grant(&grant_id)));
         }
+        DbusStateRequest::ListStatus { response } => {
+            send_response(response, Ok(dbus_status_items(state.status_summaries())));
+        }
+        DbusStateRequest::RegisterStatusPublisher {
+            role,
+            metadata,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state.register_status_publisher(role, metadata, sender_name),
+        ),
+        DbusStateRequest::PublishStatus {
+            publisher,
+            channel,
+            state: status_state,
+            label,
+            metadata,
+            response,
+        } => send_response(
+            response,
+            state.publish_status(publisher, channel, status_state, label, metadata),
+        ),
+        DbusStateRequest::ClearStatus {
+            publisher,
+            channel,
+            response,
+        } => send_response(response, Ok(state.clear_status(&publisher, &channel))),
+        DbusStateRequest::SetPassthroughMode { enabled, response } => {
+            send_response(response, Ok(state.set_shortcut_passthrough(enabled)));
+        }
         DbusStateRequest::ListAgents { response } => {
             send_response(response, Ok(dbus_agents(state.agent_summaries())));
         }
@@ -2037,6 +2249,21 @@ fn dbus_agents(agents: Vec<crate::state::AgentSummary>) -> Vec<DbusAgent> {
         .collect()
 }
 
+fn dbus_status_items(items: Vec<crate::state::StatusItemSummary>) -> Vec<DbusStatusItem> {
+    items
+        .into_iter()
+        .map(|item| {
+            (
+                item.channel,
+                item.state,
+                item.label,
+                item.publisher,
+                item.metadata,
+            )
+        })
+        .collect()
+}
+
 pub fn status_json_string(state: &mut Manifold) -> Result<String> {
     let snapshot = StatusSnapshot::from_state(state);
     serde_json::to_string(&snapshot.to_json()).context("serialize status snapshot")
@@ -2063,7 +2290,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
             format!(
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_window_focused={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} resolved_layout_source={} resolved_layout_items={} resolved_layout_panes={} resolved_layout_placeholders={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_window_focused={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} shortcut_passthrough={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} resolved_layout_source={} resolved_layout_items={} resolved_layout_panes={} resolved_layout_placeholders={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -2083,6 +2310,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 snapshot.focused_window_index_text,
                 snapshot.focused_surface_id,
                 snapshot.input_mode,
+                snapshot.shortcut_passthrough,
                 snapshot.managed_fullscreen,
                 snapshot.requested_fullscreen,
                 snapshot.focused_fullscreen,
@@ -2225,6 +2453,30 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             let changed = state.apply_layout_action(action);
             format!("OK layout-action action={action} changed={changed}\n")
         }
+        "passthrough-mode" | "passthrough" => match args {
+            [subcommand] if subcommand == "get" => {
+                format!(
+                    "OK passthrough-mode enabled={}\n",
+                    state.shortcut_passthrough()
+                )
+            }
+            [subcommand] if subcommand == "toggle" => {
+                let enabled = state.toggle_shortcut_passthrough();
+                format!("OK passthrough-mode enabled={enabled} changed=true\n")
+            }
+            [subcommand, value] if subcommand == "set" => {
+                let enabled = parse_enabled(value)?;
+                let changed = state.set_shortcut_passthrough(enabled);
+                format!("OK passthrough-mode enabled={enabled} changed={changed}\n")
+            }
+            _ => bail!("usage: passthrough-mode get|toggle|set <on|off>"),
+        },
+        "status-items" => match args {
+            [subcommand] if subcommand == "list-json" => {
+                format!("{}\n", serde_json::to_string(&state.status_summaries())?)
+            }
+            _ => bail!("usage: status-items list-json"),
+        },
         "surface-session" => match args {
             [subcommand] if subcommand == "list-json" => {
                 let response = SurfaceSessionList::from_state(state);
@@ -2374,6 +2626,7 @@ struct StatusSnapshot {
     focused_window_index_text: String,
     focused_surface_id: String,
     input_mode: &'static str,
+    shortcut_passthrough: bool,
     managed_fullscreen: bool,
     requested_fullscreen: usize,
     focused_fullscreen: bool,
@@ -2568,6 +2821,7 @@ impl StatusSnapshot {
                 crate::state::InputMode::Passthrough => "passthrough",
                 crate::state::InputMode::Normal => "normal",
             },
+            shortcut_passthrough: state.shortcut_passthrough(),
             managed_fullscreen: state.managed_fullscreen(),
             requested_fullscreen: state.requested_fullscreen_count(),
             focused_fullscreen: state.focused_window_fullscreen(),
@@ -2808,6 +3062,14 @@ fn parse_u64(value: &str, name: &str) -> Result<u64> {
     value
         .parse()
         .with_context(|| format!("{name} must be an unsigned integer"))
+}
+
+fn parse_enabled(value: &str) -> Result<bool> {
+    match value {
+        "on" | "true" | "yes" | "1" | "enabled" | "enable" => Ok(true),
+        "off" | "false" | "no" | "0" | "disabled" | "disable" => Ok(false),
+        _ => bail!("value must be on or off"),
+    }
 }
 
 fn parse_i32(value: &str, name: &str) -> Result<i32> {
