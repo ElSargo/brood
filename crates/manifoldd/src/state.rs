@@ -1023,35 +1023,35 @@ impl Manifold {
             let Some(toplevel) = window.toplevel() else {
                 return;
             };
-            let is_fullscreen = self
-                .toplevel_fullscreen_output(toplevel.wl_surface())
-                .is_some();
-            let fullscreen_output = self
-                .toplevel_fullscreen_output(toplevel.wl_surface())
-                .cloned()
-                .flatten();
-            let client_size = self.window_layout_rect(window).map_or_else(
-                || self.presentation_size(),
-                |rect| (rect.w.max(1), rect.h.max(1)),
-            );
+            let layout_rect = self.window_layout_rect(window);
             let is_active = active_surface == Some(toplevel.wl_surface())
                 && self.surface_can_receive_focus(toplevel.wl_surface());
             toplevel.with_pending_state(|state| {
-                state.size = Some(client_size.into());
-                state.bounds = Some(client_size.into());
-                if is_fullscreen || self.managed_fullscreen {
-                    state.states.set(xdg_toplevel::State::Fullscreen);
-                    state.states.unset(xdg_toplevel::State::Maximized);
-                } else {
-                    state.states.set(xdg_toplevel::State::Maximized);
-                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                if let Some(rect) = layout_rect {
+                    let is_fullscreen = self
+                        .toplevel_fullscreen_output(toplevel.wl_surface())
+                        .is_some();
+                    let fullscreen_output = self
+                        .toplevel_fullscreen_output(toplevel.wl_surface())
+                        .cloned()
+                        .flatten();
+                    let client_size = (rect.w.max(1), rect.h.max(1));
+                    state.size = Some(client_size.into());
+                    state.bounds = Some(client_size.into());
+                    if is_fullscreen || self.managed_fullscreen {
+                        state.states.set(xdg_toplevel::State::Fullscreen);
+                        state.states.unset(xdg_toplevel::State::Maximized);
+                    } else {
+                        state.states.set(xdg_toplevel::State::Maximized);
+                        state.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
+                    state.fullscreen_output = fullscreen_output;
                 }
                 if is_active {
                     state.states.set(xdg_toplevel::State::Activated);
                 } else {
                     state.states.unset(xdg_toplevel::State::Activated);
                 }
-                state.fullscreen_output = fullscreen_output;
             });
             window.set_activated(is_active);
             toplevel.send_pending_configure();
