@@ -49,7 +49,8 @@
           };
 
           nativeLibs = with pkgs; [
-            gtk3
+            gtk4
+            libadwaita
             libGL
             libgbm
             libinput
@@ -59,6 +60,19 @@
             systemdLibs
             vulkan-loader
             wayland
+          ];
+
+          gtkRuntime = with pkgs; [
+            cairo
+            gdk-pixbuf
+            glib
+            graphene
+            gsettings-desktop-schemas
+            gtk4
+            harfbuzz
+            hicolor-icon-theme
+            libadwaita
+            pango
           ];
 
           westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
@@ -126,6 +140,8 @@
           };
 
           nativeLibs = with pkgs; [
+            gtk4
+            libadwaita
             libGL
             libgbm
             libinput
@@ -135,6 +151,19 @@
             systemdLibs
             vulkan-loader
             wayland
+          ];
+
+          gtkRuntime = with pkgs; [
+            cairo
+            gdk-pixbuf
+            glib
+            graphene
+            gsettings-desktop-schemas
+            gtk4
+            harfbuzz
+            hicolor-icon-theme
+            libadwaita
+            pango
           ];
 
           westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
@@ -179,6 +208,8 @@
 
           devToolPath = lib.makeBinPath (devTools ++ smokeTools);
           nativeLibraryPath = lib.makeLibraryPath nativeLibs;
+          gtkTypelibPath = lib.makeSearchPath "lib/girepository-1.0" gtkRuntime;
+          gtkDataDirs = lib.makeSearchPath "share" gtkRuntime;
           nativePkgConfigPath = lib.concatStringsSep ":" [
             (lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs)
             (lib.makeSearchPath "lib/pkgconfig" nativeLibs)
@@ -227,6 +258,8 @@
 
               export PATH="${sessionSwitcherPython}/bin:${devToolPath}:$PATH"
               export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
+              export GI_TYPELIB_PATH="${gtkTypelibPath}:''${GI_TYPELIB_PATH:-}"
+              export XDG_DATA_DIRS="${gtkDataDirs}:''${XDG_DATA_DIRS:-}"
               export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
               export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
               export MANIFOLD_DEV_SHELL=1
@@ -236,8 +269,10 @@
               import dbus.mainloop.glib
               import gi
 
-              gi.require_version("Gtk", "3.0")
-              from gi.repository import Gtk  # noqa: F401
+              gi.require_version("Gdk", "4.0")
+              gi.require_version("Gtk", "4.0")
+              gi.require_version("Adw", "1")
+              from gi.repository import Adw, Gdk, Gtk  # noqa: F401
               PY
 
               if [[ -z "''${WAYLAND_DISPLAY:-}" && -z "''${DISPLAY:-}" ]]; then

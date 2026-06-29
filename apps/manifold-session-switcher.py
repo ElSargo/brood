@@ -9,32 +9,12 @@ import gi
 
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
-force_gtk3 = os.environ.get("MANIFOLD_SESSION_SWITCHER_FORCE_GTK3") == "1"
-disable_adwaita = os.environ.get("MANIFOLD_SESSION_SWITCHER_DISABLE_ADWAITA") == "1"
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
-try:
-    if force_gtk3:
-        raise ValueError("GTK3 fallback forced")
-    gi.require_version("Gdk", "4.0")
-    gi.require_version("Gtk", "4.0")
-    from gi.repository import Gdk, Gio, GLib, Gtk, Pango
-
-    try:
-        if disable_adwaita:
-            raise ValueError("libadwaita disabled")
-        gi.require_version("Adw", "1")
-        from gi.repository import Adw
-    except (ImportError, ValueError):
-        Adw = None
-
-    GTK4 = True
-except (ImportError, ValueError):
-    Adw = None
-    gi.require_version("Gdk", "3.0")
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import Gdk, Gio, GLib, Gtk, Pango
-
-    GTK4 = False
+GTK4 = True
 
 
 APP_ID = "org.manifold.SessionSwitcher"
