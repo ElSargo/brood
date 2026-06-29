@@ -30,6 +30,47 @@ The environment should include:
 
 The first version can be pragmatic and host-dependent. The important goal is that a future contributor can reproduce the compositor workspace without rediscovering the dependency chain.
 
+## Nix Flake Shape
+
+The stock flake output should stay app-sized by default:
+
+```bash
+nix run github:ElSargo/manifold
+```
+
+That path resolves to the packaged `manifoldd` app. It is the output to cache
+and download when the goal is just to run Manifold.
+
+The development-oriented outputs are explicit:
+
+```bash
+nix run github:ElSargo/manifold#dev-workflow
+nix run github:ElSargo/manifold#dev-workflow-full
+nix develop github:ElSargo/manifold#full
+```
+
+Use `dev-workflow` for the smallest hosted app workflow. Use
+`dev-workflow-full` or `nix develop .#full` when Docker, Go, Firefox, and smoke
+tools are part of the work.
+
+The top-level `flake.nix` only routes systems and imports. Reusable profiles,
+package definitions, and workflow scripts live under `nix/`.
+
+Downstream flakes can compose Manifold into a personalized environment by using
+the exposed dev shell or package bundle:
+
+```nix
+{
+  devShells.${system}.default = pkgs.mkShell {
+    inputsFrom = [ manifold.devShells.${system}.full ];
+    packages = [
+      manifold.packages.${system}.dev-env-full
+      # personal tools go here
+    ];
+  };
+}
+```
+
 ## Nix Run Developer Workflow
 
 The target Nix workflow is a pasteable command that creates an editable checkout
@@ -39,21 +80,21 @@ and starts a normal Manifold development session:
 nix run github:ElSargo/manifold#dev-workflow
 ```
 
-The package clones the Manifold repository into
+The app-sized workflow package clones the Manifold repository into
 `$XDG_CACHE_HOME/manifold/dev-workflow/source` or
 `~/.cache/manifold/dev-workflow/source`, starts a normal `manifoldd run` session
 from that checkout, and opens a terminal in the checkout through Manifold's
 normal hosted-app path.
 
-Before launching Manifold, the workflow builds every `examples/wasm-*` crate for
-`wasm32-unknown-unknown` in release mode. This produces the WASM artifacts that
-the checked-in `manifold.toml` refers to, so the one-liner starts with the same
-module/startup config as a normal local Manifold run.
+Before launching Manifold, the workflow installs the packaged `wasm-examples`
+artifacts into the checkout paths that the checked-in `manifold.toml` refers to.
+The WASM build is therefore cacheable through Nix/Cachix and the app workflow no
+longer needs to download a Rust toolchain just to start.
 
 The package-built binary comes from the checked-in crate2nix expression
 generated from `Cargo.lock`. The Manifold process deliberately bypasses
 configured session runners because the Nix package already provides the runtime
-and development tools for this entry point.
+for this entry point.
 
 The cached checkout is intentionally writable and reused between runs. The
 workflow should not reset local edits in that checkout. To point the one-liner at
@@ -61,6 +102,6 @@ another repository, branch, checkout directory, or startup client, set
 `MANIFOLD_DEV_REPO_URL`, `MANIFOLD_DEV_REF`, `MANIFOLD_DEV_SOURCE_DIR`, or
 `MANIFOLD_DEV_CLIENT` before running the package.
 
-This workflow is for host-visible manual development. Automated graphical
-behavior tests should still use the built-in nested test CLI; for exact
-`manifoldd test nested` arguments, see `crates/manifoldd/src/main.rs`.
+This workflow is for host-visible manual app use. Automated graphical behavior
+tests should still use the built-in nested test CLI; for exact `manifoldd test
+nested` arguments, see `crates/manifoldd/src/main.rs`.
