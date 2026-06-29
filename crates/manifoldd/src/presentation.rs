@@ -42,7 +42,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    layout::{LayoutLeafKind, LayoutRect},
+    layout::{LayoutItemKind, LayoutRect},
     state::{Manifold, PresentationStatus, SESSION_OUTPUT_REFRESH_MILLIHZ},
     winit_presenter::{
         PresenterBackend, PresenterEvent, PresenterEventSource, PresenterRuntime,
@@ -562,22 +562,32 @@ fn render_presenter_frame_with_capture(
 fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
     const PLACEHOLDER_FILL: [f32; 4] = [0.08, 0.12, 0.15, 0.92];
     const PLACEHOLDER_INSET: [f32; 4] = [0.12, 0.18, 0.22, 0.86];
+    const HANDLE: [f32; 4] = [0.32, 0.36, 0.40, 0.95];
+    const CHROME: [f32; 4] = [0.12, 0.14, 0.16, 0.80];
+    const OVERLAY: [f32; 4] = [0.08, 0.10, 0.12, 0.62];
     const BORDER: [f32; 4] = [0.22, 0.30, 0.36, 1.0];
     const ACTIVE_BORDER: [f32; 4] = [0.36, 0.64, 0.78, 1.0];
 
     let mut elements = Vec::new();
-    for mut region in state.layout.resolve(state.presentation_layout_size()) {
-        region.rect.x += state.left_panel_reserved_width();
-        let active_session_placeholder =
-            region.kind == LayoutLeafKind::Placeholder
-                || !state.layout_leaf_has_active_session_window(region.leaf);
-        if active_session_placeholder {
-            push_rect(&mut elements, inset(region.rect, 10), PLACEHOLDER_FILL);
-            push_rect(&mut elements, inset(region.rect, 18), PLACEHOLDER_INSET);
+    for item in state.resolved_layout_items() {
+        let rect = state.resolved_layout_item_rect(*item);
+        match item.kind {
+            LayoutItemKind::Placeholder => {
+                push_rect(&mut elements, inset(rect, 10), PLACEHOLDER_FILL);
+                push_rect(&mut elements, inset(rect, 18), PLACEHOLDER_INSET);
+            }
+            LayoutItemKind::Handle => push_rect(&mut elements, rect, HANDLE),
+            LayoutItemKind::Chrome => push_rect(&mut elements, rect, CHROME),
+            LayoutItemKind::Overlay => push_rect(&mut elements, rect, OVERLAY),
+            LayoutItemKind::Pane { .. } => {}
         }
 
-        let color = if region.active { ACTIVE_BORDER } else { BORDER };
-        push_border(&mut elements, region.rect, 1, color);
+        let color = if state.resolved_layout_item_active(*item) {
+            ACTIVE_BORDER
+        } else {
+            BORDER
+        };
+        push_border(&mut elements, rect, 1, color);
     }
     elements
 }
@@ -671,8 +681,7 @@ fn send_active_client_frame_callbacks(
             .elements()
             .filter(|window| state.window_visible_in_presentation(window))
             .filter(|window| {
-                active_surface.as_ref()
-                    != Manifold::window_toplevel_surface(window).as_ref()
+                active_surface.as_ref() != Manifold::window_toplevel_surface(window).as_ref()
             })
             .cloned(),
     );

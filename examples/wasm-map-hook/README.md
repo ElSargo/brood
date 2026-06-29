@@ -16,4 +16,7 @@ manifoldd run \
   --wasm-map-hook examples/wasm-map-hook/target/wasm32-unknown-unknown/release/manifold_wasm_map_hook.wasm
 ```
 
-The sample policy keeps the first visible pane as the left master pane and places every other visible pane in a right-side stack.
+This example targets the current experimental map hook and returns candidate
+resolved layout items. The layout model is documented in `docs/layout-mould.md`;
+the host validates the candidate layout and owns rendering, hit testing, focus,
+and input forwarding.

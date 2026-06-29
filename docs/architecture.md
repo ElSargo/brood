@@ -57,7 +57,7 @@ WASM modules should interact with Manifold through a stable workspace/app API ra
 
 See [WASM Integration](wasm-integration.md) for the planned host boundary, module roles, hot reload workflow, and milestones.
 
-See [Layout Mould](layout-mould.md) for the planned split between reloadable layout policy and native presentation rendering.
+See [Resolved Layout](layout-mould.md) for the planned boundary between WASM-driven layout policy and native presentation execution.
 
 See [Session Environments](session-environments.md) for the planned `enter`,
 `show`, command-context, managed filesystem/runtime IPC, network namespace, and

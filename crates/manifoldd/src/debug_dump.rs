@@ -14,6 +14,7 @@ use smithay::{
     },
 };
 
+use crate::layout::LayoutItemKind;
 use crate::{control, presentation, state::Manifold};
 
 #[derive(Clone, Copy)]
@@ -138,13 +139,40 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let resolved_items = state
+        .resolved_layout_items()
+        .iter()
+        .map(|item| {
+            let kind = match item.kind {
+                LayoutItemKind::Pane { pane } => json!({ "type": "pane", "pane": pane }),
+                LayoutItemKind::Placeholder => json!({ "type": "placeholder" }),
+                LayoutItemKind::Handle => json!({ "type": "handle" }),
+                LayoutItemKind::Chrome => json!({ "type": "chrome" }),
+                LayoutItemKind::Overlay => json!({ "type": "overlay" }),
+            };
+            let rect = state.resolved_layout_item_rect(*item);
+            json!({
+                "id": item.id.0,
+                "kind": kind,
+                "z": item.z,
+                "rect": { "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h },
+                "transform": {
+                    "offset": { "u": item.transform.offset.u, "v": item.transform.offset.v },
+                    "size": { "u": item.transform.size.u, "v": item.transform.size.v },
+                },
+                "active": state.resolved_layout_item_active(*item),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "status": status,
         "windows": windows,
         "layout": {
+            "source": state.resolved_layout_source_name(),
             "active_rect": state.active_layout_rect().map(|rect| json!({
                 "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h
             })),
+            "items": resolved_items,
             "managed_fullscreen": state.managed_fullscreen(),
         }
     }))

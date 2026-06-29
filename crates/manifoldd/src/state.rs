@@ -46,12 +46,14 @@ use crate::{
     MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     layout::{
-        LayoutAction, LayoutAxis, LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState,
+        HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind,
+        LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
+        LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
     wasm_key::WasmKeyHandler,
-    wasm_map::{MapHookInput, MapHookOutcome, MapHookResponse, MapLayoutPatch, WasmMapHook},
+    wasm_map::{MapHookInput, MapHookOutcome, MapHookResponse, WasmMapHook},
     wasm_test::{
         TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request,
     },
@@ -121,6 +123,18 @@ enum PanelEdge {
 pub enum InputMode {
     Passthrough,
     Normal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedLayoutSource {
+    NativeFallback,
+    WasmPolicy,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPresentationHit {
+    layout_hit: HitResult,
+    window_hit: Option<(Window, Point<i32, Logical>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -271,13 +285,15 @@ pub struct Manifold {
     pub detach_requested: bool,
     pub browsers: BrowserManager,
     pub layout: LayoutState,
+    accepted_resolved_layout: ResolvedLayout,
+    resolved_layout_source: ResolvedLayoutSource,
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
     active_toplevel_surface: Option<WlSurface>,
     pointer_hover_toplevel_surface: Option<WlSurface>,
     pending_pointer_focus_surface: Option<WlSurface>,
-    window_layout_leaves: Vec<(WlSurface, LayoutLeafId)>,
+    layout_leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
@@ -382,13 +398,15 @@ impl Manifold {
             detach_requested: false,
             browsers: BrowserManager::default(),
             layout: LayoutState::default(),
+            accepted_resolved_layout: ResolvedLayout::empty(),
+            resolved_layout_source: ResolvedLayoutSource::NativeFallback,
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
             active_toplevel_surface: None,
             pointer_hover_toplevel_surface: None,
             pending_pointer_focus_surface: None,
-            window_layout_leaves: Vec::new(),
+            layout_leaf_selected_panes: Vec::new(),
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
@@ -780,20 +798,264 @@ impl Manifold {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(Window, Point<i32, Logical>)> {
-        if let Some(active_window) = self.active_window() {
-            if let Some(location) = self.window_hit_location(&active_window, pos) {
-                return Some((active_window, location));
-            }
-        }
-
-        self.space
+        if let Some(panel_hit) = self
+            .space
             .elements()
-            .filter(|window| self.window_visible_in_presentation(window))
+            .filter(|window| {
+                Manifold::window_toplevel_surface(window)
+                    .is_some_and(|surface| self.panel_rect_for_surface(&surface).is_some())
+            })
             .filter_map(|window| {
                 self.window_hit_location(window, pos)
                     .map(|location| (window.clone(), location))
             })
             .last()
+        {
+            return Some(panel_hit);
+        }
+
+        if let Some(active_window) = self.active_window()
+            && let Some(surface) = Manifold::window_toplevel_surface(&active_window)
+            && self.toplevel_fullscreen_output(&surface).is_some()
+            && let Some(location) = self.window_hit_location(&active_window, pos)
+        {
+            return Some((active_window, location));
+        }
+
+        let content_rect = self.content_rect();
+        if !content_rect.contains_f64(pos.x, pos.y) {
+            return None;
+        }
+        let point = LocalPoint::from_pixel_in_rect(pos.x, pos.y, content_rect);
+        for hit in self.resolved_effective_hit_stack(point, pos) {
+            match hit.layout_hit.kind {
+                LayoutItemKind::Pane { .. } => {
+                    if let Some((window, location)) = hit.window_hit {
+                        return Some((window, location));
+                    }
+                }
+                LayoutItemKind::Placeholder
+                | LayoutItemKind::Handle
+                | LayoutItemKind::Chrome
+                | LayoutItemKind::Overlay => return None,
+            }
+        }
+        None
+    }
+
+    pub fn log_pointer_click_focus_debug(
+        &self,
+        phase: &'static str,
+        button_code: u32,
+        pos: Point<f64, Logical>,
+        target_surface: Option<&WlSurface>,
+        focus_surface: Option<&WlSurface>,
+    ) {
+        let content_rect = self.content_rect();
+        let local_point = content_rect
+            .contains_f64(pos.x, pos.y)
+            .then(|| LocalPoint::from_pixel_in_rect(pos.x, pos.y, content_rect));
+        let local_point_text = local_point.map_or_else(
+            || "outside-content".to_string(),
+            |point| format!("{:.4},{:.4}", point.u, point.v),
+        );
+        let hit_stack = local_point.map_or_else(
+            || "outside-content".to_string(),
+            |point| self.resolved_effective_hit_stack_debug_summary(point, pos),
+        );
+        let raw_hit_stack = local_point.map_or_else(
+            || "outside-content".to_string(),
+            |point| self.resolved_raw_hit_stack_debug_summary(point),
+        );
+        let hit_rejects = local_point.map_or_else(
+            || "outside-content".to_string(),
+            |point| self.resolved_hit_rejections_debug_summary(point, pos),
+        );
+
+        let message = format!(
+            "pointer click focus diagnostics phase={} button={} pointer={:.1},{:.1} content_rect={} local_point={} hit_stack=[{}] raw_layout_hit_stack=[{}] hit_rejects=[{}] target_window=[{}] selected_focus=[{}] active_window=[{}] resolved_layout_source={} resolved_layout=[{}]",
+            phase,
+            button_code,
+            pos.x,
+            pos.y,
+            layout_rect_debug(content_rect),
+            local_point_text,
+            hit_stack,
+            raw_hit_stack,
+            hit_rejects,
+            self.surface_click_debug_summary(target_surface),
+            self.surface_click_debug_summary(focus_surface),
+            self.surface_click_debug_summary(self.active_toplevel_surface.as_ref()),
+            self.resolved_layout_source_name(),
+            self.resolved_layout_debug_summary(),
+        );
+        eprintln!("{message}");
+        warn!(target: "manifoldd::pointer_focus", %message);
+    }
+
+    fn resolved_effective_hit_stack(
+        &self,
+        point: LocalPoint,
+        pos: Point<f64, Logical>,
+    ) -> Vec<ResolvedPresentationHit> {
+        self.accepted_resolved_layout
+            .hit_stack(point)
+            .into_iter()
+            .filter_map(|layout_hit| match layout_hit.kind {
+                LayoutItemKind::Pane { pane } => {
+                    let surface = self.surface_for_pane(pane)?;
+                    let window = self.window_for_toplevel_surface(&surface)?;
+                    let location = self.window_hit_location(&window, pos)?;
+                    Some(ResolvedPresentationHit {
+                        layout_hit,
+                        window_hit: Some((window, location)),
+                    })
+                }
+                LayoutItemKind::Placeholder
+                | LayoutItemKind::Handle
+                | LayoutItemKind::Chrome
+                | LayoutItemKind::Overlay => Some(ResolvedPresentationHit {
+                    layout_hit,
+                    window_hit: None,
+                }),
+            })
+            .collect()
+    }
+
+    fn resolved_effective_hit_stack_debug_summary(
+        &self,
+        point: LocalPoint,
+        pos: Point<f64, Logical>,
+    ) -> String {
+        let hits = self.resolved_effective_hit_stack(point, pos);
+        if hits.is_empty() {
+            return "none".to_string();
+        }
+        hits.into_iter()
+            .map(|hit| {
+                let target = hit
+                    .window_hit
+                    .as_ref()
+                    .and_then(|(window, _)| Manifold::window_toplevel_surface(window))
+                    .map(|surface| self.surface_click_debug_summary(Some(&surface)))
+                    .unwrap_or_else(|| "none".to_string());
+                format!("{},target={}", layout_hit_debug(hit.layout_hit), target)
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn resolved_raw_hit_stack_debug_summary(&self, point: LocalPoint) -> String {
+        let hits = self.accepted_resolved_layout.hit_stack(point);
+        if hits.is_empty() {
+            return "none".to_string();
+        }
+        hits.into_iter()
+            .map(layout_hit_debug)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn resolved_hit_rejections_debug_summary(
+        &self,
+        point: LocalPoint,
+        pos: Point<f64, Logical>,
+    ) -> String {
+        let rejects = self
+            .accepted_resolved_layout
+            .hit_stack(point)
+            .into_iter()
+            .filter_map(|hit| self.resolved_hit_rejection_debug(hit, pos))
+            .collect::<Vec<_>>();
+        if rejects.is_empty() {
+            return "none".to_string();
+        }
+        rejects.join(" | ")
+    }
+
+    fn resolved_hit_rejection_debug(
+        &self,
+        hit: HitResult,
+        pos: Point<f64, Logical>,
+    ) -> Option<String> {
+        let LayoutItemKind::Pane { pane } = hit.kind else {
+            return None;
+        };
+        let reason = match self.surface_for_pane(pane) {
+            None => "missing-surface".to_string(),
+            Some(surface) => {
+                let surface_summary = self.surface_click_debug_summary(Some(&surface));
+                match self.window_for_toplevel_surface(&surface) {
+                    None => format!("hidden-window,{surface_summary}"),
+                    Some(window) if self.window_hit_location(&window, pos).is_none() => {
+                        format!("surface-miss,{surface_summary}")
+                    }
+                    Some(_) => return None,
+                }
+            }
+        };
+        Some(format!("{},reason={}", layout_hit_debug(hit), reason))
+    }
+
+    fn resolved_layout_debug_summary(&self) -> String {
+        if self.accepted_resolved_layout.items.is_empty() {
+            return "empty".to_string();
+        }
+        self.accepted_resolved_layout
+            .items
+            .iter()
+            .map(|item| {
+                format!(
+                    "id={},kind={},z={:.3},rect={},offset={:.4},{:.4},size={:.4},{:.4},input={:?},active={}",
+                    item.id.0,
+                    layout_item_kind_debug(item.kind),
+                    item.z,
+                    layout_rect_debug(self.resolved_layout_item_rect(*item)),
+                    item.transform.offset.u,
+                    item.transform.offset.v,
+                    item.transform.size.u,
+                    item.transform.size.v,
+                    item.input,
+                    self.resolved_layout_item_active(*item)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn surface_click_debug_summary(&self, surface: Option<&WlSurface>) -> String {
+        let Some(surface) = surface else {
+            return "none".to_string();
+        };
+        let surface_id = crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()));
+        let pane = self
+            .pane_for_toplevel_surface(surface)
+            .map_or_else(|| "none".to_string(), |pane| pane.to_string());
+        let session = self
+            .session_for_toplevel_surface(surface)
+            .unwrap_or(SurfaceSessionId(1))
+            .raw();
+        let rect = self
+            .layout_rect_for_toplevel_surface(surface)
+            .map_or_else(|| "none".to_string(), layout_rect_debug);
+        let app_id = toplevel_app_id(surface)
+            .map(|value| crate::presentation::sanitize_status_value(&value))
+            .unwrap_or_else(|| "none".to_string());
+        let title = toplevel_title(surface)
+            .map(|value| crate::presentation::sanitize_status_value(&value))
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "surface={},pane={},session={},visible={},content_layout={},focusable={},rect={},app_id={},title={}",
+            surface_id,
+            pane,
+            session,
+            self.surface_visible_in_presentation(surface),
+            self.surface_participates_in_resolved_layout(surface),
+            self.surface_can_receive_focus(surface),
+            rect,
+            app_id,
+            title
+        )
     }
 
     fn window_hit_location(
@@ -814,10 +1076,10 @@ impl Manifold {
 
     pub fn first_window_center(&self) -> Option<Point<f64, Logical>> {
         self.space.elements().find_map(|window| {
-            let bbox = self.space.element_bbox(window)?.to_f64();
+            let rect = self.window_layout_rect(window)?;
             Some(Point::from((
-                bbox.loc.x + bbox.size.w / 2.0,
-                bbox.loc.y + bbox.size.h / 2.0,
+                f64::from(rect.x) + f64::from(rect.w.max(1)) / 2.0,
+                f64::from(rect.y) + f64::from(rect.h.max(1)) / 2.0,
             )))
         })
     }
@@ -881,7 +1143,6 @@ impl Manifold {
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
-        let client_leaf_active = self.layout.active_kind() == Some(LayoutLeafKind::Client);
         self.space.elements().for_each(|window| {
             let Some(toplevel) = window.toplevel() else {
                 return;
@@ -897,7 +1158,8 @@ impl Manifold {
                 || self.presentation_size(),
                 |rect| (rect.w.max(1), rect.h.max(1)),
             );
-            let is_active = client_leaf_active && active_surface == Some(toplevel.wl_surface());
+            let is_active = active_surface == Some(toplevel.wl_surface())
+                && self.surface_can_receive_focus(toplevel.wl_surface());
             toplevel.with_pending_state(|state| {
                 state.size = Some(client_size.into());
                 state.bounds = Some(client_size.into());
@@ -935,13 +1197,13 @@ impl Manifold {
         self.window_surface_sessions
             .push((surface.clone(), self.active_surface_session));
         let pane = self.register_toplevel_pane(surface);
-        let leaf = if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
-            self.layout.occupy_active_leaf()
-        } else {
-            Some(self.layout.active_leaf())
-        };
-        if let Some(leaf) = leaf {
-            self.assign_pane_to_leaf(pane, leaf);
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
+                self.layout.occupy_active_leaf();
+            }
+            if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
+                self.set_layout_leaf_selected_pane(self.layout.active_leaf(), pane);
+            }
         }
         self.apply_map_hook_for_pending_pane(pane)
     }
@@ -974,6 +1236,7 @@ impl Manifold {
         self.window_surface_sessions
             .iter()
             .filter(|(_, session)| *session == self.active_surface_session)
+            .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
             .filter_map(|(surface, _)| self.pane_for_toplevel_surface(surface))
             .fold(Vec::new(), |mut panes, pane| {
                 if !panes.contains(&pane) {
@@ -983,31 +1246,42 @@ impl Manifold {
             })
     }
 
-    fn leaf_for_pane(&self, target_pane: u64) -> Option<LayoutLeafId> {
-        let surface = self.surface_for_pane(target_pane)?;
-        self.leaf_for_toplevel_surface(&surface)
-    }
-
     fn leaf_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutLeafId> {
-        self.window_layout_leaves
+        let pane = self.pane_for_toplevel_surface(surface)?;
+        self.layout_leaf_selected_panes
             .iter()
             .rev()
-            .find_map(|(assigned_surface, leaf)| (assigned_surface == surface).then_some(*leaf))
+            .find_map(|(leaf, selected)| (*selected == pane).then_some(*leaf))
     }
 
-    fn assign_pane_to_leaf(&mut self, pane: u64, leaf: LayoutLeafId) -> bool {
-        let Some(surface) = self.surface_for_pane(pane) else {
-            return false;
-        };
-        self.window_layout_leaves
-            .retain(|(assigned_surface, _)| assigned_surface != &surface);
-        self.window_layout_leaves.push((surface, leaf));
-        true
+    fn selected_pane_for_layout_leaf(&self, target_leaf: LayoutLeafId) -> Option<u64> {
+        self.layout_leaf_selected_panes
+            .iter()
+            .rev()
+            .find_map(|(leaf, pane)| (*leaf == target_leaf).then_some(*pane))
+    }
+
+    fn set_layout_leaf_selected_pane(&mut self, leaf: LayoutLeafId, pane: u64) {
+        self.layout_leaf_selected_panes
+            .retain(|(selected_leaf, _)| *selected_leaf != leaf);
+        self.layout_leaf_selected_panes.push((leaf, pane));
+    }
+
+    fn active_session_content_surface_for_pane(&self, pane: u64) -> Option<WlSurface> {
+        let surface = self.surface_for_pane(pane)?;
+        (self
+            .session_for_toplevel_surface(&surface)
+            .unwrap_or(SurfaceSessionId(1))
+            == self.active_surface_session
+            && self.surface_participates_in_resolved_layout(&surface)
+            && self.window_for_any_toplevel_surface(&surface).is_some())
+        .then_some(surface)
     }
 
     fn apply_map_hook_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
         let visible_panes = self.active_surface_session_panes();
         let Some(handler) = self.wasm_map_hook.as_mut() else {
+            self.refresh_resolved_layout_from_native_policy();
             return self.surface_for_pane(pending_pane);
         };
         let input = MapHookInput {
@@ -1021,11 +1295,15 @@ impl Manifold {
                     ?err,
                     pending_pane, "WASM map hook failed; using native placement"
                 );
+                self.refresh_resolved_layout_from_native_policy();
                 return self.surface_for_pane(pending_pane);
             }
         };
         match outcome {
-            MapHookOutcome::Abstain => self.surface_for_pane(pending_pane),
+            MapHookOutcome::Abstain => {
+                self.refresh_resolved_layout_from_native_policy();
+                self.surface_for_pane(pending_pane)
+            }
             MapHookOutcome::Response(response) => self
                 .apply_map_hook_response(pending_pane, response)
                 .or_else(|| self.surface_for_pane(pending_pane)),
@@ -1044,102 +1322,123 @@ impl Manifold {
                     pending_pane,
                     reason, "WASM map hook rejected map; using native placement"
                 );
+                self.refresh_resolved_layout_from_native_policy();
                 None
             }
-            MapHookResponse::Patch { patches } => self.apply_map_hook_patches(patches),
-            MapHookResponse::ReplaceVisibleTree { root, focus } => {
-                self.apply_map_hook_visible_tree(root, focus)
+            MapHookResponse::ResolvedLayout { layout, focus } => {
+                self.apply_map_hook_resolved_layout(layout, focus)
             }
         }
     }
 
-    fn apply_map_hook_patches(&mut self, patches: Vec<MapLayoutPatch>) -> Option<WlSurface> {
-        let mut focus_surface = None;
-        for patch in patches {
-            match patch {
-                MapLayoutPatch::PlacePane { pane, after, focus } => {
-                    let Some(target_leaf) = after
-                        .and_then(|anchor| self.leaf_for_pane(anchor))
-                        .or_else(|| Some(self.layout.active_leaf()))
-                    else {
-                        continue;
-                    };
-                    if self.assign_pane_to_leaf(pane, target_leaf) {
-                        if focus {
-                            self.layout.set_active_leaf(target_leaf);
-                            focus_surface = self.surface_for_pane(pane);
-                        }
-                    }
-                }
-            }
-        }
-        self.reconfigure_focus_stack();
-        focus_surface
-    }
-
-    fn apply_map_hook_visible_tree(
+    fn apply_map_hook_resolved_layout(
         &mut self,
-        root: crate::layout::VisibleLayoutNode,
+        layout: ResolvedLayout,
         focus: Option<u64>,
     ) -> Option<WlSurface> {
-        let expected = self.active_surface_session_panes();
-        let mut next_layout = self.layout.clone();
-        let applied = match next_layout.replace_visible_tree(&root, focus) {
-            Ok(applied) => applied,
+        let valid_panes = self.active_surface_session_panes();
+        let layout = match layout.validate_for_panes(&valid_panes) {
+            Ok(layout) => layout,
             Err(err) => {
                 warn!(
                     ?err,
-                    "WASM map hook returned invalid visible tree; using native placement"
+                    "WASM map hook returned invalid resolved layout; using native placement"
                 );
+                self.refresh_resolved_layout_from_native_policy();
                 return None;
             }
         };
 
-        let mut assigned = applied
-            .assignments
-            .iter()
-            .map(|assignment| assignment.pane)
-            .collect::<Vec<_>>();
-        assigned.sort_unstable();
-        let mut expected_sorted = expected;
-        expected_sorted.sort_unstable();
-        if assigned != expected_sorted {
-            warn!(
-                assigned = ?assigned,
-                expected = ?expected_sorted,
-                "WASM map hook visible tree must reference exactly the active session panes"
-            );
-            return None;
-        }
-
-        let mut next_window_layout_leaves = self
-            .window_layout_leaves
-            .iter()
-            .filter(|(surface, _)| {
-                self.session_for_toplevel_surface(surface)
-                    .unwrap_or(SurfaceSessionId(1))
-                    != self.active_surface_session
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for assignment in applied.assignments {
-            let Some(surface) = self.surface_for_pane(assignment.pane) else {
-                warn!(
-                    pane = assignment.pane,
-                    "WASM map hook referenced pane without a surface"
-                );
-                return None;
-            };
-            next_window_layout_leaves.push((surface, assignment.leaf));
-        }
-
-        let focus_surface = applied
-            .focused_pane
+        let focus_surface = focus
+            .filter(|pane| layout.pane_item(*pane).is_some())
             .and_then(|pane| self.surface_for_pane(pane));
-        self.layout = next_layout;
-        self.window_layout_leaves = next_window_layout_leaves;
+        self.accepted_resolved_layout = layout;
+        self.resolved_layout_source = ResolvedLayoutSource::WasmPolicy;
         self.reconfigure_focus_stack();
         focus_surface
+    }
+
+    fn refresh_resolved_layout_from_native_policy(&mut self) {
+        self.repair_native_layout_leaf_selections();
+        let layout = self.native_fallback_resolved_layout();
+        match layout.validate_for_panes(&self.active_surface_session_panes()) {
+            Ok(layout) => {
+                self.accepted_resolved_layout = layout;
+                self.resolved_layout_source = ResolvedLayoutSource::NativeFallback;
+            }
+            Err(err) => {
+                warn!(?err, "native fallback produced invalid resolved layout");
+                self.accepted_resolved_layout = ResolvedLayout::empty();
+                self.resolved_layout_source = ResolvedLayoutSource::NativeFallback;
+            }
+        }
+    }
+
+    fn repair_native_layout_leaf_selections(&mut self) {
+        let leaves = self
+            .layout
+            .resolve(self.presentation_layout_size())
+            .into_iter()
+            .filter(|region| region.kind == LayoutLeafKind::Client)
+            .map(|region| region.leaf)
+            .collect::<Vec<_>>();
+        let panes = self.active_surface_session_panes();
+        let old_selections = self.layout_leaf_selected_panes.clone();
+        let mut used = Vec::new();
+        let mut next_selections = Vec::new();
+
+        for leaf in leaves {
+            let preferred = old_selections
+                .iter()
+                .rev()
+                .find_map(|(selected_leaf, pane)| (*selected_leaf == leaf).then_some(*pane));
+            let selected = preferred
+                .and_then(|pane| first_available_pane_from(&panes, pane, &used, 0))
+                .or_else(|| panes.iter().copied().find(|pane| !used.contains(pane)));
+            if let Some(pane) = selected {
+                used.push(pane);
+                next_selections.push((leaf, pane));
+            }
+        }
+
+        self.layout_leaf_selected_panes = next_selections;
+    }
+
+    fn native_fallback_resolved_layout(&self) -> ResolvedLayout {
+        let bounds = self.presentation_layout_size();
+        let mut items = Vec::new();
+        let mut z = 0.0;
+        for region in self.layout.resolve(bounds) {
+            let pane = self
+                .selected_pane_for_layout_leaf(region.leaf)
+                .filter(|pane| {
+                    region.kind == LayoutLeafKind::Client
+                        && self
+                            .active_session_content_surface_for_pane(*pane)
+                            .is_some()
+                });
+            let Some(pane) = pane else {
+                items.push(ResolvedLayoutItem {
+                    id: LayoutItemId(1_000_000 + region.leaf.raw()),
+                    kind: LayoutItemKind::Placeholder,
+                    z,
+                    transform: LocalTransform::from_pixel_rect(region.rect, bounds),
+                    input: InputBehavior::Hit,
+                });
+                z += 1.0;
+                continue;
+            };
+
+            items.push(ResolvedLayoutItem {
+                id: LayoutItemId(pane),
+                kind: LayoutItemKind::Pane { pane },
+                z,
+                transform: LocalTransform::from_pixel_rect(region.rect, bounds),
+                input: InputBehavior::Pane,
+            });
+            z += 1.0;
+        }
+        ResolvedLayout { items }
     }
 
     pub fn active_surface_session(&self) -> SurfaceSessionId {
@@ -1154,6 +1453,7 @@ impl Manifold {
             return false;
         }
         self.active_surface_session = session;
+        self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -1374,8 +1674,6 @@ impl Manifold {
             .retain(|_, assigned_session| *assigned_session != session);
         self.window_surface_sessions
             .retain(|(_, assigned_session)| *assigned_session != session);
-        self.window_layout_leaves
-            .retain(|(surface, _)| !surfaces.iter().any(|closed| closed == surface));
         if self.active_surface_session == session {
             self.active_surface_session = self
                 .surface_session_interaction_order
@@ -1385,6 +1683,7 @@ impl Manifold {
                 .or_else(|| self.surface_sessions.first().copied())
                 .unwrap_or(SurfaceSessionId(1));
         }
+        self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -1439,6 +1738,7 @@ impl Manifold {
         }
         self.active_surface_session = session;
         self.record_surface_session_interaction(session);
+        self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -1463,6 +1763,7 @@ impl Manifold {
         self.active_surface_session =
             self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
         self.record_surface_session_interaction(self.active_surface_session);
+        self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -1485,6 +1786,7 @@ impl Manifold {
         ));
         self.active_surface_session = session;
         self.record_surface_session_interaction(session);
+        self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         session
     }
@@ -1511,19 +1813,65 @@ impl Manifold {
         let Some(surface) = Manifold::window_toplevel_surface(window) else {
             return false;
         };
-        if self
+        if self.surface_is_visible_presentation_member(&surface)
+            || self.surface_has_visible_panel(&surface)
+        {
+            return true;
+        }
+        if !self.window_belongs_to_active_surface_session(window) {
+            return false;
+        }
+        if self.toplevel_fullscreen_output(&surface).is_some() {
+            return true;
+        }
+        self.pane_for_toplevel_surface(&surface)
+            .is_some_and(|pane| self.accepted_resolved_layout.pane_item(pane).is_some())
+    }
+
+    fn surface_participates_in_resolved_layout(&self, surface: &WlSurface) -> bool {
+        !self
             .presentation_member_surfaces
             .iter()
-            .any(|member| member == &surface)
-        {
-            return self
+            .any(|member| member == surface)
+            && !self
                 .panel_reservations
                 .iter()
-                .rev()
-                .find(|panel| panel.surface == surface)
-                .is_none_or(|panel| panel.visible);
+                .any(|panel| panel.surface == *surface)
+    }
+
+    fn surface_is_visible_presentation_member(&self, surface: &WlSurface) -> bool {
+        if !self
+            .presentation_member_surfaces
+            .iter()
+            .any(|member| member == surface)
+        {
+            return false;
         }
-        self.window_belongs_to_active_surface_session(window)
+        self.panel_reservations
+            .iter()
+            .rev()
+            .find(|panel| panel.surface == *surface)
+            .is_none_or(|panel| panel.visible)
+    }
+
+    fn surface_has_visible_panel(&self, surface: &WlSurface) -> bool {
+        self.panel_reservations
+            .iter()
+            .rev()
+            .find(|panel| panel.surface == *surface)
+            .is_some_and(|panel| panel.visible)
+    }
+
+    fn surface_visible_in_presentation(&self, surface: &WlSurface) -> bool {
+        self.window_for_any_toplevel_surface(surface)
+            .as_ref()
+            .is_some_and(|window| self.window_visible_in_presentation(window))
+    }
+
+    fn surface_can_receive_focus(&self, surface: &WlSurface) -> bool {
+        self.surface_has_visible_pane_item(surface)
+            || self.surface_is_visible_presentation_member(surface)
+            || self.surface_has_visible_panel(surface)
     }
 
     pub fn presentation_visible_window_count(&self) -> usize {
@@ -1538,6 +1886,10 @@ impl Manifold {
             return None;
         }
         let surface = Manifold::window_toplevel_surface(window)?;
+        self.layout_rect_for_toplevel_surface(&surface)
+    }
+
+    fn layout_rect_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutRect> {
         if let Some(rect) = self.panel_rect_for_surface(&surface) {
             return Some(rect);
         }
@@ -1548,14 +1900,23 @@ impl Manifold {
                 )),
             );
         }
-        let leaf = self
-            .window_layout_leaves
-            .iter()
-            .rev()
-            .find_map(|(assigned_surface, leaf)| (assigned_surface == &surface).then_some(*leaf))?;
-        self.layout
-            .leaf_rect(leaf, self.presentation_layout_size())
-            .map(|rect| self.translate_content_rect(rect))
+        if !self.surface_participates_in_resolved_layout(surface) {
+            return None;
+        }
+        let pane = self.pane_for_toplevel_surface(surface)?;
+        let item = self.accepted_resolved_layout.pane_item(pane)?;
+        Some(self.translate_content_rect(item.pixel_rect(self.presentation_layout_size())))
+    }
+
+    fn surface_has_visible_pane_item(&self, surface: &WlSurface) -> bool {
+        if !self.surface_participates_in_resolved_layout(surface) {
+            return false;
+        }
+        if self.toplevel_fullscreen_output(surface).is_some() {
+            return true;
+        }
+        self.pane_for_toplevel_surface(surface)
+            .is_some_and(|pane| self.accepted_resolved_layout.pane_item(pane).is_some())
     }
 
     pub fn request_toplevel_fullscreen(
@@ -1601,38 +1962,8 @@ impl Manifold {
     }
 
     fn surface_for_layout_leaf(&self, target_leaf: LayoutLeafId) -> Option<WlSurface> {
-        self.window_layout_leaves
-            .iter()
-            .rev()
-            .find_map(|(surface, leaf)| {
-                (*leaf == target_leaf
-                    && self
-                        .session_for_toplevel_surface(surface)
-                        .unwrap_or(SurfaceSessionId(1))
-                        == self.active_surface_session)
-                    .then(|| surface.clone())
-            })
-    }
-
-    pub fn layout_leaf_has_active_session_window(&self, target_leaf: LayoutLeafId) -> bool {
-        self.window_layout_leaves.iter().any(|(surface, leaf)| {
-            *leaf == target_leaf
-                && self
-                    .session_for_toplevel_surface(surface)
-                    .unwrap_or(SurfaceSessionId(1))
-                    == self.active_surface_session
-                && self.window_for_any_toplevel_surface(surface).is_some()
-        })
-    }
-
-    fn focus_active_layout_leaf(&mut self) {
-        let active_surface = if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
-            self.surface_for_layout_leaf(self.layout.active_leaf())
-        } else {
-            None
-        };
-        self.focus_toplevel_surface(active_surface);
-        self.reconfigure_focus_stack();
+        self.selected_pane_for_layout_leaf(target_leaf)
+            .and_then(|pane| self.active_session_content_surface_for_pane(pane))
     }
 
     pub fn focus_toplevel_surface(&mut self, active_surface: Option<WlSurface>) {
@@ -1644,18 +1975,19 @@ impl Manifold {
         }
         if let Some(leaf) = active_surface
             .as_ref()
+            .filter(|surface| self.surface_participates_in_resolved_layout(surface))
             .and_then(|surface| self.leaf_for_toplevel_surface(surface))
         {
             self.layout.set_active_leaf(leaf);
         }
         self.active_toplevel_surface = active_surface.clone();
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            self.refresh_resolved_layout_from_native_policy();
+        }
         self.activate_window_exclusively(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
-        let keyboard_focus = if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
-            active_surface
-        } else {
-            None
-        };
+        let keyboard_focus =
+            active_surface.filter(|surface| self.surface_can_receive_focus(surface));
         self.seat
             .get_keyboard()
             .expect("keyboard")
@@ -1667,7 +1999,7 @@ impl Manifold {
             self.space
                 .elements()
                 .find(|window| {
-                    self.window_belongs_to_active_surface_session(window)
+                    self.window_visible_in_presentation(window)
                         && Manifold::window_toplevel_surface(window).as_ref() == Some(active)
                 })
                 .cloned()
@@ -2119,6 +2451,7 @@ impl Manifold {
             visible,
         });
         self.layout.left_dock_visible = visible;
+        self.repair_resolved_layout_for_current_inventory();
         self.reconfigure_focus_stack();
     }
 
@@ -2155,6 +2488,7 @@ impl Manifold {
         {
             self.presentation_member_surfaces.push(surface);
         }
+        self.repair_resolved_layout_for_current_inventory();
         self.reconfigure_focus_stack();
         Ok(grant_id)
     }
@@ -2289,6 +2623,7 @@ impl Manifold {
             .retain(|(assigned_surface, _)| assigned_surface != surface);
         self.window_surface_sessions
             .push((surface.clone(), session));
+        self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -2312,15 +2647,11 @@ impl Manifold {
         self.pointer_hover_toplevel_surface = surface;
     }
 
-    pub fn pointer_hover_toplevel_surface(&self) -> Option<WlSurface> {
-        self.pointer_hover_toplevel_surface.clone()
-    }
-
     pub fn cycle_focus(&mut self, direction: FocusDirection) -> bool {
         let windows = self
             .space
             .elements()
-            .filter(|window| self.window_belongs_to_active_surface_session(window))
+            .filter(|window| self.window_visible_in_presentation(window))
             .cloned()
             .collect::<Vec<_>>();
         let window_count = windows.len();
@@ -2346,31 +2677,114 @@ impl Manifold {
         true
     }
 
+    fn cycle_focus_in_active_layout_leaf(&mut self, direction: FocusDirection) -> bool {
+        let Some(active_surface) = self.active_toplevel_surface.clone() else {
+            return false;
+        };
+        if !self.surface_has_visible_pane_item(&active_surface) {
+            return false;
+        }
+        let Some(active_leaf) = self.leaf_for_toplevel_surface(&active_surface) else {
+            return false;
+        };
+        let Some(current_pane) = self.pane_for_toplevel_surface(&active_surface) else {
+            return false;
+        };
+        let excluded = self.selected_panes_for_other_layout_leaves(active_leaf);
+        let step = match direction {
+            FocusDirection::Next => 1,
+            FocusDirection::Previous => -1,
+        };
+        let Some(next_pane) = first_available_pane_from(
+            &self.active_surface_session_panes(),
+            current_pane,
+            &excluded,
+            step,
+        ) else {
+            return false;
+        };
+        if next_pane == current_pane {
+            return false;
+        }
+        self.set_layout_leaf_selected_pane(active_leaf, next_pane);
+        self.refresh_resolved_layout_from_native_policy();
+        let Some(next_surface) = self.surface_for_pane(next_pane) else {
+            return false;
+        };
+        self.focus_toplevel_surface(Some(next_surface));
+        self.reconfigure_focus_stack();
+        true
+    }
+
+    fn split_active_content_leaf(&mut self, axis: LayoutAxis) -> bool {
+        let Some(active_surface) = self.active_toplevel_surface.clone() else {
+            return false;
+        };
+        if !self.surface_has_visible_pane_item(&active_surface) {
+            return false;
+        }
+        let Some(active_leaf) = self.leaf_for_toplevel_surface(&active_surface) else {
+            return false;
+        };
+        if !self.layout.set_active_leaf(active_leaf) {
+            return false;
+        }
+        let Some(new_leaf) = self.layout.split_active(axis) else {
+            return false;
+        };
+
+        if let Some(active_pane) = self.pane_for_toplevel_surface(&active_surface) {
+            self.set_layout_leaf_selected_pane(active_leaf, active_pane);
+            if let Some(next_pane) = first_available_pane_from(
+                &self.active_surface_session_panes(),
+                active_pane,
+                &[active_pane],
+                1,
+            ) {
+                self.set_layout_leaf_selected_pane(new_leaf, next_pane);
+            }
+        }
+
+        self.refresh_resolved_layout_from_native_policy();
+        self.reconfigure_focus_stack();
+        true
+    }
+
+    fn selected_panes_for_other_layout_leaves(&self, active_leaf: LayoutLeafId) -> Vec<u64> {
+        self.layout_leaf_selected_panes
+            .iter()
+            .filter_map(|(leaf, pane)| (*leaf != active_leaf).then_some(*pane))
+            .filter(|pane| {
+                self.active_session_content_surface_for_pane(*pane)
+                    .is_some()
+            })
+            .collect()
+    }
+
     pub fn focused_window_index(&self) -> Option<usize> {
-        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+        let active = self.active_toplevel_surface.as_ref()?;
+        if !self.surface_can_receive_focus(active) {
             return None;
         }
-        let active = self.active_toplevel_surface.as_ref()?;
         self.space
             .elements()
-            .filter(|window| self.window_belongs_to_active_surface_session(window))
+            .filter(|window| self.window_visible_in_presentation(window))
             .position(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
     }
 
     pub fn focused_window_count(&self) -> usize {
-        usize::from(
-            self.layout.active_kind() == Some(LayoutLeafKind::Client)
-                && self.active_window().is_some(),
-        )
+        usize::from(self.active_window().is_some())
     }
 
     pub fn focused_surface_id(&self) -> Option<String> {
-        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
+        let surface = self.active_toplevel_surface.as_ref()?;
+        if !self.surface_can_receive_focus(surface) {
             return None;
         }
-        self.active_toplevel_surface.as_ref().map(|surface| {
-            crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()))
-        })
+        Some(crate::presentation::sanitize_status_value(&format!(
+            "{:?}",
+            surface.id()
+        )))
     }
 
     pub fn reconfigure_focus_stack(&mut self) {
@@ -2380,6 +2794,11 @@ impl Manifold {
             .filter(|window| self.window_belongs_to_active_surface_session(window))
             .cloned()
             .collect::<Vec<_>>();
+        let visible_windows = windows
+            .iter()
+            .filter(|window| self.window_visible_in_presentation(window))
+            .cloned()
+            .collect::<Vec<_>>();
         for window in &windows {
             let location = self.window_layout_rect(window).map_or_else(
                 || focus_stack_location(0),
@@ -2387,12 +2806,18 @@ impl Manifold {
             );
             self.space.map_element(window.clone(), location, false);
         }
-        if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
+            && self.layout.active_kind() == Some(LayoutLeafKind::Placeholder)
+        {
             self.focus_toplevel_surface(None);
             return;
         }
         if self.active_window().is_none() {
-            let active_leaf_surface = self.surface_for_layout_leaf(self.layout.active_leaf());
+            let active_leaf_surface = (self.resolved_layout_source
+                == ResolvedLayoutSource::NativeFallback)
+                .then(|| self.surface_for_layout_leaf(self.layout.active_leaf()))
+                .flatten()
+                .filter(|surface| self.surface_has_visible_pane_item(surface));
             if active_leaf_surface.is_some() {
                 self.focus_toplevel_surface(active_leaf_surface);
             }
@@ -2400,7 +2825,7 @@ impl Manifold {
         if let Some(active_window) = self.active_window() {
             self.space.raise_element(&active_window, true);
             self.activate_window_exclusively(self.active_toplevel_surface.clone().as_ref());
-        } else if let Some(window) = windows.last() {
+        } else if let Some(window) = visible_windows.last() {
             self.focus_window(window);
         } else {
             self.focus_toplevel_surface(None);
@@ -2428,20 +2853,12 @@ impl Manifold {
     pub fn apply_layout_action(&mut self, action: LayoutAction) -> bool {
         match action {
             LayoutAction::FocusNext => {
-                if self.layout.focus_next() {
-                    self.focus_active_layout_leaf();
-                    true
-                } else {
-                    self.cycle_focus(FocusDirection::Next)
-                }
+                self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
+                    && self.cycle_focus_in_active_layout_leaf(FocusDirection::Next)
             }
             LayoutAction::FocusPrevious => {
-                if self.layout.focus_previous() {
-                    self.focus_active_layout_leaf();
-                    true
-                } else {
-                    self.cycle_focus(FocusDirection::Previous)
-                }
+                self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
+                    && self.cycle_focus_in_active_layout_leaf(FocusDirection::Previous)
             }
             LayoutAction::CloseActivePane => self.close_active_window(),
             LayoutAction::ToggleManagedFullscreen => {
@@ -2449,19 +2866,9 @@ impl Manifold {
                 true
             }
             LayoutAction::SplitActiveRight => {
-                let changed = self.layout.split_active(LayoutAxis::Horizontal);
-                if changed {
-                    self.reconfigure_focus_stack();
-                }
-                changed
+                self.split_active_content_leaf(LayoutAxis::Horizontal)
             }
-            LayoutAction::SplitActiveDown => {
-                let changed = self.layout.split_active(LayoutAxis::Vertical);
-                if changed {
-                    self.reconfigure_focus_stack();
-                }
-                changed
-            }
+            LayoutAction::SplitActiveDown => self.split_active_content_leaf(LayoutAxis::Vertical),
             LayoutAction::JoinActivePane
             | LayoutAction::MoveActiveToLeftDock
             | LayoutAction::MoveActiveToRightDock
@@ -2553,18 +2960,20 @@ impl Manifold {
                     .map(|toplevel| toplevel.wl_surface().clone())
             })
             .collect::<Vec<_>>();
-        self.window_layout_leaves
-            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.fullscreen_toplevels
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_surface_sessions
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.presentation_member_surfaces
             .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
-        self.panel_reservations
-            .retain(|panel| live_toplevel_surfaces.iter().any(|live| live == &panel.surface));
+        self.panel_reservations.retain(|panel| {
+            live_toplevel_surfaces
+                .iter()
+                .any(|live| live == &panel.surface)
+        });
         self.window_pane_ids
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.repair_resolved_layout_for_current_inventory();
         if self
             .pending_pointer_focus_surface
             .as_ref()
@@ -2652,6 +3061,35 @@ impl Manifold {
         outcome
     }
 
+    fn repair_resolved_layout_for_current_inventory(&mut self) {
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            self.refresh_resolved_layout_from_native_policy();
+            return;
+        }
+
+        let valid_panes = self.active_surface_session_panes();
+        let mut layout = self.accepted_resolved_layout.clone();
+        layout.items.retain(|item| match item.kind {
+            LayoutItemKind::Pane { pane } => valid_panes.contains(&pane),
+            LayoutItemKind::Placeholder
+            | LayoutItemKind::Handle
+            | LayoutItemKind::Chrome
+            | LayoutItemKind::Overlay => true,
+        });
+        match layout.validate_for_panes(&valid_panes) {
+            Ok(layout) => {
+                self.accepted_resolved_layout = layout;
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "accepted WASM resolved layout became invalid; using native fallback"
+                );
+                self.refresh_resolved_layout_from_native_policy();
+            }
+        }
+    }
+
     fn presentation_size(&self) -> (i32, i32) {
         self.space
             .outputs()
@@ -2672,15 +3110,105 @@ impl Manifold {
     }
 
     pub fn active_layout_rect(&self) -> Option<LayoutRect> {
-        self.layout
-            .active_rect(self.presentation_layout_size())
-            .map(|rect| self.translate_content_rect(rect))
+        if let Some(surface) = self.active_toplevel_surface.as_ref()
+            && let Some(rect) = self.layout_rect_for_toplevel_surface(surface)
+        {
+            return Some(rect);
+        }
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            return self
+                .layout
+                .active_rect(self.presentation_layout_size())
+                .map(|rect| self.translate_content_rect(rect));
+        }
+        None
+    }
+
+    pub fn resolved_layout_source_name(&self) -> &'static str {
+        match self.resolved_layout_source {
+            ResolvedLayoutSource::NativeFallback => "native-fallback",
+            ResolvedLayoutSource::WasmPolicy => "wasm-policy",
+        }
+    }
+
+    pub fn resolved_layout_item_count(&self) -> usize {
+        self.accepted_resolved_layout.items.len()
+    }
+
+    pub fn resolved_layout_pane_count(&self) -> usize {
+        self.accepted_resolved_layout.pane_count()
+    }
+
+    pub fn resolved_layout_placeholder_count(&self) -> usize {
+        self.accepted_resolved_layout.placeholder_count()
+    }
+
+    pub fn resolved_layout_active_kind(&self) -> &'static str {
+        if self
+            .active_toplevel_surface
+            .as_ref()
+            .is_some_and(|surface| self.surface_has_visible_pane_item(surface))
+        {
+            return "client";
+        }
+        if self
+            .active_toplevel_surface
+            .as_ref()
+            .is_some_and(|surface| {
+                self.surface_is_visible_presentation_member(surface)
+                    || self.surface_has_visible_panel(surface)
+            })
+        {
+            return "presentation";
+        }
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            return match self.layout.active_kind() {
+                Some(LayoutLeafKind::Client) => "client",
+                Some(LayoutLeafKind::Placeholder) => "placeholder",
+                None => "none",
+            };
+        }
+        "none"
+    }
+
+    pub fn resolved_layout_items(&self) -> &[ResolvedLayoutItem] {
+        &self.accepted_resolved_layout.items
+    }
+
+    pub fn resolved_layout_item_rect(&self, item: ResolvedLayoutItem) -> LayoutRect {
+        self.translate_content_rect(item.pixel_rect(self.presentation_layout_size()))
+    }
+
+    pub fn resolved_layout_item_active(&self, item: ResolvedLayoutItem) -> bool {
+        match item.kind {
+            LayoutItemKind::Pane { pane } => {
+                self.active_toplevel_surface
+                    .as_ref()
+                    .and_then(|surface| self.pane_for_toplevel_surface(surface))
+                    == Some(pane)
+            }
+            LayoutItemKind::Placeholder => {
+                self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
+                    && item.id == LayoutItemId(1_000_000 + self.layout.active_leaf().raw())
+            }
+            LayoutItemKind::Handle | LayoutItemKind::Chrome | LayoutItemKind::Overlay => false,
+        }
     }
 
     fn translate_content_rect(&self, rect: LayoutRect) -> LayoutRect {
         LayoutRect {
             x: rect.x + self.left_panel_reserved_width(),
             ..rect
+        }
+    }
+
+    fn content_rect(&self) -> LayoutRect {
+        let size = self.presentation_layout_size();
+        LayoutRect {
+            x: self.left_panel_reserved_width(),
+            y: 0,
+            w: size.w,
+            h: size.h,
         }
     }
 
@@ -2788,6 +3316,63 @@ fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
         y: 0,
         w: size.w.max(1),
         h: size.h.max(1),
+    }
+}
+
+fn layout_rect_debug(rect: LayoutRect) -> String {
+    format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h)
+}
+
+fn layout_hit_debug(hit: HitResult) -> String {
+    format!(
+        "item={},kind={},local={:.4},{:.4}",
+        hit.item.0,
+        layout_item_kind_debug(hit.kind),
+        hit.local_point.u,
+        hit.local_point.v
+    )
+}
+
+fn first_available_pane_from(
+    panes: &[u64],
+    start: u64,
+    excluded: &[u64],
+    step: isize,
+) -> Option<u64> {
+    if panes.is_empty() {
+        return None;
+    }
+    let Some(start_index) = panes.iter().position(|pane| *pane == start) else {
+        return panes.iter().copied().find(|pane| !excluded.contains(pane));
+    };
+    let len = panes.len() as isize;
+    let step = match step.cmp(&0) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    for offset in 0..panes.len() {
+        let offset = offset as isize;
+        let index = if step == 0 {
+            (start_index as isize + offset).rem_euclid(len)
+        } else {
+            (start_index as isize + (offset + 1) * step).rem_euclid(len)
+        } as usize;
+        let pane = panes[index];
+        if !excluded.contains(&pane) {
+            return Some(pane);
+        }
+    }
+    None
+}
+
+fn layout_item_kind_debug(kind: LayoutItemKind) -> String {
+    match kind {
+        LayoutItemKind::Pane { pane } => format!("pane:{pane}"),
+        LayoutItemKind::Placeholder => "placeholder".to_string(),
+        LayoutItemKind::Handle => "handle".to_string(),
+        LayoutItemKind::Chrome => "chrome".to_string(),
+        LayoutItemKind::Overlay => "overlay".to_string(),
     }
 }
 
@@ -3057,23 +3642,14 @@ struct WindowRefreshOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, focus_stack_location,
-        fullscreen_layout_rect, surface_origin_in_compositor_space,
+        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, fullscreen_layout_rect,
+        surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
     use smithay::{
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
-
-    #[test]
-    fn focus_stack_places_every_window_at_origin() {
-        let first = focus_stack_location(0);
-        let later = focus_stack_location(99);
-
-        assert_eq!((first.x, first.y), (0, 0));
-        assert_eq!((later.x, later.y), (0, 0));
-    }
 
     #[test]
     fn fullscreen_layout_covers_the_presentation_from_origin() {

@@ -130,7 +130,7 @@ Expected behavior:
 - Reattach presents the latest pane state without requiring managed apps to relaunch.
 - Hide is a session-preserving detach operation, not a quit or close operation.
 - Repeated attach or detach commands are idempotent.
-- The presentation surface decides which panes are visible and how they are arranged, dragged, animated, stacked, or hidden.
+- The presentation surface applies an accepted resolved layout to decide which panes are visible and how they are arranged, dragged, animated, stacked, or omitted from presentation.
 - The presentation surface may save its layout or visibility preferences into the workspace.
 
 ## Presentation Requests

@@ -393,7 +393,10 @@ mod tests {
         );
         assert_eq!(app.realm, super::StartupRealm::Session);
 
-        let app = config.startup.get("switcher").expect("switcher startup app");
+        let app = config
+            .startup
+            .get("switcher")
+            .expect("switcher startup app");
         assert!(app.enabled);
         assert_eq!(app.realm, super::StartupRealm::Presentation);
         assert_eq!(app.argv, ["python3", "apps/manifold-session-switcher.py"]);

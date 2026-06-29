@@ -19,39 +19,32 @@ pub extern "C" fn on_map_v1(pending_pane: i64, visible_count: i32) -> i32 {
     }
 
     let mut writer = ResponseWriter::new();
-    writer.push_str(r#"{"type":"replace-visible-tree","focus":"#);
+    writer.push_str(r#"{"type":"resolved-layout","focus":"#);
     writer.push_i64(pending_pane);
-    writer.push_str(r#","root":"#);
+    writer.push_str(r#","layout":{"items":["#);
 
     if visible_count == 1 {
-        writer.push_pane(pending_pane);
+        writer.push_pane_item(pending_pane, 0, -1, -1, 2, 2);
     } else {
         let first = unsafe { visible_pane_id(0) };
         if first <= 0 {
             return 0;
         }
 
-        writer.push_str(r#"{"type":"split","axis":"horizontal","children":["#);
-        writer.push_pane(first);
-        writer.push_str(r#",{"type":"stack","panes":["#);
-        let mut wrote_stack_pane = false;
+        writer.push_pane_item(first, 0, -1, -1, 1, 2);
         let mut index = 1;
         while index < visible_count {
             let pane = unsafe { visible_pane_id(index) };
             if pane <= 0 {
                 return 0;
             }
-            if wrote_stack_pane {
-                writer.push_byte(b',');
-            }
-            writer.push_i64(pane);
-            wrote_stack_pane = true;
+            writer.push_byte(b',');
+            writer.push_pane_item(pane, i64::from(index), 0, -1, 1, 2);
             index += 1;
         }
-        writer.push_str(r#"]}]}"#);
     }
 
-    writer.push_byte(b'}');
+    writer.push_str(r#"]}}"#);
 
     if writer.overflowed {
         return 0;
@@ -73,10 +66,30 @@ impl ResponseWriter {
         }
     }
 
-    fn push_pane(&mut self, pane: i64) {
-        self.push_str(r#"{"type":"pane","pane":"#);
+    fn push_pane_item(
+        &mut self,
+        pane: i64,
+        z: i64,
+        offset_u: i64,
+        offset_v: i64,
+        size_u: i64,
+        size_v: i64,
+    ) {
+        self.push_str(r#"{"id":"#);
         self.push_i64(pane);
-        self.push_byte(b'}');
+        self.push_str(r#","kind":{"type":"pane","pane":"#);
+        self.push_i64(pane);
+        self.push_str(r#"},"z":"#);
+        self.push_i64(z);
+        self.push_str(r#","transform":{"offset":{"u":"#);
+        self.push_i64(offset_u);
+        self.push_str(r#","v":"#);
+        self.push_i64(offset_v);
+        self.push_str(r#"},"size":{"u":"#);
+        self.push_i64(size_u);
+        self.push_str(r#","v":"#);
+        self.push_i64(size_v);
+        self.push_str(r#"}},"input":"pane"}"#);
     }
 
     fn push_str(&mut self, value: &str) {

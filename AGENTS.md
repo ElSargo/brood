@@ -19,6 +19,9 @@ The repo has a Nix flake for development-shell use, but agents should not assume
 
 ## Testing
 
+This repo is in a highly volitile and experimental state. Existing tests are to be questioned rather than trusted. If a test enforces a behavior that goes against the intention of the request, or it is anyway not fit for purpose, modify or remove it.
+Bad tests are worse than no tests.
+
 Whenever possible prefer to test the changes with a "real" workload. Open the real app and send real keystrokes, clicks and scrolls and record metrics from the nested client as well as manifoldd. Use screenshots to verify any graphical changes.
 
 For agent-driven behavior tests, use the built-in test CLI rather than starting

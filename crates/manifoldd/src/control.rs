@@ -1772,7 +1772,9 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         }
         DbusStateRequest::CreateSurfaceSession { name, response } => {
             let id = if let Some(name) = normalize_session_name(&name) {
-                state.create_and_attach_named_surface_session(Some(name)).raw()
+                state
+                    .create_and_attach_named_surface_session(Some(name))
+                    .raw()
             } else {
                 WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
                 state.active_surface_session().raw()
@@ -2007,7 +2009,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
             format!(
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} resolved_layout_source={} resolved_layout_items={} resolved_layout_panes={} resolved_layout_placeholders={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -2033,6 +2035,10 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 snapshot.layout_placeholders,
                 snapshot.layout_active_kind,
                 snapshot.layout_active_rect,
+                snapshot.resolved_layout_source,
+                snapshot.resolved_layout_items,
+                snapshot.resolved_layout_panes,
+                snapshot.resolved_layout_placeholders,
                 snapshot.left_panel_visible,
                 snapshot.left_panel_width,
                 snapshot.browsers,
@@ -2319,6 +2325,10 @@ struct StatusSnapshot {
     layout_placeholders: usize,
     layout_active_kind: &'static str,
     layout_active_rect: String,
+    resolved_layout_source: &'static str,
+    resolved_layout_items: usize,
+    resolved_layout_panes: usize,
+    resolved_layout_placeholders: usize,
     left_panel_visible: bool,
     left_panel_width: i32,
     browsers: usize,
@@ -2504,14 +2514,14 @@ impl StatusSnapshot {
             managed_fullscreen: state.managed_fullscreen(),
             requested_fullscreen: state.requested_fullscreen_count(),
             focused_fullscreen: state.focused_window_fullscreen(),
-            layout_regions: state.layout.region_count(),
-            layout_placeholders: state.layout.placeholder_count(),
-            layout_active_kind: match state.layout.active_kind() {
-                Some(crate::layout::LayoutLeafKind::Client) => "client",
-                Some(crate::layout::LayoutLeafKind::Placeholder) => "placeholder",
-                None => "none",
-            },
+            layout_regions: state.resolved_layout_item_count(),
+            layout_placeholders: state.resolved_layout_placeholder_count(),
+            layout_active_kind: state.resolved_layout_active_kind(),
             layout_active_rect,
+            resolved_layout_source: state.resolved_layout_source_name(),
+            resolved_layout_items: state.resolved_layout_item_count(),
+            resolved_layout_panes: state.resolved_layout_pane_count(),
+            resolved_layout_placeholders: state.resolved_layout_placeholder_count(),
             left_panel_visible: state.left_panel_reserved_width() > 0,
             left_panel_width: state.left_panel_reserved_width(),
             browsers: state.browsers.len(),

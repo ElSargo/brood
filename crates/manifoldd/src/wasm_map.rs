@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
-use crate::layout::VisibleLayoutNode;
+use crate::layout::ResolvedLayout;
 
 const MAX_MAP_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -11,28 +11,13 @@ const MAX_MAP_RESPONSE_BYTES: usize = 64 * 1024;
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum MapHookResponse {
     Abstain,
-    Patch {
-        patches: Vec<MapLayoutPatch>,
-    },
-    ReplaceVisibleTree {
-        root: VisibleLayoutNode,
+    ResolvedLayout {
+        layout: ResolvedLayout,
         #[serde(default)]
         focus: Option<u64>,
     },
     Reject {
         reason: String,
-    },
-}
-
-#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum MapLayoutPatch {
-    PlacePane {
-        pane: u64,
-        #[serde(default)]
-        after: Option<u64>,
-        #[serde(default)]
-        focus: bool,
     },
 }
 
@@ -157,45 +142,4 @@ fn read_guest_string(caller: &mut Caller<'_, WasmMapStore>, ptr: i32, len: i32) 
         .read(caller, ptr, &mut bytes)
         .context("read guest memory")?;
     String::from_utf8(bytes).context("guest map response must be UTF-8")
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::layout::{VisibleLayoutAxis, VisibleLayoutNode};
-
-    use super::MapHookResponse;
-
-    #[test]
-    fn parses_replace_visible_tree_response() {
-        let response: MapHookResponse = serde_json::from_str(
-            r#"{
-                "type": "replace-visible-tree",
-                "focus": 1,
-                "root": {
-                    "type": "split",
-                    "axis": "horizontal",
-                    "children": [
-                        { "type": "pane", "pane": 1 },
-                        { "type": "stack", "panes": [2, 3] }
-                    ]
-                }
-            }"#,
-        )
-        .expect("parse response");
-
-        assert_eq!(
-            response,
-            MapHookResponse::ReplaceVisibleTree {
-                focus: Some(1),
-                root: VisibleLayoutNode::Split {
-                    axis: VisibleLayoutAxis::Horizontal,
-                    children: vec![
-                        VisibleLayoutNode::Pane { pane: 1 },
-                        VisibleLayoutNode::Stack { panes: vec![2, 3] },
-                    ],
-                    flexes: None,
-                }
-            }
-        );
-    }
 }

@@ -266,6 +266,9 @@ struct NestedTestArgs {
     /// Start the inner system under test without an attached presentation window.
     #[arg(long = "inner-headless")]
     inner_headless: bool,
+    /// Load a core-WASM map hook into the inner system under test.
+    #[arg(long = "inner-wasm-map-hook", value_name = "PATH")]
+    inner_wasm_map_hook: Option<PathBuf>,
     /// Spawn a hosted Wayland app inside the inner instance after startup.
     #[arg(long = "inner-command", value_name = "CMD")]
     inner_command: Option<String>,

@@ -263,6 +263,7 @@ fn run_nested_test_with_outer(
         &inner_target,
         &inner_log,
         args.inner_headless,
+        args.inner_wasm_map_hook.as_deref(),
     )?;
     wait_for_control_bus(&inner_target, &inner_log, &mut outer_child, "inner")?;
 
@@ -347,6 +348,7 @@ fn run_nested_test_in_current_session(
         &subject_log,
         args.inner_headless,
         args.harness.as_deref(),
+        args.inner_wasm_map_hook.as_deref(),
     )?;
 
     wait_for_control_bus(&subject_target, &subject_log, &mut subject_child, "subject")?;
@@ -475,6 +477,7 @@ fn spawn_subject(
     subject_log: &Path,
     subject_headless: bool,
     harness: Option<&Path>,
+    wasm_map_hook: Option<&Path>,
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
@@ -491,6 +494,9 @@ fn spawn_subject(
     }
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
+    }
+    if let Some(wasm_map_hook) = wasm_map_hook {
+        command.arg("--wasm-map-hook").arg(wasm_map_hook);
     }
     command.stdout(Stdio::from(
         fs::File::create(subject_log)
@@ -513,6 +519,7 @@ fn spawn_inner(
     inner_target: &control::ControlTarget,
     inner_log: &Path,
     inner_headless: bool,
+    wasm_map_hook: Option<&Path>,
 ) -> Result<()> {
     let mut command = format!(
         "exec {} run --no-session-runner --no-default-modules --dbus-destination {}",
@@ -525,6 +532,10 @@ fn spawn_inner(
     }
     if inner_headless {
         command.push_str(" --headless");
+    }
+    if let Some(wasm_map_hook) = wasm_map_hook {
+        command.push_str(" --wasm-map-hook ");
+        command.push_str(&shell_quote(&wasm_map_hook.display().to_string()));
     }
     command.push_str(&format!(
         " >{} 2>&1",

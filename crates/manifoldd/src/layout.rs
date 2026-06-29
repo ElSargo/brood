@@ -1,61 +1,290 @@
 use smithay::backend::input::Keycode;
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeSet, fmt, str::FromStr};
+
+const MAX_RESOLVED_LAYOUT_ITEMS: usize = 512;
+const NORMALIZED_MIN: f64 = -1.0;
+const NORMALIZED_MAX: f64 = 1.0;
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct ResolvedLayout {
+    pub items: Vec<ResolvedLayoutItem>,
+}
+
+impl ResolvedLayout {
+    pub fn empty() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    pub fn validate_for_panes(self, valid_panes: &[u64]) -> Result<Self, ResolvedLayoutError> {
+        if self.items.len() > MAX_RESOLVED_LAYOUT_ITEMS {
+            return Err(ResolvedLayoutError(format!(
+                "resolved layout item count exceeds {MAX_RESOLVED_LAYOUT_ITEMS}"
+            )));
+        }
+
+        let mut item_ids = BTreeSet::new();
+        let mut pane_ids = BTreeSet::new();
+        for item in &self.items {
+            if item.id.0 == 0 {
+                return Err(ResolvedLayoutError(
+                    "resolved layout item IDs must be non-zero".into(),
+                ));
+            }
+            if !item_ids.insert(item.id) {
+                return Err(ResolvedLayoutError(format!(
+                    "resolved layout item id {} appears more than once",
+                    item.id.0
+                )));
+            }
+            if !item.z.is_finite() {
+                return Err(ResolvedLayoutError(format!(
+                    "resolved layout item {} has non-finite z",
+                    item.id.0
+                )));
+            }
+            item.transform.validate(item.id)?;
+            match item.kind {
+                LayoutItemKind::Pane { pane } => {
+                    if !valid_panes.contains(&pane) {
+                        return Err(ResolvedLayoutError(format!(
+                            "resolved layout references unknown pane {pane}"
+                        )));
+                    }
+                    if !pane_ids.insert(pane) {
+                        return Err(ResolvedLayoutError(format!(
+                            "resolved layout references pane {pane} more than once"
+                        )));
+                    }
+                    if item.input != InputBehavior::Pane {
+                        return Err(ResolvedLayoutError(format!(
+                            "pane item {} must use pane input behavior",
+                            item.id.0
+                        )));
+                    }
+                }
+                LayoutItemKind::Handle => {
+                    if !matches!(item.input, InputBehavior::Hit | InputBehavior::Drag) {
+                        return Err(ResolvedLayoutError(format!(
+                            "handle item {} must use hit or drag input behavior",
+                            item.id.0
+                        )));
+                    }
+                }
+                LayoutItemKind::Placeholder | LayoutItemKind::Chrome | LayoutItemKind::Overlay => {
+                    if item.input == InputBehavior::Pane {
+                        return Err(ResolvedLayoutError(format!(
+                            "non-pane item {} cannot use pane input behavior",
+                            item.id.0
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn hit_stack(&self, point: LocalPoint) -> Vec<HitResult> {
+        let mut hits = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.input != InputBehavior::None)
+            .filter_map(|(index, item)| {
+                item.transform
+                    .project_point(point)
+                    .map(|local_point| (index, item, local_point))
+            })
+            .collect::<Vec<_>>();
+        hits.sort_by(|(left_index, left, _), (right_index, right, _)| {
+            right
+                .z
+                .partial_cmp(&left.z)
+                .expect("validated z values are finite")
+                .then_with(|| right_index.cmp(left_index))
+        });
+        hits.into_iter()
+            .map(|(_, item, local_point)| HitResult {
+                item: item.id,
+                kind: item.kind,
+                local_point,
+            })
+            .collect()
+    }
+
+    pub fn pane_item(&self, pane: u64) -> Option<&ResolvedLayoutItem> {
+        self.items
+            .iter()
+            .rev()
+            .find(|item| item.kind == LayoutItemKind::Pane { pane })
+    }
+
+    pub fn placeholder_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.kind == LayoutItemKind::Placeholder)
+            .count()
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item.kind, LayoutItemKind::Pane { .. }))
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(transparent)]
+pub struct LayoutItemId(pub u64);
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
+pub struct ResolvedLayoutItem {
+    pub id: LayoutItemId,
+    pub kind: LayoutItemKind,
+    pub z: f64,
+    pub transform: LocalTransform,
+    pub input: InputBehavior,
+}
+
+impl ResolvedLayoutItem {
+    pub fn pixel_rect(self, size: LayoutSize) -> LayoutRect {
+        self.transform.pixel_rect(size)
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum VisibleLayoutNode {
-    Pane {
-        pane: u64,
-    },
-    Stack {
-        panes: Vec<u64>,
-    },
-    Split {
-        axis: VisibleLayoutAxis,
-        children: Vec<VisibleLayoutNode>,
-        #[serde(default)]
-        flexes: Option<Vec<f32>>,
-    },
+pub enum LayoutItemKind {
+    Pane { pane: u64 },
+    Placeholder,
+    Handle,
+    Chrome,
+    Overlay,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum VisibleLayoutAxis {
-    Horizontal,
-    Vertical,
+pub enum InputBehavior {
+    None,
+    Hit,
+    Drag,
+    Pane,
 }
 
-impl From<VisibleLayoutAxis> for LayoutAxis {
-    fn from(axis: VisibleLayoutAxis) -> Self {
-        match axis {
-            VisibleLayoutAxis::Horizontal => Self::Horizontal,
-            VisibleLayoutAxis::Vertical => Self::Vertical,
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
+pub struct LocalPoint {
+    pub u: f64,
+    pub v: f64,
+}
+
+impl LocalPoint {
+    pub fn from_pixel_in_rect(x: f64, y: f64, rect: LayoutRect) -> Self {
+        Self {
+            u: ((x - f64::from(rect.x)) / f64::from(rect.w.max(1))) * 2.0 - 1.0,
+            v: ((y - f64::from(rect.y)) / f64::from(rect.h.max(1))) * 2.0 - 1.0,
+        }
+    }
+
+    fn is_finite(self) -> bool {
+        self.u.is_finite() && self.v.is_finite()
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, PartialEq)]
+pub struct LocalTransform {
+    pub offset: LocalPoint,
+    pub size: LocalPoint,
+}
+
+impl LocalTransform {
+    pub fn from_pixel_rect(rect: LayoutRect, bounds: LayoutSize) -> Self {
+        let bounds_w = f64::from(bounds.w.max(1));
+        let bounds_h = f64::from(bounds.h.max(1));
+        Self {
+            offset: LocalPoint {
+                u: (f64::from(rect.x) / bounds_w) * 2.0 - 1.0,
+                v: (f64::from(rect.y) / bounds_h) * 2.0 - 1.0,
+            },
+            size: LocalPoint {
+                u: (f64::from(rect.w.max(1)) / bounds_w) * 2.0,
+                v: (f64::from(rect.h.max(1)) / bounds_h) * 2.0,
+            },
+        }
+    }
+
+    fn validate(self, id: LayoutItemId) -> Result<(), ResolvedLayoutError> {
+        if !self.offset.is_finite() || !self.size.is_finite() {
+            return Err(ResolvedLayoutError(format!(
+                "resolved layout item {} has non-finite transform",
+                id.0
+            )));
+        }
+        if self.size.u <= 0.0 || self.size.v <= 0.0 {
+            return Err(ResolvedLayoutError(format!(
+                "resolved layout item {} has non-positive size",
+                id.0
+            )));
+        }
+        let max = LocalPoint {
+            u: self.offset.u + self.size.u,
+            v: self.offset.v + self.size.v,
+        };
+        if self.offset.u < NORMALIZED_MIN
+            || self.offset.v < NORMALIZED_MIN
+            || max.u > NORMALIZED_MAX
+            || max.v > NORMALIZED_MAX
+        {
+            return Err(ResolvedLayoutError(format!(
+                "resolved layout item {} is outside normalized presentation bounds",
+                id.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn project_point(self, point: LocalPoint) -> Option<LocalPoint> {
+        if point.u < self.offset.u
+            || point.v < self.offset.v
+            || point.u >= self.offset.u + self.size.u
+            || point.v >= self.offset.v + self.size.v
+        {
+            return None;
+        }
+        Some(LocalPoint {
+            u: ((point.u - self.offset.u) / self.size.u) * 2.0 - 1.0,
+            v: ((point.v - self.offset.v) / self.size.v) * 2.0 - 1.0,
+        })
+    }
+
+    pub fn pixel_rect(self, size: LayoutSize) -> LayoutRect {
+        let w = f64::from(size.w.max(1));
+        let h = f64::from(size.h.max(1));
+        LayoutRect {
+            x: (((self.offset.u + 1.0) * 0.5) * w).round() as i32,
+            y: (((self.offset.v + 1.0) * 0.5) * h).round() as i32,
+            w: ((self.size.u * 0.5) * w).round().max(1.0) as i32,
+            h: ((self.size.v * 0.5) * h).round().max(1.0) as i32,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaneLeafAssignment {
-    pub pane: u64,
-    pub leaf: LayoutLeafId,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HitResult {
+    pub item: LayoutItemId,
+    pub kind: LayoutItemKind,
+    pub local_point: LocalPoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VisibleLayoutApply {
-    pub assignments: Vec<PaneLeafAssignment>,
-    pub focused_pane: Option<u64>,
-}
+pub struct ResolvedLayoutError(String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VisibleLayoutError(String);
-
-impl fmt::Display for VisibleLayoutError {
+impl fmt::Display for ResolvedLayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for VisibleLayoutError {}
+impl std::error::Error for ResolvedLayoutError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutAction {
@@ -195,12 +424,15 @@ impl Default for LayoutState {
 }
 
 impl LayoutState {
-    pub fn split_active(&mut self, axis: LayoutAxis) -> bool {
+    pub fn split_active(&mut self, axis: LayoutAxis) -> Option<LayoutLeafId> {
         let new_leaf = LayoutLeaf {
             id: self.allocate_leaf(),
-            kind: LayoutLeafKind::Placeholder,
+            kind: LayoutLeafKind::Client,
         };
-        self.root.split_leaf(self.active_leaf, axis, new_leaf)
+        let new_leaf_id = new_leaf.id;
+        self.root
+            .split_leaf(self.active_leaf, axis, new_leaf)
+            .then_some(new_leaf_id)
     }
 
     pub fn active_leaf(&self) -> LayoutLeafId {
@@ -236,22 +468,6 @@ impl LayoutState {
         self.root.leaf_kind(self.active_leaf)
     }
 
-    pub fn focus_next(&mut self) -> bool {
-        self.focus_by_offset(1)
-    }
-
-    pub fn focus_previous(&mut self) -> bool {
-        self.focus_by_offset(-1)
-    }
-
-    pub fn region_count(&self) -> usize {
-        self.root.leaf_count()
-    }
-
-    pub fn placeholder_count(&self) -> usize {
-        self.root.placeholder_count()
-    }
-
     pub fn resolve(&self, size: LayoutSize) -> Vec<LayoutRegion> {
         let mut regions = Vec::new();
         self.root.resolve(
@@ -267,147 +483,10 @@ impl LayoutState {
         regions
     }
 
-    pub fn replace_visible_tree(
-        &mut self,
-        root: &VisibleLayoutNode,
-        focus_pane: Option<u64>,
-    ) -> Result<VisibleLayoutApply, VisibleLayoutError> {
-        let mut builder = VisibleTreeBuilder {
-            next_leaf: 1,
-            assignments: Vec::new(),
-            seen_panes: Vec::new(),
-            focus_pane,
-            focused_leaf: None,
-        };
-        let root = builder.build_node(root)?;
-        let active_leaf = builder
-            .focused_leaf
-            .or_else(|| {
-                builder
-                    .assignments
-                    .first()
-                    .map(|assignment| assignment.leaf)
-            })
-            .ok_or_else(|| VisibleLayoutError("visible layout tree contains no panes".into()))?;
-
-        self.root = root;
-        self.next_leaf = builder.next_leaf;
-        self.active_leaf = active_leaf;
-
-        let focused_pane = focus_pane.filter(|pane| builder.seen_panes.contains(pane));
-
-        Ok(VisibleLayoutApply {
-            assignments: builder.assignments,
-            focused_pane,
-        })
-    }
-
     fn allocate_leaf(&mut self) -> LayoutLeafId {
         let id = LayoutLeafId(self.next_leaf);
         self.next_leaf += 1;
         id
-    }
-
-    fn focus_by_offset(&mut self, offset: isize) -> bool {
-        let mut leaves = Vec::new();
-        self.root.collect_leaf_ids(&mut leaves);
-        let len = leaves.len();
-        if len == 0 {
-            return false;
-        }
-        let current_ix = leaves
-            .iter()
-            .position(|leaf| *leaf == self.active_leaf)
-            .unwrap_or(0);
-        let next_ix = (current_ix as isize + offset).rem_euclid(len as isize) as usize;
-        let next = leaves[next_ix];
-        if next == self.active_leaf {
-            return false;
-        }
-        self.active_leaf = next;
-        true
-    }
-}
-
-struct VisibleTreeBuilder {
-    next_leaf: u64,
-    assignments: Vec<PaneLeafAssignment>,
-    seen_panes: Vec<u64>,
-    focus_pane: Option<u64>,
-    focused_leaf: Option<LayoutLeafId>,
-}
-
-impl VisibleTreeBuilder {
-    fn build_node(&mut self, node: &VisibleLayoutNode) -> Result<LayoutNode, VisibleLayoutError> {
-        match node {
-            VisibleLayoutNode::Pane { pane } => self.build_leaf(&[*pane]),
-            VisibleLayoutNode::Stack { panes } => {
-                if panes.is_empty() {
-                    return Err(VisibleLayoutError(
-                        "visible layout stack must contain at least one pane".into(),
-                    ));
-                }
-                self.build_leaf(panes)
-            }
-            VisibleLayoutNode::Split {
-                axis,
-                children,
-                flexes,
-            } => {
-                if children.len() < 2 {
-                    return Err(VisibleLayoutError(
-                        "visible layout split must contain at least two children".into(),
-                    ));
-                }
-                if let Some(flexes) = flexes {
-                    if flexes.len() != children.len() {
-                        return Err(VisibleLayoutError(
-                            "visible layout split flex count must match child count".into(),
-                        ));
-                    }
-                    if flexes.iter().any(|flex| !flex.is_finite() || *flex <= 0.0) {
-                        return Err(VisibleLayoutError(
-                            "visible layout split flexes must be finite positive numbers".into(),
-                        ));
-                    }
-                }
-                let mut built = children
-                    .iter()
-                    .map(|child| self.build_node(child))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter();
-                let first = built.next().expect("children length checked");
-                Ok(built.fold(first, |left, right| LayoutNode::Split {
-                    axis: (*axis).into(),
-                    first: Box::new(left),
-                    second: Box::new(right),
-                }))
-            }
-        }
-    }
-
-    fn build_leaf(&mut self, panes: &[u64]) -> Result<LayoutNode, VisibleLayoutError> {
-        let leaf = LayoutLeafId(self.next_leaf);
-        self.next_leaf += 1;
-
-        for pane in panes {
-            if self.seen_panes.contains(pane) {
-                return Err(VisibleLayoutError(format!(
-                    "visible layout references pane {pane} more than once"
-                )));
-            }
-            self.seen_panes.push(*pane);
-            self.assignments
-                .push(PaneLeafAssignment { pane: *pane, leaf });
-            if self.focus_pane == Some(*pane) {
-                self.focused_leaf = Some(leaf);
-            }
-        }
-
-        Ok(LayoutNode::Leaf(LayoutLeaf {
-            id: leaf,
-            kind: LayoutLeafKind::Client,
-        }))
     }
 }
 
@@ -451,6 +530,12 @@ pub struct LayoutRegion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutLeafId(u64);
 
+impl LayoutLeafId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutLeafKind {
     Client,
@@ -474,16 +559,6 @@ enum LayoutNode {
 }
 
 impl LayoutNode {
-    fn collect_leaf_ids(&self, leaves: &mut Vec<LayoutLeafId>) {
-        match self {
-            Self::Leaf(leaf) => leaves.push(leaf.id),
-            Self::Split { first, second, .. } => {
-                first.collect_leaf_ids(leaves);
-                second.collect_leaf_ids(leaves);
-            }
-        }
-    }
-
     fn leaf_kind(&self, target: LayoutLeafId) -> Option<LayoutLeafKind> {
         match self {
             Self::Leaf(leaf) if leaf.id == target => Some(leaf.kind),
@@ -503,22 +578,6 @@ impl LayoutNode {
             Self::Leaf(_) => false,
             Self::Split { first, second, .. } => {
                 first.set_leaf_kind(target, kind) || second.set_leaf_kind(target, kind)
-            }
-        }
-    }
-
-    fn leaf_count(&self) -> usize {
-        match self {
-            Self::Leaf(_) => 1,
-            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
-        }
-    }
-
-    fn placeholder_count(&self) -> usize {
-        match self {
-            Self::Leaf(leaf) => usize::from(leaf.kind == LayoutLeafKind::Placeholder),
-            Self::Split { first, second, .. } => {
-                first.placeholder_count() + second.placeholder_count()
             }
         }
     }
@@ -620,8 +679,18 @@ impl Default for LayoutKeymap {
                     action: LayoutAction::FocusNext,
                 },
                 LayoutKeyBinding {
+                    key: Keycode::new(44),
+                    ctrl: true,
+                    action: LayoutAction::FocusNext,
+                },
+                LayoutKeyBinding {
                     key: Keycode::new(45),
                     ctrl: false,
+                    action: LayoutAction::FocusPrevious,
+                },
+                LayoutKeyBinding {
+                    key: Keycode::new(45),
+                    ctrl: true,
                     action: LayoutAction::FocusPrevious,
                 },
                 LayoutKeyBinding {
@@ -685,7 +754,10 @@ impl LayoutKeymap {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutAction, LayoutKeymap, VisibleLayoutAxis, VisibleLayoutNode};
+    use super::{
+        InputBehavior, LayoutAction, LayoutItemId, LayoutItemKind, LayoutKeymap, LayoutSize,
+        LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+    };
     use smithay::backend::input::Keycode;
 
     #[test]
@@ -720,125 +792,87 @@ mod tests {
             Some(LayoutAction::FocusNext)
         );
         assert_eq!(
+            keymap.action_for_key(Keycode::new(44), true),
+            Some(LayoutAction::FocusNext)
+        );
+        assert_eq!(
             keymap.action_for_key(Keycode::new(43), true),
             Some(LayoutAction::SplitActiveDown)
         );
     }
 
     #[test]
-    fn split_active_creates_placeholder_region() {
-        let mut layout = super::LayoutState::default();
-
-        assert!(layout.split_active(super::LayoutAxis::Horizontal));
-        let regions = layout.resolve(super::LayoutSize { w: 100, h: 80 });
-
-        assert_eq!(regions.len(), 2);
-        assert_eq!(regions[0].rect.w, 50);
-        assert!(regions[0].active);
-        assert_eq!(regions[1].kind, super::LayoutLeafKind::Placeholder);
-        assert_eq!(layout.region_count(), 2);
-        assert_eq!(layout.placeholder_count(), 1);
-    }
-
-    #[test]
-    fn focus_moves_between_client_and_placeholder_regions() {
-        let mut layout = super::LayoutState::default();
-        layout.split_active(super::LayoutAxis::Horizontal);
-
-        assert_eq!(layout.active_kind(), Some(super::LayoutLeafKind::Client));
-        assert!(layout.focus_next());
-        assert_eq!(
-            layout.active_kind(),
-            Some(super::LayoutLeafKind::Placeholder)
-        );
-        assert!(layout.focus_previous());
-        assert_eq!(layout.active_kind(), Some(super::LayoutLeafKind::Client));
-    }
-
-    #[test]
-    fn client_rect_stays_with_client_when_placeholder_is_focused() {
-        let mut layout = super::LayoutState::default();
-        layout.split_active(super::LayoutAxis::Horizontal);
-        let size = super::LayoutSize { w: 100, h: 80 };
-        let client_rect = layout
-            .resolve(size)
-            .into_iter()
-            .find(|region| region.kind == super::LayoutLeafKind::Client)
-            .map(|region| region.rect);
-
-        assert!(layout.focus_next());
-        assert_eq!(
-            layout.active_kind(),
-            Some(super::LayoutLeafKind::Placeholder)
-        );
-        assert_eq!(
-            layout
-                .resolve(size)
-                .into_iter()
-                .find(|region| region.kind == super::LayoutLeafKind::Client)
-                .map(|region| region.rect),
-            client_rect
-        );
-        assert_ne!(layout.active_rect(size), client_rect);
-    }
-
-    #[test]
-    fn occupying_active_placeholder_turns_it_into_client_region() {
-        let mut layout = super::LayoutState::default();
-        layout.split_active(super::LayoutAxis::Horizontal);
-        assert!(layout.focus_next());
-
-        let occupied_leaf = layout.occupy_active_leaf();
-        let regions = layout.resolve(super::LayoutSize { w: 100, h: 80 });
-
-        assert_eq!(occupied_leaf, Some(layout.active_leaf()));
-        assert_eq!(layout.active_kind(), Some(super::LayoutLeafKind::Client));
-        assert_eq!(layout.placeholder_count(), 0);
-        assert_eq!(regions.iter().filter(|region| region.active).count(), 1);
-        assert_eq!(
-            regions
-                .iter()
-                .filter(|region| region.kind == super::LayoutLeafKind::Client)
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn replaces_visible_tree_with_master_and_stack() {
-        let mut layout = super::LayoutState::default();
-        let tree = VisibleLayoutNode::Split {
-            axis: VisibleLayoutAxis::Horizontal,
-            flexes: Some(vec![1.0, 2.0]),
-            children: vec![
-                VisibleLayoutNode::Pane { pane: 1 },
-                VisibleLayoutNode::Stack { panes: vec![2, 3] },
+    fn resolved_layout_rejects_duplicate_pane_items() {
+        let layout = ResolvedLayout {
+            items: vec![
+                pane_item(1, 0.0, -1.0, -1.0, 2.0, 2.0),
+                pane_item(1, 1.0, -1.0, -1.0, 2.0, 2.0),
             ],
         };
 
-        let applied = layout
-            .replace_visible_tree(&tree, Some(2))
-            .expect("replace visible tree");
-        let regions = layout.resolve(super::LayoutSize { w: 120, h: 80 });
-
-        assert_eq!(regions.len(), 2);
-        assert_eq!(applied.focused_pane, Some(2));
-        assert_eq!(applied.assignments.len(), 3);
-        assert_eq!(applied.assignments[0].pane, 1);
-        assert_eq!(applied.assignments[1].pane, 2);
-        assert_eq!(applied.assignments[1].leaf, applied.assignments[2].leaf);
-        assert_eq!(layout.active_leaf(), applied.assignments[1].leaf);
+        assert!(layout.validate_for_panes(&[1]).is_err());
     }
 
     #[test]
-    fn rejects_duplicate_visible_tree_panes() {
-        let mut layout = super::LayoutState::default();
-        let tree = VisibleLayoutNode::Stack { panes: vec![1, 1] };
+    fn resolved_layout_hit_stack_returns_topmost_item_first() {
+        let layout = ResolvedLayout {
+            items: vec![
+                pane_item(1, 0.0, -1.0, -1.0, 2.0, 2.0),
+                ResolvedLayoutItem {
+                    id: LayoutItemId(10),
+                    kind: LayoutItemKind::Handle,
+                    z: 5.0,
+                    transform: LocalTransform {
+                        offset: LocalPoint { u: -0.2, v: -1.0 },
+                        size: LocalPoint { u: 0.4, v: 2.0 },
+                    },
+                    input: InputBehavior::Drag,
+                },
+            ],
+        }
+        .validate_for_panes(&[1])
+        .expect("valid layout");
 
-        let err = layout
-            .replace_visible_tree(&tree, None)
-            .expect_err("duplicate panes should be rejected");
+        let hits = layout.hit_stack(LocalPoint { u: 0.0, v: 0.0 });
 
-        assert!(err.to_string().contains("more than once"));
+        assert_eq!(hits[0].kind, LayoutItemKind::Handle);
+        assert_eq!(hits[1].kind, LayoutItemKind::Pane { pane: 1 });
+    }
+
+    #[test]
+    fn local_transform_projects_normalized_rect_to_pixels() {
+        let rect = LocalTransform {
+            offset: LocalPoint { u: 0.0, v: -1.0 },
+            size: LocalPoint { u: 1.0, v: 2.0 },
+        }
+        .pixel_rect(LayoutSize { w: 1280, h: 800 });
+
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (640, 0, 640, 800));
+    }
+
+    fn pane_item(
+        pane: u64,
+        z: f64,
+        offset_u: f64,
+        offset_v: f64,
+        size_u: f64,
+        size_v: f64,
+    ) -> ResolvedLayoutItem {
+        ResolvedLayoutItem {
+            id: LayoutItemId(pane),
+            kind: LayoutItemKind::Pane { pane },
+            z,
+            transform: LocalTransform {
+                offset: LocalPoint {
+                    u: offset_u,
+                    v: offset_v,
+                },
+                size: LocalPoint {
+                    u: size_u,
+                    v: size_v,
+                },
+            },
+            input: InputBehavior::Pane,
+        }
     }
 }

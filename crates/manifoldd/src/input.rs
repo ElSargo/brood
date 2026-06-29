@@ -13,7 +13,7 @@ use smithay::{
 use tracing::warn;
 
 use crate::{
-    layout::LayoutKeymap,
+    layout::{LayoutAction, LayoutKeymap},
     state::{InputMode, Manifold, PresentationStatus},
 };
 
@@ -22,6 +22,10 @@ const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
 const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
 const KEY_B: Keycode = Keycode::new(56);
+const KEY_H: Keycode = Keycode::new(43);
+const KEY_J: Keycode = Keycode::new(44);
+const KEY_K: Keycode = Keycode::new(45);
+const KEY_L: Keycode = Keycode::new(46);
 const KEY_W: Keycode = Keycode::new(25);
 
 impl Manifold {
@@ -147,6 +151,16 @@ impl Manifold {
             if state == KeyState::Pressed {
                 self.suppress_mode_toggle_key_release = true;
                 self.toggle_input_mode();
+            }
+            return;
+        }
+
+        if self.ctrl_pressed
+            && let Some(action) = built_in_ctrl_layout_action(key_code)
+        {
+            self.record_consumed_keyboard_input();
+            if state == KeyState::Pressed {
+                self.apply_layout_action(action);
             }
             return;
         }
@@ -324,7 +338,11 @@ impl Manifold {
 
         let keyboard = self.seat.get_keyboard().expect("keyboard");
         let serial = SERIAL_COUNTER.next_serial();
-        let target_window = self.window_under_layout_position(pointer.current_location());
+        let pointer_location = pointer.current_location();
+        let target_window = self.window_under_layout_position(pointer_location);
+        let target_surface = target_window
+            .as_ref()
+            .and_then(|(window, _location)| Manifold::window_toplevel_surface(window));
         self.stats.record_input(
             self.presentation == PresentationStatus::Attached && target_window.is_some(),
         );
@@ -337,31 +355,54 @@ impl Manifold {
 
         match state {
             ButtonState::Pressed if !pointer.is_grabbed() => {
-                let focus_surface = self.pointer_hover_toplevel_surface().or_else(|| {
-                    target_window
-                        .as_ref()
-                        .and_then(|(window, _location)| Manifold::window_toplevel_surface(window))
-                });
+                let focus_surface = target_surface.clone();
+                self.log_pointer_click_focus_debug(
+                    "pressed-select",
+                    button_code,
+                    pointer_location,
+                    target_surface.as_ref(),
+                    focus_surface.as_ref(),
+                );
                 self.set_pending_pointer_focus_surface(focus_surface);
             }
             ButtonState::Released => {
-                let focus_surface = self.take_pending_pointer_focus_surface().or_else(|| {
-                    target_window
-                        .as_ref()
-                        .and_then(|(window, _location)| Manifold::window_toplevel_surface(window))
-                });
-                if let Some(surface) = focus_surface {
-                    if let Some(window) = self.window_for_toplevel_surface(&surface) {
+                let focus_surface = self
+                    .take_pending_pointer_focus_surface()
+                    .or_else(|| target_surface.clone());
+                self.log_pointer_click_focus_debug(
+                    "released-select",
+                    button_code,
+                    pointer_location,
+                    target_surface.as_ref(),
+                    focus_surface.as_ref(),
+                );
+                if let Some(surface) = focus_surface.as_ref() {
+                    if let Some(window) = self.window_for_toplevel_surface(surface) {
                         self.focus_window(&window);
                     } else {
-                        self.focus_toplevel_surface(Some(surface));
+                        self.focus_toplevel_surface(Some(surface.clone()));
                     }
                 } else if !pointer.is_grabbed() {
                     self.activate_window_exclusively(None);
                     keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                 }
+                self.log_pointer_click_focus_debug(
+                    "released-after-focus",
+                    button_code,
+                    pointer_location,
+                    target_surface.as_ref(),
+                    focus_surface.as_ref(),
+                );
             }
-            ButtonState::Pressed => {}
+            ButtonState::Pressed => {
+                self.log_pointer_click_focus_debug(
+                    "pressed-grabbed",
+                    button_code,
+                    pointer_location,
+                    target_surface.as_ref(),
+                    None,
+                );
+            }
         }
 
         pointer.button(
@@ -395,5 +436,15 @@ impl Manifold {
         }
         pointer.axis(self, frame);
         pointer.frame(self);
+    }
+}
+
+fn built_in_ctrl_layout_action(key_code: Keycode) -> Option<LayoutAction> {
+    match key_code {
+        KEY_J => Some(LayoutAction::FocusNext),
+        KEY_K => Some(LayoutAction::FocusPrevious),
+        KEY_L => Some(LayoutAction::SplitActiveRight),
+        KEY_H => Some(LayoutAction::SplitActiveDown),
+        _ => None,
     }
 }

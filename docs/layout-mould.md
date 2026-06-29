@@ -1,194 +1,193 @@
-# Layout Mould
+# Resolved Layout
 
-Manifold layout should be split between a host-owned renderer and a reloadable
-layout policy layer.
+Manifold layout policy should be reloadable, but presentation execution remains
+native-owned.
 
-The layout policy layer may be implemented by WASM, but it should produce data,
-not pixels. Native code remains responsible for rendering, hit testing, input
-capture, animations, surface ownership, focus, and final constraint enforcement.
-
-## Responsibilities
-
-### Native Host
-
-The native host is the authority for presentation execution.
-
-It owns:
-
-- native windows and imported surfaces
-- rendering and composition
-- pointer capture, keyboard focus, and hit testing
-- animation and preview drawing
-- actual bounds calculation from validated layout data
-- persistence and migration of accepted layout state
-- fallback behavior when a policy module fails
-- validation of all module-provided layout data
-
-The host may ask a layout policy module for decisions, but it commits only a
-validated workspace or presentation transaction.
-
-### `LayoutMould`
-
-`LayoutMould` is the top-level layout policy concept.
-
-It decides the logical arrangement of the major presentation regions:
-
-- center area
-- left side panel area
-- right side panel area
-- bottom dock
-- overlays or transient regions
-
-It does not render those regions. It returns a layout data structure describing
-which regions exist, their visibility, relative priority, and sizing policy.
-
-### Split Layout
-
-The center area may contain recursive splits. Splits should be represented as a
-logical tree with axes, children, and flex weights.
-
-The split model should not store native surface handles or raw renderer objects.
-It should refer to panes, panels, and regions by stable logical IDs.
-
-Example shape:
-
-```rust
-struct LayoutSpec {
-    regions: Vec<RegionSpec>,
-    center: SplitTree,
-}
-
-struct RegionSpec {
-    id: RegionId,
-    kind: RegionKind,
-    visible: bool,
-    size: SizePolicy,
-    min_size: Option<f32>,
-    priority: u32,
-}
-
-enum RegionKind {
-    Center,
-    LeftDock,
-    RightDock,
-    BottomDock,
-    Overlay,
-}
-
-enum SplitTree {
-    Pane(PaneId),
-    Split {
-        axis: Axis,
-        children: Vec<SplitTree>,
-        flexes: Vec<f32>,
-    },
-}
-```
-
-This mirrors the useful part of Zed's approach: persistent pane topology is a
-tree, while actual geometry is computed by the native presentation layer.
-
-## WASM Boundary
-
-A WASM layout module should behave like a pure policy engine:
+The target boundary is:
 
 ```text
-input: current layout snapshot + event + host constraints
-output: layout patch, replacement layout model, rejection, or abstain
+pane inventory + presentation constraints + layout event
+    -> WASM layout policy
+    -> candidate resolved layout
+    -> native validation
+    -> native render, hit testing, focus, and input delivery
 ```
 
-It should operate on logical IDs and typed constraints. It must not receive
-native object references, renderer internals, Smithay objects, Wayland resources,
-EGL objects, or DMA-BUF handles.
+WASM may use any internal policy model it wants. It can model splits, stacks,
+tabs, floating panes, docks, hidden panes, collapsed panes, or workspace-specific
+rules. Native code should not require that internal tree shape. Native code only
+accepts the final resolved layout data.
 
-The host validates every response before committing it.
+## Native Responsibilities
 
-Validation should reject or repair:
+The native host owns presentation execution:
 
-- duplicate pane, panel, or region IDs
-- missing or invalid center area
-- split flex counts that do not match child counts
-- empty split groups
-- negative, NaN, or unbounded sizes
-- impossible min/max constraints
-- panel placements that the panel does not support
-- references to panes or panels outside the module's authority
+- imported surfaces and native windows
+- final composition and rendering
+- pointer capture, keyboard focus, and hit testing
+- coordinate and transform math
+- validation and canonicalization of candidate resolved layouts
+- input delivery to panes or layout items
+- fallback behavior when the layout module is missing, slow, trapped, or invalid
 
-If validation fails, the host should use a deterministic native fallback and
-record diagnostics.
+The host does not ask WASM to render pixels or expose Smithay, EGL, DMA-BUF,
+renderer objects, Wayland resources, or native surface handles.
 
-## Fast Path
+## WASM Responsibilities
 
-Layout policy belongs in the synchronous fast lane only when Manifold needs a
-decision before committing a workspace or presentation transaction.
+A layout module receives pane inventory, constraints, and an event or reason for
+layout. It returns a candidate resolved layout.
 
-Good fast-path hooks:
+The module may omit panes that should not participate in the current
+presentation. Hidden, collapsed, minimized, detached, or inactive-session panes
+remain in the workspace/session model, but they are not present in the resolved
+layout unless they are currently visible or hittable.
 
-- classify a newly added window or pane
-- choose initial placement for a new managed surface
-- answer whether a dragged pane can be dropped on a target
-- convert a drop target into a semantic layout operation
-- rewrite a split or docking request before commit
+The module should emit explicit items for visible empty regions or controls. A
+drop target, placeholder, resize handle, panel background, or overlay is
+presentation behavior, so it belongs in the resolved layout even when no pane is
+inside it.
 
-The fast path must be bounded. Hooks should have strict time and memory limits,
-trap accounting, and automatic disabling after repeated failures.
+## Resolved Layout
 
-The host should avoid calling WASM on every pointer-motion frame when dragging.
-Preferred drag flow:
+Resolved layout is a host-validated flat presentation description. It is not a
+native split tree and it is not the WASM module's persistent state.
 
-1. On drag start, ask policy for valid drop zones, insertion rules, and
-   constraints.
-2. During drag motion, perform native hit testing against that prepared data and
-   render previews locally.
-3. On drop, ask policy to turn the selected target into a semantic layout patch.
-4. Validate and commit the result, or fall back to native behavior.
+Candidate Rust shape:
 
-This keeps pointer motion smooth even when policy is reloadable.
+```rust
+struct ResolvedLayout {
+    items: Vec<ResolvedLayoutItem>,
+}
 
-## Events And Responses
+struct ResolvedLayoutItem {
+    id: LayoutItemId,
+    kind: LayoutItemKind,
+    z: f64,
+    transform: LocalTransform,
+    input: InputBehavior,
+}
 
-Candidate event shape:
+enum LayoutItemKind {
+    Pane(PaneId),
+    Placeholder,
+    Handle,
+    Chrome,
+    Overlay,
+}
+```
+
+`Pane` items reference real panes from the pane inventory. Other item kinds use
+stable layout item IDs so native input can report later pointer or keyboard
+events back to the layout policy without needing to understand the policy's
+internal tree.
+
+## Coordinates
+
+Resolved layout coordinates are normalized presentation coordinates. The useful
+coordinate domain is `-1.0..=1.0` on each axis, with conversion to output pixels
+performed by native code after validation.
+
+Candidate Rust shape:
+
+```rust
+struct LocalPoint {
+    u: f64,
+    v: f64,
+}
+
+struct LocalTransform {
+    /// Top-left normalized presentation coordinate.
+    offset: LocalPoint,
+    /// Normalized width and height. A full-content item uses `2.0, 2.0`.
+    size: LocalPoint,
+}
+```
+
+Native code should provide the transform algebra: containment, intersection,
+parent-to-child projection, child-to-parent projection, clipping, and
+normalized-to-pixel conversion. That keeps coordinate behavior consistent across
+rendering, input, capture, and diagnostics.
+
+In the current host contract, `offset=(-1.0, -1.0), size=(2.0, 2.0)` covers the
+full content presentation area. `offset=(0.0, -1.0), size=(1.0, 2.0)` covers the
+right half. Native-owned presentation chrome such as reserved panels can still
+occupy space outside that content area before the transform is projected to
+pixels.
+
+## Hit Testing
+
+Hit testing is derived from the accepted resolved layout. It should not be a
+method on the WASM layout policy or on the policy's source tree.
+
+Candidate native API:
+
+```rust
+impl ResolvedLayout {
+    fn hit_stack(&self, point: LocalPoint) -> Vec<HitResult>;
+    fn top_hit(&self, point: LocalPoint) -> Option<HitResult>;
+}
+
+struct HitResult {
+    item: LayoutItemId,
+    kind: LayoutItemKind,
+    local_point: LocalPoint,
+}
+```
+
+The native implementation can walk items in reverse paint order or by sorted
+`z`, returning every item that contains the point. Pointer forwarding can use
+`top_hit`, while debugging, drag/drop, scroll pass-through, and focus policy can
+use the full hit stack.
+
+## Validation
+
+Native validation must reject or repair candidate layouts that would make the
+presentation unsafe or incoherent.
+
+Validation should check:
+
+- finite coordinates, transforms, and `z` values
+- normalized rects with `min <= max`
+- item IDs that are stable and unique within the resolved layout
+- pane references that exist in the current pane inventory
+- invalid duplicate pane placement unless the item kind explicitly allows it
+- input behaviors that match the item kind
+- items outside allowed bounds unless overflow is explicitly supported
+- excessive item counts or oversized serialized responses
+
+Validation failures should be observable in diagnostics. The host should fall
+back to a deterministic native resolved layout rather than applying invalid
+candidate data.
+
+## Events
+
+Native layout events should describe why a new resolved layout is needed without
+dictating the policy's internal model.
+
+Candidate events:
 
 ```rust
 enum LayoutEvent {
-    WindowAdded {
-        window: WindowDescriptor,
-        source: AddWindowSource,
-        preferred_area: Option<RegionId>,
-    },
-    WindowRemoved {
-        window_id: WindowId,
-    },
-    DragStarted {
-        pane_id: PaneId,
-    },
-    DragDropped {
-        pane_id: PaneId,
-        target: DropTarget,
-    },
-    SplitRequested {
-        pane_id: PaneId,
-        axis: Axis,
-        side: Side,
-    },
-}
-
-enum LayoutResponse {
-    Patch(Vec<LayoutPatch>),
-    Replace(LayoutSpec),
-    Reject { reason: String },
-    Abstain,
+    PaneAdded { pane: PaneId },
+    PaneRemoved { pane: PaneId },
+    PresentationResized { constraints: LayoutConstraints },
+    PointerPressed { hit: Option<HitResult> },
+    PointerDragged { item: LayoutItemId, from: LocalPoint, to: LocalPoint },
+    PointerReleased { hit_stack: Vec<HitResult> },
+    Command { command: LayoutCommand },
 }
 ```
 
-The response is a proposal. The native host is the committer.
+A split resize is not a native primitive in this model. It is a pointer event on
+a resolved handle item. WASM can interpret that handle as a split divider, tab
+bar, floating window edge, or anything else and return a new resolved layout.
 
 ## Fallback Rule
 
-Manifold must always have a native fallback layout mould.
+Manifold must always have a native fallback that can produce a valid resolved
+layout from pane inventory and presentation constraints.
 
-If the WASM module is missing, slow, trapped, disabled, or returns invalid data,
-the native fallback should still place windows predictably, preserve existing
-panes, and keep the presentation usable.
-
-Reloadable layout policy should make Manifold more adaptable, not fragile.
+The fallback should be simple and deterministic. It does not need to model every
+WASM policy feature; it only needs to keep panes visible enough for recovery and
+preserve session usability when policy code fails.
