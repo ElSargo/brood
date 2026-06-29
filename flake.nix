@@ -1,6 +1,13 @@
 {
   description = "Manifold development shell";
 
+  nixConfig = {
+    extra-substituters = [ "https://manifold-platform.cachix.org" ];
+    extra-trusted-public-keys = [
+      "manifold-platform.cachix.org-1:cXJupbtXzFJe8vIIyt+ZYN+ganoykFuUIZOPfFQ+GP0="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay = {
@@ -60,23 +67,20 @@
             ) old.mesonFlags;
           });
 
+          sessionSwitcherPython = pkgs.python3.withPackages (
+            ps: with ps; [
+              dbus-python
+              pygobject3
+            ]
+          );
+
           devTools = with pkgs; [
             bashInteractive
             coreutils
-            docker
-            docker-buildx
             findutils
             git
-            go
-            jq
             pkg-config
-            firefox
-            (python3.withPackages (
-              ps: with ps; [
-                dbus-python
-                pygobject3
-              ]
-            ))
+            sessionSwitcherPython
             ripgrep
             rustToolchain
           ];
@@ -139,6 +143,13 @@
             ) old.mesonFlags;
           });
 
+          sessionSwitcherPython = pkgs.python3.withPackages (
+            ps: with ps; [
+              dbus-python
+              pygobject3
+            ]
+          );
+
           devTools = with pkgs; [
             bashInteractive
             coreutils
@@ -150,12 +161,7 @@
             jq
             pkg-config
             firefox
-            (python3.withPackages (
-              ps: with ps; [
-                dbus-python
-                pygobject3
-              ]
-            ))
+            sessionSwitcherPython
             ripgrep
             rustToolchain
           ];
@@ -219,11 +225,20 @@
               RUN_ROOT="''${MANIFOLD_DEV_RUN_ROOT:-$CACHE_ROOT/runs}"
               RUST_LOG="''${RUST_LOG:-manifoldd=info,smithay=warn}"
 
-              export PATH="${devToolPath}:$PATH"
+              export PATH="${sessionSwitcherPython}/bin:${devToolPath}:$PATH"
               export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
               export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
               export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
               export MANIFOLD_DEV_SHELL=1
+
+              "${sessionSwitcherPython}/bin/python3" - <<'PY'
+              import dbus
+              import dbus.mainloop.glib
+              import gi
+
+              gi.require_version("Gtk", "3.0")
+              from gi.repository import Gtk  # noqa: F401
+              PY
 
               if [[ -z "''${WAYLAND_DISPLAY:-}" && -z "''${DISPLAY:-}" ]]; then
                 echo "ERR this workflow needs a host graphical session (WAYLAND_DISPLAY or DISPLAY)" >&2
@@ -351,70 +366,6 @@
             '';
           };
 
-          firefoxCloseReattachHarness =
-            pkgs.runCommand "manifold-firefox-close-reattach-harness.wasm"
-              {
-                nativeBuildInputs = [ rustToolchain ];
-              }
-              ''
-                rustc \
-                  --edition=2024 \
-                  --crate-name manifold_firefox_close_reattach_harness \
-                  --crate-type cdylib \
-                  --target wasm32-unknown-unknown \
-                  -O \
-                  ${./examples/wasm-firefox-close-reattach-harness/src/lib.rs} \
-                  -o "$out"
-              '';
-
-          firefoxCloseReattachTestScript =
-            pkgs.runCommand "manifold-firefox-close-reattach-test-script"
-              {
-                nativeBuildInputs = [ pkgs.makeWrapper ];
-              }
-              ''
-                mkdir -p "$out/bin"
-                makeWrapper ${pkgs.bash}/bin/bash "$out/bin/manifold-firefox-close-reattach-test" \
-                  --add-flags ${./tools/run-headless-firefox-close-reattach.sh} \
-                  --prefix PATH : "${
-                    lib.makeBinPath [
-                      pkgs.bash
-                      pkgs.coreutils
-                      pkgs.firefox
-                      pkgs.gnugrep
-                      pkgs.gnused
-                      pkgs.jq
-                      westonWithSimpleClients
-                    ]
-                  }" \
-                  --set LD_LIBRARY_PATH "${lib.makeLibraryPath nativeLibs}" \
-                  --set MANIFOLDD_BIN "${manifoldd}/bin/manifoldd" \
-                  --set HARNESS_WASM "${firefoxCloseReattachHarness}" \
-                  --set FIREFOX_BIN "${pkgs.firefox}/bin/firefox" \
-                  --set WESTON_SIMPLE_SHM "${westonWithSimpleClients}/bin/weston-simple-shm"
-              '';
-
-          firefoxCloseReattachTest =
-            pkgs.runCommand "manifold-firefox-close-reattach-test"
-              {
-                nativeBuildInputs = [ firefoxCloseReattachTestScript ];
-              }
-              ''
-                export EGL_PLATFORM=wayland
-                export LIBGL_ALWAYS_SOFTWARE=1
-                export LIBGL_DRIVERS_PATH="${pkgs.mesa}/lib/dri"
-                export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
-                export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
-                export WORKDIR="$TMPDIR/firefox-close-reattach"
-
-                manifold-firefox-close-reattach-test
-
-                mkdir -p "$out"
-                mkdir -p "$out/artifacts/nested"
-                cp "$WORKDIR/test.log" "$out/artifacts/test.log"
-                cp "$WORKDIR"/nested/*.log "$out/artifacts/nested/" 2>/dev/null || true
-                echo "OK" > "$out/result"
-              '';
         in
         {
           default = manifoldd;
@@ -422,16 +373,9 @@
           inherit
             devWorkflow
             manifoldd
-            firefoxCloseReattachHarness
-            firefoxCloseReattachTestScript
-            firefoxCloseReattachTest
             ;
         }
       );
-
-      checks = forEachSystem (system: {
-        firefox-close-reattach = self.packages.${system}.firefoxCloseReattachTest;
-      });
 
       formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

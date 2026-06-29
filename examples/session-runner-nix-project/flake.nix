@@ -10,10 +10,14 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
-      forEachSystem = f: builtins.listToAttrs (map (system: {
-        name = system;
-        value = f system;
-      }) systems);
+      forEachSystem =
+        f:
+        builtins.listToAttrs (
+          map (system: {
+            name = system;
+            value = f system;
+          }) systems
+        );
     in
     {
       devShells = forEachSystem (system: {
