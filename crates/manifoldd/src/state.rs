@@ -854,52 +854,12 @@ impl Manifold {
 
     pub fn log_pointer_click_focus_debug(
         &self,
-        phase: &'static str,
-        button_code: u32,
-        pos: Point<f64, Logical>,
-        target_surface: Option<&WlSurface>,
-        focus_surface: Option<&WlSurface>,
+        _phase: &'static str,
+        _button_code: u32,
+        _pos: Point<f64, Logical>,
+        _target_surface: Option<&WlSurface>,
+        _focus_surface: Option<&WlSurface>,
     ) {
-        let content_rect = self.content_rect();
-        let local_point = content_rect
-            .contains_f64(pos.x, pos.y)
-            .then(|| LocalPoint::from_pixel_in_rect(pos.x, pos.y, content_rect));
-        let local_point_text = local_point.map_or_else(
-            || "outside-content".to_string(),
-            |point| format!("{:.4},{:.4}", point.u, point.v),
-        );
-        let hit_stack = local_point.map_or_else(
-            || "outside-content".to_string(),
-            |point| self.resolved_effective_hit_stack_debug_summary(point, pos),
-        );
-        let raw_hit_stack = local_point.map_or_else(
-            || "outside-content".to_string(),
-            |point| self.resolved_raw_hit_stack_debug_summary(point),
-        );
-        let hit_rejects = local_point.map_or_else(
-            || "outside-content".to_string(),
-            |point| self.resolved_hit_rejections_debug_summary(point, pos),
-        );
-
-        let message = format!(
-            "pointer click focus diagnostics phase={} button={} pointer={:.1},{:.1} content_rect={} local_point={} hit_stack=[{}] raw_layout_hit_stack=[{}] hit_rejects=[{}] target_window=[{}] selected_focus=[{}] active_window=[{}] resolved_layout_source={} resolved_layout=[{}]",
-            phase,
-            button_code,
-            pos.x,
-            pos.y,
-            layout_rect_debug(content_rect),
-            local_point_text,
-            hit_stack,
-            raw_hit_stack,
-            hit_rejects,
-            self.surface_click_debug_summary(target_surface),
-            self.surface_click_debug_summary(focus_surface),
-            self.surface_click_debug_summary(self.active_toplevel_surface.as_ref()),
-            self.resolved_layout_source_name(),
-            self.resolved_layout_debug_summary(),
-        );
-        eprintln!("{message}");
-        warn!(target: "manifoldd::pointer_focus", %message);
     }
 
     fn resolved_effective_hit_stack(
@@ -929,142 +889,6 @@ impl Manifold {
                 }),
             })
             .collect()
-    }
-
-    fn resolved_effective_hit_stack_debug_summary(
-        &self,
-        point: LocalPoint,
-        pos: Point<f64, Logical>,
-    ) -> String {
-        let hits = self.resolved_effective_hit_stack(point, pos);
-        if hits.is_empty() {
-            return "none".to_string();
-        }
-        hits.into_iter()
-            .map(|hit| {
-                let target = hit
-                    .window_hit
-                    .as_ref()
-                    .and_then(|(window, _)| Manifold::window_toplevel_surface(window))
-                    .map(|surface| self.surface_click_debug_summary(Some(&surface)))
-                    .unwrap_or_else(|| "none".to_string());
-                format!("{},target={}", layout_hit_debug(hit.layout_hit), target)
-            })
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }
-
-    fn resolved_raw_hit_stack_debug_summary(&self, point: LocalPoint) -> String {
-        let hits = self.accepted_resolved_layout.hit_stack(point);
-        if hits.is_empty() {
-            return "none".to_string();
-        }
-        hits.into_iter()
-            .map(layout_hit_debug)
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }
-
-    fn resolved_hit_rejections_debug_summary(
-        &self,
-        point: LocalPoint,
-        pos: Point<f64, Logical>,
-    ) -> String {
-        let rejects = self
-            .accepted_resolved_layout
-            .hit_stack(point)
-            .into_iter()
-            .filter_map(|hit| self.resolved_hit_rejection_debug(hit, pos))
-            .collect::<Vec<_>>();
-        if rejects.is_empty() {
-            return "none".to_string();
-        }
-        rejects.join(" | ")
-    }
-
-    fn resolved_hit_rejection_debug(
-        &self,
-        hit: HitResult,
-        pos: Point<f64, Logical>,
-    ) -> Option<String> {
-        let LayoutItemKind::Pane { pane } = hit.kind else {
-            return None;
-        };
-        let reason = match self.surface_for_pane(pane) {
-            None => "missing-surface".to_string(),
-            Some(surface) => {
-                let surface_summary = self.surface_click_debug_summary(Some(&surface));
-                match self.window_for_toplevel_surface(&surface) {
-                    None => format!("hidden-window,{surface_summary}"),
-                    Some(window) if self.window_hit_location(&window, pos).is_none() => {
-                        format!("surface-miss,{surface_summary}")
-                    }
-                    Some(_) => return None,
-                }
-            }
-        };
-        Some(format!("{},reason={}", layout_hit_debug(hit), reason))
-    }
-
-    fn resolved_layout_debug_summary(&self) -> String {
-        if self.accepted_resolved_layout.items.is_empty() {
-            return "empty".to_string();
-        }
-        self.accepted_resolved_layout
-            .items
-            .iter()
-            .map(|item| {
-                format!(
-                    "id={},kind={},z={:.3},rect={},offset={:.4},{:.4},size={:.4},{:.4},input={:?},active={}",
-                    item.id.0,
-                    layout_item_kind_debug(item.kind),
-                    item.z,
-                    layout_rect_debug(self.resolved_layout_item_rect(*item)),
-                    item.transform.offset.u,
-                    item.transform.offset.v,
-                    item.transform.size.u,
-                    item.transform.size.v,
-                    item.input,
-                    self.resolved_layout_item_active(*item)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }
-
-    fn surface_click_debug_summary(&self, surface: Option<&WlSurface>) -> String {
-        let Some(surface) = surface else {
-            return "none".to_string();
-        };
-        let surface_id = crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()));
-        let pane = self
-            .pane_for_toplevel_surface(surface)
-            .map_or_else(|| "none".to_string(), |pane| pane.to_string());
-        let session = self
-            .session_for_toplevel_surface(surface)
-            .unwrap_or(SurfaceSessionId(1))
-            .raw();
-        let rect = self
-            .layout_rect_for_toplevel_surface(surface)
-            .map_or_else(|| "none".to_string(), layout_rect_debug);
-        let app_id = toplevel_app_id(surface)
-            .map(|value| crate::presentation::sanitize_status_value(&value))
-            .unwrap_or_else(|| "none".to_string());
-        let title = toplevel_title(surface)
-            .map(|value| crate::presentation::sanitize_status_value(&value))
-            .unwrap_or_else(|| "none".to_string());
-        format!(
-            "surface={},pane={},session={},visible={},content_layout={},focusable={},rect={},app_id={},title={}",
-            surface_id,
-            pane,
-            session,
-            self.surface_visible_in_presentation(surface),
-            self.surface_participates_in_resolved_layout(surface),
-            self.surface_can_receive_focus(surface),
-            rect,
-            app_id,
-            title
-        )
     }
 
     fn window_hit_location(
@@ -1911,12 +1735,6 @@ impl Manifold {
             .rev()
             .find(|panel| panel.surface == *surface)
             .is_some_and(|panel| panel.visible)
-    }
-
-    fn surface_visible_in_presentation(&self, surface: &WlSurface) -> bool {
-        self.window_for_any_toplevel_surface(surface)
-            .as_ref()
-            .is_some_and(|window| self.window_visible_in_presentation(window))
     }
 
     fn surface_can_receive_focus(&self, surface: &WlSurface) -> bool {
@@ -3543,20 +3361,6 @@ fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
     }
 }
 
-fn layout_rect_debug(rect: LayoutRect) -> String {
-    format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h)
-}
-
-fn layout_hit_debug(hit: HitResult) -> String {
-    format!(
-        "item={},kind={},local={:.4},{:.4}",
-        hit.item.0,
-        layout_item_kind_debug(hit.kind),
-        hit.local_point.u,
-        hit.local_point.v
-    )
-}
-
 fn first_available_pane_from(
     panes: &[u64],
     start: u64,
@@ -3588,16 +3392,6 @@ fn first_available_pane_from(
         }
     }
     None
-}
-
-fn layout_item_kind_debug(kind: LayoutItemKind) -> String {
-    match kind {
-        LayoutItemKind::Pane { pane } => format!("pane:{pane}"),
-        LayoutItemKind::Placeholder => "placeholder".to_string(),
-        LayoutItemKind::Handle => "handle".to_string(),
-        LayoutItemKind::Chrome => "chrome".to_string(),
-        LayoutItemKind::Overlay => "overlay".to_string(),
-    }
 }
 
 fn surface_origin_in_compositor_space(
