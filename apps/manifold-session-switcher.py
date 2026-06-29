@@ -194,7 +194,13 @@ class ManifoldBus:
         )
         return int(notification_id)
 
-    def focus_presentation_window(self):
+    def focus_presentation_window(self, activation_token=""):
+        if activation_token:
+            return bool(
+                self.compositor.FocusPresentationWindowWithActivationToken(
+                    str(activation_token)
+                )
+            )
         return bool(self.compositor.FocusPresentationWindow())
 
     def register_sidebar(self, width):
@@ -246,6 +252,8 @@ class SessionSwitcher:
         self.agent_done_state = {}
         self.agent_done_state_initialized = False
         self.notification_agents = {}
+        self.notification_tokens = {}
+        self.activated_notifications = set()
         self.animation_tick = 0
         self.registered = False
         self.last_error = None
@@ -301,6 +309,12 @@ class SessionSwitcher:
         self.bus.bus.add_signal_receiver(
             self.handle_notification_action,
             signal_name="ActionInvoked",
+            dbus_interface=NOTIFICATIONS_DESTINATION,
+            path=NOTIFICATIONS_PATH,
+        )
+        self.bus.bus.add_signal_receiver(
+            self.handle_notification_activation_token,
+            signal_name="ActivationToken",
             dbus_interface=NOTIFICATIONS_DESTINATION,
             path=NOTIFICATIONS_PATH,
         )
@@ -878,11 +892,11 @@ class SessionSwitcher:
         except Exception as err:
             write_status(self.args.event_file, event="activate-error", error=err)
 
-    def activate_agent(self, _button, agent):
+    def activate_agent(self, _button, agent, activation_token=""):
         try:
             if _button is None:
                 try:
-                    self.bus.focus_presentation_window()
+                    self.bus.focus_presentation_window(activation_token)
                 except Exception as err:
                     write_status(
                         self.args.event_file,
@@ -925,15 +939,32 @@ class SessionSwitcher:
             )
 
     def handle_notification_action(self, notification_id, action_key):
-        agent = self.notification_agents.get(int(notification_id))
-        if agent is None:
-            return
         if str(action_key) != NOTIFICATION_ACTION_DEFAULT:
             return
-        self.activate_agent(None, agent)
+        GLib.timeout_add(50, self.activate_notification, int(notification_id))
+
+    def handle_notification_activation_token(self, notification_id, activation_token):
+        notification_id = int(notification_id)
+        self.notification_tokens[notification_id] = str(activation_token)
+        self.activate_notification(notification_id)
+        return False
+
+    def activate_notification(self, notification_id):
+        if notification_id in self.activated_notifications:
+            return False
+        agent = self.notification_agents.get(notification_id)
+        if agent is None:
+            return False
+        self.activated_notifications.add(notification_id)
+        activation_token = self.notification_tokens.pop(notification_id, "")
+        self.activate_agent(None, agent, activation_token)
+        return False
 
     def handle_notification_closed(self, notification_id, _reason):
-        self.notification_agents.pop(int(notification_id), None)
+        notification_id = int(notification_id)
+        self.notification_agents.pop(notification_id, None)
+        self.notification_tokens.pop(notification_id, None)
+        self.activated_notifications.discard(notification_id)
 
     def activate_session_from_panel_press(self, _gesture, _n_press, x, y):
         self.activate_session_at_position(x, y, event_name="panel-press")

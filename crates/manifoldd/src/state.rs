@@ -1772,13 +1772,17 @@ impl Manifold {
     }
 
     pub fn focus_presentation_window(&self) -> bool {
+        self.focus_presentation_window_with_activation_token("")
+    }
+
+    pub fn focus_presentation_window_with_activation_token(&self, activation_token: &str) -> bool {
         self.presenter.as_ref().is_some_and(|presenter| {
             presenter
                 .runtime
                 .borrow()
                 .backend
                 .as_ref()
-                .is_some_and(crate::winit_presenter::PresenterBackend::focus_window)
+                .is_some_and(|backend| backend.focus_window(Some(activation_token)))
         })
     }
 

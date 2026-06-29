@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, Result as AnyResult};
 use calloop::{
     EventSource, Interest, PostAction, Readiness, Token, TokenFactory, generic::Generic,
 };
@@ -47,7 +48,14 @@ use smithay::{
     utils::{Buffer as BufferCoords, Clock, DeviceFd, Monotonic, Physical, Rectangle, Size},
 };
 use tracing::{debug, info_span, warn};
+use wayland_client::{
+    Connection, Dispatch, Proxy, QueueHandle,
+    backend::{Backend, ObjectId},
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::{wl_registry, wl_surface},
+};
 use wayland_egl as wegl;
+use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 
 pub(crate) type SharedPresenterRuntime = Rc<RefCell<PresenterRuntime>>;
 
@@ -584,11 +592,19 @@ impl PresenterBackend {
         }
     }
 
-    pub fn focus_window(&self) -> bool {
+    pub fn focus_window(&self, activation_token: Option<&str>) -> bool {
         let Some(window) = self.window() else {
             return false;
         };
         window.set_visible(true);
+        if let Some(activation_token) = activation_token.filter(|token| !token.is_empty()) {
+            if let Err(err) = activate_wayland_window_with_token(window, activation_token) {
+                debug!(
+                    ?err,
+                    "failed to activate presentation window with notification activation token"
+                );
+            }
+        }
         window.request_user_attention(Some(UserAttentionType::Critical));
         window.focus_window();
         true
@@ -685,6 +701,74 @@ impl PresenterBackend {
         }
         Ok(())
     }
+}
+
+struct ActivationProxyState;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ActivationProxyState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_activation_v1::XdgActivationV1, ()> for ActivationProxyState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &xdg_activation_v1::XdgActivationV1,
+        _event: xdg_activation_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+fn activate_wayland_window_with_token(
+    window: &WinitWindow,
+    activation_token: &str,
+) -> AnyResult<bool> {
+    let display_ptr = match window
+        .display_handle()
+        .context("get window display handle")?
+        .as_raw()
+    {
+        RawDisplayHandle::Wayland(handle) => handle.display.as_ptr().cast(),
+        _ => return Ok(false),
+    };
+    let surface_ptr = match window
+        .window_handle()
+        .context("get window handle")?
+        .as_raw()
+    {
+        RawWindowHandle::Wayland(handle) => handle.surface.as_ptr().cast(),
+        _ => return Ok(false),
+    };
+
+    let backend = unsafe { Backend::from_foreign_display(display_ptr) };
+    let connection = Connection::from_backend(backend);
+    let (globals, event_queue) =
+        registry_queue_init::<ActivationProxyState>(&connection).context("read Wayland globals")?;
+    let activation = globals
+        .bind::<xdg_activation_v1::XdgActivationV1, _, _>(&event_queue.handle(), 1..=1, ())
+        .context("bind xdg_activation_v1")?;
+    let surface_id = unsafe {
+        ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface_ptr)
+            .context("wrap presentation wl_surface")?
+    };
+    let surface =
+        wl_surface::WlSurface::from_id(&connection, surface_id).context("proxy wl_surface")?;
+
+    activation.activate(activation_token.to_string(), &surface);
+    connection
+        .flush()
+        .context("flush Wayland activation request")?;
+    Ok(true)
 }
 
 fn create_offscreen_renderbuffer(

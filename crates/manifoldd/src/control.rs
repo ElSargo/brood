@@ -238,6 +238,10 @@ enum DbusStateRequest {
     FocusPresentationWindow {
         response: BoolResponse,
     },
+    FocusPresentationWindowWithActivationToken {
+        activation_token: String,
+        response: BoolResponse,
+    },
     Dismiss {
         window_id: String,
         response: BoolResponse,
@@ -646,6 +650,18 @@ impl CompositorDbus {
         })
     }
 
+    async fn focus_presentation_window_with_activation_token(
+        &self,
+        activation_token: String,
+    ) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::FocusPresentationWindowWithActivationToken {
+                activation_token,
+                response,
+            }
+        })
+    }
+
     async fn dismiss(&self, window_id: String) -> fdo::Result<bool> {
         request_state(&self.sender, |response| DbusStateRequest::Dismiss {
             window_id,
@@ -771,6 +787,10 @@ trait ManifoldCompositor {
     ) -> zbus::Result<String>;
     fn request_focus(&self, window_id: String) -> zbus::Result<bool>;
     fn focus_presentation_window(&self) -> zbus::Result<bool>;
+    fn focus_presentation_window_with_activation_token(
+        &self,
+        activation_token: String,
+    ) -> zbus::Result<bool>;
     fn dismiss(&self, window_id: String) -> zbus::Result<bool>;
 }
 
@@ -1956,6 +1976,13 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::FocusPresentationWindow { response } => {
             send_response(response, Ok(state.focus_presentation_window()));
         }
+        DbusStateRequest::FocusPresentationWindowWithActivationToken {
+            activation_token,
+            response,
+        } => send_response(
+            response,
+            Ok(state.focus_presentation_window_with_activation_token(&activation_token)),
+        ),
         DbusStateRequest::Dismiss {
             window_id,
             response,

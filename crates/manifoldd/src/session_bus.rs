@@ -66,6 +66,10 @@ const NOTIFICATIONS_INTROSPECTION_XML: &str = r#"<node>
       <arg type="u"/>
       <arg type="s"/>
     </signal>
+    <signal name="ActivationToken">
+      <arg type="u"/>
+      <arg type="s"/>
+    </signal>
   </interface>
   <interface name="org.freedesktop.DBus.Introspectable">
     <method name="Introspect">
@@ -845,7 +849,17 @@ fn forward_notification_signals(
                         "ActionInvoked",
                         &(id, action_key),
                     )?;
-                    return Ok(());
+                }
+            }
+            Some("ActivationToken") => {
+                let (id, activation_token): (u32, String) = signal.body().deserialize()?;
+                if id == notification_id {
+                    send_notification_signal(
+                        &state,
+                        connection_id,
+                        "ActivationToken",
+                        &(id, activation_token),
+                    )?;
                 }
             }
             Some("NotificationClosed") => {
