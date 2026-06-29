@@ -49,6 +49,7 @@
           };
 
           nativeLibs = with pkgs; [
+            cairo
             gtk4
             libadwaita
             libGL
@@ -66,13 +67,14 @@
             cairo
             gdk-pixbuf
             glib
+            gobject-introspection-unwrapped
             graphene
             gsettings-desktop-schemas
             gtk4
             harfbuzz
             hicolor-icon-theme
             libadwaita
-            pango
+            pango.out
           ];
 
           westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
@@ -84,6 +86,7 @@
           sessionSwitcherPython = pkgs.python3.withPackages (
             ps: with ps; [
               dbus-python
+              pycairo
               pygobject3
             ]
           );
@@ -140,6 +143,7 @@
           };
 
           nativeLibs = with pkgs; [
+            cairo
             gtk4
             libadwaita
             libGL
@@ -157,13 +161,14 @@
             cairo
             gdk-pixbuf
             glib
+            gobject-introspection-unwrapped
             graphene
             gsettings-desktop-schemas
             gtk4
             harfbuzz
             hicolor-icon-theme
             libadwaita
-            pango
+            pango.out
           ];
 
           westonWithSimpleClients = pkgs.weston.overrideAttrs (old: {
@@ -175,6 +180,7 @@
           sessionSwitcherPython = pkgs.python3.withPackages (
             ps: with ps; [
               dbus-python
+              pycairo
               pygobject3
             ]
           );
@@ -207,7 +213,7 @@
           ];
 
           devToolPath = lib.makeBinPath (devTools ++ smokeTools);
-          nativeLibraryPath = lib.makeLibraryPath nativeLibs;
+          nativeLibraryPath = lib.makeLibraryPath (nativeLibs ++ gtkRuntime);
           gtkTypelibPath = lib.makeSearchPath "lib/girepository-1.0" gtkRuntime;
           gtkDataDirs = lib.makeSearchPath "share" gtkRuntime;
           nativePkgConfigPath = lib.concatStringsSep ":" [
@@ -267,8 +273,10 @@
               "${sessionSwitcherPython}/bin/python3" - <<'PY'
               import dbus
               import dbus.mainloop.glib
+              import cairo
               import gi
 
+              gi.require_foreign("cairo")
               gi.require_version("Gdk", "4.0")
               gi.require_version("Gtk", "4.0")
               gi.require_version("Adw", "1")
