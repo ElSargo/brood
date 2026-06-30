@@ -3441,11 +3441,7 @@ impl Manifold {
             .active_toplevel_surface
             .as_ref()
             .is_some_and(|surface| {
-                live_toplevel_surfaces.iter().any(|live| live == surface)
-                    && self
-                        .session_for_toplevel_surface(surface)
-                        .unwrap_or(SurfaceSessionId(1))
-                        == self.active_surface_session
+                self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
             });
 
         if self.active_toplevel_surface.is_some() && !active_surface_is_live {
@@ -3473,10 +3469,7 @@ impl Manifold {
         if let Some(current_focus) = current_focus {
             let focus_is_live = live_toplevel_surfaces.iter().any(|surface| {
                 surface == &current_focus
-                    && self
-                        .session_for_toplevel_surface(surface)
-                        .unwrap_or(SurfaceSessionId(1))
-                        == self.active_surface_session
+                    && self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
             });
             if !focus_is_live {
                 self.reset_transient_input_state();
@@ -3507,6 +3500,20 @@ impl Manifold {
         self.reconfigure_focus_stack();
         self.last_window_count = window_count;
         outcome
+    }
+
+    fn surface_is_live_focus_target(
+        &self,
+        surface: &WlSurface,
+        live_toplevel_surfaces: &[WlSurface],
+    ) -> bool {
+        live_toplevel_surfaces.iter().any(|live| live == surface)
+            && (self
+                .session_for_toplevel_surface(surface)
+                .unwrap_or(SurfaceSessionId(1))
+                == self.active_surface_session
+                || self.surface_is_visible_presentation_member(surface)
+                || self.surface_has_visible_panel(surface))
     }
 
     fn repair_resolved_layout_for_current_inventory(&mut self) {

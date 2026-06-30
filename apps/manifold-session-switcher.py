@@ -264,6 +264,7 @@ class SessionSwitcher:
         self.status_items = {}
         self.filtered_sessions = []
         self.expanded_sessions = set()
+        self.selected_session_id = None
         self.session_order = []
         self.session_rows = {}
         self.agent_done_state = {}
@@ -368,6 +369,12 @@ class SessionSwitcher:
             self.window.present()
         else:
             self.window.show_all()
+        GLib.idle_add(self.focus_command_entry)
+
+    def focus_command_entry(self):
+        if hasattr(self, "command_entry"):
+            self.command_entry.grab_focus()
+        return False
 
     def build_ui(self):
         self.install_css()
@@ -377,26 +384,25 @@ class SessionSwitcher:
         outer.set_margin_start(10)
         outer.set_margin_end(10)
 
-        create_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.create_entry = Gtk.Entry()
-        self.create_entry.set_placeholder_text("New session")
-        self.create_entry.connect("activate", self.create_session)
+        command_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.command_entry = Gtk.Entry()
+        self.command_entry.set_placeholder_text("Search or create session")
+        self.command_entry.connect("changed", self.filter_sessions)
+        self.command_entry.connect("activate", self.submit_command)
         if GTK4:
-            create_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
+            command_button = Gtk.Button.new_from_icon_name("go-next-symbolic")
+            key_controller = Gtk.EventControllerKey()
+            key_controller.connect("key-pressed", self.handle_command_key_pressed)
+            self.command_entry.add_controller(key_controller)
         else:
-            create_button = Gtk.Button.new_from_icon_name(
-                "list-add-symbolic", Gtk.IconSize.BUTTON
+            command_button = Gtk.Button.new_from_icon_name(
+                "go-next-symbolic", Gtk.IconSize.BUTTON
             )
-        create_button.set_tooltip_text("Create session")
-        create_button.connect("clicked", self.create_session)
-        self.pack(create_row, self.create_entry, expand=True)
-        self.pack(create_row, create_button, expand=False)
-        self.pack(outer, create_row, expand=False)
-
-        self.search_entry = Gtk.Entry()
-        self.search_entry.set_placeholder_text("Search sessions")
-        self.search_entry.connect("changed", self.filter_sessions)
-        self.pack(outer, self.search_entry, expand=False)
+        command_button.set_tooltip_text("Open selected session or create one")
+        command_button.connect("clicked", self.submit_command)
+        self.pack(command_row, self.command_entry, expand=True)
+        self.pack(command_row, command_button, expand=False)
+        self.pack(outer, command_row, expand=False)
 
         if GTK4:
             self.listbox = Gtk.ListBox()
@@ -450,6 +456,10 @@ class SessionSwitcher:
             button.session-select.active-session {
               border-color: rgba(90, 150, 190, 0.85);
               background: rgba(90, 150, 190, 0.10);
+            }
+            button.session-select.selected-session {
+              border-color: rgba(235, 190, 105, 0.90);
+              background: rgba(235, 190, 105, 0.16);
             }
             button.agent-select {
               padding: 2px 6px;
@@ -661,7 +671,7 @@ class SessionSwitcher:
             )
 
     def filter_sessions(self, *_args):
-        query = self.search_entry.get_text().strip().lower()
+        query = self.command_entry.get_text().strip().lower()
         if query:
             self.filtered_sessions = [
                 session
@@ -674,7 +684,51 @@ class SessionSwitcher:
         self.filtered_sessions.sort(
             key=lambda session: (order.get(session["id"], len(order)), session["id"])
         )
+        self.reconcile_selected_session()
         self.render_sessions()
+
+    def reconcile_selected_session(self):
+        visible_ids = [session["id"] for session in self.filtered_sessions]
+        if self.selected_session_id in visible_ids:
+            return
+        self.selected_session_id = visible_ids[0] if visible_ids else None
+
+    def move_selected_session(self, offset):
+        if not self.filtered_sessions:
+            self.selected_session_id = None
+            self.render_selection()
+            return
+
+        visible_ids = [session["id"] for session in self.filtered_sessions]
+        if self.selected_session_id in visible_ids:
+            index = visible_ids.index(self.selected_session_id)
+            index = (index + offset) % len(visible_ids)
+        elif offset < 0:
+            index = len(visible_ids) - 1
+        else:
+            index = 0
+        self.selected_session_id = visible_ids[index]
+        self.render_selection()
+
+    def render_selection(self):
+        for session_id, widgets in self.session_rows.items():
+            context = widgets["button"].get_style_context()
+            if session_id == self.selected_session_id:
+                context.add_class("selected-session")
+            else:
+                context.remove_class("selected-session")
+
+    def handle_command_key_pressed(self, _controller, keyval, _keycode, _state):
+        if keyval == Gdk.KEY_Down:
+            self.move_selected_session(1)
+            return True
+        if keyval == Gdk.KEY_Up:
+            self.move_selected_session(-1)
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.submit_command()
+            return True
+        return False
 
     def render_sessions(self):
         self.agents_by_session = {}
@@ -700,6 +754,7 @@ class SessionSwitcher:
             sessions=len(self.sessions),
             agents=len(self.agents),
             rows=len(self.filtered_sessions),
+            selected=self.selected_session_id or "none",
         )
 
     def clear_listbox(self):
@@ -727,6 +782,10 @@ class SessionSwitcher:
                 button_context.add_class("active-session")
             else:
                 button_context.remove_class("active-session")
+            if session["id"] == self.selected_session_id:
+                button_context.add_class("selected-session")
+            else:
+                button_context.remove_class("selected-session")
             widgets["toggle"].set_label(
                 "v" if session["id"] in self.expanded_sessions else ">"
             )
@@ -769,6 +828,8 @@ class SessionSwitcher:
         session_button.get_style_context().add_class("session-select")
         if session["active"]:
             session_button.get_style_context().add_class("active-session")
+        if session["id"] == self.selected_session_id:
+            session_button.get_style_context().add_class("selected-session")
         session_button.set_size_request(-1, 28)
         session_button.set_hexpand(True)
         session_button.connect("clicked", self.activate_session, session["id"])
@@ -987,6 +1048,8 @@ class SessionSwitcher:
             self.activate_session(None, session_id)
 
     def activate_session(self, _button, session_id):
+        self.selected_session_id = session_id
+        self.render_selection()
         try:
             changed = self.bus.activate(session_id)
             write_status(
@@ -1085,10 +1148,9 @@ class SessionSwitcher:
                 x=round(x, 1),
                 y=round(y, 1),
             )
-            self.create_session()
+            self.submit_command()
             return
-        list_top = 92
-        row_height = 42
+        list_top = 54
         if y < list_top:
             return
         write_status(
@@ -1098,11 +1160,18 @@ class SessionSwitcher:
             y=round(y, 1),
         )
 
+    def submit_command(self, *_args):
+        if self.selected_session_id is not None:
+            self.activate_session(None, self.selected_session_id)
+        else:
+            self.create_session()
+
     def create_session(self, *_args):
-        name = self.create_entry.get_text().strip() or None
+        name = self.command_entry.get_text().strip() or None
         try:
             session_id = self.bus.create(name)
-            self.create_entry.set_text("")
+            self.command_entry.set_text("")
+            self.selected_session_id = session_id
             write_status(
                 self.args.event_file,
                 event="create",
