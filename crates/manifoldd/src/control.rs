@@ -113,6 +113,7 @@ type ExtensionListResponse = mpsc::Sender<std::result::Result<Vec<DbusExtension>
 type GrantListResponse = mpsc::Sender<std::result::Result<Vec<DbusGrant>, String>>;
 type StatusListResponse = mpsc::Sender<std::result::Result<Vec<DbusStatusItem>, String>>;
 type AgentListResponse = mpsc::Sender<std::result::Result<Vec<DbusAgent>, String>>;
+type OptionalControlResponse = mpsc::Sender<std::result::Result<Option<String>, String>>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -234,6 +235,11 @@ enum DbusStateRequest {
     UnregisterAgent {
         agent_id: String,
         response: BoolResponse,
+    },
+    UnregisterAgentByIdentity {
+        kind: String,
+        metadata: DbusMetadata,
+        response: OptionalControlResponse,
     },
     RegisterWindow {
         extension_id: String,
@@ -571,6 +577,28 @@ impl AgentDbus {
                 .map_err(|err| fdo::Error::Failed(err.to_string()))?;
         }
         Ok(changed)
+    }
+
+    async fn unregister_agent_by_identity(
+        &self,
+        kind: String,
+        metadata: DbusMetadata,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<bool> {
+        let removed = request_state(&self.sender, |response| {
+            DbusStateRequest::UnregisterAgentByIdentity {
+                kind,
+                metadata,
+                response,
+            }
+        })?;
+        if let Some(agent_id) = removed {
+            Self::agent_unregistered(&emitter, &agent_id)
+                .await
+                .map_err(|err| fdo::Error::Failed(err.to_string()))?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     #[zbus(signal)]
@@ -2320,6 +2348,11 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::UnregisterAgent { agent_id, response } => {
             send_response(response, Ok(state.unregister_agent(&agent_id)));
         }
+        DbusStateRequest::UnregisterAgentByIdentity {
+            kind,
+            metadata,
+            response,
+        } => send_response(response, state.unregister_agent_by_identity(kind, metadata)),
         DbusStateRequest::RegisterWindow {
             extension_id,
             window_identity,
