@@ -31,21 +31,21 @@ const KEY_SPACE: i32 = 65;
 const MOD_CTRL: i32 = 1;
 const MOD_ALT: i32 = 2;
 
-const KITTY: &[u8] = b"kitty";
+const FOOT: &[u8] = b"foot";
 const AGENT_APP_ID: &[u8] = b"manifold-codex";
-const AGENT_COMMAND: &[u8] = b"kitty --class manifold-codex codex --yolo";
+const AGENT_COMMAND: &[u8] = b"foot --app-id manifold-codex codex --yolo";
 const LAZYGIT_APP_ID: &[u8] = b"manifold-lazygit";
-const LAZYGIT_COMMAND: &[u8] = b"kitty --class manifold-lazygit lazygit";
+const LAZYGIT_COMMAND: &[u8] = b"foot --app-id manifold-lazygit lazygit";
 const TERMINAL_1_APP_ID: &[u8] = b"manifold-terminal-1";
-const TERMINAL_1_COMMAND: &[u8] = b"kitty --class manifold-terminal-1";
+const TERMINAL_1_COMMAND: &[u8] = b"foot --app-id manifold-terminal-1";
 const TERMINAL_2_APP_ID: &[u8] = b"manifold-terminal-2";
-const TERMINAL_2_COMMAND: &[u8] = b"kitty --class manifold-terminal-2";
+const TERMINAL_2_COMMAND: &[u8] = b"foot --app-id manifold-terminal-2";
 const TERMINAL_3_APP_ID: &[u8] = b"manifold-terminal-3";
-const TERMINAL_3_COMMAND: &[u8] = b"kitty --class manifold-terminal-3";
+const TERMINAL_3_COMMAND: &[u8] = b"foot --app-id manifold-terminal-3";
 const TERMINAL_4_APP_ID: &[u8] = b"manifold-terminal-4";
-const TERMINAL_4_COMMAND: &[u8] = b"kitty --class manifold-terminal-4";
+const TERMINAL_4_COMMAND: &[u8] = b"foot --app-id manifold-terminal-4";
 const TERMINAL_5_APP_ID: &[u8] = b"manifold-terminal-5";
-const TERMINAL_5_COMMAND: &[u8] = b"kitty --class manifold-terminal-5";
+const TERMINAL_5_COMMAND: &[u8] = b"foot --app-id manifold-terminal-5";
 
 static mut FOCUSED_PANE: i64 = -1;
 
@@ -112,7 +112,7 @@ pub extern "C" fn on_key_v2(
 
     match key_code {
         KEY_N => unsafe { create_and_attach_session() },
-        KEY_O => unsafe { spawn_app(KITTY.as_ptr(), KITTY.len()) },
+        KEY_O => unsafe { spawn_app(FOOT.as_ptr(), FOOT.len()) },
         KEY_J => unsafe { layout_action(ACTION_FOCUS_NEXT) },
         KEY_K => unsafe { layout_action(ACTION_FOCUS_PREVIOUS) },
         KEY_Q => unsafe { layout_action(ACTION_CLOSE_ACTIVE_PANE) },

@@ -21,6 +21,7 @@ pkgs.writeShellApplication {
     pkgs.bash
     pkgs.coreutils
     pkgs.findutils
+    pkgs.foot
     pkgs.git
     pkgs.util-linux
   ];
@@ -131,7 +132,7 @@ pkgs.writeShellApplication {
           bash -lc "cd $q_source && exec ''${MANIFOLD_DEV_CLIENT}" >/dev/null
       else
         "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
-          "${pkgs.kitty}/bin/kitty" --working-directory "$SOURCE_DIR" >/dev/null
+          "${pkgs.foot}/bin/foot" --working-directory "$SOURCE_DIR" >/dev/null
       fi
     }
 

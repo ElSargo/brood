@@ -24,10 +24,10 @@ Default keymap:
 
 - `Ctrl-J`: focus next pane without leaving passthrough mode
 - `Ctrl-K`: focus previous pane without leaving passthrough mode
-- `Ctrl-G`: focus the Kitty LazyGit pane, spawning it if needed
-- `Ctrl-Enter`: focus the Kitty Codex agent pane, spawning it if needed
-- `Ctrl-1` through `Ctrl-5`: focus numbered Kitty terminal panes, spawning them if needed
-- `Ctrl-O`: spawn `kitty`
+- `Ctrl-G`: focus the Foot LazyGit pane, spawning it if needed
+- `Ctrl-Enter`: focus the Foot Codex agent pane, spawning it if needed
+- `Ctrl-1` through `Ctrl-5`: focus numbered Foot terminal panes, spawning them if needed
+- `Ctrl-O`: spawn `foot`
 - `Ctrl-N`: create and attach a new surface session
 - `Ctrl-Q`: close the active pane
 - `Ctrl-F`: toggle managed fullscreen

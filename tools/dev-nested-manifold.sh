@@ -7,7 +7,7 @@ cd "$ROOT"
 
 KEEP_RUNNING=0
 SAMPLE_SECONDS="${MANIFOLD_NESTED_SAMPLE_SECONDS:-2}"
-DEV_CLIENT="${MANIFOLD_NESTED_DEV_CLIENT:-kitty}"
+DEV_CLIENT="${MANIFOLD_NESTED_DEV_CLIENT:-foot}"
 OUT_DIR="${MANIFOLD_NESTED_OUT_DIR:-}"
 
 usage() {
@@ -26,7 +26,7 @@ Options:
 
 Environment:
   MANIFOLD_NESTED_SAMPLE_SECONDS  status sampling duration, default 2
-  MANIFOLD_NESTED_DEV_CLIENT      default dev client command, default kitty
+  MANIFOLD_NESTED_DEV_CLIENT      default dev client command, default foot
   MANIFOLD_NESTED_OUT_DIR         default output directory
 EOF
 }

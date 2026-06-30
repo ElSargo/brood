@@ -359,7 +359,7 @@ mod tests {
 
             [startup.agent]
             realm = "session"
-            argv = ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
+            argv = ["foot", "--app-id", "manifold-codex", "codex", "--yolo"]
 
             [startup.switcher]
             realm = "presentation"
@@ -389,7 +389,7 @@ mod tests {
         assert!(app.enabled);
         assert_eq!(
             app.argv,
-            ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
+            ["foot", "--app-id", "manifold-codex", "codex", "--yolo"]
         );
         assert_eq!(app.realm, super::StartupRealm::Session);
 

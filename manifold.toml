@@ -12,7 +12,7 @@ capabilities = [
 
 [startup.agent]
 enabled = true
-argv = ["kitty", "--class", "manifold-codex", "codex", "--yolo"]
+argv = ["foot", "--app-id", "manifold-codex", "codex", "--yolo"]
 
 [startup.session-switcher]
 enabled = true

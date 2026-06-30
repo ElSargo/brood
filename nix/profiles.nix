@@ -64,8 +64,8 @@ let
   appTools = [
     pkgs.coreutils
     pkgs.findutils
+    pkgs.foot
     pkgs.git
-    pkgs.kitty
     sessionSwitcherPython
     pkgs.util-linux
   ];
@@ -91,9 +91,9 @@ let
 
   smokeTools = [
     pkgs.dbus
+    pkgs.foot
     pkgs.gobject-introspection
     pkgs.glmark2
-    pkgs.kitty
     pkgs.mesa-demos
     pkgs.vulkan-tools
     pkgs.wayland-utils
