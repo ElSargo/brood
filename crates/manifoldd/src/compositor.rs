@@ -46,8 +46,10 @@ use smithay::{
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
             XdgToplevelSurfaceData,
+            decoration::XdgDecorationHandler,
         },
     },
+    reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
 };
 use tracing::{info, warn};
 
@@ -1081,6 +1083,29 @@ impl XdgShellHandler for Manifold {
     }
 }
 
+impl XdgDecorationHandler for Manifold {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.configure_server_side_decoration(toplevel);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: Mode) {
+        self.configure_server_side_decoration(toplevel);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.configure_server_side_decoration(toplevel);
+    }
+}
+
+impl Manifold {
+    fn configure_server_side_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(Mode::ServerSide);
+        });
+        toplevel.send_configure();
+    }
+}
+
 fn handle_xdg_commit(state: &mut Manifold, surface: &WlSurface) {
     if let Some(window) = state
         .space
@@ -1225,6 +1250,7 @@ mod tests {
 
 smithay::delegate_compositor!(Manifold);
 smithay::delegate_xdg_shell!(Manifold);
+smithay::delegate_xdg_decoration!(Manifold);
 #[cfg(feature = "shm-fallback")]
 smithay::delegate_shm!(Manifold);
 smithay::delegate_dmabuf!(Manifold);

@@ -36,7 +36,9 @@ use smithay::{
         drm_syncobj::DrmSyncobjState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::{XdgShellState, XdgToplevelSurfaceData},
+        shell::xdg::{
+            XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState,
+        },
         socket::ListeningSocketSource,
     },
 };
@@ -316,6 +318,8 @@ pub struct Manifold {
     pub space: Space<Window>,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
     #[cfg(feature = "shm-fallback")]
     pub shm_state: ShmState,
     #[allow(dead_code)]
@@ -406,6 +410,7 @@ impl Manifold {
         let display_handle = display.handle();
         let compositor_state = CompositorState::new::<Self>(&display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(&display_handle);
         #[cfg(feature = "shm-fallback")]
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
@@ -442,6 +447,7 @@ impl Manifold {
             space,
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
             #[cfg(feature = "shm-fallback")]
             shm_state,
             output_manager_state,
