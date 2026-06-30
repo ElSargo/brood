@@ -5,24 +5,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-attach-smoke.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
 LOG="$TMPDIR/manifoldd.log"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 env WAYLAND_DISPLAY=manifold-missing-wayland DISPLAY= \
   RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -34,7 +34,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -47,7 +47,7 @@ require_field_ge() {
     echo "ERR missing numeric $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -69,14 +69,14 @@ require_field_ge "$STATUS1" presentation_runtime_failures 0
   exit 1
 }
 
-ctl attach >/dev/null
+ctl attach > /dev/null
 
 STATUS2=""
 for _ in $(seq 1 100); do
   STATUS2="$(ctl status)"
   if [[ "$(field "$STATUS2" presentation)" == "Detached" ]] &&
     [[ "$(field "$STATUS2" presentation_attach_failures)" =~ ^[0-9]+$ ]] &&
-    (( "$(field "$STATUS2" presentation_attach_failures)" >= 1 )) &&
+    (("$(field "$STATUS2" presentation_attach_failures)" >= 1)) &&
     [[ "$(field "$STATUS2" presentation_last_error)" != "none" ]]; then
     break
   fi
@@ -103,6 +103,6 @@ echo "status_before=$STATUS1"
 echo "status_after=$STATUS2"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

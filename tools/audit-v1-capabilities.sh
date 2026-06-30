@@ -14,7 +14,7 @@ declare -A CHECK_RC
 declare -A CHECK_LOG
 
 case "$REQUIRE_NO_SKIPS" in
-  0|1) ;;
+  0 | 1) ;;
   *)
     echo "ERR MANIFOLD_AUDIT_REQUIRE_NO_SKIPS must be 0 or 1" >&2
     exit 2
@@ -28,7 +28,7 @@ run_check() {
   local rc
 
   set +e
-  "$@" >"$log" 2>&1
+  "$@" > "$log" 2>&1
   rc=$?
   set -e
 
@@ -169,7 +169,7 @@ run_check dmabuf_backend_classifier ./tools/test-dmabuf-backend-classifier.sh
 DMABUF_VALIDATOR_RESULT="$(aggregate_requirement_result dmabuf_status_validator dmabuf_backend_classifier)"
 
 HOST_PREFLIGHT_LOG="$TMPDIR/host_presentation_preflight.log"
-if ! require_host_presentation_environment >"$HOST_PREFLIGHT_LOG" 2>&1; then
+if ! require_host_presentation_environment > "$HOST_PREFLIGHT_LOG" 2>&1; then
   echo "check=host_presentation_preflight result=blocked rc=1 log=$HOST_PREFLIGHT_LOG"
   sed 's/^/  /' "$HOST_PREFLIGHT_LOG"
   emit_aggregate_requirement rust_baseline "cargo fmt/check/test" \
@@ -190,7 +190,7 @@ if ! require_host_presentation_environment >"$HOST_PREFLIGHT_LOG" 2>&1; then
   emit_requirement dmabuf_advertisement_correctness blocked "$HOST_PREFLIGHT_LOG" "host display unavailable before full audit"
   emit_requirement positive_dmabuf_import blocked "$HOST_PREFLIGHT_LOG" "host display unavailable before full audit"
   emit_requirement positive_explicit_sync_fences blocked "$HOST_PREFLIGHT_LOG" "host display unavailable before full audit"
-  if (( FAILURES > 0 )); then
+  if ((FAILURES > 0)); then
     echo "overall=fail failures=$FAILURES skips=$SKIPS host_display=unavailable tmpdir=$TMPDIR"
     exit 1
   fi
@@ -232,19 +232,19 @@ emit_aggregate_requirement dmabuf_advertisement_correctness "dmabuf diagnostics 
 emit_requirement positive_dmabuf_import "${CHECK_RESULT[dmabuf_positive]:-fail}" "${CHECK_LOG[dmabuf_positive]:-none}" "validate-dmabuf-positive"
 emit_requirement positive_explicit_sync_fences "${CHECK_RESULT[explicit_sync_positive]:-fail}" "${CHECK_LOG[explicit_sync_positive]:-none}" "MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC=1 validate-dmabuf-positive"
 
-if (( FAILURES > 0 )); then
+if ((FAILURES > 0)); then
   echo "overall=fail failures=$FAILURES skips=$SKIPS tmpdir=$TMPDIR"
   exit 1
 fi
 
-if (( SKIPS > 0 )) && [[ "$REQUIRE_NO_SKIPS" == "1" ]]; then
+if ((SKIPS > 0)) && [[ "$REQUIRE_NO_SKIPS" == "1" ]]; then
   echo "capability_completion=incomplete_backend_capability_skips skips=$SKIPS"
   emit_capability_backend_summary
   echo "overall=fail_capability_skips_disallowed failures=0 skips=$SKIPS tmpdir=$TMPDIR"
   exit 1
 fi
 
-if (( SKIPS > 0 )); then
+if ((SKIPS > 0)); then
   echo "capability_completion=incomplete_backend_capability_skips skips=$SKIPS"
   emit_capability_backend_summary
   echo "overall=pass_with_capability_skips failures=0 skips=$SKIPS tmpdir=$TMPDIR"

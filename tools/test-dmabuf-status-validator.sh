@@ -16,13 +16,13 @@ run_validator() {
   local trace_path="$TMPDIR/$name.trace"
   local output_path="$TMPDIR/$name.out"
 
-  printf '%s\n' "$trace" >"$trace_path"
+  printf '%s\n' "$trace" > "$trace_path"
   set +e
   python3 "$ROOT/tools/validate-dmabuf-status.py" \
     --status-json "$status_json" \
     --trace "$trace_path" \
     --require-explicit-sync "$require_explicit_sync" \
-    >"$output_path" 2>&1
+    > "$output_path" 2>&1
   local rc=$?
   set -e
 

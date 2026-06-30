@@ -88,12 +88,12 @@ wait_for_manifoldd_control() {
   local log="$3"
 
   for _ in $(seq 1 120); do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! kill -0 "$pid" 2> /dev/null; then
       echo "ERR manifoldd exited before DBus control became responsive" >&2
       tail -120 "$log" >&2 || true
       return 1
     fi
-    if target/debug/manifold ctl --dbus-name "$dbus_name" status >/dev/null 2>&1; then
+    if target/debug/manifold ctl --dbus-name "$dbus_name" status > /dev/null 2>&1; then
       return 0
     fi
     sleep 0.1

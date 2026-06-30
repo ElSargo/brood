@@ -5,12 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-if ! command -v weston-simple-shm >/dev/null 2>&1; then
+if ! command -v weston-simple-shm > /dev/null 2>&1; then
   echo "ERR weston-simple-shm is required for headless status parity smoke" >&2
   exit 2
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-status-parity.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -19,19 +19,19 @@ CLIENT_LOG="$TMPDIR/client.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-printf '#!/usr/bin/env bash\nexec weston-simple-shm >%q 2>&1\n' "$CLIENT_LOG" >"$WRAPPER"
+printf '#!/usr/bin/env bash\nexec weston-simple-shm >%q 2>&1\n' "$CLIENT_LOG" > "$WRAPPER"
 chmod +x "$WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -42,7 +42,7 @@ ctl() {
 
 for _ in $(seq 1 100); do
   STATUS_JSON="$(ctl status-json)"
-  if python3 - "$STATUS_JSON" <<'PY'
+  if python3 - "$STATUS_JSON" << 'PY'; then
 import json
 import sys
 
@@ -51,7 +51,6 @@ if data.get("presentation") == "Detached" and data.get("windows", 0) >= 1 and da
     sys.exit(0)
 sys.exit(1)
 PY
-  then
     break
   fi
   sleep 0.1
@@ -60,7 +59,7 @@ done
 STATUS_TEXT="$(ctl status)"
 STATUS_JSON="$(ctl status-json)"
 
-python3 - "$STATUS_TEXT" "$STATUS_JSON" <<'PY'
+python3 - "$STATUS_TEXT" "$STATUS_JSON" << 'PY'
 import json
 import sys
 
@@ -138,6 +137,6 @@ echo "status_json=$STATUS_JSON"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

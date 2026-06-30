@@ -15,7 +15,7 @@ MANIFOLDD_FEATURES="${MANIFOLD_PROBE_MANIFOLDD_FEATURES:-}"
 CLIENT=()
 
 usage() {
-  cat <<'USAGE'
+  cat << 'USAGE'
 Usage: tools/manifold-behavior-probe.sh [--duration SECONDS] [--sample-interval SECONDS] [--out-dir DIR] [--] [CLIENT [ARGS...]]
 
 Runs manifoldd with a strict dmabuf-capable client, samples status-json, captures
@@ -49,7 +49,7 @@ while (($#)); do
       OUTPUT_DIR="$2"
       shift 2
       ;;
-    --help|-h)
+    --help | -h)
       usage
       exit 0
       ;;
@@ -66,7 +66,7 @@ while (($#)); do
 done
 
 if ((${#CLIENT[@]} == 0)); then
-  if ! command -v vkcube >/dev/null 2>&1; then
+  if ! command -v vkcube > /dev/null 2>&1; then
     echo "ERR default probe client vkcube is unavailable; pass a client command after --" >&2
     exit 1
   fi
@@ -81,7 +81,7 @@ BUILD_ARGS=(cargo build -p manifoldd --offline)
 if [[ -n "$MANIFOLDD_FEATURES" ]]; then
   BUILD_ARGS+=(--features "$MANIFOLDD_FEATURES")
 fi
-"${BUILD_ARGS[@]}" >/dev/null
+"${BUILD_ARGS[@]}" > /dev/null
 
 if [[ -z "$OUTPUT_DIR" ]]; then
   OUTPUT_DIR="$(mktemp -d /tmp/manifold-behavior-probe.XXXXXX)"
@@ -99,38 +99,38 @@ json_string() {
 }
 
 emit_json() {
-  python3 - "$@" <<'PY'
+  python3 - "$@" << 'PY'
 import json
 import sys
 print(json.dumps(json.loads(sys.argv[1]), separators=(",", ":")), flush=True)
 PY
 }
 
-cat >"$WRAPPER" <<EOF
+cat > "$WRAPPER" << EOF
 #!/usr/bin/env bash
 exec env WAYLAND_DEBUG=1 $(printf ' %q' "${CLIENT[@]}") >$(printf '%q' "$CLIENT_LOG") 2>$(printf '%q' "$WAYLAND_TRACE")
 EOF
 chmod +x "$WRAPPER"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" quit > /dev/null 2>&1 || true
     sleep 0.2
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
   target/debug/manifold run --dbus-name "$DBUS_DESTINATION" -c "$WRAPPER" \
-  >"$MANIFOLDD_LOG" 2>&1 &
+  > "$MANIFOLDD_LOG" 2>&1 &
 PID=$!
 
 for _ in $(seq 1 100); do
-  if target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" status >/dev/null 2>&1; then
+  if target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" status > /dev/null 2>&1; then
     break
   fi
-  kill -0 "$PID" 2>/dev/null || {
+  kill -0 "$PID" 2> /dev/null || {
     sed -n '1,200p' "$MANIFOLDD_LOG" >&2 || true
     sed -n '1,200p' "$CLIENT_LOG" >&2 || true
     sed -n '1,200p' "$WAYLAND_TRACE" >&2 || true
@@ -154,7 +154,7 @@ emit_event() {
   local now_ns elapsed_us
   now_ns="$(date +%s%N)"
   elapsed_us="$(((now_ns - START_NS) / 1000))"
-  python3 - "$event" "$elapsed_us" "$now_ns" "$payload" <<'PY'
+  python3 - "$event" "$elapsed_us" "$now_ns" "$payload" << 'PY'
 import json
 import sys
 event, elapsed_us, unix_ns, payload = sys.argv[1:]
@@ -168,7 +168,7 @@ PY
 }
 
 emit_event "probe_started" "$(
-  python3 - "$OUTPUT_DIR" "$DBUS_DESTINATION" "$MANIFOLDD_LOG" "$CLIENT_LOG" "$WAYLAND_TRACE" "${CLIENT[@]}" <<'PY'
+  python3 - "$OUTPUT_DIR" "$DBUS_DESTINATION" "$MANIFOLDD_LOG" "$CLIENT_LOG" "$WAYLAND_TRACE" "${CLIENT[@]}" << 'PY'
 import json
 import sys
 print(json.dumps({
@@ -185,7 +185,7 @@ PY
 parse_trace_range() {
   local start="$1"
   local size="$2"
-  python3 - "$WAYLAND_TRACE" "$start" "$size" "$START_NS" <<'PY'
+  python3 - "$WAYLAND_TRACE" "$start" "$size" "$START_NS" << 'PY'
 import json
 import re
 import sys
@@ -228,14 +228,14 @@ PY
 
 while true; do
   NOW_NS="$(date +%s%N)"
-  if (( (NOW_NS - START_NS) / 1000000000 >= DURATION_SECONDS )); then
+  if (((NOW_NS - START_NS) / 1000000000 >= DURATION_SECONDS)); then
     break
   fi
 
   STATUS="$(target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" status-json)"
   SAMPLE_NS="$(date +%s%N)"
   SAMPLE_DELTA_US="$(((SAMPLE_NS - LAST_SAMPLE_NS) / 1000))"
-  python3 - "$STATUS" "$LAST_STATUS" "$SAMPLE_DELTA_US" <<'PY' | while IFS= read -r event_line; do
+  python3 - "$STATUS" "$LAST_STATUS" "$SAMPLE_DELTA_US" << 'PY' | while IFS= read -r event_line; do
 import json
 import sys
 
@@ -321,15 +321,15 @@ if previous and status["frames"] > previous["frames"]:
         "max_frame_interval_us": status["max_frame_interval_us"],
     })
 PY
-    event="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["event"])' <<<"$event_line")"
-    fields="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.stdin.read())["fields"]))' <<<"$event_line")"
+    event="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["event"])' <<< "$event_line")"
+    fields="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.stdin.read())["fields"]))' <<< "$event_line")"
     emit_event "$event" "$fields"
   done
 
   TRACE_EVENTS=""
   if [[ -f "$WAYLAND_TRACE" ]]; then
-    TRACE_SIZE="$(wc -c <"$WAYLAND_TRACE")"
-    if (( TRACE_SIZE > TRACE_OFFSET )); then
+    TRACE_SIZE="$(wc -c < "$WAYLAND_TRACE")"
+    if ((TRACE_SIZE > TRACE_OFFSET)); then
       TRACE_EVENTS="$(parse_trace_range "$TRACE_OFFSET" "$TRACE_SIZE" || true)"
       TRACE_OFFSET="$TRACE_SIZE"
     fi
@@ -344,7 +344,7 @@ PY
 done
 
 emit_event "probe_finished" "$(
-  python3 - "$LAST_STATUS" <<'PY'
+  python3 - "$LAST_STATUS" << 'PY'
 import json
 import sys
 status = json.loads(sys.argv[1]) if sys.argv[1] else {}
@@ -352,6 +352,6 @@ print(json.dumps({"final_status": status}))
 PY
 )"
 
-target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null || true
+target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

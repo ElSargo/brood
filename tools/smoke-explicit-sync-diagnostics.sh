@@ -9,7 +9,7 @@ require_host_presentation_environment
 
 WAYLAND_INFO="${MANIFOLD_WAYLAND_INFO:-}"
 if [[ -z "$WAYLAND_INFO" ]]; then
-  if command -v wayland-info >/dev/null 2>&1; then
+  if command -v wayland-info > /dev/null 2>&1; then
     WAYLAND_INFO="$(command -v wayland-info)"
   else
     echo "ERR no wayland-info found; install wayland-utils or set MANIFOLD_WAYLAND_INFO" >&2
@@ -17,9 +17,9 @@ if [[ -z "$WAYLAND_INFO" ]]; then
   fi
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-host-smoke.lock
+exec 9> /tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-explicit-sync-smoke.XXXXXX)"
@@ -28,16 +28,16 @@ LOG="$TMPDIR/manifoldd.log"
 INFO="$TMPDIR/wayland-info.txt"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -49,7 +49,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field() {
@@ -68,7 +68,7 @@ for _ in $(seq 1 80); do
   STATUS="$(ctl status)"
   if [[ "$(field "$STATUS" presentation)" == "Attached" ]] &&
     [[ "$(field "$STATUS" frames)" =~ ^[0-9]+$ ]] &&
-    (( "$(field "$STATUS" frames)" >= 1 )); then
+    (("$(field "$STATUS" frames)" >= 1)); then
     break
   fi
   sleep 0.1
@@ -82,7 +82,7 @@ DMABUF_DISABLED="$(require_field "$STATUS" dmabuf_disabled)"
 EXPLICIT_SYNC="$(require_field "$STATUS" explicit_sync)"
 EXPLICIT_SYNC_DISABLED="$(require_field "$STATUS" explicit_sync_disabled)"
 
-WAYLAND_DISPLAY="$WAYLAND_DISPLAY_NAME" "$WAYLAND_INFO" >"$INFO" 2>&1 || {
+WAYLAND_DISPLAY="$WAYLAND_DISPLAY_NAME" "$WAYLAND_INFO" > "$INFO" 2>&1 || {
   echo "ERR wayland-info failed against nested compositor" >&2
   echo "status=$STATUS" >&2
   cat "$INFO" >&2 || true
@@ -128,7 +128,7 @@ case "$EXPLICIT_SYNC" in
     }
     if [[ "$DMABUF" == "v4" ]]; then
       case "$EXPLICIT_SYNC_DISABLED" in
-        drm_render_node_path_unavailable|drm_render_node_open_failed|drm_syncobj_eventfd_unsupported) ;;
+        drm_render_node_path_unavailable | drm_render_node_open_failed | drm_syncobj_eventfd_unsupported) ;;
         *)
           echo "ERR dmabuf v4 with disabled explicit sync should report a DRM/syncobj reason: $STATUS" >&2
           exit 1
@@ -171,6 +171,6 @@ echo "syncobj_global_count=$SYNCOBJ_GLOBAL_COUNT"
 echo "wayland_info=$INFO"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

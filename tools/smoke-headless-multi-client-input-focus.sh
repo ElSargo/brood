@@ -5,12 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-if ! command -v weston-eventdemo >/dev/null 2>&1; then
+if ! command -v weston-eventdemo > /dev/null 2>&1; then
   echo "ERR weston-eventdemo is required for headless multi-client input focus smoke" >&2
   exit 2
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-multi-input.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -25,25 +25,25 @@ WRAPPER2="$TMPDIR/eventdemo-2-wrapper.sh"
 cleanup() {
   for pidfile in "$CLIENT1_PIDFILE" "$CLIENT2_PIDFILE"; do
     if [[ -s "$pidfile" ]]; then
-      kill "$(cat "$pidfile")" >/dev/null 2>&1 || true
+      kill "$(cat "$pidfile")" > /dev/null 2>&1 || true
     fi
   done
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-cat >"$WRAPPER1" <<EOF
+cat > "$WRAPPER1" << EOF
 #!/usr/bin/env bash
 echo "\$\$" >"$CLIENT1_PIDFILE"
 exec stdbuf -oL -eL weston-eventdemo \
   --log-motion --log-button --log-key --log-focus --log-redraw --log-resize \
   >"$CLIENT1_LOG" 2>&1
 EOF
-cat >"$WRAPPER2" <<EOF
+cat > "$WRAPPER2" << EOF
 #!/usr/bin/env bash
 echo "\$\$" >"$CLIENT2_PIDFILE"
 exec stdbuf -oL -eL weston-eventdemo \
@@ -54,7 +54,7 @@ chmod +x "$WRAPPER1" "$WRAPPER2"
 
 env WAYLAND_DISPLAY=manifold-missing-wayland DISPLAY= \
   RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -66,7 +66,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 numeric_field() {
@@ -94,7 +94,7 @@ wait_status() {
   done
   echo "ERR timed out waiting for status predicate: $predicate" >&2
   ctl status >&2 || true
-  cat "$CLIENT1_LOG" "$CLIENT2_LOG" >&2 2>/dev/null || true
+  cat "$CLIENT1_LOG" "$CLIENT2_LOG" >&2 2> /dev/null || true
   tail -120 "$LOG" >&2 || true
   exit 1
 }
@@ -128,7 +128,7 @@ wait_event_count_ge() {
   local count
   for _ in $(seq 1 50); do
     count="$(event_count "$file" "$pattern")"
-    if (( count >= min )); then
+    if ((count >= min)); then
       printf '%s' "$count"
       return 0
     fi
@@ -145,19 +145,19 @@ wait_event_count_ge() {
 inject_click_and_key() {
   local x="$1"
   local y="$2"
-  ctl inject motion "$x" "$y" >/dev/null
+  ctl inject motion "$x" "$y" > /dev/null
   sleep 0.05
-  ctl inject button 272 pressed >/dev/null
-  ctl inject button 272 released >/dev/null
-  ctl inject key 30 pressed >/dev/null
-  ctl inject key 30 released >/dev/null
+  ctl inject button 272 pressed > /dev/null
+  ctl inject button 272 released > /dev/null
+  ctl inject key 30 pressed > /dev/null
+  ctl inject key 30 released > /dev/null
 }
 
-ctl spawn "$WRAPPER1" >/dev/null
+ctl spawn "$WRAPPER1" > /dev/null
 wait_pidfile "$CLIENT1_PIDFILE"
 STATUS_ONE="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 1 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= 1 ))')"
 
-ctl spawn "$WRAPPER2" >/dev/null
+ctl spawn "$WRAPPER2" > /dev/null
 wait_pidfile "$CLIENT2_PIDFILE"
 STATUS_TWO="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 2 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= 2 ))')"
 
@@ -188,8 +188,8 @@ CLIENT2_KEY_AFTER_FIRST="$(event_count "$CLIENT2_LOG" 'key key: .*state: pressed
 
 STATUS_ROUTED="$(wait_status '[[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 2 )) && [[ "$(field "$status" pointer_button_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_button_events)" >= 4 )) && [[ "$(field "$status" keyboard_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" keyboard_events)" >= 4 ))')"
 
-wait_event_count_ge "first client focus" "$CLIENT1_LOG" 'focus x:' 1 >/dev/null
-wait_event_count_ge "second client focus" "$CLIENT2_LOG" 'focus x:' 1 >/dev/null
+wait_event_count_ge "first client focus" "$CLIENT1_LOG" 'focus x:' 1 > /dev/null
+wait_event_count_ge "second client focus" "$CLIENT2_LOG" 'focus x:' 1 > /dev/null
 
 echo "OK headless multi-client input focus smoke passed"
 echo "status_one=$STATUS_ONE"
@@ -201,6 +201,6 @@ echo "client1_log=$CLIENT1_LOG"
 echo "client2_log=$CLIENT2_LOG"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

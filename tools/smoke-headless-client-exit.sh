@@ -5,12 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-if ! command -v weston-simple-shm >/dev/null 2>&1; then
+if ! command -v weston-simple-shm > /dev/null 2>&1; then
   echo "ERR weston-simple-shm is required for headless client-exit smoke" >&2
   exit 2
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-client-exit.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -22,17 +22,17 @@ WRAPPER="$TMPDIR/client-wrapper.sh"
 cleanup() {
   if [[ -s "$CLIENT_PIDFILE" ]]; then
     CLIENT_PID="$(cat "$CLIENT_PIDFILE")"
-    kill "$CLIENT_PID" >/dev/null 2>&1 || true
+    kill "$CLIENT_PID" > /dev/null 2>&1 || true
   fi
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-cat >"$WRAPPER" <<EOF
+cat > "$WRAPPER" << EOF
 #!/usr/bin/env bash
 echo "\$\$" >"$CLIENT_PIDFILE"
 exec weston-simple-shm >"$CLIENT_LOG" 2>&1
@@ -40,7 +40,7 @@ EOF
 chmod +x "$WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -52,7 +52,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -65,7 +65,7 @@ require_field_ge() {
     echo "ERR missing numeric $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -103,9 +103,9 @@ STATUS1="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] &&
 require_field_ge "$STATUS1" windows 1
 require_field_ge "$STATUS1" commits 1
 
-ctl inject center-motion >/dev/null
-ctl inject button 272 pressed >/dev/null
-ctl inject button 272 released >/dev/null
+ctl inject center-motion > /dev/null
+ctl inject button 272 pressed > /dev/null
+ctl inject button 272 released > /dev/null
 STATUS_FOCUSED="$(wait_status '[[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 3 )) && [[ "$(field "$status" pointer_button_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_button_events)" >= 2 ))')"
 require_field_ge "$STATUS_FOCUSED" pointer_target_hits 3
 require_field_ge "$STATUS_FOCUSED" pointer_button_events 2
@@ -126,6 +126,6 @@ echo "status_after_exit=$STATUS2"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

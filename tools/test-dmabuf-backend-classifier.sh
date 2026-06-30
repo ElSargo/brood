@@ -15,7 +15,7 @@ run_classifier() {
   local output="$TMPDIR/$name.out"
 
   set +e
-  python3 "$ROOT/tools/classify-dmabuf-backend.py" "$@" >"$output" 2>&1
+  python3 "$ROOT/tools/classify-dmabuf-backend.py" "$@" > "$output" 2>&1
   local rc=$?
   set -e
 

@@ -5,12 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-if ! command -v weston-simple-shm >/dev/null 2>&1; then
+if ! command -v weston-simple-shm > /dev/null 2>&1; then
   echo "ERR weston-simple-shm is required for headless multi-client smoke" >&2
   exit 2
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-multi-client.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -25,23 +25,23 @@ WRAPPER2="$TMPDIR/client-2-wrapper.sh"
 cleanup() {
   for pidfile in "$CLIENT1_PIDFILE" "$CLIENT2_PIDFILE"; do
     if [[ -s "$pidfile" ]]; then
-      kill "$(cat "$pidfile")" >/dev/null 2>&1 || true
+      kill "$(cat "$pidfile")" > /dev/null 2>&1 || true
     fi
   done
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-cat >"$WRAPPER1" <<EOF
+cat > "$WRAPPER1" << EOF
 #!/usr/bin/env bash
 echo "\$\$" >"$CLIENT1_PIDFILE"
 exec weston-simple-shm >"$CLIENT1_LOG" 2>&1
 EOF
-cat >"$WRAPPER2" <<EOF
+cat > "$WRAPPER2" << EOF
 #!/usr/bin/env bash
 echo "\$\$" >"$CLIENT2_PIDFILE"
 exec weston-simple-shm >"$CLIENT2_LOG" 2>&1
@@ -49,7 +49,7 @@ EOF
 chmod +x "$WRAPPER1" "$WRAPPER2"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -61,7 +61,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -74,7 +74,7 @@ require_field_ge() {
     echo "ERR missing numeric $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -93,7 +93,7 @@ wait_status() {
   done
   echo "ERR timed out waiting for status predicate: $predicate" >&2
   ctl status >&2 || true
-  cat "$CLIENT1_LOG" "$CLIENT2_LOG" >&2 2>/dev/null || true
+  cat "$CLIENT1_LOG" "$CLIENT2_LOG" >&2 2> /dev/null || true
   tail -120 "$LOG" >&2 || true
   exit 1
 }
@@ -109,21 +109,21 @@ wait_pidfile() {
   exit 1
 }
 
-ctl spawn "$WRAPPER1" >/dev/null
+ctl spawn "$WRAPPER1" > /dev/null
 wait_pidfile "$CLIENT1_PIDFILE"
 
 STATUS_ONE_INITIAL="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 1 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= 1 ))')"
 require_field_ge "$STATUS_ONE_INITIAL" windows 1
 require_field_ge "$STATUS_ONE_INITIAL" commits 1
 
-ctl inject center-motion >/dev/null
-ctl inject button 272 pressed >/dev/null
-ctl inject button 272 released >/dev/null
+ctl inject center-motion > /dev/null
+ctl inject button 272 pressed > /dev/null
+ctl inject button 272 released > /dev/null
 STATUS_FOCUSED_ONE="$(wait_status '[[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 3 )) && [[ "$(field "$status" pointer_button_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_button_events)" >= 2 ))')"
 require_field_ge "$STATUS_FOCUSED_ONE" pointer_target_hits 3
 require_field_ge "$STATUS_FOCUSED_ONE" pointer_button_events 2
 
-ctl spawn "$WRAPPER2" >/dev/null
+ctl spawn "$WRAPPER2" > /dev/null
 wait_pidfile "$CLIENT2_PIDFILE"
 
 STATUS_TWO="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 2 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= 2 ))')"
@@ -156,6 +156,6 @@ echo "client_1_log=$CLIENT1_LOG"
 echo "client_2_log=$CLIENT2_LOG"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

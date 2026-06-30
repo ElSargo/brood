@@ -21,7 +21,7 @@ mkdir -p "$OUT_DIR" "$BIN_DIR" "$HOME_DIR" "$RUNTIME_DIR" "$FIREFOX_PROFILE"
 chmod 700 "$RUNTIME_DIR"
 SHELL_BIN="${BASH:-$(command -v bash)}"
 
-cat >"$BIN_DIR/firefox" <<EOF
+cat > "$BIN_DIR/firefox" << EOF
 #!$SHELL_BIN
 exec "$FIREFOX_BIN" \\
   --new-instance \\
@@ -31,7 +31,7 @@ exec "$FIREFOX_BIN" \\
 EOF
 chmod +x "$BIN_DIR/firefox"
 
-cat >"$BIN_DIR/weston-simple-shm" <<EOF
+cat > "$BIN_DIR/weston-simple-shm" << EOF
 #!$SHELL_BIN
 exec "$WESTON_SIMPLE_SHM"
 EOF
@@ -83,18 +83,18 @@ fi
 
 timeout --kill-after=5s "$TEST_TIMEOUT" \
   "$MANIFOLD_BIN" "${TEST_ARGS[@]}" \
-  >"$WORKDIR/test.log" 2>&1 || {
-    status=$?
-    echo "ERR firefox close/reattach nested test failed" >&2
-    cat "$WORKDIR/test.log" >&2 || true
-    tail -200 "$OUT_DIR/outer.log" >&2 || true
-    tail -200 "$OUT_DIR/inner.log" >&2 || true
-    exit "$status"
-  }
+  > "$WORKDIR/test.log" 2>&1 || {
+  status=$?
+  echo "ERR firefox close/reattach nested test failed" >&2
+  cat "$WORKDIR/test.log" >&2 || true
+  tail -200 "$OUT_DIR/outer.log" >&2 || true
+  tail -200 "$OUT_DIR/inner.log" >&2 || true
+  exit "$status"
+}
 
 LOG_FILES=("$WORKDIR/test.log" "$OUT_DIR/outer.log" "$OUT_DIR/inner.log")
 
-if grep -n 'TEST_HARNESS_RESULT kind=Failed\|TEST_HARNESS_RESULT kind=Paused' "${LOG_FILES[@]}" >/dev/null 2>&1; then
+if grep -n 'TEST_HARNESS_RESULT kind=Failed\|TEST_HARNESS_RESULT kind=Paused' "${LOG_FILES[@]}" > /dev/null 2>&1; then
   echo "ERR WASM test harness did not pass" >&2
   grep -n 'TEST_HARNESS_RESULT' "${LOG_FILES[@]}" >&2 || true
   tail -200 "$OUT_DIR/outer.log" >&2 || true
@@ -102,7 +102,7 @@ if grep -n 'TEST_HARNESS_RESULT kind=Failed\|TEST_HARNESS_RESULT kind=Paused' "$
   exit 1
 fi
 
-if ! grep -n 'TEST_HARNESS_RESULT kind=Passed' "${LOG_FILES[@]}" >/dev/null 2>&1; then
+if ! grep -n 'TEST_HARNESS_RESULT kind=Passed' "${LOG_FILES[@]}" > /dev/null 2>&1; then
   echo "ERR missing passing WASM test harness result" >&2
   tail -200 "$WORKDIR/test.log" >&2 || true
   tail -200 "$OUT_DIR/outer.log" >&2 || true
@@ -111,7 +111,7 @@ if ! grep -n 'TEST_HARNESS_RESULT kind=Passed' "${LOG_FILES[@]}" >/dev/null 2>&1
 fi
 
 ERRORS="$WORKDIR/protocol-errors.log"
-if grep -n -E 'create_immed failed|fatal display error: Protocol error|error in client communication' "${LOG_FILES[@]}" >"$ERRORS" 2>/dev/null; then
+if grep -n -E 'create_immed failed|fatal display error: Protocol error|error in client communication' "${LOG_FILES[@]}" > "$ERRORS" 2> /dev/null; then
   echo "ERR Wayland protocol error detected during Firefox close/reattach test" >&2
   cat "$ERRORS" >&2
   tail -200 "$OUT_DIR/outer.log" >&2 || true

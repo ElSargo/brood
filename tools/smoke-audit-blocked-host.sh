@@ -16,7 +16,7 @@ env \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY=missing-wayland-0 \
   DISPLAY=:99 \
-  ./tools/audit-v1-capabilities.sh >"$LOG" 2>&1
+  ./tools/audit-v1-capabilities.sh > "$LOG" 2>&1
 RC=$?
 set -e
 
@@ -84,7 +84,7 @@ grep -q '^  host_display_diagnostic=end$' "$LOG" || {
 
 REAL_CARGO="$(command -v cargo)"
 mkdir -p "$FAKEBIN"
-cat >"$FAKEBIN/cargo" <<EOF
+cat > "$FAKEBIN/cargo" << EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "fmt" ]]; then
   echo "forced cargo fmt failure for blocked-host audit precedence" >&2
@@ -100,7 +100,7 @@ env \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY=missing-wayland-0 \
   DISPLAY=:99 \
-  ./tools/audit-v1-capabilities.sh >"$FAIL_LOG" 2>&1
+  ./tools/audit-v1-capabilities.sh > "$FAIL_LOG" 2>&1
 FAIL_RC=$?
 set -e
 

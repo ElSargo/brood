@@ -32,31 +32,34 @@ let
     lockFile = ../Cargo.lock;
   };
 
-  generatedCargoNix = pkgs.runCommand "manifold-generated-cargo-nix" {
-    nativeBuildInputs = [ pkgs.crate2nix ];
-  } ''
-    export HOME="$TMPDIR/home"
-    mkdir -p "$HOME" "$out"
+  generatedCargoNix =
+    pkgs.runCommand "manifold-generated-cargo-nix"
+      {
+        nativeBuildInputs = [ pkgs.crate2nix ];
+      }
+      ''
+        export HOME="$TMPDIR/home"
+        mkdir -p "$HOME" "$out"
 
-    cp -R ${src}/. "$out/"
-    chmod -R u+w "$out"
+        cp -R ${src}/. "$out/"
+        chmod -R u+w "$out"
 
-    cd "$out"
-    mkdir -p .cargo
-    cat > .cargo/config.toml <<EOF
-    [source.crates-io]
-    replace-with = "vendored-sources"
+        cd "$out"
+        mkdir -p .cargo
+        cat > .cargo/config.toml <<EOF
+        [source.crates-io]
+        replace-with = "vendored-sources"
 
-    [source.vendored-sources]
-    directory = "${cargoVendor}"
+        [source.vendored-sources]
+        directory = "${cargoVendor}"
 
-    [net]
-    offline = true
-    EOF
+        [net]
+        offline = true
+        EOF
 
-    export CARGO_NET_OFFLINE=true
-    crate2nix generate
-  '';
+        export CARGO_NET_OFFLINE=true
+        crate2nix generate
+      '';
 
   cargoNix = pkgs.callPackage "${generatedCargoNix}/Cargo.nix" {
     defaultCrateOverrides = pkgs.defaultCrateOverrides // {
@@ -277,6 +280,61 @@ let
     ignoreCollisions = true;
   };
 
+  formatter = pkgs.writeShellApplication {
+    name = "manifold-format";
+    runtimeInputs = [
+      pkgs.git
+      pkgs.nixfmt
+      pkgs.shfmt
+      profiles.rustToolchainWithTools
+    ];
+    text = ''
+      set -euo pipefail
+
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      cd "$ROOT"
+
+      paths=("$@")
+      if ((''${#paths[@]} == 0)); then
+        paths=(.)
+      fi
+
+      source_files=()
+      while IFS= read -r -d "" file; do
+        source_files+=("$file")
+      done < <(git ls-files -z --cached --others --exclude-standard -- "''${paths[@]}")
+
+      nix_files=()
+      shell_files=()
+      for file in "''${source_files[@]}"; do
+        case "$file" in
+          .manifold/* | */.manifold/* | reference/*)
+            continue
+            ;;
+          *.nix)
+            nix_files+=("$file")
+            ;;
+          *.sh | *.bash)
+            shell_files+=("$file")
+            ;;
+        esac
+      done
+
+      echo "format=rust command=cargo-fmt"
+      cargo fmt --all
+
+      if ((''${#nix_files[@]} > 0)); then
+        echo "format=nix command=nixfmt files=''${#nix_files[@]}"
+        nixfmt "''${nix_files[@]}"
+      fi
+
+      if ((''${#shell_files[@]} > 0)); then
+        echo "format=shell command=shfmt files=''${#shell_files[@]}"
+        shfmt -w -i 2 -ci -sr "''${shell_files[@]}"
+      fi
+    '';
+  };
+
   mkDevWorkflow = import ./scripts/dev-workflow.nix;
 
   mkWorkflow =
@@ -344,6 +402,7 @@ in
   "dev-env-full" = devEnvFull;
   "runtime-files" = runtimeFiles;
   "wasm-examples" = wasmExamples;
+  inherit formatter;
 
   inherit
     devEnv

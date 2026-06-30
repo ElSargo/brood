@@ -9,7 +9,7 @@ require_host_presentation_environment
 
 REQUIRE_EXPLICIT_SYNC="${MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC:-0}"
 case "$REQUIRE_EXPLICIT_SYNC" in
-  0|1) ;;
+  0 | 1) ;;
   *)
     echo "ERR MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC must be 0 or 1" >&2
     exit 2
@@ -19,7 +19,7 @@ esac
 IMPORT_CLIENT="${MANIFOLD_DMABUF_IMPORT_CLIENT:-}"
 IMPORT_ARGS=()
 if [[ -z "$IMPORT_CLIENT" ]]; then
-  if command -v weston-simple-dmabuf-egl >/dev/null 2>&1; then
+  if command -v weston-simple-dmabuf-egl > /dev/null 2>&1; then
     IMPORT_CLIENT="$(command -v weston-simple-dmabuf-egl)"
     if [[ "$REQUIRE_EXPLICIT_SYNC" == "1" ]]; then
       IMPORT_ARGS=(--explicit-sync=1)
@@ -36,13 +36,13 @@ elif [[ -n "${MANIFOLD_DMABUF_IMPORT_ARGS:-}" ]]; then
 fi
 
 FEEDBACK_CLIENT="${MANIFOLD_DMABUF_FEEDBACK_CLIENT:-}"
-if [[ -z "$FEEDBACK_CLIENT" ]] && command -v weston-simple-dmabuf-feedback >/dev/null 2>&1; then
+if [[ -z "$FEEDBACK_CLIENT" ]] && command -v weston-simple-dmabuf-feedback > /dev/null 2>&1; then
   FEEDBACK_CLIENT="$(command -v weston-simple-dmabuf-feedback)"
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-host-smoke.lock
+exec 9> /tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-dmabuf-positive.XXXXXX)"
@@ -56,10 +56,10 @@ FEEDBACK_TRACE="$TMPDIR/feedback-client-wayland.log"
 FEEDBACK_WRAPPER="$TMPDIR/feedback-client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -68,11 +68,11 @@ trap cleanup EXIT
   printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1'
   printf ' %q' "$IMPORT_CLIENT" "${IMPORT_ARGS[@]}"
   printf ' >%q 2>%q\n' "$IMPORT_LOG" "$TRACE"
-} >"$IMPORT_WRAPPER"
+} > "$IMPORT_WRAPPER"
 chmod +x "$IMPORT_WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$IMPORT_WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$IMPORT_WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -84,7 +84,7 @@ ctl() {
 STATUS_JSON=""
 for _ in $(seq 1 80); do
   STATUS_JSON="$(ctl status-json)"
-  if python3 - "$STATUS_JSON" <<'PY'
+  if python3 - "$STATUS_JSON" << 'PY'; then
 import json
 import sys
 
@@ -95,7 +95,6 @@ if data.get("windows", 0) >= 1 and data.get("frames", 0) >= 2:
     sys.exit(0)
 sys.exit(1)
 PY
-  then
     break
   fi
   sleep 0.1
@@ -122,7 +121,8 @@ if [[ "$rc" != "0" ]]; then
   exit "$rc"
 fi
 
-DMABUF_VERSION="$(python3 - "$STATUS_JSON" <<'PY'
+DMABUF_VERSION="$(
+  python3 - "$STATUS_JSON" << 'PY'
 import json
 import sys
 
@@ -135,9 +135,9 @@ if [[ "$DMABUF_VERSION" == "v4" ]]; then
     echo "ERR dmabuf v4 advertised but no feedback client found; install weston-simple-dmabuf-feedback or set MANIFOLD_DMABUF_FEEDBACK_CLIENT" >&2
     exit 1
   }
-  printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q >%q 2>%q\n' "$FEEDBACK_CLIENT" "$FEEDBACK_LOG" "$FEEDBACK_TRACE" >"$FEEDBACK_WRAPPER"
+  printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q >%q 2>%q\n' "$FEEDBACK_CLIENT" "$FEEDBACK_LOG" "$FEEDBACK_TRACE" > "$FEEDBACK_WRAPPER"
   chmod +x "$FEEDBACK_WRAPPER"
-  ctl spawn "$FEEDBACK_WRAPPER" >/dev/null
+  ctl spawn "$FEEDBACK_WRAPPER" > /dev/null
 
   for _ in $(seq 1 80); do
     if [[ -s "$FEEDBACK_TRACE" ]] && grep -q "zwp_linux_dmabuf_feedback_v1" "$FEEDBACK_TRACE"; then
@@ -174,6 +174,6 @@ if [[ "$DMABUF_VERSION" == "v4" ]]; then
   echo "feedback_trace=$FEEDBACK_TRACE"
 fi
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

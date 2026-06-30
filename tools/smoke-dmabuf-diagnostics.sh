@@ -9,9 +9,9 @@ require_host_presentation_environment
 
 CLIENT="${MANIFOLD_SMOKE_CLIENT:-}"
 if [[ -z "$CLIENT" ]]; then
-  if command -v weston-simple-egl >/dev/null 2>&1; then
+  if command -v weston-simple-egl > /dev/null 2>&1; then
     CLIENT="$(command -v weston-simple-egl)"
-  elif command -v weston-terminal >/dev/null 2>&1; then
+  elif command -v weston-terminal > /dev/null 2>&1; then
     CLIENT="$(command -v weston-terminal)"
   else
     echo "ERR no smoke client found; install weston-simple-egl or set MANIFOLD_SMOKE_CLIENT" >&2
@@ -19,9 +19,9 @@ if [[ -z "$CLIENT" ]]; then
   fi
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-host-smoke.lock
+exec 9> /tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-dmabuf-smoke.XXXXXX)"
@@ -31,19 +31,19 @@ TRACE="$TMPDIR/client-wayland.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q 2>%q\n' "$CLIENT" "$TRACE" >"$WRAPPER"
+printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q 2>%q\n' "$CLIENT" "$TRACE" > "$WRAPPER"
 chmod +x "$WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -55,7 +55,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -68,7 +68,7 @@ require_field_ge() {
     echo "ERR missing $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -77,9 +77,9 @@ require_field_ge() {
 for _ in $(seq 1 80); do
   STATUS="$(ctl status)"
   if [[ "$(field "$STATUS" windows)" =~ ^[0-9]+$ ]] &&
-    (( "$(field "$STATUS" windows)" >= 1 )) &&
+    (("$(field "$STATUS" windows)" >= 1)) &&
     [[ "$(field "$STATUS" frames)" =~ ^[0-9]+$ ]] &&
-    (( "$(field "$STATUS" frames)" >= 2 )); then
+    (("$(field "$STATUS" frames)" >= 2)); then
     break
   fi
   sleep 0.1
@@ -139,6 +139,6 @@ echo "dmabuf_trace_count=$DMABUF_TRACE_COUNT"
 echo "log=$LOG"
 echo "wayland_trace=$TRACE"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

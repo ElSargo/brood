@@ -5,12 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-if ! command -v weston-simple-shm >/dev/null 2>&1; then
+if ! command -v weston-simple-shm > /dev/null 2>&1; then
   echo "ERR weston-simple-shm is required for headless frontend-close smoke" >&2
   exit 2
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-frontend-close.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -19,15 +19,15 @@ CLIENT_LOG="$TMPDIR/client.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-cat >"$WRAPPER" <<EOF
+cat > "$WRAPPER" << EOF
 #!/usr/bin/env bash
 exec weston-simple-shm >"$CLIENT_LOG" 2>&1
 EOF
@@ -35,7 +35,7 @@ chmod +x "$WRAPPER"
 
 env WAYLAND_DISPLAY=manifold-missing-wayland DISPLAY= \
   RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -47,7 +47,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 numeric_field() {
@@ -111,7 +111,7 @@ STATUS_CLOSED="$(wait_status '[[ "$(field "$status" presentation)" == "Detached"
   exit 1
 }
 
-ctl attach >/dev/null
+ctl attach > /dev/null
 STATUS_FAILED_ATTACH="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 1 )) && [[ "$(field "$status" presentation_attach_failures)" =~ ^[0-9]+$ ]] && (( "$(field "$status" presentation_attach_failures)" > ATTACH_FAILURES_BEFORE )) && [[ "$(field "$status" presentation_runtime_failures)" == "0" ]] && [[ "$(field "$status" presentation_last_error)" != "none" ]]')"
 [[ "$(numeric_field "$STATUS_FAILED_ATTACH" detach_count)" == "$DETACHES_BEFORE" ]] || {
   echo "ERR failed attach should not change detach_count: before=$STATUS_MAPPED after=$STATUS_FAILED_ATTACH" >&2
@@ -139,6 +139,6 @@ echo "close_response_2=$CLOSE_RESPONSE_2"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

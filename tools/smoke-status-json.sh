@@ -9,9 +9,9 @@ require_host_presentation_environment
 
 CLIENT="${MANIFOLD_SMOKE_CLIENT:-}"
 if [[ -z "$CLIENT" ]]; then
-  if command -v weston-simple-egl >/dev/null 2>&1; then
+  if command -v weston-simple-egl > /dev/null 2>&1; then
     CLIENT="$(command -v weston-simple-egl)"
-  elif command -v weston-terminal >/dev/null 2>&1; then
+  elif command -v weston-terminal > /dev/null 2>&1; then
     CLIENT="$(command -v weston-terminal)"
   else
     echo "ERR no smoke client found; install weston-simple-egl or set MANIFOLD_SMOKE_CLIENT" >&2
@@ -19,9 +19,9 @@ if [[ -z "$CLIENT" ]]; then
   fi
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-host-smoke.lock
+exec 9> /tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-status-json-smoke.XXXXXX)"
@@ -30,19 +30,19 @@ LOG="$TMPDIR/manifoldd.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-printf '#!/usr/bin/env bash\nexec %q\n' "$CLIENT" >"$WRAPPER"
+printf '#!/usr/bin/env bash\nexec %q\n' "$CLIENT" > "$WRAPPER"
 chmod +x "$WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -54,7 +54,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 wait_status_text() {
@@ -77,7 +77,7 @@ wait_status_text() {
 STATUS_JSON=""
 for _ in $(seq 1 80); do
   STATUS_JSON="$(ctl status-json)"
-  if python3 - "$STATUS_JSON" <<'PY'
+  if python3 - "$STATUS_JSON" << 'PY'; then
 import json
 import sys
 
@@ -86,7 +86,6 @@ if data.get("presentation") == "Attached" and data.get("windows", 0) >= 1 and da
     sys.exit(0)
 sys.exit(1)
 PY
-  then
     break
   fi
   sleep 0.1
@@ -99,13 +98,13 @@ INPUT_FRAME_COUNT_INITIAL="$(field "$STATUS_TEXT_INITIAL" input_frame_count)"
   exit 1
 }
 
-ctl inject center-motion >/dev/null
-ctl inject button 272 pressed >/dev/null
-ctl inject button 272 released >/dev/null
+ctl inject center-motion > /dev/null
+ctl inject button 272 pressed > /dev/null
+ctl inject button 272 released > /dev/null
 
 STATUS_TEXT="$(wait_status_text '[[ "$(field "$status" presentation)" == "Attached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 1 )) && [[ "$(field "$status" input_frame_count)" =~ ^[0-9]+$ ]] && (( "$(field "$status" input_frame_count)" > INPUT_FRAME_COUNT_INITIAL )) && [[ "$(field "$status" last_input_to_frame_us)" =~ ^[0-9]+$ ]]')"
 STATUS_JSON="$(ctl status-json)"
-python3 - "$STATUS_TEXT" "$STATUS_JSON" <<'PY'
+python3 - "$STATUS_TEXT" "$STATUS_JSON" << 'PY'
 import json
 import sys
 
@@ -368,6 +367,6 @@ echo "status_text=$STATUS_TEXT"
 echo "status_json=$STATUS_JSON"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

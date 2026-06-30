@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+repo_root="$(git rev-parse --show-toplevel 2> /dev/null || pwd -P)"
 repo_root="$(realpath "$repo_root")"
 repo_name="$(basename "$repo_root")"
 repo_parent="$(dirname "$repo_root")"
@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cat >"$hook_input_path" || true
+cat > "$hook_input_path" || true
 
 skip_or_fail() {
   local message="$1"
@@ -31,19 +31,19 @@ skip_or_fail() {
   exit 1
 }
 
-command -v btrfs >/dev/null 2>&1 || skip_or_fail "btrfs command is not available"
-btrfs subvolume show "$repo_root" >/dev/null 2>&1 ||
+command -v btrfs > /dev/null 2>&1 || skip_or_fail "btrfs command is not available"
+btrfs subvolume show "$repo_root" > /dev/null 2>&1 ||
   skip_or_fail "$repo_root is not a Btrfs subvolume"
 
 mkdir -p "$snapshot_root"
-btrfs subvolume snapshot -r "$repo_root" "$snapshot_path" >/dev/null
+btrfs subvolume snapshot -r "$repo_root" "$snapshot_path" > /dev/null
 
 SNAPSHOT_ID="$snapshot_id" \
-SNAPSHOT_PATH="$snapshot_path" \
-CREATED_AT="$created_at" \
-REPO_ROOT="$repo_root" \
-HOOK_INPUT_PATH="$hook_input_path" \
-python3 - <<'PY' >>"$manifest_path"
+  SNAPSHOT_PATH="$snapshot_path" \
+  CREATED_AT="$created_at" \
+  REPO_ROOT="$repo_root" \
+  HOOK_INPUT_PATH="$hook_input_path" \
+  python3 - << 'PY' >> "$manifest_path"
 import json
 import os
 from pathlib import Path

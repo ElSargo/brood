@@ -43,24 +43,24 @@ WRAPPER="$TMPDIR/browser-wrapper.sh"
 BROWSER_PROFILE="$TMPDIR/browser-profile"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
   if [[ -n "${HTTP_PID:-}" ]]; then
-    kill "$HTTP_PID" >/dev/null 2>&1 || true
+    kill "$HTTP_PID" > /dev/null 2>&1 || true
   fi
   if [[ -n "${INJECT_PID:-}" ]]; then
-    wait "$INJECT_PID" 2>/dev/null || true
+    wait "$INJECT_PID" 2> /dev/null || true
   fi
-  pkill -f -- "$BROWSER_PROFILE" >/dev/null 2>&1 || true
+  pkill -f -- "$BROWSER_PROFILE" > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 mkdir -p "$SITE_DIR" "$BROWSER_PROFILE"
 
-cat >"$SITE_DIR/scroll.html" <<'HTML'
+cat > "$SITE_DIR/scroll.html" << 'HTML'
 <!doctype html>
 <meta charset="utf-8">
 <title>Manifold Native Scroll Profile</title>
@@ -124,7 +124,7 @@ cat >"$SITE_DIR/scroll.html" <<'HTML'
 </script>
 HTML
 
-cat >"$TMPDIR/http-server.py" <<'PY'
+cat > "$TMPDIR/http-server.py" << 'PY'
 import http.server
 import pathlib
 import sys
@@ -165,7 +165,7 @@ print(f"PORT={server.server_port}", flush=True)
 server.serve_forever()
 PY
 
-python3 "$TMPDIR/http-server.py" "$SITE_DIR" "$START_FLAG" >"$HTTP_LOG" 2>&1 &
+python3 "$TMPDIR/http-server.py" "$SITE_DIR" "$START_FLAG" > "$HTTP_LOG" 2>&1 &
 HTTP_PID=$!
 
 PORT=""
@@ -174,7 +174,7 @@ for _ in $(seq 1 100); do
     PORT="$(sed -n 's/^PORT=//p' "$HTTP_LOG" | head -1)"
     [[ -n "$PORT" ]] && break
   fi
-  kill -0 "$HTTP_PID" 2>/dev/null || {
+  kill -0 "$HTTP_PID" 2> /dev/null || {
     echo "ERR local scroll HTTP server exited" >&2
     cat "$HTTP_LOG" >&2 || true
     exit 1
@@ -191,9 +191,9 @@ URL="http://127.0.0.1:$PORT/scroll.html"
 
 if [[ -n "${MANIFOLD_NATIVE_SCROLL_BROWSER_CMD:-}" ]]; then
   printf '#!/usr/bin/env bash\nexec env WAYLAND_DISPLAY="$WAYLAND_DISPLAY" XDG_SESSION_TYPE=wayland GDK_BACKEND=wayland bash -lc %q\n' \
-    "$MANIFOLD_NATIVE_SCROLL_BROWSER_CMD \"$URL\"" >"$WRAPPER"
-elif command -v flatpak >/dev/null 2>&1 && flatpak info com.brave.Browser >/dev/null 2>&1; then
-  cat >"$WRAPPER" <<EOF
+    "$MANIFOLD_NATIVE_SCROLL_BROWSER_CMD \"$URL\"" > "$WRAPPER"
+elif command -v flatpak > /dev/null 2>&1 && flatpak info com.brave.Browser > /dev/null 2>&1; then
+  cat > "$WRAPPER" << EOF
 #!/usr/bin/env bash
 exec flatpak run \\
   --env=WAYLAND_DISPLAY="\$WAYLAND_DISPLAY" \\
@@ -216,13 +216,13 @@ else
 fi
 chmod +x "$WRAPPER"
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-native-scroll.lock
+exec 9> /tmp/manifold-native-scroll.lock
 flock 9
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -234,7 +234,7 @@ ctl() {
 READY=0
 for _ in $(seq 1 300); do
   STATUS_JSON="$(ctl status-json)"
-  if python3 - "$STATUS_JSON" <<'PY'
+  if python3 - "$STATUS_JSON" << 'PY'; then
 import json
 import sys
 
@@ -249,7 +249,6 @@ if (
     raise SystemExit(0)
 raise SystemExit(1)
 PY
-  then
     READY=1
     break
   fi
@@ -264,9 +263,9 @@ if [[ "$READY" != 1 ]]; then
   exit 1
 fi
 
-ctl inject center-motion >/dev/null
+ctl inject center-motion > /dev/null
 
-python3 - "$DBUS_NAME" "$ROOT/target/debug/manifold" "$SAMPLES" "$DURATION_SECONDS" <<'PY' &
+python3 - "$DBUS_NAME" "$ROOT/target/debug/manifold" "$SAMPLES" "$DURATION_SECONDS" << 'PY' &
 import json
 import subprocess
 import sys
@@ -308,7 +307,7 @@ touch "$START_FLAG"
 
 (
   for _ in $(seq 1 300); do
-    ctl inject wheel 0 -120 >/dev/null || true
+    ctl inject wheel 0 -120 > /dev/null || true
     sleep 0.016
   done
 ) &
@@ -317,7 +316,7 @@ INJECT_PID=$!
 wait "$SAMPLER_PID"
 wait "$INJECT_PID" || true
 
-ctl status-json >"$FINAL_STATUS"
+ctl status-json > "$FINAL_STATUS"
 
 python3 - \
   "$SAMPLES" \
@@ -332,7 +331,7 @@ python3 - \
   "$MAX_COMMIT_TO_FRAME_P95_US" \
   "$MAX_INPUT_TO_FRAME_P95_US" \
   "$MIN_INPUT_COMMIT_FRAME_RATIO" \
-  "$TMPDIR" <<'PY' | tee "$METRICS"
+  "$TMPDIR" << 'PY' | tee "$METRICS"
 import json
 import re
 import statistics
@@ -530,7 +529,7 @@ print(f"dmabuf_explicit_sync_blockers={final_status['dmabuf_explicit_sync_blocke
 print(f"dmabuf_blocker_failures={final_status['dmabuf_blocker_failures']}")
 PY
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT
 cleanup

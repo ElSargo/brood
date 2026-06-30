@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -p manifoldd >/dev/null
+cargo build -p manifoldd > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-dbus-extensions.XXXXXX)"
 CONF="$TMPDIR/session.conf"
@@ -18,7 +18,7 @@ PROBE_ENV="$TMPDIR/probe.env"
 PROBE_STATUS="$TMPDIR/probe-status.json"
 DBUS_NAME="org.manifold.Test.DBusExtensions.p$$"
 
-cat >"$CONF" <<EOF
+cat > "$CONF" << EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
@@ -33,20 +33,20 @@ cat >"$CONF" <<EOF
 </busconfig>
 EOF
 
-dbus-daemon --config-file="$CONF" --fork --print-address=1 --print-pid=1 >"$BUS_INFO"
+dbus-daemon --config-file="$CONF" --fork --print-address=1 --print-pid=1 > "$BUS_INFO"
 DBUS_ADDRESS="$(sed -n '1p' "$BUS_INFO")"
 DBUS_PID="$(sed -n '2p' "$BUS_INFO")"
 
 cleanup() {
-  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
-  if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2>/dev/null; then
-    kill "$MANIFOLD_PID" >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
+  if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2> /dev/null; then
+    kill "$MANIFOLD_PID" > /dev/null 2>&1 || true
   fi
-  kill "$DBUS_PID" >/dev/null 2>&1 || true
+  kill "$DBUS_PID" > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-cat >"$CLIENT_WRAPPER" <<EOF
+cat > "$CLIENT_WRAPPER" << EOF
 #!/usr/bin/env bash
 echo "\$\$" >"$CLIENT_PID_FILE"
 exec weston-simple-shm >"$CLIENT_LOG" 2>&1
@@ -54,7 +54,7 @@ EOF
 chmod +x "$CLIENT_WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" -c "$CLIENT_WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" -c "$CLIENT_WRAPPER" > "$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 ctl() {
@@ -71,7 +71,7 @@ extract_string() {
 
 wait_for_control() {
   for _ in $(seq 1 100); do
-    if ctl status-json >/dev/null 2>&1; then
+    if ctl status-json > /dev/null 2>&1; then
       return 0
     fi
     sleep 0.1
@@ -83,7 +83,7 @@ wait_for_control() {
 
 wait_for_client_window() {
   for _ in $(seq 1 100); do
-    if [[ -s "$CLIENT_PID_FILE" ]] && ctl status-json | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("windows", 0) >= 1 else 1)' 2>/dev/null; then
+    if [[ -s "$CLIENT_PID_FILE" ]] && ctl status-json | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("windows", 0) >= 1 else 1)' 2> /dev/null; then
       return 0
     fi
     sleep 0.1
@@ -139,7 +139,7 @@ RESOLVED_OUT="$(call /org/manifold/Manager org.manifold.Manager ResolveSession s
   exit 1
 }
 
-call /org/manifold/Session org.manifold.Session ActivateSurfaceSession t 1 >/dev/null
+call /org/manifold/Session org.manifold.Session ActivateSurfaceSession t 1 > /dev/null
 
 EXT_ID="$(call /org/manifold/Extension org.manifold.Extension RegisterExtension 'sa{ss}' session-switcher 2 name smoke role session-switcher | extract_string)"
 EXT_ID_AGAIN="$(call /org/manifold/Extension org.manifold.Extension RegisterExtension 'sa{ss}' session-switcher 2 name smoke role session-switcher | extract_string)"
@@ -170,31 +170,31 @@ SHORTCUT_GRANT="$(call /org/manifold/Compositor org.manifold.Compositor RequestS
 }
 
 GRANTS_BEFORE="$(ctl extensions grants "$EXT_ID")"
-grep -q "grant id=$MEMBERSHIP_GRANT" <<<"$GRANTS_BEFORE" || {
+grep -q "grant id=$MEMBERSHIP_GRANT" <<< "$GRANTS_BEFORE" || {
   echo "ERR membership grant not listed: $GRANTS_BEFORE" >&2
   exit 1
 }
-grep -q "grant id=$PLACEMENT_GRANT" <<<"$GRANTS_BEFORE" || {
+grep -q "grant id=$PLACEMENT_GRANT" <<< "$GRANTS_BEFORE" || {
   echo "ERR placement grant not listed: $GRANTS_BEFORE" >&2
   exit 1
 }
-grep -q "unsupported-field=recorded" <<<"$GRANTS_BEFORE" || {
+grep -q "unsupported-field=recorded" <<< "$GRANTS_BEFORE" || {
   echo "ERR unsupported placement field was not recorded: $GRANTS_BEFORE" >&2
   exit 1
 }
-grep -q "grant id=$SHORTCUT_GRANT" <<<"$GRANTS_BEFORE" || {
+grep -q "grant id=$SHORTCUT_GRANT" <<< "$GRANTS_BEFORE" || {
   echo "ERR shortcut grant not listed: $GRANTS_BEFORE" >&2
   exit 1
 }
 
-call /org/manifold/Extension org.manifold.Extension ReleaseGrant s "$PLACEMENT_GRANT" >/dev/null
+call /org/manifold/Extension org.manifold.Extension ReleaseGrant s "$PLACEMENT_GRANT" > /dev/null
 GRANTS_AFTER="$(ctl extensions grants "$EXT_ID")"
-grep -q "grant id=$PLACEMENT_GRANT .* active=false" <<<"$GRANTS_AFTER" || {
+grep -q "grant id=$PLACEMENT_GRANT .* active=false" <<< "$GRANTS_AFTER" || {
   echo "ERR released grant was not marked inactive: $GRANTS_AFTER" >&2
   exit 1
 }
 
-call /org/manifold/Session org.manifold.Session ActivateSurfaceSession t "$CREATED_ID" >/dev/null
+call /org/manifold/Session org.manifold.Session ActivateSurfaceSession t "$CREATED_ID" > /dev/null
 
 REPLACEMENT_WINDOW_ID="$(call /org/manifold/Compositor org.manifold.Compositor RegisterWindow 'sa{ss}s' "$EXT_ID" 1 pid "$$-replacement" session-switcher | extract_string)"
 [[ -n "$REPLACEMENT_WINDOW_ID" && "$REPLACEMENT_WINDOW_ID" != "$WINDOW_ID" ]] || {
@@ -207,16 +207,16 @@ REPLACE_AGAIN_OUT="$(call /org/manifold/Compositor org.manifold.Compositor Repla
   exit 1
 }
 GRANTS_AFTER_REPLACE="$(ctl extensions grants "$EXT_ID")"
-grep -q "grant id=$MEMBERSHIP_GRANT .* active=false" <<<"$GRANTS_AFTER_REPLACE" || {
+grep -q "grant id=$MEMBERSHIP_GRANT .* active=false" <<< "$GRANTS_AFTER_REPLACE" || {
   echo "ERR replaced window membership grant was not marked inactive: $GRANTS_AFTER_REPLACE" >&2
   exit 1
 }
-grep -q "grant id=$SHORTCUT_GRANT .* active=true" <<<"$GRANTS_AFTER_REPLACE" || {
+grep -q "grant id=$SHORTCUT_GRANT .* active=true" <<< "$GRANTS_AFTER_REPLACE" || {
   echo "ERR replace role should not revoke extension-level shortcut grant: $GRANTS_AFTER_REPLACE" >&2
   exit 1
 }
 
-cat >"$PROBE" <<EOF
+cat > "$PROBE" << EOF
 #!/usr/bin/env bash
 set -euo pipefail
 {
@@ -226,7 +226,7 @@ set -euo pipefail
 RUST_LOG=off "$ROOT/target/debug/manifold" ctl status-json >"$PROBE_STATUS"
 EOF
 chmod +x "$PROBE"
-ctl spawn "$PROBE" >/dev/null
+ctl spawn "$PROBE" > /dev/null
 wait_for_probe
 
 SESSION_DBUS_ADDRESS="$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' "$PROBE_ENV")"
@@ -241,7 +241,7 @@ SESSION_DBUS_ADDRESS="$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' "$PROBE_ENV")"
   exit 1
 }
 assert_no_spawned_session_dbus_daemon
-python3 - "$PROBE_STATUS" <<'PY'
+python3 - "$PROBE_STATUS" << 'PY'
 import json
 import sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
@@ -251,14 +251,14 @@ if "active_surface_session" not in data:
 PY
 
 EXTENSIONS="$(ctl extensions list)"
-grep -q "extension id=$EXT_ID" <<<"$EXTENSIONS" || {
+grep -q "extension id=$EXT_ID" <<< "$EXTENSIONS" || {
   echo "ERR typed ctl extension listing missed registered extension: $EXTENSIONS" >&2
   exit 1
 }
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$MANIFOLD_PID" || true
-kill "$DBUS_PID" >/dev/null 2>&1 || true
+kill "$DBUS_PID" > /dev/null 2>&1 || true
 trap - EXIT
 
 echo "OK DBus extension smoke passed"

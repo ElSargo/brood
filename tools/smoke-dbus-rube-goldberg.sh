@@ -10,7 +10,7 @@ if [[ -z "$HOST_DBUS_ADDRESS" ]]; then
   exit 1
 fi
 
-cargo build -p manifoldd >/dev/null
+cargo build -p manifoldd > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-dbus-rube.XXXXXX)"
 CONF="$TMPDIR/control-bus.conf"
@@ -19,7 +19,7 @@ LOG="$TMPDIR/manifoldd.log"
 DBUS_NAME="org.manifold.Test.DBusRube.p$$"
 TOKEN="stress-$(date +%s)-$$"
 
-cat >"$CONF" <<EOF
+cat > "$CONF" << EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
@@ -34,21 +34,21 @@ cat >"$CONF" <<EOF
 </busconfig>
 EOF
 
-dbus-daemon --config-file="$CONF" --fork --print-address=1 --print-pid=1 >"$BUS_INFO"
+dbus-daemon --config-file="$CONF" --fork --print-address=1 --print-pid=1 > "$BUS_INFO"
 CONTROL_ADDRESS="$(sed -n '1p' "$BUS_INFO")"
 CONTROL_BUS_PID="$(sed -n '2p' "$BUS_INFO")"
 
 cleanup() {
-  target/debug/manifold ctl --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
-  if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2>/dev/null; then
-    kill "$MANIFOLD_PID" >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
+  if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2> /dev/null; then
+    kill "$MANIFOLD_PID" > /dev/null 2>&1 || true
   fi
-  kill "$CONTROL_BUS_PID" >/dev/null 2>&1 || true
+  kill "$CONTROL_BUS_PID" > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --no-default-modules --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --no-default-modules --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 ctl() {
@@ -57,7 +57,7 @@ ctl() {
 
 wait_for_control() {
   for _ in $(seq 1 100); do
-    if ctl status-json >/dev/null 2>&1; then
+    if ctl status-json > /dev/null 2>&1; then
       return 0
     fi
     sleep 0.1
@@ -102,7 +102,7 @@ for node in A C D B; do
     --role node \
     --node "$node" \
     --run-dir "$TMPDIR" \
-    --timeout 30 >/dev/null
+    --timeout 30 > /dev/null
   wait_for_file_matching "$TMPDIR/ready-$node" "ready=true" "node $node ready"
 done
 
@@ -112,7 +112,7 @@ ctl spawn python3 "$ROOT/tools/dbus-rube-goldberg.py" \
   --role kick \
   --run-dir "$TMPDIR" \
   --token "$TOKEN" \
-  --value 41 >/dev/null
+  --value 41 > /dev/null
 
 wait_for_file_matching "$TMPDIR/kick" "introspected=A,B,C,D" "introspection/properties kick"
 wait_for_file_matching "$TMPDIR/done" "done=true" "final notification hop"
@@ -139,14 +139,14 @@ grep -q "D Transformed token=$TOKEN value=49" "$TMPDIR/events.log" || {
   exit 1
 }
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$MANIFOLD_PID" || true
-kill "$CONTROL_BUS_PID" >/dev/null 2>&1 || true
+kill "$CONTROL_BUS_PID" > /dev/null 2>&1 || true
 trap - EXIT
 
 echo "OK DBus Rube Goldberg stress smoke passed"
 echo "token=$TOKEN"
 echo "run_dir=$TMPDIR"
-echo "kick=$(tr '\n' ' ' <"$TMPDIR/kick")"
-echo "done=$(tr '\n' ' ' <"$TMPDIR/done")"
-echo "events=$(tr '\n' '|' <"$TMPDIR/events.log")"
+echo "kick=$(tr '\n' ' ' < "$TMPDIR/kick")"
+echo "done=$(tr '\n' ' ' < "$TMPDIR/done")"
+echo "events=$(tr '\n' '|' < "$TMPDIR/events.log")"

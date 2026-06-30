@@ -7,23 +7,23 @@ cd "$ROOT"
 
 require_host_presentation_environment
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-dmabuf-backend.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
 LOG="$TMPDIR/manifoldd.log"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -35,7 +35,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field() {
@@ -54,7 +54,7 @@ for _ in $(seq 1 80); do
   STATUS="$(ctl status)"
   if [[ "$(field "$STATUS" presentation)" == "Attached" ]] &&
     [[ "$(field "$STATUS" frames)" =~ ^[0-9]+$ ]] &&
-    (( "$(field "$STATUS" frames)" >= 1 )); then
+    (("$(field "$STATUS" frames)" >= 1)); then
     break
   fi
   sleep 0.1
@@ -71,7 +71,7 @@ RENDER_NODE="$(require_field "$STATUS" render_node)"
 SHM_FORMATS="$(require_field "$STATUS" shm_formats)"
 
 DRI_RENDER_NODES="none"
-if compgen -G "/dev/dri/renderD*" >/dev/null; then
+if compgen -G "/dev/dri/renderD*" > /dev/null; then
   DRI_RENDER_NODES="$(printf '%s ' /dev/dri/renderD*)"
   DRI_RENDER_NODES="${DRI_RENDER_NODES% }"
 fi
@@ -83,9 +83,9 @@ CLASSIFIER_OUTPUT="$(
     --explicit-sync "$EXPLICIT_SYNC" \
     --explicit-sync-disabled "$EXPLICIT_SYNC_DISABLED"
 )"
-CLASSIFICATION="$(sed -n 's/^classification=//p' <<<"$CLASSIFIER_OUTPUT")"
-SUMMARY="$(sed -n 's/^summary=//p' <<<"$CLASSIFIER_OUTPUT")"
-NEXT_STEP="$(sed -n 's/^next=//p' <<<"$CLASSIFIER_OUTPUT")"
+CLASSIFICATION="$(sed -n 's/^classification=//p' <<< "$CLASSIFIER_OUTPUT")"
+SUMMARY="$(sed -n 's/^summary=//p' <<< "$CLASSIFIER_OUTPUT")"
+NEXT_STEP="$(sed -n 's/^next=//p' <<< "$CLASSIFIER_OUTPUT")"
 
 echo "OK dmabuf backend diagnostic complete"
 echo "classification=$CLASSIFICATION"
@@ -109,6 +109,6 @@ echo "log=$LOG"
 
 echo "next=$NEXT_STEP"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

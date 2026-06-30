@@ -9,9 +9,9 @@ require_host_presentation_environment
 
 CLIENT="${MANIFOLD_SMOKE_CLIENT:-}"
 if [[ -z "$CLIENT" ]]; then
-  if command -v weston-simple-egl >/dev/null 2>&1; then
+  if command -v weston-simple-egl > /dev/null 2>&1; then
     CLIENT="$(command -v weston-simple-egl)"
-  elif command -v weston-terminal >/dev/null 2>&1; then
+  elif command -v weston-terminal > /dev/null 2>&1; then
     CLIENT="$(command -v weston-terminal)"
   else
     echo "ERR no smoke client found; install weston-simple-egl or set MANIFOLD_SMOKE_CLIENT" >&2
@@ -19,9 +19,9 @@ if [[ -z "$CLIENT" ]]; then
   fi
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-host-smoke.lock
+exec 9> /tmp/manifold-host-smoke.lock
 flock 9
 
 TMPDIR="$(mktemp -d /tmp/manifold-smoke.XXXXXX)"
@@ -31,19 +31,19 @@ TRACE="$TMPDIR/client-wayland.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q 2>%q\n' "$CLIENT" "$TRACE" >"$WRAPPER"
+printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q 2>%q\n' "$CLIENT" "$TRACE" > "$WRAPPER"
 chmod +x "$WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -55,7 +55,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -68,7 +68,7 @@ require_field_ge() {
     echo "ERR missing $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -81,8 +81,8 @@ wait_for_window_and_frames() {
     if [[ "$(field "$status" presentation)" == "Attached" ]] &&
       [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] &&
       [[ "$(field "$status" frames)" =~ ^[0-9]+$ ]] &&
-      (( "$(field "$status" windows)" >= 1 )) &&
-      (( "$(field "$status" frames)" >= 2 )); then
+      (("$(field "$status" windows)" >= 1)) &&
+      (("$(field "$status" frames)" >= 2)); then
       echo "$status"
       return 0
     fi
@@ -102,7 +102,7 @@ require_field_ge "$STATUS1" frames 2
 require_field_ge "$STATUS1" commits 1
 require_field_ge "$STATUS1" attach_count 1
 
-ctl detach >/dev/null
+ctl detach > /dev/null
 sleep 0.4
 STATUS2="$(ctl status)"
 [[ "$(field "$STATUS2" presentation)" == "Detached" ]] || {
@@ -120,7 +120,7 @@ require_field_ge "$STATUS2" detach_count 1
   exit 1
 }
 
-ctl attach >/dev/null
+ctl attach > /dev/null
 sleep 0.8
 STATUS3="$(ctl status)"
 [[ "$(field "$STATUS3" presentation)" == "Attached" ]] || {
@@ -158,6 +158,6 @@ echo "status_reattached=$STATUS3"
 echo "log=$LOG"
 echo "wayland_trace=$TRACE"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

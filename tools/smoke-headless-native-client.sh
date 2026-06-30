@@ -7,7 +7,7 @@ cd "$ROOT"
 
 CLIENT="${MANIFOLD_HEADLESS_CLIENT:-}"
 if [[ -z "$CLIENT" ]]; then
-  if command -v weston-simple-shm >/dev/null 2>&1; then
+  if command -v weston-simple-shm > /dev/null 2>&1; then
     CLIENT="$(command -v weston-simple-shm)"
   else
     echo "ERR weston-simple-shm is required for headless native-client smoke" >&2
@@ -15,7 +15,7 @@ if [[ -z "$CLIENT" ]]; then
   fi
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-native-client.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -24,20 +24,20 @@ CLIENT_LOG="$TMPDIR/client.log"
 WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-printf '#!/usr/bin/env bash\nexec %q >%q 2>&1\n' "$CLIENT" "$CLIENT_LOG" >"$WRAPPER"
+printf '#!/usr/bin/env bash\nexec %q >%q 2>&1\n' "$CLIENT" "$CLIENT_LOG" > "$WRAPPER"
 chmod +x "$WRAPPER"
 
 env WAYLAND_DISPLAY=manifold-missing-wayland DISPLAY= \
   RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -49,7 +49,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -62,7 +62,7 @@ require_field_ge() {
     echo "ERR missing numeric $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -92,11 +92,11 @@ require_field_ge "$STATUS1" windows 1
 require_field_ge "$STATUS1" commits 1
 COMMITS1="$(field "$STATUS1" commits)"
 
-ctl inject center-motion >/dev/null
+ctl inject center-motion > /dev/null
 STATUS_TARGET="$(wait_status '[[ "$(field "$status" pointer_motion_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_motion_events)" >= 1 )) && [[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 1 ))')"
 require_field_ge "$STATUS_TARGET" pointer_target_hits 1
 
-ctl attach >/dev/null
+ctl attach > /dev/null
 
 STATUS2="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 1 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= COMMITS1 )) && [[ "$(field "$status" presentation_attach_failures)" =~ ^[0-9]+$ ]] && (( "$(field "$status" presentation_attach_failures)" >= 1 )) && [[ "$(field "$status" presentation_runtime_failures)" == "0" ]] && [[ "$(field "$status" presentation_last_error)" != "none" ]]')"
 require_field_ge "$STATUS2" windows 1
@@ -115,6 +115,6 @@ echo "status_after_failed_attach=$STATUS2"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

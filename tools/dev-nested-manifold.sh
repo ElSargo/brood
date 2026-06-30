@@ -11,7 +11,7 @@ DEV_CLIENT="${MANIFOLD_NESTED_DEV_CLIENT:-foot}"
 OUT_DIR="${MANIFOLD_NESTED_OUT_DIR:-}"
 
 usage() {
-  cat <<'EOF'
+  cat << 'EOF'
 usage: tools/dev-nested-manifold.sh [--keep-running] [--out-dir DIR] [--dev-client CMD]
 
 Starts a stable Manifold instance on the host display, then starts a dev
@@ -67,9 +67,9 @@ done
 
 require_host_presentation_environment
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
-exec 9>/tmp/manifold-nested-dev.lock
+exec 9> /tmp/manifold-nested-dev.lock
 flock 9
 
 if [[ -z "$OUT_DIR" ]]; then
@@ -89,14 +89,14 @@ cleanup() {
   if [[ "$KEEP_RUNNING" == "1" ]]; then
     return
   fi
-  target/debug/manifold ctl --dbus-name "$DEV_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
-  target/debug/manifold ctl --dbus-name "$STABLE_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-name "$DEV_DBUS_DESTINATION" quit > /dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-name "$STABLE_DBUS_DESTINATION" quit > /dev/null 2>&1 || true
   sleep 0.4
-  if [[ -n "${DEV_PID:-}" ]] && kill -0 "$DEV_PID" 2>/dev/null; then
-    kill "$DEV_PID" >/dev/null 2>&1 || true
+  if [[ -n "${DEV_PID:-}" ]] && kill -0 "$DEV_PID" 2> /dev/null; then
+    kill "$DEV_PID" > /dev/null 2>&1 || true
   fi
-  if [[ -n "${STABLE_PID:-}" ]] && kill -0 "$STABLE_PID" 2>/dev/null; then
-    kill "$STABLE_PID" >/dev/null 2>&1 || true
+  if [[ -n "${STABLE_PID:-}" ]] && kill -0 "$STABLE_PID" 2> /dev/null; then
+    kill "$STABLE_PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -120,7 +120,7 @@ ctl_dev_json() {
 json_field() {
   local json="$1"
   local key="$2"
-  python - "$json" "$key" <<'PY'
+  python - "$json" "$key" << 'PY'
 import json
 import sys
 
@@ -143,11 +143,11 @@ wait_status_json() {
   local status
 
   for _ in $(seq 1 160); do
-    if ! status="$($command status-json 2>/dev/null)"; then
+    if ! status="$($command status-json 2> /dev/null)"; then
       sleep 0.1
       continue
     fi
-    if python - "$status" "$predicate" <<'PY'
+    if python - "$status" "$predicate" << 'PY'; then
 import json
 import sys
 
@@ -156,7 +156,6 @@ predicate = sys.argv[2]
 if not eval(predicate, {"__builtins__": {}}, {"s": status}):
     raise SystemExit(1)
 PY
-    then
       echo "$status"
       return 0
     fi
@@ -172,30 +171,31 @@ PY
 sample_statuses() {
   local deadline
   deadline=$((SECONDS + SAMPLE_SECONDS))
-  : >"$STABLE_STATUS_JSONL"
-  : >"$DEV_STATUS_JSONL"
+  : > "$STABLE_STATUS_JSONL"
+  : > "$DEV_STATUS_JSONL"
   while ((SECONDS < deadline)); do
     local now
     now="$(date +%s.%N)"
-    if stable_status="$(ctl_stable status-json 2>/dev/null)"; then
+    if stable_status="$(ctl_stable status-json 2> /dev/null)"; then
       printf '{"sample_time":%s,"role":"stable","status":%s}\n' "$now" "$stable_status" \
-        >>"$STABLE_STATUS_JSONL"
+        >> "$STABLE_STATUS_JSONL"
     fi
-    if dev_status="$(ctl_dev status-json 2>/dev/null)"; then
+    if dev_status="$(ctl_dev status-json 2> /dev/null)"; then
       printf '{"sample_time":%s,"role":"dev","status":%s}\n' "$now" "$dev_status" \
-        >>"$DEV_STATUS_JSONL"
+        >> "$DEV_STATUS_JSONL"
     fi
     sleep 0.1
   done
 }
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$STABLE_DBUS_DESTINATION" >"$STABLE_LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$STABLE_DBUS_DESTINATION" > "$STABLE_LOG" 2>&1 &
 STABLE_PID=$!
 
 wait_for_manifoldd_control "$STABLE_DBUS_DESTINATION" "$STABLE_PID" "$STABLE_LOG"
 
-DEV_SPAWN_JSON="$(python - "$DEV_DBUS_DESTINATION" "$DEV_LOG" <<'PY'
+DEV_SPAWN_JSON="$(
+  python - "$DEV_DBUS_DESTINATION" "$DEV_LOG" << 'PY'
 import json
 import shlex
 import sys
@@ -214,7 +214,7 @@ print(json.dumps([
 ]))
 PY
 )"
-ctl_stable_json "$DEV_SPAWN_JSON" >/dev/null
+ctl_stable_json "$DEV_SPAWN_JSON" > /dev/null
 
 wait_for_manifoldd_control "$DEV_DBUS_DESTINATION" "$STABLE_PID" "$STABLE_LOG"
 
@@ -226,7 +226,8 @@ STABLE_READY="$(
     "$STABLE_LOG"
 )"
 
-DEV_CLIENT_JSON="$(python - "$DEV_CLIENT" <<'PY'
+DEV_CLIENT_JSON="$(
+  python - "$DEV_CLIENT" << 'PY'
 import json
 import shlex
 import sys
@@ -234,7 +235,7 @@ import sys
 print(json.dumps(["spawn", *shlex.split(sys.argv[1])]))
 PY
 )"
-ctl_dev_json "$DEV_CLIENT_JSON" >/dev/null
+ctl_dev_json "$DEV_CLIENT_JSON" > /dev/null
 
 DEV_READY="$(
   wait_status_json \
@@ -268,8 +269,8 @@ if [[ "$KEEP_RUNNING" == "1" ]]; then
   echo "  target/debug/manifold ctl --dbus-name $STABLE_DBUS_DESTINATION quit"
   wait "$STABLE_PID"
 else
-  ctl_dev quit >/dev/null || true
-  ctl_stable quit >/dev/null || true
+  ctl_dev quit > /dev/null || true
+  ctl_stable quit > /dev/null || true
   wait "$STABLE_PID" || true
   trap - EXIT
 fi

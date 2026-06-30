@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -p manifoldd --bins >/dev/null
-cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release >/dev/null
-cargo build --manifest-path examples/wasm-map-hook/Cargo.toml --target wasm32-unknown-unknown --release >/dev/null
+cargo build -p manifoldd --bins > /dev/null
+cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release > /dev/null
+cargo build --manifest-path examples/wasm-map-hook/Cargo.toml --target wasm32-unknown-unknown --release > /dev/null
 
 KEY_WASM="$ROOT/examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm"
 MAP_WASM="$ROOT/examples/wasm-map-hook/target/wasm32-unknown-unknown/release/manifold_wasm_map_hook.wasm"
@@ -17,7 +17,7 @@ BUS_INFO="$TMPDIR/bus.info"
 LOG="$TMPDIR/manifoldd.log"
 DBUS_NAME="org.manifold.Test.WasmPlug.p$$"
 
-cat >"$CONF" <<EOF
+cat > "$CONF" << EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
@@ -32,26 +32,26 @@ cat >"$CONF" <<EOF
 </busconfig>
 EOF
 
-dbus-daemon --config-file="$CONF" --fork --print-address=1 --print-pid=1 >"$BUS_INFO"
+dbus-daemon --config-file="$CONF" --fork --print-address=1 --print-pid=1 > "$BUS_INFO"
 DBUS_ADDRESS="$(sed -n '1p' "$BUS_INFO")"
 DBUS_PID="$(sed -n '2p' "$BUS_INFO")"
 
 cleanup() {
-  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
-  if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2>/dev/null; then
-    kill "$MANIFOLD_PID" >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
+  if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2> /dev/null; then
+    kill "$MANIFOLD_PID" > /dev/null 2>&1 || true
   fi
-  kill "$DBUS_PID" >/dev/null 2>&1 || true
+  kill "$DBUS_PID" > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 wait_for_control() {
   for _ in $(seq 1 100); do
-    if target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" status-json >/dev/null 2>&1; then
+    if target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" status-json > /dev/null 2>&1; then
       return 0
     fi
     sleep 0.1
@@ -81,9 +81,9 @@ AUTO_MAP_OUT="$(target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-
   exit 1
 }
 
-target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null || true
+target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit > /dev/null || true
 wait "$MANIFOLD_PID" || true
-kill "$DBUS_PID" >/dev/null 2>&1 || true
+kill "$DBUS_PID" > /dev/null 2>&1 || true
 trap - EXIT
 
 echo "OK WASM plug smoke passed"

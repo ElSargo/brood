@@ -5,12 +5,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 
-if ! command -v wayland-info >/dev/null 2>&1; then
+if ! command -v wayland-info > /dev/null 2>&1; then
   echo "ERR wayland-info is required for headless Wayland global smoke" >&2
   exit 2
 fi
 
-cargo build -p manifoldd --offline >/dev/null
+cargo build -p manifoldd --offline > /dev/null
 
 TMPDIR="$(mktemp -d /tmp/manifold-headless-wayland-info.XXXXXX)"
 DBUS_NAME="org.manifold.Test.p$$"
@@ -18,16 +18,16 @@ LOG="$TMPDIR/manifoldd.log"
 INFO="$TMPDIR/wayland-info.log"
 
 cleanup() {
-  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
-    kill "$PID" >/dev/null 2>&1 || true
+    kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
@@ -39,7 +39,7 @@ ctl() {
 field() {
   local status="$1"
   local key="$2"
-  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<<"$status"
+  sed -n "s/.* ${key}=\\([^ ]*\\).*/\\1/p" <<< "$status"
 }
 
 require_field_ge() {
@@ -52,7 +52,7 @@ require_field_ge() {
     echo "ERR missing numeric $key in status: $status" >&2
     exit 1
   }
-  (( value >= min )) || {
+  ((value >= min)) || {
     echo "ERR expected $key >= $min, got $value in status: $status" >&2
     exit 1
   }
@@ -71,7 +71,7 @@ NESTED_DISPLAY="$(field "$STATUS" wayland_display)"
   exit 1
 }
 
-env WAYLAND_DISPLAY="$NESTED_DISPLAY" timeout 8 wayland-info >"$INFO" 2>&1 || {
+env WAYLAND_DISPLAY="$NESTED_DISPLAY" timeout 8 wayland-info > "$INFO" 2>&1 || {
   echo "ERR wayland-info could not inspect nested compositor" >&2
   echo "status=$STATUS" >&2
   cat "$INFO" >&2 || true
@@ -104,6 +104,6 @@ echo "status=$STATUS"
 echo "wayland_info=$INFO"
 echo "log=$LOG"
 
-ctl quit >/dev/null || true
+ctl quit > /dev/null || true
 wait "$PID" || true
 trap - EXIT

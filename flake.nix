@@ -40,6 +40,8 @@
 
       packages = forEachSystem (system: import ./nix/packages.nix { pkgs = pkgsFor system; });
 
-      formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt);
+      formatter = forEachSystem (
+        system: (import ./nix/packages.nix { pkgs = pkgsFor system; }).formatter
+      );
     };
 }
