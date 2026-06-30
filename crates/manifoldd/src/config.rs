@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -187,6 +187,7 @@ pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()>
     }
 
     let config = read_config(config_path)?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
     for (id, app) in config.startup {
         if !app.enabled {
             info!(startup_app = %id, "config startup app disabled");
@@ -196,15 +197,16 @@ pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()>
             warn!(startup_app = %id, "configured startup app has empty argv; skipping app");
             continue;
         }
+        let argv = resolve_startup_argv(config_dir, &app.argv);
         match app.realm {
             StartupRealm::Session => state
-                .spawn_hosted_app_argv(&app.argv)
+                .spawn_hosted_app_argv(&argv)
                 .with_context(|| format!("spawn config startup app {id}"))?,
             StartupRealm::Presentation => state
-                .spawn_presentation_app_argv(&app.argv)
+                .spawn_presentation_app_argv(&argv)
                 .with_context(|| format!("spawn config presentation startup app {id}"))?,
         }
-        info!(startup_app = %id, realm = ?app.realm, argv = ?app.argv, "spawned config startup app");
+        info!(startup_app = %id, realm = ?app.realm, argv = ?argv, "spawned config startup app");
     }
 
     Ok(())
@@ -254,11 +256,26 @@ pub(crate) fn discover_session_runner(start_dir: &Path) -> Result<Option<Session
     Ok(None)
 }
 
-pub(crate) fn discover_config_path(start_dir: &Path) -> PathBuf {
-    let start_dir = start_dir
-        .canonicalize()
-        .unwrap_or_else(|_| start_dir.to_path_buf());
-    find_upwards(&start_dir, "manifold.toml").unwrap_or_else(|| start_dir.join("manifold.toml"))
+pub(crate) fn global_config_path() -> PathBuf {
+    let config_path = xdg_config_path();
+    if config_path.exists() {
+        return config_path;
+    }
+    repo_config_path_from_current_exe().unwrap_or(config_path)
+}
+
+fn xdg_config_path() -> PathBuf {
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(env::temp_dir);
+    config_home.join("manifold").join("manifold.toml")
+}
+
+fn repo_config_path_from_current_exe() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let start_dir = exe.parent()?;
+    find_upwards(start_dir, "manifold.toml")
 }
 
 pub(crate) fn override_session_runner(
@@ -333,6 +350,29 @@ fn resolve_path(config_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn resolve_startup_argv(config_dir: &Path, argv: &[String]) -> Vec<String> {
+    argv.iter()
+        .map(|arg| resolve_startup_arg(config_dir, arg))
+        .collect()
+}
+
+fn resolve_startup_arg(config_dir: &Path, arg: &str) -> String {
+    let path = Path::new(arg);
+    if path.is_absolute() || !is_relative_path_like_arg(path, arg) {
+        return arg.to_string();
+    }
+    let resolved = config_dir.join(path);
+    if resolved.exists() {
+        resolved.to_string_lossy().into_owned()
+    } else {
+        arg.to_string()
+    }
+}
+
+fn is_relative_path_like_arg(path: &Path, arg: &str) -> bool {
+    !arg.starts_with('-') && (arg.starts_with('.') || path.components().count() > 1)
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -346,7 +386,8 @@ mod tests {
 
     use super::{
         BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, SessionRunnerSource,
-        discover_config_path, discover_session_runner, read_config, resolve_path,
+        discover_session_runner, read_config, repo_config_path_from_current_exe, resolve_path,
+        resolve_startup_argv,
     };
 
     #[test]
@@ -427,6 +468,36 @@ mod tests {
     }
 
     #[test]
+    fn resolves_startup_path_arguments_against_config_dir() {
+        let root = temp_dir("startup-argv-paths");
+        let apps = root.join("apps");
+        std::fs::create_dir_all(&apps).expect("create apps dir");
+        std::fs::write(apps.join("manifold-session-switcher.py"), "").expect("write app");
+
+        let argv = resolve_startup_argv(
+            &root,
+            &[
+                "python3".to_string(),
+                "apps/manifold-session-switcher.py".to_string(),
+                "--width".to_string(),
+                "300".to_string(),
+            ],
+        );
+
+        assert_eq!(argv[0], "python3");
+        assert_eq!(
+            argv[1],
+            root.join("apps")
+                .join("manifold-session-switcher.py")
+                .to_string_lossy()
+        );
+        assert_eq!(argv[2], "--width");
+        assert_eq!(argv[3], "300");
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
+    }
+
+    #[test]
     fn malformed_config_reports_error() {
         let dir = std::env::temp_dir().join(format!("manifold-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -475,28 +546,18 @@ mod tests {
     }
 
     #[test]
-    fn discovers_config_from_parent_without_runner() {
-        let root = temp_dir("config-without-runner");
-        let child = root.join("src").join("bin");
-        std::fs::create_dir_all(&child).expect("create child dir");
-        std::fs::write(
-            root.join("manifold.toml"),
-            r#"
-            [startup.switcher]
-            realm = "presentation"
-            argv = ["python3", "apps/manifold-session-switcher.py"]
-            "#,
-        )
-        .expect("write manifest");
+    fn repo_config_fallback_uses_binary_location() {
+        let path = repo_config_path_from_current_exe().expect("repo config from test binary");
 
-        assert_eq!(discover_config_path(&child), root.join("manifold.toml"));
-        assert!(
-            discover_session_runner(&child)
-                .expect("discover runner")
-                .is_none()
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("manifold.toml")
         );
-
-        std::fs::remove_dir_all(root).expect("remove temp dir");
+        assert!(
+            path.exists(),
+            "repo config should exist at {}",
+            path.display()
+        );
     }
 
     #[test]

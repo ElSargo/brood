@@ -117,9 +117,9 @@ pub struct SessionArgs {
         hide = true
     )]
     pub(crate) nested_inner_dbus_address: Option<String>,
-    /// Project/session config file to load at startup.
-    #[arg(long = "config", value_name = "PATH", default_value = "manifold.toml")]
-    pub(crate) config: std::path::PathBuf,
+    /// Config file to load at startup.
+    #[arg(long = "config", value_name = "PATH")]
+    pub(crate) config: Option<PathBuf>,
     /// Start without loading modules from the config file.
     #[arg(long = "no-default-modules")]
     pub(crate) no_default_modules: bool,
@@ -139,9 +139,17 @@ impl Default for SessionArgs {
             test_harness: None,
             nested_inner_dbus_name: None,
             nested_inner_dbus_address: None,
-            config: PathBuf::from("manifold.toml"),
+            config: None,
             no_default_modules: false,
         }
+    }
+}
+
+impl SessionArgs {
+    pub(crate) fn resolved_config_path(&self) -> PathBuf {
+        self.config
+            .clone()
+            .unwrap_or_else(config::global_config_path)
     }
 }
 

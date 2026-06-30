@@ -32,8 +32,7 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
     let cache_dir = create_cache_dir(&cache_root)?;
     let current_exe = env::current_exe().context("resolve current exe")?;
     let inner_binary = session_server_path(&current_exe);
-    let mut session_args = args.session.clone();
-    session_args.config = selection.config_path.clone();
+    let session_args = args.session.clone();
     let record = LaunchRecord {
         id: launch_context::new_launch_id(),
         project_dir: selection.project_dir.clone(),
@@ -123,7 +122,7 @@ fn runner_config(args: &RunArgs) -> Result<Option<SessionRunnerSelection>> {
         return Ok(Some(config::override_session_runner(
             kind.to_string(),
             current_project_dir()?,
-            args.session.config.clone(),
+            args.session.resolved_config_path(),
         )));
     }
     config::discover_session_runner(&current_project_dir()?)

@@ -79,7 +79,9 @@ for the staged implementation plan.
    such as `flake.nix`.
 2. User-facing commands open the global Manifold control server by default.
    When that server is not already running, Manifold starts it from the
-   discovered project context before issuing the control command.
+   invoking directory before issuing the control command. The server loads
+   plugins and startup apps from the global Manifold config, not from the
+   invoked project's runner config.
 3. The session runner starts in a transient user scope, activates project tools
    such as `nix develop`, then resolves the launch record for its current
    cgroup to start the assigned session server or entered command.

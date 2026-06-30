@@ -75,9 +75,10 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
     let mut event_loop: EventLoop<'static, Manifold> = EventLoop::try_new()?;
     let display: Display<Manifold> = Display::new()?;
     let mut state = Manifold::new(&mut event_loop, display);
+    let config_path = args.resolved_config_path();
 
     if !args.no_default_modules {
-        config::load_startup_modules(&mut state, &args.config)?;
+        config::load_startup_modules(&mut state, &config_path)?;
     }
 
     if let Some(path) = args.wasm_key_handler.as_deref() {
@@ -138,7 +139,7 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
     }
 
     if !args.no_default_modules {
-        config::load_startup_apps(&mut state, &args.config)?;
+        config::load_startup_apps(&mut state, &config_path)?;
     }
 
     if let Some(command) = args.command {

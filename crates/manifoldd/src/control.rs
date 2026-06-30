@@ -1269,7 +1269,7 @@ fn open_cli_control_context(
     address: Option<String>,
 ) -> Result<CliControlContext> {
     let current_directory = current_directory()?;
-    let config_path = config::discover_config_path(&current_directory);
+    let config_path = config::global_config_path();
     let runner = config::discover_session_runner(&current_directory)?;
     let target = resolve_control_target(destination, address);
     ensure_global_control_target_running(&target, &current_directory, &config_path)?;
