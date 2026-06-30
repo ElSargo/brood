@@ -71,6 +71,7 @@ const LEFT_PANEL_MAX_WIDTH: i32 = 560;
 const LEFT_PANEL_KEYBOARD_STEP: i32 = 32;
 const LEFT_PANEL_SPLITTER_HITBOX: f64 = 8.0;
 pub(crate) const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
+const MANIFOLD_SURFACE_SESSION_ID_ENV: &str = "MANIFOLD_SURFACE_SESSION_ID";
 const SESSION_OUTPUT_SIZE: (i32, i32) = (1280, 800);
 const SESSION_NAME_ADJECTIVES: &[&str] = &[
     "amber", "brisk", "calm", "dusk", "eager", "fern", "glad", "hazel", "ivory", "jolly", "keen",
@@ -113,6 +114,7 @@ struct HostedChild {
 struct PendingChildPane {
     pid: u32,
     pane_id: u64,
+    session: SurfaceSessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,12 +631,26 @@ impl Manifold {
     }
 
     pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
+        self.spawn_hosted_app_in_session(command, self.active_surface_session)
+    }
+
+    pub fn spawn_hosted_app_in_session(
+        &mut self,
+        command: &OsString,
+        session: SurfaceSessionId,
+    ) -> Result<()> {
+        ensure!(
+            self.surface_sessions.contains(&session),
+            "unknown surface session {}",
+            session.raw()
+        );
         let pane_id = self.allocate_pane_id();
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
         child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
-        self.apply_active_session_working_directory(&mut child);
-        self.apply_control_environment(&mut child);
+        child.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+        self.apply_session_working_directory(&mut child, session);
+        self.apply_control_environment(&mut child, session);
         let child = child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
@@ -645,10 +661,12 @@ impl Manifold {
         self.pending_child_panes.push(PendingChildPane {
             pid: child.id(),
             pane_id,
+            session,
         });
         info!(
             command = ?command,
             pane_id,
+            surface_session = session.raw(),
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
         );
@@ -661,16 +679,30 @@ impl Manifold {
     }
 
     pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<()> {
+        self.spawn_hosted_app_argv_in_session(argv, self.active_surface_session)
+    }
+
+    pub fn spawn_hosted_app_argv_in_session(
+        &mut self,
+        argv: &[String],
+        session: SurfaceSessionId,
+    ) -> Result<()> {
         let Some((program, args)) = argv.split_first() else {
             anyhow::bail!("spawn requires a command");
         };
+        ensure!(
+            self.surface_sessions.contains(&session),
+            "unknown surface session {}",
+            session.raw()
+        );
 
         let pane_id = self.allocate_pane_id();
         let mut child = Command::new(program);
         child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
         child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
-        self.apply_active_session_working_directory(&mut child);
-        self.apply_control_environment(&mut child);
+        child.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+        self.apply_session_working_directory(&mut child, session);
+        self.apply_control_environment(&mut child, session);
         let child = child.spawn().with_context(|| {
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
@@ -681,10 +713,12 @@ impl Manifold {
         self.pending_child_panes.push(PendingChildPane {
             pid: child.id(),
             pane_id,
+            session,
         });
         info!(
             argv = ?argv,
             pane_id,
+            surface_session = session.raw(),
             wayland_display = %self.socket_name.to_string_lossy(),
             "spawned hosted Wayland app"
         );
@@ -702,13 +736,15 @@ impl Manifold {
         };
 
         let pane_id = self.allocate_pane_id();
+        let session = self.active_surface_session;
         let mut child = Command::new(program);
         child
             .args(args)
             .env("WAYLAND_DISPLAY", &self.socket_name)
             .env(MANIFOLD_PANE_ID_ENV, pane_id.to_string())
+            .env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string())
             .env(MANIFOLD_SESSION_ENV, "presentation");
-        self.apply_control_environment(&mut child);
+        self.apply_control_environment(&mut child, session);
         let child = child.spawn().with_context(|| {
             format!(
                 "spawn presentation app {:?} with WAYLAND_DISPLAY={}",
@@ -719,6 +755,7 @@ impl Manifold {
         self.pending_child_panes.push(PendingChildPane {
             pid: child.id(),
             pane_id,
+            session,
         });
         info!(
             argv = ?argv,
@@ -796,7 +833,7 @@ impl Manifold {
         self.browsers.spawn(options, &self.socket_name)
     }
 
-    fn apply_control_environment(&mut self, child: &mut Command) {
+    fn apply_control_environment(&mut self, child: &mut Command, session: SurfaceSessionId) {
         if let Some(session) = self.manifold_session.as_deref() {
             child.env(MANIFOLD_SESSION_ENV, session);
         }
@@ -805,11 +842,10 @@ impl Manifold {
         }
         if let Some(address) = self.manifold_dbus_address.clone() {
             child.env(MANIFOLDD_DBUS_ADDRESS_ENV, &address);
-            let session = self.active_surface_session;
             match self.ensure_session_dbus_bus(session) {
                 Ok(session_bus_address) => {
                     child.env("DBUS_SESSION_BUS_ADDRESS", session_bus_address);
-                    child.env("MANIFOLD_SURFACE_SESSION_ID", session.raw().to_string());
+                    child.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
                 }
                 Err(err) => {
                     warn!(
@@ -827,11 +863,8 @@ impl Manifold {
         }
     }
 
-    fn apply_active_session_working_directory(&self, child: &mut Command) {
-        if let Some(directory) = self
-            .surface_session_working_directories
-            .get(&self.active_surface_session)
-        {
+    fn apply_session_working_directory(&self, child: &mut Command, session: SurfaceSessionId) {
+        if let Some(directory) = self.surface_session_working_directories.get(&session) {
             child.current_dir(directory);
         }
     }
@@ -1154,9 +1187,9 @@ impl Manifold {
     }
 
     pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) -> Option<WlSurface> {
+        let (pane, session) = self.register_toplevel_pane_and_session(surface);
         self.window_surface_sessions
-            .push((surface.clone(), self.active_surface_session));
-        let pane = self.register_toplevel_pane(surface);
+            .push((surface.clone(), session));
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
                 self.layout.occupy_active_leaf();
@@ -1168,15 +1201,29 @@ impl Manifold {
         self.apply_map_hook_for_pending_pane(pane)
     }
 
-    fn register_toplevel_pane(&mut self, surface: &WlSurface) -> u64 {
+    fn register_toplevel_pane_and_session(
+        &mut self,
+        surface: &WlSurface,
+    ) -> (u64, SurfaceSessionId) {
         if let Some(pane) = self.pane_for_toplevel_surface(surface) {
-            return pane;
+            return (
+                pane,
+                self.session_for_toplevel_surface(surface)
+                    .unwrap_or_else(|| self.default_surface_session()),
+            );
         }
-        let pane = self
-            .claim_pending_child_pane(surface)
+        let pending = self.claim_pending_child_pane(surface);
+        let pane = pending
+            .as_ref()
+            .map(|pending| pending.pane_id)
             .unwrap_or_else(|| self.allocate_pane_id());
+        let session = pending
+            .as_ref()
+            .map(|pending| pending.session)
+            .or_else(|| self.session_from_toplevel_process(surface))
+            .unwrap_or_else(|| self.default_surface_session());
         self.window_pane_ids.push((surface.clone(), pane));
-        pane
+        (pane, session)
     }
 
     fn allocate_pane_id(&mut self) -> u64 {
@@ -1185,7 +1232,7 @@ impl Manifold {
         pane
     }
 
-    fn claim_pending_child_pane(&mut self, surface: &WlSurface) -> Option<u64> {
+    fn claim_pending_child_pane(&mut self, surface: &WlSurface) -> Option<PendingChildPane> {
         let surface_pid = toplevel_pid(self, surface)?;
         let index = self.pending_child_panes.iter().position(|pending| {
             let pending_pid = pending.pid.to_string();
@@ -1193,7 +1240,22 @@ impl Manifold {
                 || process_is_ancestor(&surface_pid, &pending_pid)
                 || process_is_ancestor(&pending_pid, &surface_pid)
         })?;
-        Some(self.pending_child_panes.remove(index).pane_id)
+        Some(self.pending_child_panes.remove(index))
+    }
+
+    fn session_from_toplevel_process(&self, surface: &WlSurface) -> Option<SurfaceSessionId> {
+        let pid = toplevel_pid(self, surface)?.parse::<u32>().ok()?;
+        process_tree_env_var(pid, MANIFOLD_SURFACE_SESSION_ID_ENV)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(SurfaceSessionId::from_raw)
+            .filter(|session| self.surface_sessions.contains(session))
+    }
+
+    fn default_surface_session(&self) -> SurfaceSessionId {
+        self.surface_sessions
+            .first()
+            .copied()
+            .unwrap_or(SurfaceSessionId(1))
     }
 
     fn pane_for_toplevel_surface(&self, surface: &WlSurface) -> Option<u64> {
@@ -4042,6 +4104,34 @@ fn process_parent_pid(pid: u32) -> Option<u32> {
     let mut fields = after_name.split_whitespace();
     fields.next()?;
     fields.next()?.parse().ok()
+}
+
+fn process_tree_env_var(mut pid: u32, key: &str) -> Option<String> {
+    for _ in 0..64 {
+        if let Some(value) = process_env_var(pid, key) {
+            return Some(value);
+        }
+        let Some(ppid) = process_parent_pid(pid) else {
+            return None;
+        };
+        if ppid == 0 || ppid == pid {
+            return None;
+        }
+        pid = ppid;
+    }
+    None
+}
+
+fn process_env_var(pid: u32, key: &str) -> Option<String> {
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    environ.split(|byte| *byte == 0).find_map(|entry| {
+        let (entry_key, entry_value) = entry.split_at_checked(key.len())?;
+        if entry_key == key.as_bytes() && entry_value.first() == Some(&b'=') {
+            Some(String::from_utf8_lossy(&entry_value[1..]).into_owned())
+        } else {
+            None
+        }
+    })
 }
 
 fn placement_requests_left_panel(placement: &ExtensionMetadata) -> bool {

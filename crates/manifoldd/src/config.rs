@@ -9,6 +9,8 @@ use tracing::{info, warn};
 
 use crate::{state::Manifold, wasm_key::WasmKeyHandler, wasm_map::WasmMapHook};
 
+const MANIFOLD_CONFIG_ENV: &str = "MANIFOLD_CONFIG";
+
 #[derive(Debug, serde::Deserialize)]
 pub struct ManifoldConfig {
     #[serde(default)]
@@ -257,6 +259,9 @@ pub(crate) fn discover_session_runner(start_dir: &Path) -> Result<Option<Session
 }
 
 pub(crate) fn global_config_path() -> PathBuf {
+    if let Some(config_path) = env::var_os(MANIFOLD_CONFIG_ENV).filter(|path| !path.is_empty()) {
+        return PathBuf::from(config_path);
+    }
     let config_path = xdg_config_path();
     if config_path.exists() {
         return config_path;

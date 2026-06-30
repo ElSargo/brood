@@ -77,10 +77,15 @@ class ManifoldBus:
             self.bus.get_object(self.destination, "/org/manifold/Status"),
             "org.manifold.Status",
         )
-        self.notifications = dbus.Interface(
-            self.bus.get_object(NOTIFICATIONS_DESTINATION, NOTIFICATIONS_PATH),
-            NOTIFICATIONS_DESTINATION,
-        )
+        self.notifications = None
+
+    def notification_interface(self):
+        if self.notifications is None:
+            self.notifications = dbus.Interface(
+                self.bus.get_object(NOTIFICATIONS_DESTINATION, NOTIFICATIONS_PATH),
+                NOTIFICATIONS_DESTINATION,
+            )
+        return self.notifications
 
     def list_sessions(self):
         rows = []
@@ -186,7 +191,7 @@ class ManifoldBus:
         return bool(self.agent.ShouldNotifyAgentDesktop(str(agent_id)))
 
     def notify_agent_finished(self, summary, body, timeout_ms):
-        notification_id = self.notifications.Notify(
+        notification_id = self.notification_interface().Notify(
             APP_ID,
             dbus.UInt32(0),
             "",

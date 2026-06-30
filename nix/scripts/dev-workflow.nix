@@ -2,7 +2,7 @@
   pkgs,
   lib,
   manifoldd,
-  wasmExamples,
+  runtimeFiles,
   sessionSwitcherPython,
   path,
   nativeLibraryPath,
@@ -82,19 +82,21 @@ pkgs.writeShellApplication {
       echo "source=$SOURCE_DIR"
     }
 
-    install_wasm_examples() {
+    install_runtime_files() {
       local found=0
-      local wasm
-      while IFS= read -r wasm; do
+      local file
+      while IFS= read -r file; do
         found=1
-        local rel="''${wasm#${wasmExamples}/}"
+        local rel="''${file#${runtimeFiles}/}"
         local target="$SOURCE_DIR/$rel"
         mkdir -p "$(dirname "$target")"
-        cp "$wasm" "$target"
-      done < <(find "${wasmExamples}" -type f -name '*.wasm' -print | sort)
+        rm -f "$target"
+        cp "$file" "$target"
+        chmod u+w "$target"
+      done < <(find "${runtimeFiles}" -type f -print | sort)
 
       if [[ "$found" != "1" ]]; then
-        echo "ERR no packaged WASM example artifacts found in ${wasmExamples}" >&2
+        echo "ERR no packaged runtime files found in ${runtimeFiles}" >&2
         return 2
       fi
     }
@@ -158,11 +160,11 @@ pkgs.writeShellApplication {
 
     DBUS_DESTINATION="org.manifold.DevWorkflow.p$$"
     SESSION_LOG="$RUN_DIR/session.log"
-    WASM_BUILD_LOG="$RUN_DIR/wasm-build.log"
+    RUNTIME_INSTALL_LOG="$RUN_DIR/runtime-install.log"
 
-    if ! install_wasm_examples >"$WASM_BUILD_LOG" 2>&1; then
-      echo "ERR failed to install packaged WASM examples" >&2
-      tail -120 "$WASM_BUILD_LOG" >&2 || true
+    if ! install_runtime_files >"$RUNTIME_INSTALL_LOG" 2>&1; then
+      echo "ERR failed to install packaged runtime files" >&2
+      tail -120 "$RUNTIME_INSTALL_LOG" >&2 || true
       exit 1
     fi
 
@@ -180,7 +182,7 @@ pkgs.writeShellApplication {
     echo "source=$SOURCE_DIR"
     echo "run_dir=$RUN_DIR"
     echo "dbus_destination=$DBUS_DESTINATION"
-    echo "wasm_build_log=$WASM_BUILD_LOG"
+    echo "runtime_install_log=$RUNTIME_INSTALL_LOG"
     echo "session_log=$SESSION_LOG"
     echo "Stop with Ctrl-C or close the Manifold presentation."
 

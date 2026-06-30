@@ -76,7 +76,6 @@ let
   manifoldd = cargoNix.workspaceMembers."manifoldd".build.override {
     runTests = false;
   };
-  manifold = manifoldd;
 
   wasmExamples = pkgs.stdenvNoCC.mkDerivation {
     name = "manifold-wasm-examples";
@@ -119,6 +118,43 @@ let
     '';
   };
 
+  runtimeFiles = pkgs.runCommand "manifold-runtime-files" { } ''
+    mkdir -p "$out"
+
+    install -D ${src}/manifold.toml "$out/manifold.toml"
+
+    mkdir -p "$out/apps"
+    cp -R ${src}/apps/. "$out/apps/"
+    rm -rf "$out/apps/__pycache__"
+
+    if [[ -d ${wasmExamples}/examples ]]; then
+      cp -R ${wasmExamples}/examples "$out/examples"
+    else
+      echo "ERR packaged WASM examples did not include an examples directory" >&2
+      exit 2
+    fi
+  '';
+
+  manifold = pkgs.symlinkJoin {
+    name = "manifold";
+    paths = [
+      manifoldd
+      runtimeFiles
+    ];
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      for program in manifold manifold-sessiond manifold-runner-exec manifold-runner-nix-develop; do
+        wrapProgram "$out/bin/$program" \
+          --prefix PATH : "${appToolPath}" \
+          --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
+          --prefix GI_TYPELIB_PATH : "${gtkTypelibPath}" \
+          --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \
+          --run 'export GSETTINGS_SCHEMA_DIR="''${GSETTINGS_SCHEMA_DIR:-${gsettingsSchemaDir}}"' \
+          --run 'export MANIFOLD_CONFIG="''${MANIFOLD_CONFIG:-'"$out"'/manifold.toml}"'
+      done
+    '';
+  };
+
   devEnv = pkgs.buildEnv {
     name = "manifold-dev-env";
     paths = profiles.devTools ++ profiles.nativeLibs ++ profiles.gtkRuntime;
@@ -157,7 +193,7 @@ let
         nativePkgConfigPath
         path
         pkgs
-        wasmExamples
+        runtimeFiles
         ;
       rustToolchain = profiles.rustToolchain;
       sessionSwitcherPython = profiles.sessionSwitcherPython;
@@ -174,22 +210,42 @@ let
     path = fullDevToolPath;
     exportDevVars = true;
   };
+
+  devWorkflowWithRuntime = pkgs.symlinkJoin {
+    name = "manifold-dev-workflow";
+    paths = [
+      devWorkflow
+      runtimeFiles
+    ];
+  };
+
+  devWorkflowFullWithRuntime = pkgs.symlinkJoin {
+    name = "manifold-dev-workflow-full";
+    paths = [
+      devWorkflowFull
+      runtimeFiles
+    ];
+  };
 in
 {
   default = manifold;
-  "dev-workflow" = devWorkflow;
-  "dev-workflow-full" = devWorkflowFull;
+  "dev-workflow" = devWorkflowWithRuntime;
+  "dev-workflow-full" = devWorkflowFullWithRuntime;
   "dev-env" = devEnv;
   "dev-env-full" = devEnvFull;
+  "runtime-files" = runtimeFiles;
   "wasm-examples" = wasmExamples;
 
   inherit
     devEnv
     devEnvFull
     devWorkflow
+    devWorkflowFullWithRuntime
+    devWorkflowWithRuntime
     devWorkflowFull
     manifold
     manifoldd
+    runtimeFiles
     wasmExamples
     ;
 }

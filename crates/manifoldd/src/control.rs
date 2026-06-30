@@ -1028,7 +1028,13 @@ pub fn send(args: CtlArgs) -> Result<()> {
     if !args.json && handle_typed_ctl_command(target, &args.command)? {
         return Ok(());
     }
-    let response = request_dbus_command(target, &args.command, args.json)?;
+    let command = control_command_with_target_session(
+        target,
+        &context.current_directory,
+        args.command,
+        args.json,
+    )?;
+    let response = request_dbus_command(target, &command, args.json)?;
     print!("{response}");
     Ok(())
 }
@@ -1518,6 +1524,40 @@ fn entered_argv(argv: Vec<OsString>) -> (OsString, Vec<OsString>) {
         .or_else(|| env::var_os("SHELL"))
         .unwrap_or_else(|| OsString::from("/bin/sh"));
     (program, argv.collect())
+}
+
+fn control_command_with_target_session(
+    target: &ControlTarget,
+    current_directory: &Path,
+    command: Vec<String>,
+    json: bool,
+) -> Result<Vec<String>> {
+    if json || command.first().map(String::as_str) != Some("spawn") {
+        return Ok(command);
+    }
+    let session_id = match entered_surface_session_id() {
+        Some(session_id) => Some(session_id),
+        None => resolve_directory_surface_session(target, current_directory)?,
+    };
+    Ok(control_command_for_session(command, json, session_id))
+}
+
+fn control_command_for_session(
+    command: Vec<String>,
+    json: bool,
+    session_id: Option<u64>,
+) -> Vec<String> {
+    if json || command.first().map(String::as_str) != Some("spawn") {
+        return command;
+    }
+    let Some(session_id) = session_id else {
+        return command;
+    };
+    let mut targeted = Vec::with_capacity(command.len() + 1);
+    targeted.push("spawn-in-session".to_string());
+    targeted.push(session_id.to_string());
+    targeted.extend(command.into_iter().skip(1));
+    targeted
 }
 
 pub fn switch(args: SwitchArgs) -> Result<()> {
@@ -2515,6 +2555,17 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             }
             state.spawn_hosted_app_argv(args)?;
             format!("OK spawned {}\n", args.join(" "))
+        }
+        "spawn-in-session" => {
+            let Some((session, argv)) = args.split_first() else {
+                bail!("spawn-in-session requires a session id and command");
+            };
+            if argv.is_empty() {
+                bail!("spawn-in-session requires a command");
+            }
+            let session = parse_u64(session, "session id")?;
+            state.spawn_hosted_app_argv_in_session(argv, SurfaceSessionId::from_raw(session))?;
+            format!("OK spawned {}\n", argv.join(" "))
         }
         "plug" => {
             let (kind, path) = parse_plug_args(args)?;
@@ -3522,9 +3573,9 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlTarget, SessionSwitchOutcome, WasmPlugKind, format_session_picker_row,
-        parse_plug_args, parse_skim_session_output, resolve_initial_query, session_marker_value,
-        surface_session_dir_new_command,
+        ControlTarget, SessionSwitchOutcome, WasmPlugKind, control_command_for_session,
+        format_session_picker_row, parse_plug_args, parse_skim_session_output,
+        resolve_initial_query, session_marker_value, surface_session_dir_new_command,
     };
     use crate::state::SurfaceSessionSummary;
     use std::path::Path;
@@ -3618,6 +3669,34 @@ mod tests {
             session_marker_value(&marker, "surface-session-id"),
             Some("42".to_string())
         );
+    }
+
+    #[test]
+    fn entered_spawn_command_targets_entered_session() {
+        let command = control_command_for_session(
+            vec!["spawn".to_string(), "foot".to_string()],
+            false,
+            Some(42),
+        );
+
+        assert_eq!(
+            command,
+            vec!["spawn-in-session", "42", "foot"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn json_spawn_command_is_not_rewritten() {
+        let command = control_command_for_session(
+            vec!["spawn".to_string(), "foot".to_string()],
+            true,
+            Some(42),
+        );
+
+        assert_eq!(command, vec!["spawn".to_string(), "foot".to_string()]);
     }
 
     #[test]
