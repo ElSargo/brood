@@ -1174,6 +1174,7 @@ pub fn show(args: ShowArgs) -> Result<()> {
         args.id,
         true,
         args.set_default,
+        false,
     )?;
     remember_directory_surface_session(target, &current_directory, session_id, set_default)?;
 
@@ -1191,8 +1192,14 @@ pub fn show(args: ShowArgs) -> Result<()> {
 pub fn hide(args: HideArgs) -> Result<()> {
     let context = open_cli_control_context(args.dbus_name, args.dbus_address)?;
     let target = &context.target;
-    let (session_id, current_directory, set_default) =
-        resolve_cli_surface_session(target, &context.current_directory, args.id, false, false)?;
+    let (session_id, current_directory, set_default) = resolve_cli_surface_session(
+        target,
+        &context.current_directory,
+        args.id,
+        false,
+        false,
+        true,
+    )?;
     remember_directory_surface_session(target, &current_directory, session_id, set_default)?;
 
     let status = status_snapshot(target)?;
@@ -1224,6 +1231,7 @@ fn resolve_cli_surface_session(
     query: Option<String>,
     create_if_missing: bool,
     set_default_requested: bool,
+    allow_entered_fallback: bool,
 ) -> Result<(u64, PathBuf, bool)> {
     let existing_default = resolve_directory_surface_session(target, &current_directory)?;
     let (session_id, set_default) = if let Some(query) = query {
@@ -1233,17 +1241,47 @@ fn resolve_cli_surface_session(
         )
     } else if let Some(session_id) = existing_default {
         (session_id, false)
-    } else if let Some(session_id) = entered_surface_session_id() {
-        (session_id, true)
-    } else if create_if_missing {
-        (
-            create_directory_surface_session(target, current_directory, None, true)?,
-            true,
-        )
     } else {
-        (status_snapshot(target)?.active_surface_session, false)
+        match missing_directory_surface_session_action(
+            entered_surface_session_id(),
+            create_if_missing,
+            allow_entered_fallback,
+        ) {
+            MissingDirectorySurfaceSessionAction::Entered(session_id) => (session_id, true),
+            MissingDirectorySurfaceSessionAction::Create => (
+                create_directory_surface_session(target, current_directory, None, true)?,
+                true,
+            ),
+            MissingDirectorySurfaceSessionAction::Active => {
+                (status_snapshot(target)?.active_surface_session, false)
+            }
+        }
     };
     Ok((session_id, current_directory.to_path_buf(), set_default))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MissingDirectorySurfaceSessionAction {
+    Entered(u64),
+    Create,
+    Active,
+}
+
+fn missing_directory_surface_session_action(
+    entered_session_id: Option<u64>,
+    create_if_missing: bool,
+    allow_entered_fallback: bool,
+) -> MissingDirectorySurfaceSessionAction {
+    if allow_entered_fallback {
+        if let Some(session_id) = entered_session_id {
+            return MissingDirectorySurfaceSessionAction::Entered(session_id);
+        }
+    }
+    if create_if_missing {
+        MissingDirectorySurfaceSessionAction::Create
+    } else {
+        MissingDirectorySurfaceSessionAction::Active
+    }
 }
 
 fn switch_surface_session(target: &ControlTarget, session_id: u64) -> Result<()> {
@@ -3573,8 +3611,9 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlTarget, SessionSwitchOutcome, WasmPlugKind, control_command_for_session,
-        format_session_picker_row, parse_plug_args, parse_skim_session_output,
+        ControlTarget, MissingDirectorySurfaceSessionAction, SessionSwitchOutcome, WasmPlugKind,
+        control_command_for_session, format_session_picker_row,
+        missing_directory_surface_session_action, parse_plug_args, parse_skim_session_output,
         resolve_initial_query, session_marker_value, surface_session_dir_new_command,
     };
     use crate::state::SurfaceSessionSummary;
@@ -3668,6 +3707,22 @@ mod tests {
         assert_eq!(
             session_marker_value(&marker, "surface-session-id"),
             Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn show_missing_directory_creates_even_from_entered_session() {
+        assert_eq!(
+            missing_directory_surface_session_action(Some(42), true, false),
+            MissingDirectorySurfaceSessionAction::Create
+        );
+    }
+
+    #[test]
+    fn entered_fallback_remains_available_for_callers_that_request_it() {
+        assert_eq!(
+            missing_directory_surface_session_action(Some(42), true, true),
+            MissingDirectorySurfaceSessionAction::Entered(42)
         );
     }
 
