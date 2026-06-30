@@ -155,6 +155,97 @@ let
     '';
   };
 
+  desktopActions = pkgs.writeShellApplication {
+    name = "manifold-desktop";
+    runtimeInputs = [ pkgs.coreutils ];
+    text = ''
+      set -euo pipefail
+
+      action="''${1:-show}"
+      manifold_bin="${manifold}/bin/manifold"
+
+      export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
+      export GI_TYPELIB_PATH="${gtkTypelibPath}:''${GI_TYPELIB_PATH:-}"
+      export XDG_DATA_DIRS="${gtkDataDirs}:''${XDG_DATA_DIRS:-}"
+      export GSETTINGS_SCHEMA_DIR="${gsettingsSchemaDir}"
+      export MANIFOLD_CONFIG="''${MANIFOLD_CONFIG:-${manifold}/manifold.toml}"
+
+      case "$action" in
+        show)
+          exec "$manifold_bin" show
+          ;;
+        new-session)
+          response="$("$manifold_bin" ctl surface-session dir-new "$PWD" default)"
+          case "$response" in
+            "OK surface-session active="*)
+              session_id="''${response#* active=}"
+              session_id="''${session_id%% *}"
+              exec "$manifold_bin" show --id "$session_id" --set-default
+              ;;
+            *)
+              printf '%s\n' "$response" >&2
+              exit 1
+              ;;
+          esac
+          ;;
+        picker)
+          "$manifold_bin" show >/dev/null
+          exec "${profiles.sessionSwitcherPython}/bin/python3" \
+            "${runtimeFiles}/apps/manifold-session-switcher.py" \
+            --width 360
+          ;;
+        quit)
+          exec "$manifold_bin" ctl quit
+          ;;
+        *)
+          echo "usage: manifold-desktop [show|new-session|picker|quit]" >&2
+          exit 2
+          ;;
+      esac
+    '';
+  };
+
+  desktopIntegration = pkgs.runCommand "manifold-desktop-integration" { } ''
+    install -D -m 0644 ${../assets/icons/hicolor/512x512/apps/manifold.png} \
+      "$out/share/icons/hicolor/512x512/apps/manifold.png"
+    install -D -m 0644 ${../assets/icons/hicolor/512x512/apps/manifold.png} \
+      "$out/share/pixmaps/manifold.png"
+
+    install -D -m 0644 /dev/stdin "$out/share/applications/manifold.desktop" <<EOF
+    [Desktop Entry]
+    Type=Application
+    Name=Manifold
+    Comment=Show the Manifold workspace
+    Exec=${desktopActions}/bin/manifold-desktop show
+    Icon=manifold
+    Terminal=false
+    Categories=Development;
+    StartupNotify=true
+    Actions=NewSession;OpenPicker;Quit;
+
+    [Desktop Action NewSession]
+    Name=New Session
+    Exec=${desktopActions}/bin/manifold-desktop new-session
+
+    [Desktop Action OpenPicker]
+    Name=Open Picker
+    Exec=${desktopActions}/bin/manifold-desktop picker
+
+    [Desktop Action Quit]
+    Name=Quit
+    Exec=${desktopActions}/bin/manifold-desktop quit
+    EOF
+  '';
+
+  manifoldWithDesktop = pkgs.symlinkJoin {
+    name = "manifold";
+    paths = [
+      manifold
+      desktopActions
+      desktopIntegration
+    ];
+  };
+
   devEnv = pkgs.buildEnv {
     name = "manifold-dev-env";
     paths = profiles.devTools ++ profiles.nativeLibs ++ profiles.gtkRuntime;
@@ -216,6 +307,8 @@ let
     paths = [
       devWorkflow
       runtimeFiles
+      desktopActions
+      desktopIntegration
     ];
   };
 
@@ -224,11 +317,13 @@ let
     paths = [
       devWorkflowFull
       runtimeFiles
+      desktopActions
+      desktopIntegration
     ];
   };
 in
 {
-  default = manifold;
+  default = manifoldWithDesktop;
   "dev-workflow" = devWorkflowWithRuntime;
   "dev-workflow-full" = devWorkflowFullWithRuntime;
   "dev-env" = devEnv;
@@ -243,6 +338,9 @@ in
     devWorkflowFullWithRuntime
     devWorkflowWithRuntime
     devWorkflowFull
+    desktopActions
+    desktopIntegration
+    manifoldWithDesktop
     manifold
     manifoldd
     runtimeFiles
