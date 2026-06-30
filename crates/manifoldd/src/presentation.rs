@@ -247,6 +247,12 @@ fn handle_presenter_event(
         PresenterEvent::Created => {
             if state.presentation != PresentationStatus::Attached || state.attach_requested {
                 apply_presenter_created(event_presenter, state);
+                if state.presentation == PresentationStatus::Attached
+                    && let Err(failure) = render_presenter_frame(event_presenter, state)
+                {
+                    record_presentation_runtime_failure(state, &failure);
+                    apply_pending_attach_state(event_presenter, state);
+                }
             }
         }
         PresenterEvent::CreationFailed(error) => {
@@ -332,9 +338,6 @@ fn handle_presenter_event(
         }
         PresenterEvent::Redraw => {
             if state.presentation == PresentationStatus::Detached {
-                return;
-            }
-            if state.presentation_visible_window_count() == 0 {
                 return;
             }
             if schedule_deferred_client_frame(&event_presenter, state, false) {
