@@ -172,7 +172,7 @@ let
 
       case "$action" in
         show)
-          exec "$manifold_bin" show
+          exec "$manifold_bin" show --last-focused
           ;;
         new-session)
           response="$("$manifold_bin" ctl surface-session dir-new "$PWD" default)"

@@ -193,6 +193,9 @@ pub(crate) struct ShowArgs {
     /// DBus bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
+    /// Show the most recently focused live session instead of this directory's default session.
+    #[arg(long = "last-focused", conflicts_with_all = ["id", "set_default"])]
+    pub(crate) last_focused: bool,
     /// Show this session id or session name directly.
     #[arg(long = "id")]
     pub(crate) id: Option<String>,
@@ -364,4 +367,36 @@ pub fn run_session_cli() -> Result<()> {
     };
     info!(?args, "starting manifold session server");
     compositor::serve_session(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, Command};
+    use clap::Parser;
+
+    #[test]
+    fn show_accepts_last_focused_mode() {
+        let args = Args::parse_from(["manifold", "show", "--last-focused"]);
+
+        match args.command {
+            Some(Command::Show(show)) => assert!(show.last_focused),
+            other => panic!("expected show command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_last_focused_conflicts_with_explicit_session() {
+        let err = Args::try_parse_from(["manifold", "show", "--last-focused", "--id", "2"])
+            .expect_err("last-focused and id should conflict");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn show_last_focused_conflicts_with_set_default() {
+        let err = Args::try_parse_from(["manifold", "show", "--last-focused", "--set-default"])
+            .expect_err("last-focused and set-default should conflict");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }

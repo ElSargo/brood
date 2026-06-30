@@ -1168,18 +1168,21 @@ pub fn enter(args: EnterArgs) -> Result<()> {
 pub fn show(args: ShowArgs) -> Result<()> {
     let context = open_cli_control_context(args.dbus_name, args.dbus_address)?;
     let target = &context.target;
-    let (session_id, current_directory, set_default) = resolve_cli_surface_session(
-        target,
-        &context.current_directory,
-        args.id,
-        true,
-        args.set_default,
-        false,
-    )?;
-    remember_directory_surface_session(target, &current_directory, session_id, set_default)?;
-
     let status = status_snapshot(target)?;
-    switch_surface_session(target, session_id)?;
+    if args.last_focused {
+        restore_last_focused_surface_session(target)?;
+    } else {
+        let (session_id, current_directory, set_default) = resolve_cli_surface_session(
+            target,
+            &context.current_directory,
+            args.id,
+            true,
+            args.set_default,
+            false,
+        )?;
+        remember_directory_surface_session(target, &current_directory, session_id, set_default)?;
+        switch_surface_session(target, session_id)?;
+    }
 
     if status.presentation == "Detached" {
         request_presentation_attach_and_focus(target)?;
@@ -1292,6 +1295,15 @@ fn switch_surface_session(target: &ControlTarget, session_id: u64) -> Result<()>
             "switch".to_string(),
             session_id.to_string(),
         ],
+        false,
+    )?;
+    ensure_ok_response(&response)
+}
+
+fn restore_last_focused_surface_session(target: &ControlTarget) -> Result<()> {
+    let response = request_dbus_command(
+        target,
+        &["surface-session".to_string(), "last-focused".to_string()],
         false,
     )?;
     ensure_ok_response(&response)
@@ -2739,6 +2751,13 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                     state.active_surface_session().raw()
                 )
             }
+            [subcommand] if subcommand == "last-focused" => {
+                let changed = state.restore_last_interacted_surface_session();
+                format!(
+                    "OK surface-session active={} changed={changed}\n",
+                    state.active_surface_session().raw()
+                )
+            }
             [subcommand, name @ ..] if subcommand == "new" => {
                 let name = joined_name(name);
                 if let Some(name) = name {
@@ -2766,7 +2785,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 )
             }
             _ => bail!(
-                "usage: surface-session list-json|dir-list-json <dir>|dir-get <dir>|dir-set <dir> <id> [default|keep-default]|next|new|switch <query>"
+                "usage: surface-session list-json|dir-list-json <dir>|dir-get <dir>|dir-set <dir> <id> [default|keep-default]|next|last-focused|new|switch <query>"
             ),
         },
         "browser" => browser::handle_control(args, state)?,
