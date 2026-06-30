@@ -76,6 +76,9 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
     let display: Display<Manifold> = Display::new()?;
     let mut state = Manifold::new(&mut event_loop, display);
     let config_path = args.resolved_config_path();
+    if args.no_initial_surface_session {
+        state.clear_initial_surface_session();
+    }
 
     if !args.no_default_modules {
         config::load_startup_modules(&mut state, &config_path)?;
@@ -139,7 +142,12 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
     }
 
     if !args.no_default_modules {
-        config::load_startup_apps(&mut state, &config_path)?;
+        let startup_app_filter = if args.no_initial_surface_session {
+            config::StartupAppFilter::PresentationOnly
+        } else {
+            config::StartupAppFilter::All
+        };
+        config::load_startup_apps(&mut state, &config_path, startup_app_filter)?;
     }
 
     if let Some(command) = args.command {

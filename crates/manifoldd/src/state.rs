@@ -1613,6 +1613,27 @@ impl Manifold {
         self.surface_sessions.len()
     }
 
+    pub fn clear_initial_surface_session(&mut self) {
+        if self.surface_sessions != [SurfaceSessionId(1)]
+            || !self.window_surface_sessions.is_empty()
+            || self.next_surface_session != 2
+        {
+            warn!("refusing to clear non-initial surface session state");
+            return;
+        }
+
+        self.active_surface_session = SurfaceSessionId(1);
+        self.last_interacted_surface_session = SurfaceSessionId(1);
+        self.surface_session_interaction_order.clear();
+        self.next_surface_session = 1;
+        self.surface_sessions.clear();
+        self.surface_session_names.clear();
+        self.surface_session_working_directories.clear();
+        self.surface_session_directories.clear();
+        self.surface_session_directory_defaults.clear();
+        self.native_session_layouts.clear();
+    }
+
     pub fn surface_session_summaries(&self) -> Vec<SurfaceSessionSummary> {
         self.surface_sessions
             .iter()
@@ -4370,6 +4391,29 @@ mod tests {
             state.surface_session_working_directory(session),
             Some(directory.as_path())
         );
+        assert_eq!(
+            state.resolve_directory_surface_session(&directory),
+            Some(session)
+        );
+    }
+
+    #[test]
+    fn first_session_after_clearing_initial_surface_session_reuses_session_one() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let directory = PathBuf::from("/tmp/manifold-session-cwd/first");
+
+        state.clear_initial_surface_session();
+        assert_eq!(state.surface_session_count(), 0);
+
+        let session =
+            state.create_and_attach_named_surface_session_in_directory(None, directory.clone());
+        assert!(state.remember_directory_surface_session(directory.clone(), session, true));
+
+        assert_eq!(session.raw(), 1);
+        assert_eq!(state.active_surface_session().raw(), 1);
+        assert_eq!(state.surface_session_count(), 1);
         assert_eq!(
             state.resolve_directory_surface_session(&directory),
             Some(session)

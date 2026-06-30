@@ -1170,7 +1170,18 @@ pub fn show(args: ShowArgs) -> Result<()> {
     let target = &context.target;
     let status = status_snapshot(target)?;
     if args.last_focused {
-        restore_last_focused_surface_session(target)?;
+        if status.surface_sessions == 0 {
+            let session_id =
+                create_directory_surface_session(target, &context.current_directory, None, true)?;
+            remember_directory_surface_session(
+                target,
+                &context.current_directory,
+                session_id,
+                true,
+            )?;
+        } else {
+            restore_last_focused_surface_session(target)?;
+        }
     } else {
         let (session_id, current_directory, set_default) = resolve_cli_surface_session(
             target,
@@ -1396,6 +1407,7 @@ fn spawn_global_server(
     command
         .arg("run")
         .arg("--headless")
+        .arg("--no-initial-surface-session")
         .arg("--dbus-destination")
         .arg(&target.destination)
         .arg("--config")
@@ -1695,6 +1707,7 @@ struct EnterStatusSnapshot {
     wayland_display: String,
     active_surface_session: u64,
     active_surface_session_name: String,
+    surface_sessions: usize,
     presentation: String,
 }
 

@@ -183,7 +183,17 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
     Ok(())
 }
 
-pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupAppFilter {
+    All,
+    PresentationOnly,
+}
+
+pub(crate) fn load_startup_apps(
+    state: &mut Manifold,
+    config_path: &Path,
+    filter: StartupAppFilter,
+) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
     }
@@ -201,9 +211,16 @@ pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()>
         }
         let argv = resolve_startup_argv(config_dir, &app.argv);
         match app.realm {
-            StartupRealm::Session => state
+            StartupRealm::Session if filter == StartupAppFilter::All => state
                 .spawn_hosted_app_argv(&argv)
                 .with_context(|| format!("spawn config startup app {id}"))?,
+            StartupRealm::Session => {
+                info!(
+                    startup_app = %id,
+                    "skipping session startup app because no startup surface session exists"
+                );
+                continue;
+            }
             StartupRealm::Presentation => state
                 .spawn_presentation_app_argv(&argv)
                 .with_context(|| format!("spawn config presentation startup app {id}"))?,

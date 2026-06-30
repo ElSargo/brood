@@ -161,7 +161,9 @@ The normal user entry point is `manifold`. Directory-scoped commands such as
 discover the project root before opening the control endpoint. Outside nested
 test topologies, they should use the global Manifold session server by default.
 If that server is not already running, Manifold starts it from the discovered
-project context. The server's plugins and startup apps come from the global
+project context without creating a surface session just for server startup.
+The first `enter`, `show`, or related command creates or selects the session it
+needs. The server's plugins and presentation startup apps come from the global
 Manifold config: `$XDG_CONFIG_HOME/manifold/manifold.toml`, or
 `~/.config/manifold/manifold.toml` when `XDG_CONFIG_HOME` is unset. For
 development checkouts, if that user config does not exist, Manifold falls back

@@ -123,6 +123,9 @@ pub struct SessionArgs {
     /// Start without loading modules from the config file.
     #[arg(long = "no-default-modules")]
     pub(crate) no_default_modules: bool,
+    /// Start without creating the default surface session. Used by auto-started control servers.
+    #[arg(long = "no-initial-surface-session", hide = true)]
+    pub(crate) no_initial_surface_session: bool,
 }
 
 impl Default for SessionArgs {
@@ -141,6 +144,7 @@ impl Default for SessionArgs {
             nested_inner_dbus_address: None,
             config: None,
             no_default_modules: false,
+            no_initial_surface_session: false,
         }
     }
 }
