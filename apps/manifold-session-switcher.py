@@ -24,6 +24,8 @@ PASSTHROUGH_STATUS_CHANNEL = "workspace.input.passthrough"
 NOTIFICATIONS_DESTINATION = "org.freedesktop.Notifications"
 NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
 NOTIFICATION_ACTION_DEFAULT = "default"
+MANIFOLD_SESSION_ENV = "manifold_session"
+PRESENTATION_SESSION = "presentation"
 
 
 def metadata(**items):
@@ -534,6 +536,17 @@ class SessionSwitcher:
             box.pack_start(child, expand, expand, 0)
 
     def register_with_manifold(self):
+        if not self.should_register_sidebar():
+            write_status(
+                self.args.ready_file,
+                ready="true",
+                pid=os.getpid(),
+                sidebar_registered="false",
+                sidebar_mode=self.args.sidebar_mode,
+                manifold_session=os.environ.get(MANIFOLD_SESSION_ENV, ""),
+            )
+            return False
+
         try:
             extension_id, window_id, replaced, membership, placement, shortcut = (
                 self.bus.register_sidebar(self.args.width)
@@ -553,6 +566,13 @@ class SessionSwitcher:
         except Exception as err:
             write_status(self.args.ready_file, ready="false", error=err)
         return False
+
+    def should_register_sidebar(self):
+        if self.args.sidebar_mode == "always":
+            return True
+        if self.args.sidebar_mode == "never":
+            return False
+        return os.environ.get(MANIFOLD_SESSION_ENV) == PRESENTATION_SESSION
 
     def refresh_sessions(self):
         try:
@@ -1223,6 +1243,12 @@ def main():
     parser.add_argument("--ready-file")
     parser.add_argument("--event-file")
     parser.add_argument("--close-after-activate", action="store_true")
+    parser.add_argument(
+        "--sidebar-mode",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Register as Manifold presentation chrome only in auto presentation launches, always, or never.",
+    )
     args = parser.parse_args()
     return SessionSwitcher(args).run()
 

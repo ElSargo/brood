@@ -1,7 +1,7 @@
 # Apps
 
-Repo-local apps that run inside Manifold's nested compositor.
+Repo-local apps that integrate with Manifold.
 
-- `manifold-session-switcher.py`: GTK/libadwaita session switcher. It registers over Manifold DBus as presentation chrome, requests left-sidebar placement, lists sessions, creates sessions, and activates sessions.
+- `manifold-session-switcher.py`: GTK/libadwaita session switcher. In Manifold's presentation realm it registers over DBus as presentation chrome and requests left-sidebar placement. From a normal desktop launcher it stays standalone, lists sessions, creates sessions, and activates sessions without replacing the in-presentation switcher.
 
 Built-in WASM apps will live here later. They should use host capabilities and emit scene patches rather than drawing pixels directly.
