@@ -212,6 +212,14 @@ class ManifoldBus:
             )
         return bool(self.compositor.FocusPresentationWindow())
 
+    def attach_and_focus_presentation(self):
+        response = str(
+            self.control.Command(dbus.Array(["attach-focus"], signature="s"), False)
+        )
+        if not response.startswith("OK "):
+            raise RuntimeError(response.strip())
+        return response.strip()
+
     def register_sidebar(self, width):
         extension_id = self.extension.RegisterExtension(
             "session-switcher",
@@ -284,6 +292,7 @@ class SessionSwitcher:
     def run(self):
         if not GTK4:
             self.window = self.make_window(None)
+            self.configure_window_icon(self.window)
             self.window.connect("destroy", Gtk.main_quit)
             self.build_ui()
             self.setup_notifications()
@@ -313,6 +322,7 @@ class SessionSwitcher:
 
     def on_activate(self, app):
         self.window = self.make_window(app)
+        self.configure_window_icon(self.window)
         self.build_ui()
         self.setup_notifications()
         self.refresh_sessions()
@@ -332,6 +342,10 @@ class SessionSwitcher:
             window.set_default_size(self.args.width, 720)
         window.set_title("Manifold Sessions")
         return window
+
+    def configure_window_icon(self, window):
+        if hasattr(window, "set_icon_name"):
+            window.set_icon_name("manifold")
 
     def configure_style(self):
         manager = Adw.StyleManager.get_default()
@@ -1057,15 +1071,26 @@ class SessionSwitcher:
         self.render_selection()
         try:
             changed = self.bus.activate(session_id)
+            attach_response = self.bus.attach_and_focus_presentation()
             write_status(
                 self.args.event_file,
                 event="activate",
                 session=session_id,
                 changed=str(changed).lower(),
+                attach=attach_response,
             )
             self.refresh_sessions()
+            if self.args.close_after_activate:
+                GLib.idle_add(self.close_standalone_window)
         except Exception as err:
             write_status(self.args.event_file, event="activate-error", error=err)
+
+    def close_standalone_window(self):
+        if GTK4:
+            self.window.close()
+        else:
+            self.window.destroy()
+        return False
 
     def activate_agent(self, _button, agent, activation_token=""):
         try:
@@ -1197,6 +1222,7 @@ def main():
     parser.add_argument("--notification-timeout-ms", type=int, default=300000)
     parser.add_argument("--ready-file")
     parser.add_argument("--event-file")
+    parser.add_argument("--close-after-activate", action="store_true")
     args = parser.parse_args()
     return SessionSwitcher(args).run()
 

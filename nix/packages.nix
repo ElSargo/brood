@@ -192,7 +192,8 @@ let
           "$manifold_bin" show >/dev/null
           exec "${profiles.sessionSwitcherPython}/bin/python3" \
             "${runtimeFiles}/apps/manifold-session-switcher.py" \
-            --width 360
+            --width 360 \
+            --close-after-activate
           ;;
         quit)
           exec "$manifold_bin" ctl quit
@@ -234,6 +235,19 @@ let
     [Desktop Action Quit]
     Name=Quit
     Exec=${desktopActions}/bin/manifold-desktop quit
+    EOF
+
+    install -D -m 0644 /dev/stdin "$out/share/applications/org.manifold.SessionSwitcher.desktop" <<EOF
+    [Desktop Entry]
+    Type=Application
+    Name=Manifold Session Picker
+    Comment=Pick a Manifold session
+    Exec=${desktopActions}/bin/manifold-desktop picker
+    Icon=manifold
+    Terminal=false
+    Categories=Development;
+    StartupNotify=true
+    NoDisplay=true
     EOF
   '';
 
