@@ -36,9 +36,7 @@ use smithay::{
         drm_syncobj::DrmSyncobjState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::xdg::{
-            XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState,
-        },
+        shell::xdg::{XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState},
         socket::ListeningSocketSource,
     },
 };
@@ -337,6 +335,7 @@ pub struct Manifold {
     pub presentation_runtime_failures: u64,
     pub presentation_last_error: Option<String>,
     presentation_window_focused: bool,
+    pending_presentation_focus_activation_token: Option<String>,
     pub attach_requested: bool,
     pub attach_schedule_pending: bool,
     pub detach_requested: bool,
@@ -462,6 +461,7 @@ impl Manifold {
             presentation_runtime_failures: 0,
             presentation_last_error: None,
             presentation_window_focused: false,
+            pending_presentation_focus_activation_token: None,
             attach_requested: false,
             attach_schedule_pending: false,
             detach_requested: false,
@@ -851,6 +851,7 @@ impl Manifold {
         if self.presentation == PresentationStatus::Attached {
             self.stats.record_detach_request();
             self.detach_requested = true;
+            self.pending_presentation_focus_activation_token = None;
         }
     }
 
@@ -865,6 +866,7 @@ impl Manifold {
         self.presentation = PresentationStatus::Detached;
         self.attach_requested = false;
         self.attach_schedule_pending = false;
+        self.pending_presentation_focus_activation_token = None;
     }
 
     pub fn schedule_attach(&mut self) {
@@ -899,9 +901,7 @@ impl Manifold {
                 ));
                 window
                     .surface_under(local_pos, WindowSurfaceType::ALL)
-                    .map(|(surface, point)| {
-                        (surface, (surface_origin + point).to_f64())
-                    })
+                    .map(|(surface, point)| (surface, (surface_origin + point).to_f64()))
             })
     }
 
@@ -2156,18 +2156,37 @@ impl Manifold {
         !self.presentation_window_focused() || !self.agent_has_focused_window(agent_id)
     }
 
-    pub fn focus_presentation_window(&self) -> bool {
+    pub fn focus_presentation_window(&mut self) -> bool {
         self.focus_presentation_window_with_activation_token("")
     }
 
-    pub fn focus_presentation_window_with_activation_token(&self, activation_token: &str) -> bool {
+    pub fn focus_presentation_window_with_activation_token(
+        &mut self,
+        activation_token: &str,
+    ) -> bool {
+        let token = (!activation_token.is_empty()).then(|| activation_token.to_string());
+        if self.focus_presentation_window_now(token.as_deref()) {
+            self.pending_presentation_focus_activation_token = None;
+            return true;
+        }
+        if self.attach_requested {
+            self.pending_presentation_focus_activation_token = Some(token.unwrap_or_default());
+        }
+        false
+    }
+
+    pub(crate) fn take_pending_presentation_focus_activation_token(&mut self) -> Option<String> {
+        self.pending_presentation_focus_activation_token.take()
+    }
+
+    fn focus_presentation_window_now(&self, activation_token: Option<&str>) -> bool {
         self.presenter.as_ref().is_some_and(|presenter| {
             presenter
                 .runtime
                 .borrow()
                 .backend
                 .as_ref()
-                .is_some_and(|backend| backend.focus_window(Some(activation_token)))
+                .is_some_and(|backend| backend.focus_window(activation_token))
         })
     }
 

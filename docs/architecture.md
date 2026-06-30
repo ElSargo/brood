@@ -73,18 +73,19 @@ for the staged implementation plan.
 
 ## Entered Session Data Flow
 
-1. `mctl enter`, `mctl show`, and related directory-scoped commands discover a
-   project runner from the current directory, first through an ancestor
-   `manifold.toml` and then through lower-priority project markers such as
-   `flake.nix`, and resolve that project root to a project control target.
-2. If the project session server is not already running, `mctl` starts it
-   through the configured session runner before issuing the control command.
+1. `mctl enter`, `mctl show`, `manifoldd switch`, and related user-facing
+   commands discover a project runner from the current directory, first through
+   an ancestor `manifold.toml` and then through lower-priority project markers
+   such as `flake.nix`.
+2. User-facing commands open the global Manifold control server by default.
+   When that server is not already running, Manifold starts it from the
+   discovered project context before issuing the control command.
 3. The session runner starts in a transient user scope, activates project tools
    such as `nix develop`, then resolves the launch record for its current
    cgroup to start the assigned session server or entered command.
 4. `mctl enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
 5. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
-6. The control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
+6. The global control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
 7. Optional isolation profiles create or join session-local filesystem, runtime
    IPC, network, PID/IPC, and DBus boundaries. The target `managed` profile
    captures regular writes by default, redirects runtime paths into the session,

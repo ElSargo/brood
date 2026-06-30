@@ -156,11 +156,17 @@ only; the inner binary owns cgroup launch-record decoding. Custom runners
 should use the same lifecycle shape but can compose multiple tools in any order.
 
 The normal user entry point remains `mctl`. Directory-scoped commands such as
-`mctl enter`, `mctl show`, and `mctl list` should discover the project root,
-resolve a project-specific control target, start the runner-managed session
-server when it is not already running, and then operate on that project server.
-This keeps the workflow independent of whatever environment originally launched
-any ambient Manifold process.
+`mctl enter`, `mctl show`, and `mctl list`, plus presentation-selection commands
+such as `manifoldd switch`, should discover the project root before opening the
+control endpoint. Outside nested test topologies, they should use the global
+Manifold session server by default. If that server is not already running,
+Manifold starts it from the discovered project context. Commands can then choose
+whether to show all live sessions or filter to the current directory's
+associated sessions.
+
+This keeps session discovery consistent across entry points while still letting
+runner activation belong to the project whose directory the user invoked the
+command from.
 
 Runner discovery is priority ordered:
 

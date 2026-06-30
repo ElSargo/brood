@@ -102,6 +102,10 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
     state.stats.record_attach_applied();
     state.stats.attach_count += 1;
     backend.request_redraw();
+    if let Some(activation_token) = state.take_pending_presentation_focus_activation_token() {
+        let token = (!activation_token.is_empty()).then_some(activation_token.as_str());
+        backend.focus_window(token);
+    }
     info!("presentation attached");
 }
 
