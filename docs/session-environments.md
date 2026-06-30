@@ -29,9 +29,9 @@ record which sessions are tied to each directory, plus which of those sessions
 is the directory default. Repeated `enter` and `show` calls from the same
 directory should reuse the default session. When a shell is already inside a
 session, the default `enter` path should refuse to nest and should direct the
-user toward `mctl show` or `mctl enter --new`.
+user toward `manifold show` or `manifold enter --new`.
 
-`mctl enter --new` should always create a fresh session environment, even when
+`manifold enter --new` should always create a fresh session environment, even when
 the command is already running inside one, and should print the session's easy
 identifier so the session can be shown explicitly later. Creating that extra
 session should not move the directory default unless the user asks to set the
@@ -50,7 +50,7 @@ The entered environment should provide:
 `manifold show` should be a presentation command. It should front or attach the
 session bound to the current directory, or create an empty session when invoked
 outside an entered environment and no directory binding exists. An explicit
-session id should be able to override that lookup. `mctl show --id <id>` should
+session id should be able to override that lookup. `manifold show --id <id>` should
 target a specific session, and bare `show` in a directory should reuse the last
 default session tied to that directory. Showing an explicit session should not
 move the directory default unless the user asks to set the default.
@@ -63,9 +63,10 @@ presentation surface if one exists.
 `manifold list` should show the live sessions associated with the current
 directory. A global listing mode should show all live sessions in the server.
 
-`mctl` should be a thin control alias for Manifold commands in the current
-entered context. Its default target should come from the entered session
-environment, while explicit targeting remains available for scripts and tests.
+`manifold` is the user-facing command for both session operations and direct
+control requests. Its default target should come from the entered session
+environment when present, otherwise from the global Manifold server. Explicit
+targeting remains available for scripts and tests.
 
 Do not freeze exact flags in this document. Exact parser behavior belongs in
 the command definitions when the commands exist.
@@ -103,7 +104,7 @@ launches on the inherited host display when one is available.
 ## Session Runner
 
 Project environment activation should be owned by the session lifecycle rather
-than by `mctl` or by shell startup files. The target primitive is a session
+than by the invoking shell or by shell startup files. The target primitive is a session
 runner: Manifold creates a session cache directory, creates or joins a process
 scope for the session, writes a launch record keyed by that scope, resolves the
 configured runner command, then starts the runner from the original working
@@ -132,7 +133,7 @@ The runner contract is:
 - Manifold resolves configured runner command paths relative to the project
   directory when they contain a path separator.
 - Manifold starts the runner from the original working directory so activation
-  scripts and the inner binary run where the user invoked `mctl enter`.
+  scripts and the inner binary run where the user invoked `manifold enter`.
 - Manifold invokes the configured runner as
   `runner <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>`.
 - The runner activates its environment, exports environment variables that name
@@ -155,14 +156,13 @@ binary without evaluating the flake again. The Nix runner owns Nix activation
 only; the inner binary owns cgroup launch-record decoding. Custom runners
 should use the same lifecycle shape but can compose multiple tools in any order.
 
-The normal user entry point remains `mctl`. Directory-scoped commands such as
-`mctl enter`, `mctl show`, and `mctl list`, plus presentation-selection commands
-such as `manifoldd switch`, should discover the project root before opening the
-control endpoint. Outside nested test topologies, they should use the global
-Manifold session server by default. If that server is not already running,
-Manifold starts it from the discovered project context. Commands can then choose
-whether to show all live sessions or filter to the current directory's
-associated sessions.
+The normal user entry point is `manifold`. Directory-scoped commands such as
+`manifold enter`, `manifold show`, `manifold list`, and `manifold switch` should
+discover the project root before opening the control endpoint. Outside nested
+test topologies, they should use the global Manifold session server by default.
+If that server is not already running, Manifold starts it from the discovered
+project context. Commands can then choose whether to show all live sessions or
+filter to the current directory's associated sessions.
 
 This keeps session discovery consistent across entry points while still letting
 runner activation belong to the project whose directory the user invoked the
@@ -424,8 +424,8 @@ each other.
   launch into the host desktop.
 - Do not expose the host DBus session bus by default.
 - Do not hide writes to system paths; record and report them distinctly.
-- Do not make `mctl` a separate product surface with different semantics from
-  Manifold control commands.
+- Do not split normal user operations across separate control and daemon command
+  surfaces.
 - Do not require a virtual filesystem before the plain session and command
   context model works.
 

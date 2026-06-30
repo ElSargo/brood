@@ -8,7 +8,7 @@ Manifold should be able to run and test a development instance inside a stable i
 
 ## Shape
 
-The nested test topology uses two normal `manifoldd` processes:
+The nested test topology uses two normal `manifold` processes:
 
 ```text
 host compositor
@@ -29,7 +29,7 @@ Both instances expose their own DBus control endpoints:
 The first built-in orchestration path is:
 
 ```sh
-manifoldd test
+manifold test
 ```
 
 This launches:
@@ -37,7 +37,7 @@ This launches:
 - an outer supervisor instance
 - an inner system-under-test instance hosted inside the outer instance
 
-`manifoldd test` defaults to the nested topology. `manifoldd test nested` is the explicit spelling for the same workflow.
+`manifold test` defaults to the nested topology. `manifold test nested` is the explicit spelling for the same workflow.
 
 This topology is the intended default test mode for behavior and graphics validation. The outer instance should be the authoritative end-to-end supervisor:
 
@@ -48,14 +48,14 @@ This topology is the intended default test mode for behavior and graphics valida
 
 By default the outer supervisor uses an attached offscreen presentation target, so the nested topology can start without a host-visible presentation window while still running composition, frame callbacks, capture, layout, focus, and nested Wayland behavior through the presentation path. The inner instance still attaches a normal presentation window into the outer nested compositor.
 
-When Manifold launches a hosted app, it sets `manifold_session` in that app's environment. If `manifoldd test` sees that marker, it treats the current Manifold session as the outer container and starts only the subject compositor. Use `manifoldd test nested --force-outer` when a test must create another explicit outer supervisor even though it is already running inside Manifold.
+When Manifold launches a hosted app, it sets `manifold_session` in that app's environment. If `manifold test` sees that marker, it treats the current Manifold session as the outer container and starts only the subject compositor. Use `manifold test nested --force-outer` when a test must create another explicit outer supervisor even though it is already running inside Manifold.
 
-For exact `manifoldd test nested` arguments, see `crates/manifoldd/src/main.rs`.
+For exact `manifold test nested` arguments, see `crates/manifoldd/src/main.rs`.
 
 When the topology is running, the outer instance can proxy control requests to the inner instance:
 
 ```sh
-manifoldd ctl --dbus-name <outer-destination> nested-inner status-json
+manifold ctl --dbus-name <outer-destination> nested-inner status-json
 ```
 
 For automated agent verification, this built-in CLI is the default path. Use it
@@ -133,7 +133,7 @@ inline shell quoting to create the client process it wants to test.
 
 ## Success Criteria
 
-For `manifoldd test nested`, success starts with the command exiting zero, but a
+For `manifold test nested`, success starts with the command exiting zero, but a
 useful behavior test should also validate the artifacts that match its topology:
 
 - outer-supervisor tests should record an outer debug dump, a nonempty composed
@@ -160,7 +160,7 @@ errors, or failed harness results as test failures.
 
 ## Headless Runtime
 
-`manifoldd run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and DBus control endpoint without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `manifoldd test` so the nesting policy can choose the right topology for the current environment.
+`manifold run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and DBus control endpoint without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `manifold test` so the nesting policy can choose the right topology for the current environment.
 
 ## Harness
 
@@ -173,11 +173,11 @@ tools/dev-nested-manifold.sh --keep-running
 This helper is the repo-local host-visible manual development harness. It starts the stable
 outer Manifold with a presentation window on the current desktop, then hosts the
 dev Manifold inside that window. Do not use it for automated no-host-window
-behavior tests; use `manifoldd test` for that.
+behavior tests; use `manifold test` for that.
 
 The script:
 
-1. Builds `manifoldd`.
+1. Builds `manifold`.
 2. Starts a stable instance on the real host display.
 3. Spawns a dev instance inside the stable instance.
 4. Waits for stable to map and render the dev presentation window.

@@ -1,6 +1,6 @@
 # WASM Key Handler Example
 
-This is a minimal core-WASM key handler for `manifoldd run --wasm-key-handler`.
+This is a minimal core-WASM key handler for `manifold run --wasm-key-handler`.
 The example keeps app-id navigation policy in the guest: it looks up panes by
 app id, calls exact pane focus, and tracks when no content pane is focused.
 
@@ -14,7 +14,7 @@ cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32
 Run:
 
 ```sh
-manifoldd run \
+manifold run \
   --wasm-key-handler examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm
 ```
 

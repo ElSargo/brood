@@ -23,6 +23,7 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
         return Ok(false);
     }
 
+    let working_dir = current_project_dir()?;
     let Some(selection) = runner_config(args)? else {
         return Ok(false);
     };
@@ -36,7 +37,7 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
     let record = LaunchRecord {
         id: launch_context::new_launch_id(),
         project_dir: selection.project_dir.clone(),
-        working_dir: selection.project_dir.clone(),
+        working_dir,
         cache_dir: cache_dir.clone(),
         runner_cache_root: Some(cache_root),
         runner_kind: selection.runner.kind.clone(),
@@ -52,6 +53,7 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
         runner_priority = selection.priority,
         launch = %record.id,
         project_dir = %selection.project_dir.display(),
+        working_dir = %record.working_dir.display(),
         cache_dir = %cache_dir.display(),
         "starting Manifold session runner"
     );
@@ -67,6 +69,7 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
 
 pub(crate) fn run_project_command_if_configured(
     selection: Option<&SessionRunnerSelection>,
+    working_dir: &Path,
     argv: &[OsString],
     extra_env: &[(String, OsString)],
     remove_env: &[&str],
@@ -81,7 +84,6 @@ pub(crate) fn run_project_command_if_configured(
         bail!("runner command argv must not be empty");
     }
 
-    let working_dir = current_project_dir()?;
     let cache_root = runner_cache_root(selection.runner.cache_root.as_deref());
     let cache_dir = create_cache_dir(&cache_root)?;
     let current_exe = env::current_exe().context("resolve current exe")?;
@@ -89,7 +91,7 @@ pub(crate) fn run_project_command_if_configured(
     let record = LaunchRecord {
         id: launch_context::new_launch_id(),
         project_dir: selection.project_dir.clone(),
-        working_dir,
+        working_dir: working_dir.to_path_buf(),
         cache_dir: cache_dir.clone(),
         runner_cache_root: Some(cache_root),
         runner_kind: selection.runner.kind.clone(),

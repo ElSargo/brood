@@ -20,7 +20,7 @@ WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -31,13 +31,13 @@ printf '#!/usr/bin/env bash\nexec weston-simple-shm >%q 2>&1\n' "$CLIENT_LOG" >"
 chmod +x "$WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@"
+  target/debug/manifold ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 for _ in $(seq 1 100); do

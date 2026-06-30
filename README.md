@@ -15,14 +15,14 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 
 ## Initial Shape
 
-- `manifoldd`: authoritative local session process and MVP presentation owner.
+- `manifold`: authoritative local session process and MVP presentation owner.
 - `manifold-client`: deferred presentation endpoint for future isolation or multi-window attach experiments.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
 - WASM apps: sandboxed built-in or user applications that emit scene patches.
 
 ## Current Status
 
-This repository now contains a v1 compositor proof of concept in `manifoldd`.
+This repository now contains a v1 compositor proof of concept in `manifold`.
 
 The current PoC can:
 
@@ -33,10 +33,10 @@ The current PoC can:
 - close/detach the presentation window while hosted Wayland apps keep running
 - reattach the presentation window and resume the nested window
 - report frame cadence, input-to-frame latency, client commits, frame callbacks, dmabuf state, and explicit-sync state
-- run async core-WASM behavior harnesses through `manifoldd run --test-harness`
-- orchestrate nested Manifold-in-Manifold tests through `manifoldd test nested`
+- run async core-WASM behavior harnesses through `manifold run --test-harness`
+- orchestrate nested Manifold-in-Manifold tests through `manifold test nested`
 
-The intended default behavior-testing mode is nested Manifold-in-Manifold execution with outer-instance capture and full-path input driving. The built-in `manifoldd test` command defaults to that mode. When it is launched from inside an existing Manifold session, it reuses that session as the outer container and starts only the subject instance.
+The intended default behavior-testing mode is nested Manifold-in-Manifold execution with outer-instance capture and full-path input driving. The built-in `manifold test` command defaults to that mode. When it is launched from inside an existing Manifold session, it reuses that session as the outer container and starts only the subject instance.
 
 ## Common Commands
 
@@ -46,7 +46,7 @@ Run the project:
 cargo run
 ```
 
-By default this starts `manifoldd run`, attaches a presentation surface, and loads enabled modules and startup apps from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists and starts the Codex agent workspace pane. This is the end-user path.
+By default this starts `manifold run`, attaches a presentation surface, and loads enabled modules and startup apps from `./manifold.toml`. The checked-in config enables the local `dev` WASM key handler when its built `.wasm` artifact exists and starts the Codex agent workspace pane. This is the end-user path.
 
 Run Rust unit tests:
 

@@ -4,13 +4,13 @@
 
 Manifold wants WASM integration for fast experimentation, workspace behavior control, stateful WASM pane apps, and capability-scoped interaction between apps, controllers, extensions, agents, managed apps, and the host.
 
-The current Linux prototype keeps session state, Smithay compositor state, and the MVP presentation endpoint together in `manifoldd`. Binding WASM directly to Smithay, EGL, DMA-BUF, or renderer internals would make the Linux path fast at first but would leak backend details into the app API and make later backend work harder.
+The current Linux prototype keeps session state, Smithay compositor state, and the MVP presentation endpoint together in `manifold`. Binding WASM directly to Smithay, EGL, DMA-BUF, or renderer internals would make the Linux path fast at first but would leak backend details into the app API and make later backend work harder.
 
 ## Decision
 
 WASM modules will interact with Manifold through a stable workspace/app API rather than compositor or renderer internals.
 
-The first implementation milestone should create a native session core, with any needed workspace-level model around it, for sessions, panes as presentation units, pane producers, focus, commands, events, scene state, and surface slots. Presentation layout, dragging, and animation belong to the presentation surface, with saved preferences stored in the workspace when needed. The WASM app host should then become an adapter over that model. Linux-native `manifoldd` can host Wasmtime in-process for fast iteration, while later backend work can satisfy the same behavior through a protocol-facing session process or backend-specific adapter.
+The first implementation milestone should create a native session core, with any needed workspace-level model around it, for sessions, panes as presentation units, pane producers, focus, commands, events, scene state, and surface slots. Presentation layout, dragging, and animation belong to the presentation surface, with saved preferences stored in the workspace when needed. The WASM app host should then become an adapter over that model. Linux-native `manifold` can host Wasmtime in-process for fast iteration, while later backend work can satisfy the same behavior through a protocol-facing session process or backend-specific adapter.
 
 ## Consequences
 

@@ -24,7 +24,7 @@ nix develop
 
 The environment should include:
 
-- Rust and the native libraries needed by `manifoldd`
+- Rust and the native libraries needed by `manifold`
 - Wayland, EGL/GLES, Smithay, and smoke-test dependencies
 - Docker/buildx or an equivalent image-build path when container workflows need it
 
@@ -38,7 +38,7 @@ The stock flake output should stay app-sized by default:
 nix run github:ElSargo/manifold
 ```
 
-That path resolves to the packaged `manifoldd` app. It is the output to cache
+That path resolves to the packaged `manifold` app. It is the output to cache
 and download when the goal is just to run Manifold.
 
 The development-oriented outputs are explicit:
@@ -82,7 +82,7 @@ nix run github:ElSargo/manifold#dev-workflow
 
 The app-sized workflow package clones the Manifold repository into
 `$XDG_CACHE_HOME/manifold/dev-workflow/source` or
-`~/.cache/manifold/dev-workflow/source`, starts a normal `manifoldd run` session
+`~/.cache/manifold/dev-workflow/source`, starts a normal `manifold run` session
 from that checkout, and opens a terminal in the checkout through Manifold's
 normal hosted-app path.
 
@@ -103,5 +103,5 @@ another repository, branch, checkout directory, or startup client, set
 `MANIFOLD_DEV_CLIENT` before running the package.
 
 This workflow is for host-visible manual app use. Automated graphical behavior
-tests should still use the built-in nested test CLI; for exact `manifoldd test
+tests should still use the built-in nested test CLI; for exact `manifold test
 nested` arguments, see `crates/manifoldd/src/main.rs`.

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${MANIFOLDD_BIN:?set MANIFOLDD_BIN to the manifoldd executable}"
+MANIFOLD_BIN="${MANIFOLD_BIN:-${MANIFOLDD_BIN:-}}"
+: "${MANIFOLD_BIN:?set MANIFOLD_BIN to the manifold executable}"
 : "${HARNESS_WASM:?set HARNESS_WASM to the compiled WASM harness}"
 : "${FIREFOX_BIN:?set FIREFOX_BIN to the firefox executable}"
 : "${WESTON_SIMPLE_SHM:?set WESTON_SIMPLE_SHM to weston-simple-shm}"
@@ -81,7 +82,7 @@ if [[ "${INNER_HEADLESS:-0}" == "1" ]]; then
 fi
 
 timeout --kill-after=5s "$TEST_TIMEOUT" \
-  "$MANIFOLDD_BIN" "${TEST_ARGS[@]}" \
+  "$MANIFOLD_BIN" "${TEST_ARGS[@]}" \
   >"$WORKDIR/test.log" 2>&1 || {
     status=$?
     echo "ERR firefox close/reattach nested test failed" >&2

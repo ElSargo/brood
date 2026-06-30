@@ -93,7 +93,7 @@ wait_for_manifoldd_control() {
       tail -120 "$log" >&2 || true
       return 1
     fi
-    if target/debug/manifoldd ctl --dbus-name "$dbus_name" status >/dev/null 2>&1; then
+    if target/debug/manifold ctl --dbus-name "$dbus_name" status >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.1

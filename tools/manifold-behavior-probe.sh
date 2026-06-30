@@ -114,7 +114,7 @@ chmod +x "$WRAPPER"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+    target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
     sleep 0.2
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -122,12 +122,12 @@ cleanup() {
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --dbus-name "$DBUS_DESTINATION" -c "$WRAPPER" \
+  target/debug/manifold run --dbus-name "$DBUS_DESTINATION" -c "$WRAPPER" \
   >"$MANIFOLDD_LOG" 2>&1 &
 PID=$!
 
 for _ in $(seq 1 100); do
-  if target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" status >/dev/null 2>&1; then
+  if target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" status >/dev/null 2>&1; then
     break
   fi
   kill -0 "$PID" 2>/dev/null || {
@@ -232,7 +232,7 @@ while true; do
     break
   fi
 
-  STATUS="$(target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" status-json)"
+  STATUS="$(target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" status-json)"
   SAMPLE_NS="$(date +%s%N)"
   SAMPLE_DELTA_US="$(((SAMPLE_NS - LAST_SAMPLE_NS) / 1000))"
   python3 - "$STATUS" "$LAST_STATUS" "$SAMPLE_DELTA_US" <<'PY' | while IFS= read -r event_line; do
@@ -352,6 +352,6 @@ print(json.dumps({"final_status": status}))
 PY
 )"
 
-target/debug/manifoldd ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null || true
+target/debug/manifold ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null || true
 wait "$PID" || true
 trap - EXIT

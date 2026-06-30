@@ -254,6 +254,13 @@ pub(crate) fn discover_session_runner(start_dir: &Path) -> Result<Option<Session
     Ok(None)
 }
 
+pub(crate) fn discover_config_path(start_dir: &Path) -> PathBuf {
+    let start_dir = start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| start_dir.to_path_buf());
+    find_upwards(&start_dir, "manifold.toml").unwrap_or_else(|| start_dir.join("manifold.toml"))
+}
+
 pub(crate) fn override_session_runner(
     kind: String,
     project_dir: PathBuf,
@@ -339,7 +346,7 @@ mod tests {
 
     use super::{
         BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, SessionRunnerSource,
-        discover_session_runner, read_config, resolve_path,
+        discover_config_path, discover_session_runner, read_config, resolve_path,
     };
 
     #[test]
@@ -465,6 +472,31 @@ mod tests {
         );
 
         std::fs::remove_dir_all(selection.project_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn discovers_config_from_parent_without_runner() {
+        let root = temp_dir("config-without-runner");
+        let child = root.join("src").join("bin");
+        std::fs::create_dir_all(&child).expect("create child dir");
+        std::fs::write(
+            root.join("manifold.toml"),
+            r#"
+            [startup.switcher]
+            realm = "presentation"
+            argv = ["python3", "apps/manifold-session-switcher.py"]
+            "#,
+        )
+        .expect("write manifest");
+
+        assert_eq!(discover_config_path(&child), root.join("manifold.toml"));
+        assert!(
+            discover_session_runner(&child)
+                .expect("discover runner")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(root).expect("remove temp dir");
     }
 
     #[test]

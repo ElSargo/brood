@@ -2,11 +2,11 @@
 
 Manifold is organized around a product-level workspace containing isolated sessions. The authoritative local session process can also own a presentation endpoint for the MVP.
 
-The long-term architecture may split presentation into a separate endpoint process, but the first prototype keeps the session, nested Wayland compositor, and local presentation window in `manifoldd` to prove detach/reopen behavior with the fewest moving parts.
+The long-term architecture may split presentation into a separate endpoint process, but the first prototype keeps the session, nested Wayland compositor, and local presentation window in `manifold` to prove detach/reopen behavior with the fewest moving parts.
 
 ## Components
 
-### `manifoldd`
+### `manifold`
 
 The session process owns durable session truth and the wider workspace-level environment around it:
 
@@ -66,14 +66,14 @@ for the staged implementation plan.
 
 ## MVP Data Flow
 
-1. Hosted Wayland apps connect to the nested Wayland compositor owned by `manifoldd`.
-2. `manifoldd` keeps hosted Wayland app connections and surface state alive across presentation window close/reopen.
+1. Hosted Wayland apps connect to the nested Wayland compositor owned by `manifold`.
+2. `manifold` keeps hosted Wayland app connections and surface state alive across presentation window close/reopen.
 3. The presentation endpoint imports managed app surfaces, updates scene caches, and composites the latest committed state at refresh rate.
 4. Closing the presentation window detaches by default when there is state worth preserving.
 
 ## Entered Session Data Flow
 
-1. `mctl enter`, `mctl show`, `manifoldd switch`, and related user-facing
+1. `manifold enter`, `manifold show`, `manifold switch`, and related user-facing
    commands discover a project runner from the current directory, first through
    an ancestor `manifold.toml` and then through lower-priority project markers
    such as `flake.nix`.
@@ -83,7 +83,7 @@ for the staged implementation plan.
 3. The session runner starts in a transient user scope, activates project tools
    such as `nix develop`, then resolves the launch record for its current
    cgroup to start the assigned session server or entered command.
-4. `mctl enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
+4. `manifold enter` creates or reuses the session bound to the current directory when invoked from outside an entered session and builds an entered environment for a shell or command.
 5. The entered environment carries the session DBus control endpoint and points GUI clients at the session's nested Wayland display.
 6. The global control service records which sessions are associated with each directory and which one is the default for future bare `enter` and `show` calls.
 7. Optional isolation profiles create or join session-local filesystem, runtime
@@ -91,10 +91,10 @@ for the staged implementation plan.
    captures regular writes by default, redirects runtime paths into the session,
    and keeps host bridges explicit.
 8. Programs, agents, and GUI apps launched from the entered environment inherit those boundaries and appear as session participants.
-9. `mctl show` presents the directory-bound or explicitly selected session without changing its process, filesystem, or network state, and can create an empty session when invoked outside one.
-10. `mctl hide` resolves the same target shape and detaches the presentation surface without closing the session.
-11. `mctl list` reports the directory-associated sessions by default and can report all live sessions globally.
-12. Control commands and aliases such as `mctl` default to the entered session unless a command explicitly targets another session.
+9. `manifold show` presents the directory-bound or explicitly selected session without changing its process, filesystem, or network state, and can create an empty session when invoked outside one.
+10. `manifold hide` resolves the same target shape and detaches the presentation surface without closing the session.
+11. `manifold list` reports the directory-associated sessions by default and can report all live sessions globally.
+12. `manifold ctl` and other direct control commands default to the entered session unless a command explicitly targets another session.
 
 ## Core Rule
 

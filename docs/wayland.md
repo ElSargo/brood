@@ -1,6 +1,6 @@
 # Nested Wayland
 
-Manifold currently hosts nested Wayland clients as managed apps in panes through the v1 `manifoldd` proof of concept.
+Manifold currently hosts nested Wayland clients as managed apps in panes through the v1 `manifold` proof of concept.
 
 ## Goal
 
@@ -8,7 +8,7 @@ Applications launched inside a Manifold session should create panes through thei
 
 ## Direction
 
-`manifoldd` owns the current nested Wayland compositor state. For the MVP, `manifoldd` also opens the local presentation window and imports/composites hosted Wayland app surfaces itself.
+`manifold` owns the current nested Wayland compositor state. For the MVP, `manifold` also opens the local presentation window and imports/composites hosted Wayland app surfaces itself.
 
 A separate presentation endpoint process is deferred until Manifold needs process isolation or multi-endpoint presentation.
 

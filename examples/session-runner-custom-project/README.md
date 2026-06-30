@@ -1,6 +1,6 @@
 # Session Runner Custom Project
 
-This project tests the `mctl enter` workflow without depending on Nix downloads.
+This project tests the `manifold enter` workflow without depending on Nix downloads.
 It uses the same runner ABI as the Nix runner:
 
 ```text
@@ -10,7 +10,7 @@ runner <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inne
 The runner exports marker variables, runs the supplied inner binary, and exits
 with the inner binary's status. The supplied inner binary resolves the assigned
 program or session arguments from its current cgroup. Manifold starts the
-runner from the directory where `mctl enter` was invoked.
+runner from the directory where `manifold enter` was invoked.
 
 Build Manifold first:
 
@@ -23,8 +23,8 @@ Then test the intended workflow:
 ```sh
 nix develop --command bash -lc '
   cd examples/session-runner-custom-project
-  ../../target/debug/mctl enter ./scripts/check-env.sh
-  ../../target/debug/mctl enter ../../target/debug/mctl ctl quit
+  ../../target/debug/manifold enter ./scripts/check-env.sh
+  ../../target/debug/manifold enter ../../target/debug/manifold ctl quit
 '
 ```
 

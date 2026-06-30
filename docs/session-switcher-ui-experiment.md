@@ -313,7 +313,7 @@ are not.
 ## Verification Workload
 
 Prefer the built-in test CLI for automated checks. The backend branches should
-use `cargo run -- test` or `target/debug/manifoldd test nested ...` paths rather
+use `cargo run -- test` or `target/debug/manifold test nested ...` paths rather
 than starting a host-visible presentation from an existing desktop session.
 
 Minimum behavior checks:
@@ -340,7 +340,7 @@ Minimum behavior checks:
 
 Screenshots are required for this experiment because the main behavior under
 test is presentation continuity. Structured state from the nested client and
-`manifoldd` is also required so screenshots are not the only proof.
+`manifold` is also required so screenshots are not the only proof.
 
 ## Backend Notes Requirement
 

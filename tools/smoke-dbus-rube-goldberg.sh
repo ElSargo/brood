@@ -39,7 +39,7 @@ CONTROL_ADDRESS="$(sed -n '1p' "$BUS_INFO")"
 CONTROL_BUS_PID="$(sed -n '2p' "$BUS_INFO")"
 
 cleanup() {
-  target/debug/manifoldd ctl --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
   if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2>/dev/null; then
     kill "$MANIFOLD_PID" >/dev/null 2>&1 || true
   fi
@@ -48,11 +48,11 @@ cleanup() {
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --no-default-modules --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --no-default-modules --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 ctl() {
-  target/debug/manifoldd ctl --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" "$@"
+  target/debug/manifold ctl --dbus-address "$CONTROL_ADDRESS" --dbus-name "$DBUS_NAME" "$@"
 }
 
 wait_for_control() {

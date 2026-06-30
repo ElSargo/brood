@@ -32,7 +32,7 @@ WASM modules talk to Manifold through a stable workspace/app API, not through co
 
 This means the first useful milestone is not the WASM runtime itself. The first milestone is a native session model, with any needed workspace-level model around it, that can represent sessions, panes, pane producers, focus, commands, events, scene state, surface slots, and presentation requests independently from the current Smithay `Space<Window>` representation. Presentation layout, dragging, and animation belong to the presentation surface, not the producer model.
 
-The runtime then becomes an adapter over this model. Linux-native `manifoldd` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
+The runtime then becomes an adapter over this model. Linux-native `manifold` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
 The execution model is recorded in [WASM Execution Model](wasm-execution-model.md). In short, Manifold should keep calloop as the authoritative session/compositor loop, run ordinary plugin work in a separate async lane, and reserve a synchronous fast lane for bounded pre-commit policy hooks.
 
@@ -347,7 +347,7 @@ Validation:
 
 ### 3. Embed WASM Host On Linux Native
 
-Load a small WASM module in `manifoldd` and drive it through the workspace core.
+Load a small WASM module in `manifold` and drive it through the workspace core.
 
 Minimum useful behavior:
 
@@ -359,7 +359,7 @@ Minimum useful behavior:
 
 Validation:
 
-- hot reload a trivial controller without restarting `manifoldd`
+- hot reload a trivial controller without restarting `manifold`
 - hot reload a trivial WASM pane app and preserve pane identity
 - smoke test denial of an ungranted capability
 

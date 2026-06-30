@@ -1023,11 +1023,12 @@ pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarg
 }
 
 pub fn send(args: CtlArgs) -> Result<()> {
-    let target = resolve_control_target(args.dbus_name, args.dbus_address);
-    if !args.json && handle_typed_ctl_command(&target, &args.command)? {
+    let context = open_cli_control_context(args.dbus_name, args.dbus_address)?;
+    let target = &context.target;
+    if !args.json && handle_typed_ctl_command(target, &args.command)? {
         return Ok(());
     }
-    let response = request_dbus_command(&target, &args.command, args.json)?;
+    let response = request_dbus_command(target, &args.command, args.json)?;
     print!("{response}");
     Ok(())
 }
@@ -1057,7 +1058,7 @@ pub fn enter(args: EnterArgs) -> Result<()> {
     let already_entered = entered_session_marker().is_some();
     if already_entered && !args.new {
         bail!(
-            "already inside a Manifold session; use `mctl show` to present it or `mctl enter --new` to create a separate session"
+            "already inside a Manifold session; use `manifold show` to present it or `manifold enter --new` to create a separate session"
         );
     }
 
@@ -1065,17 +1066,26 @@ pub fn enter(args: EnterArgs) -> Result<()> {
     let target = &context.target;
     let existing_default = resolve_directory_surface_session(target, &context.current_directory)?;
     let (session_id, set_default) = if args.new {
-        let session_id = create_surface_session(target, None)?;
+        let set_default = args.set_default || existing_default.is_none();
+        let session_id = create_directory_surface_session(
+            target,
+            &context.current_directory,
+            None,
+            set_default,
+        )?;
         let status = status_snapshot(target)?;
         eprintln!(
             "created Manifold session: {}",
             status.active_surface_session_name
         );
-        (session_id, args.set_default || existing_default.is_none())
+        (session_id, set_default)
     } else {
         match existing_default {
             Some(session_id) => (session_id, false),
-            None => (create_surface_session(target, None)?, true),
+            None => (
+                create_directory_surface_session(target, &context.current_directory, None, true)?,
+                true,
+            ),
         }
     };
     remember_directory_surface_session(
@@ -1125,6 +1135,7 @@ pub fn enter(args: EnterArgs) -> Result<()> {
     entered_command_argv.extend(command_args.iter().cloned());
     let status = match session_runner::run_project_command_if_configured(
         context.runner.as_ref(),
+        &context.current_directory,
         &entered_command_argv,
         &command_env,
         &remove_env,
@@ -1219,7 +1230,10 @@ fn resolve_cli_surface_session(
     } else if let Some(session_id) = entered_surface_session_id() {
         (session_id, true)
     } else if create_if_missing {
-        (create_surface_session(target, None)?, true)
+        (
+            create_directory_surface_session(target, current_directory, None, true)?,
+            true,
+        )
     } else {
         (status_snapshot(target)?.active_surface_session, false)
     };
@@ -1255,9 +1269,10 @@ fn open_cli_control_context(
     address: Option<String>,
 ) -> Result<CliControlContext> {
     let current_directory = current_directory()?;
+    let config_path = config::discover_config_path(&current_directory);
     let runner = config::discover_session_runner(&current_directory)?;
     let target = resolve_control_target(destination, address);
-    ensure_global_control_target_running(&target, &current_directory, runner.as_ref())?;
+    ensure_global_control_target_running(&target, &current_directory, &config_path)?;
 
     Ok(CliControlContext {
         target,
@@ -1269,19 +1284,28 @@ fn open_cli_control_context(
 fn ensure_global_control_target_running(
     target: &ControlTarget,
     current_directory: &Path,
-    runner: Option<&config::SessionRunnerSelection>,
+    config_path: &Path,
 ) -> Result<()> {
     if !should_auto_start_global_control_target(target) {
         return Ok(());
     }
-    if target_has_owner(target)? {
+    if status_snapshot(target).is_ok() {
         return Ok(());
     }
 
-    let log_path = spawn_global_server(target, current_directory, runner)?;
+    let (log_path, mut child) = spawn_global_server(target, current_directory, config_path)?;
     for _ in 0..1800 {
-        if target_has_owner(target)? && status_snapshot(target).is_ok() {
+        if status_snapshot(target).is_ok() {
             return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("check global Manifold server startup process")?
+        {
+            bail!(
+                "global Manifold session server exited before becoming ready with {status}; see {}",
+                log_path.display()
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1299,14 +1323,9 @@ fn should_auto_start_global_control_target(target: &ControlTarget) -> bool {
 fn spawn_global_server(
     target: &ControlTarget,
     current_directory: &Path,
-    runner: Option<&config::SessionRunnerSelection>,
-) -> Result<PathBuf> {
+    config_path: &Path,
+) -> Result<(PathBuf, std::process::Child)> {
     let current_exe = env::current_exe().context("resolve current executable")?;
-    let manifoldd = sidecar_binary_path(&current_exe, "manifoldd");
-    let server_directory = runner.map_or(current_directory, |runner| runner.project_dir.as_path());
-    let config_path = runner
-        .map(|runner| runner.config_path.clone())
-        .unwrap_or_else(|| current_directory.join("manifold.toml"));
     let log_dir = global_server_log_dir()?;
     fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
     let log_path = log_dir.join("global.log");
@@ -1317,27 +1336,27 @@ fn spawn_global_server(
         .with_context(|| format!("open {}", log_path.display()))?;
     let log_err = log.try_clone().context("clone global server log")?;
 
-    let mut command = ProcessCommand::new(&manifoldd);
+    let mut command = ProcessCommand::new(&current_exe);
     command
         .arg("run")
         .arg("--headless")
         .arg("--dbus-destination")
         .arg(&target.destination)
         .arg("--config")
-        .arg(&config_path)
-        .current_dir(server_directory)
+        .arg(config_path)
+        .current_dir(current_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     detach_session_server(&mut command);
-    command.spawn().with_context(|| {
+    let child = command.spawn().with_context(|| {
         format!(
             "start global Manifold server {} in {}",
-            manifoldd.display(),
-            server_directory.display()
+            current_exe.display(),
+            current_directory.display()
         )
     })?;
-    Ok(log_path)
+    Ok((log_path, child))
 }
 
 fn detach_session_server(command: &mut ProcessCommand) {
@@ -1345,28 +1364,6 @@ fn detach_session_server(command: &mut ProcessCommand) {
     {
         command.process_group(0);
     }
-}
-
-fn target_has_owner(target: &ControlTarget) -> Result<bool> {
-    let connection = typed_connection(target)?;
-    let proxy =
-        zbus::blocking::fdo::DBusProxy::new(&connection).context("build DBus daemon proxy")?;
-    let name = zbus::names::BusName::try_from(target.destination.as_str())
-        .with_context(|| format!("parse DBus bus name {}", target.destination))?;
-    proxy
-        .name_has_owner(name)
-        .with_context(|| format!("check DBus owner for {}", target.destination))
-}
-
-fn sidecar_binary_path(current_exe: &Path, name: &str) -> PathBuf {
-    let mut path = current_exe
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(name);
-    if let Some(extension) = current_exe.extension() {
-        path.set_extension(extension);
-    }
-    path
 }
 
 fn global_server_log_dir() -> Result<PathBuf> {
@@ -1379,18 +1376,42 @@ fn global_server_log_dir() -> Result<PathBuf> {
     Ok(root)
 }
 
-fn create_surface_session(target: &ControlTarget, name: Option<String>) -> Result<u64> {
-    let mut command = vec!["surface-session".to_string(), "new".to_string()];
+fn create_directory_surface_session(
+    target: &ControlTarget,
+    directory: &Path,
+    name: Option<String>,
+    set_default: bool,
+) -> Result<u64> {
+    let command = surface_session_dir_new_command(directory, name, set_default);
+    let response = request_dbus_command(target, &command, false)?;
+    ensure_ok_response(&response)?;
+    let value = session_marker_value(response.trim(), "active")
+        .context("surface-session dir-new response missing active marker")?;
+    value
+        .parse()
+        .with_context(|| format!("parse surface session id {value:?}"))
+}
+
+fn surface_session_dir_new_command(
+    directory: &Path,
+    name: Option<String>,
+    set_default: bool,
+) -> Vec<String> {
+    let mut command = vec![
+        "surface-session".to_string(),
+        "dir-new".to_string(),
+        directory.to_string_lossy().into_owned(),
+        if set_default {
+            "default"
+        } else {
+            "keep-default"
+        }
+        .to_string(),
+    ];
     if let Some(name) = name {
         command.push(name);
     }
-    let response = request_dbus_command(target, &command, false)?;
-    ensure_ok_response(&response)?;
-
-    let response = request_dbus_command(target, &[String::from("status-json")], false)?;
-    let status: EnterStatusSnapshot =
-        serde_json::from_str(response.trim()).context("decode Manifold status-json")?;
-    Ok(status.active_surface_session)
+    command
 }
 
 fn status_snapshot(target: &ControlTarget) -> Result<EnterStatusSnapshot> {
@@ -1532,13 +1553,7 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
             selected
         }
         SessionSwitchOutcome::Create(name) => {
-            let response = request_dbus_command(
-                target,
-                &["surface-session".to_string(), "new".to_string(), name],
-                false,
-            )?;
-            ensure_ok_response(&response)?;
-            status_snapshot(target)?.active_surface_session
+            create_directory_surface_session(target, &context.current_directory, Some(name), true)?
         }
     };
     remember_directory_surface_session(target, &context.current_directory, selected_session, true)?;
@@ -2604,6 +2619,29 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 ensure!(changed, "unknown surface session {session}");
                 format!("OK surface-session changed={changed} session={session}\n")
             }
+            [subcommand, directory, mode, name @ ..] if subcommand == "dir-new" => {
+                let set_default = match mode.as_str() {
+                    "default" | "set-default" => true,
+                    "keep-default" | "no-default" => false,
+                    _ => bail!("dir-new mode must be default or keep-default"),
+                };
+                let directory = Path::new(directory).to_path_buf();
+                let session = state.create_and_attach_named_surface_session_in_directory(
+                    joined_name(name),
+                    directory.clone(),
+                );
+                let changed = state.remember_directory_surface_session(
+                    directory.clone(),
+                    session,
+                    set_default,
+                );
+                ensure!(changed, "unknown surface session {}", session.raw());
+                format!(
+                    "OK surface-session active={} created=true directory={} default={set_default}\n",
+                    session.raw(),
+                    directory.display()
+                )
+            }
             [subcommand] if subcommand == "next" => {
                 let changed =
                     WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext).apply(state);
@@ -3486,8 +3524,10 @@ mod tests {
     use super::{
         ControlTarget, SessionSwitchOutcome, WasmPlugKind, format_session_picker_row,
         parse_plug_args, parse_skim_session_output, resolve_initial_query, session_marker_value,
+        surface_session_dir_new_command,
     };
     use crate::state::SurfaceSessionSummary;
+    use std::path::Path;
 
     fn session(id: u64, name: &str) -> SurfaceSessionSummary {
         SurfaceSessionSummary {
@@ -3577,6 +3617,41 @@ mod tests {
         assert_eq!(
             session_marker_value(&marker, "surface-session-id"),
             Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn dir_new_command_carries_client_directory_and_default_mode() {
+        let command = surface_session_dir_new_command(Path::new("/tmp/project/subdir"), None, true);
+
+        assert_eq!(
+            command,
+            vec![
+                "surface-session",
+                "dir-new",
+                "/tmp/project/subdir",
+                "default"
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_new_command_carries_name_without_setting_default() {
+        let command = surface_session_dir_new_command(
+            Path::new("/tmp/project/subdir"),
+            Some("scratch".to_string()),
+            false,
+        );
+
+        assert_eq!(
+            command,
+            vec![
+                "surface-session",
+                "dir-new",
+                "/tmp/project/subdir",
+                "keep-default",
+                "scratch"
+            ]
         );
     }
 }

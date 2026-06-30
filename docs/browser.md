@@ -50,7 +50,7 @@ Native child windows are explicitly not the desired model.
 
 ## Current Prototype
 
-`manifoldd` can currently launch Chromium as a hosted Wayland managed app through the local DBus control endpoint.
+`manifold` can currently launch Chromium as a hosted Wayland managed app through the local DBus control endpoint.
 
 For exact startup and control arguments, see:
 
@@ -65,7 +65,7 @@ The current browser control surface bridges to Chromium's local DevTools HTTP en
 
 `browser list-json` and `browser inspect-json` return machine-readable browser state with exact Chromium argv and redacted environment keys. `browser close`, `browser close-all`, and session `quit` terminate browser processes tracked by Manifold, so managed Chromium panes are not left behind when the session exits.
 
-For exact local-control requests, `manifoldd ctl --json` sends the JSON argv array directly to the socket. Browser launch config files use the same option names parsed in `crates/manifoldd/src/browser.rs`:
+For exact local-control requests, `manifold ctl --json` sends the JSON argv array directly to the socket. Browser launch config files use the same option names parsed in `crates/manifoldd/src/browser.rs`:
 
 ```json
 {

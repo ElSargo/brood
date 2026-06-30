@@ -28,7 +28,7 @@ pkgs.writeShellApplication {
   text = ''
     set -euo pipefail
 
-    MANIFOLDD_BIN="''${MANIFOLDD_BIN:-${manifoldd}/bin/manifoldd}"
+    MANIFOLD_BIN="''${MANIFOLD_BIN:-''${MANIFOLDD_BIN:-${manifoldd}/bin/manifold}}"
     REPO_URL="''${MANIFOLD_DEV_REPO_URL:-https://github.com/ElSargo/manifold.git}"
     CACHE_HOME="''${XDG_CACHE_HOME:-$HOME/.cache}"
     CACHE_ROOT="''${MANIFOLD_DEV_CACHE_DIR:-$CACHE_HOME/manifold/dev-workflow}"
@@ -109,7 +109,7 @@ pkgs.writeShellApplication {
       local log="$3"
       local label="$4"
       for _ in $(seq 1 200); do
-        if "$MANIFOLDD_BIN" ctl --dbus-name "$name" status-json >/dev/null 2>&1; then
+        if "$MANIFOLD_BIN" ctl --dbus-name "$name" status-json >/dev/null 2>&1; then
           return 0
         fi
         if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
@@ -128,10 +128,10 @@ pkgs.writeShellApplication {
       if [[ -n "''${MANIFOLD_DEV_CLIENT:-}" ]]; then
         local q_source
         q_source="$(shell_quote "$SOURCE_DIR")"
-        "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
+        "$MANIFOLD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
           bash -lc "cd $q_source && exec ''${MANIFOLD_DEV_CLIENT}" >/dev/null
       else
-        "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
+        "$MANIFOLD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
           "${pkgs.foot}/bin/foot" --working-directory "$SOURCE_DIR" >/dev/null
       fi
     }
@@ -141,7 +141,7 @@ pkgs.writeShellApplication {
         return
       fi
       if [[ -n "''${DBUS_DESTINATION:-}" ]]; then
-        "$MANIFOLDD_BIN" ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+        "$MANIFOLD_BIN" ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
       fi
       if [[ -n "''${SESSION_PID:-}" ]] && kill -0 "$SESSION_PID" 2>/dev/null; then
         kill "$SESSION_PID" >/dev/null 2>&1 || true
@@ -168,7 +168,7 @@ pkgs.writeShellApplication {
 
     (
       cd "$SOURCE_DIR"
-      RUST_LOG="$RUST_LOG" "$MANIFOLDD_BIN" run --no-session-runner --dbus-name "$DBUS_DESTINATION" --config "$SOURCE_DIR/manifold.toml"
+      RUST_LOG="$RUST_LOG" "$MANIFOLD_BIN" run --no-session-runner --dbus-name "$DBUS_DESTINATION" --config "$SOURCE_DIR/manifold.toml"
     ) >"$SESSION_LOG" 2>&1 &
     SESSION_PID=$!
 

@@ -76,6 +76,7 @@ let
   manifoldd = cargoNix.workspaceMembers."manifoldd".build.override {
     runTests = false;
   };
+  manifold = manifoldd;
 
   wasmExamples = pkgs.stdenvNoCC.mkDerivation {
     name = "manifold-wasm-examples";
@@ -175,7 +176,7 @@ let
   };
 in
 {
-  default = manifoldd;
+  default = manifold;
   "dev-workflow" = devWorkflow;
   "dev-workflow-full" = devWorkflowFull;
   "dev-env" = devEnv;
@@ -187,6 +188,7 @@ in
     devEnvFull
     devWorkflow
     devWorkflowFull
+    manifold
     manifoldd
     wasmExamples
     ;

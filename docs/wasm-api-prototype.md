@@ -195,7 +195,7 @@ pub enum WorkspaceCommand {
 }
 ```
 
-The command executor should be the only layer that calls current `manifoldd` implementation details. WASM, native controllers, DBus control endpoint commands, and tests should converge on this command model as it matures.
+The command executor should be the only layer that calls current `manifold` implementation details. WASM, native controllers, DBus control endpoint commands, and tests should converge on this command model as it matures.
 
 ## WIT Sketch
 
@@ -324,7 +324,7 @@ For the example build/run flow, see `examples/wasm-key-handler/README.md`.
 
 The first spike should be tested with real workload behavior:
 
-- Start `manifoldd`.
+- Start `manifold`.
 - Launch two hosted apps through `run-managed-app`.
 - Register normal-mode shortcuts for focus next, focus previous, and launch app.
 - Send real key input into the presentation window.

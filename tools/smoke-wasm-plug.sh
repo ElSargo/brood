@@ -37,7 +37,7 @@ DBUS_ADDRESS="$(sed -n '1p' "$BUS_INFO")"
 DBUS_PID="$(sed -n '2p' "$BUS_INFO")"
 
 cleanup() {
-  target/debug/manifoldd ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
   if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2>/dev/null; then
     kill "$MANIFOLD_PID" >/dev/null 2>&1 || true
   fi
@@ -46,12 +46,12 @@ cleanup() {
 trap cleanup EXIT
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" >"$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 wait_for_control() {
   for _ in $(seq 1 100); do
-    if target/debug/manifoldd ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" status-json >/dev/null 2>&1; then
+    if target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" status-json >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.1
@@ -63,25 +63,25 @@ wait_for_control() {
 
 wait_for_control
 
-KEY_OUT="$(target/debug/manifoldd plug --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" "$KEY_WASM")"
+KEY_OUT="$(target/debug/manifold plug --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" "$KEY_WASM")"
 [[ "$KEY_OUT" == OK\ plug\ kind=fast-key-handler\ path=* ]] || {
   echo "ERR key handler plug returned unexpected output: $KEY_OUT" >&2
   exit 1
 }
 
-MAP_OUT="$(target/debug/manifoldd plug --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" --kind fast-map-hook "$MAP_WASM")"
+MAP_OUT="$(target/debug/manifold plug --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" --kind fast-map-hook "$MAP_WASM")"
 [[ "$MAP_OUT" == OK\ plug\ kind=fast-map-hook\ path=* ]] || {
   echo "ERR map hook plug returned unexpected output: $MAP_OUT" >&2
   exit 1
 }
 
-AUTO_MAP_OUT="$(target/debug/manifoldd ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" plug "$MAP_WASM")"
+AUTO_MAP_OUT="$(target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" plug "$MAP_WASM")"
 [[ "$AUTO_MAP_OUT" == OK\ plug\ kind=fast-map-hook\ path=* ]] || {
   echo "ERR raw ctl auto map plug returned unexpected output: $AUTO_MAP_OUT" >&2
   exit 1
 }
 
-target/debug/manifoldd ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null || true
+target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null || true
 wait "$MANIFOLD_PID" || true
 kill "$DBUS_PID" >/dev/null 2>&1 || true
 trap - EXIT

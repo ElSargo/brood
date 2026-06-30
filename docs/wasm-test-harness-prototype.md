@@ -37,12 +37,12 @@ wait_for_signal(resp_ptr: i32, resp_cap: i32) -> i32
 
 `status_json` writes the current `status-json` payload into guest memory and returns the number of bytes written, or `-1` on failure.
 
-`control_json` accepts the same JSON argv array accepted by `manifoldd ctl --json`, writes the textual command response into guest memory, and returns the number of bytes written, or `-1` on failure.
+`control_json` accepts the same JSON argv array accepted by `manifold ctl --json`, writes the textual command response into guest memory, and returns the number of bytes written, or `-1` on failure.
 
 `wait_for_signal` blocks the harness thread until the host sends a named signal through:
 
 ```sh
-manifoldd ctl harness signal proceed
+manifold ctl harness signal proceed
 ```
 
 The signal name is written into guest memory and the function returns the number of bytes written, or `-1` on failure.
@@ -65,7 +65,7 @@ This keeps `Manifold` state authoritative on the session thread while still allo
 When the harness is used with the nested test topology, native client launch
 details should live in normal executable wrappers. The harness remains the
 controller/assertion layer and can either observe a wrapper started by
-`manifoldd test nested` or spawn wrapper executables through the control surface.
+`manifold test nested` or spawn wrapper executables through the control surface.
 See [Nested Development Harness](nested-dev-harness.md) for the wrapper and
 success-criteria model.
 

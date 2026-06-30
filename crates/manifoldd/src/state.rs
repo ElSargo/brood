@@ -376,6 +376,7 @@ pub struct Manifold {
     next_surface_session: u64,
     surface_sessions: Vec<SurfaceSessionId>,
     surface_session_names: Vec<(SurfaceSessionId, String)>,
+    surface_session_working_directories: BTreeMap<SurfaceSessionId, PathBuf>,
     surface_session_directories: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
     surface_session_directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
@@ -505,6 +506,12 @@ impl Manifold {
                 SurfaceSessionId(1),
                 default_surface_session_name(SurfaceSessionId(1)),
             )],
+            surface_session_working_directories: [(
+                SurfaceSessionId(1),
+                current_process_directory(),
+            )]
+            .into_iter()
+            .collect(),
             surface_session_directories: BTreeMap::new(),
             surface_session_directory_defaults: BTreeMap::new(),
             window_surface_sessions: Vec::new(),
@@ -626,6 +633,7 @@ impl Manifold {
         let mut child = Command::new(command);
         child.env("WAYLAND_DISPLAY", &self.socket_name);
         child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
+        self.apply_active_session_working_directory(&mut child);
         self.apply_control_environment(&mut child);
         let child = child.spawn().with_context(|| {
             format!(
@@ -661,6 +669,7 @@ impl Manifold {
         let mut child = Command::new(program);
         child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
         child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
+        self.apply_active_session_working_directory(&mut child);
         self.apply_control_environment(&mut child);
         let child = child.spawn().with_context(|| {
             format!(
@@ -815,6 +824,15 @@ impl Manifold {
             warn!(
                 "managed client inherits host DBUS_SESSION_BUS_ADDRESS; DBus policy modes off/proxy/private are not enforced yet"
             );
+        }
+    }
+
+    fn apply_active_session_working_directory(&self, child: &mut Command) {
+        if let Some(directory) = self
+            .surface_session_working_directories
+            .get(&self.active_surface_session)
+        {
+            child.current_dir(directory);
         }
     }
 
@@ -1617,6 +1635,9 @@ impl Manifold {
         if !sessions.contains(&session) {
             sessions.push(session);
         }
+        self.surface_session_working_directories
+            .entry(session)
+            .or_insert_with(|| directory.clone());
         if set_default
             || !self
                 .surface_session_directory_defaults
@@ -1673,6 +1694,7 @@ impl Manifold {
             .retain(|existing| *existing != session);
         self.surface_session_names
             .retain(|(assigned_session, _)| *assigned_session != session);
+        self.surface_session_working_directories.remove(&session);
         self.surface_session_interaction_order
             .retain(|existing| *existing != session);
         self.surface_session_directories
@@ -1793,6 +1815,14 @@ impl Manifold {
         &mut self,
         name: Option<String>,
     ) -> SurfaceSessionId {
+        self.create_and_attach_named_surface_session_in_directory(name, current_process_directory())
+    }
+
+    pub fn create_and_attach_named_surface_session_in_directory(
+        &mut self,
+        name: Option<String>,
+        directory: PathBuf,
+    ) -> SurfaceSessionId {
         let session = SurfaceSessionId(self.next_surface_session);
         self.next_surface_session += 1;
         self.surface_sessions.push(session);
@@ -1801,6 +1831,8 @@ impl Manifold {
             name.filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| default_surface_session_name(session)),
         ));
+        self.surface_session_working_directories
+            .insert(session, directory);
         self.save_active_native_session_layout();
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
@@ -1808,6 +1840,13 @@ impl Manifold {
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         session
+    }
+
+    #[cfg(test)]
+    pub fn surface_session_working_directory(&self, session: SurfaceSessionId) -> Option<&Path> {
+        self.surface_session_working_directories
+            .get(&session)
+            .map(PathBuf::as_path)
     }
 
     fn session_for_toplevel_surface(&self, surface: &WlSurface) -> Option<SurfaceSessionId> {
@@ -3811,6 +3850,11 @@ fn default_surface_session_name(session: SurfaceSessionId) -> String {
     format!("{adjective}-{noun}-{action}")
 }
 
+fn current_process_directory() -> PathBuf {
+    let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    directory.canonicalize().unwrap_or(directory)
+}
+
 fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
     LayoutRect {
         x: 0,
@@ -4175,7 +4219,7 @@ mod tests {
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     #[test]
     fn fullscreen_layout_covers_the_presentation_from_origin() {
@@ -4216,6 +4260,47 @@ mod tests {
         assert_eq!(
             (geometry.size.w, geometry.size.h),
             (SESSION_OUTPUT_SIZE.0, SESSION_OUTPUT_SIZE.1)
+        );
+    }
+
+    #[test]
+    fn directory_created_session_carries_the_directory_as_session_cwd() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let directory = PathBuf::from("/tmp/manifold-session-cwd/subdir");
+
+        let session = state.create_and_attach_named_surface_session_in_directory(
+            Some("subdir".to_string()),
+            directory.clone(),
+        );
+        assert!(state.remember_directory_surface_session(directory.clone(), session, true));
+
+        assert_eq!(
+            state.surface_session_working_directory(session),
+            Some(directory.as_path())
+        );
+        assert_eq!(
+            state.resolve_directory_surface_session(&directory),
+            Some(session)
+        );
+    }
+
+    #[test]
+    fn remembering_directory_does_not_rewrite_existing_session_cwd() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let original = PathBuf::from("/tmp/manifold-session-cwd/original");
+        let alias = PathBuf::from("/tmp/manifold-session-cwd/alias");
+
+        let session =
+            state.create_and_attach_named_surface_session_in_directory(None, original.clone());
+        assert!(state.remember_directory_surface_session(alias, session, true));
+
+        assert_eq!(
+            state.surface_session_working_directory(session),
+            Some(original.as_path())
         );
     }
 

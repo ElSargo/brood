@@ -38,7 +38,7 @@ DBUS_ADDRESS="$(sed -n '1p' "$BUS_INFO")"
 DBUS_PID="$(sed -n '2p' "$BUS_INFO")"
 
 cleanup() {
-  target/debug/manifoldd ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
   if [[ -n "${MANIFOLD_PID:-}" ]] && kill -0 "$MANIFOLD_PID" 2>/dev/null; then
     kill "$MANIFOLD_PID" >/dev/null 2>&1 || true
   fi
@@ -54,11 +54,11 @@ EOF
 chmod +x "$CLIENT_WRAPPER"
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" -c "$CLIENT_WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --no-session-runner --no-default-modules --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" -c "$CLIENT_WRAPPER" >"$LOG" 2>&1 &
 MANIFOLD_PID=$!
 
 ctl() {
-  target/debug/manifoldd ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" "$@"
+  target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" "$@"
 }
 
 call() {
@@ -223,7 +223,7 @@ set -euo pipefail
   printf "DBUS_SESSION_BUS_ADDRESS=%s\\n" "\${DBUS_SESSION_BUS_ADDRESS:-}"
   printf "MANIFOLDD_DBUS_DESTINATION=%s\\n" "\${MANIFOLDD_DBUS_DESTINATION:-}"
 } >"$PROBE_ENV"
-RUST_LOG=off "$ROOT/target/debug/manifoldd" ctl status-json >"$PROBE_STATUS"
+RUST_LOG=off "$ROOT/target/debug/manifold" ctl status-json >"$PROBE_STATUS"
 EOF
 chmod +x "$PROBE"
 ctl spawn "$PROBE" >/dev/null

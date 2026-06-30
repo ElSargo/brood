@@ -2,14 +2,11 @@
 name = "manifoldd"
 version = "0.1.0"
 edition.workspace = true
+default-run = "manifold"
 
 [[bin]]
-name = "manifoldd"
+name = "manifold"
 path = "src/main.rs"
-
-[[bin]]
-name = "mctl"
-Path = "src/bin/mctl.rs"
 
 [[bin]]
 name = "manifold-sessiond"

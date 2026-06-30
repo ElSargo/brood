@@ -14,9 +14,9 @@ Earlier approaches considered an embedded GUI renderer inside Helix, an Electron
 
 Manifold will begin as a new standalone project centered on a session process and thin native presentation endpoints.
 
-For the MVP prototype, this split is narrowed by [0002: Local MVP Presentation](0002-local-mvp-presentation.md): `manifoldd` owns the first local presentation window, and `manifold-client` is deferred.
+For the MVP prototype, this split is narrowed by [0002: Local MVP Presentation](0002-local-mvp-presentation.md): `manifold` owns the first local presentation window, and `manifold-client` is deferred.
 
-- `manifoldd` owns authoritative session state.
+- `manifold` owns authoritative session state.
 - `manifold-client` owns local presentation execution when the presenter is split out.
 - pane clients produce surfaces or scene data under session-process supervision.
 - browser integration is modeled as a first-party pane client.

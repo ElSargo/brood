@@ -19,7 +19,7 @@ mod winit_presenter;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -57,7 +57,7 @@ enum Command {
     Switch(SwitchArgs),
     /// Run built-in test workflows. Defaults to the nested topology.
     Test(TestArgs),
-    /// Send a command to a running manifoldd DBus control endpoint.
+    /// Send a command to a Manifold DBus control endpoint.
     Ctl(CtlArgs),
 }
 
@@ -319,32 +319,17 @@ pub fn run_cli() -> Result<()> {
         .try_init()
         .map_err(|err| anyhow::anyhow!("{err}"))?;
 
-    let invoked_as_mctl = std::env::args_os()
-        .next()
-        .and_then(|arg| {
-            std::path::PathBuf::from(arg)
-                .file_stem()
-                .map(std::ffi::OsStr::to_owned)
-        })
-        .is_some_and(|name| name == "mctl");
     let args = Args::parse();
-    info!(?args, "starting manifoldd");
+    info!(?args, "starting manifold");
 
     let command = match args.command {
         Some(command) => command,
-        None if invoked_as_mctl => {
-            let mut command = Args::command();
-            command.set_bin_name("mctl");
-            command.print_help()?;
-            println!();
-            return Ok(());
-        }
         None => Command::Run(RunArgs::default()),
     };
 
     match command {
         Command::Check => {
-            println!("manifoldd: ok");
+            println!("manifold: ok");
             Ok(())
         }
         Command::Enter(args) => control::enter(args).context("enter session environment"),

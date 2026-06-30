@@ -8,7 +8,7 @@ there.
 
 ## Target
 
-`mctl enter --managed` should create or reuse a Manifold session whose programs
+`manifold enter --managed` should create or reuse a Manifold session whose programs
 see the normal project and system paths, but whose regular writes, runtime IPC,
 DBus names, and loopback services stay inside the session unless explicitly
 bridged or promoted.
@@ -65,7 +65,7 @@ the command model.
 ### Phase 1: Session Metadata And CLI Surface
 
 - Add an isolation profile to session state.
-- Add `mctl enter --managed` and a parser-level spelling for `--plain`,
+- Add `manifold enter --managed` and a parser-level spelling for `--plain`,
   `--strict`, and future profile selection.
 - Record the project view path, lower path, upper root, and profile in session
   metadata.
@@ -75,9 +75,9 @@ the command model.
 
 Verification:
 
-- `mctl enter --managed env` prints the session id, profile, upper root, runtime
+- `manifold enter --managed env` prints the session id, profile, upper root, runtime
   root, DBus address, and Wayland display.
-- `mctl show`, `hide`, and regular control commands still target the entered
+- `manifold show`, `hide`, and regular control commands still target the entered
   session.
 
 ### Phase 2: Project Write Capture
@@ -86,8 +86,8 @@ Verification:
 - Materialize the project upper tree lazily on first project write.
 - Prefer reflink copy, then fall back to ordinary copy.
 - Keep the view path as the original project path inside the session.
-- Track changed project files and expose `mctl worktree status` and
-  `mctl worktree diff`.
+- Track changed project files and expose `manifold worktree status` and
+  `manifold worktree diff`.
 
 Verification:
 
@@ -163,7 +163,7 @@ Verification:
 
 ### Phase 7: Export, Promote, And Cleanup
 
-- Add `mctl worktree export`, `promote`, and `discard`.
+- Add `manifold worktree export`, `promote`, and `discard`.
 - Promote project changes through git-aware patch application with conflict
   checks.
 - Promote external changes only through explicit path-by-path operations.

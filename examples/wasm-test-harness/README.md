@@ -1,4 +1,4 @@
-This is a minimal async core-WASM test harness for `manifoldd run --test-harness`.
+This is a minimal async core-WASM test harness for `manifold run --test-harness`.
 
 For the exact CLI argument definition, see `crates/manifoldd/src/main.rs`.
 
@@ -12,7 +12,7 @@ cargo build --manifest-path examples/wasm-test-harness/Cargo.toml --target wasm3
 Run:
 
 ```sh
-manifoldd run \
+manifold run \
   --test-harness examples/wasm-test-harness/target/wasm32-unknown-unknown/release/manifold_wasm_test_harness.wasm
 ```
 

@@ -55,7 +55,7 @@ Expected behavior:
 - `manifold show` fronts, attaches, or switches presentation to the directory-bound or explicitly selected session, or creates an empty session when invoked outside one and no binding exists, without changing the shell environment.
 - `manifold hide` resolves the same session target shape as `show` and detaches the presentation surface when one exists, without closing the session.
 - Session listing should show the live sessions associated with the current directory by default and all live sessions when requested globally.
-- A thin control alias such as `mctl` may exist, but it should use the same command semantics and default target as Manifold control commands.
+- `manifold` is the normal user-facing command; direct control commands should use the same default target as the rest of the command surface.
 - Entered shells should make the active DBus control endpoint, session id, session name, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
 - Entering a session should not by itself require filesystem, network, or PID isolation; those are profiles layered on top.
 

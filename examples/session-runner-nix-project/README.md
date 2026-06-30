@@ -14,15 +14,15 @@ Quick runner-only smoke:
 
 ```sh
 cd examples/session-runner-nix-project
-../../target/debug/mctl enter ./scripts/check-env.sh
+../../target/debug/manifold enter ./scripts/check-env.sh
 ```
 
-Full `mctl enter` smoke:
+Full `manifold enter` smoke:
 
 ```sh
 cd examples/session-runner-nix-project
-../../target/debug/mctl enter ./scripts/check-env.sh
-../../target/debug/mctl enter ../../target/debug/mctl ctl quit
+../../target/debug/manifold enter ./scripts/check-env.sh
+../../target/debug/manifold enter ../../target/debug/manifold ctl quit
 ```
 
 The Nix project reuses this repository's dev shell through a local flake input

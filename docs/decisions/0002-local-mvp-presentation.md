@@ -12,10 +12,10 @@ Remote connections are not a current goal. The first question is whether Manifol
 
 ## Decision
 
-The MVP will use a single local `manifoldd` process that owns both the durable session and the local presentation window.
+The MVP will use a single local `manifold` process that owns both the durable session and the local presentation window.
 
-- `manifoldd` owns the nested Wayland compositor for hosted Wayland apps.
-- `manifoldd` opens a normal desktop presentation window on the user's current compositor.
+- `manifold` owns the nested Wayland compositor for hosted Wayland apps.
+- `manifold` opens a normal desktop presentation window on the user's current compositor.
 - Hosted Wayland apps connect to Manifold's Wayland display, not directly to the system compositor.
 - Closing the presentation window detaches by default when there is managed app or session state worth preserving.
 - Remote presentation, remote networking, and multi-user security are non-goals for this phase.

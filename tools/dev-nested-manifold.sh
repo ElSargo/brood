@@ -89,8 +89,8 @@ cleanup() {
   if [[ "$KEEP_RUNNING" == "1" ]]; then
     return
   fi
-  target/debug/manifoldd ctl --dbus-name "$DEV_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
-  target/debug/manifoldd ctl --dbus-name "$STABLE_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-name "$DEV_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+  target/debug/manifold ctl --dbus-name "$STABLE_DBUS_DESTINATION" quit >/dev/null 2>&1 || true
   sleep 0.4
   if [[ -n "${DEV_PID:-}" ]] && kill -0 "$DEV_PID" 2>/dev/null; then
     kill "$DEV_PID" >/dev/null 2>&1 || true
@@ -102,19 +102,19 @@ cleanup() {
 trap cleanup EXIT
 
 ctl_stable() {
-  target/debug/manifoldd ctl --dbus-name "$STABLE_DBUS_DESTINATION" "$@"
+  target/debug/manifold ctl --dbus-name "$STABLE_DBUS_DESTINATION" "$@"
 }
 
 ctl_dev() {
-  target/debug/manifoldd ctl --dbus-name "$DEV_DBUS_DESTINATION" "$@"
+  target/debug/manifold ctl --dbus-name "$DEV_DBUS_DESTINATION" "$@"
 }
 
 ctl_stable_json() {
-  target/debug/manifoldd ctl --dbus-name "$STABLE_DBUS_DESTINATION" --json "$1"
+  target/debug/manifold ctl --dbus-name "$STABLE_DBUS_DESTINATION" --json "$1"
 }
 
 ctl_dev_json() {
-  target/debug/manifoldd ctl --dbus-name "$DEV_DBUS_DESTINATION" --json "$1"
+  target/debug/manifold ctl --dbus-name "$DEV_DBUS_DESTINATION" --json "$1"
 }
 
 json_field() {
@@ -190,7 +190,7 @@ sample_statuses() {
 }
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --dbus-name "$STABLE_DBUS_DESTINATION" >"$STABLE_LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$STABLE_DBUS_DESTINATION" >"$STABLE_LOG" 2>&1 &
 STABLE_PID=$!
 
 wait_for_manifoldd_control "$STABLE_DBUS_DESTINATION" "$STABLE_PID" "$STABLE_LOG"
@@ -202,7 +202,7 @@ import sys
 
 destination, log = sys.argv[1], sys.argv[2]
 command = (
-    "exec target/debug/manifoldd run "
+    "exec target/debug/manifold run "
     f"--dbus-name {shlex.quote(destination)} "
     f">{shlex.quote(log)} 2>&1"
 )
@@ -264,8 +264,8 @@ if [[ "$KEEP_RUNNING" == "1" ]]; then
   echo "keep_running=1"
   echo "stable_pid=$STABLE_PID"
   echo "Stop with:"
-  echo "  target/debug/manifoldd ctl --dbus-name $DEV_DBUS_DESTINATION quit"
-  echo "  target/debug/manifoldd ctl --dbus-name $STABLE_DBUS_DESTINATION quit"
+  echo "  target/debug/manifold ctl --dbus-name $DEV_DBUS_DESTINATION quit"
+  echo "  target/debug/manifold ctl --dbus-name $STABLE_DBUS_DESTINATION quit"
   wait "$STABLE_PID"
 else
   ctl_dev quit >/dev/null || true

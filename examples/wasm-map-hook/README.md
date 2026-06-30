@@ -1,6 +1,6 @@
 # WASM Map Hook Example
 
-This is a minimal core-WASM fast map hook for `manifoldd run --wasm-map-hook`.
+This is a minimal core-WASM fast map hook for `manifold run --wasm-map-hook`.
 
 Build:
 
@@ -12,7 +12,7 @@ cargo build --manifest-path examples/wasm-map-hook/Cargo.toml --target wasm32-un
 Run:
 
 ```sh
-manifoldd run \
+manifold run \
   --wasm-map-hook examples/wasm-map-hook/target/wasm32-unknown-unknown/release/manifold_wasm_map_hook.wasm
 ```
 

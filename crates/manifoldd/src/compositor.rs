@@ -18,6 +18,7 @@ use smithay::{
     },
     desktop::{PopupKind, Window},
     input::{Seat, SeatHandler, SeatState},
+    reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
     reexports::{
         calloop::{EventLoop, Interest},
         wayland_server::{
@@ -45,11 +46,9 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
-            decoration::XdgDecorationHandler,
+            XdgToplevelSurfaceData, decoration::XdgDecorationHandler,
         },
     },
-    reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
 };
 use tracing::{info, warn};
 

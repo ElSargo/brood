@@ -44,7 +44,7 @@ BROWSER_PROFILE="$TMPDIR/browser-profile"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -222,13 +222,13 @@ exec 9>/tmp/manifold-native-scroll.lock
 flock 9
 
 RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@"
+  target/debug/manifold ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 READY=0
@@ -266,7 +266,7 @@ fi
 
 ctl inject center-motion >/dev/null
 
-python3 - "$DBUS_NAME" "$ROOT/target/debug/manifoldd" "$SAMPLES" "$DURATION_SECONDS" <<'PY' &
+python3 - "$DBUS_NAME" "$ROOT/target/debug/manifold" "$SAMPLES" "$DURATION_SECONDS" <<'PY' &
 import json
 import subprocess
 import sys

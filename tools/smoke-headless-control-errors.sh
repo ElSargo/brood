@@ -20,7 +20,7 @@ WRAPPER="$TMPDIR/client-wrapper.sh"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
-    target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
+    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit >/dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" >/dev/null 2>&1 || true
   fi
@@ -32,13 +32,13 @@ chmod +x "$WRAPPER"
 
 env WAYLAND_DISPLAY=manifold-missing-wayland DISPLAY= \
   RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifoldd run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
+  target/debug/manifold run --headless --dbus-name "$DBUS_NAME" -c "$WRAPPER" >"$LOG" 2>&1 &
 PID=$!
 
 wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@"
+  target/debug/manifold ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 field() {
@@ -82,7 +82,7 @@ expect_ctl_error() {
   shift
   local output
 
-  if output="$(target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" "$@" 2>&1)"; then
+  if output="$(target/debug/manifold ctl --dbus-name "$DBUS_NAME" "$@" 2>&1)"; then
     echo "ERR $name expected ctl failure, got success: $output" >&2
     tail -120 "$LOG" >&2 || true
     exit 1
@@ -95,7 +95,7 @@ expect_json_error() {
   local payload="$2"
   local output
 
-  if output="$(target/debug/manifoldd ctl --dbus-name "$DBUS_NAME" --json "$payload" 2>&1)"; then
+  if output="$(target/debug/manifold ctl --dbus-name "$DBUS_NAME" --json "$payload" 2>&1)"; then
     echo "ERR $name expected JSON ctl failure, got success: $output" >&2
     tail -120 "$LOG" >&2 || true
     exit 1
