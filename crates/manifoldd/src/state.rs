@@ -891,12 +891,16 @@ impl Manifold {
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         self.window_under_layout_position(pos)
             .and_then(|(window, location)| {
-                let local_pos =
-                    Point::from((pos.x - f64::from(location.x), pos.y - f64::from(location.y)));
+                let surface_origin =
+                    window_surface_origin_in_compositor_space(location, window.geometry().loc);
+                let local_pos = Point::from((
+                    pos.x - f64::from(surface_origin.x),
+                    pos.y - f64::from(surface_origin.y),
+                ));
                 window
                     .surface_under(local_pos, WindowSurfaceType::ALL)
                     .map(|(surface, point)| {
-                        (surface, surface_origin_in_compositor_space(location, point))
+                        (surface, (surface_origin + point).to_f64())
                     })
             })
     }
@@ -998,7 +1002,14 @@ impl Manifold {
         if !rect.contains_f64(pos.x, pos.y) {
             return None;
         }
-        let local_pos = Point::from((pos.x - f64::from(rect.x), pos.y - f64::from(rect.y)));
+        let surface_origin = window_surface_origin_in_compositor_space(
+            Point::from((rect.x, rect.y)),
+            window.geometry().loc,
+        );
+        let local_pos = Point::from((
+            pos.x - f64::from(surface_origin.x),
+            pos.y - f64::from(surface_origin.y),
+        ));
         window
             .surface_under(local_pos, WindowSurfaceType::ALL)
             .is_some()
@@ -3823,11 +3834,11 @@ fn first_available_pane_from(
     None
 }
 
-fn surface_origin_in_compositor_space(
+fn window_surface_origin_in_compositor_space(
     window_location: Point<i32, Logical>,
-    surface_location: Point<i32, Logical>,
-) -> Point<f64, Logical> {
-    (window_location + surface_location).to_f64()
+    window_geometry_location: Point<i32, Logical>,
+) -> Point<i32, Logical> {
+    window_location - window_geometry_location
 }
 
 fn focus_stack_location(_slot: usize) -> Point<i32, Logical> {
@@ -4138,7 +4149,7 @@ struct WindowRefreshOutcome {
 mod tests {
     use super::{
         Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, fullscreen_layout_rect,
-        surface_origin_in_compositor_space,
+        window_surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
     use smithay::{
@@ -4162,12 +4173,13 @@ mod tests {
     }
 
     #[test]
-    fn surface_under_returns_compositor_space_surface_origin() {
-        let window_location = Point::from((280, 0));
-        let surface_location = Point::from((640, 12));
-        let origin = surface_origin_in_compositor_space(window_location, surface_location);
+    fn surface_origin_accounts_for_window_geometry_offset() {
+        let window_location = Point::from((0, 0));
+        let window_geometry_location = Point::from((4, 28));
+        let origin =
+            window_surface_origin_in_compositor_space(window_location, window_geometry_location);
 
-        assert_eq!((origin.x, origin.y), (920.0, 12.0));
+        assert_eq!((origin.x, origin.y), (-4, -28));
     }
 
     #[test]
