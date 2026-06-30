@@ -2097,6 +2097,9 @@ impl Manifold {
     }
 
     pub fn set_presentation_window_focused(&mut self, focused: bool) {
+        if self.presentation_window_focused && !focused {
+            self.reset_transient_input_state();
+        }
         self.presentation_window_focused = focused;
     }
 
@@ -4194,6 +4197,29 @@ mod tests {
         assert!(state.should_notify_agent_desktop(&agent_id));
         state.set_presentation_window_focused(true);
         assert!(state.should_notify_agent_desktop(&agent_id));
+    }
+
+    #[test]
+    fn presentation_focus_loss_clears_transient_keyboard_state() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+
+        state.set_presentation_window_focused(true);
+        state.ctrl_pressed = true;
+        state.ctrl_pressed_key = Some(smithay::backend::input::Keycode::new(37));
+        state.ctrl_forwarded_to_client = true;
+        state.shortcut_prefix_active = true;
+        state.suppress_shortcut_prefix_key_release =
+            Some(smithay::backend::input::Keycode::new(56));
+
+        state.set_presentation_window_focused(false);
+
+        assert!(!state.ctrl_pressed);
+        assert_eq!(state.ctrl_pressed_key, None);
+        assert!(!state.ctrl_forwarded_to_client);
+        assert!(!state.shortcut_prefix_active);
+        assert_eq!(state.suppress_shortcut_prefix_key_release, None);
     }
 
     #[test]
