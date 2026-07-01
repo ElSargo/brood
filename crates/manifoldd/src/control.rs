@@ -1,3 +1,18 @@
+#![allow(
+    clippy::exit,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::let_underscore_must_use,
+    clippy::needless_pass_by_ref_mut,
+    clippy::needless_pass_by_value,
+    clippy::option_if_let_else,
+    clippy::too_many_arguments,
+    clippy::unnecessary_wraps,
+    clippy::unused_async,
+    reason = "tracked in issues.md: control.rs preserves DBus async signatures and token-oriented command plumbing"
+)]
+// TODO(lint-structure): separate DBus proxy ABI, CLI parsing, and process entrypoint policy.
+
 use std::{
     collections::BTreeMap,
     env,

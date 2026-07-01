@@ -1,5 +1,15 @@
-use smithay::backend::input::Keycode;
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "tracked in issues.md: layout math still mixes float ratios, integer pixels, and positional parse assertions"
+)]
+// TODO(lint-structure): introduce checked geometry and parser result helpers for layout math.
+
 use std::{collections::BTreeSet, fmt, str::FromStr};
+
+use smithay::backend::input::Keycode;
 
 const MAX_RESOLVED_LAYOUT_ITEMS: usize = 512;
 const NORMALIZED_MIN: f64 = -1.0;

@@ -1,3 +1,19 @@
+#![allow(
+    clippy::allow_attributes_without_reason,
+    clippy::branches_sharing_code,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::let_underscore_must_use,
+    clippy::needless_pass_by_ref_mut,
+    clippy::needless_pass_by_value,
+    clippy::option_if_let_else,
+    clippy::type_complexity,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unreachable,
+    reason = "tracked in issues.md: session bus forwarding still parses raw DBus messages and owns routing state inline"
+)]
+// TODO(lint-structure): replace the ad hoc DBus byte router with typed message/session abstractions.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,

@@ -1,3 +1,10 @@
+#![allow(
+    clippy::let_underscore_must_use,
+    clippy::string_slice,
+    reason = "tracked in issues.md: launch context logging still truncates display strings by byte offsets"
+)]
+// TODO(lint-structure): define environment preview truncation in Unicode scalar terms.
+
 use std::{
     env,
     ffi::{OsStr, OsString},

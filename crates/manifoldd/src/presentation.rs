@@ -1,3 +1,12 @@
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::if_same_then_else,
+    clippy::needless_for_each,
+    clippy::needless_pass_by_ref_mut,
+    reason = "tracked in issues.md: presentation code still converts signed layout coordinates at the renderer boundary"
+)]
+// TODO(lint-structure): separate presentation geometry from Smithay output conversion.
+
 use std::{
     cell::RefCell,
     fmt,

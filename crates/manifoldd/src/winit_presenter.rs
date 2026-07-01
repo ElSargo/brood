@@ -1,3 +1,15 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::clone_on_ref_ptr,
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    clippy::undocumented_unsafe_blocks,
+    clippy::used_underscore_binding,
+    reason = "tracked in issues.md: presenter still keeps raw GL/Winit handles and FFI invariants inline"
+)]
+// TODO(lint-structure): wrap Winit/GL FFI state in audited safe renderer abstractions.
+
 use std::{
     cell::{Cell, RefCell},
     env,

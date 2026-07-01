@@ -1,3 +1,29 @@
+#![allow(
+    clippy::allow_attributes_without_reason,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::expect_used,
+    clippy::filter_map_next,
+    clippy::indexing_slicing,
+    clippy::iter_on_single_items,
+    clippy::let_underscore_must_use,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_ref_mut,
+    clippy::needless_pass_by_value,
+    clippy::option_if_let_else,
+    clippy::question_mark,
+    clippy::struct_field_names,
+    clippy::too_many_arguments,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_debug_formatting,
+    clippy::unused_self,
+    clippy::unwrap_used,
+    clippy::useless_let_if_seq,
+    reason = "tracked in issues.md: central runtime state currently owns too many invariants and conversions directly"
+)]
+// TODO(lint-structure): decompose Manifold state into typed geometry, session, focus, and registry services.
+
 use std::{
     collections::BTreeMap,
     ffi::OsString,

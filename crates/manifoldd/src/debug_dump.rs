@@ -1,3 +1,13 @@
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing,
+    clippy::needless_pass_by_ref_mut,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_wraps,
+    reason = "tracked in issues.md: debug dump still works directly over renderer buffers and raw pixel memory"
+)]
+// TODO(lint-structure): replace raw image-buffer indexing with typed pixel/stride helpers.
+
 use std::{
     fs,
     path::{Path, PathBuf},

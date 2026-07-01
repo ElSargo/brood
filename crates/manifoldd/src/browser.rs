@@ -1,3 +1,9 @@
+#![allow(
+    clippy::indexing_slicing,
+    reason = "tracked in issues.md: browser command parsing still relies on positional tokens"
+)]
+// TODO(lint-structure): replace browser command token parsing with a typed parser.
+
 use std::{
     collections::BTreeMap,
     env,

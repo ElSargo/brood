@@ -1,3 +1,11 @@
+#![allow(
+    clippy::allow_attributes_without_reason,
+    clippy::cast_possible_truncation,
+    clippy::expect_used,
+    reason = "tracked in issues.md: input state still encodes geometry and gesture invariants inline"
+)]
+// TODO(lint-structure): make pointer coordinate conversion and gesture state explicitly fallible.
+
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,

@@ -1,3 +1,17 @@
+#![allow(
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    clippy::needless_collect,
+    clippy::needless_pass_by_ref_mut,
+    clippy::needless_pass_by_value,
+    clippy::question_mark,
+    clippy::significant_drop_tightening,
+    clippy::unused_self,
+    clippy::useless_let_if_seq,
+    reason = "tracked in issues.md: compositor setup mixes ownership, event-loop callbacks, and test harness orchestration"
+)]
+// TODO(lint-structure): split nested-test orchestration from compositor/runtime wiring.
+
 use std::{
     env,
     ffi::OsStr,

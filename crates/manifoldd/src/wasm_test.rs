@@ -1,3 +1,11 @@
+#![allow(
+    clippy::let_underscore_must_use,
+    clippy::needless_pass_by_value,
+    clippy::while_let_loop,
+    reason = "tracked in issues.md: WASM test harness still manages child processes and messages procedurally"
+)]
+// TODO(lint-structure): model harness process lifecycle with explicit handles and events.
+
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},

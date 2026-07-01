@@ -1,3 +1,9 @@
+#![allow(
+    clippy::too_many_arguments,
+    reason = "tracked in issues.md: WASM key calls still pass event context as parallel scalar arguments"
+)]
+// TODO(lint-structure): group WASM key event fields into a typed invocation context.
+
 use std::path::Path;
 
 use anyhow::{Context, Result};

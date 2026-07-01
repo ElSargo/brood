@@ -18,8 +18,8 @@ const CACHE_MANIFEST: &str = "manifest.json";
 const CACHE_PROFILE: &str = "profile";
 const LOCK_DIR: &str = ".lock";
 const CACHE_NAMESPACE: &str = "nix-develop";
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
 fn main() -> Result<()> {
     let args = ActivationArgs::parse()?;
@@ -44,13 +44,26 @@ impl ActivationArgs {
             "usage: manifold-runner-nix-develop <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>"
         );
 
-        let mut args = args.into_iter();
+        let Ok(
+            [
+                project_dir,
+                working_dir,
+                cache_dir,
+                runner_cache_root,
+                inner_binary,
+            ],
+        ) = <Vec<OsString> as TryInto<[OsString; 5]>>::try_into(args)
+        else {
+            bail!(
+                "usage: manifold-runner-nix-develop <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>"
+            );
+        };
         Ok(Self {
-            project_dir: PathBuf::from(args.next().expect("project dir arg exists")),
-            working_dir: PathBuf::from(args.next().expect("working dir arg exists")),
-            cache_dir: PathBuf::from(args.next().expect("session cache dir arg exists")),
-            runner_cache_root: PathBuf::from(args.next().expect("runner cache root arg exists")),
-            inner_binary: PathBuf::from(args.next().expect("inner binary arg exists")),
+            project_dir: PathBuf::from(project_dir),
+            working_dir: PathBuf::from(working_dir),
+            cache_dir: PathBuf::from(cache_dir),
+            runner_cache_root: PathBuf::from(runner_cache_root),
+            inner_binary: PathBuf::from(inner_binary),
         })
     }
 }
@@ -72,6 +85,10 @@ fn cached_activation_script(args: &ActivationArgs) -> Result<PathBuf> {
     rebuild_cache(args, &cache_dir, &expected)
 }
 
+#[allow(
+    clippy::exit,
+    reason = "tracked in issues.md: runner entrypoint must preserve the activated child exit status until entrypoint policy is redesigned"
+)]
 fn run_activation_script(args: &ActivationArgs, activation_script: &Path) -> Result<()> {
     let status = Command::new("bash")
         .arg("-c")
@@ -285,7 +302,7 @@ impl CacheLock {
 
 impl Drop for CacheLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let _cleanup_result = fs::remove_dir_all(&self.path);
     }
 }
 
