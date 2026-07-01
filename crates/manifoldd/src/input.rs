@@ -339,6 +339,17 @@ impl Manifold {
         state: KeyState,
         time: u32,
     ) {
+        match state {
+            KeyState::Pressed => {
+                if !self.forwarded_pressed_keys.contains(&key_code) {
+                    self.forwarded_pressed_keys.push(key_code);
+                }
+            }
+            KeyState::Released => {
+                self.forwarded_pressed_keys
+                    .retain(|pressed_key| *pressed_key != key_code);
+            }
+        }
         let can_sample_visible_latency =
             self.presentation == PresentationStatus::Attached && self.active_window().is_some();
         self.stats.record_input(can_sample_visible_latency);

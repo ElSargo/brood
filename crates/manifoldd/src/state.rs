@@ -366,6 +366,7 @@ pub struct Manifold {
     pub(crate) ctrl_forwarded_to_client: bool,
     pub(crate) alt_forwarded_to_client: bool,
     pub(crate) shift_forwarded_to_client: bool,
+    pub(crate) forwarded_pressed_keys: Vec<smithay::backend::input::Keycode>,
     pub(crate) suppress_mode_toggle_key_release: bool,
     pub(crate) shortcut_prefix_active: bool,
     pub(crate) suppress_shortcut_prefix_key_release: Option<smithay::backend::input::Keycode>,
@@ -493,6 +494,7 @@ impl Manifold {
             ctrl_forwarded_to_client: false,
             alt_forwarded_to_client: false,
             shift_forwarded_to_client: false,
+            forwarded_pressed_keys: Vec::new(),
             suppress_mode_toggle_key_release: false,
             shortcut_prefix_active: false,
             suppress_shortcut_prefix_key_release: None,
@@ -1558,41 +1560,18 @@ impl Manifold {
     }
 
     pub fn reset_transient_input_state(&mut self) {
-        if self.ctrl_forwarded_to_client {
-            if let Some(key_code) = self.ctrl_pressed_key {
-                self.seat.get_keyboard().expect("keyboard").input::<(), _>(
-                    self,
-                    key_code,
-                    smithay::backend::input::KeyState::Released,
-                    SERIAL_COUNTER.next_serial(),
-                    0,
-                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
-                );
-            }
-        }
-        if self.alt_forwarded_to_client {
-            if let Some(key_code) = self.alt_pressed_key {
-                self.seat.get_keyboard().expect("keyboard").input::<(), _>(
-                    self,
-                    key_code,
-                    smithay::backend::input::KeyState::Released,
-                    SERIAL_COUNTER.next_serial(),
-                    0,
-                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
-                );
-            }
-        }
-        if self.shift_forwarded_to_client {
-            if let Some(key_code) = self.shift_pressed_key {
-                self.seat.get_keyboard().expect("keyboard").input::<(), _>(
-                    self,
-                    key_code,
-                    smithay::backend::input::KeyState::Released,
-                    SERIAL_COUNTER.next_serial(),
-                    0,
-                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
-                );
-            }
+        for key_code in std::mem::take(&mut self.forwarded_pressed_keys)
+            .into_iter()
+            .rev()
+        {
+            self.seat.get_keyboard().expect("keyboard").input::<(), _>(
+                self,
+                key_code,
+                smithay::backend::input::KeyState::Released,
+                SERIAL_COUNTER.next_serial(),
+                0,
+                |_, _, _| smithay::input::keyboard::FilterResult::Forward,
+            );
         }
 
         self.ctrl_pressed = false;
@@ -4467,6 +4446,9 @@ mod tests {
         state.ctrl_pressed = true;
         state.ctrl_pressed_key = Some(smithay::backend::input::Keycode::new(37));
         state.ctrl_forwarded_to_client = true;
+        state
+            .forwarded_pressed_keys
+            .push(smithay::backend::input::Keycode::new(37));
         state.shortcut_prefix_active = true;
         state.suppress_shortcut_prefix_key_release =
             Some(smithay::backend::input::Keycode::new(56));
@@ -4476,8 +4458,31 @@ mod tests {
         assert!(!state.ctrl_pressed);
         assert_eq!(state.ctrl_pressed_key, None);
         assert!(!state.ctrl_forwarded_to_client);
+        assert!(state.forwarded_pressed_keys.is_empty());
         assert!(!state.shortcut_prefix_active);
         assert_eq!(state.suppress_shortcut_prefix_key_release, None);
+    }
+
+    #[test]
+    fn presentation_focus_loss_releases_untracked_forwarded_keys() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+
+        state.set_presentation_window_focused(true);
+        state.forward_keyboard_key(
+            smithay::backend::input::Keycode::new(133),
+            smithay::backend::input::KeyState::Pressed,
+            1,
+        );
+        assert_eq!(
+            state.forwarded_pressed_keys,
+            vec![smithay::backend::input::Keycode::new(133)]
+        );
+
+        state.set_presentation_window_focused(false);
+
+        assert!(state.forwarded_pressed_keys.is_empty());
     }
 
     #[test]
