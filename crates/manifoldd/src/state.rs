@@ -2579,6 +2579,38 @@ impl Manifold {
         true
     }
 
+    pub fn unregister_agent_by_identity(
+        &mut self,
+        kind: String,
+        metadata: ExtensionMetadata,
+    ) -> Result<Option<String>> {
+        let kind = normalize_registry_value(&kind).context("agent kind must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let id = stable_agent_registry_id(&kind, &metadata);
+        Ok(self.unregister_agent(&id).then_some(id))
+    }
+
+    fn unregister_agents_for_pane(&mut self, pane_id: u64) -> Vec<String> {
+        let pane_id = pane_id.to_string();
+        let removed = self
+            .extension_registry
+            .agents
+            .iter()
+            .filter(|agent| agent.metadata.get("pane_id") == Some(&pane_id))
+            .map(|agent| agent.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        self.extension_registry
+            .agents
+            .retain(|agent| !removed.contains(&agent.id));
+        self.extension_registry
+            .notifications
+            .retain(|notification| !removed.contains(&notification.agent_id));
+        removed.into_iter().collect()
+    }
+
     pub fn register_status_publisher(
         &mut self,
         role: String,
@@ -3549,6 +3581,21 @@ impl Manifold {
                 .iter()
                 .any(|live| live == &panel.surface)
         });
+        let closed_panes = self
+            .window_pane_ids
+            .iter()
+            .filter(|(surface, _)| !live_toplevel_surfaces.iter().any(|live| live == surface))
+            .map(|(_, pane)| *pane)
+            .collect::<Vec<_>>();
+        for pane_id in closed_panes {
+            for agent_id in self.unregister_agents_for_pane(pane_id) {
+                info!(
+                    pane_id,
+                    agent_id = %agent_id,
+                    "unregistered agent for closed pane"
+                );
+            }
+        }
         self.window_pane_ids
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         let live_toplevel_pids = live_toplevel_surfaces
