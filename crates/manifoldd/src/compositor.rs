@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -99,8 +100,12 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
         info!(path = %path.display(), "loaded CLI test harness");
     }
 
-    state.nested_inner_dbus_destination = args.nested_inner_dbus_name.clone();
-    state.nested_inner_dbus_address = args.nested_inner_dbus_address.clone();
+    state
+        .nested_inner_dbus_destination
+        .clone_from(&args.nested_inner_dbus_name);
+    state
+        .nested_inner_dbus_address
+        .clone_from(&args.nested_inner_dbus_address);
 
     let control_target =
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
@@ -111,8 +116,10 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
         .or_else(|| env::var("DBUS_SESSION_BUS_ADDRESS").ok());
     state.manifold_session = Some(control_target.session_marker());
     state.manifold_dbus_destination = Some(control_target.destination.clone());
-    state.manifold_dbus_address = control_dbus_address.clone();
-    state.host_dbus_address = control_dbus_address.clone();
+    state
+        .manifold_dbus_address
+        .clone_from(&control_dbus_address);
+    state.host_dbus_address.clone_from(&control_dbus_address);
 
     println!("WAYLAND_DISPLAY={}", state.socket_name.to_string_lossy());
     println!(
@@ -192,7 +199,7 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
 pub fn run_test(args: TestArgs) -> Result<()> {
     match args
         .command
-        .unwrap_or(TestCommand::Nested(NestedTestArgs::default()))
+        .unwrap_or_else(|| TestCommand::Nested(NestedTestArgs::default()))
     {
         TestCommand::Nested(args) => run_nested_test(args),
     }
@@ -554,10 +561,11 @@ fn spawn_inner(
         command.push_str(" --wasm-map-hook ");
         command.push_str(&shell_quote(&wasm_map_hook.display().to_string()));
     }
-    command.push_str(&format!(
+    let _format_result = write!(
+        &mut command,
         " >{} 2>&1",
         shell_quote(&inner_log.display().to_string())
-    ));
+    );
     let inner_args = vec![
         "spawn".to_string(),
         "bash".to_string(),

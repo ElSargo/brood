@@ -884,13 +884,15 @@ fn request_state<T>(
     build: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> DbusStateRequest,
 ) -> fdo::Result<T> {
     let (response_tx, response_rx) = mpsc::channel();
-    sender
-        .send(build(response_tx))
-        .map_err(|_| fdo::Error::Failed("Manifold session loop is not running".to_string()))?;
+    sender.send(build(response_tx)).map_err(|err| {
+        fdo::Error::Failed(format!("Manifold session loop is not running: {err}"))
+    })?;
     response_rx
         .recv_timeout(CONTROL_REPLY_TIMEOUT)
-        .map_err(|_| {
-            fdo::Error::Failed("timed out waiting for Manifold control response".to_string())
+        .map_err(|err| {
+            fdo::Error::Failed(format!(
+                "timed out waiting for Manifold control response: {err}"
+            ))
         })?
         .map_err(fdo::Error::Failed)
 }

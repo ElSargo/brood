@@ -2,7 +2,8 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::{OsStr, OsString},
-    fmt, fs,
+    fmt::{self, Write as _},
+    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -177,8 +178,8 @@ impl BrowserManager {
 
         let child = command.spawn().with_context(|| {
             format!(
-                "spawn Chromium {:?} with WAYLAND_DISPLAY={}",
-                chromium,
+                "spawn Chromium {} with WAYLAND_DISPLAY={}",
+                chromium.display(),
                 wayland_display.to_string_lossy()
             )
         })?;
@@ -197,7 +198,10 @@ impl BrowserManager {
             argv,
         };
         self.instances.push(BrowserInstance { summary, child });
-        Ok(&self.instances.last().expect("inserted browser").summary)
+        let Some(instance) = self.instances.last() else {
+            bail!("inserted browser disappeared");
+        };
+        Ok(&instance.summary)
     }
 
     pub fn list(&mut self) -> Vec<&BrowserInstanceSummary> {
@@ -293,28 +297,28 @@ pub fn handle_control(args: &[String], state: &mut Manifold) -> Result<String> {
         "tabs" => {
             let browser = browser_from_args(rest, state)?;
             let response = devtools_request(browser.devtools_port, "GET", "/json/list", "")?;
-            Ok(format_devtools_response(response))
+            Ok(format_devtools_response(&response))
         }
         "new" => {
             let browser = browser_from_args(rest, state)?;
             let url = rest.get(1).map_or(DEFAULT_URL, String::as_str);
             let path = format!("/json/new?{}", percent_encode(url));
             let response = devtools_request(browser.devtools_port, "PUT", &path, "")?;
-            Ok(format_devtools_response(response))
+            Ok(format_devtools_response(&response))
         }
         "activate" => {
             let browser = browser_from_args(rest, state)?;
             let target_id = take_value(rest, 1, "browser activate target id")?;
             let path = format!("/json/activate/{}", percent_encode_path_segment(target_id));
             let response = devtools_request(browser.devtools_port, "GET", &path, "")?;
-            Ok(format_devtools_response(response))
+            Ok(format_devtools_response(&response))
         }
         "close-target" => {
             let browser = browser_from_args(rest, state)?;
             let target_id = take_value(rest, 1, "browser close-target target id")?;
             let path = format!("/json/close/{}", percent_encode_path_segment(target_id));
             let response = devtools_request(browser.devtools_port, "GET", &path, "")?;
-            Ok(format_devtools_response(response))
+            Ok(format_devtools_response(&response))
         }
         "devtools" => {
             let browser = browser_from_args(rest, state)?;
@@ -322,7 +326,7 @@ pub fn handle_control(args: &[String], state: &mut Manifold) -> Result<String> {
             let path = rest.get(2).map_or("/json/version", String::as_str);
             let body = rest.get(3).map_or("", String::as_str);
             let response = devtools_request(browser.devtools_port, method, path, body)?;
-            Ok(format_devtools_response(response))
+            Ok(format_devtools_response(&response))
         }
         "close" => {
             let Some(id) = rest.first() else {
@@ -339,7 +343,8 @@ pub fn handle_control(args: &[String], state: &mut Manifold) -> Result<String> {
             let summaries = state.browsers.close_all();
             let mut output = format!("OK browsers_closed={}\n", summaries.len());
             for summary in summaries {
-                output.push_str(&format!("browser id={} pid={}\n", summary.id, summary.pid));
+                let _format_result =
+                    writeln!(&mut output, "browser id={} pid={}", summary.id, summary.pid);
             }
             Ok(output)
         }
@@ -351,15 +356,15 @@ fn terminate_instance(mut instance: BrowserInstance) -> Result<BrowserInstanceSu
     if instance.child.try_wait()?.is_none() {
         instance.child.kill()?;
     }
-    let _ = instance.child.wait();
+    let _wait_result = instance.child.wait();
     Ok(instance.summary)
 }
 
 fn terminate_instance_lossy(mut instance: BrowserInstance) -> BrowserInstanceSummary {
     if matches!(instance.child.try_wait(), Ok(None)) {
-        let _ = instance.child.kill();
+        let _kill_result = instance.child.kill();
     }
-    let _ = instance.child.wait();
+    let _wait_result = instance.child.wait();
     instance.summary
 }
 
@@ -557,7 +562,7 @@ fn devtools_request(port: u16, method: &str, path: &str, body: &str) -> Result<D
     })
 }
 
-fn format_devtools_response(response: DevtoolsResponse) -> String {
+fn format_devtools_response(response: &DevtoolsResponse) -> String {
     format!(
         "OK devtools_status={}\n{}\n",
         response.status, response.body
@@ -618,8 +623,9 @@ fn format_browser_list(summaries: Vec<&BrowserInstanceSummary>) -> String {
 
     let mut output = format!("OK browsers={}\n", summaries.len());
     for summary in summaries {
-        output.push_str(&format!(
-            "browser id={} pid={} url={} platform={} devtools=http://127.0.0.1:{} profile={} extensions={} env={} unset_env={}\n",
+        let _format_result = writeln!(
+            &mut output,
+            "browser id={} pid={} url={} platform={} devtools=http://127.0.0.1:{} profile={} extensions={} env={} unset_env={}",
             summary.id,
             summary.pid,
             summary.url,
@@ -629,7 +635,7 @@ fn format_browser_list(summaries: Vec<&BrowserInstanceSummary>) -> String {
             summary.extensions.len(),
             summary.env.len(),
             summary.unset_env.len()
-        ));
+        );
     }
     output
 }
@@ -654,16 +660,16 @@ fn format_browser_inspect(summary: &BrowserInstanceSummary) -> String {
     );
 
     for extension in &summary.extensions {
-        output.push_str(&format!("extension={}\n", extension.display()));
+        let _format_result = writeln!(&mut output, "extension={}", extension.display());
     }
     for key in summary.env.keys() {
-        output.push_str(&format!("env={key}\n"));
+        let _format_result = writeln!(&mut output, "env={key}");
     }
     for key in &summary.unset_env {
-        output.push_str(&format!("unset_env={key}\n"));
+        let _format_result = writeln!(&mut output, "unset_env={key}");
     }
     for arg in &summary.argv {
-        output.push_str(&format!("arg={arg}\n"));
+        let _format_result = writeln!(&mut output, "arg={arg}");
     }
 
     output

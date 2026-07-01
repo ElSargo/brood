@@ -254,7 +254,7 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<RealmState>>) -> Resul
     let mut reader = BufReader::new(stream.try_clone().context("clone DBus client stream")?);
     let guid = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
         .guid
         .clone();
     authenticate(&mut reader, &guid)?;
@@ -262,7 +262,7 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<RealmState>>) -> Resul
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let connection_id = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
         .insert_connection(tx);
 
     let mut writer = stream.try_clone().context("clone DBus writer stream")?;
@@ -280,7 +280,7 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<RealmState>>) -> Resul
     let result = read_messages(&mut reader, connection_id, Arc::clone(&state));
     state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
         .remove_connection(connection_id);
     drop(stream);
     let _ = writer_thread.join();
@@ -425,7 +425,7 @@ fn route_message(
 
     let mut state = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
     if let Some(destination) = destination
         && let Some(owner) = state.name_owner(&destination)
         && owner != connection_id
@@ -460,7 +460,7 @@ fn handle_dbus_method(
 ) -> Result<()> {
     let mut state = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
     match member {
         Some("Hello") => {
             let name = state.unique_name(connection_id);
@@ -617,13 +617,13 @@ fn handle_notifications_method(
 ) -> Result<()> {
     let host_bus_address = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
         .host_bus_address
         .clone();
     let Some(host_bus_address) = host_bus_address else {
         let mut state = state
             .lock()
-            .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+            .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
         return send_error(
             &mut state,
             connection_id,
@@ -643,7 +643,7 @@ fn handle_notifications_method(
             );
             let mut state = state
                 .lock()
-                .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+                .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
             return send_error(
                 &mut state,
                 connection_id,
@@ -663,7 +663,7 @@ fn handle_notifications_method(
         );
         let mut state = state
             .lock()
-            .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+            .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
         return send_reply_from(
             &mut state,
             connection_id,
@@ -675,7 +675,7 @@ fn handle_notifications_method(
 
     let mut state = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
     match reply {
         NotificationMethodReply::Unit => send_reply_from(
             &mut state,
@@ -894,7 +894,7 @@ where
         .build(body)?;
     let mut state = state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?;
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
     send_to(&mut state, connection_id, signal.data().to_vec());
     Ok(())
 }
@@ -972,7 +972,7 @@ fn broadcast(state: &mut RealmState, bytes: Vec<u8>, except: Option<u64>) {
 fn ensure_unique(connection_id: u64, state: &Arc<Mutex<RealmState>>) -> Result<String> {
     Ok(state
         .lock()
-        .map_err(|_| anyhow!("DBus realm state poisoned"))?
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
         .unique_name(connection_id))
 }
 
@@ -1085,8 +1085,9 @@ impl SessionBusRealm {
 
 #[cfg(test)]
 #[allow(
+    clippy::default_trait_access,
     clippy::unwrap_used,
-    reason = "unit tests assert DBus setup succeeds before checking behavior"
+    reason = "unit tests rely on inferred DBus bitflag defaults from zbus"
 )]
 mod tests {
     use super::{

@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use smithay::wayland::shm::ShmState;
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
-    input::{Seat, SeatState},
+    input::{Seat, SeatState, keyboard::XkbConfig},
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
@@ -423,7 +423,7 @@ impl Manifold {
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "manifold");
-        seat.add_keyboard(Default::default(), 200, 25)
+        seat.add_keyboard(XkbConfig::default(), 200, 25)
             .expect("keyboard capability");
         seat.add_pointer();
 
@@ -2100,7 +2100,7 @@ impl Manifold {
         {
             self.layout.set_active_leaf(leaf);
         }
-        self.active_toplevel_surface = active_surface.clone();
+        self.active_toplevel_surface.clone_from(&active_surface);
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             self.refresh_resolved_layout_from_native_policy();
         }
@@ -2526,7 +2526,7 @@ impl Manifold {
         record.attention = true;
         record.unread_notifications = record.unread_notifications.saturating_add(1);
         if matches!(level.as_str(), "waiting" | "blocked" | "error") {
-            record.status = level.clone();
+            record.status.clone_from(&level);
         }
 
         let mut id_metadata = metadata.clone();
@@ -4269,7 +4269,7 @@ fn stable_registry_id<'a, S>(
 where
     S: AsRef<str> + 'a + ?Sized,
 {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for part in parts {
         fnv1a(&mut hash, part.as_ref().as_bytes());
         fnv1a(&mut hash, b"\0");
@@ -4286,7 +4286,7 @@ where
 fn fnv1a(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(0x100000001b3);
+        *hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
 }
 
