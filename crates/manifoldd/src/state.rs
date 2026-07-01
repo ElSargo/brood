@@ -173,6 +173,8 @@ pub struct SurfaceSessionSummary {
     pub name: String,
     pub active: bool,
     pub windows: usize,
+    #[serde(default)]
+    pub working_directory: Option<String>,
 }
 
 pub type ExtensionMetadata = BTreeMap<String, String>;
@@ -1653,6 +1655,10 @@ impl Manifold {
                 name: self.surface_session_name(session).to_string(),
                 active: session == self.active_surface_session,
                 windows: self.surface_session_window_count(session),
+                working_directory: self
+                    .surface_session_working_directories
+                    .get(&session)
+                    .map(|directory| directory.to_string_lossy().into_owned()),
             })
     }
 
@@ -4394,6 +4400,12 @@ mod tests {
         assert_eq!(
             state.resolve_directory_surface_session(&directory),
             Some(session)
+        );
+        assert_eq!(
+            state
+                .surface_session_summary(session)
+                .and_then(|summary| summary.working_directory),
+            Some(directory.to_string_lossy().into_owned())
         );
     }
 

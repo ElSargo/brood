@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import threading
+from pathlib import Path
 
 import dbus
 import dbus.mainloop.glib
@@ -26,6 +32,7 @@ NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
 NOTIFICATION_ACTION_DEFAULT = "default"
 MANIFOLD_SESSION_ENV = "manifold_session"
 PRESENTATION_SESSION = "presentation"
+WORKTREE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def metadata(**items):
@@ -90,17 +97,37 @@ class ManifoldBus:
         return self.notifications
 
     def list_sessions(self):
-        rows = []
-        for session_id, name, active, windows in self.manager.ListSessions():
-            rows.append(
-                {
-                    "id": int(session_id),
-                    "name": str(name),
-                    "active": bool(active),
-                    "windows": int(windows),
-                }
+        try:
+            response = str(
+                self.control.Command(
+                    dbus.Array(["surface-session", "list-json"], signature="s"),
+                    False,
+                )
             )
-        return rows
+            payload = json.loads(response)
+            return [
+                {
+                    "id": int(session["id"]),
+                    "name": str(session["name"]),
+                    "active": bool(session["active"]),
+                    "windows": int(session["windows"]),
+                    "working_directory": str(session.get("working_directory") or ""),
+                }
+                for session in payload.get("sessions", [])
+            ]
+        except Exception:
+            rows = []
+            for session_id, name, active, windows in self.manager.ListSessions():
+                rows.append(
+                    {
+                        "id": int(session_id),
+                        "name": str(name),
+                        "active": bool(active),
+                        "windows": int(windows),
+                        "working_directory": "",
+                    }
+                )
+            return rows
 
     def list_agents(self):
         rows = []
@@ -486,8 +513,18 @@ class SessionSwitcher:
               padding: 2px 6px;
               min-height: 24px;
             }
+            button.worktree-create {
+              background: transparent;
+              border: 1px solid transparent;
+              box-shadow: none;
+              text-shadow: none;
+              padding: 3px 5px;
+              min-height: 32px;
+              min-width: 32px;
+            }
             button.session-select:hover,
-            button.dropdown-toggle:hover {
+            button.dropdown-toggle:hover,
+            button.worktree-create:hover {
               background: rgba(120, 120, 120, 0.14);
             }
             .agent-dot-working {
@@ -542,7 +579,6 @@ class SessionSwitcher:
                 ready="true",
                 pid=os.getpid(),
                 sidebar_registered="false",
-                sidebar_mode=self.args.sidebar_mode,
                 manifold_session=os.environ.get(MANIFOLD_SESSION_ENV, ""),
             )
             return False
@@ -568,10 +604,6 @@ class SessionSwitcher:
         return False
 
     def should_register_sidebar(self):
-        if self.args.sidebar_mode == "always":
-            return True
-        if self.args.sidebar_mode == "never":
-            return False
         return os.environ.get(MANIFOLD_SESSION_ENV) == PRESENTATION_SESSION
 
     def refresh_sessions(self):
@@ -863,6 +895,9 @@ class SessionSwitcher:
         content.set_hexpand(True)
         content.set_vexpand(False)
 
+        session_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        session_row.set_hexpand(True)
+
         session_button = Gtk.Button()
         session_button.get_style_context().add_class("session-select")
         if session["active"]:
@@ -880,7 +915,21 @@ class SessionSwitcher:
             session_button.set_child(session_label)
         else:
             session_button.add(session_label)
-        self.pack(content, session_button, expand=False)
+        self.pack(session_row, session_button, expand=True)
+
+        if GTK4:
+            worktree_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
+        else:
+            worktree_button = Gtk.Button.new_from_icon_name(
+                "list-add-symbolic", Gtk.IconSize.BUTTON
+            )
+        worktree_button.get_style_context().add_class("worktree-create")
+        worktree_button.set_tooltip_text("Create worktree session")
+        worktree_button.set_hexpand(False)
+        worktree_button.set_size_request(32, 32)
+        worktree_button.connect("clicked", self.prompt_worktree_session, session["id"])
+        self.pack(session_row, worktree_button, expand=False)
+        self.pack(content, session_row, expand=False)
 
         agent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         agent_box.set_hexpand(True)
@@ -1010,6 +1059,257 @@ class SessionSwitcher:
             agent_box.set_opacity(0.0)
             self.fade_in(agent_box)
             toggle_button.set_label("v")
+
+    def prompt_worktree_session(self, _button, session_id):
+        session = self.find_session(session_id)
+        write_status(
+            self.args.event_file,
+            event="worktree-session-click",
+            session=session_id,
+        )
+        if session is None:
+            self.report_worktree_error(session_id, "", "unknown session")
+            return
+
+        source_directory = self.session_source_directory(session)
+        if not source_directory:
+            self.report_worktree_error(
+                session_id,
+                "",
+                "session has no working directory; restart Manifold or set MANIFOLD_WORKTREE_SOURCE",
+            )
+            return
+
+        dialog = Gtk.Dialog(
+            title="New Worktree",
+            transient_for=self.window,
+            modal=True,
+        )
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Create", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+
+        content = dialog.get_content_area()
+        content.set_spacing(8)
+        content.set_margin_top(10)
+        content.set_margin_bottom(10)
+        content.set_margin_start(10)
+        content.set_margin_end(10)
+
+        label = Gtk.Label(label="Branch and worktree name")
+        label.set_xalign(0)
+        self.pack(content, label, expand=False)
+
+        entry = Gtk.Entry()
+        entry.set_activates_default(True)
+        entry.set_placeholder_text("feature-name")
+        self.pack(content, entry, expand=False)
+
+        dialog.connect(
+            "response",
+            self.handle_worktree_session_response,
+            entry,
+            {**dict(session), "source_directory": source_directory},
+        )
+        if GTK4:
+            dialog.present()
+        else:
+            dialog.show_all()
+
+    def handle_worktree_session_response(self, dialog, response, entry, session):
+        name = entry.get_text().strip()
+        dialog.destroy()
+        if response != Gtk.ResponseType.ACCEPT or not name:
+            return
+        self.start_worktree_session(session, name)
+
+    def find_session(self, session_id):
+        for session in self.sessions:
+            if session["id"] == session_id:
+                return session
+        return None
+
+    def session_source_directory(self, session):
+        candidates = [session.get("working_directory", "")]
+        for agent in self.agents_by_session.get(session["id"], []):
+            metadata = agent.get("metadata", {})
+            candidates.extend(
+                [
+                    metadata.get("cwd", ""),
+                    metadata.get("working_directory", ""),
+                    metadata.get("project_dir", ""),
+                ]
+            )
+        candidates.extend(
+            [
+                os.environ.get("MANIFOLD_WORKTREE_SOURCE", ""),
+                os.getcwd(),
+            ]
+        )
+        for candidate in candidates:
+            if self.is_git_worktree(candidate):
+                return str(Path(candidate).expanduser())
+        return ""
+
+    def is_git_worktree(self, path):
+        if not path:
+            return False
+        directory = Path(path).expanduser()
+        if not directory.is_dir():
+            return False
+        completed = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+    def start_worktree_session(self, session, raw_name):
+        write_status(
+            self.args.event_file,
+            event="worktree-session-start",
+            session=session["id"],
+            name=raw_name,
+            directory=session.get("source_directory", ""),
+        )
+        thread = threading.Thread(
+            target=self.run_worktree_session,
+            args=(dict(session), raw_name),
+            daemon=True,
+        )
+        thread.start()
+
+    def run_worktree_session(self, session, raw_name):
+        try:
+            branch = self.worktree_name(raw_name)
+            source_dir = Path(session["source_directory"]).expanduser()
+            if not source_dir.is_dir():
+                raise RuntimeError(f"session directory does not exist: {source_dir}")
+
+            repo_root = Path(
+                self.run_checked(
+                    ["git", "-C", str(source_dir), "rev-parse", "--show-toplevel"],
+                    cwd=source_dir,
+                ).strip()
+            )
+            target_dir = repo_root.parent / branch
+            if target_dir.exists():
+                raise RuntimeError(f"worktree path already exists: {target_dir}")
+
+            self.run_checked(
+                [
+                    "git",
+                    "-C",
+                    str(repo_root),
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(target_dir),
+                    "HEAD",
+                ],
+                cwd=repo_root,
+            )
+            self.run_checked(
+                [self.manifold_executable(), "show"],
+                cwd=target_dir,
+                env=os.environ.copy(),
+            )
+            GLib.idle_add(
+                self.finish_worktree_session,
+                session["id"],
+                branch,
+                str(target_dir),
+                "",
+            )
+        except Exception as err:
+            GLib.idle_add(
+                self.finish_worktree_session,
+                session.get("id", "unknown"),
+                raw_name,
+                "",
+                str(err),
+            )
+
+    def worktree_name(self, raw_name):
+        name = WORKTREE_NAME_RE.sub("-", raw_name.strip()).strip(".-")
+        if not name:
+            raise RuntimeError("worktree name is empty after sanitizing")
+        return name
+
+    def run_checked(self, argv, cwd, env=None):
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            if not detail:
+                detail = f"exit status {completed.returncode}"
+            raise RuntimeError(f"{' '.join(argv)} failed: {detail}")
+        return completed.stdout
+
+    def manifold_executable(self):
+        configured = os.environ.get("MANIFOLD_BIN")
+        if configured:
+            return configured
+        installed = shutil.which("manifold")
+        if installed:
+            return installed
+        repo_root = Path(__file__).resolve().parents[1]
+        for candidate in (
+            repo_root / "target" / "debug" / "manifold",
+            repo_root / "result" / "bin" / "manifold",
+        ):
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return "manifold"
+
+    def finish_worktree_session(self, session_id, name, directory, error):
+        if error:
+            self.report_worktree_error(session_id, name, error)
+        else:
+            write_status(
+                self.args.event_file,
+                event="worktree-session",
+                session=session_id,
+                name=name,
+                directory=directory,
+            )
+            self.refresh_sessions()
+        return False
+
+    def report_worktree_error(self, session_id, name, error):
+        write_status(
+            self.args.event_file,
+            event="worktree-session-error",
+            session=session_id,
+            name=name,
+            error=error,
+        )
+        self.show_error("Worktree session failed", str(error))
+
+    def show_error(self, title, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=title,
+        )
+        dialog.format_secondary_text(message)
+        dialog.connect("response", lambda dialog, _response: dialog.destroy())
+        if GTK4:
+            dialog.present()
+        else:
+            dialog.show_all()
 
     def make_agent_button(self, agent):
         button = Gtk.Button()
@@ -1247,7 +1547,7 @@ def main():
         "--sidebar-mode",
         choices=("auto", "always", "never"),
         default="auto",
-        help="Register as Manifold presentation chrome only in auto presentation launches, always, or never.",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
     return SessionSwitcher(args).run()
