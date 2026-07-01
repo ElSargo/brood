@@ -405,7 +405,15 @@ let
       fi
 
       system="$(nix eval --raw --impure --expr builtins.currentSystem)"
-      attrs=(.#default .#ci ".#checks.$system.lint")
+      attrs=(
+        .#default
+        .#ci
+        ".#checks.$system.lint"
+        .#cargoArtifacts
+        .#clippyCheck
+        .#shellCheck
+        .#manifolddArtifacts
+      )
 
       echo "cache-ci=build attrs=''${attrs[*]}"
       mapfile -t output_paths < <(nix build --no-link --print-out-paths "''${attrs[@]}")
@@ -675,6 +683,7 @@ in
     manifoldWithDesktop
     manifold
     manifoldd
+    manifolddArtifacts
     lintCheck
     runtimeFiles
     shellCheck
