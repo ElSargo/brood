@@ -15,32 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31.9.1
-        with:
-          extra_nix_config: |
-            accept-flake-config = true
-            extra-substituters = https://manifold-platform.cachix.org
-            extra-trusted-public-keys = manifold-platform.cachix.org-1:cXJupbtXzFJe8vIIyt+ZYN+ganoykFuUIZOPfFQ+GP0=
-
-      - name: Configure Cachix
-        uses: cachix/cachix-action@v17
-        with:
-          name: manifold-platform
-          skipPush: true
-
-      - name: Run lints
-        run: nix build --print-build-logs .#checks.x86_64-linux.lint
-
-  build:
-    name: Build
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -67,32 +43,5 @@ jobs:
           name: manifold-platform
           skipPush: true
 
-      - name: Build packages
-        run: nix build --print-build-logs .#default .#dev-workflow .#wasm-examples
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    needs:
-      - lint
-      - build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31.9.1
-        with:
-          extra_nix_config: |
-            accept-flake-config = true
-            extra-substituters = https://manifold-platform.cachix.org
-            extra-trusted-public-keys = manifold-platform.cachix.org-1:cXJupbtXzFJe8vIIyt+ZYN+ganoykFuUIZOPfFQ+GP0=
-
-      - name: Configure Cachix
-        uses: cachix/cachix-action@v17
-        with:
-          name: manifold-platform
-          skipPush: true
-
-      - name: Run tests
-        run: nix build --print-build-logs .#checks.x86_64-linux.test
+      - name: Run CI
+        run: nix run --print-build-logs .#ci
