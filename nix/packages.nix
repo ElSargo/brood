@@ -61,6 +61,23 @@ let
     }
   );
 
+  testCheck = craneLib.cargoTest (
+    craneBaseArgs
+    // {
+      inherit cargoArtifacts;
+      cargoExtraArgs = "--locked -p manifoldd";
+      env = {
+        CARGO_PROFILE = "";
+        LD_LIBRARY_PATH = nativeLibraryPath;
+      };
+      preCheck = ''
+        export XDG_RUNTIME_DIR="$TMPDIR/xdg-runtime"
+        mkdir -p "$XDG_RUNTIME_DIR"
+        chmod 700 "$XDG_RUNTIME_DIR"
+      '';
+    }
+  );
+
   manifolddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
     // {
@@ -373,7 +390,7 @@ let
       fi
 
       echo "ci=job name=test status=started"
-      nix develop .#full -c cargo test -p manifoldd --locked
+      nix build --print-build-logs ".#checks.$system.test"
       echo "ci=job name=test status=passed"
       echo "ci=all status=passed"
     '';
@@ -409,6 +426,7 @@ let
         .#default
         .#ci
         ".#checks.$system.lint"
+        ".#checks.$system.test"
         .#cargoArtifacts
         .#clippyCheck
         .#shellCheck
@@ -687,6 +705,7 @@ in
     lintCheck
     runtimeFiles
     shellCheck
+    testCheck
     wasmExamples
     ;
 }

@@ -95,4 +95,4 @@ jobs:
           skipPush: true
 
       - name: Run tests
-        run: nix develop .#full -c cargo test -p manifoldd --locked
+        run: nix build --print-build-logs .#checks.x86_64-linux.test
