@@ -26,7 +26,7 @@ Whenever possible prefer to test the changes with a "real" workload. Open the re
 
 For agent-driven behavior tests, use the built-in test CLI rather than starting
 a host-visible Manifold presentation yourself. Prefer `cargo run -- test` or
-`target/debug/manifoldd test nested --inner-command '<client command>'` after a
+`target/debug/manifold test nested --inner-command '<client command>'` after a
 build. This starts the outer supervisor headlessly by default and avoids
 creating a new OS window in the current desktop session.
 

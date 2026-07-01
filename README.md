@@ -73,7 +73,7 @@ For automated graphical behavior checks, keep using `test`, for example:
 cargo run -- test nested --inner-command 'weston-simple-egl -f'
 ```
 
-The outer supervisor is offscreen-attached unless `uu--outer-headful` is explicitly
+The outer supervisor is offscreen-attached unless `--outer-headful` is explicitly
 passed.
 The older helper script `tools/dev-nested-manifold.sh` is for host-visible manual
 development and opens a presentation window on the current desktop.
@@ -97,7 +97,7 @@ nix run github:ElSargo/manifold#dev-workflow
 This clones a writable checkout under `~/.cache`, installs the packaged WASM
 example artifacts used by the normal config, starts a normal Manifold session
 from the Nix-built binary, and opens a terminal in that checkout. See
-[Development Environment](docs/dev-environment.md).
+[Develop With Nix](docs/workflows/develop-with-nix.md).
 
 For the larger toolbox with Docker, Go, Firefox, and smoke tools:
 
@@ -123,16 +123,16 @@ Concrete choices for renderer stack, CEF integration, IPC, protocol encoding, WA
 
 ## Docs
 
-- [Vision](docs/vision.md)
-- [Shared Behavior Spec](docs/shared-behavior.md)
+The docs are organized as a wiki-style knowledge base.
+
+- [Knowledge Base Index](docs/index.md)
+- [Overview](docs/overview.md)
 - [Architecture](docs/architecture.md)
-- [Protocol](docs/protocol.md)
-- [Rendering](docs/rendering.md)
-- [Apps](docs/apps.md)
-- [WASM Integration](docs/wasm-integration.md)
-- [WASM Realms](docs/wasm-realms.md)
-- [WASM Test Harness Prototype](docs/wasm-test-harness-prototype.md)
-- [Browser](docs/browser.md)
-- [Wayland](docs/wayland.md)
-- [Development Environment](docs/dev-environment.md)
+- [Runtime](docs/systems/runtime.md)
+- [Testing](docs/systems/testing.md)
+- [Configuration](docs/systems/configuration.md)
+- [Extension Host](docs/systems/extension-host.md)
+- [CLI Reference Pointers](docs/reference/cli.md)
 - [Decision Records](docs/decisions/README.md)
+
+Historical design notes and older prototypes live under `docs/archive/`.

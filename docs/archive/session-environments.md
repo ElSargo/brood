@@ -207,8 +207,9 @@ command = ["./tools/manifold-session-runner"]
 cache_root = ".manifold/cache"
 ```
 
-Custom runners do not receive project, cache, or program arguments. They should
-activate their environment and then run a helper such as `manifold-runner-exec`,
+Custom runners receive the same project, working-directory, session-cache,
+persistent-cache, and inner-binary positional arguments as built-in runners.
+They should activate their environment and then run the supplied inner binary,
 which resolves and execs the assigned program from the current cgroup. This lets
 users add new activation tools by editing an executable or config rather than
 changing Manifold.
