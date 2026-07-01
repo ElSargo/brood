@@ -1567,9 +1567,8 @@ impl Manifold {
             .extension_registry
             .windows
             .iter()
-            .filter_map(|window| {
-                toplevel_matches_identity(self, surface, &window.identity).then(|| window.id.clone())
-            })
+            .filter(|window| toplevel_matches_identity(self, surface, &window.identity))
+            .map(|window| window.id.clone())
             .collect::<Vec<_>>();
         if window_ids.is_empty() {
             return;
