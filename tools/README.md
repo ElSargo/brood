@@ -6,7 +6,7 @@ Experimental backend work that is not part of the supported workflow should live
 
 ## Primary Workflows
 
-Run `./tools/dev-nested-manifold.sh --keep-running` to start a stable Manifold instance, spawn a development Manifold instance inside it, launch a real client inside the dev instance, and sample both `status-json` streams. See [Nested Development Harness](../docs/nested-dev-harness.md).
+Run `./tools/dev-nested-manifold.sh --keep-running` to start a stable Manifold instance, spawn a development Manifold instance inside it, launch a real client inside the dev instance, and sample both `status-json` streams. See [Test Nested Behavior](../docs/workflows/test-nested.md).
 
 Run `./tools/audit-v1-capabilities.sh` from the repo root for the concise v1 acceptance audit. It runs formatting, offline checking, unit tests, headless compositor checks, supported host-backed smoke tests when a host display is available, and the dmabuf capability checks. Set `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1` on a DRM-capable backend to make capability skips fail the audit.
 

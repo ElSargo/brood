@@ -269,7 +269,13 @@ Current usability note:
 - config-loaded startup modules are parsed in `crates/manifoldd/src/config.rs`
 - the checked-in example module path lives in `manifold.toml`
 
-The guest exports:
+The guest should export the current v2 key handler entry point:
+
+```text
+on_key_v2(key_code: i32, key_state: i32, input_mode: i32, ctrl_pressed: i32, modifiers: i32) -> i32
+```
+
+The older v1 entry point remains supported as a compatibility fallback:
 
 ```text
 on_key(key_code: i32, key_state: i32, input_mode: i32, ctrl_pressed: i32) -> i32
@@ -279,6 +285,7 @@ ABI values:
 
 - `key_state`: `0` released, `1` pressed
 - `input_mode`: `0` passthrough, `1` normal
+- `modifiers`: bitset where `1` is Ctrl and `2` is Alt
 - return `0` for unhandled, non-zero for handled
 
 The host imports these functions from module `manifold`:
@@ -308,7 +315,7 @@ calls so it can update its own model before requesting host focus. The older
 
 When a handler is loaded, normal-mode key presses go to `on_key` first. Modified shortcut chords can also be claimed from passthrough mode, which lets workspace-level bindings work without toggling modes first. A successful normal-mode call replaces the built-in normal-mode map for that key path; if the guest traps, Manifold logs the failure and falls back to the built-in handler so the session remains usable during experiments.
 
-The sample handler lives in `examples/wasm-key-handler` and maps a minimal workspace keymap around app-ID-targeted Kitty panes:
+The sample handler lives in `examples/wasm-key-handler` and maps a minimal workspace keymap around app-ID-targeted Foot panes:
 
 - `Ctrl-J` / `Ctrl-K` -> focus next / previous pane
 - `Ctrl-L` / `Ctrl-H` / `Ctrl-S` -> split right, split down, or smart split
