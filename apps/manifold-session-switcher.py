@@ -327,8 +327,8 @@ class SessionSwitcher:
             self.setup_notifications()
             self.refresh_sessions()
             self.refresh_statuses()
+            self.register_with_manifold()
             self.present_window()
-            GLib.timeout_add(250, self.register_with_manifold)
             GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
             GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
             GLib.timeout_add(450, self.animate_working_agents)
@@ -356,8 +356,8 @@ class SessionSwitcher:
         self.setup_notifications()
         self.refresh_sessions()
         self.refresh_statuses()
+        self.register_with_manifold()
         self.present_window()
-        GLib.timeout_add(250, self.register_with_manifold)
         GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
         GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
         GLib.timeout_add(450, self.animate_working_agents)
@@ -604,7 +604,7 @@ class SessionSwitcher:
         return False
 
     def should_register_sidebar(self):
-        return os.environ.get(MANIFOLD_SESSION_ENV) == PRESENTATION_SESSION
+        return bool(os.environ.get(MANIFOLD_SESSION_ENV) or os.environ.get("MANIFOLD_SURFACE_SESSION_ID"))
 
     def refresh_sessions(self):
         try:
@@ -1080,47 +1080,68 @@ class SessionSwitcher:
             )
             return
 
-        dialog = Gtk.Dialog(
-            title="New Worktree",
-            transient_for=self.window,
-            modal=True,
-        )
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Create", Gtk.ResponseType.ACCEPT)
-        dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+        popover = Gtk.Popover()
+        popover.set_parent(_button)
 
-        content = dialog.get_content_area()
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         content.set_spacing(8)
         content.set_margin_top(10)
         content.set_margin_bottom(10)
         content.set_margin_start(10)
         content.set_margin_end(10)
 
-        label = Gtk.Label(label="Branch and worktree name")
+        label = Gtk.Label(label="New worktree branch")
         label.set_xalign(0)
         self.pack(content, label, expand=False)
 
         entry = Gtk.Entry()
-        entry.set_activates_default(True)
         entry.set_placeholder_text("feature-name")
         self.pack(content, entry, expand=False)
 
-        dialog.connect(
-            "response",
-            self.handle_worktree_session_response,
-            entry,
-            {**dict(session), "source_directory": source_directory},
-        )
-        if GTK4:
-            dialog.present()
-        else:
-            dialog.show_all()
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        actions.set_halign(Gtk.Align.END)
+        cancel_button = Gtk.Button(label="Cancel")
+        create_button = Gtk.Button(label="Create")
+        create_button.get_style_context().add_class("suggested-action")
+        self.pack(actions, cancel_button, expand=False)
+        self.pack(actions, create_button, expand=False)
+        self.pack(content, actions, expand=False)
 
-    def handle_worktree_session_response(self, dialog, response, entry, session):
+        session = {**dict(session), "source_directory": source_directory}
+        cancel_button.connect("clicked", self.close_worktree_popover, popover)
+        create_button.connect(
+            "clicked",
+            self.handle_worktree_popover_create,
+            popover,
+            entry,
+            session,
+        )
+        entry.connect(
+            "activate",
+            self.handle_worktree_popover_create,
+            popover,
+            entry,
+            session,
+        )
+        popover.set_child(content)
+        self.worktree_popover = popover
+        popover.popup()
+        entry.grab_focus()
+
+    def close_worktree_popover(self, _button, popover):
+        popover.popdown()
+        popover.unparent()
+        if getattr(self, "worktree_popover", None) is popover:
+            self.worktree_popover = None
+
+    def handle_worktree_popover_create(self, _widget, popover, entry, session):
         name = entry.get_text().strip()
-        dialog.destroy()
-        if response != Gtk.ResponseType.ACCEPT or not name:
+        if not name:
             return
+        popover.popdown()
+        popover.unparent()
+        if getattr(self, "worktree_popover", None) is popover:
+            self.worktree_popover = None
         self.start_worktree_session(session, name)
 
     def find_session(self, session_id):
@@ -1212,14 +1233,34 @@ class SessionSwitcher:
                 ],
                 cwd=repo_root,
             )
+            response = self.run_checked(
+                [
+                    self.manifold_executable(),
+                    "ctl",
+                    "surface-session",
+                    "dir-new",
+                    str(target_dir),
+                    "default",
+                    branch,
+                ],
+                cwd=target_dir,
+                env=os.environ.copy(),
+            )
+            session_id = self.parse_surface_session_active(response)
             self.run_checked(
-                [self.manifold_executable(), "show"],
+                [
+                    self.manifold_executable(),
+                    "show",
+                    "--id",
+                    str(session_id),
+                    "--set-default",
+                ],
                 cwd=target_dir,
                 env=os.environ.copy(),
             )
             GLib.idle_add(
                 self.finish_worktree_session,
-                session["id"],
+                session_id,
                 branch,
                 str(target_dir),
                 "",
@@ -1255,6 +1296,14 @@ class SessionSwitcher:
                 detail = f"exit status {completed.returncode}"
             raise RuntimeError(f"{' '.join(argv)} failed: {detail}")
         return completed.stdout
+
+    def parse_surface_session_active(self, response):
+        for field in response.strip().split():
+            if field.startswith("active="):
+                return int(field.removeprefix("active="))
+        raise RuntimeError(
+            f"surface-session dir-new response missing active session: {response.strip()}"
+        )
 
     def manifold_executable(self):
         configured = os.environ.get("MANIFOLD_BIN")

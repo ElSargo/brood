@@ -1482,6 +1482,7 @@ impl Manifold {
         let registered = self.register_toplevel_pane_and_session(surface);
         self.window_surface_sessions
             .push((surface.clone(), registered.session));
+        self.apply_registered_extension_grants_for_surface(surface);
         if registered.presentation {
             self.mark_presentation_child_surface(surface);
             self.refresh_resolved_layout_from_native_policy();
@@ -1558,6 +1559,73 @@ impl Manifold {
             pane_id: pane,
             session,
             presentation,
+        }
+    }
+
+    fn apply_registered_extension_grants_for_surface(&mut self, surface: &WlSurface) {
+        let window_ids = self
+            .extension_registry
+            .windows
+            .iter()
+            .filter_map(|window| {
+                toplevel_matches_identity(self, surface, &window.identity).then(|| window.id.clone())
+            })
+            .collect::<Vec<_>>();
+        if window_ids.is_empty() {
+            return;
+        }
+
+        let grants = self
+            .extension_registry
+            .grants
+            .iter()
+            .filter(|grant| grant.active)
+            .filter(|grant| {
+                grant
+                    .detail
+                    .get("window_id")
+                    .is_some_and(|id| window_ids.iter().any(|window_id| window_id == id))
+            })
+            .map(|grant| (grant.kind.clone(), grant.detail.clone()))
+            .collect::<Vec<_>>();
+
+        for (kind, detail) in grants {
+            match kind.as_str() {
+                "presentation-membership" => {
+                    if !self
+                        .presentation_member_surfaces
+                        .iter()
+                        .any(|member| member == surface)
+                    {
+                        self.presentation_member_surfaces.push(surface.clone());
+                    }
+                }
+                "placement" => {
+                    if let Some(session) = detail
+                        .get("surface_session")
+                        .or_else(|| detail.get("session_id"))
+                        .and_then(|value| self.resolve_surface_session(value))
+                    {
+                        self.assign_toplevel_surface_session(surface, session);
+                    }
+                    if placement_requests_left_panel(&detail) {
+                        let width =
+                            placement_panel_width(&detail).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
+                        let visible = detail
+                            .get("visible")
+                            .and_then(|value| parse_boolish(value))
+                            .unwrap_or(true);
+                        self.reserve_left_panel(surface.clone(), width, visible);
+                    }
+                    if detail
+                        .get("focus")
+                        .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"))
+                    {
+                        self.focus_toplevel_surface(Some(surface.clone()));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -4068,11 +4136,17 @@ impl Manifold {
 
     fn repair_resolved_layout_for_current_inventory(&mut self) {
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
+            self.collapse_empty_native_layout_leaves();
             self.refresh_resolved_layout_from_native_policy();
             return;
         }
 
         let valid_panes = self.active_surface_session_panes();
+        if let [pane] = valid_panes.as_slice() {
+            self.accepted_resolved_layout = self.single_pane_resolved_layout(*pane);
+            return;
+        }
+
         let mut layout = self.accepted_resolved_layout.clone();
         layout.items.retain(|item| match item.kind {
             LayoutItemKind::Pane { pane } => valid_panes.contains(&pane),
@@ -4092,6 +4166,38 @@ impl Manifold {
                 );
                 self.refresh_resolved_layout_from_native_policy();
             }
+        }
+    }
+
+    fn collapse_empty_native_layout_leaves(&mut self) {
+        loop {
+            let empty_leaf = self.layout.leaf_ids().into_iter().find(|leaf| {
+                self.selected_pane_for_layout_leaf(*leaf)
+                    .is_none_or(|pane| self.active_session_content_surface_for_pane(pane).is_none())
+            });
+            let Some(empty_leaf) = empty_leaf else {
+                return;
+            };
+            if self.layout.remove_leaf(empty_leaf).is_none() {
+                return;
+            }
+            self.layout_leaf_selected_panes
+                .retain(|(leaf, _)| *leaf != empty_leaf);
+        }
+    }
+
+    fn single_pane_resolved_layout(&self, pane: u64) -> ResolvedLayout {
+        ResolvedLayout {
+            items: vec![ResolvedLayoutItem {
+                id: LayoutItemId(pane),
+                kind: LayoutItemKind::Pane { pane },
+                z: 0.0,
+                transform: LocalTransform {
+                    offset: LocalPoint { u: -1.0, v: -1.0 },
+                    size: LocalPoint { u: 2.0, v: 2.0 },
+                },
+                input: InputBehavior::Pane,
+            }],
         }
     }
 

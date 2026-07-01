@@ -500,6 +500,14 @@ impl LayoutState {
         Some((removed_leaf, next_active_leaf))
     }
 
+    pub fn remove_leaf(&mut self, leaf: LayoutLeafId) -> Option<(LayoutLeafId, LayoutLeafId)> {
+        let next_active_leaf = self.root.remove_leaf(leaf)?;
+        if self.active_leaf == leaf {
+            self.active_leaf = next_active_leaf;
+        }
+        Some((leaf, next_active_leaf))
+    }
+
     pub fn active_rect(&self, size: LayoutSize) -> Option<LayoutRect> {
         self.leaf_rect(self.active_leaf, size)
     }
