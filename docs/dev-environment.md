@@ -95,6 +95,13 @@ The package-built binary comes from the Crane package path in `nix/packages.nix`
 The Manifold process deliberately bypasses configured session runners because
 the Nix package already provides the runtime for this entry point.
 
+CI currently treats cached Nix check outputs as authoritative when they are
+available from the trusted Cachix cache. This is the normal Nix model: if the
+derivation and inputs match, substituting `checks.test` is equivalent to a prior
+successful run by a trusted builder. We may still choose to add an explicit
+GitHub-only test lane later if we want every CI run to execute the test binaries
+again instead of accepting the cached check output.
+
 The cached checkout is intentionally writable and reused between runs. The
 workflow should not reset local edits in that checkout. To point the one-liner at
 another repository, branch, checkout directory, or startup client, set
