@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
@@ -87,13 +87,57 @@ pub fn run(args: RunArgs) -> Result<()> {
 }
 
 pub fn serve_session(args: SessionArgs) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("manifold-tokio")
+        .enable_all()
+        .build()
+        .context("start Tokio runtime")?;
+    let runtime_handle = runtime.handle().clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let calloop_thread = thread::Builder::new()
+        .name("manifold-calloop".to_string())
+        .spawn(move || {
+            let result = serve_session_on_calloop_thread(args, runtime_handle);
+            result_tx.send(result).ok();
+        })
+        .context("spawn calloop compositor thread")?;
+
+    runtime.block_on(async move {
+        tokio::task::spawn_blocking(move || {
+            let result = result_rx
+                .recv()
+                .context("calloop compositor thread exited without result")?;
+            calloop_thread.join().map_err(compositor_thread_panic)?;
+            result
+        })
+        .await
+        .context("join calloop compositor thread")?
+    })
+}
+
+fn compositor_thread_panic(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        anyhow!("calloop compositor thread panicked: {message}")
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        anyhow!("calloop compositor thread panicked: {message}")
+    } else {
+        anyhow!("calloop compositor thread panicked")
+    }
+}
+
+fn serve_session_on_calloop_thread(
+    args: SessionArgs,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
     let mut event_loop: EventLoop<'static, Manifold> = EventLoop::try_new()?;
     let display: Display<Manifold> = Display::new()?;
     let mut state = Manifold::new(&mut event_loop, display);
+    state.set_async_runtime(runtime.clone());
     let config_path = args.resolved_config_path();
     if args.no_initial_surface_session {
         state.clear_initial_surface_session();
     }
+    config::load_runtime_settings(&mut state, &config_path)?;
 
     if !args.no_default_modules {
         config::load_startup_modules(&mut state, &config_path)?;
@@ -110,7 +154,7 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
     }
 
     if let Some(path) = args.test_harness.as_deref() {
-        state.test_harness = Some(TestHarnessRuntime::start(path)?);
+        state.test_harness = Some(TestHarnessRuntime::start_on_runtime(path, &runtime));
         info!(path = %path.display(), "loaded CLI test harness");
     }
 
@@ -123,7 +167,7 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
 
     let control_target =
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
-    control::listen(&mut event_loop, control_target.clone())?;
+    control::listen(&mut event_loop, control_target.clone(), runtime)?;
     let control_dbus_address = control_target
         .address
         .clone()

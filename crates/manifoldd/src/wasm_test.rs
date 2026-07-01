@@ -14,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use tokio::runtime::Handle as TokioHandle;
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 
 use crate::control;
@@ -66,33 +67,31 @@ pub struct TestHarnessRuntime {
 }
 
 impl TestHarnessRuntime {
-    pub fn start(path: &Path) -> Result<Self> {
+    pub fn start_on_runtime(path: &Path, runtime: &TokioHandle) -> Self {
         let (requests_tx, requests_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::channel();
         let (signal_tx, signal_rx) = mpsc::sync_channel(64);
         let path = path.to_path_buf();
-        let thread_path = path.clone();
-        thread::Builder::new()
-            .name("manifold-test-harness".to_string())
-            .spawn(move || {
-                if let Err(err) =
-                    run_harness_thread(&thread_path, requests_tx, signal_rx, completion_tx.clone())
-                {
-                    let _ = completion_tx.send(TestHarnessCompletion {
-                        kind: TestHarnessOutcomeKind::Failed,
-                        exit_code: 1,
-                        detail: err.to_string(),
-                    });
-                }
-            })
-            .with_context(|| format!("spawn test harness thread for {}", path.display()))?;
+        let run_harness = move || {
+            if let Err(err) =
+                run_harness_thread(&path, requests_tx, signal_rx, completion_tx.clone())
+            {
+                let _ = completion_tx.send(TestHarnessCompletion {
+                    kind: TestHarnessOutcomeKind::Failed,
+                    exit_code: 1,
+                    detail: err.to_string(),
+                });
+            }
+        };
+        let task = runtime.spawn_blocking(run_harness);
+        drop(task);
 
-        Ok(Self {
+        Self {
             requests: requests_rx,
             completion: completion_rx,
             signal_sender: signal_tx,
             completed: false,
-        })
+        }
     }
 
     pub fn take_pending_requests(&self) -> Vec<TestHarnessRequest> {

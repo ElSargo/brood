@@ -970,7 +970,7 @@ impl PresenterEventSource {
     pub fn new(
         runtime: SharedPresenterRuntime,
     ) -> Result<Self, smithay::reexports::winit::error::EventLoopError> {
-        let event_loop = EventLoop::builder().build()?;
+        let event_loop = new_presenter_event_loop()?;
         event_loop.set_control_flow(smithay::reexports::winit::event_loop::ControlFlow::Poll);
         let event_loop = Generic::new(event_loop, Interest::READ, calloop::Mode::Level);
         Ok(Self {
@@ -1034,6 +1034,28 @@ impl PresenterEventSource {
             );
         }
     }
+}
+
+fn new_presenter_event_loop()
+-> Result<EventLoop<()>, smithay::reexports::winit::error::EventLoopError> {
+    let mut builder = EventLoop::builder();
+    #[cfg(all(
+        unix,
+        not(target_os = "android"),
+        not(target_os = "ios"),
+        not(target_os = "macos")
+    ))]
+    {
+        smithay::reexports::winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
+            &mut builder,
+            true,
+        );
+        smithay::reexports::winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(
+            &mut builder,
+            true,
+        );
+    }
+    builder.build()
 }
 
 struct PresenterApp<'a, F: FnMut(PresenterEvent)> {

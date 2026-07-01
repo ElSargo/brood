@@ -29,7 +29,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -44,7 +44,7 @@ use smithay::{
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::{
-            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, channel,
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
@@ -96,6 +96,7 @@ const LEFT_PANEL_MIN_WIDTH: i32 = 180;
 const LEFT_PANEL_MAX_WIDTH: i32 = 560;
 const LEFT_PANEL_KEYBOARD_STEP: i32 = 32;
 const LEFT_PANEL_SPLITTER_HITBOX: f64 = 8.0;
+const DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT: usize = 3;
 pub const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
 const MANIFOLD_SURFACE_SESSION_ID_ENV: &str = "MANIFOLD_SURFACE_SESSION_ID";
 const SESSION_OUTPUT_SIZE: (i32, i32) = (1280, 800);
@@ -132,15 +133,96 @@ pub enum FocusDirection {
 
 struct HostedChild {
     command: String,
-    child: Child,
+    child: Option<Child>,
+    pid: u32,
     pane_id: Option<u64>,
+}
+
+struct HostedChildStarted {
+    pid: u32,
+    command: String,
+    pane_id: u64,
+    session: SurfaceSessionId,
+}
+
+struct HostedChildSpawnFailure {
+    command: String,
+    pane_id: u64,
+    error: String,
+}
+
+struct HostedChildExit {
+    pid: u32,
+    command: String,
+    pane_id: Option<u64>,
+    result: std::io::Result<ExitStatus>,
+}
+
+enum HostedChildEvent {
+    Started(HostedChildStarted),
+    SpawnFailed(HostedChildSpawnFailure),
+    Exited(HostedChildExit),
+}
+
+fn record_hosted_child_exit_status(
+    hosted_child_exits: &mut u64,
+    hosted_child_failures: &mut u64,
+    hosted_child_last_status: &mut Option<String>,
+    command: &str,
+    pane_id: Option<u64>,
+    status: ExitStatus,
+) {
+    *hosted_child_exits += 1;
+    if !status.success() {
+        *hosted_child_failures += 1;
+    }
+    let detail = match status.code() {
+        Some(code) => format!("exit:{code}"),
+        None => "signal".to_string(),
+    };
+    *hosted_child_last_status = Some(format!("{command}:{detail}"));
+    info!(
+        command,
+        pane_id = ?pane_id,
+        status = %detail,
+        success = status.success(),
+        "hosted Wayland app exited"
+    );
+}
+
+fn record_hosted_child_exit_error(
+    hosted_child_exits: &mut u64,
+    hosted_child_failures: &mut u64,
+    hosted_child_last_status: &mut Option<String>,
+    command: &str,
+    pane_id: Option<u64>,
+    err: &std::io::Error,
+    status: &str,
+) {
+    *hosted_child_exits += 1;
+    *hosted_child_failures += 1;
+    *hosted_child_last_status = Some(format!("{command}:{status}"));
+    warn!(
+        ?err,
+        command,
+        pane_id = ?pane_id,
+        "failed to poll hosted Wayland app"
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingChildPane {
-    pid: u32,
+    pid: Option<u32>,
     pane_id: u64,
     session: SurfaceSessionId,
+    presentation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegisteredToplevelPane {
+    pane_id: u64,
+    session: SurfaceSessionId,
+    presentation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +462,7 @@ pub struct Manifold {
     pointer_hover_toplevel_surface: Option<WlSurface>,
     pending_pointer_focus_surface: Option<WlSurface>,
     layout_leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
+    native_auto_split_visible_limit: usize,
     native_session_layouts: BTreeMap<SurfaceSessionId, NativeSessionLayout>,
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
@@ -411,6 +494,7 @@ pub struct Manifold {
     surface_session_directories: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
     surface_session_directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
     window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
+    presentation_child_surfaces: Vec<WlSurface>,
     presentation_member_surfaces: Vec<WlSurface>,
     panel_reservations: Vec<PanelReservation>,
     left_panel_resizing: bool,
@@ -430,6 +514,8 @@ pub struct Manifold {
     pub(crate) manifold_dbus_destination: Option<String>,
     pub(crate) manifold_dbus_address: Option<String>,
     hosted_children: Vec<HostedChild>,
+    hosted_child_event_sender: channel::Sender<HostedChildEvent>,
+    async_runtime: Option<tokio::runtime::Handle>,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
     hosted_child_last_status: Option<String>,
@@ -458,6 +544,7 @@ impl Manifold {
         space.map_output(&session_output, (0, 0));
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
+        let hosted_child_event_sender = Self::init_hosted_child_event_source(event_loop);
         Self::init_window_lifecycle_timer(event_loop);
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
@@ -508,6 +595,7 @@ impl Manifold {
             pointer_hover_toplevel_surface: None,
             pending_pointer_focus_surface: None,
             layout_leaf_selected_panes: Vec::new(),
+            native_auto_split_visible_limit: DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT,
             native_session_layouts: BTreeMap::new(),
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
@@ -547,6 +635,7 @@ impl Manifold {
             surface_session_directories: BTreeMap::new(),
             surface_session_directory_defaults: BTreeMap::new(),
             window_surface_sessions: Vec::new(),
+            presentation_child_surfaces: Vec::new(),
             presentation_member_surfaces: Vec::new(),
             panel_reservations: Vec::new(),
             left_panel_resizing: false,
@@ -568,10 +657,20 @@ impl Manifold {
             manifold_dbus_destination: None,
             manifold_dbus_address: None,
             hosted_children: Vec::new(),
+            hosted_child_event_sender,
+            async_runtime: None,
             hosted_child_exits: 0,
             hosted_child_failures: 0,
             hosted_child_last_status: None,
         }
+    }
+
+    pub fn set_async_runtime(&mut self, runtime: tokio::runtime::Handle) {
+        self.async_runtime = Some(runtime);
+    }
+
+    pub const fn set_native_auto_split_visible_limit(&mut self, limit: usize) {
+        self.native_auto_split_visible_limit = limit;
     }
 
     fn init_session_output(display_handle: &DisplayHandle) -> Output {
@@ -660,6 +759,30 @@ impl Manifold {
             .expect("insert window lifecycle timer");
     }
 
+    fn init_hosted_child_event_source(
+        event_loop: &mut EventLoop<'static, Self>,
+    ) -> channel::Sender<HostedChildEvent> {
+        let (sender, receiver) = channel::channel();
+        event_loop
+            .handle()
+            .insert_source(receiver, |event, (), state| {
+                let channel::Event::Msg(event) = event else {
+                    return;
+                };
+                match event {
+                    HostedChildEvent::Started(started) => {
+                        state.record_hosted_child_started(started);
+                    }
+                    HostedChildEvent::SpawnFailed(failure) => {
+                        state.record_hosted_child_spawn_failure(failure);
+                    }
+                    HostedChildEvent::Exited(exit) => state.record_hosted_child_exit(exit),
+                }
+            })
+            .expect("insert hosted child event source");
+        sender
+    }
+
     pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
         self.spawn_hosted_app_in_session(command, self.active_surface_session)
     }
@@ -675,37 +798,24 @@ impl Manifold {
             session.raw()
         );
         let pane_id = self.allocate_pane_id();
-        let mut child = Command::new(command);
-        child.env("WAYLAND_DISPLAY", &self.socket_name);
-        child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
-        child.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
-        self.apply_session_working_directory(&mut child, session);
-        self.apply_control_environment(&mut child, session);
-        let child = child.spawn().with_context(|| {
+        let mut command_builder = Command::new(command);
+        command_builder.env("WAYLAND_DISPLAY", &self.socket_name);
+        command_builder.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
+        command_builder.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+        self.apply_session_working_directory(&mut command_builder, session);
+        self.apply_control_environment(&mut command_builder, session);
+        self.launch_hosted_child(
+            command.to_string_lossy().into_owned(),
+            command_builder,
+            pane_id,
+            session,
+            false,
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
                 command,
                 self.socket_name.to_string_lossy()
-            )
-        })?;
-        self.pending_child_panes.push(PendingChildPane {
-            pid: child.id(),
-            pane_id,
-            session,
-        });
-        info!(
-            command = ?command,
-            pane_id,
-            surface_session = session.raw(),
-            wayland_display = %self.socket_name.to_string_lossy(),
-            "spawned hosted Wayland app"
-        );
-        self.hosted_children.push(HostedChild {
-            command: command.to_string_lossy().into_owned(),
-            child,
-            pane_id: Some(pane_id),
-        });
-        Ok(())
+            ),
+        )
     }
 
     pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<()> {
@@ -727,37 +837,26 @@ impl Manifold {
         );
 
         let pane_id = self.allocate_pane_id();
-        let mut child = Command::new(program);
-        child.args(args).env("WAYLAND_DISPLAY", &self.socket_name);
-        child.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
-        child.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
-        self.apply_session_working_directory(&mut child, session);
-        self.apply_control_environment(&mut child, session);
-        let child = child.spawn().with_context(|| {
+        let mut command_builder = Command::new(program);
+        command_builder
+            .args(args)
+            .env("WAYLAND_DISPLAY", &self.socket_name);
+        command_builder.env(MANIFOLD_PANE_ID_ENV, pane_id.to_string());
+        command_builder.env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+        self.apply_session_working_directory(&mut command_builder, session);
+        self.apply_control_environment(&mut command_builder, session);
+        self.launch_hosted_child(
+            argv.join(" "),
+            command_builder,
+            pane_id,
+            session,
+            false,
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
                 argv,
                 self.socket_name.to_string_lossy()
-            )
-        })?;
-        self.pending_child_panes.push(PendingChildPane {
-            pid: child.id(),
-            pane_id,
-            session,
-        });
-        info!(
-            argv = ?argv,
-            pane_id,
-            surface_session = session.raw(),
-            wayland_display = %self.socket_name.to_string_lossy(),
-            "spawned hosted Wayland app"
-        );
-        self.hosted_children.push(HostedChild {
-            command: argv.join(" "),
-            child,
-            pane_id: Some(pane_id),
-        });
-        Ok(())
+            ),
+        )
     }
 
     pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<()> {
@@ -767,77 +866,234 @@ impl Manifold {
 
         let pane_id = self.allocate_pane_id();
         let session = self.active_surface_session;
-        let mut child = Command::new(program);
-        child
+        let mut command_builder = Command::new(program);
+        command_builder
             .args(args)
             .env("WAYLAND_DISPLAY", &self.socket_name)
             .env(MANIFOLD_PANE_ID_ENV, pane_id.to_string())
-            .env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string())
-            .env(MANIFOLD_SESSION_ENV, "presentation");
-        self.apply_control_environment(&mut child, session);
-        let child = child.spawn().with_context(|| {
+            .env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+        self.apply_control_environment(&mut command_builder, session);
+        command_builder.env(MANIFOLD_SESSION_ENV, "presentation");
+        self.launch_hosted_child(
+            argv.join(" "),
+            command_builder,
+            pane_id,
+            session,
+            true,
             format!(
                 "spawn presentation app {:?} with WAYLAND_DISPLAY={}",
                 argv,
                 self.socket_name.to_string_lossy()
-            )
-        })?;
+            ),
+        )
+    }
+
+    fn launch_hosted_child(
+        &mut self,
+        command_label: String,
+        mut command: Command,
+        pane_id: u64,
+        session: SurfaceSessionId,
+        presentation: bool,
+        spawn_context: String,
+    ) -> Result<()> {
         self.pending_child_panes.push(PendingChildPane {
-            pid: child.id(),
+            pid: None,
             pane_id,
             session,
+            presentation,
         });
-        info!(
-            argv = ?argv,
-            pane_id,
-            wayland_display = %self.socket_name.to_string_lossy(),
-            "spawned presentation app"
-        );
+        if let Some(runtime) = self.async_runtime.clone() {
+            self.spawn_hosted_child_launch_task(runtime, command_label, command, pane_id, session);
+            return Ok(());
+        }
+
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                self.mark_pending_child_started(pane_id, pid);
+                info!(
+                    command = %command_label,
+                    pane_id,
+                    surface_session = session.raw(),
+                    wayland_display = %self.socket_name.to_string_lossy(),
+                    "spawned hosted Wayland app"
+                );
+                self.track_hosted_child(command_label, pid, Some(child), Some(pane_id));
+                Ok(())
+            }
+            Err(err) => {
+                self.pending_child_panes
+                    .retain(|pending| pending.pane_id != pane_id);
+                Err(err).with_context(|| spawn_context)
+            }
+        }
+    }
+
+    fn track_hosted_child(
+        &mut self,
+        command: String,
+        pid: u32,
+        child: Option<Child>,
+        pane_id: Option<u64>,
+    ) {
         self.hosted_children.push(HostedChild {
-            command: argv.join(" "),
+            command,
             child,
-            pane_id: Some(pane_id),
+            pid,
+            pane_id,
         });
-        Ok(())
+    }
+
+    fn mark_pending_child_started(&mut self, pane_id: u64, pid: u32) {
+        if let Some(pending) = self
+            .pending_child_panes
+            .iter_mut()
+            .rev()
+            .find(|pending| pending.pane_id == pane_id)
+        {
+            pending.pid = Some(pid);
+        }
+    }
+
+    fn spawn_hosted_child_launch_task(
+        &self,
+        runtime: tokio::runtime::Handle,
+        command: String,
+        mut child_command: Command,
+        pane_id: u64,
+        session: SurfaceSessionId,
+    ) {
+        let sender = self.hosted_child_event_sender.clone();
+        let task = runtime.spawn_blocking(move || match child_command.spawn() {
+            Ok(mut child) => {
+                let pid = child.id();
+                sender
+                    .send(HostedChildEvent::Started(HostedChildStarted {
+                        pid,
+                        command: command.clone(),
+                        pane_id,
+                        session,
+                    }))
+                    .ok();
+                let result = child.wait();
+                sender
+                    .send(HostedChildEvent::Exited(HostedChildExit {
+                        pid,
+                        command,
+                        pane_id: Some(pane_id),
+                        result,
+                    }))
+                    .ok();
+            }
+            Err(err) => {
+                sender
+                    .send(HostedChildEvent::SpawnFailed(HostedChildSpawnFailure {
+                        command,
+                        pane_id,
+                        error: err.to_string(),
+                    }))
+                    .ok();
+            }
+        });
+        drop(task);
+    }
+
+    fn record_hosted_child_started(&mut self, started: HostedChildStarted) {
+        self.mark_pending_child_started(started.pane_id, started.pid);
+        info!(
+            command = %started.command,
+            pid = started.pid,
+            pane_id = started.pane_id,
+            surface_session = started.session.raw(),
+            wayland_display = %self.socket_name.to_string_lossy(),
+            "spawned hosted Wayland app"
+        );
+        self.track_hosted_child(started.command, started.pid, None, Some(started.pane_id));
+    }
+
+    fn record_hosted_child_spawn_failure(&mut self, failure: HostedChildSpawnFailure) {
+        self.pending_child_panes
+            .retain(|pending| pending.pane_id != failure.pane_id);
+        self.hosted_child_failures += 1;
+        self.hosted_child_last_status = Some(format!("{}:spawn_error", failure.command));
+        warn!(
+            error = %failure.error,
+            command = %failure.command,
+            pane_id = failure.pane_id,
+            "failed to spawn hosted Wayland app"
+        );
     }
 
     pub fn refresh_hosted_children(&mut self) {
         let mut active = Vec::with_capacity(self.hosted_children.len());
         for mut hosted in self.hosted_children.drain(..) {
-            match hosted.child.try_wait() {
+            let Some(child) = hosted.child.as_mut() else {
+                active.push(hosted);
+                continue;
+            };
+            match child.try_wait() {
                 Ok(Some(status)) => {
-                    self.hosted_child_exits += 1;
-                    if !status.success() {
-                        self.hosted_child_failures += 1;
-                    }
-                    let detail = match status.code() {
-                        Some(code) => format!("exit:{code}"),
-                        None => "signal".to_string(),
-                    };
-                    self.hosted_child_last_status = Some(format!("{}:{detail}", hosted.command));
-                    info!(
-                        command = %hosted.command,
-                        pane_id = ?hosted.pane_id,
-                        status = %detail,
-                        success = status.success(),
-                        "hosted Wayland app exited"
+                    record_hosted_child_exit_status(
+                        &mut self.hosted_child_exits,
+                        &mut self.hosted_child_failures,
+                        &mut self.hosted_child_last_status,
+                        &hosted.command,
+                        hosted.pane_id,
+                        status,
                     );
                 }
                 Ok(None) => active.push(hosted),
                 Err(err) => {
-                    self.hosted_child_exits += 1;
-                    self.hosted_child_failures += 1;
-                    self.hosted_child_last_status = Some(format!("{}:poll_error", hosted.command));
-                    warn!(
-                        ?err,
-                        command = %hosted.command,
-                        pane_id = ?hosted.pane_id,
-                        "failed to poll hosted Wayland app"
+                    record_hosted_child_exit_error(
+                        &mut self.hosted_child_exits,
+                        &mut self.hosted_child_failures,
+                        &mut self.hosted_child_last_status,
+                        &hosted.command,
+                        hosted.pane_id,
+                        &err,
+                        "poll_error",
                     );
                 }
             }
         }
         self.hosted_children = active;
+    }
+
+    fn record_hosted_child_exit(&mut self, exit: HostedChildExit) {
+        let mut matched = false;
+        self.hosted_children.retain(|hosted| {
+            let keep = hosted.pid != exit.pid;
+            matched |= !keep;
+            keep
+        });
+        if !matched {
+            warn!(
+                pid = exit.pid,
+                command = %exit.command,
+                pane_id = ?exit.pane_id,
+                "hosted Wayland app exit arrived after child record was gone"
+            );
+        }
+        match exit.result {
+            Ok(status) => record_hosted_child_exit_status(
+                &mut self.hosted_child_exits,
+                &mut self.hosted_child_failures,
+                &mut self.hosted_child_last_status,
+                &exit.command,
+                exit.pane_id,
+                status,
+            ),
+            Err(err) => record_hosted_child_exit_error(
+                &mut self.hosted_child_exits,
+                &mut self.hosted_child_failures,
+                &mut self.hosted_child_last_status,
+                &exit.command,
+                exit.pane_id,
+                &err,
+                "wait_error",
+            ),
+        }
     }
 
     pub const fn hosted_child_count(&self) -> usize {
@@ -909,8 +1165,12 @@ impl Manifold {
             return Ok(bus.1.address().to_string());
         }
 
-        let handle = SessionBusHandle::start(realm, self.host_dbus_address.clone())
-            .context("start in-process session DBus bus")?;
+        let handle = if let Some(runtime) = self.async_runtime.as_ref() {
+            SessionBusHandle::start_on_runtime(realm, self.host_dbus_address.clone(), runtime)
+        } else {
+            SessionBusHandle::start(realm, self.host_dbus_address.clone())
+        }
+        .context("start in-process session DBus bus")?;
         let address = handle.address().to_string();
         self.session_dbus_buses.push((realm, handle));
         info!(
@@ -1219,30 +1479,68 @@ impl Manifold {
     }
 
     pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) -> Option<WlSurface> {
-        let (pane, session) = self.register_toplevel_pane_and_session(surface);
+        let registered = self.register_toplevel_pane_and_session(surface);
         self.window_surface_sessions
-            .push((surface.clone(), session));
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            if self.layout.active_kind() == Some(LayoutLeafKind::Placeholder) {
-                self.layout.occupy_active_leaf();
-            }
-            if self.layout.active_kind() == Some(LayoutLeafKind::Client) {
-                self.set_layout_leaf_selected_pane(self.layout.active_leaf(), pane);
-            }
+            .push((surface.clone(), registered.session));
+        if registered.presentation {
+            self.mark_presentation_child_surface(surface);
+            self.refresh_resolved_layout_from_native_policy();
+            return self.active_content_surface_for_layout_action();
         }
-        self.apply_map_hook_for_pending_pane(pane)
+        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
+            && registered.session == self.active_surface_session
+        {
+            self.place_new_native_pane(registered.pane_id);
+        }
+        self.apply_map_hook_for_pending_pane(registered.pane_id)
+    }
+
+    fn place_new_native_pane(&mut self, pane: u64) {
+        match self.layout.active_kind() {
+            Some(LayoutLeafKind::Client) => {
+                let active_leaf = self.layout.active_leaf();
+                let occupied_pane =
+                    self.selected_pane_for_layout_leaf(active_leaf)
+                        .filter(|selected| {
+                            self.active_session_content_surface_for_pane(*selected)
+                                .is_some()
+                        });
+                let Some(occupied_pane) = occupied_pane else {
+                    self.set_layout_leaf_selected_pane(active_leaf, pane);
+                    return;
+                };
+                if self.resolved_layout_pane_count() >= self.native_auto_split_visible_limit {
+                    return;
+                }
+                let axis = self.smart_split_axis_for_active_leaf();
+                if let Some(new_leaf) = self.layout.split_active(axis) {
+                    self.set_layout_leaf_selected_pane(active_leaf, occupied_pane);
+                    self.set_layout_leaf_selected_pane(new_leaf, pane);
+                    self.layout.set_active_leaf(new_leaf);
+                } else {
+                    self.set_layout_leaf_selected_pane(active_leaf, pane);
+                }
+            }
+            None => {}
+        }
     }
 
     fn register_toplevel_pane_and_session(
         &mut self,
         surface: &WlSurface,
-    ) -> (u64, SurfaceSessionId) {
+    ) -> RegisteredToplevelPane {
         if let Some(pane) = self.pane_for_toplevel_surface(surface) {
-            return (
-                pane,
-                self.session_for_toplevel_surface(surface)
+            return RegisteredToplevelPane {
+                pane_id: pane,
+                session: self
+                    .session_for_toplevel_surface(surface)
                     .unwrap_or_else(|| self.default_surface_session()),
-            );
+                presentation: self.toplevel_process_is_presentation(surface)
+                    || self
+                        .presentation_child_surfaces
+                        .iter()
+                        .any(|child| child == surface),
+            };
         }
         let pending = self.claim_pending_child_pane(surface);
         let pane = pending
@@ -1253,8 +1551,14 @@ impl Manifold {
             .map(|pending| pending.session)
             .or_else(|| self.session_from_toplevel_process(surface))
             .unwrap_or_else(|| self.default_surface_session());
+        let presentation = pending.as_ref().is_some_and(|pending| pending.presentation)
+            || self.toplevel_process_is_presentation(surface);
         self.window_pane_ids.push((surface.clone(), pane));
-        (pane, session)
+        RegisteredToplevelPane {
+            pane_id: pane,
+            session,
+            presentation,
+        }
     }
 
     const fn allocate_pane_id(&mut self) -> u64 {
@@ -1265,12 +1569,27 @@ impl Manifold {
 
     fn claim_pending_child_pane(&mut self, surface: &WlSurface) -> Option<PendingChildPane> {
         let surface_pid = toplevel_pid(self, surface)?;
-        let index = self.pending_child_panes.iter().position(|pending| {
-            let pending_pid = pending.pid.to_string();
-            surface_pid == pending_pid
-                || process_is_ancestor(&surface_pid, &pending_pid)
-                || process_is_ancestor(&pending_pid, &surface_pid)
-        })?;
+        let index = self
+            .pending_child_panes
+            .iter()
+            .position(|pending| {
+                let Some(pending_pid) = pending.pid else {
+                    return false;
+                };
+                let pending_pid = pending_pid.to_string();
+                surface_pid == pending_pid
+                    || process_is_ancestor(&surface_pid, &pending_pid)
+                    || process_is_ancestor(&pending_pid, &surface_pid)
+            })
+            .or_else(|| {
+                let surface_pid = surface_pid.parse::<u32>().ok()?;
+                let pane_id = process_tree_env_var(surface_pid, MANIFOLD_PANE_ID_ENV)?
+                    .parse::<u64>()
+                    .ok()?;
+                self.pending_child_panes
+                    .iter()
+                    .position(|pending| pending.pane_id == pane_id)
+            })?;
         Some(self.pending_child_panes.remove(index))
     }
 
@@ -1280,6 +1599,23 @@ impl Manifold {
             .and_then(|value| value.parse::<u64>().ok())
             .map(SurfaceSessionId::from_raw)
             .filter(|session| self.surface_sessions.contains(session))
+    }
+
+    fn toplevel_process_is_presentation(&self, surface: &WlSurface) -> bool {
+        let Some(pid) = toplevel_pid(self, surface).and_then(|pid| pid.parse::<u32>().ok()) else {
+            return false;
+        };
+        process_tree_env_var(pid, MANIFOLD_SESSION_ENV).as_deref() == Some("presentation")
+    }
+
+    fn mark_presentation_child_surface(&mut self, surface: &WlSurface) {
+        if !self
+            .presentation_child_surfaces
+            .iter()
+            .any(|child| child == surface)
+        {
+            self.presentation_child_surfaces.push(surface.clone());
+        }
     }
 
     fn default_surface_session(&self) -> SurfaceSessionId {
@@ -1982,9 +2318,13 @@ impl Manifold {
 
     fn surface_participates_in_resolved_layout(&self, surface: &WlSurface) -> bool {
         !self
-            .presentation_member_surfaces
+            .presentation_child_surfaces
             .iter()
-            .any(|member| member == surface)
+            .any(|child| child == surface)
+            && !self
+                .presentation_member_surfaces
+                .iter()
+                .any(|member| member == surface)
             && !self
                 .panel_reservations
                 .iter()
@@ -3269,12 +3609,9 @@ impl Manifold {
         if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
             return false;
         }
-        let Some(active_surface) = self.active_toplevel_surface.clone() else {
+        let Some(active_surface) = self.active_content_surface_for_layout_action() else {
             return false;
         };
-        if !self.surface_has_visible_pane_item(&active_surface) {
-            return false;
-        }
         let Some(active_leaf) = self.leaf_for_toplevel_surface(&active_surface) else {
             return false;
         };
@@ -3306,37 +3643,35 @@ impl Manifold {
         if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
             return false;
         }
-        let Some(active_surface) = self.active_toplevel_surface.as_ref() else {
-            return false;
-        };
-        if !self.surface_has_visible_pane_item(active_surface) {
+        if self.active_content_surface_for_layout_action().is_none() {
             return false;
         }
+        let axis = self.smart_split_axis_for_active_leaf();
+        self.split_active_content_leaf(axis)
+    }
+
+    fn active_content_surface_for_layout_action(&self) -> Option<WlSurface> {
+        self.active_toplevel_surface
+            .as_ref()
+            .filter(|surface| self.surface_has_visible_pane_item(surface))
+            .cloned()
+            .or_else(|| self.surface_for_layout_leaf(self.layout.active_leaf()))
+    }
+
+    fn smart_split_axis_for_active_leaf(&self) -> LayoutAxis {
         let rect = self
             .layout
             .active_rect(self.presentation_layout_size())
             .unwrap_or_else(|| fullscreen_layout_rect(self.presentation_layout_size()));
-        let axis = if rect.w >= rect.h {
+        if rect.w >= rect.h {
             LayoutAxis::Horizontal
         } else {
             LayoutAxis::Vertical
-        };
-        self.split_active_content_leaf(axis)
+        }
     }
 
     fn focus_layout_leaf_by_offset(&mut self, offset: isize) -> bool {
         if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
-            return false;
-        }
-        if self
-            .active_toplevel_surface
-            .as_ref()
-            .is_some_and(|surface| {
-                !self.surface_has_visible_pane_item(surface)
-                    && (self.surface_is_visible_presentation_member(surface)
-                        || self.surface_has_visible_panel(surface))
-            })
-        {
             return false;
         }
         let previous_leaf = self.layout.active_leaf();
@@ -3358,17 +3693,6 @@ impl Manifold {
 
     fn remove_active_split(&mut self) -> bool {
         if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
-            return false;
-        }
-        if self
-            .active_toplevel_surface
-            .as_ref()
-            .is_some_and(|surface| {
-                !self.surface_has_visible_pane_item(surface)
-                    && (self.surface_is_visible_presentation_member(surface)
-                        || self.surface_has_visible_panel(surface))
-            })
-        {
             return false;
         }
         let Some((removed_leaf, next_leaf)) = self.layout.remove_active_leaf() else {
@@ -3606,6 +3930,8 @@ impl Manifold {
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.window_surface_sessions
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.presentation_child_surfaces
+            .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.presentation_member_surfaces
             .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.panel_reservations.retain(|panel| {
@@ -3635,12 +3961,15 @@ impl Manifold {
             .filter_map(|surface| toplevel_pid(self, surface))
             .collect::<Vec<_>>();
         self.pending_child_panes.retain(|pending| {
-            let pid = pending.pid.to_string();
+            let Some(pid) = pending.pid else {
+                return true;
+            };
+            let pid_string = pid.to_string();
             live_toplevel_pids.iter().any(|surface_pid| {
-                surface_pid == &pid
-                    || process_is_ancestor(surface_pid, &pid)
-                    || process_is_ancestor(&pid, surface_pid)
-            }) || process_parent_pid(pending.pid).is_some()
+                surface_pid == &pid_string
+                    || process_is_ancestor(surface_pid, &pid_string)
+                    || process_is_ancestor(&pid_string, surface_pid)
+            }) || process_parent_pid(pid).is_some()
         });
         self.repair_resolved_layout_for_current_inventory();
         if self
@@ -3847,7 +4176,6 @@ impl Manifold {
                     "client"
                 }
                 Some(LayoutLeafKind::Client) => "placeholder",
-                Some(LayoutLeafKind::Placeholder) => "placeholder",
                 None => "none",
             };
         }

@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Control and DBus API shape
 
-- `crates/manifoldd/src/control.rs`: `unused_async` is concentrated in DBus
-  interface methods. Removing it properly means changing how the zbus-facing API
-  is exposed, not just deleting keywords.
 - `crates/manifoldd/src/control.rs`: `exit` in the command path shows that CLI
   process policy is still mixed into control logic. A proper fix should return
   typed exit outcomes from command execution and let the binary entrypoint exit.

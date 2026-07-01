@@ -500,12 +500,6 @@ impl LayoutState {
         Some((removed_leaf, next_active_leaf))
     }
 
-    pub fn occupy_active_leaf(&mut self) -> Option<LayoutLeafId> {
-        self.root
-            .set_leaf_kind(self.active_leaf, LayoutLeafKind::Client)
-            .then_some(self.active_leaf)
-    }
-
     pub fn active_rect(&self, size: LayoutSize) -> Option<LayoutRect> {
         self.leaf_rect(self.active_leaf, size)
     }
@@ -598,7 +592,6 @@ impl LayoutLeafId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutLeafKind {
     Client,
-    Placeholder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,19 +617,6 @@ impl LayoutNode {
             Self::Leaf(_) => None,
             Self::Split { first, second, .. } => {
                 first.leaf_kind(target).or_else(|| second.leaf_kind(target))
-            }
-        }
-    }
-
-    fn set_leaf_kind(&mut self, target: LayoutLeafId, kind: LayoutLeafKind) -> bool {
-        match self {
-            Self::Leaf(leaf) if leaf.id == target => {
-                leaf.kind = kind;
-                true
-            }
-            Self::Leaf(_) => false,
-            Self::Split { first, second, .. } => {
-                first.set_leaf_kind(target, kind) || second.set_leaf_kind(target, kind)
             }
         }
     }

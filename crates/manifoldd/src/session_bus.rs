@@ -30,6 +30,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use tokio::{runtime::Handle as TokioHandle, task::JoinHandle};
 use tracing::{debug, warn};
 use zbus::{
     Message,
@@ -107,10 +108,67 @@ pub struct SessionBusHandle {
     dir: PathBuf,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl SessionBusHandle {
     pub(crate) fn start(realm: SessionBusRealm, host_bus_address: Option<String>) -> Result<Self> {
+        let StartedSessionBus {
+            address,
+            socket_path,
+            dir,
+            listener,
+            state,
+            stop,
+        } = Self::bind(realm, host_bus_address)?;
+        let thread_stop = Arc::clone(&stop);
+        let thread_state = Arc::clone(&state);
+        let thread = thread::Builder::new()
+            .name(format!("manifold-dbus-{}", realm.label()))
+            .spawn(move || accept_loop(listener, thread_state, thread_stop))
+            .context("spawn in-process DBus realm thread")?;
+
+        Ok(Self {
+            address,
+            socket_path,
+            dir,
+            stop,
+            thread: Some(thread),
+            task: None,
+        })
+    }
+
+    pub(crate) fn start_on_runtime(
+        realm: SessionBusRealm,
+        host_bus_address: Option<String>,
+        runtime: &TokioHandle,
+    ) -> Result<Self> {
+        let StartedSessionBus {
+            address,
+            socket_path,
+            dir,
+            listener,
+            state,
+            stop,
+        } = Self::bind(realm, host_bus_address)?;
+        let task_stop = Arc::clone(&stop);
+        let task_state = Arc::clone(&state);
+        let task_runtime = runtime.clone();
+        let task = runtime.spawn_blocking(move || {
+            accept_loop_on_runtime(listener, task_state, task_stop, task_runtime);
+        });
+
+        Ok(Self {
+            address,
+            socket_path,
+            dir,
+            stop,
+            thread: None,
+            task: Some(task),
+        })
+    }
+
+    fn bind(realm: SessionBusRealm, host_bus_address: Option<String>) -> Result<StartedSessionBus> {
         let dir = std::env::temp_dir().join(format!(
             "manifold-inprocess-dbus-{}-{}",
             std::process::id(),
@@ -129,19 +187,14 @@ impl SessionBusHandle {
         let address = format!("unix:path={}", socket_path.display());
         let state = Arc::new(Mutex::new(RealmState::new(realm, guid, host_bus_address)));
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let thread_state = Arc::clone(&state);
-        let thread = thread::Builder::new()
-            .name(format!("manifold-dbus-{}", realm.label()))
-            .spawn(move || accept_loop(listener, thread_state, thread_stop))
-            .context("spawn in-process DBus realm thread")?;
 
-        Ok(Self {
+        Ok(StartedSessionBus {
             address,
             socket_path,
             dir,
+            listener,
+            state,
             stop,
-            thread: Some(thread),
         })
     }
 
@@ -157,8 +210,20 @@ impl Drop for SessionBusHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+struct StartedSessionBus {
+    address: String,
+    socket_path: PathBuf,
+    dir: PathBuf,
+    listener: UnixListener,
+    state: Arc<Mutex<RealmState>>,
+    stop: Arc<AtomicBool>,
 }
 
 struct RealmState {
@@ -254,6 +319,34 @@ fn accept_loop(listener: UnixListener, state: Arc<Mutex<RealmState>>, stop: Arc<
                             debug!(?err, "in-process DBus client disconnected");
                         }
                     });
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => {
+                warn!(?err, "in-process DBus realm accept failed");
+                break;
+            }
+        }
+    }
+}
+
+fn accept_loop_on_runtime(
+    listener: UnixListener,
+    state: Arc<Mutex<RealmState>>,
+    stop: Arc<AtomicBool>,
+    runtime: TokioHandle,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let connection_state = Arc::clone(&state);
+                let task = runtime.spawn_blocking(move || {
+                    if let Err(err) = handle_connection(stream, connection_state) {
+                        debug!(?err, "in-process DBus client disconnected");
+                    }
+                });
+                drop(task);
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(std::time::Duration::from_millis(10));

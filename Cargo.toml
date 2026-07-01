@@ -25,11 +25,12 @@ thiserror = "2.0.18"
 toml = "0.9.12"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "sync", "time"] }
 wasmtime = "43.0.2"
 wayland-egl = "0.32.11"
 wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
-zbus = "5.13.2"
+zbus = { version = "5.13.2", default-features = false, features = ["blocking-api", "tokio"] }
 
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -1 }

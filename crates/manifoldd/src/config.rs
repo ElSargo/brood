@@ -16,6 +16,8 @@ pub struct ManifoldConfig {
     #[serde(default)]
     session: SessionConfig,
     #[serde(default)]
+    layout: LayoutConfig,
+    #[serde(default)]
     module: BTreeMap<String, ModuleConfig>,
     #[serde(default)]
     startup: BTreeMap<String, StartupAppConfig>,
@@ -24,6 +26,11 @@ pub struct ManifoldConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 struct SessionConfig {
     runner: Option<SessionRunnerConfig>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct LayoutConfig {
+    auto_split_visible_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -107,6 +114,18 @@ enum StartupRealm {
     #[default]
     Session,
     Presentation,
+}
+
+pub fn load_runtime_settings(state: &mut Manifold, config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config = read_config(config_path)?;
+    if let Some(limit) = config.layout.auto_split_visible_limit {
+        state.set_native_auto_split_visible_limit(limit);
+    }
+    Ok(())
 }
 
 pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<()> {
@@ -432,6 +451,9 @@ mod tests {
             path = "target/layout.wasm"
             capabilities = ["layout:on-map"]
 
+            [layout]
+            auto_split_visible_limit = 3
+
             [startup.agent]
             realm = "session"
             argv = ["foot", "--app-id", "manifold-codex", "codex", "--yolo"]
@@ -459,6 +481,7 @@ mod tests {
         assert_eq!(module.kind, "fast-map-hook");
         assert_eq!(module.path, PathBuf::from("target/layout.wasm"));
         assert_eq!(module.capabilities, ["layout:on-map"]);
+        assert_eq!(config.layout.auto_split_visible_limit, Some(3));
 
         let app = config.startup.get("agent").expect("agent startup app");
         assert!(app.enabled);

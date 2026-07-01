@@ -8,8 +8,7 @@
     clippy::option_if_let_else,
     clippy::too_many_arguments,
     clippy::unnecessary_wraps,
-    clippy::unused_async,
-    reason = "tracked in issues.md: control.rs preserves DBus async signatures and token-oriented command plumbing"
+    reason = "tracked in issues.md: control.rs preserves token-oriented command plumbing while DBus waits cross the compositor actor boundary"
 )]
 // TODO(lint-structure): separate DBus proxy ABI, CLI parsing, and process entrypoint policy.
 
@@ -18,6 +17,7 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -120,15 +120,16 @@ impl ControlTarget {
     }
 }
 
-type ControlResponse = mpsc::Sender<std::result::Result<String, String>>;
-type BoolResponse = mpsc::Sender<std::result::Result<bool, String>>;
-type U64Response = mpsc::Sender<std::result::Result<u64, String>>;
-type SessionListResponse = mpsc::Sender<std::result::Result<Vec<DbusSurfaceSession>, String>>;
-type ExtensionListResponse = mpsc::Sender<std::result::Result<Vec<DbusExtension>, String>>;
-type GrantListResponse = mpsc::Sender<std::result::Result<Vec<DbusGrant>, String>>;
-type StatusListResponse = mpsc::Sender<std::result::Result<Vec<DbusStatusItem>, String>>;
-type AgentListResponse = mpsc::Sender<std::result::Result<Vec<DbusAgent>, String>>;
-type OptionalControlResponse = mpsc::Sender<std::result::Result<Option<String>, String>>;
+type DbusResponse<T> = tokio::sync::oneshot::Sender<std::result::Result<T, String>>;
+type ControlResponse = DbusResponse<String>;
+type BoolResponse = DbusResponse<bool>;
+type U64Response = DbusResponse<u64>;
+type SessionListResponse = DbusResponse<Vec<DbusSurfaceSession>>;
+type ExtensionListResponse = DbusResponse<Vec<DbusExtension>>;
+type GrantListResponse = DbusResponse<Vec<DbusGrant>>;
+type StatusListResponse = DbusResponse<Vec<DbusStatusItem>>;
+type AgentListResponse = DbusResponse<Vec<DbusAgent>>;
+type OptionalControlResponse = DbusResponse<Option<String>>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -350,6 +351,7 @@ impl ControlDbus {
             json,
             response,
         })
+        .await
     }
 }
 
@@ -359,12 +361,14 @@ impl ManagerDbus {
         request_state(&self.sender, |response| {
             DbusStateRequest::ListSurfaceSessions { response }
         })
+        .await
     }
 
     async fn active_session(&self) -> fdo::Result<u64> {
         request_state(&self.sender, |response| DbusStateRequest::ActiveSession {
             response,
         })
+        .await
     }
 
     async fn resolve_session(&self, session: String) -> fdo::Result<u64> {
@@ -372,12 +376,14 @@ impl ManagerDbus {
             query: session,
             response,
         })
+        .await
     }
 
     async fn list_extensions(&self) -> fdo::Result<Vec<DbusExtension>> {
         request_state(&self.sender, |response| DbusStateRequest::ListExtensions {
             response,
         })
+        .await
     }
 }
 
@@ -387,36 +393,42 @@ impl SessionDbus {
         request_state(&self.sender, |response| DbusStateRequest::CurrentStatus {
             response,
         })
+        .await
     }
 
     async fn list_surface_sessions(&self) -> fdo::Result<Vec<DbusSurfaceSession>> {
         request_state(&self.sender, |response| {
             DbusStateRequest::ListSurfaceSessions { response }
         })
+        .await
     }
 
     async fn activate_surface_session(&self, id: u64) -> fdo::Result<bool> {
         request_state(&self.sender, |response| {
             DbusStateRequest::ActivateSurfaceSession { id, response }
         })
+        .await
     }
 
     async fn create_surface_session(&self, name: String) -> fdo::Result<u64> {
         request_state(&self.sender, |response| {
             DbusStateRequest::CreateSurfaceSession { name, response }
         })
+        .await
     }
 
     async fn rename_surface_session(&self, id: u64, name: String) -> fdo::Result<bool> {
         request_state(&self.sender, |response| {
             DbusStateRequest::RenameSurfaceSession { id, name, response }
         })
+        .await
     }
 
     async fn close_surface_session(&self, id: u64) -> fdo::Result<bool> {
         request_state(&self.sender, |response| {
             DbusStateRequest::CloseSurfaceSession { id, response }
         })
+        .await
     }
 }
 
@@ -437,6 +449,7 @@ impl ExtensionDbus {
                 response,
             }
         })
+        .await
     }
 
     async fn unregister_extension(&self, extension_id: String) -> fdo::Result<bool> {
@@ -446,6 +459,7 @@ impl ExtensionDbus {
                 response,
             }
         })
+        .await
     }
 
     async fn list_grants(&self, extension_id: String) -> fdo::Result<Vec<DbusGrant>> {
@@ -453,6 +467,7 @@ impl ExtensionDbus {
             extension_id,
             response,
         })
+        .await
     }
 
     async fn release_grant(&self, grant_id: String) -> fdo::Result<bool> {
@@ -460,6 +475,7 @@ impl ExtensionDbus {
             grant_id,
             response,
         })
+        .await
     }
 }
 
@@ -469,6 +485,7 @@ impl AgentDbus {
         request_state(&self.sender, |response| DbusStateRequest::ListAgents {
             response,
         })
+        .await
     }
 
     async fn register_agent(
@@ -484,7 +501,8 @@ impl AgentDbus {
             metadata,
             sender_name: sender_name.clone(),
             response,
-        })?;
+        })
+        .await?;
         Self::agent_registered(&emitter, &agent_id, &sender_name)
             .await
             .map_err(|err| fdo::Error::Failed(err.to_string()))?;
@@ -506,7 +524,8 @@ impl AgentDbus {
             metadata,
             sender_name: sender_name.clone(),
             response,
-        })?;
+        })
+        .await?;
         if changed {
             Self::agent_updated(&emitter, &agent_id, &sender_name)
                 .await
@@ -537,7 +556,8 @@ impl AgentDbus {
                 metadata,
                 sender_name: sender_name.clone(),
                 response,
-            })?;
+            })
+            .await?;
         Self::agent_notification(
             &emitter,
             &agent_id,
@@ -562,7 +582,8 @@ impl AgentDbus {
                 agent_id: agent_id.clone(),
                 response,
             }
-        })?;
+        })
+        .await?;
         if changed {
             Self::agent_attention_cleared(&emitter, &agent_id)
                 .await
@@ -575,6 +596,7 @@ impl AgentDbus {
         request_state(&self.sender, |response| {
             DbusStateRequest::ShouldNotifyAgentDesktop { agent_id, response }
         })
+        .await
     }
 
     async fn unregister_agent(
@@ -585,7 +607,8 @@ impl AgentDbus {
         let changed = request_state(&self.sender, |response| DbusStateRequest::UnregisterAgent {
             agent_id: agent_id.clone(),
             response,
-        })?;
+        })
+        .await?;
         if changed {
             Self::agent_unregistered(&emitter, &agent_id)
                 .await
@@ -606,7 +629,8 @@ impl AgentDbus {
                 metadata,
                 response,
             }
-        })?;
+        })
+        .await?;
         if let Some(agent_id) = removed {
             Self::agent_unregistered(&emitter, &agent_id)
                 .await
@@ -657,6 +681,7 @@ impl StatusDbus {
         request_state(&self.sender, |response| DbusStateRequest::ListStatus {
             response,
         })
+        .await
     }
 
     async fn register_publisher(
@@ -674,6 +699,7 @@ impl StatusDbus {
                 response,
             }
         })
+        .await
     }
 
     async fn publish(
@@ -692,7 +718,8 @@ impl StatusDbus {
             label: label.clone(),
             metadata: metadata.clone(),
             response,
-        })?;
+        })
+        .await?;
         if changed {
             Self::status_changed(&emitter, &channel, &state, &label, &publisher, &metadata)
                 .await
@@ -711,7 +738,8 @@ impl StatusDbus {
             publisher: publisher.clone(),
             channel: channel.clone(),
             response,
-        })?;
+        })
+        .await?;
         if changed {
             Self::status_cleared(&emitter, &channel, &publisher)
                 .await
@@ -727,7 +755,8 @@ impl StatusDbus {
     ) -> fdo::Result<bool> {
         let changed = request_state(&self.sender, |response| {
             DbusStateRequest::SetPassthroughMode { enabled, response }
-        })?;
+        })
+        .await?;
         if changed && enabled {
             let mut metadata = DbusMetadata::new();
             metadata.insert("scope".to_string(), "workspace".to_string());
@@ -789,6 +818,7 @@ impl CompositorDbus {
             sender_name,
             response,
         })
+        .await
     }
 
     async fn request_placement(
@@ -806,6 +836,7 @@ impl CompositorDbus {
                 response,
             }
         })
+        .await
     }
 
     async fn replace_role(
@@ -823,6 +854,7 @@ impl CompositorDbus {
             sender_name,
             response,
         })
+        .await
     }
 
     async fn request_presentation_membership(
@@ -840,6 +872,7 @@ impl CompositorDbus {
                 response,
             }
         })
+        .await
     }
 
     async fn request_shortcut(
@@ -859,6 +892,7 @@ impl CompositorDbus {
             sender_name,
             response,
         })
+        .await
     }
 
     async fn request_focus(&self, window_id: String) -> fdo::Result<bool> {
@@ -866,12 +900,14 @@ impl CompositorDbus {
             window_id,
             response,
         })
+        .await
     }
 
     async fn focus_presentation_window(&self) -> fdo::Result<bool> {
         request_state(&self.sender, |response| {
             DbusStateRequest::FocusPresentationWindow { response }
         })
+        .await
     }
 
     async fn focus_presentation_window_with_activation_token(
@@ -884,6 +920,7 @@ impl CompositorDbus {
                 response,
             }
         })
+        .await
     }
 
     async fn dismiss(&self, window_id: String) -> fdo::Result<bool> {
@@ -891,25 +928,32 @@ impl CompositorDbus {
             window_id,
             response,
         })
+        .await
     }
 }
 
 fn request_state<T>(
     sender: &channel::Sender<DbusStateRequest>,
-    build: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> DbusStateRequest,
-) -> fdo::Result<T> {
-    let (response_tx, response_rx) = mpsc::channel();
-    sender.send(build(response_tx)).map_err(|err| {
-        fdo::Error::Failed(format!("Manifold session loop is not running: {err}"))
-    })?;
-    response_rx
-        .recv_timeout(CONTROL_REPLY_TIMEOUT)
-        .map_err(|err| {
-            fdo::Error::Failed(format!(
-                "timed out waiting for Manifold control response: {err}"
-            ))
-        })?
-        .map_err(fdo::Error::Failed)
+    build: impl FnOnce(DbusResponse<T>) -> DbusStateRequest,
+) -> impl Future<Output = fdo::Result<T>> {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let send_result = sender.send(build(response_tx));
+    async move {
+        send_result.map_err(|err| {
+            fdo::Error::Failed(format!("Manifold session loop is not running: {err}"))
+        })?;
+        tokio::time::timeout(CONTROL_REPLY_TIMEOUT, response_rx)
+            .await
+            .map_err(|err| {
+                fdo::Error::Failed(format!(
+                    "timed out waiting for Manifold control response: {err}"
+                ))
+            })?
+            .map_err(|err| {
+                fdo::Error::Failed(format!("Manifold control response was dropped: {err}"))
+            })?
+            .map_err(fdo::Error::Failed)
+    }
 }
 
 fn header_sender(header: &Header<'_>) -> String {
@@ -1044,7 +1088,11 @@ trait ManifoldCompositor {
     fn dismiss(&self, window_id: String) -> zbus::Result<bool>;
 }
 
-pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarget) -> Result<()> {
+pub fn listen(
+    event_loop: &mut EventLoop<'static, Manifold>,
+    target: ControlTarget,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
     let (sender, receiver) = channel::channel::<DbusStateRequest>();
     event_loop
         .handle()
@@ -1056,7 +1104,7 @@ pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarg
         })
         .map_err(|err| anyhow::anyhow!("insert DBus control request channel: {err:?}"))?;
 
-    start_dbus_service(target.clone(), sender)?;
+    start_dbus_service(target.clone(), sender, runtime)?;
 
     info!(
         dbus_destination = %target.destination,
@@ -1755,68 +1803,68 @@ struct EnterStatusSnapshot {
 fn start_dbus_service(
     target: ControlTarget,
     sender: channel::Sender<DbusStateRequest>,
+    runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel();
-    thread::Builder::new()
-        .name("manifold-dbus-control".to_string())
-        .spawn(move || {
-            let service_ready_tx = ready_tx.clone();
-            let result = zbus::block_on(async move {
-                let builder = match target.address.as_deref() {
-                    Some(address) => zbus::connection::Builder::address(address)?,
-                    None => zbus::connection::Builder::session()?,
-                };
-                let _connection = builder
-                    .name(target.destination.as_str())?
-                    .serve_at(
-                        CONTROL_OBJECT_PATH,
-                        ControlDbus {
-                            sender: sender.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        CONTROL_OBJECT_PATH,
-                        SessionDbus {
-                            sender: sender.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        MANAGER_OBJECT_PATH,
-                        ManagerDbus {
-                            sender: sender.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        EXTENSION_OBJECT_PATH,
-                        ExtensionDbus {
-                            sender: sender.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        AGENT_OBJECT_PATH,
-                        AgentDbus {
-                            sender: sender.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        STATUS_OBJECT_PATH,
-                        StatusDbus {
-                            sender: sender.clone(),
-                        },
-                    )?
-                    .serve_at(COMPOSITOR_OBJECT_PATH, CompositorDbus { sender })?
-                    .build()
-                    .await?;
-                service_ready_tx.send(Ok::<(), String>(())).ok();
-                std::future::pending::<zbus::Result<()>>().await
-            });
-            let message = match result {
-                Ok(()) => "DBus control service exited".to_string(),
-                Err(err) => err.to_string(),
+    let task = runtime.spawn(async move {
+        let service_ready_tx = ready_tx.clone();
+        let result = async move {
+            let builder = match target.address.as_deref() {
+                Some(address) => zbus::connection::Builder::address(address)?,
+                None => zbus::connection::Builder::session()?,
             };
-            ready_tx.send(Err(message)).ok();
-        })
-        .context("spawn DBus control service thread")?;
+            let _connection = builder
+                .name(target.destination.as_str())?
+                .serve_at(
+                    CONTROL_OBJECT_PATH,
+                    ControlDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(
+                    CONTROL_OBJECT_PATH,
+                    SessionDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(
+                    MANAGER_OBJECT_PATH,
+                    ManagerDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(
+                    EXTENSION_OBJECT_PATH,
+                    ExtensionDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(
+                    AGENT_OBJECT_PATH,
+                    AgentDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(
+                    STATUS_OBJECT_PATH,
+                    StatusDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(COMPOSITOR_OBJECT_PATH, CompositorDbus { sender })?
+                .build()
+                .await?;
+            service_ready_tx.send(Ok::<(), String>(())).ok();
+            std::future::pending::<zbus::Result<()>>().await
+        }
+        .await;
+        let message = match result {
+            Ok(()) => "DBus control service exited".to_string(),
+            Err(err) => err.to_string(),
+        };
+        ready_tx.send(Err(message)).ok();
+    });
+    drop(task);
 
     ready_rx
         .recv_timeout(CONTROL_REPLY_TIMEOUT)
@@ -2440,7 +2488,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
     }
 }
 
-fn send_response<T>(response: mpsc::Sender<std::result::Result<T, String>>, result: Result<T>) {
+fn send_response<T>(response: DbusResponse<T>, result: Result<T>) {
     let response_result = result.map_err(|err| err.to_string());
     if let Err(err) = &response_result {
         warn!(error = %err, "DBus request failed");
