@@ -876,6 +876,11 @@ impl LayoutKeymap {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "layout unit tests assert exact parsed tree positions"
+)]
 mod tests {
     use super::{
         InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutKeymap,

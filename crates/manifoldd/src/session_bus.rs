@@ -1084,6 +1084,10 @@ impl SessionBusRealm {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit tests assert DBus setup succeeds before checking behavior"
+)]
 mod tests {
     use super::{
         NOTIFICATIONS_DESTINATION, NOTIFICATIONS_UNIQUE_NAME, SessionBusHandle, SessionBusRealm,

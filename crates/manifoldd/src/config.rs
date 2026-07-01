@@ -400,6 +400,11 @@ const fn default_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "unit tests use direct fixture setup and positional assertions"
+)]
 mod tests {
     use std::{
         path::{Path, PathBuf},

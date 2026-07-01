@@ -364,6 +364,11 @@ pub fn run_session_cli() -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "CLI parser tests intentionally panic on impossible command variants"
+)]
 mod tests {
     use super::{Args, Command};
     use clap::Parser;

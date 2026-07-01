@@ -3669,6 +3669,10 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "unit tests use direct parse assertions where panic output is useful"
+)]
 mod tests {
     use super::{
         ControlTarget, MissingDirectorySurfaceSessionAction, SessionSwitchOutcome, WasmPlugKind,

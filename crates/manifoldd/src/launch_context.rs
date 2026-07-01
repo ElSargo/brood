@@ -117,6 +117,11 @@ pub fn os_args(args: &[OsString]) -> impl Iterator<Item = &OsStr> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::let_underscore_must_use,
+    reason = "unit tests use direct temp directory setup and best-effort cleanup"
+)]
 mod tests {
     use super::{LaunchRecord, launch_id_from_cgroup_line};
 

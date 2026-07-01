@@ -4352,6 +4352,12 @@ struct WindowRefreshOutcome {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "unit tests use direct fixture setup and focused state assertions"
+)]
 mod tests {
     use super::{
         Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, fullscreen_layout_rect,
