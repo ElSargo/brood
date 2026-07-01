@@ -90,7 +90,7 @@ pub fn dump_bundle(state: &mut Manifold, dir: &Path, options: DumpOptions) -> Re
     if options.include_composed {
         let composed_path = dir.join("composed.png");
         presentation::dump_composed_frame(state, &composed_path)
-            .map_err(|failure| anyhow::anyhow!("presentation capture failed: {:?}", failure))?;
+            .map_err(|failure| anyhow::anyhow!("presentation capture failed: {failure:?}"))?;
         manifest.insert(
             "composed".to_string(),
             json!({ "path": composed_path.file_name().and_then(|s| s.to_str()).unwrap_or("composed.png") }),
@@ -123,11 +123,12 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
         .elements()
         .enumerate()
         .map(|(index, window)| {
-            let surface_id = Manifold::window_toplevel_surface(window)
-                .map(|surface| {
+            let surface_id = Manifold::window_toplevel_surface(window).map_or_else(
+                || "none".to_string(),
+                |surface| {
                     crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()))
-                })
-                .unwrap_or_else(|| "none".to_string());
+                },
+            );
             let rect = state
                 .window_layout_rect(window)
                 .map(|rect| json!({ "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h }));
@@ -203,8 +204,7 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
 
         let buffer_kind = format!("{:?}", buffer_type(&buffer));
         let dimensions = buffer_dimensions(&buffer)
-            .map(|size| json!({ "w": size.w, "h": size.h }))
-            .unwrap_or(Value::Null);
+            .map_or(Value::Null, |size| json!({ "w": size.w, "h": size.h }));
         let has_alpha = buffer_has_alpha(&buffer);
 
         let entry = match save_surface_buffer_png(&buffer, dir, &surface_id) {
@@ -245,7 +245,7 @@ fn save_surface_buffer_png(
     dir: &Path,
     surface_id: &str,
 ) -> Result<Option<PathBuf>> {
-    let capture = with_buffer_contents(buffer, |ptr, len, data| capture_shm_buffer(ptr, len, data))
+    let capture = with_buffer_contents(buffer, capture_shm_buffer)
         .map_err(|err| anyhow::anyhow!("read shm buffer: {err}"));
     let capture = match capture {
         Ok(Some(capture)) => capture,

@@ -57,7 +57,7 @@ use wayland_client::{
 use wayland_egl as wegl;
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 
-pub(crate) type SharedPresenterRuntime = Rc<RefCell<PresenterRuntime>>;
+pub type SharedPresenterRuntime = Rc<RefCell<PresenterRuntime>>;
 
 #[derive(Debug, Clone, Copy)]
 struct RawWaylandDisplay(*mut c_void);
@@ -119,7 +119,7 @@ impl native::EGLNativeDisplay for RawXlibDisplay {
     }
 }
 
-pub(crate) struct PresenterRuntime {
+pub struct PresenterRuntime {
     pub backend: Option<PresenterBackend>,
     pub want_window: bool,
     pub pending_events: Vec<PresenterEvent>,
@@ -304,7 +304,7 @@ enum PresenterTarget {
 }
 
 #[derive(Debug)]
-pub(crate) struct PresenterBackend {
+pub struct PresenterBackend {
     renderer: GlesRenderer,
     _display: EGLDisplay,
     target: Option<PresenterRenderTarget>,
@@ -316,7 +316,7 @@ pub(crate) struct PresenterBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WaylandEglBind {
+pub enum WaylandEglBind {
     RendererDisplay,
     Unsupported,
 }
@@ -534,7 +534,7 @@ impl PresenterBackend {
         self.bind_size = None;
     }
 
-    fn has_target(&self) -> bool {
+    const fn has_target(&self) -> bool {
         self.target.is_some()
     }
 
@@ -553,7 +553,7 @@ impl PresenterBackend {
         self.window().map(WinitWindow::inner_size)
     }
 
-    fn window_is_x11(&self) -> bool {
+    const fn window_is_x11(&self) -> bool {
         matches!(
             self.target.as_ref(),
             Some(PresenterRenderTarget::Window(PresenterFrontend {
@@ -597,24 +597,24 @@ impl PresenterBackend {
             return false;
         };
         window.set_visible(true);
-        if let Some(activation_token) = activation_token.filter(|token| !token.is_empty()) {
-            if let Err(err) = activate_wayland_window_with_token(window, activation_token) {
-                debug!(
-                    ?err,
-                    "failed to activate presentation window with notification activation token"
-                );
-            }
+        if let Some(activation_token) = activation_token.filter(|token| !token.is_empty())
+            && let Err(err) = activate_wayland_window_with_token(window, activation_token)
+        {
+            debug!(
+                ?err,
+                "failed to activate presentation window with notification activation token"
+            );
         }
         window.request_user_attention(Some(UserAttentionType::Critical));
         window.focus_window();
         true
     }
 
-    pub fn take_redraw_requested(&self) -> bool {
+    pub const fn take_redraw_requested(&self) -> bool {
         self.redraw_requested.replace(false)
     }
 
-    pub fn target_name(&self) -> &'static str {
+    pub const fn target_name(&self) -> &'static str {
         match self.target.as_ref() {
             Some(PresenterRenderTarget::Window(_)) => "winit",
             Some(PresenterRenderTarget::Offscreen(_)) => "offscreen",
@@ -622,7 +622,7 @@ impl PresenterBackend {
         }
     }
 
-    pub fn renderer(&mut self) -> &mut GlesRenderer {
+    pub const fn renderer(&mut self) -> &mut GlesRenderer {
         &mut self.renderer
     }
 
@@ -888,7 +888,7 @@ fn create_egl_surface(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum PresenterBackendError {
+pub enum PresenterBackendError {
     #[error("create winit window: {0}")]
     Window(#[from] smithay::reexports::winit::error::OsError),
     #[error("create EGL display: {0}")]
@@ -910,7 +910,7 @@ pub(crate) enum PresenterBackendError {
 }
 
 #[derive(Debug)]
-pub(crate) enum PresenterEvent {
+pub enum PresenterEvent {
     Created,
     CreationFailed(String),
     Resized {
@@ -945,7 +945,7 @@ pub(crate) enum PresenterEvent {
     },
 }
 
-pub(crate) struct PresenterEventSource {
+pub struct PresenterEventSource {
     runtime: SharedPresenterRuntime,
     event_loop: Generic<EventLoop<()>>,
     fake_token: Option<Token>,
@@ -1033,7 +1033,7 @@ struct PresenterApp<'a, F: FnMut(PresenterEvent)> {
 
 impl<F: FnMut(PresenterEvent)> PresenterApp<'_, F> {
     fn timestamp(&self) -> u32 {
-        self.clock.now().as_millis() as u32
+        self.clock.now().as_millis()
     }
 
     fn emit_pending(&mut self) {
@@ -1220,14 +1220,14 @@ impl EventSource for PresenterEventSource {
     }
 }
 
-fn key_state(state: ElementState) -> KeyState {
+const fn key_state(state: ElementState) -> KeyState {
     match state {
         ElementState::Pressed => KeyState::Pressed,
         ElementState::Released => KeyState::Released,
     }
 }
 
-fn button_state(state: ElementState) -> ButtonState {
+const fn button_state(state: ElementState) -> ButtonState {
     match state {
         ElementState::Pressed => ButtonState::Pressed,
         ElementState::Released => ButtonState::Released,
@@ -1251,7 +1251,7 @@ fn button_code(button: WinitMouseButton, is_x11: bool) -> u32 {
     }
 }
 
-fn xorg_mouse_to_libinput(xorg: u32) -> u32 {
+const fn xorg_mouse_to_libinput(xorg: u32) -> u32 {
     match xorg {
         0 => 0,
         1 => 0x110,
@@ -1297,7 +1297,7 @@ fn axis_values(
     }
 }
 
-pub(crate) fn axis_frame(
+pub fn axis_frame(
     horizontal_amount: Option<f64>,
     vertical_amount: Option<f64>,
     horizontal_v120: Option<i32>,

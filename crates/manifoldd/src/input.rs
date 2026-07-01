@@ -313,23 +313,26 @@ impl Manifold {
     }
 
     fn forward_pressed_modifiers_to_focused_client(&mut self, time: u32) {
-        if self.ctrl_pressed && !self.ctrl_forwarded_to_client {
-            if let Some(key_code) = self.ctrl_pressed_key {
-                self.ctrl_forwarded_to_client = true;
-                self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
-            }
+        if self.ctrl_pressed
+            && !self.ctrl_forwarded_to_client
+            && let Some(key_code) = self.ctrl_pressed_key
+        {
+            self.ctrl_forwarded_to_client = true;
+            self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
         }
-        if self.alt_pressed && !self.alt_forwarded_to_client {
-            if let Some(key_code) = self.alt_pressed_key {
-                self.alt_forwarded_to_client = true;
-                self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
-            }
+        if self.alt_pressed
+            && !self.alt_forwarded_to_client
+            && let Some(key_code) = self.alt_pressed_key
+        {
+            self.alt_forwarded_to_client = true;
+            self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
         }
-        if self.shift_pressed && !self.shift_forwarded_to_client {
-            if let Some(key_code) = self.shift_pressed_key {
-                self.shift_forwarded_to_client = true;
-                self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
-            }
+        if self.shift_pressed
+            && !self.shift_forwarded_to_client
+            && let Some(key_code) = self.shift_pressed_key
+        {
+            self.shift_forwarded_to_client = true;
+            self.forward_keyboard_key_to_focused_client(key_code, KeyState::Pressed, time);
         }
     }
 
@@ -377,7 +380,7 @@ impl Manifold {
         let serial = SERIAL_COUNTER.next_serial();
         let hover_surface = self
             .window_under_layout_position(pos)
-            .and_then(|(window, _location)| Manifold::window_toplevel_surface(&window));
+            .and_then(|(window, _location)| Self::window_toplevel_surface(&window));
         self.set_pointer_hover_toplevel_surface(hover_surface);
         let under = self.surface_under(pos);
         self.stats
@@ -431,7 +434,7 @@ impl Manifold {
         let target_window = self.window_under_layout_position(pointer_location);
         let target_surface = target_window
             .as_ref()
-            .and_then(|(window, _location)| Manifold::window_toplevel_surface(window));
+            .and_then(|(window, _location)| Self::window_toplevel_surface(window));
         self.stats.record_input(
             self.presentation == PresentationStatus::Attached && target_window.is_some(),
         );
@@ -528,7 +531,7 @@ impl Manifold {
     }
 }
 
-fn built_in_ctrl_layout_action(key_code: Keycode) -> Option<LayoutAction> {
+const fn built_in_ctrl_layout_action(key_code: Keycode) -> Option<LayoutAction> {
     match key_code {
         KEY_J => Some(LayoutAction::FocusNext),
         KEY_K => Some(LayoutAction::FocusPrevious),

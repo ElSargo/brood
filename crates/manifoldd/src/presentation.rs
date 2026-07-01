@@ -50,7 +50,7 @@ use crate::{
     },
 };
 
-pub(crate) struct PresenterHandle {
+pub struct PresenterHandle {
     pub(crate) runtime: SharedPresenterRuntime,
     pub(crate) output: Output,
     pub(crate) damage_tracker: RefCell<OutputDamageTracker>,
@@ -172,25 +172,24 @@ fn attach_target(
 
     let timer_presenter = Rc::clone(&presenter);
     loop_handle
-        .insert_source(Timer::immediate(), move |_, _, state| {
+        .insert_source(Timer::immediate(), move |_, (), state| {
             apply_pending_attach_state(&timer_presenter, state);
             if target == PresentationTarget::Offscreen {
                 timer_presenter.runtime.borrow_mut().ensure_offscreen();
                 drain_pending_presenter_events(&timer_presenter, state);
-                if offscreen_frame_requested(&timer_presenter, state) {
-                    if let Err(failure) = render_presenter_frame(&timer_presenter, state) {
-                        record_presentation_runtime_failure(state, &failure);
-                        apply_pending_attach_state(&timer_presenter, state);
-                    }
+                if offscreen_frame_requested(&timer_presenter, state)
+                    && let Err(failure) = render_presenter_frame(&timer_presenter, state)
+                {
+                    record_presentation_runtime_failure(state, &failure);
+                    apply_pending_attach_state(&timer_presenter, state);
                 }
             }
             if TEMP_AGGRESSIVE_PRESENTATION_POLL
                 && state.presentation == PresentationStatus::Attached
+                && let Err(failure) = render_presenter_frame(&timer_presenter, state)
             {
-                if let Err(failure) = render_presenter_frame(&timer_presenter, state) {
-                    record_presentation_runtime_failure(state, &failure);
-                    apply_pending_attach_state(&timer_presenter, state);
-                }
+                record_presentation_runtime_failure(state, &failure);
+                apply_pending_attach_state(&timer_presenter, state);
             }
             TimeoutAction::ToDuration(presentation_control_poll_interval(
                 state.presentation,
@@ -204,7 +203,7 @@ fn attach_target(
             .map_err(|err| anyhow!("init winit presentation event loop: {err}"))?;
         let event_presenter = Rc::clone(&presenter);
         loop_handle
-            .insert_source(event_source, move |event, _, state| {
+            .insert_source(event_source, move |event, (), state| {
                 apply_pending_attach_state(&event_presenter, state);
                 handle_presenter_event(&event_presenter, state, event);
             })
@@ -279,10 +278,10 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state, true) {
-                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.request_redraw();
-                }
+            if !schedule_deferred_client_frame(event_presenter, state, true)
+                && let Some(backend) = event_presenter.runtime.borrow().backend.as_ref()
+            {
+                backend.request_redraw();
             }
         }
         PresenterEvent::PointerMotion { position, time } => {
@@ -290,10 +289,10 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state, true) {
-                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.request_redraw();
-                }
+            if !schedule_deferred_client_frame(event_presenter, state, true)
+                && let Some(backend) = event_presenter.runtime.borrow().backend.as_ref()
+            {
+                backend.request_redraw();
             }
         }
         PresenterEvent::PointerButton {
@@ -305,10 +304,10 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state, true) {
-                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.request_redraw();
-                }
+            if !schedule_deferred_client_frame(event_presenter, state, true)
+                && let Some(backend) = event_presenter.runtime.borrow().backend.as_ref()
+            {
+                backend.request_redraw();
             }
         }
         PresenterEvent::PointerAxis {
@@ -330,23 +329,23 @@ fn handle_presenter_event(
             if let Err(err) = state.display_handle.flush_clients() {
                 warn!(?err, "flush clients after presentation input failed");
             }
-            if !schedule_deferred_client_frame(&event_presenter, state, true) {
-                if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
-                    backend.request_redraw();
-                }
+            if !schedule_deferred_client_frame(event_presenter, state, true)
+                && let Some(backend) = event_presenter.runtime.borrow().backend.as_ref()
+            {
+                backend.request_redraw();
             }
         }
         PresenterEvent::Redraw => {
             if state.presentation == PresentationStatus::Detached {
                 return;
             }
-            if schedule_deferred_client_frame(&event_presenter, state, false) {
+            if schedule_deferred_client_frame(event_presenter, state, false) {
                 return;
             }
 
-            if let Err(failure) = render_presenter_frame(&event_presenter, state) {
+            if let Err(failure) = render_presenter_frame(event_presenter, state) {
                 record_presentation_runtime_failure(state, &failure);
-                apply_pending_attach_state(&event_presenter, state);
+                apply_pending_attach_state(event_presenter, state);
             }
         }
         PresenterEvent::CloseRequested => {
@@ -358,14 +357,14 @@ fn handle_presenter_event(
     }
 }
 
-pub(crate) fn request_presenter_redraw_after_client_commit(state: &mut Manifold) {
+pub fn request_presenter_redraw_after_client_commit(state: &mut Manifold) {
     if state.presentation != PresentationStatus::Attached {
         return;
     }
     if state.presentation_visible_window_count() == 0 {
         return;
     }
-    let Some(presenter) = state.presenter.as_ref().cloned() else {
+    let Some(presenter) = state.presenter.clone() else {
         return;
     };
     if state.presentation_redraw_deferred {
@@ -410,7 +409,7 @@ fn schedule_deferred_client_frame(
     let result =
         state
             .loop_handle
-            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+            .insert_source(Timer::from_duration(delay), move |_, (), state| {
                 state.presentation_redraw_deferred = false;
                 apply_pending_attach_state(&timer_presenter, state);
                 if state.presentation == PresentationStatus::Attached {
@@ -443,7 +442,7 @@ fn render_presenter_frame(
     render_presenter_frame_with_capture(presenter, state, None)
 }
 
-pub(crate) fn dump_composed_frame(
+pub fn dump_composed_frame(
     state: &mut Manifold,
     path: &Path,
 ) -> std::result::Result<(), PresentationRuntimeFailure> {
@@ -453,15 +452,13 @@ pub(crate) fn dump_composed_frame(
             detail: "presentation_not_attached".to_string(),
         });
     }
-    let presenter =
-        state
-            .presenter
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| PresentationRuntimeFailure {
-                context: "capture",
-                detail: "presentation_not_attached".to_string(),
-            })?;
+    let presenter = state
+        .presenter
+        .clone()
+        .ok_or_else(|| PresentationRuntimeFailure {
+            context: "capture",
+            detail: "presentation_not_attached".to_string(),
+        })?;
     render_presenter_frame_with_capture(&presenter, state, Some(path))
 }
 
@@ -737,9 +734,7 @@ fn initialize_dmabuf(state: &mut Manifold, backend: &mut PresenterBackend) {
     match render_node {
         Ok(Some(node)) => {
             debug_assert_eq!(advertisement, DmabufAdvertisement::Version4);
-            let feedback = match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone())
-                .build()
-            {
+            let feedback = match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats).build() {
                 Ok(feedback) => feedback,
                 Err(err) => {
                     state.dmabuf.render_node = Some(format!("{node:?}"));
@@ -844,7 +839,7 @@ enum DmabufAdvertisement {
     Version4,
 }
 
-fn dmabuf_advertisement_for(format_count: usize) -> DmabufAdvertisement {
+const fn dmabuf_advertisement_for(format_count: usize) -> DmabufAdvertisement {
     if format_count == 0 {
         return DmabufAdvertisement::Disabled {
             reason: "no_dmabuf_texture_formats",
@@ -855,7 +850,7 @@ fn dmabuf_advertisement_for(format_count: usize) -> DmabufAdvertisement {
 }
 
 #[cfg(test)]
-fn explicit_sync_disabled_reason_for(advertisement: DmabufAdvertisement) -> &'static str {
+const fn explicit_sync_disabled_reason_for(advertisement: DmabufAdvertisement) -> &'static str {
     match advertisement {
         DmabufAdvertisement::Disabled { reason } => reason,
         DmabufAdvertisement::Version4 => "none",
@@ -863,7 +858,7 @@ fn explicit_sync_disabled_reason_for(advertisement: DmabufAdvertisement) -> &'st
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PresentationRuntimeFailure {
+pub struct PresentationRuntimeFailure {
     context: &'static str,
     detail: String,
 }
@@ -896,7 +891,7 @@ fn record_presentation_runtime_failure(state: &mut Manifold, failure: &Presentat
     state.request_detach();
 }
 
-pub(crate) fn sanitize_status_value(value: &str) -> String {
+pub fn sanitize_status_value(value: &str) -> String {
     value
         .chars()
         .map(|ch| {

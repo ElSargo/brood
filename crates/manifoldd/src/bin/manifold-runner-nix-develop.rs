@@ -271,10 +271,10 @@ impl CacheLock {
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                    if !lock_owner_alive(&path) {
-                        remove_path_if_exists(&path)?;
-                    } else {
+                    if lock_owner_alive(&path) {
                         thread::sleep(Duration::from_millis(100));
+                    } else {
+                        remove_path_if_exists(&path)?;
                     }
                 }
                 Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),

@@ -280,20 +280,19 @@ impl WasmKeyHandler {
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|err| anyhow::anyhow!("instantiate WASM key handler: {err}"))?;
-        let on_key = match instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "on_key_v2")
+        let on_key = if let Ok(func) =
+            instance.get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "on_key_v2")
         {
-            Ok(func) => WasmKeyEntry::V2(func),
-            Err(_) => {
-                let func = instance
-                    .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "on_key")
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "find exported on_key_v2(..., modifiers) or on_key(..., ctrl_pressed): {err}"
-                        )
-                    })?;
-                WasmKeyEntry::V1(func)
-            }
+            WasmKeyEntry::V2(func)
+        } else {
+            let func = instance
+                .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "on_key")
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "find exported on_key_v2(..., modifiers) or on_key(..., ctrl_pressed): {err}"
+                    )
+                })?;
+            WasmKeyEntry::V1(func)
         };
 
         Ok(Self { store, on_key })
@@ -357,21 +356,21 @@ impl WasmKeyOutcome {
     }
 }
 
-fn abi_key_state(state: KeyState) -> i32 {
+const fn abi_key_state(state: KeyState) -> i32 {
     match state {
         KeyState::Released => ABI_KEY_RELEASED,
         KeyState::Pressed => ABI_KEY_PRESSED,
     }
 }
 
-fn abi_input_mode(mode: InputMode) -> i32 {
+const fn abi_input_mode(mode: InputMode) -> i32 {
     match mode {
         InputMode::Passthrough => ABI_MODE_PASSTHROUGH,
         InputMode::Normal => ABI_MODE_NORMAL,
     }
 }
 
-fn abi_modifiers(ctrl_pressed: bool, alt_pressed: bool) -> i32 {
+const fn abi_modifiers(ctrl_pressed: bool, alt_pressed: bool) -> i32 {
     let mut modifiers = 0;
     if ctrl_pressed {
         modifiers |= ABI_MOD_CTRL;
@@ -392,7 +391,7 @@ fn read_guest_string(caller: &mut Caller<'_, WasmKeyStore>, ptr: i32, len: i32) 
     );
     let memory = caller
         .get_export("memory")
-        .and_then(|export| export.into_memory())
+        .and_then(wasmtime::Extern::into_memory)
         .context("guest must export memory for spawn_app(ptr, len)")?;
     let ptr = usize::try_from(ptr).context("convert guest string pointer")?;
     let mut bytes = vec![0; len];

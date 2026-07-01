@@ -26,6 +26,7 @@ pub struct LaunchRecord {
 }
 
 impl LaunchRecord {
+    #[must_use]
     pub fn env_pairs(&self) -> [(String, OsString); 3] {
         [
             (
@@ -44,6 +45,7 @@ impl LaunchRecord {
     }
 }
 
+#[must_use]
 pub fn new_launch_id() -> String {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -51,6 +53,7 @@ pub fn new_launch_id() -> String {
     format!("p{}t{stamp}", std::process::id())
 }
 
+#[must_use]
 pub fn scope_unit(id: &str) -> String {
     format!("{SCOPE_PREFIX}{id}.scope")
 }

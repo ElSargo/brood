@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 
     #[cfg(unix)]
     {
-        Err(command.exec()).map_err(Into::into)
+        Err(Into::into(command.exec()))
     }
 
     #[cfg(not(unix))]

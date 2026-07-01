@@ -131,14 +131,14 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
             );
             state.record_presentation_attach_failure(&err.to_string());
         }
-    } else if !args.headless {
-        if let Err(err) = presentation::attach(&event_loop.handle(), &mut state) {
-            warn!(
-                ?err,
-                "failed to attach initial presentation; continuing detached"
-            );
-            state.record_presentation_attach_failure(&err.to_string());
-        }
+    } else if !args.headless
+        && let Err(err) = presentation::attach(&event_loop.handle(), &mut state)
+    {
+        warn!(
+            ?err,
+            "failed to attach initial presentation; continuing detached"
+        );
+        state.record_presentation_attach_failure(&err.to_string());
     }
 
     if !args.no_default_modules {
@@ -199,16 +199,13 @@ pub fn run_test(args: TestArgs) -> Result<()> {
 }
 
 fn run_nested_test(args: NestedTestArgs) -> Result<()> {
-    let out_dir = match args.out_dir.as_ref() {
-        Some(dir) => {
-            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            dir.clone()
-        }
-        None => {
-            let dir = env::temp_dir().join(format!("manifold-nested-test-{}", std::process::id()));
-            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            dir
-        }
+    let out_dir = if let Some(dir) = args.out_dir.as_ref() {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        dir.clone()
+    } else {
+        let dir = env::temp_dir().join(format!("manifold-nested-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        dir
     };
 
     let control_bus_address = env::var("DBUS_SESSION_BUS_ADDRESS").ok();
@@ -426,9 +423,7 @@ fn nested_test_topology(
     args: &NestedTestArgs,
     inherited_session: Option<&OsStr>,
 ) -> NestedTestTopology {
-    let has_inherited_session = inherited_session
-        .map(|session| !session.is_empty())
-        .unwrap_or(false);
+    let has_inherited_session = inherited_session.is_some_and(|session| !session.is_empty());
     if args.force_outer || !has_inherited_session {
         NestedTestTopology::OuterSupervisor
     } else {
@@ -590,10 +585,9 @@ fn wait_for_control_bus(
         }
         if let Ok(response) =
             control::request_dbus_command(target, &[String::from("status-json")], false)
+            && response.trim_start().starts_with('{')
         {
-            if response.trim_start().starts_with('{') {
-                return Ok(());
-            }
+            return Ok(());
         }
         if start.elapsed() > Duration::from_secs(15) {
             let log_tail = read_log_tail(log_path);
@@ -616,17 +610,14 @@ fn wait_for_outer_window(
         }
         if let Ok(response) =
             control::request_dbus_command(outer_target, &[String::from("status-json")], false)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&response)
+            && json
+                .get("windows")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                >= 1
         {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                if json
-                    .get("windows")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-                    >= 1
-                {
-                    return Ok(());
-                }
-            }
+            return Ok(());
         }
         if start.elapsed() > Duration::from_secs(15) {
             let log_tail = read_log_tail(log_path);
@@ -650,30 +641,29 @@ fn wait_for_hosted_inner_command(
         }
         if let Ok(response) =
             control::request_dbus_command(inner_target, &[String::from("status-json")], false)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&response)
         {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response) {
-                let windows = json
-                    .get("windows")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                let frames = json
-                    .get("frames")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                if windows > status_before.windows && frames >= 2 {
-                    return Ok(());
-                }
-                let status = HostedInnerStatus::from_json(&json);
-                if status.failures > status_before.failures {
-                    let last_status = json
-                        .get("hosted_child_last_status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown");
-                    bail!("inner command exited unsuccessfully: {last_status}");
-                }
-                if status.exits > status_before.exits {
-                    return Ok(());
-                }
+            let windows = json
+                .get("windows")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let frames = json
+                .get("frames")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if windows > status_before.windows && frames >= 2 {
+                return Ok(());
+            }
+            let status = HostedInnerStatus::from_json(&json);
+            if status.failures > status_before.failures {
+                let last_status = json
+                    .get("hosted_child_last_status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                bail!("inner command exited unsuccessfully: {last_status}");
+            }
+            if status.exits > status_before.exits {
+                return Ok(());
             }
         }
         if start.elapsed() > Duration::from_secs(15) {
@@ -828,7 +818,7 @@ impl CompositorHandler for Manifold {
                                 if let Some(client) = surface.client() {
                                     let result = state.loop_handle.insert_source(
                                         source,
-                                        move |_, _, data| {
+                                        move |(), (), data| {
                                             let display_handle = data.display_handle.clone();
                                             data.client_compositor_state(&client)
                                                 .blocker_cleared(data, &display_handle);
@@ -865,7 +855,7 @@ impl CompositorHandler for Manifold {
                     Ok((blocker, source)) => {
                         if let Some(client) = surface.client() {
                             let result =
-                                state.loop_handle.insert_source(source, move |_, _, data| {
+                                state.loop_handle.insert_source(source, move |(), _, data| {
                                     let display_handle = data.display_handle.clone();
                                     data.client_compositor_state(&client)
                                         .blocker_cleared(data, &display_handle);
@@ -907,7 +897,7 @@ impl CompositorHandler for Manifold {
             if let Some(window) = self
                 .space
                 .elements()
-                .find(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(&root))
+                .find(|window| Self::window_toplevel_surface(window).as_ref() == Some(&root))
             {
                 window.on_commit();
             }
@@ -964,7 +954,7 @@ impl DmabufHandler for Manifold {
         match result {
             Ok(_) => {
                 self.dmabuf.stats.accepted += 1;
-                if let Err(err) = notifier.successful::<Manifold>() {
+                if let Err(err) = notifier.successful::<Self>() {
                     warn!(
                         ?err,
                         "client disconnected before dmabuf buffer creation completed"
@@ -1007,8 +997,7 @@ fn dmabuf_import_summary(dmabuf: &Dmabuf) -> String {
         .join(".");
     let node = dmabuf
         .node()
-        .map(|node| format!("{node:?}"))
-        .unwrap_or_else(|| "none".to_string());
+        .map_or_else(|| "none".to_string(), |node| format!("{node:?}"));
 
     crate::presentation::sanitize_status_value(&format!(
         "{}x{}:{:?}:{:?}:planes{}:strides{}:offsets{}:yinvert{}:node{}",
@@ -1031,7 +1020,10 @@ enum DmabufBlockerPlan {
     ExplicitSync,
 }
 
-fn dmabuf_blocker_plan(has_dmabuf: bool, has_explicit_acquire_point: bool) -> DmabufBlockerPlan {
+const fn dmabuf_blocker_plan(
+    has_dmabuf: bool,
+    has_explicit_acquire_point: bool,
+) -> DmabufBlockerPlan {
     if !has_dmabuf {
         return DmabufBlockerPlan::None;
     }
@@ -1048,7 +1040,7 @@ impl XdgShellHandler for Manifold {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
-        let active_surface = Manifold::window_toplevel_surface(&window);
+        let active_surface = Self::window_toplevel_surface(&window);
         let mut focus_surface = active_surface.clone();
         if let Some(surface) = active_surface.as_ref() {
             focus_surface = self.assign_new_toplevel_surface(surface);
@@ -1134,21 +1126,20 @@ fn handle_xdg_commit(state: &mut Manifold, surface: &WlSurface) {
             }
         });
 
-        if initial_configure_sent == Some(false) {
-            if let Some(toplevel) = window.toplevel() {
-                toplevel.send_configure();
-            }
+        if initial_configure_sent == Some(false)
+            && let Some(toplevel) = window.toplevel()
+        {
+            toplevel.send_configure();
         }
     }
 
     state.popups.commit(surface);
-    if let Some(PopupKind::Xdg(popup)) = state.popups.find_popup(surface) {
-        if !popup.is_initial_configure_sent() {
-            if let Err(err) = popup.send_configure() {
-                state.stats.xdg_configure_errors += 1;
-                warn!(?err, "send initial popup configure failed");
-            }
-        }
+    if let Some(PopupKind::Xdg(popup)) = state.popups.find_popup(surface)
+        && !popup.is_initial_configure_sent()
+        && let Err(err) = popup.send_configure()
+    {
+        state.stats.xdg_configure_errors += 1;
+        warn!(?err, "send initial popup configure failed");
     }
 }
 

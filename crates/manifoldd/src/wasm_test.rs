@@ -34,7 +34,7 @@ pub enum TestHarnessOutcomeKind {
 }
 
 impl TestHarnessOutcomeKind {
-    fn from_exit_code(code: i32) -> Self {
+    const fn from_exit_code(code: i32) -> Self {
         match code {
             0 => Self::Passed,
             2 => Self::Paused,
@@ -369,7 +369,7 @@ fn write_guest_bytes(
 fn guest_memory(caller: &mut Caller<'_, TestHarnessStore>) -> Result<Memory> {
     caller
         .get_export("memory")
-        .and_then(|export| export.into_memory())
+        .and_then(wasmtime::Extern::into_memory)
         .context("guest must export memory")
 }
 

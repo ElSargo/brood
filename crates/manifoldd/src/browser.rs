@@ -52,7 +52,9 @@ pub struct BrowserInstanceSummary {
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum BrowserPlatform {
+    #[default]
     Auto,
     Wayland,
     X11,
@@ -77,12 +79,6 @@ impl Default for BrowserLaunchOptions {
             app_mode: true,
             platform: BrowserPlatform::Auto,
         }
-    }
-}
-
-impl Default for BrowserPlatform {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
@@ -230,7 +226,7 @@ impl BrowserManager {
         self.reap_finished();
         self.instances
             .drain(..)
-            .map(|instance| terminate_instance_lossy(instance))
+            .map(terminate_instance_lossy)
             .collect()
     }
 

@@ -74,13 +74,13 @@ type DbusAgent = (
 );
 
 #[derive(Clone, Debug)]
-pub(crate) struct ControlTarget {
+pub struct ControlTarget {
     pub(crate) destination: String,
     pub(crate) address: Option<String>,
 }
 
 impl ControlTarget {
-    pub(crate) fn new(destination: String, address: Option<String>) -> Self {
+    pub(crate) const fn new(destination: String, address: Option<String>) -> Self {
         Self {
             destination,
             address,
@@ -898,8 +898,7 @@ fn request_state<T>(
 fn header_sender(header: &Header<'_>) -> String {
     header
         .sender()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "unknown".to_string())
+        .map_or_else(|| "unknown".to_string(), ToString::to_string)
 }
 
 #[proxy(
@@ -1032,7 +1031,7 @@ pub fn listen(event_loop: &mut EventLoop<'static, Manifold>, target: ControlTarg
     let (sender, receiver) = channel::channel::<DbusStateRequest>();
     event_loop
         .handle()
-        .insert_source(receiver, |event, _, state| {
+        .insert_source(receiver, |event, (), state| {
             let Event::Msg(request) = event else {
                 return;
             };
@@ -1167,24 +1166,23 @@ pub fn enter(args: EnterArgs) -> Result<()> {
 
     let mut entered_command_argv = vec![program.clone()];
     entered_command_argv.extend(command_args.iter().cloned());
-    let status = match session_runner::run_project_command_if_configured(
+    let status = if let Some(status) = session_runner::run_project_command_if_configured(
         context.runner.as_ref(),
         &context.current_directory,
         &entered_command_argv,
         &command_env,
         &remove_env,
     )? {
-        Some(status) => status,
-        None => {
-            let mut command = ProcessCommand::new(&program);
-            command
-                .args(&command_args)
-                .envs(command_env.iter().map(|(key, value)| (key, value)));
-            for key in &remove_env {
-                command.env_remove(key);
-            }
-            command.status().context("run entered command")?
+        status
+    } else {
+        let mut command = ProcessCommand::new(&program);
+        command
+            .args(&command_args)
+            .envs(command_env.iter().map(|(key, value)| (key, value)));
+        for key in &remove_env {
+            command.env_remove(key);
         }
+        command.status().context("run entered command")?
     };
 
     match status.code() {
@@ -1275,7 +1273,7 @@ fn resolve_cli_surface_session(
     set_default_requested: bool,
     allow_entered_fallback: bool,
 ) -> Result<(u64, PathBuf, bool)> {
-    let existing_default = resolve_directory_surface_session(target, &current_directory)?;
+    let existing_default = resolve_directory_surface_session(target, current_directory)?;
     let (session_id, set_default) = if let Some(query) = query {
         (
             resolve_surface_session(target, &query)?,
@@ -1309,15 +1307,13 @@ enum MissingDirectorySurfaceSessionAction {
     Active,
 }
 
-fn missing_directory_surface_session_action(
+const fn missing_directory_surface_session_action(
     entered_session_id: Option<u64>,
     create_if_missing: bool,
     allow_entered_fallback: bool,
 ) -> MissingDirectorySurfaceSessionAction {
-    if allow_entered_fallback {
-        if let Some(session_id) = entered_session_id {
-            return MissingDirectorySurfaceSessionAction::Entered(session_id);
-        }
+    if allow_entered_fallback && let Some(session_id) = entered_session_id {
+        return MissingDirectorySurfaceSessionAction::Entered(session_id);
     }
     if create_if_missing {
         MissingDirectorySurfaceSessionAction::Create
@@ -1697,7 +1693,7 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn resolve_control_target(
+pub fn resolve_control_target(
     destination: Option<String>,
     address: Option<String>,
 ) -> ControlTarget {
@@ -1889,7 +1885,7 @@ fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Resul
                     status,
                     &parse_metadata_args(metadata)?,
                 )?;
-                println!("agent id={} changed={changed}", agent_id);
+                println!("agent id={agent_id} changed={changed}");
             }
             [subcommand, agent_id, title, body @ ..] if subcommand == "notify" => {
                 let body = joined_name(body).unwrap_or_default();
@@ -1906,11 +1902,11 @@ fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Resul
             }
             [subcommand, agent_id] if subcommand == "clear" => {
                 let changed = request_agent_clear(target, agent_id)?;
-                println!("agent id={} changed={changed}", agent_id);
+                println!("agent id={agent_id} changed={changed}");
             }
             [subcommand, agent_id] if subcommand == "unregister" => {
                 let changed = request_agent_unregister(target, agent_id)?;
-                println!("agent id={} changed={changed}", agent_id);
+                println!("agent id={agent_id} changed={changed}");
             }
             _ => bail!(
                 "usage: agents list | agents register <kind> [key=value...] | agents status <id> <status> [key=value...] | agents notify <id> <title> [body...] | agents clear <id> | agents unregister <id>"
@@ -2174,7 +2170,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(response, execute_dbus_request(command, json, state)),
         DbusStateRequest::CurrentStatus { response } => {
-            send_response(response, status_json_string(state))
+            send_response(response, status_json_string(state));
         }
         DbusStateRequest::ListSurfaceSessions { response } => {
             state.refresh_window_state();
@@ -2682,7 +2678,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 bail!("focus-app-id requires exactly one app id");
             };
             let changed = state.focus_app_id(app_id);
-            format!("OK focus-app-id app_id={} changed={changed}\n", app_id)
+            format!("OK focus-app-id app_id={app_id} changed={changed}\n")
         }
         "focus-window" => {
             let identity = parse_metadata_args(args)?;
@@ -2735,7 +2731,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             [subcommand, directory] if subcommand == "dir-get" => {
                 let session = state
                     .resolve_directory_surface_session(Path::new(directory))
-                    .map(|session| session.raw());
+                    .map(super::state::SurfaceSessionId::raw);
                 match session {
                     Some(session) => format!("OK surface-session session={session}\n"),
                     None => "OK surface-session session=none\n".to_string(),
@@ -2838,7 +2834,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "harness" => match args {
             [subcommand, name] if subcommand == "signal" => {
                 state.signal_test_harness(name.clone())?;
-                format!("OK harness signal {}\n", name)
+                format!("OK harness signal {name}\n")
             }
             _ => bail!("usage: harness signal <name>"),
         },
@@ -2857,7 +2853,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             [subcommand, dir] if subcommand == "dump" => {
                 let manifest =
                     debug_dump::dump_bundle(state, Path::new(dir), DumpOptions::parse(None)?)?;
-                format!("OK debug dump {}\n", manifest)
+                format!("OK debug dump {manifest}\n")
             }
             [subcommand, dir, selectors] if subcommand == "dump" => {
                 let manifest = debug_dump::dump_bundle(
@@ -2865,7 +2861,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                     Path::new(dir),
                     DumpOptions::parse(Some(selectors))?,
                 )?;
-                format!("OK debug dump {}\n", manifest)
+                format!("OK debug dump {manifest}\n")
             }
             _ => bail!("usage: debug dump <dir> [state,composed,surfaces]"),
         },
@@ -3130,7 +3126,7 @@ impl StatusSnapshot {
                     .borrow()
                     .backend
                     .as_ref()
-                    .map(|backend| backend.target_name())
+                    .map(super::winit_presenter::PresenterBackend::target_name)
             })
             .unwrap_or("none");
         let dmabuf = state
@@ -3319,8 +3315,7 @@ impl StatusSnapshot {
                 .dmabuf
                 .render_node
                 .as_deref()
-                .map(sanitize_ctl_field)
-                .unwrap_or_else(|| "none".to_string()),
+                .map_or_else(|| "none".to_string(), sanitize_ctl_field),
             explicit_sync,
             explicit_sync_disabled: state.dmabuf.explicit_sync_disabled_reason,
         }

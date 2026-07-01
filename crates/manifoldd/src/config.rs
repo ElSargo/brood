@@ -27,7 +27,7 @@ struct SessionConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub(crate) struct SessionRunnerConfig {
+pub struct SessionRunnerConfig {
     #[serde(default = "default_enabled")]
     pub(crate) enabled: bool,
     pub(crate) kind: String,
@@ -37,14 +37,14 @@ pub(crate) struct SessionRunnerConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionRunnerSource {
+pub enum SessionRunnerSource {
     Manifest,
     Flake,
     Override,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionRunnerSelection {
+pub struct SessionRunnerSelection {
     pub(crate) runner: SessionRunnerConfig,
     pub(crate) project_dir: PathBuf,
     pub(crate) config_path: PathBuf,
@@ -184,12 +184,12 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StartupAppFilter {
+pub enum StartupAppFilter {
     All,
     PresentationOnly,
 }
 
-pub(crate) fn load_startup_apps(
+pub fn load_startup_apps(
     state: &mut Manifold,
     config_path: &Path,
     filter: StartupAppFilter,
@@ -231,7 +231,7 @@ pub(crate) fn load_startup_apps(
     Ok(())
 }
 
-pub(crate) fn discover_session_runner(start_dir: &Path) -> Result<Option<SessionRunnerSelection>> {
+pub fn discover_session_runner(start_dir: &Path) -> Result<Option<SessionRunnerSelection>> {
     let start_dir = start_dir
         .canonicalize()
         .unwrap_or_else(|_| start_dir.to_path_buf());
@@ -275,7 +275,7 @@ pub(crate) fn discover_session_runner(start_dir: &Path) -> Result<Option<Session
     Ok(None)
 }
 
-pub(crate) fn global_config_path() -> PathBuf {
+pub fn global_config_path() -> PathBuf {
     if let Some(config_path) = env::var_os(MANIFOLD_CONFIG_ENV).filter(|path| !path.is_empty()) {
         return PathBuf::from(config_path);
     }
@@ -300,7 +300,7 @@ fn repo_config_path_from_current_exe() -> Option<PathBuf> {
     find_upwards(start_dir, "manifold.toml")
 }
 
-pub(crate) fn override_session_runner(
+pub const fn override_session_runner(
     kind: String,
     project_dir: PathBuf,
     config_path: PathBuf,
@@ -395,7 +395,7 @@ fn is_relative_path_like_arg(path: &Path, arg: &str) -> bool {
     !arg.starts_with('-') && (arg.starts_with('.') || path.components().count() > 1)
 }
 
-fn default_enabled() -> bool {
+const fn default_enabled() -> bool {
     true
 }
 

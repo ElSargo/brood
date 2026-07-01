@@ -79,13 +79,13 @@ const NOTIFICATIONS_INTROSPECTION_XML: &str = r#"<node>
 </node>"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum SessionBusRealm {
+pub enum SessionBusRealm {
     Surface(u64),
     #[allow(dead_code)]
     Headless(u64),
 }
 
-pub(crate) struct SessionBusHandle {
+pub struct SessionBusHandle {
     address: String,
     socket_path: PathBuf,
     dir: PathBuf,
@@ -155,7 +155,7 @@ struct RealmState {
 }
 
 impl RealmState {
-    fn new(realm: SessionBusRealm, guid: String, host_bus_address: Option<String>) -> Self {
+    const fn new(realm: SessionBusRealm, guid: String, host_bus_address: Option<String>) -> Self {
         Self {
             realm,
             guid,
@@ -1050,7 +1050,7 @@ fn read_u32(bytes: &[u8], little: bool) -> u32 {
     }
 }
 
-fn padding_for_8_bytes(len: usize) -> usize {
+const fn padding_for_8_bytes(len: usize) -> usize {
     (8 - (len % 8)) % 8
 }
 

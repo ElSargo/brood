@@ -70,7 +70,7 @@ const LEFT_PANEL_MIN_WIDTH: i32 = 180;
 const LEFT_PANEL_MAX_WIDTH: i32 = 560;
 const LEFT_PANEL_KEYBOARD_STEP: i32 = 32;
 const LEFT_PANEL_SPLITTER_HITBOX: f64 = 8.0;
-pub(crate) const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
+pub const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
 const MANIFOLD_SURFACE_SESSION_ID_ENV: &str = "MANIFOLD_SURFACE_SESSION_ID";
 const SESSION_OUTPUT_SIZE: (i32, i32) = (1280, 800);
 const SESSION_NAME_ADJECTIVES: &[&str] = &[
@@ -313,7 +313,7 @@ pub struct Manifold {
     pub start_time: Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
-    pub loop_handle: LoopHandle<'static, Manifold>,
+    pub loop_handle: LoopHandle<'static, Self>,
     pub loop_signal: LoopSignal,
 
     pub(crate) session_output: Output,
@@ -326,7 +326,7 @@ pub struct Manifold {
     pub shm_state: ShmState,
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
-    pub seat_state: SeatState<Manifold>,
+    pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     #[allow(dead_code)]
     pub dmabuf: DmabufRuntime,
@@ -574,7 +574,7 @@ impl Manifold {
     }
 
     fn init_wayland_listener(
-        display: Display<Manifold>,
+        display: Display<Self>,
         event_loop: &mut EventLoop<'static, Self>,
     ) -> OsString {
         let listening_socket = ListeningSocketSource::new_auto().expect("wayland socket");
@@ -582,7 +582,7 @@ impl Manifold {
         let loop_handle = event_loop.handle();
 
         loop_handle
-            .insert_source(listening_socket, move |client_stream, _, state| {
+            .insert_source(listening_socket, move |client_stream, (), state| {
                 let result = state
                     .display_handle
                     .insert_client(client_stream, Arc::new(ClientState::default()));
@@ -625,7 +625,7 @@ impl Manifold {
             .handle()
             .insert_source(
                 Timer::from_duration(WINDOW_LIFECYCLE_REFRESH_INTERVAL),
-                |_, _, state| {
+                |_, (), state| {
                     state.refresh_hosted_children();
                     state.refresh_window_state_from_lifecycle_timer();
                     TimeoutAction::ToDuration(WINDOW_LIFECYCLE_REFRESH_INTERVAL)
@@ -814,15 +814,15 @@ impl Manifold {
         self.hosted_children = active;
     }
 
-    pub fn hosted_child_count(&self) -> usize {
+    pub const fn hosted_child_count(&self) -> usize {
         self.hosted_children.len()
     }
 
-    pub fn hosted_child_exits(&self) -> u64 {
+    pub const fn hosted_child_exits(&self) -> u64 {
         self.hosted_child_exits
     }
 
-    pub fn hosted_child_failures(&self) -> u64 {
+    pub const fn hosted_child_failures(&self) -> u64 {
         self.hosted_child_failures
     }
 
@@ -928,7 +928,7 @@ impl Manifold {
         let handle = self.loop_handle.clone();
         let result = self
             .loop_handle
-            .insert_source(Timer::immediate(), move |_, _, state| {
+            .insert_source(Timer::immediate(), move |_, (), state| {
                 if let Err(err) = crate::presentation::attach(&handle, state) {
                     warn!(?err, "failed to attach presentation");
                     state.record_presentation_attach_failure(&err.to_string());
@@ -969,7 +969,7 @@ impl Manifold {
             .elements()
             .rev()
             .filter_map(|window| {
-                Manifold::window_toplevel_surface(window)
+                Self::window_toplevel_surface(window)
                     .is_some_and(|surface| self.panel_rect_for_surface(&surface).is_some())
                     .then(|| {
                         self.window_hit_location(window, pos)
@@ -983,7 +983,7 @@ impl Manifold {
         }
 
         if let Some(active_window) = self.active_window()
-            && let Some(surface) = Manifold::window_toplevel_surface(&active_window)
+            && let Some(surface) = Self::window_toplevel_surface(&active_window)
             && self.toplevel_fullscreen_output(&surface).is_some()
             && let Some(location) = self.window_hit_location(&active_window, pos)
         {
@@ -1011,7 +1011,7 @@ impl Manifold {
         None
     }
 
-    pub fn log_pointer_click_focus_debug(
+    pub const fn log_pointer_click_focus_debug(
         &self,
         _phase: &'static str,
         _button_code: u32,
@@ -1104,31 +1104,31 @@ impl Manifold {
             service_request(self, request);
         }
 
-        if self.test_harness_completion.is_none() {
-            if let Some(completion) = harness.try_take_completion() {
-                match completion.kind {
-                    TestHarnessOutcomeKind::Passed => {
-                        info!(detail = %completion.detail, "test harness passed");
-                        self.loop_signal.stop();
-                    }
-                    TestHarnessOutcomeKind::Failed => {
-                        warn!(
-                            exit_code = completion.exit_code,
-                            detail = %completion.detail,
-                            "test harness failed"
-                        );
-                        self.loop_signal.stop();
-                    }
-                    TestHarnessOutcomeKind::Paused => {
-                        warn!(
-                            exit_code = completion.exit_code,
-                            detail = %completion.detail,
-                            "test harness paused for interactive inspection"
-                        );
-                    }
+        if self.test_harness_completion.is_none()
+            && let Some(completion) = harness.try_take_completion()
+        {
+            match completion.kind {
+                TestHarnessOutcomeKind::Passed => {
+                    info!(detail = %completion.detail, "test harness passed");
+                    self.loop_signal.stop();
                 }
-                self.test_harness_completion = Some(completion);
+                TestHarnessOutcomeKind::Failed => {
+                    warn!(
+                        exit_code = completion.exit_code,
+                        detail = %completion.detail,
+                        "test harness failed"
+                    );
+                    self.loop_signal.stop();
+                }
+                TestHarnessOutcomeKind::Paused => {
+                    warn!(
+                        exit_code = completion.exit_code,
+                        detail = %completion.detail,
+                        "test harness paused for interactive inspection"
+                    );
+                }
             }
+            self.test_harness_completion = Some(completion);
         }
 
         self.test_harness = Some(harness);
@@ -1221,8 +1221,7 @@ impl Manifold {
         let pending = self.claim_pending_child_pane(surface);
         let pane = pending
             .as_ref()
-            .map(|pending| pending.pane_id)
-            .unwrap_or_else(|| self.allocate_pane_id());
+            .map_or_else(|| self.allocate_pane_id(), |pending| pending.pane_id);
         let session = pending
             .as_ref()
             .map(|pending| pending.session)
@@ -1232,7 +1231,7 @@ impl Manifold {
         (pane, session)
     }
 
-    fn allocate_pane_id(&mut self) -> u64 {
+    const fn allocate_pane_id(&mut self) -> u64 {
         let pane = self.next_pane_id;
         self.next_pane_id += 1;
         pane
@@ -1487,7 +1486,7 @@ impl Manifold {
         ResolvedLayout { items }
     }
 
-    pub fn active_surface_session(&self) -> SurfaceSessionId {
+    pub const fn active_surface_session(&self) -> SurfaceSessionId {
         self.active_surface_session
     }
 
@@ -1541,7 +1540,7 @@ impl Manifold {
             .find(|session| {
                 self.surface_sessions.contains(session)
                     && self.space.elements().any(|window| {
-                        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+                        let Some(surface) = Self::window_toplevel_surface(window) else {
                             return false;
                         };
                         self.session_for_toplevel_surface(&surface)
@@ -1592,7 +1591,7 @@ impl Manifold {
         self.pointer_hover_toplevel_surface = None;
     }
 
-    pub fn surface_session_count(&self) -> usize {
+    pub const fn surface_session_count(&self) -> usize {
         self.surface_sessions.len()
     }
 
@@ -1747,9 +1746,8 @@ impl Manifold {
         let surfaces = self
             .window_surface_sessions
             .iter()
-            .filter_map(|(surface, assigned_session)| {
-                (*assigned_session == session).then(|| surface.clone())
-            })
+            .filter(|&(_surface, assigned_session)| *assigned_session == session)
+            .map(|(surface, _assigned_session)| surface.clone())
             .collect::<Vec<_>>();
 
         for surface in &surfaces {
@@ -1825,7 +1823,7 @@ impl Manifold {
         self.space
             .elements()
             .filter(|window| {
-                let Some(surface) = Manifold::window_toplevel_surface(window) else {
+                let Some(surface) = Self::window_toplevel_surface(window) else {
                     return false;
                 };
                 let assigned_session = self
@@ -1929,7 +1927,7 @@ impl Manifold {
     }
 
     pub fn window_belongs_to_active_surface_session(&self, window: &Window) -> bool {
-        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+        let Some(surface) = Self::window_toplevel_surface(window) else {
             return false;
         };
         self.session_for_toplevel_surface(&surface)
@@ -1938,7 +1936,7 @@ impl Manifold {
     }
 
     pub fn window_visible_in_presentation(&self, window: &Window) -> bool {
-        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+        let Some(surface) = Self::window_toplevel_surface(window) else {
             return false;
         };
         if self.surface_is_visible_presentation_member(&surface)
@@ -2007,15 +2005,15 @@ impl Manifold {
         if !self.window_visible_in_presentation(window) {
             return None;
         }
-        let surface = Manifold::window_toplevel_surface(window)?;
+        let surface = Self::window_toplevel_surface(window)?;
         self.layout_rect_for_toplevel_surface(&surface)
     }
 
     fn layout_rect_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutRect> {
-        if let Some(rect) = self.panel_rect_for_surface(&surface) {
+        if let Some(rect) = self.panel_rect_for_surface(surface) {
             return Some(rect);
         }
-        if self.toplevel_fullscreen_output(&surface).is_some() {
+        if self.toplevel_fullscreen_output(surface).is_some() {
             return Some(
                 self.translate_content_rect(fullscreen_layout_rect(
                     self.presentation_layout_size(),
@@ -2059,7 +2057,7 @@ impl Manifold {
         self.reconfigure_focus_stack();
     }
 
-    pub fn requested_fullscreen_count(&self) -> usize {
+    pub const fn requested_fullscreen_count(&self) -> usize {
         self.fullscreen_toplevels.len()
     }
 
@@ -2153,7 +2151,7 @@ impl Manifold {
                 .elements()
                 .find(|window| {
                     self.window_visible_in_presentation(window)
-                        && Manifold::window_toplevel_surface(window).as_ref() == Some(active)
+                        && Self::window_toplevel_surface(window).as_ref() == Some(active)
                 })
                 .cloned()
         })
@@ -2167,7 +2165,7 @@ impl Manifold {
 
     pub fn focus_window(&mut self, window: &Window) {
         self.space.raise_element(window, true);
-        let Some(surface) = Manifold::window_toplevel_surface(window) else {
+        let Some(surface) = Self::window_toplevel_surface(window) else {
             self.focus_toplevel_surface(None);
             return;
         };
@@ -2210,7 +2208,7 @@ impl Manifold {
             .elements()
             .filter(|window| self.window_belongs_to_active_surface_session(window))
             .find(|window| {
-                Manifold::window_toplevel_surface(window).is_some_and(|surface| {
+                Self::window_toplevel_surface(window).is_some_and(|surface| {
                     toplevel_matches_agent_identity(self, &surface, identity)
                 })
             })
@@ -2229,7 +2227,7 @@ impl Manifold {
         self.presentation_window_focused = focused;
     }
 
-    pub fn presentation_window_focused(&self) -> bool {
+    pub const fn presentation_window_focused(&self) -> bool {
         self.presentation_window_focused
     }
 
@@ -2284,7 +2282,9 @@ impl Manifold {
         false
     }
 
-    pub(crate) fn take_pending_presentation_focus_activation_token(&mut self) -> Option<String> {
+    pub(crate) const fn take_pending_presentation_focus_activation_token(
+        &mut self,
+    ) -> Option<String> {
         self.pending_presentation_focus_activation_token.take()
     }
 
@@ -2329,7 +2329,7 @@ impl Manifold {
             .elements()
             .filter(|window| self.window_belongs_to_active_surface_session(window))
             .filter_map(|window| {
-                let surface = Manifold::window_toplevel_surface(window)?;
+                let surface = Self::window_toplevel_surface(window)?;
                 if !self.surface_participates_in_resolved_layout(&surface) {
                     return None;
                 }
@@ -2749,7 +2749,7 @@ impl Manifold {
             .collect()
     }
 
-    pub fn shortcut_passthrough(&self) -> bool {
+    pub const fn shortcut_passthrough(&self) -> bool {
         self.shortcut_passthrough
     }
 
@@ -2971,7 +2971,7 @@ impl Manifold {
     ) -> Result<String> {
         ensure_metadata(&membership)?;
         let window = self.window_record(window_id)?;
-        let mut detail = membership.clone();
+        let mut detail = membership;
         detail.insert("window_id".to_string(), window_id.to_string());
         let grant_id = self.record_grant(
             &window.extension_id,
@@ -3061,7 +3061,7 @@ impl Manifold {
             .elements()
             .find(|window| {
                 self.window_visible_in_presentation(window)
-                    && Manifold::window_toplevel_surface(window).as_ref() == Some(surface)
+                    && Self::window_toplevel_surface(window).as_ref() == Some(surface)
             })
             .cloned()
     }
@@ -3069,7 +3069,7 @@ impl Manifold {
     fn window_for_any_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
-            .find(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(surface))
+            .find(|window| Self::window_toplevel_surface(window).as_ref() == Some(surface))
             .cloned()
     }
 
@@ -3153,7 +3153,7 @@ impl Manifold {
 
     fn find_surface_for_window_identity(&self, identity: &ExtensionMetadata) -> Option<WlSurface> {
         self.space.elements().find_map(|window| {
-            let surface = Manifold::window_toplevel_surface(window)?;
+            let surface = Self::window_toplevel_surface(window)?;
             toplevel_matches_identity(self, &surface, identity).then_some(surface)
         })
     }
@@ -3162,7 +3162,7 @@ impl Manifold {
         self.pending_pointer_focus_surface = surface;
     }
 
-    pub fn take_pending_pointer_focus_surface(&mut self) -> Option<WlSurface> {
+    pub const fn take_pending_pointer_focus_surface(&mut self) -> Option<WlSurface> {
         self.pending_pointer_focus_surface.take()
     }
 
@@ -3188,7 +3188,7 @@ impl Manifold {
             .as_ref()
             .and_then(|active| {
                 windows.iter().position(|window| {
-                    Manifold::window_toplevel_surface(window).as_ref() == Some(active)
+                    Self::window_toplevel_surface(window).as_ref() == Some(active)
                 })
             })
             .unwrap_or(window_count - 1);
@@ -3379,7 +3379,7 @@ impl Manifold {
         self.space
             .elements()
             .filter(|window| self.window_visible_in_presentation(window))
-            .position(|window| Manifold::window_toplevel_surface(window).as_ref() == Some(active))
+            .position(|window| Self::window_toplevel_surface(window).as_ref() == Some(active))
     }
 
     pub fn focused_window_count(&self) -> usize {
@@ -3445,7 +3445,7 @@ impl Manifold {
         }
     }
 
-    pub fn toggle_input_mode(&mut self) -> InputMode {
+    pub const fn toggle_input_mode(&mut self) -> InputMode {
         self.input_mode = match self.input_mode {
             InputMode::Passthrough => InputMode::Normal,
             InputMode::Normal => InputMode::Passthrough,
@@ -3459,7 +3459,7 @@ impl Manifold {
         self.managed_fullscreen
     }
 
-    pub fn managed_fullscreen(&self) -> bool {
+    pub const fn managed_fullscreen(&self) -> bool {
         self.managed_fullscreen
     }
 
@@ -3774,14 +3774,14 @@ impl Manifold {
         None
     }
 
-    pub fn resolved_layout_source_name(&self) -> &'static str {
+    pub const fn resolved_layout_source_name(&self) -> &'static str {
         match self.resolved_layout_source {
             ResolvedLayoutSource::NativeFallback => "native-fallback",
             ResolvedLayoutSource::WasmPolicy => "wasm-policy",
         }
     }
 
-    pub fn resolved_layout_item_count(&self) -> usize {
+    pub const fn resolved_layout_item_count(&self) -> usize {
         self.accepted_resolved_layout.items.len()
     }
 
@@ -3907,7 +3907,7 @@ impl Manifold {
         self.left_panel_resizing = self.left_panel_reserved_width() > 0;
     }
 
-    pub fn end_left_panel_resize(&mut self) -> bool {
+    pub const fn end_left_panel_resize(&mut self) -> bool {
         let was_resizing = self.left_panel_resizing;
         self.left_panel_resizing = false;
         was_resizing
@@ -4193,19 +4193,17 @@ fn placement_requests_left_panel(placement: &ExtensionMetadata) -> bool {
     let edge = placement
         .get("edge")
         .or_else(|| placement.get("side"))
-        .map(|value| value.eq_ignore_ascii_case("left"))
-        .unwrap_or(false);
+        .is_some_and(|value| value.eq_ignore_ascii_case("left"));
     let panel_mode = placement
         .get("mode")
         .or_else(|| placement.get("kind"))
         .or_else(|| placement.get("placement"))
-        .map(|value| {
+        .is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
                 "panel" | "sidebar" | "dock" | "left-panel" | "left-sidebar"
             )
-        })
-        .unwrap_or(false);
+        });
     edge || panel_mode
 }
 
@@ -4688,7 +4686,7 @@ impl RuntimeStats {
         }
     }
 
-    pub fn record_attach_failed(&mut self) {
+    pub const fn record_attach_failed(&mut self) {
         self.pending_attach_request_at = None;
         self.pending_attach_frame_at = None;
     }
@@ -4702,7 +4700,7 @@ impl RuntimeStats {
         self.clear_pending_visible_latency_samples();
     }
 
-    fn clear_pending_visible_latency_samples(&mut self) {
+    const fn clear_pending_visible_latency_samples(&mut self) {
         self.pending_input_at = None;
         self.pending_input_events = 0;
         self.pending_input_commit_at = None;
@@ -4732,19 +4730,19 @@ impl RuntimeStats {
         max_delay.checked_sub(input_at.elapsed())
     }
 
-    pub fn record_input_frame_deferred(&mut self) {
+    pub const fn record_input_frame_deferred(&mut self) {
         self.input_frame_deferrals += 1;
     }
 
-    pub fn record_input_deferred_frame(&mut self) {
+    pub const fn record_input_deferred_frame(&mut self) {
         self.input_deferred_frames += 1;
     }
 
-    pub fn record_client_frame_deferred(&mut self) {
+    pub const fn record_client_frame_deferred(&mut self) {
         self.client_frame_deferrals += 1;
     }
 
-    pub fn record_client_deferred_frame(&mut self) {
+    pub const fn record_client_deferred_frame(&mut self) {
         self.client_deferred_frames += 1;
     }
 
@@ -4757,12 +4755,12 @@ impl RuntimeStats {
             }
             self.pending_commits += 1;
 
-            if let Some(input_at) = self.pending_input_at {
-                if self.pending_input_commit_at.is_none() {
-                    self.pending_input_to_commit_micros =
-                        Some(now.duration_since(input_at).as_micros());
-                    self.pending_input_commit_at = Some(now);
-                }
+            if let Some(input_at) = self.pending_input_at
+                && self.pending_input_commit_at.is_none()
+            {
+                self.pending_input_to_commit_micros =
+                    Some(now.duration_since(input_at).as_micros());
+                self.pending_input_commit_at = Some(now);
             }
 
             if let Some(callback_at) = self.pending_client_frame_callback_at.take() {

@@ -18,7 +18,7 @@ use crate::{
 
 const RUNNER_ACTIVE_ENV: &str = "MANIFOLD_SESSION_RUNNER_ACTIVE";
 
-pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
+pub fn run_if_configured(args: &RunArgs) -> Result<bool> {
     if args.no_session_runner || env::var_os(RUNNER_ACTIVE_ENV).is_some() {
         return Ok(false);
     }
@@ -66,7 +66,7 @@ pub(crate) fn run_if_configured(args: &RunArgs) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn run_project_command_if_configured(
+pub fn run_project_command_if_configured(
     selection: Option<&SessionRunnerSelection>,
     working_dir: &Path,
     argv: &[OsString],
@@ -240,9 +240,7 @@ fn create_cache_dir(cache_root: &Path) -> Result<PathBuf> {
 }
 
 fn runner_cache_root(configured_cache_root: Option<&Path>) -> PathBuf {
-    configured_cache_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_cache_root)
+    configured_cache_root.map_or_else(default_cache_root, Path::to_path_buf)
 }
 
 fn default_cache_root() -> PathBuf {

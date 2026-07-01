@@ -134,7 +134,7 @@ fn read_guest_string(caller: &mut Caller<'_, WasmMapStore>, ptr: i32, len: i32) 
     );
     let memory = caller
         .get_export("memory")
-        .and_then(|export| export.into_memory())
+        .and_then(wasmtime::Extern::into_memory)
         .context("guest must export memory for set_map_response(ptr, len)")?;
     let ptr = usize::try_from(ptr).context("convert guest string pointer")?;
     let mut bytes = vec![0; len];

@@ -57,11 +57,11 @@ enum Command {
     Switch(SwitchArgs),
     /// Run built-in test workflows. Defaults to the nested topology.
     Test(TestArgs),
-    /// Send a command to a Manifold DBus control endpoint.
+    /// Send a command to a Manifold `DBus` control endpoint.
     Ctl(CtlArgs),
 }
 
-#[derive(Debug, Clone, Parser)]
+#[derive(Debug, Clone, Parser, Default)]
 struct RunArgs {
     #[command(flatten)]
     session: SessionArgs,
@@ -78,10 +78,10 @@ pub struct SessionArgs {
     /// Command to launch as a hosted Wayland app inside the nested compositor.
     #[arg(short = 'c', long = "command")]
     pub(crate) command: Option<OsString>,
-    /// DBus destination name for this session control endpoint.
+    /// `DBus` destination name for this session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name", default_value = DEFAULT_MANIFOLD_DBUS_NAME)]
     pub(crate) dbus_name: String,
-    /// DBus bus address for this session control endpoint.
+    /// `DBus` bus address for this session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// Start the service/runtime process without tying it to a presentation session.
@@ -102,7 +102,7 @@ pub struct SessionArgs {
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     pub(crate) test_harness: Option<PathBuf>,
-    /// Inner DBus control destination used by nested test supervisors.
+    /// Inner `DBus` control destination used by nested test supervisors.
     #[arg(
         long = "nested-inner-dbus-destination",
         alias = "nested-inner-dbus-name",
@@ -110,7 +110,7 @@ pub struct SessionArgs {
         hide = true
     )]
     pub(crate) nested_inner_dbus_name: Option<String>,
-    /// Inner DBus bus address used by nested test supervisors.
+    /// Inner `DBus` bus address used by nested test supervisors.
     #[arg(
         long = "nested-inner-dbus-address",
         value_name = "ADDRESS",
@@ -157,22 +157,12 @@ impl SessionArgs {
     }
 }
 
-impl Default for RunArgs {
-    fn default() -> Self {
-        Self {
-            session: SessionArgs::default(),
-            no_session_runner: false,
-            session_runner: None,
-        }
-    }
-}
-
 #[derive(Debug, Parser)]
 pub(crate) struct EnterArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub(crate) dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// Force creation of a new session even when already entered.
@@ -191,10 +181,10 @@ pub(crate) struct EnterArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct ShowArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub(crate) dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// Show the most recently focused live session instead of this directory's default session.
@@ -210,10 +200,10 @@ pub(crate) struct ShowArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct HideArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub(crate) dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// Hide this session id or session name directly.
@@ -223,10 +213,10 @@ pub(crate) struct HideArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct ListArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub(crate) dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// List all active sessions instead of only sessions associated with this directory.
@@ -236,10 +226,10 @@ pub(crate) struct ListArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct PlugArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub(crate) dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// WASM lane to replace. Auto tries the key handler ABI, then the map hook ABI.
@@ -252,10 +242,10 @@ pub(crate) struct PlugArgs {
 
 #[derive(Debug, Parser)]
 pub(crate) struct SwitchArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub(crate) dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
     /// Skim-compatible selector command.
@@ -295,7 +285,7 @@ struct NestedTestArgs {
     /// Start the outer supervisor with a visible presentation window.
     #[arg(long = "outer-headful")]
     outer_headful: bool,
-    /// Start an outer supervisor even when manifold_session says this is already nested.
+    /// Start an outer supervisor even when `manifold_session` says this is already nested.
     #[arg(long = "force-outer")]
     force_outer: bool,
     /// Start the inner system under test without an attached presentation window.
@@ -314,10 +304,10 @@ struct NestedTestArgs {
 
 #[derive(Debug, Parser)]
 struct CtlArgs {
-    /// DBus destination name for the session control endpoint.
+    /// `DBus` destination name for the session control endpoint.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     dbus_name: Option<String>,
-    /// DBus bus address for the session control endpoint.
+    /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     dbus_address: Option<String>,
     /// Send COMMAND as a raw JSON argv array instead of parsing command-line words.

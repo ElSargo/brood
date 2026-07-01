@@ -11,7 +11,7 @@ pub struct ResolvedLayout {
 }
 
 impl ResolvedLayout {
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self { items: Vec::new() }
     }
 
@@ -180,12 +180,12 @@ pub struct LocalPoint {
 impl LocalPoint {
     pub fn from_pixel_in_rect(x: f64, y: f64, rect: LayoutRect) -> Self {
         Self {
-            u: ((x - f64::from(rect.x)) / f64::from(rect.w.max(1))) * 2.0 - 1.0,
-            v: ((y - f64::from(rect.y)) / f64::from(rect.h.max(1))) * 2.0 - 1.0,
+            u: ((x - f64::from(rect.x)) / f64::from(rect.w.max(1))).mul_add(2.0, -1.0),
+            v: ((y - f64::from(rect.y)) / f64::from(rect.h.max(1))).mul_add(2.0, -1.0),
         }
     }
 
-    fn is_finite(self) -> bool {
+    const fn is_finite(self) -> bool {
         self.u.is_finite() && self.v.is_finite()
     }
 }
@@ -202,8 +202,8 @@ impl LocalTransform {
         let bounds_h = f64::from(bounds.h.max(1));
         Self {
             offset: LocalPoint {
-                u: (f64::from(rect.x) / bounds_w) * 2.0 - 1.0,
-                v: (f64::from(rect.y) / bounds_h) * 2.0 - 1.0,
+                u: (f64::from(rect.x) / bounds_w).mul_add(2.0, -1.0),
+                v: (f64::from(rect.y) / bounds_h).mul_add(2.0, -1.0),
             },
             size: LocalPoint {
                 u: (f64::from(rect.w.max(1)) / bounds_w) * 2.0,
@@ -251,8 +251,8 @@ impl LocalTransform {
             return None;
         }
         Some(LocalPoint {
-            u: ((point.u - self.offset.u) / self.size.u) * 2.0 - 1.0,
-            v: ((point.v - self.offset.v) / self.size.v) * 2.0 - 1.0,
+            u: ((point.u - self.offset.u) / self.size.u).mul_add(2.0, -1.0),
+            v: ((point.v - self.offset.v) / self.size.v).mul_add(2.0, -1.0),
         })
     }
 
@@ -310,7 +310,7 @@ pub enum LayoutAction {
 }
 
 impl LayoutAction {
-    pub fn from_abi(value: i32) -> Option<Self> {
+    pub const fn from_abi(value: i32) -> Option<Self> {
         Some(match value {
             1 => Self::FocusNext,
             2 => Self::FocusPrevious,
@@ -456,7 +456,7 @@ impl LayoutState {
             .then_some(new_leaf_id)
     }
 
-    pub fn active_leaf(&self) -> LayoutLeafId {
+    pub const fn active_leaf(&self) -> LayoutLeafId {
         self.active_leaf
     }
 
@@ -532,7 +532,7 @@ impl LayoutState {
         leaves
     }
 
-    fn allocate_leaf(&mut self) -> LayoutLeafId {
+    const fn allocate_leaf(&mut self) -> LayoutLeafId {
         let id = LayoutLeafId(self.next_leaf);
         self.next_leaf += 1;
         id
@@ -602,8 +602,8 @@ enum LayoutNode {
     Leaf(LayoutLeaf),
     Split {
         axis: LayoutAxis,
-        first: Box<LayoutNode>,
-        second: Box<LayoutNode>,
+        first: Box<Self>,
+        second: Box<Self>,
     },
 }
 
@@ -721,7 +721,7 @@ impl LayoutNode {
     }
 }
 
-fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRect) {
+const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRect) {
     match axis {
         LayoutAxis::Horizontal => {
             let first_w = rect.w / 2;
