@@ -54,6 +54,13 @@ jobs:
             extra-substituters = https://manifold-platform.cachix.org
             extra-trusted-public-keys = manifold-platform.cachix.org-1:cXJupbtXzFJe8vIIyt+ZYN+ganoykFuUIZOPfFQ+GP0=
 
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+
       - name: Configure Cachix
         uses: cachix/cachix-action@v17
         with:
