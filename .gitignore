@@ -36,3 +36,5 @@ logs/
 .env.*
 !.env.example
 /result
+/result-1
+/result-2
