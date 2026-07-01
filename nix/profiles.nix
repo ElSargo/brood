@@ -82,6 +82,8 @@ let
   ];
 
   fullDevExtras = [
+    pkgs.act
+    pkgs.actionlint
     pkgs.docker
     pkgs.docker-buildx
     pkgs.firefox

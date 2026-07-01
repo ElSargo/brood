@@ -71,11 +71,13 @@ done
   tail -120 "$LOG" >&2 || true
   exit 1
 }
-[[ "$(field "$STATUS" presentation_attach_failures)" =~ ^[0-9]+$ ]] &&
-  (("$(field "$STATUS" presentation_attach_failures)" >= 1)) || {
+if ! {
+  [[ "$(field "$STATUS" presentation_attach_failures)" =~ ^[0-9]+$ ]] &&
+    (("$(field "$STATUS" presentation_attach_failures)" >= 1))
+}; then
   echo "ERR expected startup attach failure count: $STATUS" >&2
   exit 1
-}
+fi
 [[ "$(field "$STATUS" presentation_runtime_failures)" == "0" ]] || {
   echo "ERR startup attach failure should not count as runtime redraw failure: $STATUS" >&2
   exit 1
@@ -84,16 +86,20 @@ done
   echo "ERR expected startup attach failure to report presentation_last_error: $STATUS" >&2
   exit 1
 }
-[[ "$(field "$STATUS" windows)" =~ ^[0-9]+$ ]] &&
-  (("$(field "$STATUS" windows)" >= 1)) || {
+if ! {
+  [[ "$(field "$STATUS" windows)" =~ ^[0-9]+$ ]] &&
+    (("$(field "$STATUS" windows)" >= 1))
+}; then
   echo "ERR expected nested client to map despite failed startup frontend: $STATUS" >&2
   exit 1
-}
-[[ "$(field "$STATUS" commits)" =~ ^[0-9]+$ ]] &&
-  (("$(field "$STATUS" commits)" >= 1)) || {
+fi
+if ! {
+  [[ "$(field "$STATUS" commits)" =~ ^[0-9]+$ ]] &&
+    (("$(field "$STATUS" commits)" >= 1))
+}; then
   echo "ERR expected nested client commits despite failed startup frontend: $STATUS" >&2
   exit 1
-}
+fi
 
 echo "OK startup attach fallback smoke passed"
 echo "status=$STATUS"

@@ -280,6 +280,79 @@ let
     ignoreCollisions = true;
   };
 
+  ciTools = pkgs.buildEnv {
+    name = "manifold-ci-tools";
+    paths = [
+      pkgs.act
+      pkgs.actionlint
+    ];
+  };
+
+  localCi = pkgs.writeShellApplication {
+    name = "manifold-ci";
+    runtimeInputs = [
+      pkgs.actionlint
+      pkgs.coreutils
+      pkgs.git
+      pkgs.nix
+    ];
+    text = ''
+      set -euo pipefail
+
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      cd "$ROOT"
+
+      echo "ci=workflow command=actionlint"
+      actionlint .github/workflows/ci.yml
+
+      tmpdir="$(mktemp -d)"
+      cleanup() {
+        rm -rf "$tmpdir"
+      }
+      trap cleanup EXIT
+
+      run_job() {
+        local name="$1"
+        shift
+
+        {
+          echo "ci=job name=$name status=started"
+          "$@"
+          echo "ci=job name=$name status=passed"
+        } >"$tmpdir/$name.log" 2>&1
+      }
+
+      run_job lint nix run .#lint &
+      lint_pid="$!"
+      run_job build nix build --print-build-logs .#default .#dev-workflow .#wasm-examples &
+      build_pid="$!"
+
+      status=0
+
+      if ! wait "$lint_pid"; then
+        status=1
+        echo "ci=job name=lint status=failed"
+      fi
+      cat "$tmpdir/lint.log"
+
+      if ! wait "$build_pid"; then
+        status=1
+        echo "ci=job name=build status=failed"
+      fi
+      cat "$tmpdir/build.log"
+
+      if ((status != 0)); then
+        echo "ci=stage name=test status=skipped"
+        exit "$status"
+      fi
+
+      echo "ci=job name=test status=started"
+      nix develop .#full -c cargo test -p manifoldd --locked
+      echo "ci=job name=test status=passed"
+      echo "ci=all status=passed"
+    '';
+  };
+
   formatter = pkgs.writeShellApplication {
     name = "manifold-format";
     runtimeInputs = [
@@ -334,6 +407,112 @@ let
       fi
     '';
   };
+
+  linter = pkgs.writeShellApplication {
+    name = "manifold-lint";
+    runtimeInputs = [
+      pkgs.findutils
+      pkgs.git
+      pkgs.pkg-config
+      pkgs.shellcheck
+      pkgs.stdenv.cc
+      profiles.rustToolchainWithTools
+    ];
+    text = ''
+      set -euo pipefail
+
+      if ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+        cd "$ROOT"
+        in_git_repo=1
+      else
+        in_git_repo=0
+      fi
+
+      export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
+      export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
+
+      paths=("$@")
+      if ((''${#paths[@]} == 0)); then
+        paths=(.)
+      fi
+
+      source_files=()
+      if [[ "$in_git_repo" == "1" ]]; then
+        while IFS= read -r -d "" file; do
+          source_files+=("$file")
+        done < <(git ls-files -z --cached --others --exclude-standard -- "''${paths[@]}")
+      else
+        while IFS= read -r -d "" file; do
+          source_files+=("''${file#./}")
+        done < <(
+          find "''${paths[@]}" \
+            \( -path "./.git" -o -path "./.git/*" \
+            -o -path "./.manifold" -o -path "./.manifold/*" \
+            -o -path "./target" -o -path "./target/*" \
+            -o -path "./reference" -o -path "./reference/*" \
+            -o -path "./result" -o -path "./result/*" \) -prune \
+            -o -type f -print0
+        )
+      fi
+
+      shell_files=()
+      for file in "''${source_files[@]}"; do
+        case "$file" in
+          .manifold/* | */.manifold/* | reference/*)
+            continue
+            ;;
+          *.sh | *.bash)
+            shell_files+=("$file")
+            ;;
+        esac
+      done
+
+      echo "lint=rust command=cargo-clippy"
+      cargo clippy --workspace --all-targets --locked
+
+      echo "lint=rust command=cargo-check"
+      cargo check --workspace --all-targets --locked
+
+      if ((''${#shell_files[@]} > 0)); then
+        echo "lint=shell command=shellcheck files=''${#shell_files[@]}"
+        shellcheck -e SC2016 -e SC2034 "''${shell_files[@]}"
+      fi
+    '';
+  };
+
+  lintCheck =
+    pkgs.runCommand "manifold-lint-check"
+      {
+        nativeBuildInputs = [ linter ];
+      }
+      ''
+        export HOME="$TMPDIR/home"
+        export CARGO_HOME="$TMPDIR/cargo-home"
+        export CARGO_TARGET_DIR="$TMPDIR/target"
+        export CARGO_NET_OFFLINE=true
+        mkdir -p "$HOME" "$CARGO_HOME" source
+
+        cp -R ${src}/. source/
+        chmod -R u+w source
+        cd source
+
+        mkdir -p .cargo
+        cat > .cargo/config.toml <<EOF
+        [source.crates-io]
+        replace-with = "vendored-sources"
+
+        [source.vendored-sources]
+        directory = "${cargoVendor}"
+
+        [net]
+        offline = true
+        EOF
+
+        manifold-lint
+
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
 
   mkDevWorkflow = import ./scripts/dev-workflow.nix;
 
@@ -400,13 +579,18 @@ in
   "dev-workflow-full" = devWorkflowFullWithRuntime;
   "dev-env" = devEnv;
   "dev-env-full" = devEnvFull;
+  ci = localCi;
+  "ci-tools" = ciTools;
+  lint = linter;
   "runtime-files" = runtimeFiles;
   "wasm-examples" = wasmExamples;
-  inherit formatter;
+  inherit formatter linter;
 
   inherit
     devEnv
     devEnvFull
+    ciTools
+    localCi
     devWorkflow
     devWorkflowFullWithRuntime
     devWorkflowWithRuntime
@@ -416,6 +600,7 @@ in
     manifoldWithDesktop
     manifold
     manifoldd
+    lintCheck
     runtimeFiles
     wasmExamples
     ;

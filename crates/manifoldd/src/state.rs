@@ -963,15 +963,17 @@ impl Manifold {
         if let Some(panel_hit) = self
             .space
             .elements()
-            .filter(|window| {
+            .rev()
+            .filter_map(|window| {
                 Manifold::window_toplevel_surface(window)
                     .is_some_and(|surface| self.panel_rect_for_surface(&surface).is_some())
+                    .then(|| {
+                        self.window_hit_location(window, pos)
+                            .map(|location| (window.clone(), location))
+                    })
+                    .flatten()
             })
-            .filter_map(|window| {
-                self.window_hit_location(window, pos)
-                    .map(|location| (window.clone(), location))
-            })
-            .last()
+            .next()
         {
             return Some(panel_hit);
         }

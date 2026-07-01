@@ -40,6 +40,16 @@
 
       packages = forEachSystem (system: import ./nix/packages.nix { pkgs = pkgsFor system; });
 
+      checks = forEachSystem (
+        system:
+        let
+          packages = import ./nix/packages.nix { pkgs = pkgsFor system; };
+        in
+        {
+          lint = packages.lintCheck;
+        }
+      );
+
       formatter = forEachSystem (
         system: (import ./nix/packages.nix { pkgs = pkgsFor system; }).formatter
       );
