@@ -44,8 +44,8 @@ use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy};
 
 use crate::{
     CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
-    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs, ShowArgs, SwitchArgs,
-    browser,
+    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs, ShowArgs, ShowTarget,
+    SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     config,
     debug_dump::{self, DumpOptions},
@@ -1274,16 +1274,24 @@ pub fn show(args: ShowArgs) -> Result<()> {
             restore_last_focused_surface_session(target)?;
         }
     } else {
-        let (session_id, current_directory, set_default) = resolve_cli_surface_session(
+        let allow_entered_fallback = args.id.is_none() && args.target != Some(ShowTarget::Here);
+        let resolution = resolve_cli_surface_session(
             target,
             &context.current_directory,
             args.id,
             true,
             args.set_default,
-            false,
+            allow_entered_fallback,
         )?;
-        remember_directory_surface_session(target, &current_directory, session_id, set_default)?;
-        switch_surface_session(target, session_id)?;
+        if resolution.remember_directory {
+            remember_directory_surface_session(
+                target,
+                &resolution.current_directory,
+                resolution.session_id,
+                resolution.set_default,
+            )?;
+        }
+        switch_surface_session(target, resolution.session_id)?;
     }
 
     if status.presentation == "Detached" {
@@ -1297,7 +1305,7 @@ pub fn show(args: ShowArgs) -> Result<()> {
 pub fn hide(args: HideArgs) -> Result<()> {
     let context = open_cli_control_context(args.dbus_name, args.dbus_address)?;
     let target = &context.target;
-    let (session_id, current_directory, set_default) = resolve_cli_surface_session(
+    let resolution = resolve_cli_surface_session(
         target,
         &context.current_directory,
         args.id,
@@ -1305,10 +1313,17 @@ pub fn hide(args: HideArgs) -> Result<()> {
         false,
         true,
     )?;
-    remember_directory_surface_session(target, &current_directory, session_id, set_default)?;
+    if resolution.remember_directory {
+        remember_directory_surface_session(
+            target,
+            &resolution.current_directory,
+            resolution.session_id,
+            resolution.set_default,
+        )?;
+    }
 
     let status = status_snapshot(target)?;
-    switch_surface_session(target, session_id)?;
+    switch_surface_session(target, resolution.session_id)?;
 
     if status.presentation == "Attached" {
         let response = request_dbus_command(target, &["detach".to_string()], false)?;
@@ -1330,6 +1345,13 @@ pub fn list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+struct CliSurfaceSessionResolution {
+    session_id: u64,
+    current_directory: PathBuf,
+    set_default: bool,
+    remember_directory: bool,
+}
+
 fn resolve_cli_surface_session(
     target: &ControlTarget,
     current_directory: &Path,
@@ -1337,39 +1359,61 @@ fn resolve_cli_surface_session(
     create_if_missing: bool,
     set_default_requested: bool,
     allow_entered_fallback: bool,
-) -> Result<(u64, PathBuf, bool)> {
+) -> Result<CliSurfaceSessionResolution> {
     let existing_default = resolve_directory_surface_session(target, current_directory)?;
-    let (session_id, set_default) = if let Some(query) = query {
-        (
-            resolve_surface_session(target, &query)?,
-            set_default_requested,
-        )
-    } else if let Some(session_id) = existing_default {
-        (session_id, false)
+    let (session_id, set_default, remember_directory) = if let Some(query) = query {
+        let session_id = resolve_surface_session(target, &query)?;
+        (session_id, set_default_requested, true)
     } else {
-        match missing_directory_surface_session_action(
+        match choose_cli_surface_session(
+            existing_default,
             entered_surface_session_id(),
             create_if_missing,
             allow_entered_fallback,
         ) {
-            MissingDirectorySurfaceSessionAction::Entered(session_id) => (session_id, true),
+            MissingDirectorySurfaceSessionAction::Entered(session_id) => (session_id, false, false),
+            MissingDirectorySurfaceSessionAction::ExistingDefault(session_id) => {
+                (session_id, false, true)
+            }
             MissingDirectorySurfaceSessionAction::Create => (
                 create_directory_surface_session(target, current_directory, None, true)?,
                 true,
+                true,
             ),
             MissingDirectorySurfaceSessionAction::Active => {
-                (status_snapshot(target)?.active_surface_session, false)
+                (status_snapshot(target)?.active_surface_session, false, true)
             }
         }
     };
-    Ok((session_id, current_directory.to_path_buf(), set_default))
+    Ok(CliSurfaceSessionResolution {
+        session_id,
+        current_directory: current_directory.to_path_buf(),
+        set_default,
+        remember_directory,
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum MissingDirectorySurfaceSessionAction {
     Entered(u64),
+    ExistingDefault(u64),
     Create,
     Active,
+}
+
+const fn choose_cli_surface_session(
+    existing_default: Option<u64>,
+    entered_session_id: Option<u64>,
+    create_if_missing: bool,
+    allow_entered_fallback: bool,
+) -> MissingDirectorySurfaceSessionAction {
+    if allow_entered_fallback && let Some(session_id) = entered_session_id {
+        return MissingDirectorySurfaceSessionAction::Entered(session_id);
+    }
+    if let Some(session_id) = existing_default {
+        return MissingDirectorySurfaceSessionAction::ExistingDefault(session_id);
+    }
+    missing_directory_surface_session_action(entered_session_id, create_if_missing, false)
 }
 
 const fn missing_directory_surface_session_action(
@@ -3741,7 +3785,7 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 mod tests {
     use super::{
         ControlTarget, MissingDirectorySurfaceSessionAction, SessionSwitchOutcome, WasmPlugKind,
-        control_command_for_session, format_session_picker_row,
+        choose_cli_surface_session, control_command_for_session, format_session_picker_row,
         missing_directory_surface_session_action, parse_plug_args, parse_skim_session_output,
         resolve_initial_query, session_marker_value, surface_session_dir_new_command,
     };
@@ -3842,7 +3886,7 @@ mod tests {
     }
 
     #[test]
-    fn show_missing_directory_creates_even_from_entered_session() {
+    fn show_here_missing_directory_creates_even_from_entered_session() {
         assert_eq!(
             missing_directory_surface_session_action(Some(42), true, false),
             MissingDirectorySurfaceSessionAction::Create
@@ -3854,6 +3898,22 @@ mod tests {
         assert_eq!(
             missing_directory_surface_session_action(Some(42), true, true),
             MissingDirectorySurfaceSessionAction::Entered(42)
+        );
+    }
+
+    #[test]
+    fn entered_fallback_wins_over_directory_default_when_allowed() {
+        assert_eq!(
+            choose_cli_surface_session(Some(7), Some(42), true, true),
+            MissingDirectorySurfaceSessionAction::Entered(42)
+        );
+    }
+
+    #[test]
+    fn show_here_keeps_directory_default_ahead_of_entered_fallback() {
+        assert_eq!(
+            choose_cli_surface_session(Some(7), Some(42), true, false),
+            MissingDirectorySurfaceSessionAction::ExistingDefault(7)
         );
     }
 

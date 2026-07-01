@@ -25,7 +25,7 @@ mod winit_presenter;
 use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -202,6 +202,14 @@ pub(crate) struct ShowArgs {
     /// Make the shown session the default for this directory.
     #[arg(long = "set-default")]
     pub(crate) set_default: bool,
+    /// Show this directory's session even when already inside another Manifold session.
+    #[arg(value_enum, value_name = "TARGET", conflicts_with_all = ["id", "last_focused"])]
+    pub(crate) target: Option<ShowTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ShowTarget {
+    Here,
 }
 
 #[derive(Debug, Parser)]
@@ -376,7 +384,7 @@ pub fn run_session_cli() -> Result<()> {
     reason = "CLI parser tests intentionally panic on impossible command variants"
 )]
 mod tests {
-    use super::{Args, Command};
+    use super::{Args, Command, ShowTarget};
     use clap::Parser;
 
     #[test]
@@ -401,6 +409,32 @@ mod tests {
     fn show_last_focused_conflicts_with_set_default() {
         let err = Args::try_parse_from(["manifold", "show", "--last-focused", "--set-default"])
             .expect_err("last-focused and set-default should conflict");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn show_accepts_here_target() {
+        let args = Args::parse_from(["manifold", "show", "here"]);
+
+        match args.command {
+            Some(Command::Show(show)) => assert_eq!(show.target, Some(ShowTarget::Here)),
+            other => panic!("expected show command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_here_conflicts_with_explicit_session() {
+        let err = Args::try_parse_from(["manifold", "show", "here", "--id", "2"])
+            .expect_err("here and id should conflict");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn show_here_conflicts_with_last_focused() {
+        let err = Args::try_parse_from(["manifold", "show", "here", "--last-focused"])
+            .expect_err("here and last-focused should conflict");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }

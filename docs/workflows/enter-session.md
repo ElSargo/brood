@@ -14,12 +14,13 @@ Current entry points:
 ```sh
 manifold enter
 manifold show
+manifold show here
 manifold hide
 manifold list
 manifold switch
 ```
 
-`enter` creates or reuses a directory-bound session and starts a shell or requested command inside that context. `show` presents a directory-bound or explicitly selected session. `hide` detaches presentation. `list` reports sessions. `switch` uses a selector or direct query to activate an existing session or create a new one.
+`enter` creates or reuses a directory-bound session and starts a shell or requested command inside that context. `show` presents the current entered session when one is available, otherwise it presents a directory-bound or explicitly selected session. `show here` always uses the command's current directory as the session target. `hide` detaches presentation. `list` reports sessions. `switch` uses a selector or direct query to activate an existing session or create a new one.
 
 Exact flags are defined in `crates/manifoldd/src/lib.rs`.
 
