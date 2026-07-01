@@ -10,6 +10,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -18,6 +19,7 @@
 
   outputs =
     {
+      crane,
       nixpkgs,
       rust-overlay,
       ...
@@ -38,12 +40,21 @@
     {
       devShells = forEachSystem (system: import ./nix/dev-shells.nix { pkgs = pkgsFor system; });
 
-      packages = forEachSystem (system: import ./nix/packages.nix { pkgs = pkgsFor system; });
+      packages = forEachSystem (
+        system:
+        import ./nix/packages.nix {
+          inherit crane;
+          pkgs = pkgsFor system;
+        }
+      );
 
       checks = forEachSystem (
         system:
         let
-          packages = import ./nix/packages.nix { pkgs = pkgsFor system; };
+          packages = import ./nix/packages.nix {
+            inherit crane;
+            pkgs = pkgsFor system;
+          };
         in
         {
           lint = packages.lintCheck;
@@ -51,7 +62,11 @@
       );
 
       formatter = forEachSystem (
-        system: (import ./nix/packages.nix { pkgs = pkgsFor system; }).formatter
+        system:
+        (import ./nix/packages.nix {
+          inherit crane;
+          pkgs = pkgsFor system;
+        }).formatter
       );
     };
 }

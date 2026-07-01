@@ -1,4 +1,4 @@
-{ pkgs }:
+{ pkgs, crane }:
 
 let
   lib = pkgs.lib;
@@ -19,7 +19,7 @@ let
       let
         base = baseNameOf path;
       in
-      base != "Cargo.nix" && base != "target";
+      base != "target";
   };
   nativePkgConfigPath = lib.concatStringsSep ":" [
     (lib.makeSearchPathOutput "dev" "lib/pkgconfig" profiles.nativeLibs)
@@ -28,57 +28,81 @@ let
     (lib.makeSearchPath "share/pkgconfig" profiles.nativeLibs)
   ];
 
-  cargoVendor = pkgs.rustPlatform.importCargoLock {
-    lockFile = ../Cargo.lock;
+  craneLib = (crane.mkLib pkgs).overrideToolchain profiles.rustToolchainWithTools;
+  craneSrc = craneLib.cleanCargoSource src;
+
+  craneBaseArgs = {
+    pname = "manifold";
+    version = "0.1.0";
+    src = craneSrc;
+    strictDeps = true;
+    nativeBuildInputs = [ pkgs.pkg-config ];
+    buildInputs = profiles.nativeLibs;
   };
 
-  generatedCargoNix =
-    pkgs.runCommand "manifold-generated-cargo-nix"
-      {
-        nativeBuildInputs = [ pkgs.crate2nix ];
-      }
-      ''
-        export HOME="$TMPDIR/home"
-        mkdir -p "$HOME" "$out"
-
-        cp -R ${src}/. "$out/"
-        chmod -R u+w "$out"
-
-        cd "$out"
-        mkdir -p .cargo
-        cat > .cargo/config.toml <<EOF
-        [source.crates-io]
-        replace-with = "vendored-sources"
-
-        [source.vendored-sources]
-        directory = "${cargoVendor}"
-
-        [net]
-        offline = true
-        EOF
-
-        export CARGO_NET_OFFLINE=true
-        crate2nix generate
-      '';
-
-  cargoNix = pkgs.callPackage "${generatedCargoNix}/Cargo.nix" {
-    defaultCrateOverrides = pkgs.defaultCrateOverrides // {
-      "av-scenechange" = attrs: {
-        CARGO_ENCODED_RUSTFLAGS = attrs.CARGO_ENCODED_RUSTFLAGS or "";
-      };
-      rav1e = attrs: {
-        CARGO_ENCODED_RUSTFLAGS = attrs.CARGO_ENCODED_RUSTFLAGS or "";
-      };
-      manifoldd = attrs: {
-        nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
-        buildInputs = (attrs.buildInputs or [ ]) ++ profiles.nativeLibs;
-      };
-    };
+  craneLintArgs = craneBaseArgs // {
+    cargoExtraArgs = "--workspace --locked";
+    env.CARGO_PROFILE = "";
   };
 
-  manifoldd = cargoNix.workspaceMembers."manifoldd".build.override {
-    runTests = false;
-  };
+  cargoArtifacts = craneLib.buildDepsOnly (
+    craneLintArgs
+    // {
+      cargoBuildExtraArgs = "--all-targets";
+      cargoCheckExtraArgs = "--all-targets";
+    }
+  );
+
+  clippyCheck = craneLib.cargoClippy (
+    craneLintArgs
+    // {
+      inherit cargoArtifacts;
+      cargoClippyExtraArgs = "--all-targets";
+    }
+  );
+
+  manifolddArtifacts = craneLib.buildDepsOnly (
+    craneBaseArgs
+    // {
+      cargoBuildExtraArgs = "-p manifoldd --bins";
+      cargoCheckExtraArgs = "-p manifoldd --all-targets";
+      cargoTestExtraArgs = "-p manifoldd --no-run";
+    }
+  );
+
+  manifoldd = craneLib.buildPackage (
+    craneBaseArgs
+    // {
+      cargoArtifacts = manifolddArtifacts;
+      cargoBuildExtraArgs = "-p manifoldd --bins";
+      doCheck = false;
+    }
+  );
+
+  shellCheck = pkgs.runCommand "manifold-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
+    cp -R ${src}/. source
+    chmod -R u+w source
+    cd source
+
+    mapfile -d "" shell_files < <(
+      find . \
+        \( -path "./.git" -o -path "./.git/*" \
+        -o -path "./.manifold" -o -path "./.manifold/*" \
+        -o -path "*/.manifold" -o -path "*/.manifold/*" \
+        -o -path "./target" -o -path "./target/*" \
+        -o -path "./reference" -o -path "./reference/*" \
+        -o -path "./result" -o -path "./result/*" \) -prune \
+        -o \( -name "*.sh" -o -name "*.bash" \) -type f -print0
+    )
+
+    if ((''${#shell_files[@]} > 0)); then
+      echo "lint=shell command=shellcheck files=''${#shell_files[@]}"
+      shellcheck -e SC2016 -e SC2034 "''${shell_files[@]}"
+    fi
+
+    mkdir -p "$out"
+    touch "$out/passed"
+  '';
 
   wasmExamples = pkgs.stdenvNoCC.mkDerivation {
     name = "manifold-wasm-examples";
@@ -311,6 +335,8 @@ let
       }
       trap cleanup EXIT
 
+      system="$(nix eval --raw --impure --expr builtins.currentSystem)"
+
       run_job() {
         local name="$1"
         shift
@@ -322,7 +348,7 @@ let
         } >"$tmpdir/$name.log" 2>&1
       }
 
-      run_job lint nix run .#lint &
+      run_job lint nix build --print-build-logs ".#checks.$system.lint" &
       lint_pid="$!"
       run_job build nix build --print-build-logs .#default .#dev-workflow .#wasm-examples &
       build_pid="$!"
@@ -350,6 +376,74 @@ let
       nix develop .#full -c cargo test -p manifoldd --locked
       echo "ci=job name=test status=passed"
       echo "ci=all status=passed"
+    '';
+  };
+
+  cacheCi = pkgs.writeShellApplication {
+    name = "manifold-cache-ci";
+    runtimeInputs = [
+      pkgs.cachix
+      pkgs.coreutils
+      pkgs.git
+      pkgs.nix
+    ];
+    text = ''
+      set -euo pipefail
+
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      cd "$ROOT"
+
+      cache="''${CACHIX_CACHE:-manifold-platform}"
+      if (($# > 0)); then
+        cache="$1"
+        shift
+      fi
+
+      if (($# > 0)); then
+        echo "usage: nix run .#cache-ci [cachix-cache-name]" >&2
+        exit 2
+      fi
+
+      system="$(nix eval --raw --impure --expr builtins.currentSystem)"
+      attrs=(.#default .#ci ".#checks.$system.lint")
+
+      echo "cache-ci=build attrs=''${attrs[*]}"
+      mapfile -t output_paths < <(nix build --no-link --print-out-paths "''${attrs[@]}")
+
+      echo "cache-ci=push cache=$cache paths=''${#output_paths[@]}"
+      printf "cache-ci=path %s\n" "''${output_paths[@]}"
+      cachix push "$cache" "''${output_paths[@]}"
+      echo "cache-ci=status passed"
+    '';
+  };
+
+  primeCargoTarget = pkgs.writeShellApplication {
+    name = "manifold-prime-cargo-target";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.git
+      pkgs.gnutar
+      pkgs.nix
+      pkgs.zstd
+    ];
+    text = ''
+      set -euo pipefail
+
+      ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      cd "$ROOT"
+
+      artifact="$(nix build --no-link --print-out-paths .#cargoArtifacts | tail -n1)"
+      archive="$artifact/target.tar.zst"
+
+      if [[ ! -f "$archive" ]]; then
+        echo "prime-cargo-target=error missing-archive path=$archive" >&2
+        exit 1
+      fi
+
+      mkdir -p target
+      echo "prime-cargo-target=extract archive=$archive destination=$ROOT/target"
+      tar --zstd -xf "$archive" -C target
+      echo "prime-cargo-target=status passed"
     '';
   };
 
@@ -480,39 +574,14 @@ let
     '';
   };
 
-  lintCheck =
-    pkgs.runCommand "manifold-lint-check"
-      {
-        nativeBuildInputs = [ linter ];
-      }
-      ''
-        export HOME="$TMPDIR/home"
-        export CARGO_HOME="$TMPDIR/cargo-home"
-        export CARGO_TARGET_DIR="$TMPDIR/target"
-        export CARGO_NET_OFFLINE=true
-        mkdir -p "$HOME" "$CARGO_HOME" source
+  lintCheck = pkgs.runCommand "manifold-lint-check" { } ''
+    echo "lint=rust command=cargo-check artifacts=${cargoArtifacts}"
+    echo "lint=rust command=cargo-clippy check=${clippyCheck}"
+    echo "lint=shell check=${shellCheck}"
 
-        cp -R ${src}/. source/
-        chmod -R u+w source
-        cd source
-
-        mkdir -p .cargo
-        cat > .cargo/config.toml <<EOF
-        [source.crates-io]
-        replace-with = "vendored-sources"
-
-        [source.vendored-sources]
-        directory = "${cargoVendor}"
-
-        [net]
-        offline = true
-        EOF
-
-        manifold-lint
-
-        mkdir -p "$out"
-        touch "$out/passed"
-      '';
+    mkdir -p "$out"
+    touch "$out/passed"
+  '';
 
   mkDevWorkflow = import ./scripts/dev-workflow.nix;
 
@@ -580,16 +649,22 @@ in
   "dev-env" = devEnv;
   "dev-env-full" = devEnvFull;
   ci = localCi;
+  "cache-ci" = cacheCi;
   "ci-tools" = ciTools;
   lint = linter;
+  "prime-cargo-target" = primeCargoTarget;
   "runtime-files" = runtimeFiles;
   "wasm-examples" = wasmExamples;
   inherit formatter linter;
 
   inherit
+    cargoArtifacts
+    clippyCheck
     devEnv
     devEnvFull
+    cacheCi
     ciTools
+    primeCargoTarget
     localCi
     devWorkflow
     devWorkflowFullWithRuntime
@@ -602,6 +677,7 @@ in
     manifoldd
     lintCheck
     runtimeFiles
+    shellCheck
     wasmExamples
     ;
 }

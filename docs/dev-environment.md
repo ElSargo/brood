@@ -91,10 +91,9 @@ artifacts into the checkout paths that the checked-in `manifold.toml` refers to.
 The WASM build is therefore cacheable through Nix/Cachix and the app workflow no
 longer needs to download a Rust toolchain just to start.
 
-The package-built binary comes from a crate2nix expression generated from
-`Cargo.lock` by the Nix package path. `Cargo.nix` is intentionally not checked
-in. The Manifold process deliberately bypasses configured session runners
-because the Nix package already provides the runtime for this entry point.
+The package-built binary comes from the Crane package path in `nix/packages.nix`.
+The Manifold process deliberately bypasses configured session runners because
+the Nix package already provides the runtime for this entry point.
 
 The cached checkout is intentionally writable and reused between runs. The
 workflow should not reset local edits in that checkout. To point the one-liner at

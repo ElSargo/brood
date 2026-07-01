@@ -96,7 +96,7 @@ nix run github:ElSargo/manifold#dev-workflow
 
 This clones a writable checkout under `~/.cache`, installs the packaged WASM
 example artifacts used by the normal config, starts a normal Manifold session
-from the crate2nix-built binary, and opens a terminal in that checkout. See
+from the Nix-built binary, and opens a terminal in that checkout. See
 [Development Environment](docs/dev-environment.md).
 
 For the larger toolbox with Docker, Go, Firefox, and smoke tools:

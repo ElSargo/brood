@@ -37,7 +37,7 @@ jobs:
           skipPush: true
 
       - name: Run lints
-        run: nix run .#lint
+        run: nix build --print-build-logs .#checks.x86_64-linux.lint
 
   build:
     name: Build
