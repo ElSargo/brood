@@ -3690,6 +3690,7 @@ mod tests {
             name: name.to_string(),
             active: false,
             windows: 0,
+            working_directory: None,
         }
     }
 
@@ -3700,6 +3701,7 @@ mod tests {
             name: "notes".to_string(),
             active: true,
             windows: 2,
+            working_directory: None,
         });
 
         let output = format!("ignored query\n{row}");

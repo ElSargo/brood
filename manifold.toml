@@ -17,7 +17,7 @@ argv = ["foot", "--app-id", "manifold-codex", "codex", "--yolo"]
 [startup.session-switcher]
 enabled = true
 realm = "presentation"
-argv = ["python3", "apps/manifold-session-switcher.py", "--width", "300", "--sidebar-mode", "always"]
+argv = ["python3", "apps/manifold-session-switcher.py", "--width", "300"]
 
 [session.runner]
 enabled = true
