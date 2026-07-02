@@ -14,6 +14,8 @@ Run `./tools/smoke-v1-full.sh` from the repo root for the full supported v1 proo
 
 Run `nix build .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).software-e2e` for the sandboxed software-rendered graphical proof. It uses llvmpipe, real Weston clients, nested Manifold presentation, split layout actions, and debug dumps with composed PNG captures.
 
+Run `nix build .#software-e2e-artifacts` to export the inspectable proof bundle: `frame.png`, `layout-state.json`, and `detected-layout.json`.
+
 The full suite and compositor smoke scripts require a host display socket for the Winit presentation endpoint. If preflight fails, the log includes `host_display_diagnostic=begin...end` with socket paths, environment, and directory listings. If an unusual backend is available but these socket checks do not detect it, set `MANIFOLD_SKIP_HOST_PREFLIGHT=1` to let `manifold` attempt startup directly. The headless smoke scripts can still be run individually when no host display is available.
 
 ## Focused Checks

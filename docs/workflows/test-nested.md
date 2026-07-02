@@ -43,7 +43,15 @@ Run the sandboxed software-rendered graphical proof through Nix:
 nix build .#checks.$(nix eval --raw --impure --expr builtins.currentSystem).software-e2e
 ```
 
-The result contains `inner-dump/` and `outer-dump/` with composed PNG captures and state manifests. The inner dump exercises real clients in a split layout; the outer dump proves the same session can be presented and captured through the offscreen supervisor.
+The result contains `inner-dump/` and `outer-dump/` with composed PNG captures and state manifests. The inner dump is the pixel proof for real clients in a split layout. The outer dump is a supervisor diagnostic for the hosted inner presentation.
+
+Build the inspectable artifact bundle when the captured frame and decoded marker positions are the desired output:
+
+```sh
+nix build .#software-e2e-artifacts
+```
+
+The result contains `frame.png`, `layout-state.json`, and `detected-layout.json`.
 
 Related:
 

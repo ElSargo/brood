@@ -116,6 +116,37 @@ let
         touch "$out/passed"
       '';
 
+  softwareE2eArtifacts =
+    pkgs.runCommand "manifold-software-e2e-artifacts"
+      {
+        nativeBuildInputs = [
+          pkgs.python3
+          softwareE2eCapture
+        ];
+      }
+      ''
+        run_dir="$TMPDIR/software-e2e"
+        mkdir -p "$run_dir"
+
+        manifold-software-e2e-capture --out-dir "$run_dir"
+        python3 ${src}/tools/detect-surface-markers.py \
+          "$run_dir/inner-dump/composed.png" \
+          "$run_dir/inner-dump/state.json" \
+          "$run_dir/detected-layout.json"
+
+        mkdir -p "$out"
+        cp "$run_dir/inner-dump/composed.png" "$out/frame.png"
+        cp "$run_dir/inner-dump/state.json" "$out/layout-state.json"
+        cp "$run_dir/detected-layout.json" "$out/detected-layout.json"
+        cp "$run_dir/summary.txt" "$out/summary.txt"
+        cat > "$out/README.txt" <<EOF
+        frame.png              inner composed frame used for pixel detection
+        layout-state.json      Manifold debug-dump layout/window state
+        detected-layout.json   marker IDs and positions decoded from frame.png, matched to layout-state.json
+        summary.txt            capture command summary
+        EOF
+      '';
+
   testCheck = pkgs.runCommand "manifold-test-check" { } ''
     echo "test=rust cargo=${cargoTestCheck}"
     echo "test=software-e2e check=${softwareE2eCheck}"
@@ -727,6 +758,7 @@ in
   lint = linter;
   "prime-cargo-target" = primeCargoTarget;
   "software-e2e-capture" = softwareE2eCapture;
+  "software-e2e-artifacts" = softwareE2eArtifacts;
   "runtime-files" = runtimeFiles;
   "wasm-examples" = wasmExamples;
   inherit formatter linter;
@@ -753,6 +785,7 @@ in
     lintCheck
     runtimeFiles
     shellCheck
+    softwareE2eArtifacts
     softwareE2eCapture
     softwareE2eCheck
     testCheck

@@ -43,7 +43,7 @@ use smithay::{
         timer::{TimeoutAction, Timer},
     },
     utils::DeviceFd,
-    utils::{Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale},
+    utils::{Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -693,8 +693,9 @@ where
     ) -> Vec<C> {
         let mut elements = Vec::new();
         if let Some(marker_id) = self.marker_id {
+            let marker_size = self.window.geometry().size;
             elements.extend(
-                marker_render_elements(marker_id, location, scale, alpha)
+                marker_render_elements(marker_id, location, marker_size, scale, alpha)
                     .into_iter()
                     .map(TestSurfaceRenderElement::Marker)
                     .map(C::from),
@@ -720,53 +721,73 @@ where
 fn marker_render_elements(
     marker_id: u64,
     location: Point<i32, Physical>,
+    size: Size<i32, Logical>,
     scale: Scale<f64>,
     alpha: f32,
 ) -> Vec<SolidColorRenderElement> {
-    const GRID: i32 = 9;
-    const BACKGROUND: [f32; 4] = [1.0, 1.0, 1.0, 0.94];
-    const DARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
-    const ANCHOR: [f32; 4] = [1.0, 0.0, 0.75, 1.0];
+    let marker_size = MARKER_GRID * MARKER_CELL;
+    let physical_size: Size<i32, Physical> = size.to_physical_precise_round(scale);
+    let opposite_offset = Point::<i32, Physical>::from((
+        (physical_size.w - marker_size).max(0),
+        (physical_size.h - marker_size).max(0),
+    ));
 
     let mut elements = Vec::new();
-    for row in 0..GRID {
-        for col in 0..GRID {
+    push_marker(&mut elements, location, scale, alpha, marker_id);
+    if opposite_offset.x != 0 || opposite_offset.y != 0 {
+        push_marker(
+            &mut elements,
+            location + opposite_offset,
+            scale,
+            alpha,
+            marker_id,
+        );
+    }
+    elements
+}
+
+fn push_marker(
+    elements: &mut Vec<SolidColorRenderElement>,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    marker_id: u64,
+) {
+    for row in 0..MARKER_GRID {
+        for col in 0..MARKER_GRID {
             if row == 1 && col == 1 {
                 push_marker_cell(
-                    &mut elements,
+                    elements,
                     location,
                     scale,
                     alpha,
-                    MarkerCell::new(col, row, 1, ANCHOR),
+                    MarkerCell::new(col, row, 1, MARKER_ANCHOR),
                 );
             } else if marker_cell_is_dark(marker_id, col, row) {
                 push_marker_cell(
-                    &mut elements,
+                    elements,
                     location,
                     scale,
                     alpha,
-                    MarkerCell::new(col, row, 1, DARK),
+                    MarkerCell::new(col, row, 1, MARKER_DARK),
                 );
             }
         }
     }
     push_marker_cell(
-        &mut elements,
+        elements,
         location,
         scale,
         alpha,
-        MarkerCell::new(0, 0, GRID, BACKGROUND),
+        MarkerCell::new(0, 0, MARKER_GRID, MARKER_BACKGROUND),
     );
-
-    elements
 }
 
 fn marker_cell_is_dark(marker_id: u64, col: i32, row: i32) -> bool {
-    const GRID: i32 = 9;
-    if row == 0 || col == 0 || row == GRID - 1 || col == GRID - 1 {
+    if row == 0 || col == 0 || row == MARKER_GRID - 1 || col == MARKER_GRID - 1 {
         return true;
     }
-    if (row == 1 && col == GRID - 2) || (row == GRID - 2 && col == 1) {
+    if (row == 1 && col == MARKER_GRID - 2) || (row == MARKER_GRID - 2 && col == 1) {
         return true;
     }
     if !(2..=6).contains(&row) || !(2..=6).contains(&col) {
@@ -775,6 +796,12 @@ fn marker_cell_is_dark(marker_id: u64, col: i32, row: i32) -> bool {
     let bit = u64::try_from((row - 2) * 5 + (col - 2)).unwrap_or(0);
     ((marker_id >> bit) & 1) == 1
 }
+
+const MARKER_GRID: i32 = 9;
+const MARKER_CELL: i32 = 5;
+const MARKER_BACKGROUND: [f32; 4] = [1.0, 1.0, 1.0, 0.94];
+const MARKER_DARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+const MARKER_ANCHOR: [f32; 4] = [1.0, 0.0, 0.75, 1.0];
 
 #[derive(Clone, Copy)]
 struct MarkerCell {
@@ -802,10 +829,9 @@ fn push_marker_cell(
     alpha: f32,
     cell: MarkerCell,
 ) {
-    const CELL: i32 = 5;
-    let offset = Point::<i32, Logical>::from((cell.col * CELL, cell.row * CELL))
+    let offset = Point::<i32, Logical>::from((cell.col * MARKER_CELL, cell.row * MARKER_CELL))
         .to_physical_precise_round(scale);
-    let size = CELL * cell.span;
+    let size = MARKER_CELL * cell.span;
     let buffer = SolidColorBuffer::new((size, size), cell.color);
     elements.push(SolidColorRenderElement::from_buffer(
         &buffer,
