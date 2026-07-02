@@ -35,6 +35,8 @@ cargo run -- test nested --keep-running --inner-command ./tmp-client-wrapper
 
 The outer supervisor is offscreen by default. Pass `--outer-headful` only for host-visible manual inspection.
 
+Nested debug dumps include `outer-dump/composed.png` and `outer-dump/state.json`. When the outer supervisor is used, hosted surfaces are rendered with test-only surface-local markers; `state.json` records each visible window's `marker_id` beside its expected rect.
+
 Related:
 
 - [[../systems/testing]]

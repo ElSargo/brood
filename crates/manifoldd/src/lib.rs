@@ -96,6 +96,9 @@ pub struct SessionArgs {
     /// Start with an attached offscreen presentation target. Used by nested tests.
     #[arg(long = "offscreen-presentation", hide = true)]
     pub(crate) offscreen_presentation: bool,
+    /// Render test fiducials in each hosted surface's local coordinate space.
+    #[arg(long = "test-surface-markers", hide = true)]
+    pub(crate) test_surface_markers: bool,
     /// Launch an isolated Chromium browser pane at startup.
     #[arg(long = "browser", value_name = "URL", num_args = 0..=1, default_missing_value = "about:blank")]
     pub(crate) browser: Option<String>,
@@ -142,6 +145,7 @@ impl Default for SessionArgs {
             dbus_address: None,
             headless: false,
             offscreen_presentation: false,
+            test_surface_markers: false,
             browser: None,
             wasm_key_handler: None,
             wasm_map_hook: None,

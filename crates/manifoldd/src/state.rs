@@ -502,6 +502,7 @@ pub struct Manifold {
     session_dbus_buses: Vec<(SessionBusRealm, SessionBusHandle)>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
+    pub(crate) test_surface_markers: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
     pub(crate) wasm_key_handler: Option<WasmKeyHandler>,
     pub(crate) wasm_map_hook: Option<WasmMapHook>,
@@ -643,6 +644,7 @@ impl Manifold {
             session_dbus_buses: Vec::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
+            test_surface_markers: false,
             presenter: None,
             wasm_key_handler: None,
             wasm_map_hook: None,
@@ -2440,6 +2442,14 @@ impl Manifold {
         }
         let surface = Self::window_toplevel_surface(window)?;
         self.layout_rect_for_toplevel_surface(&surface)
+    }
+
+    pub(crate) fn window_test_marker_id(&self, window: &Window, fallback_index: usize) -> u64 {
+        let Some(surface) = Self::window_toplevel_surface(window) else {
+            return fallback_marker_id(fallback_index);
+        };
+        self.pane_for_toplevel_surface(&surface)
+            .unwrap_or_else(|| fallback_marker_id(fallback_index))
     }
 
     fn layout_rect_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutRect> {
@@ -4424,6 +4434,10 @@ fn default_surface_session_name(session: SurfaceSessionId) -> String {
         / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
         % SESSION_NAME_ACTIONS.len()];
     format!("{adjective}-{noun}-{action}")
+}
+
+fn fallback_marker_id(index: usize) -> u64 {
+    1_000_000 + u64::try_from(index).unwrap_or(u64::MAX - 1_000_000)
 }
 
 fn current_process_directory() -> PathBuf {

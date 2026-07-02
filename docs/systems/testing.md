@@ -23,6 +23,8 @@ Outside Manifold, the default topology starts an outer supervisor with offscreen
 
 The outer supervisor is offscreen-attached unless `--outer-headful` is passed.
 
+Nested tests render surface-local fiducial markers in hosted surfaces before final composition. Debug dumps include the composed framebuffer and matching marker IDs in `state.json`, so image-based checks can verify that the captured pixels and Manifold's expected pane/layout metadata agree.
+
 See [[../workflows/test-nested]].
 
 ## Manual Host-Visible Harness

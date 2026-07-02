@@ -27,22 +27,23 @@ use smithay::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
         renderer::{
-            ExportMem, ImportDma,
+            ExportMem, ImportAll, ImportDma, Renderer,
             damage::OutputDamageTracker,
             element::{
-                Kind,
+                AsRenderElements, Kind,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
+                surface::WaylandSurfaceRenderElement,
             },
         },
     },
-    desktop::Space,
+    desktop::{Space, Window, space::SpaceElement},
     output::{Mode, Output},
     reexports::calloop::{
         LoopHandle,
         timer::{TimeoutAction, Timer},
     },
     utils::DeviceFd,
-    utils::{Buffer as BufferCoords, Point, Rectangle},
+    utils::{Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -485,23 +486,24 @@ fn render_presenter_frame_with_capture(
     let mut damage_tracker = presenter.damage_tracker.borrow_mut();
     let size = backend.window_size();
     let damage = Rectangle::from_size(size);
-    let mut render_space = Space::default();
+    let mut render_space: Space<MarkedWindow> = Space::default();
     render_space.map_output(&output, (0, 0));
-    for window in state
+    for (index, window) in state
         .space
         .elements()
         .filter(|window| state.window_visible_in_presentation(window))
+        .enumerate()
     {
         let loc = state
             .window_layout_rect(window)
             .map_or((0, 0), |rect| (rect.x, rect.y));
-        render_space.map_element(window.clone(), loc, true);
+        render_space.map_element(marked_window(state, window, index), loc, true);
     }
     if let Some(active_window) = state.active_presentation_window() {
         let loc = state
             .window_layout_rect(&active_window)
             .map_or((0, 0), |rect| (rect.x, rect.y));
-        render_space.map_element(active_window, loc, true);
+        render_space.map_element(marked_window(state, &active_window, 0), loc, true);
     }
     let chrome_elements = layout_chrome_elements(state);
 
@@ -605,6 +607,188 @@ fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
         push_border(&mut elements, rect, 1, color);
     }
     elements
+}
+
+fn marked_window(state: &Manifold, window: &Window, index: usize) -> MarkedWindow {
+    let marker_id = state
+        .test_surface_markers
+        .then(|| state.window_test_marker_id(window, index));
+    MarkedWindow {
+        window: window.clone(),
+        marker_id,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MarkedWindow {
+    window: Window,
+    marker_id: Option<u64>,
+}
+
+impl PartialEq for MarkedWindow {
+    fn eq(&self, other: &Self) -> bool {
+        self.window == other.window
+    }
+}
+
+impl IsAlive for MarkedWindow {
+    fn alive(&self) -> bool {
+        self.window.alive()
+    }
+}
+
+impl SpaceElement for MarkedWindow {
+    fn geometry(&self) -> Rectangle<i32, Logical> {
+        self.window.geometry()
+    }
+
+    fn bbox(&self) -> Rectangle<i32, Logical> {
+        self.window.bbox()
+    }
+
+    fn is_in_input_region(&self, point: &Point<f64, Logical>) -> bool {
+        self.window.is_in_input_region(point)
+    }
+
+    fn z_index(&self) -> u8 {
+        self.window.z_index()
+    }
+
+    fn set_activate(&self, activated: bool) {
+        self.window.set_activate(activated);
+    }
+
+    fn output_enter(&self, output: &Output, overlap: Rectangle<i32, Logical>) {
+        self.window.output_enter(output, overlap);
+    }
+
+    fn output_leave(&self, output: &Output) {
+        self.window.output_leave(output);
+    }
+
+    fn refresh(&self) {
+        self.window.refresh();
+    }
+}
+
+smithay::backend::renderer::element::render_elements! {
+    TestSurfaceRenderElement<R> where R: ImportAll;
+    Surface=WaylandSurfaceRenderElement<R>,
+    Marker=SolidColorRenderElement,
+}
+
+impl<R> AsRenderElements<R> for MarkedWindow
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    type RenderElement = TestSurfaceRenderElement<R>;
+
+    fn render_elements<C: From<Self::RenderElement>>(
+        &self,
+        renderer: &mut R,
+        location: Point<i32, Physical>,
+        scale: Scale<f64>,
+        alpha: f32,
+    ) -> Vec<C> {
+        let mut elements = Vec::new();
+        if let Some(marker_id) = self.marker_id {
+            elements.extend(
+                marker_render_elements(marker_id, location, scale, alpha)
+                    .into_iter()
+                    .map(TestSurfaceRenderElement::Marker)
+                    .map(C::from),
+            );
+        }
+        elements.extend(
+            AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                &self.window,
+                renderer,
+                location,
+                scale,
+                alpha,
+            )
+            .into_iter()
+            .map(TestSurfaceRenderElement::Surface)
+            .map(C::from),
+        );
+
+        elements
+    }
+}
+
+fn marker_render_elements(
+    marker_id: u64,
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Vec<SolidColorRenderElement> {
+    const GRID: i32 = 9;
+    const BACKGROUND: [f32; 4] = [1.0, 1.0, 1.0, 0.94];
+    const DARK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    const ANCHOR: [f32; 4] = [1.0, 0.0, 0.75, 1.0];
+
+    let mut elements = Vec::new();
+    for row in 0..GRID {
+        for col in 0..GRID {
+            if row == 1 && col == 1 {
+                push_marker_cell(&mut elements, location, scale, alpha, col, row, 1, ANCHOR);
+            } else if marker_cell_is_dark(marker_id, col, row) {
+                push_marker_cell(&mut elements, location, scale, alpha, col, row, 1, DARK);
+            }
+        }
+    }
+    push_marker_cell(
+        &mut elements,
+        location,
+        scale,
+        alpha,
+        0,
+        0,
+        GRID,
+        BACKGROUND,
+    );
+
+    elements
+}
+
+fn marker_cell_is_dark(marker_id: u64, col: i32, row: i32) -> bool {
+    const GRID: i32 = 9;
+    if row == 0 || col == 0 || row == GRID - 1 || col == GRID - 1 {
+        return true;
+    }
+    if (row == 1 && col == GRID - 2) || (row == GRID - 2 && col == 1) {
+        return true;
+    }
+    if !(2..=6).contains(&row) || !(2..=6).contains(&col) {
+        return false;
+    }
+    let bit = u64::try_from((row - 2) * 5 + (col - 2)).unwrap_or(0);
+    ((marker_id >> bit) & 1) == 1
+}
+
+fn push_marker_cell(
+    elements: &mut Vec<SolidColorRenderElement>,
+    origin: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    col: i32,
+    row: i32,
+    span: i32,
+    color: [f32; 4],
+) {
+    const CELL: i32 = 5;
+    let offset =
+        Point::<i32, Logical>::from((col * CELL, row * CELL)).to_physical_precise_round(scale);
+    let size = CELL * span;
+    let buffer = SolidColorBuffer::new((size, size), color);
+    elements.push(SolidColorRenderElement::from_buffer(
+        &buffer,
+        origin + offset,
+        scale,
+        alpha,
+        Kind::Unspecified,
+    ));
 }
 
 fn push_border(

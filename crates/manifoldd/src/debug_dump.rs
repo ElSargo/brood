@@ -133,6 +133,9 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
         .elements()
         .enumerate()
         .map(|(index, window)| {
+            let marker_id = state
+                .test_surface_markers
+                .then(|| state.window_test_marker_id(window, index));
             let surface_id = Manifold::window_toplevel_surface(window).map_or_else(
                 || "none".to_string(),
                 |surface| {
@@ -145,6 +148,7 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
             json!({
                 "index": index,
                 "surface_id": surface_id,
+                "marker_id": marker_id,
                 "rect": rect,
                 "focused": state.focused_window_index() == Some(index),
             })
@@ -177,6 +181,7 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
         .collect::<Vec<_>>();
     Ok(json!({
         "status": status,
+        "test_surface_markers": state.test_surface_markers,
         "windows": windows,
         "layout": {
             "source": state.resolved_layout_source_name(),
@@ -195,6 +200,9 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
         let Some(surface) = Manifold::window_toplevel_surface(window) else {
             continue;
         };
+        let marker_id = state
+            .test_surface_markers
+            .then(|| state.window_test_marker_id(window, index));
         let surface_id = crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()));
         let buffer = with_states(&surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
@@ -207,6 +215,7 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
             surfaces.push(json!({
                 "index": index,
                 "surface_id": surface_id,
+                "marker_id": marker_id,
                 "status": "no_current_buffer",
             }));
             continue;
@@ -221,6 +230,7 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
             Ok(Some(path)) => json!({
                 "index": index,
                 "surface_id": surface_id,
+                "marker_id": marker_id,
                 "buffer_type": buffer_kind,
                 "dimensions": dimensions,
                 "has_alpha": has_alpha,
@@ -230,6 +240,7 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
             Ok(None) => json!({
                 "index": index,
                 "surface_id": surface_id,
+                "marker_id": marker_id,
                 "buffer_type": buffer_kind,
                 "dimensions": dimensions,
                 "has_alpha": has_alpha,
@@ -238,6 +249,7 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
             Err(err) => json!({
                 "index": index,
                 "surface_id": surface_id,
+                "marker_id": marker_id,
                 "buffer_type": buffer_kind,
                 "dimensions": dimensions,
                 "has_alpha": has_alpha,

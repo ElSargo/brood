@@ -133,6 +133,7 @@ fn serve_session_on_calloop_thread(
     let display: Display<Manifold> = Display::new()?;
     let mut state = Manifold::new(&mut event_loop, display);
     state.set_async_runtime(runtime.clone());
+    state.test_surface_markers = args.test_surface_markers;
     let config_path = args.resolved_config_path();
     if args.no_initial_surface_session {
         state.clear_initial_surface_session();
@@ -527,6 +528,7 @@ fn spawn_outer(
     if !outer_headful {
         command.arg("--offscreen-presentation");
     }
+    command.arg("--test-surface-markers");
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
     }
@@ -566,6 +568,7 @@ fn spawn_subject(
     if subject_headless {
         command.arg("--headless");
     }
+    command.arg("--test-surface-markers");
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
     }
@@ -611,6 +614,7 @@ fn spawn_inner(
     if inner_headless {
         command.push_str(" --headless");
     }
+    command.push_str(" --test-surface-markers");
     if let Some(wasm_key_handler) = wasm_key_handler {
         command.push_str(" --wasm-key-handler ");
         command.push_str(&shell_quote(&wasm_key_handler.display().to_string()));
