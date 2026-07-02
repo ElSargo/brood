@@ -436,7 +436,7 @@ let
       fi
 
       echo "ci=job name=test status=started"
-      nix build --print-build-logs ".#checks.$system.test"
+      nix build --print-build-logs ".#checks.$system.test" ".#checks.$system.software-e2e"
       echo "ci=job name=test status=passed"
       echo "ci=all status=passed"
     '';
@@ -473,6 +473,7 @@ let
         .#ci
         ".#checks.$system.lint"
         ".#checks.$system.test"
+        ".#checks.$system.software-e2e"
         .#cargoArtifacts
         .#clippyCheck
         .#shellCheck
