@@ -732,9 +732,21 @@ fn marker_render_elements(
     for row in 0..GRID {
         for col in 0..GRID {
             if row == 1 && col == 1 {
-                push_marker_cell(&mut elements, location, scale, alpha, col, row, 1, ANCHOR);
+                push_marker_cell(
+                    &mut elements,
+                    location,
+                    scale,
+                    alpha,
+                    MarkerCell::new(col, row, 1, ANCHOR),
+                );
             } else if marker_cell_is_dark(marker_id, col, row) {
-                push_marker_cell(&mut elements, location, scale, alpha, col, row, 1, DARK);
+                push_marker_cell(
+                    &mut elements,
+                    location,
+                    scale,
+                    alpha,
+                    MarkerCell::new(col, row, 1, DARK),
+                );
             }
         }
     }
@@ -743,10 +755,7 @@ fn marker_render_elements(
         location,
         scale,
         alpha,
-        0,
-        0,
-        GRID,
-        BACKGROUND,
+        MarkerCell::new(0, 0, GRID, BACKGROUND),
     );
 
     elements
@@ -767,21 +776,37 @@ fn marker_cell_is_dark(marker_id: u64, col: i32, row: i32) -> bool {
     ((marker_id >> bit) & 1) == 1
 }
 
+#[derive(Clone, Copy)]
+struct MarkerCell {
+    col: i32,
+    row: i32,
+    span: i32,
+    color: [f32; 4],
+}
+
+impl MarkerCell {
+    const fn new(col: i32, row: i32, span: i32, color: [f32; 4]) -> Self {
+        Self {
+            col,
+            row,
+            span,
+            color,
+        }
+    }
+}
+
 fn push_marker_cell(
     elements: &mut Vec<SolidColorRenderElement>,
     origin: Point<i32, Physical>,
     scale: Scale<f64>,
     alpha: f32,
-    col: i32,
-    row: i32,
-    span: i32,
-    color: [f32; 4],
+    cell: MarkerCell,
 ) {
     const CELL: i32 = 5;
-    let offset =
-        Point::<i32, Logical>::from((col * CELL, row * CELL)).to_physical_precise_round(scale);
-    let size = CELL * span;
-    let buffer = SolidColorBuffer::new((size, size), color);
+    let offset = Point::<i32, Logical>::from((cell.col * CELL, cell.row * CELL))
+        .to_physical_precise_round(scale);
+    let size = CELL * cell.span;
+    let buffer = SolidColorBuffer::new((size, size), cell.color);
     elements.push(SolidColorRenderElement::from_buffer(
         &buffer,
         origin + offset,

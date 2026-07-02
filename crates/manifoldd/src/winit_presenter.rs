@@ -407,7 +407,11 @@ impl PresenterBackend {
         let span_for_guard = span.clone();
         let _guard = span_for_guard.enter();
         let display = offscreen_egl_display()?;
-        let context = create_egl_context(&display, gl_attributes)?;
+        let context = if env::var_os("MANIFOLD_ALLOW_SOFTWARE_EGL_CONFIG").is_some() {
+            EGLContext::new(&display)?
+        } else {
+            create_egl_context(&display, gl_attributes)?
+        };
         let _ = context.unbind();
         let mut renderer = unsafe { GlesRenderer::new(context)? };
         let renderbuffer = create_offscreen_renderbuffer(&mut renderer, size)?;
@@ -522,16 +526,15 @@ fn create_egl_context(
     display: &EGLDisplay,
     gl_attributes: GlAttributes,
 ) -> Result<EGLContext, PresenterBackendError> {
-    Ok(
-        EGLContext::new_with_config(display, gl_attributes, PixelFormatRequirements::_10_bit())
-            .or_else(|_| {
-                EGLContext::new_with_config(
-                    display,
-                    gl_attributes,
-                    PixelFormatRequirements::_8_bit(),
-                )
-            })?,
-    )
+    let mut ten_bit = PixelFormatRequirements::_10_bit();
+    let mut eight_bit = PixelFormatRequirements::_8_bit();
+    if env::var_os("MANIFOLD_ALLOW_SOFTWARE_EGL_CONFIG").is_some() {
+        ten_bit.hardware_accelerated = None;
+        eight_bit.hardware_accelerated = None;
+    }
+
+    Ok(EGLContext::new_with_config(display, gl_attributes, ten_bit)
+        .or_else(|_| EGLContext::new_with_config(display, gl_attributes, eight_bit))?)
 }
 
 impl PresenterBackend {

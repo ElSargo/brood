@@ -61,7 +61,7 @@ let
     }
   );
 
-  testCheck = craneLib.cargoTest (
+  cargoTestCheck = craneLib.cargoTest (
     craneBaseArgs
     // {
       inherit cargoArtifacts;
@@ -77,6 +77,52 @@ let
       '';
     }
   );
+
+  softwareE2eCapture = pkgs.writeShellApplication {
+    name = "manifold-software-e2e-capture";
+    runtimeInputs = [
+      pkgs.bash
+      pkgs.coreutils
+      pkgs.dbus
+      pkgs.gnused
+      pkgs.python3
+      profiles.westonWithSimpleClients
+    ];
+    text = ''
+      export DBUS_SESSION_BUS_CONFIG=${pkgs.dbus}/share/dbus-1/session.conf
+      export __EGL_VENDOR_LIBRARY_FILENAMES=${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json
+      export LIBGL_DRIVERS_PATH=${pkgs.mesa}/lib/dri
+      export GBM_BACKENDS_PATH=${pkgs.mesa}/lib/gbm
+      exec bash ${src}/tools/software-e2e-capture.sh \
+        --manifold-bin ${manifold}/bin/manifold \
+        "$@"
+    '';
+  };
+
+  softwareE2eCheck =
+    pkgs.runCommand "manifold-software-e2e-check" { nativeBuildInputs = [ softwareE2eCapture ]; }
+      ''
+        run_dir="$TMPDIR/software-e2e"
+        mkdir -p "$run_dir"
+
+        manifold-software-e2e-capture --out-dir "$run_dir"
+
+        mkdir -p "$out"
+        cp -R "$run_dir"/inner-dump "$out/inner-dump"
+        cp -R "$run_dir"/outer-dump "$out/outer-dump"
+        cp "$run_dir"/*.json "$out/"
+        cp "$run_dir"/*.log "$out/"
+        cp "$run_dir"/summary.txt "$out/"
+        touch "$out/passed"
+      '';
+
+  testCheck = pkgs.runCommand "manifold-test-check" { } ''
+    echo "test=rust cargo=${cargoTestCheck}"
+    echo "test=software-e2e check=${softwareE2eCheck}"
+    mkdir -p "$out"
+    ln -s ${softwareE2eCheck} "$out/software-e2e"
+    touch "$out/passed"
+  '';
 
   manifolddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
@@ -679,6 +725,7 @@ in
   "ci-tools" = ciTools;
   lint = linter;
   "prime-cargo-target" = primeCargoTarget;
+  "software-e2e-capture" = softwareE2eCapture;
   "runtime-files" = runtimeFiles;
   "wasm-examples" = wasmExamples;
   inherit formatter linter;
@@ -705,6 +752,8 @@ in
     lintCheck
     runtimeFiles
     shellCheck
+    softwareE2eCapture
+    softwareE2eCheck
     testCheck
     wasmExamples
     ;

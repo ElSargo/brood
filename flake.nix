@@ -59,6 +59,7 @@
         {
           lint = packages.lintCheck;
           test = packages.testCheck;
+          software-e2e = packages.softwareE2eCheck;
         }
       );
 
