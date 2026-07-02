@@ -45,3 +45,9 @@ jobs:
 
       - name: Run CI
         run: nix run --print-build-logs .#ci
+
+      - name: Push Cachix
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: nix run --print-build-logs .#cache-ci
