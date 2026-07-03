@@ -1,8 +1,8 @@
 # WASM Integration
 
-This is the canonical WASM design-target document.
+This archived page was an earlier WASM design-target document. The current target plugin architecture is documented in [Plugin](../concepts/plugin.md), [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Policy](../systems/layout-policy.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md).
 
-It describes the intended Manifold app and module model, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
+It describes the intended Manifold app and module model as historical context, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
 
 WASM is Manifold's planned fast-iteration layer for workspace behavior, built-in tools, user apps, extensions, and agents. Manifold should have a workspace and WASM app model; the open question is the exact shape, not whether this direction belongs in the project.
 
@@ -34,17 +34,17 @@ This means the first useful milestone is not the WASM runtime itself. The first 
 
 The runtime then becomes an adapter over this model. Linux-native `manifold` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
-The execution model is recorded in [WASM Execution Model](wasm-execution-model.md). In short, Manifold should keep calloop as the authoritative session/compositor loop, run ordinary plugin work in a separate async lane, and reserve a synchronous fast lane for bounded pre-commit policy hooks.
+The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold should keep the session process authoritative, run ordinary plugin work as actor/mailbox traffic, and reserve sync policy lanes for bounded pre-commit policy hooks that read immutable swapchain state.
 
-The layout policy boundary is recorded in [Resolved Layout](layout-mould.md). In short, WASM returns candidate resolved layout items, while the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
+The layout policy boundary is now promoted into [Layout Policy](../systems/layout-policy.md). In short, plugins return candidate resolved layout items through a sync policy lane, while the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
 
 The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md). In short, modules should target `global`, `session`, or `surface` realms, with mostly shared host APIs plus realm-local convenience bindings and lifetimes.
 
-The native UI backend experiment is recorded in [Session Switcher UI Experiment](session-switcher-ui-experiment.md). In short, WASM should write a flat host-validated UI tree, while native backends such as Iced or GPUI render the accepted tree without becoming the plugin ABI.
+The native UI backend experiment is recorded in [Session Switcher UI Experiment](../experiments/session-switcher-ui.md), with the target UI boundary summarized in [Plugin UI And Pane Rendering](../systems/plugin-ui.md). In short, plugins should write a flat host-validated UI tree, while native backends such as Iced or GPUI render the accepted tree without becoming the plugin ABI.
 
 The entered session environment model is recorded in [Session Environments](session-environments.md). In short, `manifold enter` should bind shells, commands, GUI apps, agents, and optional filesystem/network/DBus isolation layers to one session context.
 
-This boundary is recorded in [ADR 0005](decisions/0005-wasm-through-workspace-api.md).
+This boundary is recorded in [ADR 0005](../decisions/0005-wasm-through-workspace-api.md).
 
 ## Module Roles
 
@@ -173,7 +173,7 @@ Examples:
 
 Event delivery should have backpressure and diagnostics. Slow modules should be visible in status output and logs.
 
-Event delivery belongs to the async lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded fast lane described in [WASM Execution Model](wasm-execution-model.md).
+Event delivery belongs to the async actor/mailbox lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded sync policy lane described in [Plugin Runtime](../systems/plugin-runtime.md).
 
 Realm-local events should be easy:
 
@@ -268,10 +268,11 @@ The initial built-ins should be:
 
 - a registry
 - mailbox-style messaging
+- plugin-scoped swapchains for latest-state publication to sync policy lanes
 
 Instance ids should be the default addressing model. Named aliases or higher-level service routing can be layered on top later through the registry or a broker module.
 
-RPC can remain a later addition if real workloads prove it necessary.
+RPC can remain a later addition if real workloads prove it necessary. Sync policy lanes are reserved for immediate host decisions, not general RPC.
 
 ## Data Flow
 
@@ -293,7 +294,7 @@ Current usability note:
 
 - the exact currently implemented CLI entry points are defined in `crates/manifoldd/src/main.rs`
 - config-loaded startup modules are defined in `manifold.toml` and parsed in `crates/manifoldd/src/config.rs`
-- the current runnable WASM paths are the fast key handler in `crates/manifoldd/src/wasm_key.rs` and the test harness in `crates/manifoldd/src/wasm_test.rs`
+- the current runnable WASM paths are the fast key handler in `crates/manifoldd/src/wasm_key.rs`, the map hook in `crates/manifoldd/src/wasm_map.rs`, and the test harness in `crates/manifoldd/src/wasm_test.rs`
 
 Reload policy should be explicit:
 

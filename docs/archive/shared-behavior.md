@@ -15,18 +15,18 @@ Unless a section explicitly says otherwise, references here to the implementatio
 
 ## Workspace And Sessions
 
-The workspace is the whole managed Manifold environment at the product level. A session is the concrete durable runtime unit: an isolated collection of related panes, producer state, environment, cwd, agents, programs, and capabilities.
+The workspace is the whole managed Manifold environment at the product level. A session is the concrete durable runtime unit: an isolated collection of related panes, producer state, plugin state, environment, cwd, agents, programs, and capabilities.
 
 Expected behavior:
 
 - A presentation surface presents one session at a time.
 - A session can be configured and managed as a unit.
-- Programs and agents inside a session may access the state and capabilities granted inside that session.
+- Programs, agents, and plugins inside a session may access the state and capabilities granted inside that session.
 - Environment variables, cwd, and similar launch context belong to the session, are mutable, and are inherited by programs launched inside it.
 - Session-aware tools may observe and update session environment state; already-running external processes may not automatically reflect changes to inherited process environment.
 - Sessions are isolated from each other unless the workspace grants an explicit bridge.
-- Session membership is the primary first-phase trust boundary: programs, agents, and WASM apps inside the same session are assumed to trust each other.
-- WASM apps inside a session may communicate with each other through session APIs and granted capabilities.
+- Session membership is the primary first-phase trust boundary: programs, agents, and plugins/WASM apps inside the same session are assumed to trust each other.
+- Plugins/WASM apps inside a session may communicate with each other through session APIs, mailbox messages, and granted capabilities.
 - External apps may use a session-scoped DBus proxy for desktop-style communication inside the session.
 - The session DBus proxy should not expose ambient host-wide or cross-session DBus access by default.
 - Plain first-phase sessions may use the real host/project filesystem through session cwd, environment, and granted capabilities.
@@ -96,13 +96,13 @@ Expected behavior:
 
 ## Pane Producers
 
-Pane producers include supervised pane clients, managed app surfaces, and WASM pane apps. A producer is not the same thing as a pane.
+Pane producers include supervised pane clients, managed app surfaces, and plugin/WASM pane apps. A producer is not the same thing as a pane.
 
 Expected behavior:
 
 - Managed native apps are external processes whose surfaces are tracked and placed by Manifold.
 - Hosted Wayland apps are managed apps connected to Manifold's nested Wayland compositor; their Wayland windows can create panes.
-- WASM pane apps own durable app state in the session process and can create any number of panes by emitting semantic scene patches.
+- Plugin/WASM pane apps own durable app state in the session process and can create any number of panes by describing host-rendered native component trees or emitting semantic scene patches.
 - Browser panes have a current behavior/testing path: real Chromium launched as a hosted Wayland managed app.
 - Browser panes also have a roadmap path: a minimal first-party browser pane client designed to show pages with less overhead.
 
@@ -115,6 +115,7 @@ Focus belongs to the workspace pane model, even when a backend uses platform-spe
 Expected behavior:
 
 - Pointer, keyboard, wheel, and future IME/clipboard events route to the focused or hit-tested pane according to Manifold policy.
+- The host owns final key routing and shortcut conflict resolution; privileged plugins may influence immediate key policy only through bounded sync policy lanes.
 - Focus changes are observable through status, events, or testable workspace state.
 - Detach and reattach should not lose the intended focused pane when that pane still exists.
 - If the focused producer exits, focus should clear or move according to an explicit rule rather than pointing at stale state.
@@ -135,7 +136,7 @@ Expected behavior:
 
 ## Presentation Requests
 
-Pane producers and apps may communicate with the presentation surface using an actor-like request model. A request describes what the producer wants; it is not a command that the presentation surface must obey.
+Pane producers and apps may communicate with the presentation surface using actor/mailbox requests. A request describes what the producer wants; it is not a command that the presentation surface must obey.
 
 Expected behavior:
 
@@ -164,7 +165,7 @@ Expected behavior:
 - Presentation failure should be reported without destroying the session whenever possible.
 - Managed apps that keep running while detached should remain visible in workspace status.
 - Browser processes tracked by the session should be cleaned up on session quit.
-- Future WASM app state should persist according to host-controlled storage and explicit reload policy.
+- Future plugin/WASM app state should persist according to host-controlled storage and explicit reload policy.
 
 ## Performance
 

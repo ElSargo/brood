@@ -1,14 +1,14 @@
 # WASM API Prototype
 
-This page is a focused target-design note for the first WASM API spike.
+This archived page is a focused target-design note for an earlier WASM API spike.
 
-Use [WASM Integration](wasm-integration.md) as the canonical overview. This page only narrows the first command/API slice.
+Use [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Policy](../systems/layout-policy.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md) for the current target. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
 This note scopes the first WASM API spike to workspace navigation, managed app launch, and keyboard shortcut handling. These are deliberately small because they already exist in the native prototype as focus commands, hosted app spawning, browser launch control, and normal-mode key handling.
 
 The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Manifold should execute those requests through the same session process paths used by native input and control commands.
 
-The execution lane split for these APIs is documented in [WASM Execution Model](wasm-execution-model.md): normal plugin work runs asynchronously, while only bounded pre-commit policy hooks and fast shortcut decisions run synchronously.
+The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): normal plugin work runs through actors and mailboxes, while only bounded pre-commit policy hooks and immediate shortcut decisions run through sync policy lanes that read immutable published state.
 
 ## First Prototype Order
 
@@ -80,7 +80,7 @@ For the first spike, `run-managed-app` can call the current hosted Wayland spawn
 
 ## Keyboard Shortcuts
 
-Keyboard shortcuts should be command bindings. A WASM controller registers bindings, and Manifold dispatches matched key chords to commands when input policy allows interception.
+Keyboard shortcuts should be command bindings. A WASM controller registers bindings, and Manifold dispatches matched key chords to commands when input policy allows interception. Privileged raw or modal key policy belongs in a sync key policy lane, not an arbitrary actor queue.
 
 Initial host functions:
 
@@ -127,7 +127,7 @@ Capability requirements:
 
 ## Event Stream And Fast-Path Publication
 
-The shortcut API should not force every fast-path key handler to replay workspace events. Plugins should be able to process events asynchronously, publish a compact latest-state payload, and let the fast hook read that payload when a shortcut is pressed.
+The shortcut API should not force every sync key policy handler to replay workspace events. Plugins should be able to process events asynchronously, publish a compact latest-state payload, and let the sync hook read that payload when a shortcut is pressed.
 
 Initial workspace events for navigation policy:
 
@@ -149,7 +149,7 @@ poll-workspace-events(after-seq, max-events) -> event-batch
 
 The snapshot is the recovery and reload path. The event stream is the incremental update path. If an event batch overflows or the plugin reloads, the plugin rebuilds from `workspace-snapshot`.
 
-For fast-path state, the host should expose plugin-scoped publication slots:
+For sync policy state, the host should expose plugin-scoped swapchain publication slots:
 
 ```text
 publish(name: option<string>, payload) -> generation
@@ -169,7 +169,7 @@ NavState {
 }
 ```
 
-The fast shortcut hook then receives the current publication root and resolves `Ctrl+O`, `Ctrl+Enter`, `Ctrl+E`, or `Ctrl+G` by reading this latest state. If the target pane is absent or stale, it can request `run-managed-app` instead.
+The sync key policy hook then receives the current publication root and resolves `Ctrl+O`, `Ctrl+Enter`, `Ctrl+E`, or `Ctrl+G` by reading this latest state. If the target pane is absent or stale, it can request `run-managed-app` instead.
 
 ## Rust Trait Sketch
 

@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/config.rs
   - manifold.toml
@@ -18,10 +18,12 @@ Current top-level config families:
 - `module`
 - `startup`
 
-Current module kinds:
+Current module kinds are prototype WASM lanes:
 
 - `fast-key-handler`
 - `fast-map-hook`
+
+Target plugin manifests should eventually replace these lane-specific kinds with declarations for actors, sync policy lanes, capabilities, actions, pane types, and swapchains.
 
 Current startup realms:
 
@@ -32,3 +34,4 @@ Related:
 
 - [[../systems/configuration]]
 - [[wasm-fast-lanes]]
+- [[../systems/plugin-runtime]]

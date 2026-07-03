@@ -15,7 +15,7 @@ Do not duplicate CLI argument lists in prose. For exact flags, subcommands, and 
 
 ## Development Environment
 
-The repo has a Nix flake for development-shell use, but agents should not assume it is required. Prefer the normal checked-in Cargo and script entry points unless the task specifically needs the flake or the local environment is missing dependencies.
+Prefer the checked-in Nix flake for builds, checks, and behavior-test commands. Use `nix develop --command ...` for local Cargo entry points unless the task explicitly requires testing outside the Nix environment. This keeps compiler, linker, Wayland/EGL, WASM target, and smoke-tool dependencies aligned with CI and avoids host shell drift.
 
 ## Testing
 
@@ -24,11 +24,7 @@ Bad tests are worse than no tests.
 
 Whenever possible prefer to test the changes with a "real" workload. Open the real app and send real keystrokes, clicks and scrolls and record metrics from the nested client as well as manifoldd. Use screenshots to verify any graphical changes.
 
-For agent-driven behavior tests, use the built-in test CLI rather than starting
-a host-visible Manifold presentation yourself. Prefer `cargo run -- test` or
-`target/debug/manifold test nested --inner-command '<client command>'` after a
-build. This starts the outer supervisor headlessly by default and avoids
-creating a new OS window in the current desktop session.
+For agent-driven behavior tests, use the built-in test CLI through Nix rather than starting a host-visible Manifold presentation yourself. Prefer `nix develop --command cargo run -- test` or `nix develop --command target/debug/manifold test nested --inner-command '<client command>'` after a Nix-backed build. This starts the outer supervisor with offscreen presentation by default and avoids creating a new OS window in the current desktop session.
 
 Do not use `tools/dev-nested-manifold.sh` for automated agent verification
 unless the task explicitly asks for a host-visible manual development harness.

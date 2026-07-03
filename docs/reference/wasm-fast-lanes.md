@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/wasm_key.rs
   - crates/manifoldd/src/wasm_map.rs
@@ -12,6 +12,8 @@ code-links:
 # WASM Fast Lanes
 
 The current runnable WASM surface is a set of narrow core-WASM lanes. These are implementation lanes, not the final product API.
+
+The target plugin model keeps the useful synchronous property of these lanes but replaces direct side-effect-style host imports with sync policy lanes that read immutable swapchain state and return bounded decision envelopes plus message batches. See [[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and [[../systems/layout-policy]].
 
 ## Fast Key Handler
 
@@ -34,6 +36,8 @@ Modifier bits:
 
 Selected imports include layout actions, pane lookup, exact pane focus, spawn, session switching, and session creation. See `crates/manifoldd/src/wasm_key.rs`.
 
+Those imports currently append pending host commands while the synchronous call is active. In the target model, the key lane returns `Consume`, `Forward`, or `Abstain` plus host-validated directives/messages after reading its latest state frame.
+
 ## Fast Map Hook
 
 Export:
@@ -48,6 +52,8 @@ Selected imports:
 - `set_map_response(ptr: i32, len: i32) -> i32`
 
 Responses are JSON and are validated by the host before affecting presentation.
+
+This is the current prototype of the target sync layout policy lane. The target response should become a typed layout decision envelope backed by immutable published state, with the host still owning validation, fallback, hit testing, focus, and rendering.
 
 ## Async Test Harness
 
@@ -72,4 +78,7 @@ Selected imports include `sleep_ms`, `log`, `status_json`, `control_json`, and `
 Related:
 
 - [[../systems/extension-host]]
+- [[../systems/plugin-runtime]]
+- [[../systems/input-shortcuts]]
+- [[../systems/layout-policy]]
 - [[../workflows/build-wasm-examples]]

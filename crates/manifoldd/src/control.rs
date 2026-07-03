@@ -60,12 +60,14 @@ use crate::{
 const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 const MANAGER_OBJECT_PATH: &str = "/org/manifold/Manager";
 const EXTENSION_OBJECT_PATH: &str = "/org/manifold/Extension";
+const PLUGIN_OBJECT_PATH: &str = "/org/manifold/Plugin";
 const COMPOSITOR_OBJECT_PATH: &str = "/org/manifold/Compositor";
 const AGENT_OBJECT_PATH: &str = "/org/manifold/Agent";
 const STATUS_OBJECT_PATH: &str = "/org/manifold/Status";
 const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
 const MANAGER_INTERFACE: &str = "org.manifold.Manager";
 const EXTENSION_INTERFACE: &str = "org.manifold.Extension";
+const PLUGIN_INTERFACE: &str = "org.manifold.Plugin";
 const AGENT_INTERFACE: &str = "org.manifold.Agent";
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -74,6 +76,7 @@ type DbusSurfaceSession = (u64, String, bool, u64);
 type DbusExtension = (String, String, String, DbusMetadata);
 type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 type DbusStatusItem = (String, String, String, String, DbusMetadata);
+type DbusPluginActor = (String, String, u64, u64, u64);
 type DbusAgent = (
     String,
     String,
@@ -128,6 +131,7 @@ type SessionListResponse = DbusResponse<Vec<DbusSurfaceSession>>;
 type ExtensionListResponse = DbusResponse<Vec<DbusExtension>>;
 type GrantListResponse = DbusResponse<Vec<DbusGrant>>;
 type StatusListResponse = DbusResponse<Vec<DbusStatusItem>>;
+type PluginActorListResponse = DbusResponse<Vec<DbusPluginActor>>;
 type AgentListResponse = DbusResponse<Vec<DbusAgent>>;
 type OptionalControlResponse = DbusResponse<Option<String>>;
 
@@ -190,6 +194,15 @@ enum DbusStateRequest {
     },
     ListStatus {
         response: StatusListResponse,
+    },
+    ListPluginActors {
+        response: PluginActorListResponse,
+    },
+    SendPluginActorMessage {
+        actor_id: String,
+        message: String,
+        sender_name: String,
+        response: BoolResponse,
     },
     RegisterStatusPublisher {
         role: String,
@@ -325,6 +338,11 @@ struct SessionDbus {
 
 #[derive(Clone)]
 struct ExtensionDbus {
+    sender: channel::Sender<DbusStateRequest>,
+}
+
+#[derive(Clone)]
+struct PluginDbus {
     sender: channel::Sender<DbusStateRequest>,
 }
 
@@ -474,6 +492,34 @@ impl ExtensionDbus {
         request_state(&self.sender, |response| DbusStateRequest::ReleaseGrant {
             grant_id,
             response,
+        })
+        .await
+    }
+}
+
+#[zbus::interface(name = "org.manifold.Plugin")]
+impl PluginDbus {
+    async fn list_actors(&self) -> fdo::Result<Vec<DbusPluginActor>> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ListPluginActors { response }
+        })
+        .await
+    }
+
+    async fn send_message(
+        &self,
+        actor_id: String,
+        message: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<bool> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| {
+            DbusStateRequest::SendPluginActorMessage {
+                actor_id,
+                message,
+                sender_name,
+                response,
+            }
         })
         .await
     }
@@ -1003,6 +1049,15 @@ trait ManifoldExtension {
     fn unregister_extension(&self, extension_id: String) -> zbus::Result<bool>;
     fn list_grants(&self, extension_id: String) -> zbus::Result<Vec<DbusGrant>>;
     fn release_grant(&self, grant_id: String) -> zbus::Result<bool>;
+}
+
+#[proxy(
+    interface = "org.manifold.Plugin",
+    default_path = "/org/manifold/Plugin"
+)]
+trait ManifoldPlugin {
+    fn list_actors(&self) -> zbus::Result<Vec<DbusPluginActor>>;
+    fn send_message(&self, actor_id: String, message: String) -> zbus::Result<bool>;
 }
 
 #[proxy(interface = "org.manifold.Agent", default_path = "/org/manifold/Agent")]
@@ -1884,6 +1939,12 @@ fn start_dbus_service(
                     },
                 )?
                 .serve_at(
+                    PLUGIN_OBJECT_PATH,
+                    PluginDbus {
+                        sender: sender.clone(),
+                    },
+                )?
+                .serve_at(
                     AGENT_OBJECT_PATH,
                     AgentDbus {
                         sender: sender.clone(),
@@ -1976,6 +2037,18 @@ fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Resul
                 }
             }
             _ => bail!("usage: extensions list | extensions grants [extension_id]"),
+        },
+        "actors" => match args {
+            [subcommand] if subcommand == "list" => {
+                for actor in request_plugin_actor_list(target)? {
+                    print_plugin_actor(&actor);
+                }
+            }
+            [subcommand, actor_id, message @ ..] if subcommand == "send" => {
+                let queued = request_plugin_actor_send(target, actor_id, &message.join(" "))?;
+                println!("actor id={actor_id} queued={queued}");
+            }
+            _ => bail!("usage: actors list | actors send <actor-id> [message...]"),
         },
         "agents" => match args {
             [subcommand] if subcommand == "list" => {
@@ -2081,6 +2154,38 @@ fn request_grant_list(target: &ControlTarget, extension_id: &str) -> Result<Vec<
         })
 }
 
+fn plugin_proxy<'a>(
+    connection: &'a zbus::blocking::Connection,
+    target: &'a ControlTarget,
+) -> Result<ManifoldPluginProxyBlocking<'a>> {
+    ManifoldPluginProxyBlocking::builder(connection)
+        .destination(target.destination.as_str())?
+        .path(PLUGIN_OBJECT_PATH)?
+        .interface(PLUGIN_INTERFACE)?
+        .build()
+        .context("build Manifold Plugin DBus proxy")
+}
+
+fn request_plugin_actor_list(target: &ControlTarget) -> Result<Vec<DbusPluginActor>> {
+    let connection = typed_connection(target)?;
+    let proxy = plugin_proxy(&connection, target)?;
+    proxy
+        .list_actors()
+        .with_context(|| format!("call Manifold Plugin.ListActors on {}", target.destination))
+}
+
+fn request_plugin_actor_send(
+    target: &ControlTarget,
+    actor_id: &str,
+    message: &str,
+) -> Result<bool> {
+    let connection = typed_connection(target)?;
+    let proxy = plugin_proxy(&connection, target)?;
+    proxy
+        .send_message(actor_id.to_string(), message.to_string())
+        .with_context(|| format!("call Manifold Plugin.SendMessage on {}", target.destination))
+}
+
 fn agent_proxy<'a>(
     connection: &'a zbus::blocking::Connection,
     target: &'a ControlTarget,
@@ -2178,6 +2283,15 @@ fn request_agent_unregister(target: &ControlTarget, agent_id: &str) -> Result<bo
                 target.destination
             )
         })
+}
+
+fn print_plugin_actor(
+    (id, kind, enqueued_messages, dropped_messages, mailbox_capacity): &DbusPluginActor,
+) {
+    println!(
+        "actor id={} kind={} enqueued_messages={} dropped_messages={} mailbox_capacity={}",
+        id, kind, enqueued_messages, dropped_messages, mailbox_capacity
+    );
 }
 
 fn print_agent(
@@ -2376,6 +2490,23 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::ListStatus { response } => {
             send_response(response, Ok(dbus_status_items(state.status_summaries())));
         }
+        DbusStateRequest::ListPluginActors { response } => {
+            send_response(
+                response,
+                Ok(dbus_plugin_actors(state.plugin_actor_summaries())),
+            );
+        }
+        DbusStateRequest::SendPluginActorMessage {
+            actor_id,
+            message,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state
+                .send_plugin_actor_message(&actor_id, sender_name, message)
+                .map(|()| true),
+        ),
         DbusStateRequest::RegisterStatusPublisher {
             role,
             metadata,
@@ -2549,6 +2680,23 @@ fn dbus_surface_sessions(sessions: Vec<SurfaceSessionSummary>) -> Vec<DbusSurfac
                 session.name,
                 session.active,
                 u64::try_from(session.windows).unwrap_or(u64::MAX),
+            )
+        })
+        .collect()
+}
+
+fn dbus_plugin_actors(
+    actors: Vec<crate::plugin_runtime::PluginActorSummary>,
+) -> Vec<DbusPluginActor> {
+    actors
+        .into_iter()
+        .map(|actor| {
+            (
+                actor.id,
+                actor.kind,
+                actor.enqueued_messages,
+                actor.dropped_messages,
+                u64::try_from(actor.mailbox_capacity).unwrap_or(u64::MAX),
             )
         })
         .collect()
@@ -3104,6 +3252,10 @@ struct StatusSnapshot {
     left_panel_width: i32,
     browsers: usize,
     agents: Vec<crate::state::AgentSummary>,
+    plugin_actors: Vec<DbusPluginActor>,
+    plugin_actor_messages: u64,
+    plugin_actor_failures: u64,
+    plugin_actor_last_status: String,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -3299,6 +3451,12 @@ impl StatusSnapshot {
             left_panel_width: state.left_panel_reserved_width(),
             browsers: state.browsers.len(),
             agents: state.agent_summaries(),
+            plugin_actors: dbus_plugin_actors(state.plugin_actor_summaries()),
+            plugin_actor_messages: state.plugin_actor_message_count(),
+            plugin_actor_failures: state.plugin_actor_failure_count(),
+            plugin_actor_last_status: sanitize_ctl_field(
+                state.plugin_actor_last_status().unwrap_or("none"),
+            ),
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),

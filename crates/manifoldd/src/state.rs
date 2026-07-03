@@ -77,6 +77,7 @@ use crate::{
         LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
         LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     },
+    plugin_runtime::{PluginActorSummary, PluginHostEvent, PluginRuntime},
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
     wasm_key::WasmKeyHandler,
@@ -500,6 +501,11 @@ pub struct Manifold {
     left_panel_resizing: bool,
     extension_registry: ExtensionRegistry,
     session_dbus_buses: Vec<(SessionBusRealm, SessionBusHandle)>,
+    plugin_runtime: Option<PluginRuntime>,
+    plugin_host_event_sender: channel::Sender<PluginHostEvent>,
+    plugin_actor_messages: u64,
+    plugin_actor_failures: u64,
+    plugin_actor_last_status: Option<String>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
@@ -546,6 +552,7 @@ impl Manifold {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let hosted_child_event_sender = Self::init_hosted_child_event_source(event_loop);
+        let plugin_host_event_sender = Self::init_plugin_host_event_source(event_loop);
         Self::init_window_lifecycle_timer(event_loop);
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
@@ -642,6 +649,11 @@ impl Manifold {
             left_panel_resizing: false,
             extension_registry: ExtensionRegistry::default(),
             session_dbus_buses: Vec::new(),
+            plugin_runtime: None,
+            plugin_host_event_sender,
+            plugin_actor_messages: 0,
+            plugin_actor_failures: 0,
+            plugin_actor_last_status: None,
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
@@ -668,7 +680,76 @@ impl Manifold {
     }
 
     pub fn set_async_runtime(&mut self, runtime: tokio::runtime::Handle) {
+        if self.plugin_runtime.is_none() {
+            self.plugin_runtime = Some(PluginRuntime::start_builtin(
+                &runtime,
+                self.plugin_host_event_sender.clone(),
+            ));
+            self.plugin_actor_last_status = Some("builtin:started".to_string());
+        }
         self.async_runtime = Some(runtime);
+    }
+
+    pub fn send_plugin_actor_message(
+        &mut self,
+        actor_id: &str,
+        sender: String,
+        body: String,
+    ) -> Result<()> {
+        let plugin_runtime = self
+            .plugin_runtime
+            .as_mut()
+            .context("plugin runtime is not running")?;
+        plugin_runtime.send_message(actor_id, sender, body)?;
+        self.plugin_actor_messages += 1;
+        self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+        Ok(())
+    }
+
+    pub fn plugin_actor_summaries(&self) -> Vec<PluginActorSummary> {
+        self.plugin_runtime
+            .as_ref()
+            .map_or_else(Vec::new, PluginRuntime::actor_summaries)
+    }
+
+    fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
+        match event {
+            PluginHostEvent::SpawnFootRequested { actor_id, message } => {
+                info!(
+                    plugin_actor = %actor_id,
+                    dbus_sender = %message.sender,
+                    message = %message.body,
+                    "plugin actor requested foot spawn"
+                );
+                let argv = vec!["foot".to_string()];
+                match self.spawn_hosted_app_argv(&argv) {
+                    Ok(()) => {
+                        self.plugin_actor_last_status = Some(format!("{actor_id}:spawned_foot"));
+                    }
+                    Err(err) => {
+                        self.plugin_actor_failures += 1;
+                        self.plugin_actor_last_status = Some(format!("{actor_id}:spawn_error"));
+                        warn!(
+                            plugin_actor = %actor_id,
+                            error = %err,
+                            "plugin actor failed to spawn foot"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub const fn plugin_actor_message_count(&self) -> u64 {
+        self.plugin_actor_messages
+    }
+
+    pub const fn plugin_actor_failure_count(&self) -> u64 {
+        self.plugin_actor_failures
+    }
+
+    pub fn plugin_actor_last_status(&self) -> Option<&str> {
+        self.plugin_actor_last_status.as_deref()
     }
 
     pub const fn set_native_auto_split_visible_limit(&mut self, limit: usize) {
@@ -782,6 +863,22 @@ impl Manifold {
                 }
             })
             .expect("insert hosted child event source");
+        sender
+    }
+
+    fn init_plugin_host_event_source(
+        event_loop: &mut EventLoop<'static, Self>,
+    ) -> channel::Sender<PluginHostEvent> {
+        let (sender, receiver) = channel::channel();
+        event_loop
+            .handle()
+            .insert_source(receiver, |event, (), state| {
+                let channel::Event::Msg(event) = event else {
+                    return;
+                };
+                state.handle_plugin_host_event(event);
+            })
+            .expect("insert plugin host event source");
         sender
     }
 

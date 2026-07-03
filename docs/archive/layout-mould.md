@@ -1,5 +1,7 @@
 # Resolved Layout
 
+This archived page records the earlier resolved-layout sketch. The current target layout boundary is [Layout Policy](../systems/layout-policy.md), which frames layout as a sync policy lane reading immutable plugin swapchain state.
+
 Manifold layout policy should be reloadable, but presentation execution remains
 native-owned.
 
@@ -7,7 +9,7 @@ The target boundary is:
 
 ```text
 pane inventory + presentation constraints + layout event
-    -> WASM layout policy
+    -> plugin sync layout policy
     -> candidate resolved layout
     -> native validation
     -> native render, hit testing, focus, and input delivery

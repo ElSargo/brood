@@ -13,6 +13,7 @@ mod debug_dump;
 mod input;
 pub mod launch_context;
 mod layout;
+mod plugin_runtime;
 mod presentation;
 mod session_bus;
 mod session_runner;
@@ -331,7 +332,7 @@ struct CtlArgs {
     /// Send COMMAND as a raw JSON argv array instead of parsing command-line words.
     #[arg(long)]
     json: bool,
-    /// Command to send: attach, detach, close-frontend, spawn <cmd>, browser, inject, status, quit.
+    /// Command to send: attach, detach, close-frontend, spawn <cmd>, actors, browser, inject, status, quit.
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<String>,
 }

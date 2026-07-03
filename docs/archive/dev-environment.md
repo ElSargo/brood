@@ -1,12 +1,14 @@
 # Development Environment
 
+This archived page records earlier environment planning. Current checked-in workflows prefer the Nix flake for builds, checks, and behavior tests.
+
 Manifold should be easy to enter from a fresh machine or dev container without vendoring every Rust dependency.
 
 ## Current Shape
 
 - Rust dependencies resolve through normal Cargo metadata.
 - `target/`, `vendor/`, `.cargo/`, and `reference/` are local workspace artifacts and are ignored.
-- `flake.nix` is available for developers who want a Nix shell, but it is not the required entry point.
+- `flake.nix` is the preferred checked-in build and test environment.
 
 ## Dev Container Goal
 
@@ -16,7 +18,7 @@ The target is a one-liner workspace for future development containers:
 docker run --rm -it -v "$PWD:/workspace" manifold/dev
 ```
 
-or the optional Nix shell:
+or the Nix shell:
 
 ```bash
 nix develop

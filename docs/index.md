@@ -2,7 +2,7 @@
 status: canonical
 type: index
 authority: documentation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 ---
 
 # Manifold Knowledge Base
@@ -24,6 +24,13 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[systems/wayland-compositor]] describes the nested Wayland compositor path.
 - [[systems/extension-host]] describes current WASM and extension lanes.
 
+## Target Design
+
+- [[systems/plugin-runtime]] describes the actor mailbox runtime, sync policy lanes, and swapchains.
+- [[systems/input-shortcuts]] describes host-owned shortcut routing with privileged sync key policy.
+- [[systems/layout-policy]] describes host-validated layout policy and resolved layouts.
+- [[systems/plugin-ui]] describes native component panes, chrome, and custom drawing escape hatches.
+
 ## Core Concepts
 
 - [[concepts/workspace]]
@@ -32,6 +39,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[concepts/presentation-surface]]
 - [[concepts/managed-app]]
 - [[concepts/session-runner]]
+- [[concepts/plugin]]
 - [[concepts/wasm-controller]]
 
 ## Workflows

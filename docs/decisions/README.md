@@ -12,4 +12,4 @@ Decisions should be short, dated, and explicit about context, decision, conseque
 
 Related product-level behavior:
 
-- [Shared Behavior Spec](../shared-behavior.md)
+- [Shared Behavior Spec](../archive/shared-behavior.md)

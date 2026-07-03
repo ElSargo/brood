@@ -53,7 +53,7 @@ surface session.
 
 ### Command Palette Session Picker
 
-A keyboard shortcut opens a command-palette-style picker for sessions.
+A host-resolved keyboard shortcut opens a command-palette-style picker for sessions.
 
 Expected behavior:
 
@@ -77,15 +77,16 @@ list data, but this experiment should not shell out to the CLI picker.
 The experiment should keep this ownership model:
 
 ```text
-WASM plugin
+WASM plugin actor
   owns switcher-local state
+  receives host events through a mailbox
   computes view state
-  writes a flat UI tree into guest memory
+  returns or publishes a flat UI tree
         |
         v
 Manifold host
   reads and validates the UI tree
-  owns session truth, commands, focus, input routing, layout, and rendering
+  owns session truth, commands, focus, input routing, layout, chrome, and rendering
   lowers the accepted tree into the selected native backend
         |
         v
@@ -106,13 +107,15 @@ model. Avoid designing a bidirectional shared mutable region for the first pass.
 Preferred lifecycle:
 
 ```text
-host creates surface-realm switcher module
-host sends UiHostEvent::Snapshot with the current session list
-host calls plugin_update(event)
-plugin mutates its state
-plugin returns BufferRef to a full UI tree or patch
+host creates surface-realm switcher plugin actor
+host sends UiHostEvent::Snapshot with the current session list through the actor mailbox
+host invokes plugin_update(event) or drains the actor update step
+plugin actor mutates its own state
+plugin actor returns BufferRef to a full UI tree or patch
 host reads, validates, commits, and renders
 ```
+
+This UI actor is asynchronous plugin behavior, not a sync policy lane. If the picker is opened by a shortcut, the key decision is resolved by the host keymap or a privileged sync key policy lane, then the actor receives an open-picker message.
 
 Minimum exported functions:
 
@@ -238,7 +241,7 @@ UiHostEvent::Dismiss {
 }
 ```
 
-The plugin may request semantic actions. The host validates and executes them.
+The plugin may request semantic actions by returning action intents or sending mailbox messages. The host validates and executes them.
 
 Required actions for this experiment:
 
@@ -312,9 +315,7 @@ are not.
 
 ## Verification Workload
 
-Prefer the built-in test CLI for automated checks. The backend branches should
-use `cargo run -- test` or `target/debug/manifold test nested ...` paths rather
-than starting a host-visible presentation from an existing desktop session.
+Prefer the built-in test CLI through Nix for automated checks. The backend branches should use `nix develop --command cargo run -- test` or `nix develop --command target/debug/manifold test nested ...` paths rather than starting a host-visible presentation from an existing desktop session.
 
 Minimum behavior checks:
 
@@ -363,6 +364,12 @@ The note should include:
 
 Be direct about model mismatches. A failed or awkward backend is useful if it
 explains why.
+
+## Related Pages
+
+- [[../systems/plugin-ui]]
+- [[../systems/plugin-runtime]]
+- [[../systems/input-shortcuts]]
 
 ## Open Questions
 
