@@ -62,7 +62,11 @@ use smithay::{
         drm_syncobj::DrmSyncobjState,
         fractional_scale::{self, FractionalScaleManagerState},
         output::OutputManagerState,
-        selection::data_device::DataDeviceState,
+        selection::{
+            data_device::DataDeviceState,
+            ext_data_control::DataControlState as ExtDataControlState,
+            wlr_data_control::DataControlState as WlrDataControlState,
+        },
         shell::xdg::{XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState},
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
@@ -74,6 +78,7 @@ use crate::{
     MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_PANE_ID_ENV, MANIFOLD_SESSION_ENV,
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
+    clipboard::HostClipboardBridge,
     layout::{
         HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind,
         LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
@@ -450,6 +455,9 @@ pub struct Manifold {
     pub viewporter_state: ViewporterState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
+    pub ext_data_control_state: ExtDataControlState,
+    pub wlr_data_control_state: WlrDataControlState,
+    pub(crate) host_clipboard_bridge: Option<HostClipboardBridge>,
     #[allow(dead_code)]
     pub dmabuf: DmabufRuntime,
     pub popups: PopupManager,
@@ -551,6 +559,10 @@ impl Manifold {
             FractionalScaleManagerState::new::<Self>(&display_handle);
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let ext_data_control_state =
+            ExtDataControlState::new::<Self, _>(&display_handle, None, |_| true);
+        let wlr_data_control_state =
+            WlrDataControlState::new::<Self, _>(&display_handle, None, |_| true);
 
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "manifold");
@@ -564,6 +576,7 @@ impl Manifold {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let hosted_child_event_sender = Self::init_hosted_child_event_source(event_loop);
+        let host_clipboard_bridge = Self::init_host_clipboard_bridge(event_loop);
         Self::init_window_lifecycle_timer(event_loop);
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
@@ -592,6 +605,9 @@ impl Manifold {
             viewporter_state,
             seat_state,
             data_device_state,
+            ext_data_control_state,
+            wlr_data_control_state,
+            host_clipboard_bridge,
             dmabuf,
             popups: PopupManager::default(),
             seat,
@@ -831,6 +847,22 @@ impl Manifold {
             })
             .expect("insert hosted child event source");
         sender
+    }
+
+    fn init_host_clipboard_bridge(
+        event_loop: &mut EventLoop<'static, Self>,
+    ) -> Option<HostClipboardBridge> {
+        let (sender, receiver) = channel::channel();
+        event_loop
+            .handle()
+            .insert_source(receiver, |event, (), state| {
+                let channel::Event::Msg(event) = event else {
+                    return;
+                };
+                state.handle_host_clipboard_event(event);
+            })
+            .expect("insert host clipboard event source");
+        HostClipboardBridge::start(sender)
     }
 
     pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {

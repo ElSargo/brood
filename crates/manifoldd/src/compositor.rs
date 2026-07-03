@@ -54,10 +54,18 @@ use smithay::{
         fractional_scale::FractionalScaleHandler,
         output::OutputHandler,
         selection::{
-            SelectionHandler,
+            SelectionHandler, SelectionSource, SelectionTarget,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
+            },
+            ext_data_control::{
+                DataControlHandler as ExtDataControlHandler,
+                DataControlState as ExtDataControlState,
+            },
+            wlr_data_control::{
+                DataControlHandler as WlrDataControlHandler,
+                DataControlState as WlrDataControlState,
             },
         },
         shell::xdg::{
@@ -72,6 +80,7 @@ use crate::{
     MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     NestedTestArgs, RunArgs, SessionArgs, TestArgs, TestCommand,
     browser::BrowserLaunchOptions,
+    clipboard::{ClipboardSelection, send_clipboard_selection},
     config, control, presentation, session_runner,
     state::{ClientState, Manifold, PresentationStatus},
     wasm_key::WasmKeyHandler,
@@ -1242,12 +1251,44 @@ impl SeatHandler for Manifold {
 }
 
 impl SelectionHandler for Manifold {
-    type SelectionUserData = ();
+    type SelectionUserData = ClipboardSelection;
+
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        seat: Seat<Self>,
+    ) {
+        self.sync_internal_clipboard_to_host(ty, source, seat);
+    }
+
+    fn send_selection(
+        &mut self,
+        _ty: SelectionTarget,
+        mime_type: String,
+        fd: std::os::unix::io::OwnedFd,
+        _seat: Seat<Self>,
+        user_data: &Self::SelectionUserData,
+    ) {
+        send_clipboard_selection(user_data, mime_type, fd);
+    }
 }
 
 impl DataDeviceHandler for Manifold {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
+    }
+}
+
+impl ExtDataControlHandler for Manifold {
+    fn data_control_state(&self) -> &ExtDataControlState {
+        &self.ext_data_control_state
+    }
+}
+
+impl WlrDataControlHandler for Manifold {
+    fn data_control_state(&self) -> &WlrDataControlState {
+        &self.wlr_data_control_state
     }
 }
 
@@ -1338,6 +1379,8 @@ smithay::delegate_dmabuf!(Manifold);
 smithay::delegate_drm_syncobj!(Manifold);
 smithay::delegate_seat!(Manifold);
 smithay::delegate_data_device!(Manifold);
+smithay::delegate_ext_data_control!(Manifold);
+smithay::delegate_data_control!(Manifold);
 smithay::delegate_output!(Manifold);
 smithay::delegate_fractional_scale!(Manifold);
 smithay::delegate_viewporter!(Manifold);

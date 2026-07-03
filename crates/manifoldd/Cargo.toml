@@ -23,6 +23,7 @@ shm-fallback = []
 [dependencies]
 anyhow.workspace = true
 calloop.workspace = true
+calloop-wayland-source.workspace = true
 clap.workspace = true
 image.workspace = true
 serde.workspace = true
@@ -37,6 +38,7 @@ wasmtime.workspace = true
 wayland-egl.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
 zbus.workspace = true
 
 [lints.rust]

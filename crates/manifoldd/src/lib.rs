@@ -5,6 +5,7 @@
 // TODO(lint-structure): move CLI/default resolution into typed helpers instead of ad hoc options.
 
 mod browser;
+mod clipboard;
 mod command;
 mod compositor;
 mod config;
