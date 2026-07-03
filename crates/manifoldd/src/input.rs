@@ -40,6 +40,7 @@ const KEY_J: Keycode = Keycode::new(44);
 const KEY_K: Keycode = Keycode::new(45);
 const KEY_L: Keycode = Keycode::new(46);
 const KEY_P: Keycode = Keycode::new(33);
+const KEY_Q: Keycode = Keycode::new(24);
 const KEY_S: Keycode = Keycode::new(39);
 const KEY_U: Keycode = Keycode::new(30);
 const KEY_W: Keycode = Keycode::new(25);
@@ -231,6 +232,18 @@ impl Manifold {
             return;
         }
 
+        if self.ctrl_pressed && key_code == KEY_Q {
+            self.record_consumed_keyboard_input();
+            if state == KeyState::Pressed {
+                if self.shift_pressed {
+                    self.close_active_surface_session();
+                } else {
+                    self.close_active_window();
+                }
+            }
+            return;
+        }
+
         if self.ctrl_pressed
             && let Some(action) = built_in_ctrl_layout_action(key_code)
         {
@@ -297,6 +310,7 @@ impl Manifold {
                 self.input_mode,
                 self.ctrl_pressed,
                 self.alt_pressed,
+                self.shift_pressed,
                 focused_pane,
                 panes,
             )

@@ -22,6 +22,7 @@ const ABI_MODE_PASSTHROUGH: i32 = 0;
 const ABI_MODE_NORMAL: i32 = 1;
 const ABI_MOD_CTRL: i32 = 1;
 const ABI_MOD_ALT: i32 = 2;
+const ABI_MOD_SHIFT: i32 = 4;
 const MAX_SPAWN_COMMAND_BYTES: usize = 4096;
 
 #[derive(Default)]
@@ -215,6 +216,21 @@ impl WasmKeyHandler {
         linker
             .func_wrap(
                 "manifold",
+                "close_active_session",
+                |mut caller: Caller<'_, WasmKeyStore>| -> i32 {
+                    caller
+                        .data_mut()
+                        .pending_commands
+                        .push(WorkspaceCommand::Surface(
+                            SurfaceCommand::CloseActiveSession,
+                        ));
+                    1
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("define manifold.close_active_session import: {err}"))?;
+        linker
+            .func_wrap(
+                "manifold",
                 "spawn_app",
                 |mut caller: Caller<'_, WasmKeyStore>, ptr: i32, len: i32| -> i32 {
                     let command = match read_guest_string(&mut caller, ptr, len) {
@@ -311,6 +327,7 @@ impl WasmKeyHandler {
         input_mode: InputMode,
         ctrl_pressed: bool,
         alt_pressed: bool,
+        shift_pressed: bool,
         focused_pane: Option<u64>,
         panes: Vec<WasmKeyPane>,
     ) -> Result<WasmKeyOutcome> {
@@ -332,7 +349,7 @@ impl WasmKeyHandler {
                     key_args.1,
                     key_args.2,
                     key_args.3,
-                    abi_modifiers(ctrl_pressed, alt_pressed),
+                    abi_modifiers(ctrl_pressed, alt_pressed, shift_pressed),
                 ),
             ),
         }
@@ -376,13 +393,16 @@ const fn abi_input_mode(mode: InputMode) -> i32 {
     }
 }
 
-const fn abi_modifiers(ctrl_pressed: bool, alt_pressed: bool) -> i32 {
+const fn abi_modifiers(ctrl_pressed: bool, alt_pressed: bool, shift_pressed: bool) -> i32 {
     let mut modifiers = 0;
     if ctrl_pressed {
         modifiers |= ABI_MOD_CTRL;
     }
     if alt_pressed {
         modifiers |= ABI_MOD_ALT;
+    }
+    if shift_pressed {
+        modifiers |= ABI_MOD_SHIFT;
     }
     modifiers
 }

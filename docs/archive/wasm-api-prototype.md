@@ -322,7 +322,7 @@ The sample handler lives in `examples/wasm-key-handler` and maps a minimal works
 - `Ctrl-U` -> remove the active split
 - `Ctrl-.` / `Ctrl-,` -> focus next / previous split slot
 - `Ctrl-G` -> focus or spawn the LazyGit pane
-- `Ctrl-Enter` -> focus or spawn the Codex agent pane
+- `Ctrl-Enter` -> focus or spawn the pi agent pane
 - `Ctrl-1` through `Ctrl-5` -> focus or spawn numbered terminal panes
 
 For the example build/run flow, see `examples/wasm-key-handler/README.md`.

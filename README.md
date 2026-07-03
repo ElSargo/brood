@@ -51,7 +51,7 @@ loads enabled modules and startup apps from the global Manifold config. Manifold
 first checks the XDG config location and then falls back to the checked-in
 `manifold.toml` found from the development binary's repo checkout. The checked-in
 config enables the local `dev` WASM key handler when its built `.wasm` artifact
-exists and starts the Codex agent workspace pane.
+exists and starts the pi agent workspace pane.
 
 Run Rust unit tests:
 

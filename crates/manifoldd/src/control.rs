@@ -2794,6 +2794,39 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             let changed = state.focus_window_identity(&identity);
             format!("OK focus-window changed={changed}\n")
         }
+        "client" | "pane" => match args {
+            [subcommand] if subcommand == "close" => {
+                let changed = state.close_active_window();
+                format!("OK client close target=active changed={changed}\n")
+            }
+            [subcommand, target] if subcommand == "close" && target == "active" => {
+                let changed = state.close_active_window();
+                format!("OK client close target=active changed={changed}\n")
+            }
+            [subcommand, pane] if subcommand == "close" => {
+                let pane = parse_u64(pane, "pane id")?;
+                let changed = state.close_pane(pane);
+                format!("OK client close pane={pane} changed={changed}\n")
+            }
+            _ => bail!("usage: client close [active|<pane-id>]"),
+        },
+        "close-client" | "close-pane" => match args {
+            [] => {
+                let changed = state.close_active_window();
+                format!("OK client close target=active changed={changed}\n")
+            }
+            [target] if target == "active" => {
+                let changed = state.close_active_window();
+                format!("OK client close target=active changed={changed}\n")
+            }
+            [pane] => {
+                let pane = parse_u64(pane, "pane id")?;
+                let changed = state.close_pane(pane);
+                format!("OK client close pane={pane} changed={changed}\n")
+            }
+            _ => bail!("usage: close-client [active|<pane-id>]"),
+        },
+        "close-session" => close_surface_session_command(args, state)?,
         "layout-action" | "layout" => {
             let [action] = args else {
                 bail!("layout-action requires exactly one action name");
@@ -2909,6 +2942,9 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                     state.active_surface_session().raw()
                 )
             }
+            [subcommand, target @ ..] if subcommand == "close" => {
+                close_surface_session_command(target, state)?
+            }
             [subcommand, name @ ..] if subcommand == "new" => {
                 let name = joined_name(name);
                 if let Some(name) = name {
@@ -2936,7 +2972,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 )
             }
             _ => bail!(
-                "usage: surface-session list-json|dir-list-json <dir>|dir-get <dir>|dir-set <dir> <id> [default|keep-default]|next|last-focused|new|switch <query>"
+                "usage: surface-session list-json|dir-list-json <dir>|dir-get <dir>|dir-set <dir> <id> [default|keep-default]|next|last-focused|close [active|<query>]|new|switch <query>"
             ),
         },
         "browser" => browser::handle_control(args, state)?,
@@ -2982,6 +3018,23 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
     };
 
     Ok(response)
+}
+
+fn close_surface_session_command(args: &[String], state: &mut Manifold) -> Result<String> {
+    let session = match args {
+        [] => state.active_surface_session(),
+        [target] if target == "active" => state.active_surface_session(),
+        [query] => state
+            .resolve_surface_session(query)
+            .with_context(|| format!("unknown surface session {query:?}"))?,
+        _ => bail!("usage: close-session [active|<query>]"),
+    };
+    let closed = session.raw();
+    let changed = state.close_surface_session(session);
+    Ok(format!(
+        "OK surface-session closed={closed} active={} changed={changed}\n",
+        state.active_surface_session().raw()
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

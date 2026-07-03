@@ -25,11 +25,12 @@ Default keymap:
 - `Ctrl-J`: focus next pane without leaving passthrough mode
 - `Ctrl-K`: focus previous pane without leaving passthrough mode
 - `Ctrl-G`: focus the Foot LazyGit pane, spawning it if needed
-- `Ctrl-Enter`: focus the Foot Codex agent pane, spawning it if needed
+- `Ctrl-Enter`: focus the Foot pi agent pane, spawning it if needed
 - `Ctrl-1` through `Ctrl-5`: focus numbered Foot terminal panes, spawning them if needed
 - `Ctrl-O`: spawn `foot`
 - `Ctrl-N`: create and attach a new surface session
-- `Ctrl-Q`: close the active pane
+- `Ctrl-Q`: close the active pane without leaving passthrough mode
+- `Ctrl-Shift-Q`: close the active surface session
 - `Ctrl-F`: toggle managed fullscreen
 - `Ctrl-L`: split active pane right
 - `Ctrl-H`: split active pane down

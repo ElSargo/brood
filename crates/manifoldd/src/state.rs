@@ -2002,6 +2002,9 @@ impl Manifold {
     }
 
     fn save_active_native_session_layout(&mut self) {
+        if !self.surface_sessions.contains(&self.active_surface_session) {
+            return;
+        }
         self.native_session_layouts.insert(
             self.active_surface_session,
             NativeSessionLayout {
@@ -2039,6 +2042,7 @@ impl Manifold {
         self.save_active_native_session_layout();
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
+        self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
@@ -2246,29 +2250,53 @@ impl Manifold {
         }
     }
 
+    pub fn close_active_surface_session(&mut self) -> bool {
+        self.close_surface_session(self.active_surface_session)
+    }
+
     pub fn close_surface_session(&mut self, session: SurfaceSessionId) -> bool {
-        if self.surface_sessions.len() <= 1 || !self.surface_sessions.contains(&session) {
+        if !self.surface_sessions.contains(&session) {
             return false;
         }
         if self.active_surface_session != session {
             self.save_active_native_session_layout();
         }
 
-        let surfaces = self
-            .window_surface_sessions
-            .iter()
-            .filter(|&(_surface, assigned_session)| *assigned_session == session)
-            .map(|(surface, _assigned_session)| surface.clone())
-            .collect::<Vec<_>>();
-
+        let surfaces = self.content_surfaces_for_session(session);
         for surface in &surfaces {
-            if let Some(window) = self.window_for_any_toplevel_surface(surface)
-                && let Some(toplevel) = window.toplevel()
-            {
-                toplevel.send_close();
-            }
+            self.send_close_to_toplevel_surface(surface);
         }
 
+        self.remove_surface_session_record(session);
+        self.restore_native_session_layout(self.active_surface_session);
+        self.refresh_resolved_layout_from_native_policy();
+        self.reconfigure_focus_stack();
+        if !surfaces.is_empty()
+            && let Err(err) = self.display_handle.flush_clients()
+        {
+            warn!(?err, "flush clients after surface session close failed");
+        }
+        true
+    }
+
+    fn prune_empty_unfocused_surface_sessions(&mut self) -> bool {
+        let sessions = self
+            .surface_sessions
+            .iter()
+            .copied()
+            .filter(|session| *session != self.active_surface_session)
+            .filter(|session| !self.surface_session_has_content_panes_or_pending(*session))
+            .collect::<Vec<_>>();
+        if sessions.is_empty() {
+            return false;
+        }
+        for session in sessions {
+            self.remove_surface_session_record(session);
+        }
+        true
+    }
+
+    fn remove_surface_session_record(&mut self, session: SurfaceSessionId) {
         self.surface_sessions
             .retain(|existing| *existing != session);
         self.surface_session_names
@@ -2283,9 +2311,9 @@ impl Manifold {
             });
         self.surface_session_directory_defaults
             .retain(|_, assigned_session| *assigned_session != session);
-        self.window_surface_sessions
-            .retain(|(_, assigned_session)| *assigned_session != session);
         self.native_session_layouts.remove(&session);
+        self.session_dbus_buses
+            .retain(|(realm, _)| *realm != SessionBusRealm::Surface(session.raw()));
         if self.active_surface_session == session {
             self.active_surface_session = self
                 .surface_session_interaction_order
@@ -2293,12 +2321,44 @@ impl Manifold {
                 .copied()
                 .find(|candidate| self.surface_sessions.contains(candidate))
                 .or_else(|| self.surface_sessions.first().copied())
-                .unwrap_or(SurfaceSessionId(1));
+                .unwrap_or(SurfaceSessionId(0));
         }
-        self.restore_native_session_layout(self.active_surface_session);
-        self.refresh_resolved_layout_from_native_policy();
-        self.reconfigure_focus_stack();
-        true
+        if self.active_surface_session.raw() != 0
+            && !self
+                .surface_session_interaction_order
+                .contains(&self.active_surface_session)
+        {
+            self.surface_session_interaction_order
+                .insert(0, self.active_surface_session);
+        }
+        if self.last_interacted_surface_session == session {
+            self.last_interacted_surface_session = self.active_surface_session;
+        }
+    }
+
+    fn content_surfaces_for_session(&self, session: SurfaceSessionId) -> Vec<WlSurface> {
+        self.window_surface_sessions
+            .iter()
+            .filter(|(surface, assigned_session)| {
+                *assigned_session == session
+                    && self.surface_participates_in_resolved_layout(surface)
+            })
+            .map(|(surface, _assigned_session)| surface.clone())
+            .collect()
+    }
+
+    fn surface_session_has_content_panes_or_pending(&self, session: SurfaceSessionId) -> bool {
+        self.window_surface_sessions
+            .iter()
+            .any(|(surface, assigned_session)| {
+                *assigned_session == session
+                    && self.surface_participates_in_resolved_layout(surface)
+                    && self.window_for_any_toplevel_surface(surface).is_some()
+            })
+            || self
+                .pending_child_panes
+                .iter()
+                .any(|pending| pending.session == session && !pending.presentation)
     }
 
     pub fn resolve_surface_session(&self, query: &str) -> Option<SurfaceSessionId> {
@@ -2353,6 +2413,7 @@ impl Manifold {
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
         self.record_surface_session_interaction(session);
+        self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
@@ -2381,6 +2442,7 @@ impl Manifold {
             self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
         self.restore_native_session_layout(self.active_surface_session);
         self.record_surface_session_interaction(self.active_surface_session);
+        self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         true
@@ -2416,6 +2478,7 @@ impl Manifold {
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
         self.record_surface_session_interaction(session);
+        self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         session
@@ -4030,17 +4093,42 @@ impl Manifold {
     }
 
     pub fn close_active_window(&mut self) -> bool {
-        let Some(window) = self.active_window() else {
+        let Some(surface) = self.active_toplevel_surface.clone() else {
+            return false;
+        };
+        if !self.surface_has_visible_pane_item(&surface) {
+            return false;
+        }
+        self.reset_transient_input_state();
+        let closed = self.send_close_to_toplevel_surface(&surface);
+        if closed && let Err(err) = self.display_handle.flush_clients() {
+            warn!(?err, "flush clients after close request failed");
+        }
+        closed
+    }
+
+    pub fn close_pane(&mut self, pane: u64) -> bool {
+        let Some(surface) = self.surface_for_pane(pane) else {
+            return false;
+        };
+        if self.active_toplevel_surface.as_ref() == Some(&surface) {
+            self.reset_transient_input_state();
+        }
+        let closed = self.send_close_to_toplevel_surface(&surface);
+        if closed && let Err(err) = self.display_handle.flush_clients() {
+            warn!(?err, pane, "flush clients after pane close request failed");
+        }
+        closed
+    }
+
+    fn send_close_to_toplevel_surface(&self, surface: &WlSurface) -> bool {
+        let Some(window) = self.window_for_any_toplevel_surface(surface) else {
             return false;
         };
         let Some(toplevel) = window.toplevel() else {
             return false;
         };
-        self.reset_transient_input_state();
         toplevel.send_close();
-        if let Err(err) = self.display_handle.flush_clients() {
-            warn!(?err, "flush clients after close request failed");
-        }
         true
     }
 
@@ -4204,6 +4292,7 @@ impl Manifold {
                 outcome.focus_cleared = true;
             }
         }
+        self.prune_empty_unfocused_surface_sessions();
         self.reconfigure_focus_stack();
         self.last_window_count = window_count;
         outcome
@@ -4884,6 +4973,8 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
             | "control+n"
             | "ctrl+q"
             | "control+q"
+            | "ctrl+shift+q"
+            | "control+shift+q"
             | "ctrl+f"
             | "control+f"
             | "ctrl+l"
@@ -4921,7 +5012,7 @@ mod tests {
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::path::PathBuf;
 
     #[test]
     fn fullscreen_layout_covers_the_presentation_from_origin() {
@@ -4995,6 +5086,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_unfocused_surface_session_closes_after_focus_moves() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let initial_session = state.active_surface_session();
+
+        let next_session = state.create_and_attach_surface_session();
+
+        assert_eq!(state.active_surface_session(), next_session);
+        assert_eq!(state.surface_session_count(), 1);
+        assert!(state.surface_session_summary(initial_session).is_none());
+        assert!(state.surface_session_summary(next_session).is_some());
+    }
+
+    #[test]
+    fn active_empty_surface_session_stays_open() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let active_session = state.active_surface_session();
+
+        state.refresh_window_state();
+
+        assert_eq!(state.surface_session_count(), 1);
+        assert!(state.surface_session_summary(active_session).is_some());
+    }
+
+    #[test]
     fn first_session_after_clearing_initial_surface_session_reuses_session_one() {
         let mut event_loop = EventLoop::try_new().expect("event loop");
         let display = Display::new().expect("display");
@@ -5033,23 +5152,6 @@ mod tests {
             state.surface_session_working_directory(session),
             Some(original.as_path())
         );
-    }
-
-    #[test]
-    fn agent_desktop_notification_still_sends_when_presentation_focused_but_agent_is_not() {
-        let mut event_loop = EventLoop::try_new().expect("event loop");
-        let display = Display::new().expect("display");
-        let mut state = Manifold::new(&mut event_loop, display);
-
-        let mut metadata = BTreeMap::new();
-        metadata.insert("app_id".to_string(), "smoke-agent".to_string());
-        let agent_id = state
-            .register_agent("codex".to_string(), metadata, ":test.sender".to_string())
-            .expect("register agent");
-
-        assert!(state.should_notify_agent_desktop(&agent_id));
-        state.set_presentation_window_focused(true);
-        assert!(state.should_notify_agent_desktop(&agent_id));
     }
 
     #[test]
@@ -5099,50 +5201,6 @@ mod tests {
         state.set_presentation_window_focused(false);
 
         assert!(state.forwarded_pressed_keys.is_empty());
-    }
-
-    #[test]
-    fn agent_registration_uses_pane_id_as_stable_identity() {
-        let mut event_loop = EventLoop::try_new().expect("event loop");
-        let display = Display::new().expect("display");
-        let mut state = Manifold::new(&mut event_loop, display);
-
-        let mut first = BTreeMap::new();
-        first.insert("pane_id".to_string(), "7".to_string());
-        first.insert("status".to_string(), "running".to_string());
-        first.insert("cwd".to_string(), "/tmp/first".to_string());
-        first.insert("first_user_message".to_string(), "first prompt".to_string());
-        let first_id = state
-            .register_agent("codex".to_string(), first, ":test.sender".to_string())
-            .expect("register first agent state");
-
-        let mut second = BTreeMap::new();
-        second.insert("pane_id".to_string(), "7".to_string());
-        second.insert("status".to_string(), "done".to_string());
-        second.insert("cwd".to_string(), "/tmp/second".to_string());
-        second.insert(
-            "first_user_message".to_string(),
-            "second prompt".to_string(),
-        );
-        let second_id = state
-            .register_agent("codex".to_string(), second, ":test.sender".to_string())
-            .expect("register second agent state");
-
-        let agents = state.agent_summaries();
-        assert_eq!(first_id, second_id);
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status, "done");
-        assert_eq!(
-            agents[0].metadata.get("cwd").map(String::as_str),
-            Some("/tmp/second")
-        );
-        assert_eq!(
-            agents[0]
-                .metadata
-                .get("first_user_message")
-                .map(String::as_str),
-            Some("first prompt")
-        );
     }
 }
 

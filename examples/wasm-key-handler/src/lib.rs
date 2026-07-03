@@ -30,10 +30,11 @@ const KEY_SPACE: i32 = 65;
 
 const MOD_CTRL: i32 = 1;
 const MOD_ALT: i32 = 2;
+const MOD_SHIFT: i32 = 4;
 
 const FOOT: &[u8] = b"foot";
-const AGENT_APP_ID: &[u8] = b"manifold-codex";
-const AGENT_COMMAND: &[u8] = b"foot --app-id manifold-codex codex --yolo";
+const AGENT_APP_ID: &[u8] = b"manifold-pi";
+const AGENT_COMMAND: &[u8] = b"foot --app-id manifold-pi pi --yolo";
 const LAZYGIT_APP_ID: &[u8] = b"manifold-lazygit";
 const LAZYGIT_COMMAND: &[u8] = b"foot --app-id manifold-lazygit lazygit";
 const TERMINAL_1_APP_ID: &[u8] = b"manifold-terminal-1";
@@ -72,6 +73,7 @@ unsafe extern "C" {
     fn spawn_app(ptr: *const u8, len: usize) -> i32;
     fn switch_active_session_next() -> i32;
     fn create_and_attach_session() -> i32;
+    fn close_active_session() -> i32;
 }
 
 #[unsafe(no_mangle)]
@@ -100,7 +102,7 @@ pub extern "C" fn on_key_v2(
 
     if modifiers & MOD_CTRL != 0 && is_global_ctrl_workspace_key(key_code) {
         return if key_state == KEY_STATE_PRESSED {
-            handle_global_ctrl_workspace_key(key_code)
+            handle_global_ctrl_workspace_key(key_code, modifiers)
         } else {
             1
         };
@@ -139,6 +141,7 @@ fn is_global_ctrl_workspace_key(key_code: i32) -> bool {
             | KEY_K
             | KEY_G
             | KEY_H
+            | KEY_Q
             | KEY_L
             | KEY_S
             | KEY_U
@@ -153,8 +156,10 @@ fn is_global_ctrl_workspace_key(key_code: i32) -> bool {
     )
 }
 
-fn handle_global_ctrl_workspace_key(key_code: i32) -> i32 {
+fn handle_global_ctrl_workspace_key(key_code: i32, modifiers: i32) -> i32 {
     match key_code {
+        KEY_Q if modifiers & MOD_SHIFT != 0 => unsafe { close_active_session() },
+        KEY_Q => unsafe { layout_action(ACTION_CLOSE_ACTIVE_PANE) },
         KEY_J => unsafe { layout_action(ACTION_FOCUS_NEXT) },
         KEY_K => unsafe { layout_action(ACTION_FOCUS_PREVIOUS) },
         KEY_H => unsafe { layout_action(ACTION_SPLIT_ACTIVE_DOWN) },

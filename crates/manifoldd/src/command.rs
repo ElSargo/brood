@@ -15,6 +15,7 @@ pub enum WorkspaceCommand {
 pub enum SurfaceCommand {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
+    CloseActiveSession,
 }
 
 impl WorkspaceCommand {
@@ -43,6 +44,7 @@ impl SurfaceCommand {
                 state.create_and_attach_surface_session();
                 true
             }
+            Self::CloseActiveSession => state.close_active_surface_session(),
         }
     }
 }

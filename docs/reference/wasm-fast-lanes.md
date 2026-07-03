@@ -31,8 +31,9 @@ Modifier bits:
 
 - `1`: Ctrl
 - `2`: Alt
+- `4`: Shift
 
-Selected imports include layout actions, pane lookup, exact pane focus, spawn, session switching, and session creation. See `crates/manifoldd/src/wasm_key.rs`.
+Selected imports include layout actions, pane lookup, exact pane focus, spawn, session switching, session creation, and active-session close. See `crates/manifoldd/src/wasm_key.rs`.
 
 ## Fast Map Hook
 
