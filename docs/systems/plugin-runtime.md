@@ -43,15 +43,17 @@ Plugins may be internally multi-threaded, but that is an implementation detail. 
 
 ## Current Prototype
 
-The first runtime slice is intentionally small: Manifold starts a built-in actor named `debug-foot` on the Tokio runtime. The actor owns a bounded mailbox. Any mailbox message causes it to send a host event requesting `foot` be spawned in the active session.
+The first runtime slice is intentionally small: Manifold starts a built-in actor named `debug-toggle` on the Tokio runtime. The actor owns a bounded mailbox and publishes an immutable boolean frame to its default swapchain. Each actor message toggles that boolean and appends a new host-owned frame.
+
+A prototype sync key lane handles `Ctrl+O`. It reads the latest actor frame without waiting on the actor mailbox. If the frame says `spawn_btop_next=false`, the lane returns a host command to spawn `foot htop`; if it says `true`, the lane returns a host command to spawn `foot btop`. The lane also returns a mailbox message asking `debug-toggle` to toggle and publish the next frame.
 
 Debugging entry points:
 
 - DBus interface: `org.manifold.Plugin` at `/org/manifold/Plugin`
 - CLI helper: `manifold ctl actors list`
-- CLI helper: `manifold ctl actors send debug-foot <message>`
+- CLI helper: `manifold ctl actors send debug-toggle <message>`
 
-This prototype exercises actor mailboxes and host-thread command execution without making the actor a final plugin API.
+This prototype exercises actor mailboxes, host-owned swapchain append, synchronous key policy reads, returned host commands, and returned actor messages without making the actor a final plugin API.
 
 ## Mailboxes
 
@@ -101,24 +103,26 @@ Swapchains are the bridge from async actors to sync policy lanes.
 
 ```text
 actor processes events asynchronously
-actor publishes immutable frame to named swapchain
-host atomically publishes latest generation
-sync lane reads latest generation during a host call
+actor asks host to append an immutable frame to a named swapchain
+host atomically publishes the latest Arc-backed frame node
+sync lane reads the latest frame during a host call
 ```
 
 The default swapchain is enough for simple plugins. Named swapchains let a plugin split materialized policy state by worker, feature, or lane without inventing shared mutable memory.
 
 Required guarantees:
 
-- publishing is atomic
+- publishing is host-owned and atomic
 - frames are immutable once visible
-- generations are monotonic per swapchain
 - frame count, size, and schema are bounded
 - invalid frames are rejected before publication
-- a sync invocation pins the frame it reads for the duration of the call
+- a sync invocation pins the `Arc` frame it reads for the duration of the call
 - old frames are reclaimed only when no invocation can still read them
+- frame payloads live in a host-owned namespace and do not contain plugin heap pointers
 
-The sync lane should normally read the latest frame, not walk an unbounded history. If a policy needs history, the actor should materialize the needed bounded history into the latest frame.
+The sync lane should normally read the latest frame, not walk an unbounded history. The prototype stores frames as a bounded `Arc` linked list for pinning and diagnostics, but policy reads are latest-frame reads. If a policy needs history, the actor should materialize the needed bounded history into the latest frame.
+
+Native in-process frames do not need to serialize through JSON. The safety rule is that plugins publish values into a host-owned frame namespace: owned data, offsets, handles, and resource IDs are valid; raw pointers or references into plugin heap/task memory are not valid published state. For WASM, host append should copy out of guest memory into this namespace before publication.
 
 ## WASM ABI Direction
 

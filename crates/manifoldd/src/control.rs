@@ -76,7 +76,7 @@ type DbusSurfaceSession = (u64, String, bool, u64);
 type DbusExtension = (String, String, String, DbusMetadata);
 type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 type DbusStatusItem = (String, String, String, String, DbusMetadata);
-type DbusPluginActor = (String, String, u64, u64, u64);
+type DbusPluginActor = (String, String, u64, u64, u64, u64, String);
 type DbusAgent = (
     String,
     String,
@@ -2286,11 +2286,25 @@ fn request_agent_unregister(target: &ControlTarget, agent_id: &str) -> Result<bo
 }
 
 fn print_plugin_actor(
-    (id, kind, enqueued_messages, dropped_messages, mailbox_capacity): &DbusPluginActor,
+    (
+        id,
+        kind,
+        enqueued_messages,
+        dropped_messages,
+        mailbox_capacity,
+        published_frames,
+        latest_frame,
+    ): &DbusPluginActor,
 ) {
     println!(
-        "actor id={} kind={} enqueued_messages={} dropped_messages={} mailbox_capacity={}",
-        id, kind, enqueued_messages, dropped_messages, mailbox_capacity
+        "actor id={} kind={} enqueued_messages={} dropped_messages={} mailbox_capacity={} published_frames={} latest_frame={}",
+        id,
+        kind,
+        enqueued_messages,
+        dropped_messages,
+        mailbox_capacity,
+        published_frames,
+        latest_frame
     );
 }
 
@@ -2697,6 +2711,8 @@ fn dbus_plugin_actors(
                 actor.enqueued_messages,
                 actor.dropped_messages,
                 u64::try_from(actor.mailbox_capacity).unwrap_or(u64::MAX),
+                actor.published_frames,
+                actor.latest_frame,
             )
         })
         .collect()

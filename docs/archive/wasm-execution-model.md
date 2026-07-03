@@ -138,14 +138,14 @@ publish(some("editor"), EditorNavState { target })
 publish(some("git"), GitNavState { target })
 ```
 
-The host should internally retain enough old generations to keep sync-policy references valid for the duration of a call. The internal representation may use a publication log, linked nodes, or another RCU-like structure, but the sync policy lane should only see the current immutable root.
+The host should internally retain enough old frames to keep sync-policy references valid for the duration of a call. The internal representation may use an Arc linked list, publication log, ring, or another RCU-like structure, but the sync policy lane should only see the current immutable root.
 
 Host guarantees:
 
 - publish is atomic
 - published records are immutable
 - sync-policy references remain valid for the hook call
-- each publish receives a monotonic generation
+- host metadata is sufficient to trace and debug frame publication without making generation numbers part of the plugin contract
 - payload size, slot count, and reference depth are bounded
 - malformed payloads are rejected before becoming visible
 - trapping plugin code cannot corrupt host or plugin publication state

@@ -66,7 +66,6 @@ KeyQuery {
   input_mode,
   focus_context,
   pressed_modifier_state,
-  state_generation,
 }
 + latest plugin swapchain frame
     -> KeyPolicyResult
@@ -83,6 +82,8 @@ KeyPolicyResult {
 ```
 
 The lane may read its latest published state and return a message batch, but it does not mutate host state or wait for actor work. The host applies accepted directives and enqueues messages only after the call returns.
+
+The current native prototype handles `Ctrl+O` this way: it reads the `debug-toggle` actor's latest swapchain frame, returns a host command for `foot htop` or `foot btop`, and returns a mailbox message asking the actor to toggle and publish the next frame.
 
 ## Relation To The Current WASM Key Handler
 

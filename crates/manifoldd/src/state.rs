@@ -39,6 +39,7 @@ use anyhow::{Context, Result, ensure};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
+    backend::input::{KeyState, Keycode},
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState, keyboard::XkbConfig},
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
@@ -77,7 +78,10 @@ use crate::{
         LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
         LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     },
-    plugin_runtime::{PluginActorSummary, PluginHostEvent, PluginRuntime},
+    plugin_runtime::{
+        PluginActorSummary, PluginHostEvent, PluginRuntime, PluginSyncKeyDecision,
+        PluginSyncKeyInput,
+    },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
     wasm_key::WasmKeyHandler,
@@ -712,27 +716,82 @@ impl Manifold {
             .map_or_else(Vec::new, PluginRuntime::actor_summaries)
     }
 
+    pub fn try_plugin_sync_key_handler(
+        &mut self,
+        key_code: Keycode,
+        key_state: KeyState,
+    ) -> Option<bool> {
+        let input = PluginSyncKeyInput {
+            key_code,
+            key_state,
+            ctrl_pressed: self.ctrl_pressed,
+            alt_pressed: self.alt_pressed,
+            shift_pressed: self.shift_pressed,
+        };
+        let decision = self
+            .plugin_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.handle_sync_key(&input))?;
+        self.apply_plugin_sync_key_decision(decision);
+        Some(true)
+    }
+
+    fn apply_plugin_sync_key_decision(&mut self, decision: PluginSyncKeyDecision) {
+        if let Some(argv) = decision.spawn_argv {
+            match self.spawn_hosted_app_argv(&argv) {
+                Ok(()) => {
+                    self.plugin_actor_last_status =
+                        Some(format!("host:spawned_{}", argv.join("_")));
+                }
+                Err(err) => {
+                    self.plugin_actor_failures += 1;
+                    self.plugin_actor_last_status = Some("host:spawn_error".to_string());
+                    warn!(argv = ?argv, error = %err, "plugin sync key failed to spawn command");
+                }
+            }
+        }
+
+        for message in decision.actor_messages {
+            if let Err(err) =
+                self.send_plugin_actor_message(&message.actor_id, message.sender, message.body)
+            {
+                self.plugin_actor_failures += 1;
+                self.plugin_actor_last_status = Some(format!("{}:message_error", message.actor_id));
+                warn!(
+                    plugin_actor = %message.actor_id,
+                    error = %err,
+                    "plugin sync key failed to enqueue actor message"
+                );
+            }
+        }
+    }
+
     fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
         match event {
-            PluginHostEvent::SpawnFootRequested { actor_id, message } => {
-                info!(
-                    plugin_actor = %actor_id,
-                    dbus_sender = %message.sender,
-                    message = %message.body,
-                    "plugin actor requested foot spawn"
-                );
-                let argv = vec!["foot".to_string()];
-                match self.spawn_hosted_app_argv(&argv) {
+            PluginHostEvent::AppendSwapchainFrame {
+                actor_id,
+                slot,
+                frame,
+            } => {
+                let result = self
+                    .plugin_runtime
+                    .as_mut()
+                    .context("plugin runtime is not running")
+                    .and_then(|runtime| runtime.append_frame(&actor_id, &slot, frame));
+                match result {
                     Ok(()) => {
-                        self.plugin_actor_last_status = Some(format!("{actor_id}:spawned_foot"));
+                        self.plugin_actor_last_status =
+                            Some(format!("{actor_id}:{slot}:frame_appended"));
                     }
                     Err(err) => {
                         self.plugin_actor_failures += 1;
-                        self.plugin_actor_last_status = Some(format!("{actor_id}:spawn_error"));
+                        self.plugin_actor_last_status =
+                            Some(format!("{actor_id}:{slot}:frame_error"));
                         warn!(
                             plugin_actor = %actor_id,
+                            swapchain_slot = %slot,
                             error = %err,
-                            "plugin actor failed to spawn foot"
+                            "plugin actor failed to append swapchain frame"
                         );
                     }
                 }

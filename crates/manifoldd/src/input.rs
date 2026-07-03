@@ -231,6 +231,11 @@ impl Manifold {
             return;
         }
 
+        if self.try_plugin_sync_key_handler(key_code, state) == Some(true) {
+            self.record_consumed_keyboard_input();
+            return;
+        }
+
         if self.ctrl_pressed
             && let Some(action) = built_in_ctrl_layout_action(key_code)
         {

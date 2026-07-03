@@ -49,7 +49,6 @@ LayoutQuery {
   constraints,
   current_focus,
   pointer_or_command_context,
-  state_generation,
 }
 + latest plugin swapchain frame
     -> LayoutPolicyResult
@@ -94,7 +93,7 @@ PointerDrag {
   item_id,
   drag_start,
   current_position,
-  original_layout_generation,
+  original_layout_snapshot,
 }
 ```
 

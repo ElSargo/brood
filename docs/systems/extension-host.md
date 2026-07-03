@@ -15,7 +15,7 @@ code-links:
 The current extension story has three implementation layers:
 
 - DBus extension/status/agent/plugin surfaces for external tools and debugging.
-- A built-in lightweight plugin actor named `debug-foot`.
+- A built-in lightweight plugin actor named `debug-toggle` plus a prototype sync key lane.
 - Core-WASM fast lanes for key handling, map hooks, and test harnesses.
 
 The target design is broader: plugins should use host-owned actors, mailboxes, registry entries, capability checks, sync policy lanes, and swapchains. Future APIs should be workspace/session/pane/input/layout/capability oriented and should not expose compositor internals.
@@ -48,13 +48,13 @@ Plugin actors may be multi-threaded internally, but host-visible communication r
 
 `manifold plug` currently hot-loads a WASM module into a running session. Auto mode tries the fast key-handler ABI first, then the fast map-hook ABI. Guest memory is not preserved across replacement.
 
-Target hot reload should restart affected actors and sync lanes, preserve host-owned pane identity where possible, invalidate published swapchain frames by generation, and show reload failures in status output without tearing down the session process.
+Target hot reload should restart affected actors and sync lanes, preserve host-owned pane identity where possible, drop or replace published swapchain frame roots for the reloaded components, and show reload failures in status output without tearing down the session process.
 
 ## Current DBus Extension Surfaces
 
 The DBus extension surface supports extension registration, status publication, agent registration, plugin actor inspection/messaging, and related UI integration. The GTK session switcher uses these surfaces for status and agent rows.
 
-The first actor prototype is `debug-foot`. It runs as a Tokio task with a bounded mailbox. Sending any message to it through `org.manifold.Plugin.SendMessage` or `manifold ctl actors send debug-foot <message>` enqueues mailbox work; the actor then asks the host to spawn `foot` in the active session.
+The first actor prototype is `debug-toggle`. It runs as a Tokio task with a bounded mailbox. The actor publishes an immutable boolean frame to a host-owned swapchain. `Ctrl+O` is handled by a prototype sync key lane that reads that frame, asks the host to spawn `foot htop` or `foot btop`, and returns a mailbox message asking the actor to toggle and publish the next frame. Sending any message through `org.manifold.Plugin.SendMessage` or `manifold ctl actors send debug-toggle <message>` also toggles the actor frame.
 
 ## Related Pages
 

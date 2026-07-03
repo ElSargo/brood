@@ -49,7 +49,7 @@ A special plugin-owned synchronous routine that the host may invoke for immediat
 _Avoid_: actor, background worker, blocking RPC
 
 **Swapchain**:
-A host-owned latest-state publication path. Plugin actors publish immutable frames; sync policy lanes read the latest valid generation without draining a queue.
+A host-owned latest-state publication path. Plugin actors ask the host to append immutable frames; sync policy lanes read the latest valid frame without draining a queue.
 _Avoid_: event log, mailbox, shared mutable heap
 
 **WASM app host**:

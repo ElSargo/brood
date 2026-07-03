@@ -43,7 +43,7 @@ A swapchain is the host-owned latest-state publication path between async actors
 
 An actor publishes immutable frames to a default or named plugin-scoped swapchain. The host atomically makes the latest valid frame visible. A sync lane receives a reference, handle, or copied view for the current invocation and reads that latest frame without replaying event history.
 
-Swapchains are not message queues. They have no backlog for the sync lane to drain and cannot block either side. Internal retention may use a linked list, ring, RCU-style root, or another strategy, but the public contract is latest immutable state by generation.
+Swapchains are not message queues. They have no backlog for the sync lane to drain and cannot block either side. Internal retention may use an `Arc` linked list, ring, RCU-style root, or another strategy, but the public contract is latest immutable state, not event history.
 
 For core WASM, the ABI should avoid assuming that a raw host pointer is meaningful in guest memory. The host may pass a handle, copy a frame into guest memory, or expose a read-only view through an explicit runtime mechanism.
 
