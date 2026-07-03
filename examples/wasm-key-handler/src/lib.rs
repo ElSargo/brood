@@ -34,7 +34,7 @@ const MOD_SHIFT: i32 = 4;
 
 const FOOT: &[u8] = b"foot";
 const AGENT_APP_ID: &[u8] = b"manifold-pi";
-const AGENT_COMMAND: &[u8] = b"foot --app-id manifold-pi pi --yolo";
+const AGENT_COMMAND: &[u8] = b"foot --app-id manifold-pi pi";
 const LAZYGIT_APP_ID: &[u8] = b"manifold-lazygit";
 const LAZYGIT_COMMAND: &[u8] = b"foot --app-id manifold-lazygit lazygit";
 const TERMINAL_1_APP_ID: &[u8] = b"manifold-terminal-1";
