@@ -51,6 +51,7 @@ use smithay::{
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
         drm_syncobj::{DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
+        fractional_scale::FractionalScaleHandler,
         output::OutputHandler,
         selection::{
             SelectionHandler,
@@ -854,6 +855,7 @@ impl CompositorHandler for Manifold {
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
+        self.register_surface(surface);
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             let mut acquire_point = None;
             let mut has_release_point = false;
@@ -953,6 +955,10 @@ impl CompositorHandler for Manifold {
                 }
             }
         });
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.unregister_surface(surface);
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -1251,6 +1257,12 @@ impl ServerDndGrabHandler for Manifold {}
 
 impl OutputHandler for Manifold {}
 
+impl FractionalScaleHandler for Manifold {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        self.update_fractional_scale_for_surface(&surface);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -1327,3 +1339,5 @@ smithay::delegate_drm_syncobj!(Manifold);
 smithay::delegate_seat!(Manifold);
 smithay::delegate_data_device!(Manifold);
 smithay::delegate_output!(Manifold);
+smithay::delegate_fractional_scale!(Manifold);
+smithay::delegate_viewporter!(Manifold);

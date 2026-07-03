@@ -37,7 +37,7 @@ use smithay::{
         },
     },
     desktop::{Space, Window, space::SpaceElement},
-    output::{Mode, Output},
+    output::{Mode, Output, Scale as OutputScale},
     reexports::calloop::{
         LoopHandle,
         timer::{TimeoutAction, Timer},
@@ -56,7 +56,7 @@ use crate::{
     state::{Manifold, PresentationStatus, SESSION_OUTPUT_REFRESH_MILLIHZ},
     winit_presenter::{
         PresenterBackend, PresenterEvent, PresenterEventSource, PresenterRuntime,
-        SharedPresenterRuntime, WaylandEglBind, axis_frame,
+        SharedPresenterRuntime, WaylandEglBind, axis_frame, normalize_host_scale_factor,
     },
 };
 
@@ -64,6 +64,10 @@ pub struct PresenterHandle {
     pub(crate) runtime: SharedPresenterRuntime,
     pub(crate) output: Output,
     pub(crate) damage_tracker: RefCell<OutputDamageTracker>,
+}
+
+fn output_scale_for_host(scale_factor: f64) -> OutputScale {
+    OutputScale::Fractional(normalize_host_scale_factor(scale_factor))
 }
 
 fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold) {
@@ -76,10 +80,14 @@ fn apply_presenter_created(presenter: &Rc<PresenterHandle>, state: &mut Manifold
         size: backend.window_size(),
         refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
     };
-    presenter
-        .output
-        .change_current_state(Some(mode), None, None, None);
+    presenter.output.change_current_state(
+        Some(mode),
+        None,
+        Some(output_scale_for_host(backend.scale_factor())),
+        None,
+    );
     presenter.output.set_preferred(mode);
+    state.refresh_fractional_scales();
 
     #[cfg(feature = "shm-fallback")]
     {
@@ -166,8 +174,11 @@ fn attach_target(
         }
     };
     let output = state.session_output.clone();
-    output.change_current_state(Some(mode), None, None, Some((0, 0).into()));
+    let initial_scale =
+        (target == PresentationTarget::Offscreen).then_some(OutputScale::Integer(1));
+    output.change_current_state(Some(mode), None, initial_scale, Some((0, 0).into()));
     output.set_preferred(mode);
+    state.refresh_fractional_scales();
 
     let damage_tracker = OutputDamageTracker::from_output(&output);
     state.dmabuf.importer = Some(Rc::clone(&runtime));
@@ -267,17 +278,31 @@ fn handle_presenter_event(
         PresenterEvent::CreationFailed(error) => {
             state.record_presentation_attach_failure(&error);
         }
-        PresenterEvent::Resized { size } => {
+        PresenterEvent::Resized { size, scale_factor } => {
             event_presenter.output.change_current_state(
                 Some(Mode {
                     size,
                     refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
                 }),
                 None,
-                None,
+                Some(output_scale_for_host(scale_factor)),
                 None,
             );
+            state.refresh_fractional_scales();
             state.reconfigure_focus_stack();
+        }
+        PresenterEvent::ScaleFactorChanged { scale_factor } => {
+            event_presenter.output.change_current_state(
+                None,
+                None,
+                Some(output_scale_for_host(scale_factor)),
+                None,
+            );
+            state.refresh_fractional_scales();
+            state.reconfigure_focus_stack();
+            if let Some(backend) = event_presenter.runtime.borrow().backend.as_ref() {
+                backend.request_redraw();
+            }
         }
         PresenterEvent::Keyboard {
             key_code,
@@ -505,7 +530,8 @@ fn render_presenter_frame_with_capture(
             .map_or((0, 0), |rect| (rect.x, rect.y));
         render_space.map_element(marked_window(state, &active_window, 0), loc, true);
     }
-    let chrome_elements = layout_chrome_elements(state);
+    let output_scale = Scale::from(output.current_scale().fractional_scale());
+    let chrome_elements = layout_chrome_elements(state, output_scale);
 
     {
         let (renderer, mut framebuffer) = backend
@@ -576,7 +602,7 @@ fn render_presenter_frame_with_capture(
     Ok(())
 }
 
-fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
+fn layout_chrome_elements(state: &Manifold, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {
     const PLACEHOLDER_FILL: [f32; 4] = [0.08, 0.12, 0.15, 0.92];
     const PLACEHOLDER_INSET: [f32; 4] = [0.12, 0.18, 0.22, 0.86];
     const HANDLE: [f32; 4] = [0.32, 0.36, 0.40, 0.95];
@@ -590,12 +616,12 @@ fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
         let rect = state.resolved_layout_item_rect(*item);
         match item.kind {
             LayoutItemKind::Placeholder => {
-                push_rect(&mut elements, inset(rect, 10), PLACEHOLDER_FILL);
-                push_rect(&mut elements, inset(rect, 18), PLACEHOLDER_INSET);
+                push_rect(&mut elements, inset(rect, 10), scale, PLACEHOLDER_FILL);
+                push_rect(&mut elements, inset(rect, 18), scale, PLACEHOLDER_INSET);
             }
-            LayoutItemKind::Handle => push_rect(&mut elements, rect, HANDLE),
-            LayoutItemKind::Chrome => push_rect(&mut elements, rect, CHROME),
-            LayoutItemKind::Overlay => push_rect(&mut elements, rect, OVERLAY),
+            LayoutItemKind::Handle => push_rect(&mut elements, rect, scale, HANDLE),
+            LayoutItemKind::Chrome => push_rect(&mut elements, rect, scale, CHROME),
+            LayoutItemKind::Overlay => push_rect(&mut elements, rect, scale, OVERLAY),
             LayoutItemKind::Pane { .. } => {}
         }
 
@@ -604,7 +630,7 @@ fn layout_chrome_elements(state: &Manifold) -> Vec<SolidColorRenderElement> {
         } else {
             BORDER
         };
-        push_border(&mut elements, rect, 1, color);
+        push_border(&mut elements, rect, scale, 1, color);
     }
     elements
 }
@@ -725,11 +751,13 @@ fn marker_render_elements(
     scale: Scale<f64>,
     alpha: f32,
 ) -> Vec<SolidColorRenderElement> {
-    let marker_size = MARKER_GRID * MARKER_CELL;
+    let marker_size: Size<i32, Physical> =
+        Size::<i32, Logical>::from((MARKER_GRID * MARKER_CELL, MARKER_GRID * MARKER_CELL))
+            .to_physical_precise_round(scale);
     let physical_size: Size<i32, Physical> = size.to_physical_precise_round(scale);
     let opposite_offset = Point::<i32, Physical>::from((
-        (physical_size.w - marker_size).max(0),
-        (physical_size.h - marker_size).max(0),
+        (physical_size.w - marker_size.w).max(0),
+        (physical_size.h - marker_size.h).max(0),
     ));
 
     let mut elements = Vec::new();
@@ -845,6 +873,7 @@ fn push_marker_cell(
 fn push_border(
     elements: &mut Vec<SolidColorRenderElement>,
     rect: LayoutRect,
+    scale: Scale<f64>,
     thickness: i32,
     color: [f32; 4],
 ) {
@@ -855,6 +884,7 @@ fn push_border(
             h: thickness,
             ..rect
         },
+        scale,
         color,
     );
     push_rect(
@@ -864,6 +894,7 @@ fn push_border(
             h: thickness,
             ..rect
         },
+        scale,
         color,
     );
     push_rect(
@@ -872,6 +903,7 @@ fn push_border(
             w: thickness,
             ..rect
         },
+        scale,
         color,
     );
     push_rect(
@@ -881,6 +913,7 @@ fn push_border(
             w: thickness,
             ..rect
         },
+        scale,
         color,
     );
 }
@@ -897,15 +930,20 @@ fn inset(rect: LayoutRect, amount: i32) -> LayoutRect {
     }
 }
 
-fn push_rect(elements: &mut Vec<SolidColorRenderElement>, rect: LayoutRect, color: [f32; 4]) {
+fn push_rect(
+    elements: &mut Vec<SolidColorRenderElement>,
+    rect: LayoutRect,
+    scale: Scale<f64>,
+    color: [f32; 4],
+) {
     if rect.w <= 0 || rect.h <= 0 {
         return;
     }
     let buffer = SolidColorBuffer::new((rect.w, rect.h), color);
     elements.push(SolidColorRenderElement::from_buffer(
         &buffer,
-        Point::from((rect.x, rect.y)),
-        1.0,
+        Point::<i32, Logical>::from((rect.x, rect.y)).to_physical_precise_round(scale),
+        scale,
         1.0,
         Kind::Unspecified,
     ));

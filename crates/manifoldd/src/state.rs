@@ -41,7 +41,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::{
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState, keyboard::XkbConfig},
-    output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
+    output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, channel,
@@ -55,15 +55,17 @@ use smithay::{
             protocol::{wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER, Transform},
+    utils::{IsAlive, Logical, Point, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
         drm_syncobj::DrmSyncobjState,
+        fractional_scale::{self, FractionalScaleManagerState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::xdg::{XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState},
         socket::ListeningSocketSource,
+        viewporter::ViewporterState,
     },
 };
 use tracing::{info, warn};
@@ -208,6 +210,14 @@ fn record_hosted_child_exit_error(
         pane_id = ?pane_id,
         "failed to poll hosted Wayland app"
     );
+}
+
+fn set_fractional_scale_for_surface(surface: &WlSurface, scale: f64) {
+    with_states(surface, |states| {
+        fractional_scale::with_fractional_scale(states, |fractional_scale| {
+            fractional_scale.set_preferred_scale(scale);
+        });
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +444,10 @@ pub struct Manifold {
     pub shm_state: ShmState,
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
+    #[allow(dead_code)]
+    pub fractional_scale_manager_state: FractionalScaleManagerState,
+    #[allow(dead_code)]
+    pub viewporter_state: ViewporterState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     #[allow(dead_code)]
@@ -467,6 +481,7 @@ pub struct Manifold {
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
+    known_surfaces: Vec<WlSurface>,
     pending_child_panes: Vec<PendingChildPane>,
     pub(crate) ctrl_pressed: bool,
     pub(crate) alt_pressed: bool,
@@ -532,6 +547,9 @@ impl Manifold {
         #[cfg(feature = "shm-fallback")]
         let shm_state = ShmState::new::<Self>(&display_handle, Vec::new());
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
+        let fractional_scale_manager_state =
+            FractionalScaleManagerState::new::<Self>(&display_handle);
+        let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
 
         let mut seat_state = SeatState::new();
@@ -570,6 +588,8 @@ impl Manifold {
             #[cfg(feature = "shm-fallback")]
             shm_state,
             output_manager_state,
+            fractional_scale_manager_state,
+            viewporter_state,
             seat_state,
             data_device_state,
             dmabuf,
@@ -601,6 +621,7 @@ impl Manifold {
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
+            known_surfaces: Vec::new(),
             pending_child_panes: Vec::new(),
             ctrl_pressed: false,
             alt_pressed: false,
@@ -675,6 +696,33 @@ impl Manifold {
         self.native_auto_split_visible_limit = limit;
     }
 
+    pub fn register_surface(&mut self, surface: &WlSurface) {
+        if !self.known_surfaces.contains(surface) {
+            self.known_surfaces.push(surface.clone());
+        }
+        self.update_fractional_scale_for_surface(surface);
+    }
+
+    pub fn unregister_surface(&mut self, surface: &WlSurface) {
+        self.known_surfaces.retain(|known| known != surface);
+    }
+
+    pub fn refresh_fractional_scales(&mut self) {
+        let scale = self.current_fractional_scale();
+        self.known_surfaces.retain(IsAlive::alive);
+        for surface in &self.known_surfaces {
+            set_fractional_scale_for_surface(surface, scale);
+        }
+    }
+
+    pub fn update_fractional_scale_for_surface(&self, surface: &WlSurface) {
+        set_fractional_scale_for_surface(surface, self.current_fractional_scale());
+    }
+
+    fn current_fractional_scale(&self) -> f64 {
+        self.session_output.current_scale().fractional_scale()
+    }
+
     fn init_session_output(display_handle: &DisplayHandle) -> Output {
         let output = Output::new(
             "manifold-session".to_string(),
@@ -693,7 +741,7 @@ impl Manifold {
         output.change_current_state(
             Some(mode),
             Some(Transform::Flipped180),
-            None,
+            Some(OutputScale::Integer(1)),
             Some((0, 0).into()),
         );
         output.set_preferred(mode);

@@ -296,10 +296,16 @@ impl PresenterRuntime {
         self.backend.as_ref().and_then(PresenterBackend::window_id)
     }
 
-    fn active_window_size(&self) -> Option<PhysicalSize<u32>> {
+    fn active_window_metrics(&self) -> Option<(PhysicalSize<u32>, f64)> {
         self.backend
             .as_ref()
-            .and_then(PresenterBackend::window_inner_size)
+            .and_then(PresenterBackend::window_metrics)
+    }
+
+    fn active_window_scale_factor(&self) -> Option<f64> {
+        self.backend
+            .as_ref()
+            .and_then(PresenterBackend::window_scale_factor)
     }
 
     fn active_is_x11(&self) -> bool {
@@ -564,8 +570,18 @@ impl PresenterBackend {
         self.window().map(WinitWindow::id)
     }
 
-    fn window_inner_size(&self) -> Option<PhysicalSize<u32>> {
-        self.window().map(WinitWindow::inner_size)
+    fn window_scale_factor(&self) -> Option<f64> {
+        self.window()
+            .map(|window| normalize_host_scale_factor(window.scale_factor()))
+    }
+
+    fn window_metrics(&self) -> Option<(PhysicalSize<u32>, f64)> {
+        self.window().map(|window| {
+            (
+                window.inner_size(),
+                normalize_host_scale_factor(window.scale_factor()),
+            )
+        })
     }
 
     const fn window_is_x11(&self) -> bool {
@@ -596,6 +612,15 @@ impl PresenterBackend {
                 (w, h).into()
             }
             PresenterRenderTarget::Offscreen(target) => target.size,
+        }
+    }
+
+    pub fn scale_factor(&self) -> f64 {
+        match self.target.as_ref() {
+            Some(PresenterRenderTarget::Window(frontend)) => {
+                normalize_host_scale_factor(frontend.window.scale_factor())
+            }
+            Some(PresenterRenderTarget::Offscreen(_)) | None => 1.0,
         }
     }
 
@@ -930,6 +955,10 @@ pub enum PresenterEvent {
     CreationFailed(String),
     Resized {
         size: Size<i32, Physical>,
+        scale_factor: f64,
+    },
+    ScaleFactorChanged {
+        scale_factor: f64,
     },
     Redraw,
     CloseRequested,
@@ -1114,8 +1143,16 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
 
         match event {
             WindowEvent::Resized(size) => {
+                let scale_factor =
+                    { self.runtime.borrow().active_window_scale_factor() }.unwrap_or(1.0);
                 (self.callback)(PresenterEvent::Resized {
                     size: (size.width as i32, size.height as i32).into(),
+                    scale_factor,
+                });
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                (self.callback)(PresenterEvent::ScaleFactorChanged {
+                    scale_factor: normalize_host_scale_factor(scale_factor),
                 });
             }
             WindowEvent::RedrawRequested => (self.callback)(PresenterEvent::Redraw),
@@ -1141,16 +1178,18 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 });
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let active_window_size = { self.runtime.borrow().active_window_size() };
-                if let Some(size) = active_window_size {
-                    let position = pointer_position(position, size);
+                let active_window_metrics = { self.runtime.borrow().active_window_metrics() };
+                if let Some((size, scale_factor)) = active_window_metrics {
+                    let position = pointer_position(position, size, scale_factor);
                     let time = self.timestamp();
                     (self.callback)(PresenterEvent::PointerMotion { position, time });
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let scale_factor =
+                    { self.runtime.borrow().active_window_scale_factor() }.unwrap_or(1.0);
                 let (horizontal_amount, vertical_amount, horizontal_v120, vertical_v120, source) =
-                    axis_values(delta);
+                    axis_values(delta, scale_factor);
                 let time = self.timestamp();
                 (self.callback)(PresenterEvent::PointerAxis {
                     horizontal_amount,
@@ -1177,9 +1216,9 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 location,
                 ..
             }) => {
-                let active_window_size = { self.runtime.borrow().active_window_size() };
-                if let Some(size) = active_window_size {
-                    let position = pointer_position(location, size);
+                let active_window_metrics = { self.runtime.borrow().active_window_metrics() };
+                if let Some((size, scale_factor)) = active_window_metrics {
+                    let position = pointer_position(location, size, scale_factor);
                     let time = self.timestamp();
                     (self.callback)(PresenterEvent::PointerMotion { position, time });
                 }
@@ -1298,17 +1337,31 @@ const fn xorg_mouse_to_libinput(xorg: u32) -> u32 {
     }
 }
 
+pub fn normalize_host_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
 fn pointer_position(
     position: PhysicalPosition<f64>,
     size: PhysicalSize<u32>,
+    scale_factor: f64,
 ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
-    let width = f64::from(size.width.max(1));
-    let height = f64::from(size.height.max(1));
-    smithay::utils::Point::from((position.x.clamp(0.0, width), position.y.clamp(0.0, height)))
+    let scale_factor = normalize_host_scale_factor(scale_factor);
+    let width = f64::from(size.width.max(1)) / scale_factor;
+    let height = f64::from(size.height.max(1)) / scale_factor;
+    smithay::utils::Point::from((
+        (position.x / scale_factor).clamp(0.0, width),
+        (position.y / scale_factor).clamp(0.0, height),
+    ))
 }
 
 fn axis_values(
     delta: MouseScrollDelta,
+    scale_factor: f64,
 ) -> (
     Option<f64>,
     Option<f64>,
@@ -1324,13 +1377,16 @@ fn axis_values(
             Some((-y * 120.0) as i32),
             AxisSource::Wheel,
         ),
-        MouseScrollDelta::PixelDelta(delta) => (
-            Some(-delta.x),
-            Some(-delta.y),
-            None,
-            None,
-            AxisSource::Continuous,
-        ),
+        MouseScrollDelta::PixelDelta(delta) => {
+            let scale_factor = normalize_host_scale_factor(scale_factor);
+            (
+                Some(-delta.x / scale_factor),
+                Some(-delta.y / scale_factor),
+                None,
+                None,
+                AxisSource::Continuous,
+            )
+        }
     }
 }
 
@@ -1356,4 +1412,62 @@ pub fn axis_frame(
         frame = frame.v120(Axis::Vertical, v120);
     }
     frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{axis_values, normalize_host_scale_factor, pointer_position};
+    use smithay::{
+        backend::input::AxisSource,
+        reexports::winit::{
+            dpi::{PhysicalPosition, PhysicalSize},
+            event::MouseScrollDelta,
+        },
+    };
+
+    fn assert_close(left: f64, right: f64) {
+        assert!((left - right).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn normalizes_invalid_host_scale_factors_to_one() {
+        assert_close(normalize_host_scale_factor(2.0), 2.0);
+        assert_close(normalize_host_scale_factor(0.0), 1.0);
+        assert_close(normalize_host_scale_factor(f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn pointer_position_uses_logical_coordinates_for_host_scale() {
+        let position = pointer_position(
+            PhysicalPosition::new(640.0, 400.0),
+            PhysicalSize::new(1280, 800),
+            2.0,
+        );
+        assert_close(position.x, 320.0);
+        assert_close(position.y, 200.0);
+    }
+
+    #[test]
+    fn pointer_position_clamps_after_host_scale_conversion() {
+        let position = pointer_position(
+            PhysicalPosition::new(1400.0, 900.0),
+            PhysicalSize::new(1280, 800),
+            2.0,
+        );
+        assert_close(position.x, 640.0);
+        assert_close(position.y, 400.0);
+    }
+
+    #[test]
+    fn pixel_scroll_delta_uses_logical_coordinates_for_host_scale() {
+        let (horizontal, vertical, horizontal_v120, vertical_v120, source) = axis_values(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(12.0, -8.0)),
+            2.0,
+        );
+        assert_close(horizontal.expect("horizontal pixel delta"), -6.0);
+        assert_close(vertical.expect("vertical pixel delta"), 4.0);
+        assert!(horizontal_v120.is_none());
+        assert!(vertical_v120.is_none());
+        assert_eq!(source, AxisSource::Continuous);
+    }
 }
