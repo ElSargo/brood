@@ -184,6 +184,10 @@ impl WasmActor {
         Ok(())
     }
 
+    pub fn actor_id(&self) -> crate::ActorId {
+        self.store.data().mailbox.actor_id()
+    }
+
     pub fn inbox_arena(&self) -> Option<&GuestArena> {
         self.store.data().inbox_arena.as_ref()
     }

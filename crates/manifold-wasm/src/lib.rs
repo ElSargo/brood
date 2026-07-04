@@ -53,3 +53,6 @@ pub use policy_provider::{
     PublicationRegistry, PublicationSummary, WasmPolicyProvider,
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
+
+#[cfg(test)]
+mod tests;

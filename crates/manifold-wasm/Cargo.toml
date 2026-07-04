@@ -11,6 +11,9 @@ tokio.workspace = true
 tracing.workspace = true
 wasmtime.workspace = true
 
+[dev-dependencies]
+wat = "1.241.2"
+
 [lints.rust]
 warnings = { level = "deny", priority = -1 }
 unsafe_code = "forbid"
