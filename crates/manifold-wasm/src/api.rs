@@ -13,12 +13,11 @@ use crate::{
 pub const DEFAULT_GUEST_ARENA_ALIGN: usize = 8;
 pub const DEFAULT_MAILBOX_ARENA_BYTES: usize = 64 * 1024;
 pub const DEFAULT_EPOCH_TICKS: u64 = 1;
-pub const EPOCH_RUN_CONTINUE: i32 = 0;
-pub const EPOCH_RUN_STOP: i32 = 1;
+pub const EPOCH_RUN_CONTINUE: i64 = 0;
+pub const EPOCH_RUN_STOP: i64 = -1;
+pub const EPOCH_RUN_ERROR: i64 = -2;
 pub const READ_MESSAGE_CLOSED: i32 = -1;
 pub const READ_MESSAGE_ERROR: i32 = -2;
-pub const PUBLISH_OK: i32 = 1;
-pub const PUBLISH_ERROR: i32 = -1;
 pub const MAX_PUBLICATION_SLOT_BYTES: usize = 128;
 pub const MAX_PUBLICATION_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -43,6 +42,7 @@ pub struct GuestArena {
     cursor: usize,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestAllocation {
     ptr: i32,
@@ -69,8 +69,16 @@ impl Registry {
         self.mailboxes.register_actor(name, capacity)
     }
 
+    pub fn register_host_mailbox(&mut self, capacity: usize) -> Result<Mailbox> {
+        self.register_actor(crate::global_key_policy::HOST_ACTOR_NAME, capacity)
+    }
+
     pub fn actor_id_for_name(&self, name: &str) -> Option<ActorId> {
         self.mailboxes.actor_id_for_name(name)
+    }
+
+    pub fn host_actor_id(&self) -> Option<ActorId> {
+        self.actor_id_for_name(crate::global_key_policy::HOST_ACTOR_NAME)
     }
 
     pub fn try_post_named_message(&self, recipient: &str, payload: Vec<u8>) -> Result<()> {
@@ -81,8 +89,19 @@ impl Registry {
         self.mailboxes.try_post_message(recipient, payload)
     }
 
+    pub fn try_post_host_message(&self, payload: Vec<u8>) -> Result<()> {
+        self.try_post_named_message(crate::global_key_policy::HOST_ACTOR_NAME, payload)
+    }
+
     pub async fn post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
         self.mailboxes.post_message(recipient, payload).await
+    }
+
+    pub async fn post_host_message(&self, payload: Vec<u8>) -> Result<()> {
+        let actor_id = self
+            .host_actor_id()
+            .context("host mailbox is not registered")?;
+        self.post_message(actor_id, payload).await
     }
 
     pub fn try_post_message_from_range(
@@ -93,6 +112,17 @@ impl Registry {
     ) -> Result<()> {
         self.mailboxes
             .try_post_message_from_range(recipient, memory, payload)
+    }
+
+    pub fn try_post_host_message_from_range(
+        &self,
+        memory: &[u8],
+        payload: Range<usize>,
+    ) -> Result<()> {
+        let actor_id = self
+            .host_actor_id()
+            .context("host mailbox is not registered")?;
+        self.try_post_message_from_range(actor_id, memory, payload)
     }
 
     pub fn append_default_publication_frame(

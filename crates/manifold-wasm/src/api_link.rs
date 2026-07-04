@@ -8,7 +8,6 @@ pub const GUEST_MEMORY_EXPORT: &str = "memory";
 pub const ARENA_ALLOC_EXPORT: &str = "manifold_arena_alloc";
 pub const ARENA_FREE_EXPORT: &str = "manifold_arena_free";
 pub const READ_MESSAGE_IMPORT: &str = "read_message";
-pub const PUBLISH_IMPORT: &str = "publish";
 pub const EPOCH_RUN_EXPORT: &str = "manifold_epoch_run";
 
 pub fn load_guest_arena_allocator<T: 'static>(

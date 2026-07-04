@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use wasmtime::{Engine, Module};
 
 use crate::{
-    actor::{WasmActor, WasmActorConfig},
+    actor::{ActorEpochOutcome, WasmActor, WasmActorConfig},
     api::{Registry, async_epoch_engine, load_module_async},
     module_link::{discover_module_inventory, parse_actor_export},
     policy_provider::{PolicyProviderDeclaration, WasmPolicyProvider},
@@ -140,18 +140,21 @@ impl WasmPluginModule {
         &mut self,
         actor_index: usize,
         registry: &mut Registry,
-    ) -> Result<i32> {
+    ) -> Result<ActorEpochOutcome> {
         let actor = self
             .actors
             .get_mut(actor_index)
             .with_context(|| format!("unknown WASM actor index {actor_index}"))?;
-        actor.run_one_epoch_and_publish(registry).await
+        actor.run_one_epoch_and_dispatch(registry).await
     }
 
-    pub async fn run_all_actor_epochs(&mut self, registry: &mut Registry) -> Result<Vec<i32>> {
+    pub async fn run_all_actor_epochs(
+        &mut self,
+        registry: &mut Registry,
+    ) -> Result<Vec<ActorEpochOutcome>> {
         let mut statuses = Vec::with_capacity(self.actors.len());
         for actor in &mut self.actors {
-            statuses.push(actor.run_one_epoch_and_publish(registry).await?);
+            statuses.push(actor.run_one_epoch_and_dispatch(registry).await?);
         }
         Ok(statuses)
     }
