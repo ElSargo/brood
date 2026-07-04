@@ -8,7 +8,7 @@ The first async test-harness prototype is currently exposed through the `run` CL
 
 This is intentionally separate from `--wasm-key-handler`.
 
-- `--wasm-key-handler` is the current prototype synchronous key hook. The target shape is a sync key policy lane.
+- `--wasm-key-handler` is the current prototype synchronous key hook. The target shape is a key policy provider.
 - `--test-harness` is an async controller lane for behavior testing.
 
 ## Current Guest ABI

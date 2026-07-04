@@ -1702,6 +1702,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "manifold-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "tracing",
+ "wasmtime",
+]
+
+[[package]]
 name = "manifoldd"
 version = "0.1.0"
 dependencies = [

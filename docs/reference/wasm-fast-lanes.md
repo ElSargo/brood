@@ -13,7 +13,7 @@ code-links:
 
 The current runnable WASM surface is a set of narrow core-WASM lanes. These are implementation lanes, not the final product API.
 
-The target plugin model keeps the useful synchronous property of these lanes but replaces direct side-effect-style host imports with sync policy lanes that read immutable swapchain state and return bounded decision envelopes plus message batches. See [[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and [[../systems/layout-policy]].
+The target plugin model keeps the useful synchronous property of these lanes but replaces direct side-effect-style host imports with policy providers that read immutable published state and return bounded decision envelopes plus message batches. See [[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and [[../systems/layout-policy]].
 
 ## Fast Key Handler
 
@@ -53,7 +53,7 @@ Selected imports:
 
 Responses are JSON and are validated by the host before affecting presentation.
 
-This is the current prototype of the target sync layout policy lane. The target response should become a typed layout decision envelope backed by immutable published state, with the host still owning validation, fallback, hit testing, focus, and rendering.
+This is the current prototype of the target layout policy provider. The target response should become a typed layout decision envelope backed by immutable published state, with the host still owning validation, fallback, hit testing, focus, and rendering.
 
 ## Async Test Harness
 

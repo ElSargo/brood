@@ -23,7 +23,7 @@ Current module kinds are prototype WASM lanes:
 - `fast-key-handler`
 - `fast-map-hook`
 
-Target plugin manifests should eventually replace these lane-specific kinds with declarations for actors, sync policy lanes, capabilities, actions, pane types, and swapchains.
+Target plugin manifests should eventually replace these lane-specific kinds with declarations for actors, policy providers, capabilities, actions, pane types, and publications.
 
 Current startup realms:
 

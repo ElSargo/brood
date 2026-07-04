@@ -115,7 +115,7 @@ Focus belongs to the workspace pane model, even when a backend uses platform-spe
 Expected behavior:
 
 - Pointer, keyboard, wheel, and future IME/clipboard events route to the focused or hit-tested pane according to Manifold policy.
-- The host owns final key routing and shortcut conflict resolution; privileged plugins may influence immediate key policy only through bounded sync policy lanes.
+- The host owns final key routing and shortcut conflict resolution; privileged plugins may influence immediate key policy only through bounded policy providers.
 - Focus changes are observable through status, events, or testable workspace state.
 - Detach and reattach should not lose the intended focused pane when that pane still exists.
 - If the focused producer exits, focus should clear or move according to an explicit rule rather than pointing at stale state.

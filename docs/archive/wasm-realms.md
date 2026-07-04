@@ -140,11 +140,11 @@ The initial built-in primitives should be:
 
 - a registry
 - mailbox-style messaging
-- plugin-scoped swapchains for latest-state publication to sync policy lanes
+- plugin-scoped publications for latest-state publication to policy providers
 
 These should prefer instance ids as the default addressing model. Higher-level aliases or named services may be layered on top later through the registry or through a global broker module.
 
-RPC can remain a later addition if real workloads prove it necessary. The first coordination model should stay asynchronous and actor-like, with sync policy lanes reserved for immediate host decisions rather than general RPC.
+RPC can remain a later addition if real workloads prove it necessary. The first coordination model should stay asynchronous and actor-like, with policy providers reserved for immediate host decisions rather than general RPC.
 
 ## Event Shape
 

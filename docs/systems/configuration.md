@@ -36,7 +36,7 @@ Current module kinds are prototype WASM lanes:
 - `fast-key-handler`
 - `fast-map-hook`
 
-The target plugin configuration should move from these lane-specific module kinds to plugin manifests that declare actors, capabilities, sync policy lanes, actions, pane types, and swapchains.
+The target plugin configuration should move from these lane-specific module kinds to plugin manifests that declare actors, capabilities, policy providers, actions, pane types, and publications.
 
 Startup apps can target the session realm or presentation realm. Presentation startup apps remain available when an auto-started global control server skips creating its own initial surface session.
 

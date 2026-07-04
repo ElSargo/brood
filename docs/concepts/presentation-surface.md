@@ -13,7 +13,7 @@ The current prototype's session process also owns the MVP presentation endpoint.
 
 Presentation state is not pane state. A presentation surface may save layout or visibility preferences into the workspace, but the pane remains owned by its producer or session state.
 
-Plugins may influence presentation through host-validated requests and sync layout policy lanes. They do not directly own final rendering, hit testing, focus routing, or accepted layout commits.
+Plugins may influence presentation through host-validated requests and layout policy providers. They do not directly own final rendering, hit testing, focus routing, or accepted layout commits.
 
 Related:
 

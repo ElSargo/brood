@@ -57,7 +57,7 @@ User-facing commands such as `enter`, `show`, `hide`, `list`, `switch`, `plug`, 
 
 ## Plugin And Extension Boundary
 
-The target plugin architecture is actor-oriented. Normal plugin behavior runs through host-provided mailboxes, registry entries, capability checks, and native APIs. Latency-critical keyboard, focus, map, and layout decisions use narrow synchronous policy lanes that read immutable swapchain state and return bounded decision envelopes.
+The target plugin architecture is actor-oriented. Normal plugin behavior runs through host-provided mailboxes, registry entries, capability checks, and native APIs. Latency-critical keyboard, focus, map, and layout decisions use policy providers that read immutable published state and return bounded decision envelopes.
 
 WASM and extension APIs should operate on workspace, session, pane, command, status, input, and layout concepts. They should not expose Smithay, Winit, EGL, DMA-BUF, or renderer internals as the product API.
 

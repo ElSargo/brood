@@ -79,8 +79,8 @@ use crate::{
         LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     },
     plugin_runtime::{
-        PluginActorSummary, PluginHostEvent, PluginRuntime, PluginSyncKeyDecision,
-        PluginSyncKeyInput,
+        PluginActorSummary, PluginHostEvent, PluginMailboxSummary, PluginRuntime,
+        PluginSyncKeyDecision, PluginSyncKeyInput,
     },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
@@ -710,10 +710,35 @@ impl Manifold {
         Ok(())
     }
 
+    pub fn send_plugin_actor_message_to_slot(
+        &mut self,
+        actor_id: &str,
+        mailbox_slot: &str,
+        sender: String,
+        body: String,
+    ) -> Result<()> {
+        let plugin_runtime = self
+            .plugin_runtime
+            .as_mut()
+            .context("plugin runtime is not running")?;
+        plugin_runtime.send_message_to_slot(actor_id, mailbox_slot, sender, body)?;
+        self.plugin_actor_messages += 1;
+        self.plugin_actor_last_status = Some(format!("{actor_id}:{mailbox_slot}:message_queued"));
+        Ok(())
+    }
+
     pub fn plugin_actor_summaries(&self) -> Vec<PluginActorSummary> {
         self.plugin_runtime
             .as_ref()
             .map_or_else(Vec::new, PluginRuntime::actor_summaries)
+    }
+
+    pub fn plugin_mailbox_summaries(&self, actor_id: &str) -> Result<Vec<PluginMailboxSummary>> {
+        let plugin_runtime = self
+            .plugin_runtime
+            .as_ref()
+            .context("plugin runtime is not running")?;
+        plugin_runtime.mailbox_summaries(actor_id)
     }
 
     pub fn try_plugin_sync_key_handler(
@@ -752,13 +777,20 @@ impl Manifold {
         }
 
         for message in decision.actor_messages {
-            if let Err(err) =
-                self.send_plugin_actor_message(&message.actor_id, message.sender, message.body)
-            {
+            if let Err(err) = self.send_plugin_actor_message_to_slot(
+                &message.actor_id,
+                &message.mailbox_slot,
+                message.sender,
+                message.body,
+            ) {
                 self.plugin_actor_failures += 1;
-                self.plugin_actor_last_status = Some(format!("{}:message_error", message.actor_id));
+                self.plugin_actor_last_status = Some(format!(
+                    "{}:{}:message_error",
+                    message.actor_id, message.mailbox_slot
+                ));
                 warn!(
                     plugin_actor = %message.actor_id,
+                    mailbox_slot = %message.mailbox_slot,
                     error = %err,
                     "plugin sync key failed to enqueue actor message"
                 );
@@ -768,7 +800,7 @@ impl Manifold {
 
     fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
         match event {
-            PluginHostEvent::AppendSwapchainFrame {
+            PluginHostEvent::AppendPublicationFrame {
                 actor_id,
                 slot,
                 frame,
@@ -789,9 +821,9 @@ impl Manifold {
                             Some(format!("{actor_id}:{slot}:frame_error"));
                         warn!(
                             plugin_actor = %actor_id,
-                            swapchain_slot = %slot,
+                            publication_slot = %slot,
                             error = %err,
-                            "plugin actor failed to append swapchain frame"
+                            "plugin actor failed to append publication frame"
                         );
                     }
                 }

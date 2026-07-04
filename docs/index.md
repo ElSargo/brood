@@ -26,7 +26,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 ## Target Design
 
-- [[systems/plugin-runtime]] describes the actor mailbox runtime, sync policy lanes, and swapchains.
+- [[systems/plugin-runtime]] describes the actor mailbox runtime, policy providers, and publications.
 - [[systems/input-shortcuts]] describes host-owned shortcut routing with privileged sync key policy.
 - [[systems/layout-policy]] describes host-validated layout policy and resolved layouts.
 - [[systems/plugin-ui]] describes native component panes, chrome, and custom drawing escape hatches.

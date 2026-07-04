@@ -76,7 +76,8 @@ type DbusSurfaceSession = (u64, String, bool, u64);
 type DbusExtension = (String, String, String, DbusMetadata);
 type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 type DbusStatusItem = (String, String, String, String, DbusMetadata);
-type DbusPluginActor = (String, String, u64, u64, u64, u64, String);
+type DbusPluginActor = (String, String, u64, u64, u64, u64, String, String);
+type DbusPluginMailbox = (String, u64, u64, u64);
 type DbusAgent = (
     String,
     String,
@@ -132,6 +133,7 @@ type ExtensionListResponse = DbusResponse<Vec<DbusExtension>>;
 type GrantListResponse = DbusResponse<Vec<DbusGrant>>;
 type StatusListResponse = DbusResponse<Vec<DbusStatusItem>>;
 type PluginActorListResponse = DbusResponse<Vec<DbusPluginActor>>;
+type PluginMailboxListResponse = DbusResponse<Vec<DbusPluginMailbox>>;
 type AgentListResponse = DbusResponse<Vec<DbusAgent>>;
 type OptionalControlResponse = DbusResponse<Option<String>>;
 
@@ -198,8 +200,19 @@ enum DbusStateRequest {
     ListPluginActors {
         response: PluginActorListResponse,
     },
+    ListPluginMailboxes {
+        actor_id: String,
+        response: PluginMailboxListResponse,
+    },
     SendPluginActorMessage {
         actor_id: String,
+        message: String,
+        sender_name: String,
+        response: BoolResponse,
+    },
+    SendPluginActorSlotMessage {
+        actor_id: String,
+        mailbox_slot: String,
         message: String,
         sender_name: String,
         response: BoolResponse,
@@ -506,6 +519,13 @@ impl PluginDbus {
         .await
     }
 
+    async fn list_mailboxes(&self, actor_id: String) -> fdo::Result<Vec<DbusPluginMailbox>> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ListPluginMailboxes { actor_id, response }
+        })
+        .await
+    }
+
     async fn send_message(
         &self,
         actor_id: String,
@@ -516,6 +536,26 @@ impl PluginDbus {
         request_state(&self.sender, |response| {
             DbusStateRequest::SendPluginActorMessage {
                 actor_id,
+                message,
+                sender_name,
+                response,
+            }
+        })
+        .await
+    }
+
+    async fn send_message_to_slot(
+        &self,
+        actor_id: String,
+        mailbox_slot: String,
+        message: String,
+        #[zbus(header)] header: Header<'_>,
+    ) -> fdo::Result<bool> {
+        let sender_name = header_sender(&header);
+        request_state(&self.sender, |response| {
+            DbusStateRequest::SendPluginActorSlotMessage {
+                actor_id,
+                mailbox_slot,
                 message,
                 sender_name,
                 response,
@@ -1057,7 +1097,14 @@ trait ManifoldExtension {
 )]
 trait ManifoldPlugin {
     fn list_actors(&self) -> zbus::Result<Vec<DbusPluginActor>>;
+    fn list_mailboxes(&self, actor_id: String) -> zbus::Result<Vec<DbusPluginMailbox>>;
     fn send_message(&self, actor_id: String, message: String) -> zbus::Result<bool>;
+    fn send_message_to_slot(
+        &self,
+        actor_id: String,
+        mailbox_slot: String,
+        message: String,
+    ) -> zbus::Result<bool>;
 }
 
 #[proxy(interface = "org.manifold.Agent", default_path = "/org/manifold/Agent")]
@@ -2044,11 +2091,27 @@ fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Resul
                     print_plugin_actor(&actor);
                 }
             }
+            [subcommand, actor_id] if subcommand == "mailboxes" => {
+                for mailbox in request_plugin_mailbox_list(target, actor_id)? {
+                    print_plugin_mailbox(actor_id, &mailbox);
+                }
+            }
             [subcommand, actor_id, message @ ..] if subcommand == "send" => {
                 let queued = request_plugin_actor_send(target, actor_id, &message.join(" "))?;
                 println!("actor id={actor_id} queued={queued}");
             }
-            _ => bail!("usage: actors list | actors send <actor-id> [message...]"),
+            [subcommand, actor_id, mailbox_slot, message @ ..] if subcommand == "send-slot" => {
+                let queued = request_plugin_actor_send_to_slot(
+                    target,
+                    actor_id,
+                    mailbox_slot,
+                    &message.join(" "),
+                )?;
+                println!("actor id={actor_id} mailbox_slot={mailbox_slot} queued={queued}");
+            }
+            _ => bail!(
+                "usage: actors list | actors mailboxes <actor-id> | actors send <actor-id> [message...] | actors send-slot <actor-id> <slot> [message...]"
+            ),
         },
         "agents" => match args {
             [subcommand] if subcommand == "list" => {
@@ -2174,6 +2237,20 @@ fn request_plugin_actor_list(target: &ControlTarget) -> Result<Vec<DbusPluginAct
         .with_context(|| format!("call Manifold Plugin.ListActors on {}", target.destination))
 }
 
+fn request_plugin_mailbox_list(
+    target: &ControlTarget,
+    actor_id: &str,
+) -> Result<Vec<DbusPluginMailbox>> {
+    let connection = typed_connection(target)?;
+    let proxy = plugin_proxy(&connection, target)?;
+    proxy.list_mailboxes(actor_id.to_string()).with_context(|| {
+        format!(
+            "call Manifold Plugin.ListMailboxes on {}",
+            target.destination
+        )
+    })
+}
+
 fn request_plugin_actor_send(
     target: &ControlTarget,
     actor_id: &str,
@@ -2184,6 +2261,28 @@ fn request_plugin_actor_send(
     proxy
         .send_message(actor_id.to_string(), message.to_string())
         .with_context(|| format!("call Manifold Plugin.SendMessage on {}", target.destination))
+}
+
+fn request_plugin_actor_send_to_slot(
+    target: &ControlTarget,
+    actor_id: &str,
+    mailbox_slot: &str,
+    message: &str,
+) -> Result<bool> {
+    let connection = typed_connection(target)?;
+    let proxy = plugin_proxy(&connection, target)?;
+    proxy
+        .send_message_to_slot(
+            actor_id.to_string(),
+            mailbox_slot.to_string(),
+            message.to_string(),
+        )
+        .with_context(|| {
+            format!(
+                "call Manifold Plugin.SendMessageToSlot on {}",
+                target.destination
+            )
+        })
 }
 
 fn agent_proxy<'a>(
@@ -2294,17 +2393,29 @@ fn print_plugin_actor(
         mailbox_capacity,
         published_frames,
         latest_frame,
+        mailbox_slots,
     ): &DbusPluginActor,
 ) {
     println!(
-        "actor id={} kind={} enqueued_messages={} dropped_messages={} mailbox_capacity={} published_frames={} latest_frame={}",
+        "actor id={} kind={} enqueued_messages={} dropped_messages={} mailbox_capacity={} published_frames={} latest_frame={} mailbox_slots={}",
         id,
         kind,
         enqueued_messages,
         dropped_messages,
         mailbox_capacity,
         published_frames,
-        latest_frame
+        latest_frame,
+        mailbox_slots
+    );
+}
+
+fn print_plugin_mailbox(
+    actor_id: &str,
+    (slot, enqueued_messages, dropped_messages, capacity): &DbusPluginMailbox,
+) {
+    println!(
+        "actor id={} mailbox_slot={} enqueued_messages={} dropped_messages={} capacity={}",
+        actor_id, slot, enqueued_messages, dropped_messages, capacity
     );
 }
 
@@ -2510,6 +2621,12 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
                 Ok(dbus_plugin_actors(state.plugin_actor_summaries())),
             );
         }
+        DbusStateRequest::ListPluginMailboxes { actor_id, response } => send_response(
+            response,
+            state
+                .plugin_mailbox_summaries(&actor_id)
+                .map(dbus_plugin_mailboxes),
+        ),
         DbusStateRequest::SendPluginActorMessage {
             actor_id,
             message,
@@ -2519,6 +2636,18 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
             state
                 .send_plugin_actor_message(&actor_id, sender_name, message)
+                .map(|()| true),
+        ),
+        DbusStateRequest::SendPluginActorSlotMessage {
+            actor_id,
+            mailbox_slot,
+            message,
+            sender_name,
+            response,
+        } => send_response(
+            response,
+            state
+                .send_plugin_actor_message_to_slot(&actor_id, &mailbox_slot, sender_name, message)
                 .map(|()| true),
         ),
         DbusStateRequest::RegisterStatusPublisher {
@@ -2713,9 +2842,44 @@ fn dbus_plugin_actors(
                 u64::try_from(actor.mailbox_capacity).unwrap_or(u64::MAX),
                 actor.published_frames,
                 actor.latest_frame,
+                format_plugin_mailbox_slots(&actor.mailbox_slots),
             )
         })
         .collect()
+}
+
+fn dbus_plugin_mailboxes(
+    mailboxes: Vec<crate::plugin_runtime::PluginMailboxSummary>,
+) -> Vec<DbusPluginMailbox> {
+    mailboxes
+        .into_iter()
+        .map(|mailbox| {
+            (
+                mailbox.slot,
+                mailbox.enqueued_messages,
+                mailbox.dropped_messages,
+                u64::try_from(mailbox.capacity).unwrap_or(u64::MAX),
+            )
+        })
+        .collect()
+}
+
+fn format_plugin_mailbox_slots(
+    mailboxes: &[crate::plugin_runtime::PluginMailboxSummary],
+) -> String {
+    if mailboxes.is_empty() {
+        return "none".to_string();
+    }
+    mailboxes
+        .iter()
+        .map(|mailbox| {
+            format!(
+                "{}:{}/{}/{}",
+                mailbox.slot, mailbox.enqueued_messages, mailbox.dropped_messages, mailbox.capacity
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn dbus_agents(agents: Vec<crate::state::AgentSummary>) -> Vec<DbusAgent> {

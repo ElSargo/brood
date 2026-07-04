@@ -26,9 +26,9 @@ calloop/session thread
   -> command requests back to calloop/session thread
 ```
 
-## Sync Policy Lane
+## Policy Provider
 
-The sync policy lane is for user-defined policy that must participate in a state transition before Manifold commits it. It exists for cases where asynchronous reaction would be too late or could create inconsistent ownership.
+The policy provider is for user-defined policy that must participate in a state transition before Manifold commits it. It exists for cases where asynchronous reaction would be too late or could create inconsistent ownership.
 
 Examples:
 
@@ -37,7 +37,7 @@ Examples:
 - a command needs preflight validation or rewrite
 - a focus change needs allow, deny, redirect, or abstain policy
 
-Sync policy lane hooks are synchronous and bounded. They must not perform slow or unbounded work.
+Policy provider hooks are synchronous and bounded. They must not perform slow or unbounded work.
 
 Allowed:
 
@@ -77,7 +77,7 @@ Examples:
 - perform storage or slow computation
 - launch follow-up app actions through capability-checked commands
 
-The async lane should support:
+The apolicy provider should support:
 
 - bounded event queues
 - backpressure diagnostics
@@ -103,7 +103,7 @@ async plugin worker
   -> publishes immutable payload to a slot
   -> host atomically publishes a new composite root
 
-sync policy lane
+policy provider
   -> receives the current root reference
   -> reads the default slot or a named slot
   -> returns a bounded decision immediately
@@ -138,7 +138,7 @@ publish(some("editor"), EditorNavState { target })
 publish(some("git"), GitNavState { target })
 ```
 
-The host should internally retain enough old frames to keep sync-policy references valid for the duration of a call. The internal representation may use an Arc linked list, publication log, ring, or another RCU-like structure, but the sync policy lane should only see the current immutable root.
+The host should internally retain enough old frames to keep sync-policy references valid for the duration of a call. The internal representation may use an Arc linked list, publication log, ring, or another RCU-like structure, but the policy provider should only see the current immutable root.
 
 Host guarantees:
 
@@ -159,7 +159,7 @@ Manifold should treat backend observations and user input as candidate workspace
 ```text
 observe backend/input/control event
 build pending transaction
-run relevant sync policy hooks
+run relevant policy providers
 resolve hook decisions
 commit one workspace transaction
 emit durable workspace events
@@ -193,7 +193,7 @@ For example, on a managed app map event:
 ```text
 surface mapped
   -> PendingPane { surface, app_id, title, pid, ... }
-  -> sync policy hooks return claim/place/deny decisions
+  -> policy providers return claim/place/deny decisions
   -> host resolves the winning namespace and placement request
   -> host commits PaneOpened with final owner
   -> losing hooks receive PaneClaimRejected or observe PaneOpened with final owner
@@ -226,7 +226,7 @@ For controller-backed bindings:
 ```text
 key input
   -> host matches shortcut
-  -> sync policy lane may resolve or rewrite the command
+  -> policy provider may resolve or rewrite the command
   -> host emits ShortcutInvoked
   -> async controller may request follow-up commands
 ```
@@ -238,25 +238,25 @@ The first implementation should keep shortcut bindings in normal mode only. That
 The first native implementation can avoid Wasmtime while proving the API:
 
 - route existing normal-mode commands through a `WorkspaceCommand` executor
-- add a native sync policy hook registry
+- add a native policy provider registry
 - add a native async controller queue or mock executor
 - expose hook and command counters through `status-json`
 
 When Wasmtime is added:
 
 - use one host-owned command/event model for both lanes
-- keep sync policy lane instances separate from async actor lane instances
-- use strict Wasmtime limits for sync policy hooks
+- keep policy provider instances separate from async actor lane instances
+- use strict Wasmtime limits for policy providers
 - run async guest calls on the async runtime
 - send all command requests back to the calloop/session thread
 
-The sync policy lane should be an admission-controlled feature. A module should have to declare sync hooks in its manifest and receive explicit capabilities for them.
+The policy provider should be an admission-controlled feature. A module should have to declare sync hooks in its manifest and receive explicit capabilities for them.
 
 ## Diagnostics
 
 Both lanes need separate diagnostics.
 
-Sync policy lane counters:
+Policy provider counters:
 
 - registered hooks
 - hook calls
@@ -268,7 +268,7 @@ Sync policy lane counters:
 - claims rejected
 - policy denials
 
-Async lane counters:
+Apolicy provider counters:
 
 - registered modules
 - event queue length
@@ -283,6 +283,6 @@ These should eventually appear in `status-json` so real workload tests can verif
 
 ## Design Rule
 
-Use a sync policy lane only when Manifold needs a decision before committing workspace state. Use the async actor lane for everything else.
+Use a policy provider only when Manifold needs a decision before committing workspace state. Use the async actor lane for everything else.
 
 That preserves consistency for map, focus, command, and shortcut policy while keeping ordinary plugin work isolated from latency-sensitive paths.

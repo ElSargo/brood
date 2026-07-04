@@ -8,7 +8,7 @@ This note scopes the first WASM API spike to workspace navigation, managed app l
 
 The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Manifold should execute those requests through the same session process paths used by native input and control commands.
 
-The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): normal plugin work runs through actors and mailboxes, while only bounded pre-commit policy hooks and immediate shortcut decisions run through sync policy lanes that read immutable published state.
+The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): normal plugin work runs through actors and mailboxes, while only bounded pre-commit policy hooks and immediate shortcut decisions run through policy providers that read immutable published state.
 
 ## First Prototype Order
 
@@ -80,7 +80,7 @@ For the first spike, `run-managed-app` can call the current hosted Wayland spawn
 
 ## Keyboard Shortcuts
 
-Keyboard shortcuts should be command bindings. A WASM controller registers bindings, and Manifold dispatches matched key chords to commands when input policy allows interception. Privileged raw or modal key policy belongs in a sync key policy lane, not an arbitrary actor queue.
+Keyboard shortcuts should be command bindings. A WASM controller registers bindings, and Manifold dispatches matched key chords to commands when input policy allows interception. Privileged raw or modal key policy belongs in a key policy provider, not an arbitrary actor queue.
 
 Initial host functions:
 
@@ -117,7 +117,7 @@ The first implementation should use `normal` mode only. This matches the current
 
 Shortcut dispatch should produce a normal workspace command request. For example, a WASM controller can bind `j` in normal mode to `focus-next`, or bind `w` to `run-managed-app({ argv: ["wezterm"] })`. The controller should not receive every raw key event unless it has a separate input-observation capability.
 
-Simple shortcut bindings can dispatch directly to workspace commands on the fast path. Controller-backed bindings should emit a shortcut event to the async lane and may request follow-up commands after the initial host-owned decision.
+Simple shortcut bindings can dispatch directly to workspace commands on the fast path. Controller-backed bindings should emit a shortcut event to the apolicy provider and may request follow-up commands after the initial host-owned decision.
 
 Capability requirements:
 
@@ -149,7 +149,7 @@ poll-workspace-events(after-seq, max-events) -> event-batch
 
 The snapshot is the recovery and reload path. The event stream is the incremental update path. If an event batch overflows or the plugin reloads, the plugin rebuilds from `workspace-snapshot`.
 
-For sync policy state, the host should expose plugin-scoped swapchain publication slots:
+For policy-provider state, the host should expose plugin-scoped publication slots:
 
 ```text
 publish(name: option<string>, payload) -> generation

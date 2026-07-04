@@ -115,7 +115,7 @@ plugin actor returns BufferRef to a full UI tree or patch
 host reads, validates, commits, and renders
 ```
 
-This UI actor is asynchronous plugin behavior, not a sync policy lane. If the picker is opened by a shortcut, the key decision is resolved by the host keymap or a privileged sync key policy lane, then the actor receives an open-picker message.
+This UI actor is asynchronous plugin behavior, not a policy provider. If the picker is opened by a shortcut, the key decision is resolved by the host keymap or a privileged key policy provider, then the actor receives an open-picker message.
 
 Minimum exported functions:
 

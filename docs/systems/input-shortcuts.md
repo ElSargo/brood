@@ -7,7 +7,7 @@ last-reviewed: 2026-07-03
 
 # Input And Keyboard Shortcuts
 
-The target input model keeps final key routing in the host while allowing privileged plugins to participate in immediate keyboard policy through synchronous policy lanes.
+The target input model keeps final key routing in the host while allowing privileged plugins to participate in immediate keyboard policy through policy providers.
 
 ## Ownership
 
@@ -26,7 +26,7 @@ Plugins may contribute:
 - action and command registrations
 - default shortcut suggestions
 - contextual enablement predicates
-- privileged sync key policy lanes
+- privileged key policy providers
 - actor-handled command behavior after invocation
 
 ## Default Shortcut Model
@@ -48,15 +48,15 @@ The target routing order is:
 
 1. host-reserved safety and recovery keys
 2. focused native widget/text-input behavior
-3. granted sync key policy lane for the active context
+3. granted key policy provider for the active context
 4. host keymap/action dispatch
 5. forwarding to the focused managed client pane
 
 The exact order may be specialized for modes, but raw keyboard observation remains a separate capability. Ordinary plugins should not become global keyloggers.
 
-## Sync Key Policy Lane
+## Key Policy Provider
 
-A sync key policy lane is for modal or workspace-level behavior that must decide immediately whether a key is consumed, transformed, or forwarded.
+A key policy provider is for modal or workspace-level behavior that must decide immediately whether a key is consumed, transformed, or forwarded.
 
 ```text
 KeyQuery {
@@ -67,7 +67,7 @@ KeyQuery {
   focus_context,
   pressed_modifier_state,
 }
-+ latest plugin swapchain frame
++ latest plugin publication frame
     -> KeyPolicyResult
 ```
 
@@ -81,9 +81,9 @@ KeyPolicyResult {
 }
 ```
 
-The lane may read its latest published state and return a message batch, but it does not mutate host state or wait for actor work. The host applies accepted directives and enqueues messages only after the call returns.
+The provider may read its latest published state and return a message batch, but it does not mutate host state or wait for actor work. The host applies accepted directives and enqueues messages only after the call returns.
 
-The current native prototype handles `Ctrl+O` this way: it reads the `debug-toggle` actor's latest swapchain frame, returns a host command for `foot htop` or `foot btop`, and returns a mailbox message asking the actor to toggle and publish the next frame.
+The current native prototype handles `Ctrl+O` this way: it reads the `debug-toggle` actor's latest publication frame, returns a host command for `foot htop` or `foot btop`, and returns a mailbox message asking the actor to toggle and publish the next frame.
 
 ## Relation To The Current WASM Key Handler
 
@@ -98,11 +98,11 @@ This avoids reentrancy and deadlock while preserving fast key handling.
 
 ## Actor Follow-Up
 
-When a shortcut invokes long-running behavior, the sync path should only make the immediate routing decision. Follow-up work belongs to actors:
+When a shortcut invokes long-running behavior, the policy path should only make the immediate routing decision. Follow-up work belongs to actors:
 
 ```text
 key press
-  -> sync lane consumes key and returns message InvokeAction(search.open)
+  -> policy provider consumes key and returns message InvokeAction(search.open)
   -> host enqueues message
   -> search actor opens pane or updates UI asynchronously
 ```
@@ -111,15 +111,15 @@ If a key should launch or focus an app immediately, the result should still be a
 
 ## Diagnostics
 
-Input diagnostics should separate host keymap behavior from sync policy behavior:
+Input diagnostics should separate host keymap behavior from policy provider behavior:
 
 - matched binding and scope
 - winning plugin/action
 - conflicts and overrides
-- sync key policy call count and latency
-- traps, timeouts, disabled lanes
+- key policy provider call count and latency
+- traps, timeouts, disabled providers
 - consumed, forwarded, and transformed key counts
-- messages emitted from sync key policy results
+- messages emitted from key policy provider results
 
 Related:
 

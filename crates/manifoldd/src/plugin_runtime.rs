@@ -11,7 +11,8 @@ use tracing::{info, warn};
 pub(crate) const DEBUG_TOGGLE_ACTOR_ID: &str = "debug-toggle";
 const DEBUG_TOGGLE_ACTOR_KIND: &str = "builtin-toggle-launcher";
 const DEBUG_TOGGLE_ACTOR_MAILBOX_CAPACITY: usize = 64;
-const DEFAULT_SWAPCHAIN_SLOT: &str = "default";
+const DEFAULT_MAILBOX_SLOT: &str = "default";
+const DEFAULT_PUBLICATION_SLOT: &str = "default";
 const MAX_LINKED_FRAME_DEPTH: usize = 16;
 const SYNC_KEY_SENDER: &str = "host:sync-key";
 const KEY_O: Keycode = Keycode::new(32);
@@ -25,17 +26,26 @@ pub(crate) struct PluginMessage {
 #[derive(Clone, Debug)]
 pub(crate) struct PluginActorMessage {
     pub(crate) actor_id: String,
+    pub(crate) mailbox_slot: String,
     pub(crate) sender: String,
     pub(crate) body: String,
 }
 
 #[derive(Debug)]
 pub(crate) enum PluginHostEvent {
-    AppendSwapchainFrame {
+    AppendPublicationFrame {
         actor_id: String,
         slot: String,
         frame: PluginFramePayload,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PluginMailboxSummary {
+    pub(crate) slot: String,
+    pub(crate) enqueued_messages: u64,
+    pub(crate) dropped_messages: u64,
+    pub(crate) capacity: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +55,7 @@ pub(crate) struct PluginActorSummary {
     pub(crate) enqueued_messages: u64,
     pub(crate) dropped_messages: u64,
     pub(crate) mailbox_capacity: usize,
+    pub(crate) mailbox_slots: Vec<PluginMailboxSummary>,
     pub(crate) published_frames: u64,
     pub(crate) latest_frame: String,
 }
@@ -73,11 +84,17 @@ pub(crate) struct PluginRuntime {
 struct PluginActorHandle {
     id: String,
     kind: String,
-    mailbox: mpsc::Sender<PluginMessage>,
+    mailboxes: Vec<PluginMailboxHandle>,
+    publications: Vec<PluginPublication>,
+}
+
+#[derive(Debug)]
+struct PluginMailboxHandle {
+    slot: String,
+    sender: mpsc::Sender<PluginMessage>,
     enqueued_messages: u64,
     dropped_messages: u64,
-    mailbox_capacity: usize,
-    swapchains: Vec<PluginSwapchain>,
+    capacity: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -93,10 +110,10 @@ struct PluginFrameNode {
 }
 
 #[derive(Debug)]
-struct PluginSwapchain {
+struct PluginPublication {
     slot: String,
     latest: Option<Arc<PluginFrameNode>>,
-    appended_frames: u64,
+    published_frames: u64,
 }
 
 impl PluginRuntime {
@@ -115,11 +132,7 @@ impl PluginRuntime {
         slot: &str,
         frame: PluginFramePayload,
     ) -> Result<()> {
-        let Some(actor) = self
-            .actors
-            .iter_mut()
-            .find(|actor| actor.id.as_str() == actor_id)
-        else {
+        let Some(actor) = self.actor_mut(actor_id) else {
             bail!("unknown plugin actor {actor_id:?}");
         };
 
@@ -133,25 +146,28 @@ impl PluginRuntime {
         sender: String,
         body: String,
     ) -> Result<()> {
-        let Some(actor) = self
-            .actors
-            .iter_mut()
-            .find(|actor| actor.id.as_str() == actor_id)
-        else {
+        self.send_message_to_slot(actor_id, DEFAULT_MAILBOX_SLOT, sender, body)
+    }
+
+    pub(crate) fn send_message_to_slot(
+        &mut self,
+        actor_id: &str,
+        slot: &str,
+        sender: String,
+        body: String,
+    ) -> Result<()> {
+        let Some(actor) = self.actor_mut(actor_id) else {
             bail!("unknown plugin actor {actor_id:?}");
         };
 
-        let message = PluginMessage { sender, body };
-        match actor.mailbox.try_send(message) {
-            Ok(()) => {
-                actor.enqueued_messages += 1;
-                Ok(())
-            }
-            Err(err) => {
-                actor.dropped_messages += 1;
-                bail!("plugin actor {actor_id:?} mailbox rejected message: {err}")
-            }
-        }
+        actor.send_message_to_slot(slot, PluginMessage { sender, body })
+    }
+
+    pub(crate) fn mailbox_summaries(&self, actor_id: &str) -> Result<Vec<PluginMailboxSummary>> {
+        let Some(actor) = self.actor(actor_id) else {
+            bail!("unknown plugin actor {actor_id:?}");
+        };
+        Ok(actor.mailbox_summaries())
     }
 
     pub(crate) fn handle_sync_key(
@@ -175,7 +191,7 @@ impl PluginRuntime {
 
         let spawn_btop = self
             .actor(DEBUG_TOGGLE_ACTOR_ID)
-            .and_then(|actor| actor.latest_payload(DEFAULT_SWAPCHAIN_SLOT))
+            .and_then(|actor| actor.latest_payload(DEFAULT_PUBLICATION_SLOT))
             .is_some_and(|payload| match payload {
                 PluginFramePayload::ToggleChoice { spawn_btop_next } => spawn_btop_next,
             });
@@ -185,6 +201,7 @@ impl PluginRuntime {
             spawn_argv: Some(vec!["foot".to_string(), tool.to_string()]),
             actor_messages: vec![PluginActorMessage {
                 actor_id: DEBUG_TOGGLE_ACTOR_ID.to_string(),
+                mailbox_slot: DEFAULT_MAILBOX_SLOT.to_string(),
                 sender: SYNC_KEY_SENDER.to_string(),
                 body: "toggle".to_string(),
             }],
@@ -192,18 +209,7 @@ impl PluginRuntime {
     }
 
     pub(crate) fn actor_summaries(&self) -> Vec<PluginActorSummary> {
-        self.actors
-            .iter()
-            .map(|actor| PluginActorSummary {
-                id: actor.id.clone(),
-                kind: actor.kind.clone(),
-                enqueued_messages: actor.enqueued_messages,
-                dropped_messages: actor.dropped_messages,
-                mailbox_capacity: actor.mailbox_capacity,
-                published_frames: actor.published_frames(),
-                latest_frame: actor.latest_frame_label(),
-            })
-            .collect()
+        self.actors.iter().map(PluginActorHandle::summary).collect()
     }
 
     fn actor(&self, actor_id: &str) -> Option<&PluginActorHandle> {
@@ -211,44 +217,139 @@ impl PluginRuntime {
             .iter()
             .find(|actor| actor.id.as_str() == actor_id)
     }
+
+    fn actor_mut(&mut self, actor_id: &str) -> Option<&mut PluginActorHandle> {
+        self.actors
+            .iter_mut()
+            .find(|actor| actor.id.as_str() == actor_id)
+    }
 }
 
 impl PluginActorHandle {
-    fn append_frame(&mut self, slot: &str, frame: PluginFramePayload) {
-        if let Some(swapchain) = self
-            .swapchains
+    fn new(id: String, kind: String, mailboxes: Vec<PluginMailboxHandle>) -> Self {
+        Self {
+            id,
+            kind,
+            mailboxes,
+            publications: Vec::new(),
+        }
+    }
+
+    fn send_message_to_slot(&mut self, slot: &str, message: PluginMessage) -> Result<()> {
+        let actor_id = self.id.clone();
+        let Some(mailbox) = self
+            .mailboxes
             .iter_mut()
-            .find(|swapchain| swapchain.slot == slot)
+            .find(|mailbox| mailbox.slot == slot)
+        else {
+            bail!("plugin actor {actor_id:?} has no mailbox slot {slot:?}");
+        };
+
+        mailbox.send(&actor_id, message)
+    }
+
+    fn append_frame(&mut self, slot: &str, frame: PluginFramePayload) {
+        if let Some(publication) = self
+            .publications
+            .iter_mut()
+            .find(|publication| publication.slot == slot)
         {
-            swapchain.append(frame);
+            publication.append(frame);
             return;
         }
 
-        self.swapchains.push(PluginSwapchain::new(slot.to_string()));
-        if let Some(swapchain) = self.swapchains.last_mut() {
-            swapchain.append(frame);
+        self.publications
+            .push(PluginPublication::new(slot.to_string()));
+        if let Some(publication) = self.publications.last_mut() {
+            publication.append(frame);
         }
     }
 
     fn latest_payload(&self, slot: &str) -> Option<PluginFramePayload> {
-        self.swapchains
+        self.publications
             .iter()
-            .find(|swapchain| swapchain.slot == slot)
-            .and_then(PluginSwapchain::latest_payload)
+            .find(|publication| publication.slot == slot)
+            .and_then(PluginPublication::latest_payload)
+    }
+
+    fn summary(&self) -> PluginActorSummary {
+        let mailbox_slots = self.mailbox_summaries();
+        PluginActorSummary {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            enqueued_messages: mailbox_slots
+                .iter()
+                .map(|mailbox| mailbox.enqueued_messages)
+                .sum(),
+            dropped_messages: mailbox_slots
+                .iter()
+                .map(|mailbox| mailbox.dropped_messages)
+                .sum(),
+            mailbox_capacity: mailbox_slots.iter().map(|mailbox| mailbox.capacity).sum(),
+            mailbox_slots,
+            published_frames: self.published_frames(),
+            latest_frame: self.latest_frame_label(),
+        }
+    }
+
+    fn mailbox_summaries(&self) -> Vec<PluginMailboxSummary> {
+        self.mailboxes
+            .iter()
+            .map(PluginMailboxHandle::summary)
+            .collect()
     }
 
     fn published_frames(&self) -> u64 {
-        self.swapchains
+        self.publications
             .iter()
-            .map(|swapchain| swapchain.appended_frames)
+            .map(|publication| publication.published_frames)
             .sum()
     }
 
     fn latest_frame_label(&self) -> String {
-        self.swapchains
+        self.publications
             .iter()
-            .find(|swapchain| swapchain.slot == DEFAULT_SWAPCHAIN_SLOT)
-            .map_or_else(|| "none".to_string(), PluginSwapchain::latest_label)
+            .find(|publication| publication.slot == DEFAULT_PUBLICATION_SLOT)
+            .map_or_else(|| "none".to_string(), PluginPublication::latest_label)
+    }
+}
+
+impl PluginMailboxHandle {
+    fn new(slot: String, capacity: usize) -> (Self, mpsc::Receiver<PluginMessage>) {
+        let (sender, receiver) = mpsc::channel::<PluginMessage>(capacity);
+        (
+            Self {
+                slot,
+                sender,
+                enqueued_messages: 0,
+                dropped_messages: 0,
+                capacity,
+            },
+            receiver,
+        )
+    }
+
+    fn send(&mut self, actor_id: &str, message: PluginMessage) -> Result<()> {
+        match self.sender.try_send(message) {
+            Ok(()) => {
+                self.enqueued_messages += 1;
+                Ok(())
+            }
+            Err(err) => {
+                self.dropped_messages += 1;
+                let slot = &self.slot;
+                bail!("plugin actor {actor_id:?} mailbox slot {slot:?} rejected message: {err}")
+            }
+        }
+    }
+
+    fn summary(&self) -> PluginMailboxSummary {
+        PluginMailboxSummary {
+            slot: self.slot.clone(),
+            enqueued_messages: self.enqueued_messages,
+            dropped_messages: self.dropped_messages,
+            capacity: self.capacity,
+        }
     }
 }
 
@@ -262,12 +363,12 @@ impl PluginFramePayload {
     }
 }
 
-impl PluginSwapchain {
+impl PluginPublication {
     fn new(slot: String) -> Self {
         Self {
             slot,
             latest: None,
-            appended_frames: 0,
+            published_frames: 0,
         }
     }
 
@@ -281,7 +382,7 @@ impl PluginSwapchain {
             previous,
             depth,
         }));
-        self.appended_frames += 1;
+        self.published_frames += 1;
     }
 
     fn latest_payload(&self) -> Option<PluginFramePayload> {
@@ -318,8 +419,10 @@ fn start_toggle_actor(
     runtime: &tokio::runtime::Handle,
     host_sender: channel::Sender<PluginHostEvent>,
 ) -> PluginActorHandle {
-    let (mailbox, mut receiver) =
-        mpsc::channel::<PluginMessage>(DEBUG_TOGGLE_ACTOR_MAILBOX_CAPACITY);
+    let (default_mailbox, mut default_receiver) = PluginMailboxHandle::new(
+        DEFAULT_MAILBOX_SLOT.to_string(),
+        DEBUG_TOGGLE_ACTOR_MAILBOX_CAPACITY,
+    );
     let actor_id = DEBUG_TOGGLE_ACTOR_ID.to_string();
     let task_actor_id = actor_id.clone();
     let task_host_sender = host_sender.clone();
@@ -327,9 +430,10 @@ fn start_toggle_actor(
         info!(plugin_actor = %task_actor_id, "plugin actor started");
         let mut spawn_btop_next = false;
         publish_toggle_frame(&task_host_sender, &task_actor_id, spawn_btop_next);
-        while let Some(message) = receiver.recv().await {
+        while let Some(message) = default_receiver.recv().await {
             info!(
                 plugin_actor = %task_actor_id,
+                mailbox_slot = %DEFAULT_MAILBOX_SLOT,
                 dbus_sender = %message.sender,
                 message = %message.body,
                 "plugin actor received mailbox message"
@@ -341,15 +445,11 @@ fn start_toggle_actor(
     });
     drop(task);
 
-    PluginActorHandle {
-        id: actor_id,
-        kind: DEBUG_TOGGLE_ACTOR_KIND.to_string(),
-        mailbox,
-        enqueued_messages: 0,
-        dropped_messages: 0,
-        mailbox_capacity: DEBUG_TOGGLE_ACTOR_MAILBOX_CAPACITY,
-        swapchains: Vec::new(),
-    }
+    PluginActorHandle::new(
+        actor_id,
+        DEBUG_TOGGLE_ACTOR_KIND.to_string(),
+        vec![default_mailbox],
+    )
 }
 
 fn publish_toggle_frame(
@@ -357,11 +457,11 @@ fn publish_toggle_frame(
     actor_id: &str,
     spawn_btop_next: bool,
 ) {
-    if let Err(err) = host_sender.send(PluginHostEvent::AppendSwapchainFrame {
+    if let Err(err) = host_sender.send(PluginHostEvent::AppendPublicationFrame {
         actor_id: actor_id.to_string(),
-        slot: DEFAULT_SWAPCHAIN_SLOT.to_string(),
+        slot: DEFAULT_PUBLICATION_SLOT.to_string(),
         frame: PluginFramePayload::ToggleChoice { spawn_btop_next },
     }) {
-        warn!(plugin_actor = %actor_id, error = ?err, "plugin actor could not publish swapchain frame");
+        warn!(plugin_actor = %actor_id, error = ?err, "plugin actor could not publish publication frame");
     }
 }

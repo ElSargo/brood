@@ -7,7 +7,7 @@ last-reviewed: 2026-07-03
 
 # Build WASM Examples
 
-The local examples target `wasm32-unknown-unknown`. They exercise the current prototype WASM lanes, not the final plugin actor/sync-lane API.
+The local examples target `wasm32-unknown-unknown`. They exercise the current prototype WASM lanes, not the final plugin actor/policy-provider API.
 
 ```sh
 nix develop --command cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release

@@ -34,9 +34,9 @@ This means the first useful milestone is not the WASM runtime itself. The first 
 
 The runtime then becomes an adapter over this model. Linux-native `manifold` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
-The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold should keep the session process authoritative, run ordinary plugin work as actor/mailbox traffic, and reserve sync policy lanes for bounded pre-commit policy hooks that read immutable swapchain state.
+The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold should keep the session process authoritative, run ordinary plugin work as actor/mailbox traffic, and reserve policy providers for bounded pre-commit policy hooks that read immutable published state.
 
-The layout policy boundary is now promoted into [Layout Policy](../systems/layout-policy.md). In short, plugins return candidate resolved layout items through a sync policy lane, while the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
+The layout policy boundary is now promoted into [Layout Policy](../systems/layout-policy.md). In short, plugins return candidate resolved layout items through a policy provider, while the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
 
 The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md). In short, modules should target `global`, `session`, or `surface` realms, with mostly shared host APIs plus realm-local convenience bindings and lifetimes.
 
@@ -173,7 +173,7 @@ Examples:
 
 Event delivery should have backpressure and diagnostics. Slow modules should be visible in status output and logs.
 
-Event delivery belongs to the async actor/mailbox lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded sync policy lane described in [Plugin Runtime](../systems/plugin-runtime.md).
+Event delivery belongs to the async actor/mailbox lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded policy provider described in [Plugin Runtime](../systems/plugin-runtime.md).
 
 Realm-local events should be easy:
 
@@ -268,11 +268,11 @@ The initial built-ins should be:
 
 - a registry
 - mailbox-style messaging
-- plugin-scoped swapchains for latest-state publication to sync policy lanes
+- plugin-scoped publications for latest-state publication to policy providers
 
 Instance ids should be the default addressing model. Named aliases or higher-level service routing can be layered on top later through the registry or a broker module.
 
-RPC can remain a later addition if real workloads prove it necessary. Sync policy lanes are reserved for immediate host decisions, not general RPC.
+RPC can remain a later addition if real workloads prove it necessary. Policy providers are reserved for immediate host decisions, not general RPC.
 
 ## Data Flow
 

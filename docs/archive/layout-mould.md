@@ -1,6 +1,6 @@
 # Resolved Layout
 
-This archived page records the earlier resolved-layout sketch. The current target layout boundary is [Layout Policy](../systems/layout-policy.md), which frames layout as a sync policy lane reading immutable plugin swapchain state.
+This archived page records the earlier resolved-layout sketch. The current target layout boundary is [Layout Policy](../systems/layout-policy.md), which frames layout as a policy provider reading immutable plugin publication state.
 
 Manifold layout policy should be reloadable, but presentation execution remains
 native-owned.

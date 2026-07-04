@@ -15,7 +15,7 @@ The host owns:
 
 - pane shells, tabs, borders, title bars, menus, overlays, and recovery UI
 - layout integration and resize/focus/visibility events
-- input routing between native widgets, plugin actors, sync policy lanes, and managed clients
+- input routing between native widgets, plugin actors, policy providers, and managed clients
 - theming, accessibility, text editing primitives, and platform integration
 - validation of plugin-provided UI trees or patches
 
@@ -56,7 +56,7 @@ Host -> Actor: PaneResized / PaneFocused / PaneHidden / PaneDestroyed
 Actor -> Host: CommandRequest / ViewPatch / Status
 ```
 
-Pane content updates flow through actor mailboxes and host validation. They do not run on the synchronous key/layout path unless a separate sync policy lane is explicitly involved.
+Pane content updates flow through actor mailboxes and host validation. They do not run on the synchronous key/layout path unless a separate policy provider is explicitly involved.
 
 ## Native Chrome
 
@@ -76,11 +76,11 @@ Some plugins need lower-level rendering. The target model can support explicit e
 
 Custom drawing should not be the default pane API. It should bypass native components only when real workloads need it.
 
-## Relation To Sync Policy
+## Relation To Policy Providers
 
-UI actors are asynchronous. They can publish latest state to swapchains when a sync policy lane needs that state for keyboard or layout decisions, but the view tree itself should not become a sync-path backlog.
+UI actors are asynchronous. They can publish latest state to publications when a policy provider needs that state for keyboard or layout decisions, but the view tree itself should not become a policy-path backlog.
 
-For example, a session switcher actor can own picker query state and render a native component tree. A host shortcut or sync key policy can open the picker immediately by sending a message or host directive, while the actor performs filtering and UI updates through normal mailbox delivery.
+For example, a session switcher actor can own picker query state and render a native component tree. A host shortcut or key policy provider can open the picker immediately by sending a message or host directive, while the actor performs filtering and UI updates through normal mailbox delivery.
 
 ## Validation And Diagnostics
 
