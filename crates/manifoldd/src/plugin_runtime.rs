@@ -34,6 +34,7 @@ pub(crate) enum PluginHostEvent {
         slot: String,
         frame: PluginFramePayload,
     },
+    DrainWasmHostMailbox,
 }
 
 #[derive(Clone, Debug)]

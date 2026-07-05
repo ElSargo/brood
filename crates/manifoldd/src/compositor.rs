@@ -142,6 +142,11 @@ fn serve_session_on_calloop_thread(
         config::load_startup_modules(&mut state, &config_path)?;
     }
 
+    if let Some(path) = args.wasm_plugin.as_deref() {
+        state.replace_wasm_plugin(path)?;
+        info!(path = %path.display(), "loaded CLI WASM plugin");
+    }
+
     if let Some((provider, path)) = cli_policy_arg(args.wasm_key_policy.as_deref())? {
         state.replace_wasm_global_key_policy(&path, &provider)?;
         info!(provider = %provider, path = %path.display(), "loaded CLI WASM key policy");
@@ -335,6 +340,7 @@ fn run_nested_test_with_outer(
         &inner_target,
         &inner_log,
         args.inner_headless,
+        args.inner_wasm_plugin.clone(),
         cli_policy_arg(args.inner_wasm_key_policy.as_deref())?,
     )?;
     wait_for_control_bus(&inner_target, &inner_log, &mut outer_child, "inner")?;
@@ -420,6 +426,7 @@ fn run_nested_test_in_current_session(
         &subject_log,
         args.inner_headless,
         args.harness.as_deref(),
+        args.inner_wasm_plugin.clone(),
         cli_policy_arg(args.inner_wasm_key_policy.as_deref())?,
     )?;
 
@@ -548,6 +555,7 @@ fn spawn_subject(
     subject_log: &Path,
     subject_headless: bool,
     harness: Option<&Path>,
+    wasm_plugin: Option<PathBuf>,
     wasm_key_policy: Option<(String, PathBuf)>,
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
@@ -566,6 +574,9 @@ fn spawn_subject(
     command.arg("--test-surface-markers");
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
+    }
+    if let Some(path) = wasm_plugin {
+        command.arg("--wasm-plugin").arg(path);
     }
     if let Some((provider, path)) = wasm_key_policy {
         command.arg("--wasm-key-policy").arg(provider).arg(path);
@@ -591,6 +602,7 @@ fn spawn_inner(
     inner_target: &control::ControlTarget,
     inner_log: &Path,
     inner_headless: bool,
+    wasm_plugin: Option<PathBuf>,
     wasm_key_policy: Option<(String, PathBuf)>,
 ) -> Result<()> {
     let mut command = format!(
@@ -606,6 +618,10 @@ fn spawn_inner(
         command.push_str(" --headless");
     }
     command.push_str(" --test-surface-markers");
+    if let Some(path) = wasm_plugin {
+        command.push_str(" --wasm-plugin ");
+        command.push_str(&shell_quote(&path.display().to_string()));
+    }
     if let Some((provider, path)) = wasm_key_policy {
         command.push_str(" --wasm-key-policy ");
         command.push_str(&shell_quote(&provider));

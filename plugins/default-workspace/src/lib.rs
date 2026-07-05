@@ -84,7 +84,10 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
     let output = response_buffer_mut();
     let input = KeyInput::parse(query);
 
-    if input.modifiers & MOD_ALT != 0 && input.key_code == KEY_SPACE && input.input_mode == INPUT_MODE_NORMAL {
+    if input.modifiers & MOD_ALT != 0
+        && input.key_code == KEY_SPACE
+        && input.input_mode == INPUT_MODE_NORMAL
+    {
         return if input.key_state == KEY_RELEASED {
             write_consume(output, &[])
         } else {
@@ -100,7 +103,10 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
         };
     }
 
-    if input.key_state != KEY_PRESSED || input.input_mode != INPUT_MODE_NORMAL || input.modifiers & MOD_CTRL == 0 {
+    if input.key_state != KEY_PRESSED
+        || input.input_mode != INPUT_MODE_NORMAL
+        || input.modifiers & MOD_CTRL == 0
+    {
         return OUTPUT_ABSTAIN;
     }
 
@@ -148,10 +154,10 @@ pub extern "C" fn manifold_policy_provider_layout_tile(
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"layout":{"items":["#);
     if pane_count == 1 {
-        write_pane_item(&mut writer, panes[0], 0.0, 0.0, 0.0, 1.0, 1.0);
+        write_pane_item(&mut writer, panes[0], 0.0, -1.0, -1.0, 2.0, 2.0);
     } else {
-        write_pane_item(&mut writer, panes[0], 0.0, 0.0, 0.0, 0.5, 1.0);
-        let each = 1.0 / ((pane_count - 1) as f32);
+        write_pane_item(&mut writer, panes[0], 0.0, -1.0, -1.0, 1.0, 2.0);
+        let each = 2.0 / ((pane_count - 1) as f32);
         let mut index = 1;
         while index < pane_count {
             writer.byte(b',');
@@ -159,9 +165,9 @@ pub extern "C" fn manifold_policy_provider_layout_tile(
                 &mut writer,
                 panes[index],
                 index as f32,
-                0.5,
-                each * ((index - 1) as f32),
-                0.5,
+                0.0,
+                -1.0 + each * ((index - 1) as f32),
+                1.0,
                 each,
             );
             index += 1;
@@ -218,7 +224,21 @@ fn messages_for_global_key(key_code: i32) -> &'static [Message<'static>] {
 fn is_global_workspace_key(key_code: i32) -> bool {
     matches!(
         key_code,
-        KEY_J | KEY_K | KEY_G | KEY_H | KEY_L | KEY_S | KEY_U | KEY_COMMA | KEY_DOT | KEY_ENTER | KEY_1 | KEY_2 | KEY_3 | KEY_4 | KEY_5
+        KEY_J
+            | KEY_K
+            | KEY_G
+            | KEY_H
+            | KEY_L
+            | KEY_S
+            | KEY_U
+            | KEY_COMMA
+            | KEY_DOT
+            | KEY_ENTER
+            | KEY_1
+            | KEY_2
+            | KEY_3
+            | KEY_4
+            | KEY_5
     )
 }
 
@@ -226,7 +246,10 @@ fn is_global_workspace_key(key_code: i32) -> bool {
 enum Message<'a> {
     LayoutAction(&'a str),
     SpawnApp(&'a [&'a str]),
-    FocusOrSpawnApp { app_id: &'a str, argv: &'a [&'a str] },
+    FocusOrSpawnApp {
+        app_id: &'a str,
+        argv: &'a [&'a str],
+    },
     SwitchActiveSessionNext,
     CreateAndAttachSession,
 }
@@ -261,8 +284,12 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
                 payload.argv(argv);
                 payload.byte(b'}');
             }
-            Message::SwitchActiveSessionNext => payload.bytes(br#"{"type":"switch-active-session-next"}"#),
-            Message::CreateAndAttachSession => payload.bytes(br#"{"type":"create-and-attach-session"}"#),
+            Message::SwitchActiveSessionNext => {
+                payload.bytes(br#"{"type":"switch-active-session-next"}"#)
+            }
+            Message::CreateAndAttachSession => {
+                payload.bytes(br#"{"type":"create-and-attach-session"}"#)
+            }
         }
         writer.bytes(br#"]}"#);
         index += 1;
@@ -271,7 +298,15 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
     finish_response(writer.finish())
 }
 
-fn write_pane_item(writer: &mut Writer<'_>, pane: u64, z: f32, offset_u: f32, offset_v: f32, size_u: f32, size_v: f32) {
+fn write_pane_item(
+    writer: &mut Writer<'_>,
+    pane: u64,
+    z: f32,
+    offset_u: f32,
+    offset_v: f32,
+    size_u: f32,
+    size_v: f32,
+) {
     writer.bytes(br#"{"id":"#);
     writer.u64(pane);
     writer.bytes(br#", "kind":{"type":"pane","pane":"#);
@@ -315,11 +350,19 @@ struct Writer<'a> {
 
 impl<'a> Writer<'a> {
     fn new(output: &'a mut [u8]) -> Self {
-        Self { output, len: 0, overflowed: false }
+        Self {
+            output,
+            len: 0,
+            overflowed: false,
+        }
     }
 
     fn finish(self) -> i32 {
-        if self.overflowed { OUTPUT_ERROR } else { self.len as i32 }
+        if self.overflowed {
+            OUTPUT_ERROR
+        } else {
+            self.len as i32
+        }
     }
 
     fn byte(&mut self, byte: u8) {
@@ -361,7 +404,10 @@ struct PayloadWriter<'a, 'b> {
 
 impl<'a, 'b> PayloadWriter<'a, 'b> {
     fn new(output: &'a mut Writer<'b>) -> Self {
-        Self { output, first: true }
+        Self {
+            output,
+            first: true,
+        }
     }
 
     fn byte(&mut self, byte: u8) {
@@ -410,7 +456,9 @@ fn write_u64(writer: &mut Writer<'_>, mut value: u64) {
         digits[len] = b'0' + (value % 10) as u8;
         len += 1;
         value /= 10;
-        if value == 0 { break; }
+        if value == 0 {
+            break;
+        }
     }
     while len > 0 {
         len -= 1;
@@ -450,7 +498,11 @@ fn parse_i32_field(bytes: &[u8], needle: &[u8]) -> Option<i32> {
     if next == cursor {
         return None;
     }
-    Some(if negative { -(value as i32) } else { value as i32 })
+    Some(if negative {
+        -(value as i32)
+    } else {
+        value as i32
+    })
 }
 
 fn parse_optional_u64_field(bytes: &[u8], needle: &[u8]) -> Option<u64> {
@@ -465,7 +517,9 @@ fn parse_optional_u64_field(bytes: &[u8], needle: &[u8]) -> Option<u64> {
 fn parse_u64_at(bytes: &[u8], mut cursor: usize) -> (u64, usize) {
     let mut value = 0_u64;
     while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-        value = value.saturating_mul(10).saturating_add((bytes[cursor] - b'0') as u64);
+        value = value
+            .saturating_mul(10)
+            .saturating_add((bytes[cursor] - b'0') as u64);
         cursor += 1;
     }
     (value, cursor)

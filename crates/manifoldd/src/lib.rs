@@ -101,6 +101,9 @@ pub struct SessionArgs {
     /// Launch an isolated Chromium browser pane at startup.
     #[arg(long = "browser", value_name = "URL", num_args = 0..=1, default_missing_value = "about:blank")]
     pub(crate) browser: Option<String>,
+    /// Load a self-contained target-shape WASM plugin module.
+    #[arg(long = "wasm-plugin", value_name = "PATH")]
+    pub(crate) wasm_plugin: Option<PathBuf>,
     /// Load a target-shape WASM key policy provider as NAME from PATH.
     #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     pub(crate) wasm_key_policy: Option<Vec<String>>,
@@ -146,6 +149,7 @@ impl Default for SessionArgs {
             offscreen_presentation: false,
             test_surface_markers: false,
             browser: None,
+            wasm_plugin: None,
             wasm_key_policy: None,
             wasm_layout_policy: None,
             test_harness: None,
@@ -308,6 +312,9 @@ struct NestedTestArgs {
     /// Start the inner system under test without an attached presentation window.
     #[arg(long = "inner-headless")]
     inner_headless: bool,
+    /// Load a self-contained target-shape WASM plugin into the inner system under test.
+    #[arg(long = "inner-wasm-plugin", value_name = "PATH")]
+    inner_wasm_plugin: Option<PathBuf>,
     /// Load a target-shape WASM key policy provider into the inner system under test.
     #[arg(long = "inner-wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     inner_wasm_key_policy: Option<Vec<String>>,

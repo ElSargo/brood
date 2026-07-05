@@ -89,10 +89,6 @@ const BUILTIN_RUNNER_DETECTORS: &[SessionRunnerDetector] = &[SessionRunnerDetect
     runner: nix_develop_runner,
 }];
 
-#[allow(
-    dead_code,
-    reason = "target plugin config will reuse module path and capability fields"
-)]
 #[derive(Debug, serde::Deserialize)]
 struct ModuleConfig {
     #[serde(default = "default_enabled")]
@@ -132,7 +128,7 @@ pub fn load_runtime_settings(state: &mut Manifold, config_path: &Path) -> Result
     Ok(())
 }
 
-pub fn load_startup_modules(_state: &mut Manifold, config_path: &Path) -> Result<()> {
+pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<()> {
     if !config_path.exists() {
         info!(
             path = %config_path.display(),
@@ -150,6 +146,29 @@ pub fn load_startup_modules(_state: &mut Manifold, config_path: &Path) -> Result
         }
 
         match module.kind.as_str() {
+            "wasm-plugin" | "plugin" => {
+                let module_path = resolve_path(
+                    config_path.parent().unwrap_or_else(|| Path::new(".")),
+                    &module.path,
+                );
+                if !module_path.exists() {
+                    warn!(
+                        module = %id,
+                        path = %module_path.display(),
+                        "configured WASM plugin does not exist; skipping module"
+                    );
+                    continue;
+                }
+                state
+                    .replace_wasm_plugin(&module_path)
+                    .with_context(|| format!("load config module {id}"))?;
+                info!(
+                    module = %id,
+                    path = %module_path.display(),
+                    capabilities = ?module.capabilities,
+                    "loaded config WASM plugin"
+                );
+            }
             "fast-key-handler" | "fast-map-hook" => {
                 warn!(
                     module = %id,

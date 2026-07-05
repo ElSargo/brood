@@ -88,14 +88,27 @@ impl WasmActor {
         mailbox: Mailbox,
         config: WasmActorConfig,
     ) -> Result<Self> {
+        Self::load_named_with_config(path, mailbox, config, EPOCH_RUN_EXPORT).await
+    }
+
+    pub async fn load_named(path: &Path, mailbox: Mailbox, run_export: &str) -> Result<Self> {
+        Self::load_named_with_config(path, mailbox, WasmActorConfig::default(), run_export).await
+    }
+
+    pub async fn load_named_with_config(
+        path: &Path,
+        mailbox: Mailbox,
+        config: WasmActorConfig,
+        run_export: &str,
+    ) -> Result<Self> {
         ensure!(config.epoch_ticks > 0, "epoch ticks must be non-zero");
 
         let engine = async_epoch_engine()?;
         let module = load_module_async(engine.clone(), path).await?;
-        Self::load_from_module(engine, &module, mailbox, config, EPOCH_RUN_EXPORT).await
+        Self::load_from_module(engine, &module, mailbox, config, run_export).await
     }
 
-    pub(crate) async fn load_from_module(
+    pub async fn load_from_module(
         engine: Engine,
         module: &Module,
         mailbox: Mailbox,

@@ -507,8 +507,9 @@ pub struct Manifold {
     plugin_actor_messages: u64,
     plugin_actor_failures: u64,
     plugin_actor_last_status: Option<String>,
-    wasm_registry: manifold_wasm::Registry,
+    wasm_registry: Arc<tokio::sync::Mutex<manifold_wasm::Registry>>,
     wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
+    wasm_actor_names: Vec<String>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
@@ -661,8 +662,9 @@ impl Manifold {
             plugin_actor_messages: 0,
             plugin_actor_failures: 0,
             plugin_actor_last_status: None,
-            wasm_registry,
+            wasm_registry: Arc::new(tokio::sync::Mutex::new(wasm_registry)),
             wasm_host_mailbox: Some(wasm_host_mailbox),
+            wasm_actor_names: Vec::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
@@ -798,10 +800,10 @@ impl Manifold {
                 | manifold_wasm::GlobalKeyDecision::ForwardWithModifiers
         );
         for message in outcome.messages {
-            if let Err(err) = self
-                .wasm_registry
-                .try_post_named_message(&message.actor, message.payload)
-            {
+            let result = self.block_on_wasm_registry(|registry| {
+                registry.try_post_named_message(&message.actor, message.payload)
+            });
+            if let Err(err) = result {
                 self.plugin_actor_failures += 1;
                 self.plugin_actor_last_status =
                     Some(format!("key-policy:{}:message_error", message.actor));
@@ -812,6 +814,37 @@ impl Manifold {
         }
         self.drain_wasm_host_mailbox();
         handled
+    }
+
+    fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
+        let actor_names = self.wasm_actor_names.clone();
+        for actor in actor_names {
+            let result = self.block_on_wasm_registry(|registry| {
+                registry.try_post_named_message(&actor, payload.as_bytes().to_vec())
+            });
+            match result {
+                Ok(()) => {
+                    self.plugin_actor_messages += 1;
+                    self.plugin_actor_last_status = Some(format!("{actor}:event_queued"));
+                }
+                Err(err) => {
+                    self.plugin_actor_failures += 1;
+                    self.plugin_actor_last_status = Some(format!("{actor}:event_error"));
+                    warn!(actor = %actor, error = %err, "failed to enqueue WASM actor event");
+                }
+            }
+        }
+    }
+
+    fn block_on_wasm_registry<T>(&self, f: impl FnOnce(&mut manifold_wasm::Registry) -> T) -> T {
+        let registry = Arc::clone(&self.wasm_registry);
+        self.async_runtime
+            .as_ref()
+            .expect("async runtime must be initialized before WASM registry use")
+            .block_on(async move {
+                let mut registry = registry.lock().await;
+                f(&mut registry)
+            })
     }
 
     fn drain_wasm_host_mailbox(&mut self) {
@@ -894,6 +927,7 @@ impl Manifold {
 
     fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
         match event {
+            PluginHostEvent::DrainWasmHostMailbox => self.drain_wasm_host_mailbox(),
             PluginHostEvent::AppendPublicationFrame {
                 actor_id,
                 slot,
@@ -1772,6 +1806,11 @@ impl Manifold {
             self.refresh_resolved_layout_from_native_policy();
             return self.active_content_surface_for_layout_action();
         }
+        self.emit_wasm_actor_event_to_all(format!(
+            r#"{{"type":"pane-mapped","pane":{},"session":{}}}"#,
+            registered.pane_id,
+            registered.session.raw()
+        ));
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
             && registered.session == self.active_surface_session
         {
@@ -3477,6 +3516,113 @@ impl Manifold {
         enabled
     }
 
+    pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::from_file(&engine, path)
+            .map_err(|err| anyhow::anyhow!("load {}: {err}", path.display()))?;
+        let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
+        ensure!(
+            !inventory.is_empty(),
+            "WASM plugin does not declare any actors or policy providers"
+        );
+
+        if let Some(provider) = select_policy_provider(
+            &inventory.policy_providers,
+            manifold_wasm::PolicyProviderKind::Key,
+            "workspace",
+        )? {
+            self.wasm_global_key_policy =
+                Some(manifold_wasm::WasmGlobalKeyPolicy::load_from_module(
+                    engine.clone(),
+                    &module,
+                    provider,
+                )?);
+            info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
+        }
+
+        if let Some(provider) = select_policy_provider(
+            &inventory.policy_providers,
+            manifold_wasm::PolicyProviderKind::Layout,
+            "tile",
+        )? {
+            self.wasm_layout_policy = Some(manifold_wasm::WasmLayoutPolicy::load_from_module(
+                engine, &module, provider,
+            )?);
+            info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin layout policy");
+        }
+
+        self.start_wasm_plugin_actors(path, &inventory.actors)?;
+        Ok(())
+    }
+
+    fn start_wasm_plugin_actors(
+        &mut self,
+        path: &Path,
+        actors: &[manifold_wasm::WasmActorDeclaration],
+    ) -> Result<()> {
+        let Some(runtime) = self.async_runtime.clone() else {
+            anyhow::bail!("async runtime is not initialized");
+        };
+        self.wasm_actor_names = actors.iter().map(|actor| actor.name.clone()).collect();
+        for actor in actors {
+            let path = path.to_path_buf();
+            let actor_name = actor.name.clone();
+            let export_name = actor.export_name.clone();
+            let registry = Arc::clone(&self.wasm_registry);
+            let host_events = self.plugin_host_event_sender.clone();
+            let mailbox = runtime.block_on({
+                let registry = Arc::clone(&registry);
+                let actor_name = actor_name.clone();
+                async move { registry.lock().await.register_actor(actor_name, 64) }
+            })?;
+            let task = runtime.spawn(async move {
+                let mut actor = match manifold_wasm::WasmActor::load_named(
+                    &path,
+                    mailbox,
+                    &export_name,
+                )
+                .await
+                {
+                    Ok(actor) => actor,
+                    Err(err) => {
+                        warn!(actor = %actor_name, error = %err, "failed to load WASM plugin actor");
+                        return;
+                    }
+                };
+                info!(actor = %actor_name, export = %export_name, path = %path.display(), "started WASM plugin actor");
+                loop {
+                    let outcome = match actor.run_one_epoch().await {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            warn!(actor = %actor_name, error = %err, "WASM plugin actor epoch failed");
+                            return;
+                        }
+                    };
+                    match outcome {
+                        manifold_wasm::ActorEpochOutcome::Continue { outbox } => {
+                            if let Some(outbox) = outbox {
+                                let dispatch = {
+                                    let mut registry = registry.lock().await;
+                                    actor.dispatch_outbox(&mut registry, &outbox)
+                                };
+                                if let Err(err) = dispatch {
+                                    warn!(actor = %actor_name, error = %err, "WASM plugin actor outbox dispatch failed");
+                                }
+                                let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
+                            }
+                        }
+                        manifold_wasm::ActorEpochOutcome::Stop => {
+                            info!(actor = %actor_name, "WASM plugin actor stopped");
+                            return;
+                        }
+                    }
+                }
+            });
+            drop(task);
+        }
+        Ok(())
+    }
+
     pub(crate) fn replace_wasm_global_key_policy(
         &mut self,
         path: &Path,
@@ -5077,6 +5223,32 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
             | "control+p"
             | "alt+space"
     )
+}
+
+fn select_policy_provider<'a>(
+    providers: &'a [manifold_wasm::PolicyProviderDeclaration],
+    kind: manifold_wasm::PolicyProviderKind,
+    preferred_name: &str,
+) -> Result<Option<&'a manifold_wasm::PolicyProviderDeclaration>> {
+    let matching = providers
+        .iter()
+        .filter(|provider| provider.kind == kind)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    if let Some(provider) = matching
+        .iter()
+        .copied()
+        .find(|provider| provider.name == preferred_name)
+    {
+        return Ok(Some(provider));
+    }
+    ensure!(
+        matching.len() == 1,
+        "WASM plugin declares multiple {kind:?} providers but none named {preferred_name:?}"
+    );
+    Ok(matching.first().copied())
 }
 
 fn convert_wasm_resolved_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLayout {

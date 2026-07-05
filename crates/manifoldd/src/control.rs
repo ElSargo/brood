@@ -3315,6 +3315,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WasmPlugKind {
     Auto,
+    Plugin,
     KeyPolicy,
     LayoutPolicy,
 }
@@ -3323,9 +3324,10 @@ impl WasmPlugKind {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "auto" => Ok(Self::Auto),
+            "plugin" | "wasm-plugin" => Ok(Self::Plugin),
             "key-policy" | "key" => Ok(Self::KeyPolicy),
             "layout-policy" | "layout" => Ok(Self::LayoutPolicy),
-            _ => bail!("plug kind must be auto, key-policy, or layout-policy"),
+            _ => bail!("plug kind must be auto, plugin, key-policy, or layout-policy"),
         }
     }
 }
@@ -3358,7 +3360,7 @@ fn parse_plug_args(args: &[String]) -> Result<(WasmPlugKind, PathBuf)> {
         index += 1;
     }
 
-    let path = path.context("usage: plug [--kind auto|key-policy|layout-policy] <path>")?;
+    let path = path.context("usage: plug [--kind auto|plugin|key-policy|layout-policy] <path>")?;
     Ok((kind, path))
 }
 
@@ -3369,6 +3371,10 @@ fn plug_wasm_module(state: &mut Manifold, path: &Path, kind: WasmPlugKind) -> Re
         path.display()
     );
     match kind {
+        WasmPlugKind::Plugin => {
+            state.replace_wasm_plugin(path)?;
+            Ok("plugin")
+        }
         WasmPlugKind::KeyPolicy => {
             state.replace_wasm_global_key_policy(path, "workspace")?;
             Ok("key-policy")
@@ -3378,17 +3384,8 @@ fn plug_wasm_module(state: &mut Manifold, path: &Path, kind: WasmPlugKind) -> Re
             Ok("layout-policy")
         }
         WasmPlugKind::Auto => {
-            let key_error = match state.replace_wasm_global_key_policy(path, "workspace") {
-                Ok(()) => return Ok("key-policy"),
-                Err(err) => err,
-            };
-            match state.replace_wasm_layout_policy(path, "tile") {
-                Ok(()) => Ok("layout-policy"),
-                Err(layout_error) => Err(anyhow::anyhow!(
-                    "could not plug {} as key-policy ({key_error}) or layout-policy ({layout_error})",
-                    path.display()
-                )),
-            }
+            state.replace_wasm_plugin(path)?;
+            Ok("plugin")
         }
     }
 }
