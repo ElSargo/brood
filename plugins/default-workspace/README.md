@@ -18,3 +18,11 @@ Output:
 ```text
 plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm
 ```
+
+Run the key policy in a nested subject:
+
+```sh
+nix develop --command cargo run -- test nested --force-outer --inner-headless \
+  --inner-wasm-key-policy workspace \
+  plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm
+```

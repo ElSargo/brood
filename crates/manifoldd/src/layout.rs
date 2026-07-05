@@ -320,6 +320,10 @@ pub enum LayoutAction {
 }
 
 impl LayoutAction {
+    #[allow(
+        dead_code,
+        reason = "legacy ABI tests still document numeric layout action mapping"
+    )]
     pub const fn from_abi(value: i32) -> Option<Self> {
         Some(match value {
             1 => Self::FocusNext,

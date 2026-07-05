@@ -1,10 +1,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Result, bail};
-use smithay::{
-    backend::input::{KeyState, Keycode},
-    reexports::calloop::channel,
-};
+use smithay::reexports::calloop::channel;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -17,19 +14,9 @@ const HOST_ACTOR_MAILBOX_CAPACITY: usize = 256;
 const DEFAULT_MAILBOX_SLOT: &str = "default";
 const DEFAULT_PUBLICATION_SLOT: &str = "default";
 const MAX_LINKED_FRAME_DEPTH: usize = 16;
-const SYNC_KEY_SENDER: &str = "host:sync-key";
-const KEY_O: Keycode = Keycode::new(32);
 
 #[derive(Clone, Debug)]
 pub(crate) struct PluginMessage {
-    pub(crate) sender: String,
-    pub(crate) body: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PluginActorMessage {
-    pub(crate) actor_id: String,
-    pub(crate) mailbox_slot: String,
     pub(crate) sender: String,
     pub(crate) body: String,
 }
@@ -67,21 +54,6 @@ pub(crate) struct PluginActorSummary {
     pub(crate) mailbox_slots: Vec<PluginMailboxSummary>,
     pub(crate) published_frames: u64,
     pub(crate) latest_frame: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PluginSyncKeyInput {
-    pub(crate) key_code: Keycode,
-    pub(crate) key_state: KeyState,
-    pub(crate) ctrl_pressed: bool,
-    pub(crate) alt_pressed: bool,
-    pub(crate) shift_pressed: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct PluginSyncKeyDecision {
-    pub(crate) spawn_argv: Option<Vec<String>>,
-    pub(crate) actor_messages: Vec<PluginActorMessage>,
 }
 
 #[derive(Debug)]
@@ -197,44 +169,6 @@ impl PluginRuntime {
         Ok(actor.mailbox_summaries())
     }
 
-    pub(crate) fn handle_sync_key(
-        &self,
-        input: &PluginSyncKeyInput,
-    ) -> Option<PluginSyncKeyDecision> {
-        if input.key_code != KEY_O
-            || !input.ctrl_pressed
-            || input.alt_pressed
-            || input.shift_pressed
-        {
-            return None;
-        }
-
-        if input.key_state == KeyState::Released {
-            return Some(PluginSyncKeyDecision {
-                spawn_argv: None,
-                actor_messages: Vec::new(),
-            });
-        }
-
-        let spawn_btop = self
-            .actor(DEBUG_TOGGLE_ACTOR_ID)
-            .and_then(|actor| actor.latest_payload(DEFAULT_PUBLICATION_SLOT))
-            .is_some_and(|payload| match payload {
-                PluginFramePayload::ToggleChoice { spawn_btop_next } => spawn_btop_next,
-            });
-        let tool = if spawn_btop { "btop" } else { "htop" };
-
-        Some(PluginSyncKeyDecision {
-            spawn_argv: Some(vec!["foot".to_string(), tool.to_string()]),
-            actor_messages: vec![PluginActorMessage {
-                actor_id: DEBUG_TOGGLE_ACTOR_ID.to_string(),
-                mailbox_slot: DEFAULT_MAILBOX_SLOT.to_string(),
-                sender: SYNC_KEY_SENDER.to_string(),
-                body: "toggle".to_string(),
-            }],
-        })
-    }
-
     pub(crate) fn actor_summaries(&self) -> Vec<PluginActorSummary> {
         let mut summaries = Vec::with_capacity(self.actors.len() + 1);
         summaries.push(self.host_mailbox.summary());
@@ -297,13 +231,6 @@ impl PluginActorHandle {
         if let Some(publication) = self.publications.last_mut() {
             publication.append(frame);
         }
-    }
-
-    fn latest_payload(&self, slot: &str) -> Option<PluginFramePayload> {
-        self.publications
-            .iter()
-            .find(|publication| publication.slot == slot)
-            .and_then(PluginPublication::latest_payload)
     }
 
     fn summary(&self) -> PluginActorSummary {
@@ -460,10 +387,6 @@ impl PluginPublication {
             depth,
         }));
         self.published_frames += 1;
-    }
-
-    fn latest_payload(&self) -> Option<PluginFramePayload> {
-        self.latest.as_ref().map(|latest| latest.payload.clone())
     }
 
     fn latest_label(&self) -> String {

@@ -3315,17 +3315,17 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WasmPlugKind {
     Auto,
-    FastKeyHandler,
-    FastMapHook,
+    KeyPolicy,
+    LayoutPolicy,
 }
 
 impl WasmPlugKind {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "auto" => Ok(Self::Auto),
-            "fast-key-handler" | "key" | "key-handler" => Ok(Self::FastKeyHandler),
-            "fast-map-hook" | "map" | "map-hook" => Ok(Self::FastMapHook),
-            _ => bail!("plug kind must be auto, fast-key-handler, or fast-map-hook"),
+            "key-policy" | "key" => Ok(Self::KeyPolicy),
+            "layout-policy" | "layout" => Ok(Self::LayoutPolicy),
+            _ => bail!("plug kind must be auto, key-policy, or layout-policy"),
         }
     }
 }
@@ -3358,7 +3358,7 @@ fn parse_plug_args(args: &[String]) -> Result<(WasmPlugKind, PathBuf)> {
         index += 1;
     }
 
-    let path = path.context("usage: plug [--kind auto|fast-key-handler|fast-map-hook] <path>")?;
+    let path = path.context("usage: plug [--kind auto|key-policy|layout-policy] <path>")?;
     Ok((kind, path))
 }
 
@@ -3369,23 +3369,23 @@ fn plug_wasm_module(state: &mut Manifold, path: &Path, kind: WasmPlugKind) -> Re
         path.display()
     );
     match kind {
-        WasmPlugKind::FastKeyHandler => {
-            state.replace_wasm_key_handler(path)?;
-            Ok("fast-key-handler")
+        WasmPlugKind::KeyPolicy => {
+            state.replace_wasm_global_key_policy(path, "workspace")?;
+            Ok("key-policy")
         }
-        WasmPlugKind::FastMapHook => {
-            state.replace_wasm_map_hook(path)?;
-            Ok("fast-map-hook")
+        WasmPlugKind::LayoutPolicy => {
+            state.replace_wasm_layout_policy(path, "tile")?;
+            Ok("layout-policy")
         }
         WasmPlugKind::Auto => {
-            let key_error = match state.replace_wasm_key_handler(path) {
-                Ok(()) => return Ok("fast-key-handler"),
+            let key_error = match state.replace_wasm_global_key_policy(path, "workspace") {
+                Ok(()) => return Ok("key-policy"),
                 Err(err) => err,
             };
-            match state.replace_wasm_map_hook(path) {
-                Ok(()) => Ok("fast-map-hook"),
-                Err(map_error) => Err(anyhow::anyhow!(
-                    "could not plug {} as fast-key-handler ({key_error}) or fast-map-hook ({map_error})",
+            match state.replace_wasm_layout_policy(path, "tile") {
+                Ok(()) => Ok("layout-policy"),
+                Err(layout_error) => Err(anyhow::anyhow!(
+                    "could not plug {} as key-policy ({key_error}) or layout-policy ({layout_error})",
                     path.display()
                 )),
             }
@@ -4187,12 +4187,12 @@ mod tests {
     fn plug_args_accept_kind_option() {
         let (kind, path) = parse_plug_args(&[
             "--kind".to_string(),
-            "fast-map-hook".to_string(),
+            "layout-policy".to_string(),
             "layout.wasm".to_string(),
         ])
         .unwrap();
 
-        assert_eq!(kind, WasmPlugKind::FastMapHook);
+        assert_eq!(kind, WasmPlugKind::LayoutPolicy);
         assert_eq!(path, std::path::PathBuf::from("layout.wasm"));
     }
 

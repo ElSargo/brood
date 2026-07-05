@@ -231,7 +231,7 @@ impl Manifold {
             return;
         }
 
-        if self.try_plugin_sync_key_handler(key_code, state) == Some(true) {
+        if self.try_wasm_global_key_policy(key_code, state) == Some(true) {
             self.record_consumed_keyboard_input();
             return;
         }
@@ -243,14 +243,6 @@ impl Manifold {
             if state == KeyState::Pressed {
                 self.apply_layout_action(action);
             }
-            return;
-        }
-
-        if self.input_mode != InputMode::Normal
-            && (self.ctrl_pressed || self.alt_pressed)
-            && self.try_wasm_key_handler(key_code, state) == Some(true)
-        {
-            self.record_consumed_keyboard_input();
             return;
         }
 
@@ -269,13 +261,6 @@ impl Manifold {
     }
 
     fn handle_normal_mode_key(&mut self, key_code: Keycode) {
-        if self
-            .try_wasm_key_handler(key_code, KeyState::Pressed)
-            .is_some()
-        {
-            return;
-        }
-
         match key_code {
             KEY_W => {
                 if let Err(err) = self.spawn_wezterm_pane() {
@@ -288,32 +273,6 @@ impl Manifold {
                 {
                     self.apply_layout_action(action);
                 }
-            }
-        }
-    }
-
-    fn try_wasm_key_handler(&mut self, key_code: Keycode, state: KeyState) -> Option<bool> {
-        let focused_pane = self.focused_pane();
-        let panes = self.active_session_wasm_key_panes();
-        let result = self.wasm_key_handler.as_mut().map(|handler| {
-            handler.handle_key(
-                key_code,
-                state,
-                self.input_mode,
-                self.ctrl_pressed,
-                self.alt_pressed,
-                focused_pane,
-                panes,
-            )
-        })?;
-        match result {
-            Ok(outcome) => Some(outcome.apply(self)),
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "WASM key handler failed; using built-in fallback when available"
-                );
-                None
             }
         }
     }

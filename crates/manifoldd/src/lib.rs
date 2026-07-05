@@ -18,8 +18,6 @@ mod presentation;
 mod session_bus;
 mod session_runner;
 mod state;
-mod wasm_key;
-mod wasm_map;
 mod wasm_test;
 mod winit_presenter;
 
@@ -103,12 +101,12 @@ pub struct SessionArgs {
     /// Launch an isolated Chromium browser pane at startup.
     #[arg(long = "browser", value_name = "URL", num_args = 0..=1, default_missing_value = "about:blank")]
     pub(crate) browser: Option<String>,
-    /// Load a core-WASM normal-mode key handler.
-    #[arg(long = "wasm-key-handler", value_name = "PATH")]
-    pub(crate) wasm_key_handler: Option<PathBuf>,
-    /// Load a core-WASM fast map hook.
-    #[arg(long = "wasm-map-hook", value_name = "PATH")]
-    pub(crate) wasm_map_hook: Option<PathBuf>,
+    /// Load a target-shape WASM key policy provider as NAME from PATH.
+    #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
+    pub(crate) wasm_key_policy: Option<Vec<String>>,
+    /// Load a target-shape WASM layout policy provider as NAME from PATH.
+    #[arg(long = "wasm-layout-policy", value_names = ["NAME", "PATH"], num_args = 2)]
+    pub(crate) wasm_layout_policy: Option<Vec<String>>,
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     pub(crate) test_harness: Option<PathBuf>,
@@ -148,8 +146,8 @@ impl Default for SessionArgs {
             offscreen_presentation: false,
             test_surface_markers: false,
             browser: None,
-            wasm_key_handler: None,
-            wasm_map_hook: None,
+            wasm_key_policy: None,
+            wasm_layout_policy: None,
             test_harness: None,
             nested_inner_dbus_name: None,
             nested_inner_dbus_address: None,
@@ -310,12 +308,9 @@ struct NestedTestArgs {
     /// Start the inner system under test without an attached presentation window.
     #[arg(long = "inner-headless")]
     inner_headless: bool,
-    /// Load a core-WASM map hook into the inner system under test.
-    #[arg(long = "inner-wasm-map-hook", value_name = "PATH")]
-    inner_wasm_map_hook: Option<PathBuf>,
-    /// Load a core-WASM key handler into the inner system under test.
-    #[arg(long = "inner-wasm-key-handler", value_name = "PATH")]
-    inner_wasm_key_handler: Option<PathBuf>,
+    /// Load a target-shape WASM key policy provider into the inner system under test.
+    #[arg(long = "inner-wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
+    inner_wasm_key_policy: Option<Vec<String>>,
     /// Spawn a hosted Wayland app inside the inner instance after startup.
     #[arg(long = "inner-command", value_name = "CMD")]
     inner_command: Option<String>,

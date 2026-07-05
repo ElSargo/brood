@@ -73,8 +73,6 @@ use crate::{
     browser::BrowserLaunchOptions,
     config, control, presentation, session_runner,
     state::{ClientState, Manifold, PresentationStatus},
-    wasm_key::WasmKeyHandler,
-    wasm_map::WasmMapHook,
     wasm_test::{TestHarnessOutcomeKind, TestHarnessRuntime},
 };
 
@@ -144,14 +142,14 @@ fn serve_session_on_calloop_thread(
         config::load_startup_modules(&mut state, &config_path)?;
     }
 
-    if let Some(path) = args.wasm_key_handler.as_deref() {
-        state.wasm_key_handler = Some(WasmKeyHandler::load(path)?);
-        info!(path = %path.display(), "loaded CLI WASM key handler");
+    if let Some((provider, path)) = cli_policy_arg(args.wasm_key_policy.as_deref())? {
+        state.replace_wasm_global_key_policy(&path, &provider)?;
+        info!(provider = %provider, path = %path.display(), "loaded CLI WASM key policy");
     }
 
-    if let Some(path) = args.wasm_map_hook.as_deref() {
-        state.wasm_map_hook = Some(WasmMapHook::load(path)?);
-        info!(path = %path.display(), "loaded CLI WASM map hook");
+    if let Some((provider, path)) = cli_policy_arg(args.wasm_layout_policy.as_deref())? {
+        state.replace_wasm_layout_policy(&path, &provider)?;
+        info!(provider = %provider, path = %path.display(), "loaded CLI WASM layout policy");
     }
 
     if let Some(path) = args.test_harness.as_deref() {
@@ -337,8 +335,7 @@ fn run_nested_test_with_outer(
         &inner_target,
         &inner_log,
         args.inner_headless,
-        args.inner_wasm_key_handler.as_deref(),
-        args.inner_wasm_map_hook.as_deref(),
+        cli_policy_arg(args.inner_wasm_key_policy.as_deref())?,
     )?;
     wait_for_control_bus(&inner_target, &inner_log, &mut outer_child, "inner")?;
 
@@ -423,8 +420,7 @@ fn run_nested_test_in_current_session(
         &subject_log,
         args.inner_headless,
         args.harness.as_deref(),
-        args.inner_wasm_key_handler.as_deref(),
-        args.inner_wasm_map_hook.as_deref(),
+        cli_policy_arg(args.inner_wasm_key_policy.as_deref())?,
     )?;
 
     wait_for_control_bus(&subject_target, &subject_log, &mut subject_child, "subject")?;
@@ -552,8 +548,7 @@ fn spawn_subject(
     subject_log: &Path,
     subject_headless: bool,
     harness: Option<&Path>,
-    wasm_key_handler: Option<&Path>,
-    wasm_map_hook: Option<&Path>,
+    wasm_key_policy: Option<(String, PathBuf)>,
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
@@ -572,11 +567,8 @@ fn spawn_subject(
     if let Some(harness) = harness {
         command.arg("--test-harness").arg(harness);
     }
-    if let Some(wasm_key_handler) = wasm_key_handler {
-        command.arg("--wasm-key-handler").arg(wasm_key_handler);
-    }
-    if let Some(wasm_map_hook) = wasm_map_hook {
-        command.arg("--wasm-map-hook").arg(wasm_map_hook);
+    if let Some((provider, path)) = wasm_key_policy {
+        command.arg("--wasm-key-policy").arg(provider).arg(path);
     }
     command.stdout(Stdio::from(
         fs::File::create(subject_log)
@@ -599,8 +591,7 @@ fn spawn_inner(
     inner_target: &control::ControlTarget,
     inner_log: &Path,
     inner_headless: bool,
-    wasm_key_handler: Option<&Path>,
-    wasm_map_hook: Option<&Path>,
+    wasm_key_policy: Option<(String, PathBuf)>,
 ) -> Result<()> {
     let mut command = format!(
         "exec {} run --no-session-runner --no-default-modules --dbus-destination {}",
@@ -615,13 +606,11 @@ fn spawn_inner(
         command.push_str(" --headless");
     }
     command.push_str(" --test-surface-markers");
-    if let Some(wasm_key_handler) = wasm_key_handler {
-        command.push_str(" --wasm-key-handler ");
-        command.push_str(&shell_quote(&wasm_key_handler.display().to_string()));
-    }
-    if let Some(wasm_map_hook) = wasm_map_hook {
-        command.push_str(" --wasm-map-hook ");
-        command.push_str(&shell_quote(&wasm_map_hook.display().to_string()));
+    if let Some((provider, path)) = wasm_key_policy {
+        command.push_str(" --wasm-key-policy ");
+        command.push_str(&shell_quote(&provider));
+        command.push(' ');
+        command.push_str(&shell_quote(&path.display().to_string()));
     }
     let _format_result = write!(
         &mut command,
@@ -811,6 +800,16 @@ fn shell_split(command: &str) -> Result<Vec<String>> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn cli_policy_arg(values: Option<&[String]>) -> Result<Option<(String, PathBuf)>> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let [provider, path] = values else {
+        bail!("WASM policy arguments require NAME and PATH");
+    };
+    Ok(Some((provider.clone(), PathBuf::from(path))))
 }
 
 fn read_log_tail(path: &Path) -> String {

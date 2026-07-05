@@ -80,14 +80,10 @@ use crate::{
         LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     },
     plugin_runtime::{
-        PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary,
-        PluginRuntime, PluginSyncKeyDecision, PluginSyncKeyInput,
+        PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary, PluginRuntime,
     },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
-    wasm_key::WasmKeyHandler,
-    wasm_key::WasmKeyPane,
-    wasm_map::{MapHookInput, MapHookOutcome, MapHookResponse, WasmMapHook},
     wasm_test::{
         TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request,
     },
@@ -511,12 +507,14 @@ pub struct Manifold {
     plugin_actor_messages: u64,
     plugin_actor_failures: u64,
     plugin_actor_last_status: Option<String>,
+    wasm_registry: manifold_wasm::Registry,
+    wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
-    pub(crate) wasm_key_handler: Option<WasmKeyHandler>,
-    pub(crate) wasm_map_hook: Option<WasmMapHook>,
+    pub(crate) wasm_global_key_policy: Option<manifold_wasm::WasmGlobalKeyPolicy>,
+    pub(crate) wasm_layout_policy: Option<manifold_wasm::WasmLayoutPolicy>,
     pub(crate) test_harness: Option<TestHarnessRuntime>,
     pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
     pub(crate) nested_inner_dbus_destination: Option<String>,
@@ -567,6 +565,10 @@ impl Manifold {
             shm_formats: MANDATORY_SHM_FORMATS,
             ..DmabufRuntime::default()
         };
+        let mut wasm_registry = manifold_wasm::Registry::new();
+        let wasm_host_mailbox = wasm_registry
+            .register_host_mailbox(256)
+            .expect("register WASM host mailbox");
 
         Self {
             start_time,
@@ -659,12 +661,14 @@ impl Manifold {
             plugin_actor_messages: 0,
             plugin_actor_failures: 0,
             plugin_actor_last_status: None,
+            wasm_registry,
+            wasm_host_mailbox: Some(wasm_host_mailbox),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
             presenter: None,
-            wasm_key_handler: None,
-            wasm_map_hook: None,
+            wasm_global_key_policy: None,
+            wasm_layout_policy: None,
             test_harness: None,
             test_harness_completion: None,
             nested_inner_dbus_destination: None,
@@ -744,54 +748,112 @@ impl Manifold {
         plugin_runtime.mailbox_summaries(actor_id)
     }
 
-    pub fn try_plugin_sync_key_handler(
+    pub fn try_wasm_global_key_policy(
         &mut self,
         key_code: Keycode,
         key_state: KeyState,
     ) -> Option<bool> {
-        let input = PluginSyncKeyInput {
-            key_code,
-            key_state,
-            ctrl_pressed: self.ctrl_pressed,
-            alt_pressed: self.alt_pressed,
-            shift_pressed: self.shift_pressed,
+        let modifiers = (self.ctrl_pressed as i32 * manifold_wasm::ABI_MOD_CTRL)
+            | (self.alt_pressed as i32 * manifold_wasm::ABI_MOD_ALT)
+            | (self.shift_pressed as i32 * manifold_wasm::ABI_MOD_SHIFT);
+        let input_mode = match self.input_mode {
+            InputMode::Passthrough => manifold_wasm::ABI_INPUT_MODE_PASSTHROUGH,
+            InputMode::Normal => manifold_wasm::ABI_INPUT_MODE_NORMAL,
         };
-        let decision = self
-            .plugin_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.handle_sync_key(&input))?;
-        self.apply_plugin_sync_key_decision(decision);
-        Some(true)
-    }
-
-    fn apply_plugin_sync_key_decision(&mut self, decision: PluginSyncKeyDecision) {
-        if let Some(argv) = decision.spawn_argv {
-            self.apply_plugin_workspace_command(
-                WorkspaceCommand::SpawnApp(argv.clone()),
-                &format!("legacy-sync-key:spawn:{}", argv.join("_")),
-            );
-        }
-
-        for message in decision.actor_messages {
-            if let Err(err) = self.send_plugin_actor_message_to_slot(
-                &message.actor_id,
-                &message.mailbox_slot,
-                message.sender,
-                message.body,
-            ) {
+        let key_state = match key_state {
+            KeyState::Released => manifold_wasm::ABI_KEY_RELEASED,
+            KeyState::Pressed => manifold_wasm::ABI_KEY_PRESSED,
+        };
+        let input = manifold_wasm::GlobalKeyPolicyInput::new(
+            i32::try_from(key_code.raw()).unwrap_or(i32::MAX),
+            key_state,
+            modifiers,
+            input_mode,
+        );
+        let outcome = self
+            .wasm_global_key_policy
+            .as_mut()
+            .map(|policy| policy.handle_key(input, None))?;
+        match outcome {
+            Ok(outcome) => Some(self.apply_wasm_global_key_policy_outcome(outcome)),
+            Err(err) => {
                 self.plugin_actor_failures += 1;
-                self.plugin_actor_last_status = Some(format!(
-                    "{}:{}:message_error",
-                    message.actor_id, message.mailbox_slot
-                ));
+                self.plugin_actor_last_status = Some("key-policy:error".to_string());
                 warn!(
-                    plugin_actor = %message.actor_id,
-                    mailbox_slot = %message.mailbox_slot,
-                    error = %err,
-                    "plugin sync key failed to enqueue actor message"
+                    ?err,
+                    "WASM global key policy failed; falling back to native key handling"
                 );
+                None
             }
         }
+    }
+
+    fn apply_wasm_global_key_policy_outcome(
+        &mut self,
+        outcome: manifold_wasm::GlobalKeyPolicyOutcome,
+    ) -> bool {
+        let handled = matches!(
+            outcome.decision,
+            manifold_wasm::GlobalKeyDecision::Consume
+                | manifold_wasm::GlobalKeyDecision::ForwardWithModifiers
+        );
+        for message in outcome.messages {
+            if let Err(err) = self
+                .wasm_registry
+                .try_post_named_message(&message.actor, message.payload)
+            {
+                self.plugin_actor_failures += 1;
+                self.plugin_actor_last_status =
+                    Some(format!("key-policy:{}:message_error", message.actor));
+                warn!(actor = %message.actor, error = %err, "WASM key policy message enqueue failed");
+            } else {
+                self.plugin_actor_messages += 1;
+            }
+        }
+        self.drain_wasm_host_mailbox();
+        handled
+    }
+
+    fn drain_wasm_host_mailbox(&mut self) {
+        let Some(mut mailbox) = self.wasm_host_mailbox.take() else {
+            return;
+        };
+        loop {
+            let message = match mailbox.try_read_message() {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(err) => {
+                    self.plugin_actor_failures += 1;
+                    self.plugin_actor_last_status = Some("wasm-host:mailbox_error".to_string());
+                    warn!(?err, "WASM host mailbox failed");
+                    break;
+                }
+            };
+            self.apply_wasm_host_message(message);
+        }
+        self.wasm_host_mailbox = Some(mailbox);
+    }
+
+    fn apply_wasm_host_message(&mut self, message: Vec<u8>) {
+        let body = match String::from_utf8(message) {
+            Ok(body) => body,
+            Err(err) => {
+                self.plugin_actor_failures += 1;
+                self.plugin_actor_last_status = Some("wasm-host:message_utf8_error".to_string());
+                warn!(error = %err, "WASM host mailbox received non-UTF-8 payload");
+                return;
+            }
+        };
+        let command = match parse_plugin_host_command(&body) {
+            Ok(command) => command,
+            Err(err) => {
+                self.plugin_actor_failures += 1;
+                self.plugin_actor_last_status = Some("wasm-host:message_parse_error".to_string());
+                warn!(body = %body, error = %err, "WASM host mailbox rejected message");
+                return;
+            }
+        };
+        self.apply_plugin_workspace_command(command, "wasm-host:message");
     }
 
     fn drain_plugin_host_mailbox(&mut self) {
@@ -1975,56 +2037,44 @@ impl Manifold {
     }
 
     fn apply_map_hook_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
-        let visible_panes = self.active_surface_session_panes();
-        let Some(handler) = self.wasm_map_hook.as_mut() else {
+        let mut visible_panes = self.active_surface_session_panes();
+        if !visible_panes.contains(&pending_pane) {
+            visible_panes.push(pending_pane);
+        }
+        let focused_pane = self.focused_pane();
+        let size = self.presentation_layout_size();
+        let Some(policy) = self.wasm_layout_policy.as_mut() else {
             self.refresh_resolved_layout_from_native_policy();
             return self.surface_for_pane(pending_pane);
         };
-        let input = MapHookInput {
-            pending_pane,
+        let input = manifold_wasm::LayoutPolicyInput::new(
             visible_panes,
-        };
-        let outcome = match handler.handle_map(input) {
-            Ok(outcome) => outcome,
+            focused_pane,
+            manifold_wasm::LayoutSize {
+                w: size.w,
+                h: size.h,
+            },
+        );
+        let outcome = match policy.resolve_layout(input, None) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                self.refresh_resolved_layout_from_native_policy();
+                return self.surface_for_pane(pending_pane);
+            }
             Err(err) => {
                 warn!(
                     ?err,
-                    pending_pane, "WASM map hook failed; using native placement"
+                    pending_pane, "WASM layout policy failed; using native placement"
                 );
                 self.refresh_resolved_layout_from_native_policy();
                 return self.surface_for_pane(pending_pane);
             }
         };
-        match outcome {
-            MapHookOutcome::Abstain => {
-                self.refresh_resolved_layout_from_native_policy();
-                self.surface_for_pane(pending_pane)
-            }
-            MapHookOutcome::Response(response) => self
-                .apply_map_hook_response(pending_pane, response)
-                .or_else(|| self.surface_for_pane(pending_pane)),
-        }
-    }
-
-    fn apply_map_hook_response(
-        &mut self,
-        pending_pane: u64,
-        response: MapHookResponse,
-    ) -> Option<WlSurface> {
-        match response {
-            MapHookResponse::Abstain => None,
-            MapHookResponse::Reject { reason } => {
-                warn!(
-                    pending_pane,
-                    reason, "WASM map hook rejected map; using native placement"
-                );
-                self.refresh_resolved_layout_from_native_policy();
-                None
-            }
-            MapHookResponse::ResolvedLayout { layout, focus } => {
-                self.apply_map_hook_resolved_layout(layout, focus)
-            }
-        }
+        self.apply_map_hook_resolved_layout(
+            convert_wasm_resolved_layout(outcome.layout),
+            outcome.focus,
+        )
+        .or_else(|| self.surface_for_pane(pending_pane))
     }
 
     fn apply_map_hook_resolved_layout(
@@ -2987,23 +3037,6 @@ impl Manifold {
             .flatten()
     }
 
-    pub fn active_session_wasm_key_panes(&self) -> Vec<WasmKeyPane> {
-        self.space
-            .elements()
-            .filter(|window| self.window_belongs_to_active_surface_session(window))
-            .filter_map(|window| {
-                let surface = Self::window_toplevel_surface(window)?;
-                if !self.surface_participates_in_resolved_layout(&surface) {
-                    return None;
-                }
-                Some(WasmKeyPane {
-                    pane: self.pane_for_toplevel_surface(&surface)?,
-                    app_id: toplevel_app_id(&surface),
-                })
-            })
-            .collect()
-    }
-
     pub fn register_extension(
         &mut self,
         role: String,
@@ -3444,15 +3477,23 @@ impl Manifold {
         enabled
     }
 
-    pub(crate) fn replace_wasm_key_handler(&mut self, path: &Path) -> Result<()> {
-        let handler = WasmKeyHandler::load(path)?;
-        self.wasm_key_handler = Some(handler);
+    pub(crate) fn replace_wasm_global_key_policy(
+        &mut self,
+        path: &Path,
+        provider_name: &str,
+    ) -> Result<()> {
+        let policy = manifold_wasm::WasmGlobalKeyPolicy::load(path, provider_name)?;
+        self.wasm_global_key_policy = Some(policy);
         Ok(())
     }
 
-    pub(crate) fn replace_wasm_map_hook(&mut self, path: &Path) -> Result<()> {
-        let hook = WasmMapHook::load(path)?;
-        self.wasm_map_hook = Some(hook);
+    pub(crate) fn replace_wasm_layout_policy(
+        &mut self,
+        path: &Path,
+        provider_name: &str,
+    ) -> Result<()> {
+        let policy = manifold_wasm::WasmLayoutPolicy::load(path, provider_name)?;
+        self.wasm_layout_policy = Some(policy);
         Ok(())
     }
 
@@ -5036,6 +5077,42 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
             | "control+p"
             | "alt+space"
     )
+}
+
+fn convert_wasm_resolved_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLayout {
+    ResolvedLayout {
+        items: layout
+            .items
+            .into_iter()
+            .map(|item| ResolvedLayoutItem {
+                id: LayoutItemId(item.id.0),
+                kind: match item.kind {
+                    manifold_wasm::LayoutItemKind::Pane { pane } => LayoutItemKind::Pane { pane },
+                    manifold_wasm::LayoutItemKind::Placeholder => LayoutItemKind::Placeholder,
+                    manifold_wasm::LayoutItemKind::Handle => LayoutItemKind::Handle,
+                    manifold_wasm::LayoutItemKind::Chrome => LayoutItemKind::Chrome,
+                    manifold_wasm::LayoutItemKind::Overlay => LayoutItemKind::Overlay,
+                },
+                z: item.z,
+                transform: LocalTransform {
+                    offset: LocalPoint {
+                        u: item.transform.offset.u,
+                        v: item.transform.offset.v,
+                    },
+                    size: LocalPoint {
+                        u: item.transform.size.u,
+                        v: item.transform.size.v,
+                    },
+                },
+                input: match item.input {
+                    manifold_wasm::InputBehavior::None => InputBehavior::None,
+                    manifold_wasm::InputBehavior::Hit => InputBehavior::Hit,
+                    manifold_wasm::InputBehavior::Drag => InputBehavior::Drag,
+                    manifold_wasm::InputBehavior::Pane => InputBehavior::Pane,
+                },
+            })
+            .collect(),
+    }
 }
 
 fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {

@@ -153,4 +153,14 @@ impl Mailbox {
         };
         Ok(message)
     }
+
+    pub fn try_read_message(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.inner.try_recv() {
+            Ok(message) => Ok(Some(message)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                bail!("actor {} mailbox is closed", self.actor_id.raw())
+            }
+        }
+    }
 }

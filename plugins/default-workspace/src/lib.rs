@@ -244,6 +244,7 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
         match messages[index] {
             Message::LayoutAction(action) => {
                 payload.bytes(br#"{"type":"layout-action","action":"#);
+                payload.byte(b'"');
                 payload.quoted_body(action.as_bytes());
                 payload.bytes(br#""}"#);
             }
@@ -253,7 +254,8 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
                 payload.byte(b'}');
             }
             Message::FocusOrSpawnApp { app_id, argv } => {
-                payload.bytes(br#"{"type":"focus-or-spawn-app","app_id":"#);
+                payload.bytes(br#"{"type":"focus-or-spawn-app","app-id":"#);
+                payload.byte(b'"');
                 payload.quoted_body(app_id.as_bytes());
                 payload.bytes(br#"","argv":"#);
                 payload.argv(argv);
