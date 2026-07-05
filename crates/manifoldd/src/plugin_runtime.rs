@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Result, bail};
 use smithay::{
@@ -9,8 +9,11 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 pub(crate) const DEBUG_TOGGLE_ACTOR_ID: &str = "debug-toggle";
+pub(crate) const HOST_ACTOR_ID: &str = "host";
 const DEBUG_TOGGLE_ACTOR_KIND: &str = "builtin-toggle-launcher";
+const HOST_ACTOR_KIND: &str = "native-host";
 const DEBUG_TOGGLE_ACTOR_MAILBOX_CAPACITY: usize = 64;
+const HOST_ACTOR_MAILBOX_CAPACITY: usize = 256;
 const DEFAULT_MAILBOX_SLOT: &str = "default";
 const DEFAULT_PUBLICATION_SLOT: &str = "default";
 const MAX_LINKED_FRAME_DEPTH: usize = 16;
@@ -27,6 +30,12 @@ pub(crate) struct PluginMessage {
 pub(crate) struct PluginActorMessage {
     pub(crate) actor_id: String,
     pub(crate) mailbox_slot: String,
+    pub(crate) sender: String,
+    pub(crate) body: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PluginHostMessage {
     pub(crate) sender: String,
     pub(crate) body: String,
 }
@@ -78,6 +87,7 @@ pub(crate) struct PluginSyncKeyDecision {
 #[derive(Debug)]
 pub(crate) struct PluginRuntime {
     actors: Vec<PluginActorHandle>,
+    host_mailbox: PluginHostMailbox,
 }
 
 #[derive(Debug)]
@@ -92,6 +102,14 @@ struct PluginActorHandle {
 struct PluginMailboxHandle {
     slot: String,
     sender: mpsc::Sender<PluginMessage>,
+    enqueued_messages: u64,
+    dropped_messages: u64,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct PluginHostMailbox {
+    messages: VecDeque<PluginHostMessage>,
     enqueued_messages: u64,
     dropped_messages: u64,
     capacity: usize,
@@ -123,6 +141,7 @@ impl PluginRuntime {
     ) -> Self {
         Self {
             actors: vec![start_toggle_actor(runtime, host_sender)],
+            host_mailbox: PluginHostMailbox::new(HOST_ACTOR_MAILBOX_CAPACITY),
         }
     }
 
@@ -156,6 +175,10 @@ impl PluginRuntime {
         sender: String,
         body: String,
     ) -> Result<()> {
+        if actor_id == HOST_ACTOR_ID {
+            return self.host_mailbox.send(sender, body);
+        }
+
         let Some(actor) = self.actor_mut(actor_id) else {
             bail!("unknown plugin actor {actor_id:?}");
         };
@@ -164,6 +187,10 @@ impl PluginRuntime {
     }
 
     pub(crate) fn mailbox_summaries(&self, actor_id: &str) -> Result<Vec<PluginMailboxSummary>> {
+        if actor_id == HOST_ACTOR_ID {
+            return Ok(self.host_mailbox.summary().mailbox_slots);
+        }
+
         let Some(actor) = self.actor(actor_id) else {
             bail!("unknown plugin actor {actor_id:?}");
         };
@@ -209,7 +236,14 @@ impl PluginRuntime {
     }
 
     pub(crate) fn actor_summaries(&self) -> Vec<PluginActorSummary> {
-        self.actors.iter().map(PluginActorHandle::summary).collect()
+        let mut summaries = Vec::with_capacity(self.actors.len() + 1);
+        summaries.push(self.host_mailbox.summary());
+        summaries.extend(self.actors.iter().map(PluginActorHandle::summary));
+        summaries
+    }
+
+    pub(crate) fn drain_host_messages(&mut self) -> Vec<PluginHostMessage> {
+        self.host_mailbox.drain()
     }
 
     fn actor(&self, actor_id: &str) -> Option<&PluginActorHandle> {
@@ -311,6 +345,49 @@ impl PluginActorHandle {
             .iter()
             .find(|publication| publication.slot == DEFAULT_PUBLICATION_SLOT)
             .map_or_else(|| "none".to_string(), PluginPublication::latest_label)
+    }
+}
+
+impl PluginHostMailbox {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            messages: VecDeque::new(),
+            enqueued_messages: 0,
+            dropped_messages: 0,
+            capacity,
+        }
+    }
+
+    fn send(&mut self, sender: String, body: String) -> Result<()> {
+        if self.messages.len() >= self.capacity {
+            self.dropped_messages += 1;
+            bail!("plugin host mailbox rejected message: mailbox is full");
+        }
+        self.messages.push_back(PluginHostMessage { sender, body });
+        self.enqueued_messages += 1;
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Vec<PluginHostMessage> {
+        self.messages.drain(..).collect()
+    }
+
+    fn summary(&self) -> PluginActorSummary {
+        PluginActorSummary {
+            id: HOST_ACTOR_ID.to_string(),
+            kind: HOST_ACTOR_KIND.to_string(),
+            enqueued_messages: self.enqueued_messages,
+            dropped_messages: self.dropped_messages,
+            mailbox_capacity: self.capacity,
+            mailbox_slots: vec![PluginMailboxSummary {
+                slot: DEFAULT_MAILBOX_SLOT.to_string(),
+                enqueued_messages: self.enqueued_messages,
+                dropped_messages: self.dropped_messages,
+                capacity: self.capacity,
+            }],
+            published_frames: 0,
+            latest_frame: "none".to_string(),
+        }
     }
 }
 

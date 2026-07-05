@@ -73,14 +73,15 @@ use crate::{
     MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_PANE_ID_ENV, MANIFOLD_SESSION_ENV,
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
+    command::{SurfaceCommand, WorkspaceCommand},
     layout::{
         HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind,
         LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
         LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     },
     plugin_runtime::{
-        PluginActorSummary, PluginHostEvent, PluginMailboxSummary, PluginRuntime,
-        PluginSyncKeyDecision, PluginSyncKeyInput,
+        PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary,
+        PluginRuntime, PluginSyncKeyDecision, PluginSyncKeyInput,
     },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
@@ -707,6 +708,7 @@ impl Manifold {
         plugin_runtime.send_message(actor_id, sender, body)?;
         self.plugin_actor_messages += 1;
         self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+        self.drain_plugin_host_mailbox();
         Ok(())
     }
 
@@ -724,6 +726,7 @@ impl Manifold {
         plugin_runtime.send_message_to_slot(actor_id, mailbox_slot, sender, body)?;
         self.plugin_actor_messages += 1;
         self.plugin_actor_last_status = Some(format!("{actor_id}:{mailbox_slot}:message_queued"));
+        self.drain_plugin_host_mailbox();
         Ok(())
     }
 
@@ -763,17 +766,10 @@ impl Manifold {
 
     fn apply_plugin_sync_key_decision(&mut self, decision: PluginSyncKeyDecision) {
         if let Some(argv) = decision.spawn_argv {
-            match self.spawn_hosted_app_argv(&argv) {
-                Ok(()) => {
-                    self.plugin_actor_last_status =
-                        Some(format!("host:spawned_{}", argv.join("_")));
-                }
-                Err(err) => {
-                    self.plugin_actor_failures += 1;
-                    self.plugin_actor_last_status = Some("host:spawn_error".to_string());
-                    warn!(argv = ?argv, error = %err, "plugin sync key failed to spawn command");
-                }
-            }
+            self.apply_plugin_workspace_command(
+                WorkspaceCommand::SpawnApp(argv.clone()),
+                &format!("legacy-sync-key:spawn:{}", argv.join("_")),
+            );
         }
 
         for message in decision.actor_messages {
@@ -795,6 +791,42 @@ impl Manifold {
                     "plugin sync key failed to enqueue actor message"
                 );
             }
+        }
+    }
+
+    fn drain_plugin_host_mailbox(&mut self) {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return;
+        };
+        for message in plugin_runtime.drain_host_messages() {
+            self.apply_plugin_host_message(message);
+        }
+    }
+
+    fn apply_plugin_host_message(&mut self, message: PluginHostMessage) {
+        let command = match parse_plugin_host_command(&message.body) {
+            Ok(command) => command,
+            Err(err) => {
+                self.plugin_actor_failures += 1;
+                self.plugin_actor_last_status = Some("host:message_parse_error".to_string());
+                warn!(
+                    sender = %message.sender,
+                    body = %message.body,
+                    error = %err,
+                    "plugin host mailbox rejected message"
+                );
+                return;
+            }
+        };
+        self.apply_plugin_workspace_command(command, &format!("host:message:{}", message.sender));
+    }
+
+    fn apply_plugin_workspace_command(&mut self, command: WorkspaceCommand, status_context: &str) {
+        if command.apply(self) {
+            self.plugin_actor_last_status = Some(format!("{status_context}:applied"));
+        } else {
+            self.plugin_actor_failures += 1;
+            self.plugin_actor_last_status = Some(format!("{status_context}:rejected"));
         }
     }
 
@@ -5004,6 +5036,29 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
             | "control+p"
             | "alt+space"
     )
+}
+
+fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
+    let message: manifold_wasm::HostMessage =
+        serde_json::from_str(body).context("decode plugin host message")?;
+    Ok(match message {
+        manifold_wasm::HostMessage::LayoutAction { action } => WorkspaceCommand::Layout(
+            action
+                .parse::<LayoutAction>()
+                .with_context(|| format!("parse plugin host layout action {action:?}"))?,
+        ),
+        manifold_wasm::HostMessage::FocusPane { pane } => WorkspaceCommand::FocusPane(pane),
+        manifold_wasm::HostMessage::SpawnApp { argv } => WorkspaceCommand::SpawnApp(argv),
+        manifold_wasm::HostMessage::FocusOrSpawnApp { app_id, argv } => {
+            WorkspaceCommand::FocusOrSpawnApp { app_id, argv }
+        }
+        manifold_wasm::HostMessage::SwitchActiveSessionNext => {
+            WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext)
+        }
+        manifold_wasm::HostMessage::CreateAndAttachSession => {
+            WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession)
+        }
+    })
 }
 
 #[derive(Default)]

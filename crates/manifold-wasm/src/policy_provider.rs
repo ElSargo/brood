@@ -11,6 +11,9 @@ use anyhow::{Context, Result, ensure};
 use crate::{api::read_range, mailbox::ActorId};
 
 pub const DEFAULT_PUBLICATION_SLOT: &str = "default";
+pub const POLICY_PROVIDER_RESPONSE_OK: i32 = 1;
+pub const POLICY_PROVIDER_RESPONSE_ABSTAIN: i32 = 0;
+pub const POLICY_PROVIDER_RESPONSE_ERROR: i32 = -1;
 const MAX_RETAINED_PUBLICATION_FRAMES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +29,15 @@ pub struct PolicyProviderDeclaration {
     pub name: String,
     pub kind: PolicyProviderKind,
     pub export_name: String,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyProviderResponse {
+    pub status: i32,
+    pub payload_ptr: i32,
+    pub payload_len: i32,
+    pub reserved: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +94,54 @@ impl PolicyProviderKind {
 impl PolicyProviderDeclaration {
     pub fn from_export_name(export_name: &str) -> Option<Self> {
         crate::policy_provider_link::parse_policy_provider_export(export_name)
+    }
+}
+
+impl PolicyProviderResponse {
+    pub const BYTE_LEN: usize = 16;
+
+    pub const fn ok(payload_ptr: i32, payload_len: i32) -> Self {
+        Self {
+            status: POLICY_PROVIDER_RESPONSE_OK,
+            payload_ptr,
+            payload_len,
+            reserved: 0,
+        }
+    }
+
+    pub const fn abstain() -> Self {
+        Self {
+            status: POLICY_PROVIDER_RESPONSE_ABSTAIN,
+            payload_ptr: 0,
+            payload_len: 0,
+            reserved: 0,
+        }
+    }
+
+    pub const fn error() -> Self {
+        Self {
+            status: POLICY_PROVIDER_RESPONSE_ERROR,
+            payload_ptr: 0,
+            payload_len: 0,
+            reserved: 0,
+        }
+    }
+
+    pub fn read_from_memory(memory: &[u8], ptr: i32) -> Result<Self> {
+        ensure!(ptr > 0, "policy provider returned a null response pointer");
+        let start = usize::try_from(ptr).context("convert policy response pointer")?;
+        let end = start
+            .checked_add(Self::BYTE_LEN)
+            .context("policy response descriptor range overflowed")?;
+        let bytes = memory.get(start..end).with_context(|| {
+            format!("policy response descriptor range {start}..{end} is outside guest memory")
+        })?;
+        Ok(Self {
+            status: read_i32_le(bytes, 0)?,
+            payload_ptr: read_i32_le(bytes, 4)?,
+            payload_len: read_i32_le(bytes, 8)?,
+            reserved: read_i32_le(bytes, 12)?,
+        })
     }
 }
 
@@ -261,6 +321,18 @@ impl PublicationFrameLease {
     pub fn retained_depth(&self) -> usize {
         self.inner.retained_depth()
     }
+}
+
+fn read_i32_le(bytes: &[u8], offset: usize) -> Result<i32> {
+    let end = offset
+        .checked_add(4)
+        .context("policy response field range overflowed")?;
+    let field = bytes
+        .get(offset..end)
+        .context("policy response field is outside descriptor")?;
+    Ok(i32::from_le_bytes(field.try_into().map_err(|err| {
+        anyhow::anyhow!("read policy response field: {err}")
+    })?))
 }
 
 pub(crate) fn is_valid_declaration_name(name: &str) -> bool {

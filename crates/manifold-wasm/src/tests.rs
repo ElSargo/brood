@@ -257,6 +257,8 @@ fn policy_module_wat() -> Result<String> {
     })?;
     let consume_ptr = 4096;
     let layout_ptr = consume_ptr + consume.len() + 64;
+    let consume_response_ptr = layout_ptr + layout.len() + 64;
+    let layout_response_ptr = consume_response_ptr + crate::PolicyProviderResponse::BYTE_LEN + 64;
     Ok(format!(
         r#"(module
   (memory (export "memory") 32)
@@ -271,29 +273,28 @@ fn policy_module_wat() -> Result<String> {
     global.set $heap
     local.get $ptr)
   (func (export "manifold_arena_free") (param i32) (param i32) (param i32))
-  (func $copy (param $src i32) (param $dst i32) (param $len i32)
-    (local $i i32)
-    (loop $loop
-      local.get $i
-      local.get $len
-      i32.lt_u
-      if
-        local.get $dst
-        local.get $i
-        i32.add
-        local.get $src
-        local.get $i
-        i32.add
-        i32.load8_u
-        i32.store8
-        local.get $i
-        i32.const 1
-        i32.add
-        local.set $i
-        br $loop
-      end))
+  (func $response (param $desc i32) (param $payload i32) (param $len i32) (result i32)
+    local.get $desc
+    i32.const 1
+    i32.store
+    local.get $desc
+    i32.const 4
+    i32.add
+    local.get $payload
+    i32.store
+    local.get $desc
+    i32.const 8
+    i32.add
+    local.get $len
+    i32.store
+    local.get $desc
+    i32.const 12
+    i32.add
+    i32.const 0
+    i32.store
+    local.get $desc)
   (func (export "manifold_policy_provider_key_consume")
-    (param $query_ptr i32) (param $query_len i32) (param $state_ptr i32) (param $state_len i32) (param $output_ptr i32) (param $output_cap i32) (result i32)
+    (param $query_ptr i32) (param $query_len i32) (param $state_ptr i32) (param $state_len i32) (result i32)
     local.get $state_len
     i32.const 1
     i32.eq
@@ -303,29 +304,29 @@ fn policy_module_wat() -> Result<String> {
     i32.eq
     i32.and
     if (result i32)
+      i32.const {consume_response_ptr}
       i32.const {consume_ptr}
-      local.get $output_ptr
       i32.const {consume_len}
-      call $copy
-      i32.const {consume_len}
+      call $response
     else
       i32.const 0
     end)
   (func (export "manifold_policy_provider_key_abstain")
-    (param i32) (param i32) (param i32) (param i32) (param i32) (param i32) (result i32)
+    (param i32) (param i32) (param i32) (param i32) (result i32)
     i32.const 0)
   (func (export "manifold_policy_provider_layout_tile")
-    (param $query_ptr i32) (param $query_len i32) (param $state_ptr i32) (param $state_len i32) (param $output_ptr i32) (param $output_cap i32) (result i32)
+    (param $query_ptr i32) (param $query_len i32) (param $state_ptr i32) (param $state_len i32) (result i32)
+    i32.const {layout_response_ptr}
     i32.const {layout_ptr}
-    local.get $output_ptr
     i32.const {layout_len}
-    call $copy
-    i32.const {layout_len})
+    call $response)
   (data (i32.const {consume_ptr}) "{consume_data}")
   (data (i32.const {layout_ptr}) "{layout_data}"))"#,
         consume_len = consume.len(),
+        consume_response_ptr = consume_response_ptr,
         consume_data = wat_data(&consume),
         layout_len = layout.len(),
+        layout_response_ptr = layout_response_ptr,
         layout_data = wat_data(&layout),
     ))
 }

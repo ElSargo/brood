@@ -9,7 +9,10 @@ use crate::{
     global_key_policy_link::{
         GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GlobalKeyPolicyExport,
     },
-    policy_provider::{PolicyProviderDeclaration, PolicyProviderKind, PublicationFrameLease},
+    policy_provider::{
+        PolicyProviderDeclaration, PolicyProviderKind, PolicyProviderResponse,
+        PublicationFrameLease,
+    },
 };
 
 pub const ABI_KEY_RELEASED: i32 = 0;
@@ -78,7 +81,6 @@ pub struct WasmGlobalKeyPolicy {
 pub struct GlobalKeyPolicyInvocationBuffers {
     pub query: GuestAllocation,
     pub state: GuestAllocation,
-    pub output: GuestAllocation,
 }
 
 pub struct WasmGlobalKeyPolicyEntry {
@@ -159,13 +161,8 @@ impl WasmGlobalKeyPolicy {
         let state = publication.map_or(&[][..], PublicationFrameLease::bytes);
         let buffers = self.prepare_invocation_buffers(&query, state)?;
 
-        let status = self.entry.call(&mut self.store, &buffers)?;
-        read_policy_outcome(
-            self.allocator.memory().data(&self.store),
-            buffers.output.ptr(),
-            buffers.output.len(),
-            status,
-        )
+        let response_ptr = self.entry.call(&mut self.store, &buffers)?;
+        read_policy_outcome(self.allocator.memory().data(&self.store), response_ptr)
     }
 
     pub fn prepare_invocation_buffers(
@@ -199,15 +196,7 @@ impl WasmGlobalKeyPolicy {
             state,
             crate::DEFAULT_GUEST_ARENA_ALIGN,
         )?;
-        let output = arena.allocate(
-            MAX_GLOBAL_KEY_POLICY_RESULT_BYTES,
-            crate::DEFAULT_GUEST_ARENA_ALIGN,
-        )?;
-        Ok(GlobalKeyPolicyInvocationBuffers {
-            query,
-            state,
-            output,
-        })
+        Ok(GlobalKeyPolicyInvocationBuffers { query, state })
     }
 
     fn ensure_arena_capacity(&mut self, required_capacity: usize) -> Result<()> {
@@ -254,8 +243,6 @@ impl WasmGlobalKeyPolicyEntry {
                     buffers.query.len(),
                     buffers.state.ptr(),
                     buffers.state.len(),
-                    buffers.output.ptr(),
-                    buffers.output.len(),
                 ),
             )
             .map_err(|err| anyhow::anyhow!("call WASM global key policy: {err}"))
@@ -272,8 +259,7 @@ pub fn host_message(message: HostMessage) -> Result<GlobalKeyActorMessage> {
 fn invocation_arena_capacity(query_len: usize, state_len: usize) -> Result<usize> {
     query_len
         .checked_add(state_len)
-        .and_then(|size| size.checked_add(MAX_GLOBAL_KEY_POLICY_RESULT_BYTES))
-        .and_then(|size| size.checked_add(crate::DEFAULT_GUEST_ARENA_ALIGN * 3))
+        .and_then(|size| size.checked_add(crate::DEFAULT_GUEST_ARENA_ALIGN * 2))
         .context("global key policy invocation arena size overflowed")
 }
 
@@ -295,31 +281,40 @@ fn discover_key_provider(
         })
 }
 
-fn read_policy_outcome(
-    memory: &[u8],
-    result_ptr: i32,
-    result_capacity: i32,
-    status: i32,
-) -> Result<GlobalKeyPolicyOutcome> {
-    if status == GLOBAL_KEY_POLICY_RESULT_ABSTAIN {
+fn read_policy_outcome(memory: &[u8], response_ptr: i32) -> Result<GlobalKeyPolicyOutcome> {
+    if response_ptr == GLOBAL_KEY_POLICY_RESULT_ABSTAIN {
         return Ok(GlobalKeyPolicyOutcome::default());
     }
     ensure!(
-        status != GLOBAL_KEY_POLICY_RESULT_ERROR,
+        response_ptr != GLOBAL_KEY_POLICY_RESULT_ERROR,
         "WASM global key policy returned provider error"
     );
     ensure!(
-        status > 0,
-        "WASM global key policy returned invalid status {status}"
+        response_ptr > 0,
+        "WASM global key policy returned invalid response pointer {response_ptr}"
     );
-    let result_len = usize::try_from(status).context("convert key policy result length")?;
-    let capacity =
-        usize::try_from(result_capacity).context("convert key policy result capacity")?;
+
+    let response = PolicyProviderResponse::read_from_memory(memory, response_ptr)?;
+    if response.status == GLOBAL_KEY_POLICY_RESULT_ABSTAIN {
+        return Ok(GlobalKeyPolicyOutcome::default());
+    }
     ensure!(
-        result_len <= capacity,
-        "WASM global key policy returned {result_len} bytes for {capacity} byte result buffer"
+        response.status != GLOBAL_KEY_POLICY_RESULT_ERROR,
+        "WASM global key policy returned provider error"
     );
-    let start = usize::try_from(result_ptr).context("convert key policy result pointer")?;
+    ensure!(
+        response.status == crate::POLICY_PROVIDER_RESPONSE_OK,
+        "WASM global key policy returned invalid descriptor status {}",
+        response.status
+    );
+    let result_len =
+        usize::try_from(response.payload_len).context("convert key policy result length")?;
+    ensure!(
+        result_len <= MAX_GLOBAL_KEY_POLICY_RESULT_BYTES,
+        "WASM global key policy returned {result_len} bytes but limit is {MAX_GLOBAL_KEY_POLICY_RESULT_BYTES}"
+    );
+    let start =
+        usize::try_from(response.payload_ptr).context("convert key policy result pointer")?;
     let end = start
         .checked_add(result_len)
         .context("key policy result range overflowed")?;

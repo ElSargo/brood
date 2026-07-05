@@ -6,9 +6,9 @@ use crate::{
     policy_provider::{PolicyProviderKind, WasmPolicyProvider},
 };
 
-pub const GLOBAL_KEY_POLICY_RESULT_OK: i32 = 1;
-pub const GLOBAL_KEY_POLICY_RESULT_ABSTAIN: i32 = 0;
-pub const GLOBAL_KEY_POLICY_RESULT_ERROR: i32 = -1;
+pub const GLOBAL_KEY_POLICY_RESULT_OK: i32 = crate::POLICY_PROVIDER_RESPONSE_OK;
+pub const GLOBAL_KEY_POLICY_RESULT_ABSTAIN: i32 = crate::POLICY_PROVIDER_RESPONSE_ABSTAIN;
+pub const GLOBAL_KEY_POLICY_RESULT_ERROR: i32 = crate::POLICY_PROVIDER_RESPONSE_ERROR;
 
 /// ABI for a key policy provider export:
 ///
@@ -18,17 +18,16 @@ pub const GLOBAL_KEY_POLICY_RESULT_ERROR: i32 = -1;
 ///   query_len: i32,
 ///   state_ptr: i32,
 ///   state_len: i32,
-///   output_ptr: i32,
-///   output_capacity: i32,
 /// ) -> i32
 /// ```
 ///
 /// The host copies a UTF-8 JSON key query and the latest publication frame, when
-/// present, into reusable guest memory before invocation. The provider writes a
-/// UTF-8 JSON decision envelope into the output buffer and returns the number of
-/// bytes written. A return of `0` means abstain; a negative return means provider
-/// error.
-pub type GlobalKeyPolicyExport = TypedFunc<(i32, i32, i32, i32, i32, i32), i32>;
+/// present, into guest memory before invocation. The provider returns a pointer to
+/// a `PolicyProviderResponse` descriptor. The host copies the descriptor and
+/// payload while guest execution is suspended, then validates and applies the
+/// command envelope. Descriptor status `0` means abstain; negative status means
+/// provider error.
+pub type GlobalKeyPolicyExport = TypedFunc<(i32, i32, i32, i32), i32>;
 
 pub fn load_global_key_policy_entry<T: 'static>(
     mut store: impl AsContextMut<Data = T>,
@@ -42,7 +41,7 @@ pub fn load_global_key_policy_entry<T: 'static>(
         declaration.name
     );
     let func = instance
-        .get_typed_func::<(i32, i32, i32, i32, i32, i32), i32>(&mut store, &declaration.export_name)
+        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, &declaration.export_name)
         .map_err(|err| {
             anyhow::anyhow!(
                 "load key policy export {:?}: {err}",

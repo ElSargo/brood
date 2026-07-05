@@ -60,8 +60,10 @@ pub use module::{
 };
 pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX};
 pub use policy_provider::{
-    DEFAULT_PUBLICATION_SLOT, PolicyProviderDeclaration, PolicyProviderKind, PublicationFrameLease,
-    PublicationRegistry, PublicationSummary, WasmPolicyProvider,
+    DEFAULT_PUBLICATION_SLOT, POLICY_PROVIDER_RESPONSE_ABSTAIN, POLICY_PROVIDER_RESPONSE_ERROR,
+    POLICY_PROVIDER_RESPONSE_OK, PolicyProviderDeclaration, PolicyProviderKind,
+    PolicyProviderResponse, PublicationFrameLease, PublicationRegistry, PublicationSummary,
+    WasmPolicyProvider,
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
 

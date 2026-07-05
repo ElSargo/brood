@@ -9,7 +9,10 @@ use crate::{
     layout_policy_link::{
         LAYOUT_POLICY_RESULT_ABSTAIN, LAYOUT_POLICY_RESULT_ERROR, LayoutPolicyExport,
     },
-    policy_provider::{PolicyProviderDeclaration, PolicyProviderKind, PublicationFrameLease},
+    policy_provider::{
+        PolicyProviderDeclaration, PolicyProviderKind, PolicyProviderResponse,
+        PublicationFrameLease,
+    },
 };
 
 pub const DEFAULT_LAYOUT_POLICY_ARENA_BYTES: usize = 128 * 1024;
@@ -99,7 +102,6 @@ pub struct WasmLayoutPolicy {
 pub struct LayoutPolicyInvocationBuffers {
     pub query: GuestAllocation,
     pub state: GuestAllocation,
-    pub output: GuestAllocation,
 }
 
 pub struct WasmLayoutPolicyEntry {
@@ -179,13 +181,8 @@ impl WasmLayoutPolicy {
         let state = publication.map_or(&[][..], PublicationFrameLease::bytes);
         let buffers = self.prepare_invocation_buffers(&query, state)?;
 
-        let status = self.entry.call(&mut self.store, &buffers)?;
-        read_layout_policy_outcome(
-            self.allocator.memory().data(&self.store),
-            buffers.output.ptr(),
-            buffers.output.len(),
-            status,
-        )
+        let response_ptr = self.entry.call(&mut self.store, &buffers)?;
+        read_layout_policy_outcome(self.allocator.memory().data(&self.store), response_ptr)
     }
 
     pub fn prepare_invocation_buffers(
@@ -219,15 +216,7 @@ impl WasmLayoutPolicy {
             state,
             crate::DEFAULT_GUEST_ARENA_ALIGN,
         )?;
-        let output = arena.allocate(
-            MAX_LAYOUT_POLICY_RESULT_BYTES,
-            crate::DEFAULT_GUEST_ARENA_ALIGN,
-        )?;
-        Ok(LayoutPolicyInvocationBuffers {
-            query,
-            state,
-            output,
-        })
+        Ok(LayoutPolicyInvocationBuffers { query, state })
     }
 
     fn ensure_arena_capacity(&mut self, required_capacity: usize) -> Result<()> {
@@ -274,8 +263,6 @@ impl WasmLayoutPolicyEntry {
                     buffers.query.len(),
                     buffers.state.ptr(),
                     buffers.state.len(),
-                    buffers.output.ptr(),
-                    buffers.output.len(),
                 ),
             )
             .map_err(|err| anyhow::anyhow!("call WASM layout policy: {err}"))
@@ -285,8 +272,7 @@ impl WasmLayoutPolicyEntry {
 fn invocation_arena_capacity(query_len: usize, state_len: usize) -> Result<usize> {
     query_len
         .checked_add(state_len)
-        .and_then(|size| size.checked_add(MAX_LAYOUT_POLICY_RESULT_BYTES))
-        .and_then(|size| size.checked_add(crate::DEFAULT_GUEST_ARENA_ALIGN * 3))
+        .and_then(|size| size.checked_add(crate::DEFAULT_GUEST_ARENA_ALIGN * 2))
         .context("layout policy invocation arena size overflowed")
 }
 
@@ -312,29 +298,41 @@ fn discover_layout_provider(
 
 fn read_layout_policy_outcome(
     memory: &[u8],
-    result_ptr: i32,
-    result_capacity: i32,
-    status: i32,
+    response_ptr: i32,
 ) -> Result<Option<LayoutPolicyOutcome>> {
-    if status == LAYOUT_POLICY_RESULT_ABSTAIN {
+    if response_ptr == LAYOUT_POLICY_RESULT_ABSTAIN {
         return Ok(None);
     }
     ensure!(
-        status != LAYOUT_POLICY_RESULT_ERROR,
+        response_ptr != LAYOUT_POLICY_RESULT_ERROR,
         "WASM layout policy returned provider error"
     );
     ensure!(
-        status > 0,
-        "WASM layout policy returned invalid status {status}"
+        response_ptr > 0,
+        "WASM layout policy returned invalid response pointer {response_ptr}"
     );
-    let result_len = usize::try_from(status).context("convert layout policy result length")?;
-    let capacity =
-        usize::try_from(result_capacity).context("convert layout policy result capacity")?;
+
+    let response = PolicyProviderResponse::read_from_memory(memory, response_ptr)?;
+    if response.status == LAYOUT_POLICY_RESULT_ABSTAIN {
+        return Ok(None);
+    }
     ensure!(
-        result_len <= capacity,
-        "WASM layout policy returned {result_len} bytes for {capacity} byte result buffer"
+        response.status != LAYOUT_POLICY_RESULT_ERROR,
+        "WASM layout policy returned provider error"
     );
-    let start = usize::try_from(result_ptr).context("convert layout policy result pointer")?;
+    ensure!(
+        response.status == crate::POLICY_PROVIDER_RESPONSE_OK,
+        "WASM layout policy returned invalid descriptor status {}",
+        response.status
+    );
+    let result_len =
+        usize::try_from(response.payload_len).context("convert layout policy result length")?;
+    ensure!(
+        result_len <= MAX_LAYOUT_POLICY_RESULT_BYTES,
+        "WASM layout policy returned {result_len} bytes but limit is {MAX_LAYOUT_POLICY_RESULT_BYTES}"
+    );
+    let start =
+        usize::try_from(response.payload_ptr).context("convert layout policy result pointer")?;
     let end = start
         .checked_add(result_len)
         .context("layout policy result range overflowed")?;

@@ -1722,6 +1722,7 @@ dependencies = [
  "calloop 0.14.4",
  "clap",
  "image",
+ "manifold-wasm",
  "serde",
  "serde_json",
  "smithay",
