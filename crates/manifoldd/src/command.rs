@@ -9,12 +9,19 @@ pub enum WorkspaceCommand {
     FocusPane(u64),
     FocusOrSpawnApp { app_id: String, argv: Vec<String> },
     Surface(SurfaceCommand),
+    Input(InputCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceCommand {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCommand {
+    ToggleShortcutPassthrough,
+    SetShortcutPassthrough(bool),
 }
 
 impl WorkspaceCommand {
@@ -31,6 +38,7 @@ impl WorkspaceCommand {
             Self::FocusPane(pane) => state.focus_pane(pane),
             Self::FocusOrSpawnApp { app_id, argv } => state.focus_app_id_or_spawn(&app_id, &argv),
             Self::Surface(command) => command.apply(state),
+            Self::Input(command) => command.apply(state),
         }
     }
 }
@@ -43,6 +51,18 @@ impl SurfaceCommand {
                 state.create_and_attach_surface_session();
                 true
             }
+        }
+    }
+}
+
+impl InputCommand {
+    fn apply(self, state: &mut Manifold) -> bool {
+        match self {
+            Self::ToggleShortcutPassthrough => {
+                state.toggle_shortcut_passthrough();
+                true
+            }
+            Self::SetShortcutPassthrough(enabled) => state.set_shortcut_passthrough(enabled),
         }
     }
 }

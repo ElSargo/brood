@@ -9,8 +9,6 @@
 
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
-use smithay::backend::input::Keycode;
-
 const MAX_RESOLVED_LAYOUT_ITEMS: usize = 512;
 const NORMALIZED_MIN: f64 = -1.0;
 const NORMALIZED_MAX: f64 = 1.0;
@@ -752,131 +750,6 @@ const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRe
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayoutKeyBinding {
-    pub key: Keycode,
-    pub ctrl: bool,
-    pub action: LayoutAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayoutKeymap {
-    bindings: Vec<LayoutKeyBinding>,
-}
-
-impl Default for LayoutKeymap {
-    fn default() -> Self {
-        Self {
-            bindings: vec![
-                LayoutKeyBinding {
-                    key: Keycode::new(44),
-                    ctrl: false,
-                    action: LayoutAction::FocusNext,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(44),
-                    ctrl: true,
-                    action: LayoutAction::FocusNext,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(45),
-                    ctrl: false,
-                    action: LayoutAction::FocusPrevious,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(45),
-                    ctrl: true,
-                    action: LayoutAction::FocusPrevious,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(24),
-                    ctrl: false,
-                    action: LayoutAction::CloseActivePane,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(41),
-                    ctrl: false,
-                    action: LayoutAction::ToggleManagedFullscreen,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(46),
-                    ctrl: false,
-                    action: LayoutAction::SplitActiveRight,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(43),
-                    ctrl: true,
-                    action: LayoutAction::SplitActiveDown,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(39),
-                    ctrl: false,
-                    action: LayoutAction::SplitActiveSmart,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(30),
-                    ctrl: false,
-                    action: LayoutAction::JoinActivePane,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(60),
-                    ctrl: false,
-                    action: LayoutAction::FocusNextSplit,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(60),
-                    ctrl: true,
-                    action: LayoutAction::FocusNextSplit,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(59),
-                    ctrl: false,
-                    action: LayoutAction::FocusPreviousSplit,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(59),
-                    ctrl: true,
-                    action: LayoutAction::FocusPreviousSplit,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(23),
-                    ctrl: false,
-                    action: LayoutAction::ToggleLeftDock,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(26),
-                    ctrl: false,
-                    action: LayoutAction::ToggleRightDock,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(48),
-                    ctrl: false,
-                    action: LayoutAction::ToggleBottomDock,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(27),
-                    ctrl: true,
-                    action: LayoutAction::DecreaseLeftDockWidth,
-                },
-                LayoutKeyBinding {
-                    key: Keycode::new(28),
-                    ctrl: true,
-                    action: LayoutAction::IncreaseLeftDockWidth,
-                },
-            ],
-        }
-    }
-}
-
-impl LayoutKeymap {
-    pub fn action_for_key(&self, key: Keycode, ctrl: bool) -> Option<LayoutAction> {
-        self.bindings
-            .iter()
-            .find(|binding| binding.key == key && binding.ctrl == ctrl)
-            .map(|binding| binding.action)
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -885,10 +758,9 @@ impl LayoutKeymap {
 )]
 mod tests {
     use super::{
-        InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutKeymap,
-        LayoutSize, LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+        InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutSize,
+        LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     };
-    use smithay::backend::input::Keycode;
 
     #[test]
     fn decodes_abi_actions() {
@@ -935,40 +807,6 @@ mod tests {
             Ok(LayoutAction::FocusNextSplit)
         );
         assert!("bogus".parse::<LayoutAction>().is_err());
-    }
-
-    #[test]
-    fn default_keymap_maps_normal_mode_actions() {
-        let keymap = LayoutKeymap::default();
-
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(44), false),
-            Some(LayoutAction::FocusNext)
-        );
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(44), true),
-            Some(LayoutAction::FocusNext)
-        );
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(43), true),
-            Some(LayoutAction::SplitActiveDown)
-        );
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(39), false),
-            Some(LayoutAction::SplitActiveSmart)
-        );
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(30), false),
-            Some(LayoutAction::JoinActivePane)
-        );
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(60), true),
-            Some(LayoutAction::FocusNextSplit)
-        );
-        assert_eq!(
-            keymap.action_for_key(Keycode::new(59), true),
-            Some(LayoutAction::FocusPreviousSplit)
-        );
     }
 
     #[test]

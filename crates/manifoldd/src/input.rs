@@ -6,6 +6,7 @@
 )]
 // TODO(lint-structure): make pointer coordinate conversion and gesture state explicitly fallible.
 
+use crate::state::{InputMode, Manifold, PresentationStatus};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -18,12 +19,6 @@ use smithay::{
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
 };
-use tracing::warn;
-
-use crate::{
-    layout::{LayoutAction, LayoutKeymap},
-    state::{InputMode, Manifold, PresentationStatus},
-};
 
 const KEY_LEFTCTRL: Keycode = Keycode::new(37);
 const KEY_RIGHTCTRL: Keycode = Keycode::new(105);
@@ -31,18 +26,6 @@ const KEY_LEFTSHIFT: Keycode = Keycode::new(50);
 const KEY_RIGHTSHIFT: Keycode = Keycode::new(62);
 const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
-const KEY_ESC: Keycode = Keycode::new(1);
-const KEY_B: Keycode = Keycode::new(56);
-const KEY_COMMA: Keycode = Keycode::new(59);
-const KEY_DOT: Keycode = Keycode::new(60);
-const KEY_H: Keycode = Keycode::new(43);
-const KEY_J: Keycode = Keycode::new(44);
-const KEY_K: Keycode = Keycode::new(45);
-const KEY_L: Keycode = Keycode::new(46);
-const KEY_P: Keycode = Keycode::new(33);
-const KEY_S: Keycode = Keycode::new(39);
-const KEY_U: Keycode = Keycode::new(30);
-const KEY_W: Keycode = Keycode::new(25);
 
 impl Manifold {
     #[allow(dead_code)]
@@ -112,21 +95,6 @@ impl Manifold {
         let is_shift = matches!(key_code, KEY_LEFTSHIFT | KEY_RIGHTSHIFT);
         let is_alt = matches!(key_code, KEY_LEFTALT | KEY_RIGHTALT);
 
-        if key_code == KEY_B && state == KeyState::Released && self.suppress_mode_toggle_key_release
-        {
-            self.suppress_mode_toggle_key_release = false;
-            self.record_consumed_keyboard_input();
-            return;
-        }
-
-        if self.suppress_shortcut_prefix_key_release == Some(key_code)
-            && state == KeyState::Released
-        {
-            self.suppress_shortcut_prefix_key_release = None;
-            self.record_consumed_keyboard_input();
-            return;
-        }
-
         if is_ctrl {
             match state {
                 KeyState::Pressed => {
@@ -193,88 +161,15 @@ impl Manifold {
             return;
         }
 
-        if self.ctrl_pressed && self.shift_pressed && key_code == KEY_ESC {
-            self.record_consumed_keyboard_input();
-            if state == KeyState::Pressed {
-                self.shortcut_prefix_active = false;
-                self.suppress_shortcut_prefix_key_release = Some(key_code);
-                self.toggle_shortcut_passthrough();
-            }
-            return;
-        }
-
-        if self.ctrl_pressed && key_code == KEY_B && !self.shortcut_passthrough() {
-            self.record_consumed_keyboard_input();
-            if state == KeyState::Pressed && !self.suppress_mode_toggle_key_release {
-                self.suppress_mode_toggle_key_release = true;
-                self.shortcut_prefix_active = false;
-                self.toggle_input_mode();
-            }
-            return;
-        }
-
-        if self.shortcut_prefix_active {
-            self.record_consumed_keyboard_input();
-            if state == KeyState::Pressed {
-                self.shortcut_prefix_active = false;
-                self.suppress_shortcut_prefix_key_release = Some(key_code);
-                if key_code == KEY_P {
-                    self.set_shortcut_passthrough(true);
-                }
-            }
-            return;
-        }
-
-        if self.shortcut_passthrough() {
-            self.forward_pressed_modifiers_to_focused_client(time);
-            self.forward_keyboard_key_to_focused_client(key_code, state, time);
-            return;
-        }
-
         if self.try_wasm_global_key_policy(key_code, state) == Some(true) {
             self.record_consumed_keyboard_input();
             return;
         }
 
-        if self.ctrl_pressed
-            && let Some(action) = built_in_ctrl_layout_action(key_code)
-        {
-            self.record_consumed_keyboard_input();
-            if state == KeyState::Pressed {
-                self.apply_layout_action(action);
-            }
-            return;
-        }
-
-        if self.input_mode == InputMode::Normal {
-            self.record_consumed_keyboard_input();
-            if state == KeyState::Pressed {
-                self.handle_normal_mode_key(key_code);
-            }
-            return;
-        }
-
-        if self.input_mode != InputMode::Normal {
+        if self.shortcut_passthrough() || self.input_mode != InputMode::Normal {
             self.forward_pressed_modifiers_to_focused_client(time);
         }
         self.forward_keyboard_key_to_focused_client(key_code, state, time);
-    }
-
-    fn handle_normal_mode_key(&mut self, key_code: Keycode) {
-        match key_code {
-            KEY_W => {
-                if let Err(err) = self.spawn_wezterm_pane() {
-                    warn!(?err, "failed to spawn wezterm pane from normal mode");
-                }
-            }
-            _ => {
-                if let Some(action) =
-                    LayoutKeymap::default().action_for_key(key_code, self.ctrl_pressed)
-                {
-                    self.apply_layout_action(action);
-                }
-            }
-        }
     }
 
     fn record_consumed_keyboard_input(&mut self) {
@@ -500,20 +395,6 @@ impl Manifold {
         }
         pointer.axis(self, frame);
         pointer.frame(self);
-    }
-}
-
-const fn built_in_ctrl_layout_action(key_code: Keycode) -> Option<LayoutAction> {
-    match key_code {
-        KEY_J => Some(LayoutAction::FocusNext),
-        KEY_K => Some(LayoutAction::FocusPrevious),
-        KEY_L => Some(LayoutAction::SplitActiveRight),
-        KEY_H => Some(LayoutAction::SplitActiveDown),
-        KEY_S => Some(LayoutAction::SplitActiveSmart),
-        KEY_U => Some(LayoutAction::JoinActivePane),
-        KEY_DOT => Some(LayoutAction::FocusNextSplit),
-        KEY_COMMA => Some(LayoutAction::FocusPreviousSplit),
-        _ => None,
     }
 }
 

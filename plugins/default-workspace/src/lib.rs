@@ -10,11 +10,14 @@ const OUTPUT_OK: i32 = 1;
 
 const KEY_RELEASED: i32 = 0;
 const KEY_PRESSED: i32 = 1;
+const INPUT_MODE_PASSTHROUGH: i32 = 0;
 const INPUT_MODE_NORMAL: i32 = 1;
 
 const MOD_CTRL: i32 = 1;
 const MOD_ALT: i32 = 2;
+const MOD_SHIFT: i32 = 4;
 
+const KEY_ESC: i32 = 1;
 const KEY_1: i32 = 10;
 const KEY_2: i32 = 11;
 const KEY_3: i32 = 12;
@@ -22,6 +25,7 @@ const KEY_4: i32 = 13;
 const KEY_5: i32 = 14;
 const KEY_ENTER: i32 = 36;
 const KEY_O: i32 = 32;
+const KEY_B: i32 = 56;
 const KEY_Q: i32 = 24;
 const KEY_D: i32 = 40;
 const KEY_F: i32 = 41;
@@ -32,6 +36,7 @@ const KEY_K: i32 = 45;
 const KEY_L: i32 = 46;
 const KEY_S: i32 = 39;
 const KEY_U: i32 = 30;
+const KEY_W: i32 = 25;
 const KEY_N: i32 = 57;
 const KEY_P: i32 = 33;
 const KEY_COMMA: i32 = 59;
@@ -42,6 +47,7 @@ static mut HEAP: [u8; HEAP_BYTES] = [0; HEAP_BYTES];
 static mut HEAP_CURSOR: usize = 0;
 static mut RESPONSE: [u8; RESPONSE_BYTES] = [0; RESPONSE_BYTES];
 static mut RESPONSE_DESC: [i32; 4] = [0; 4];
+static mut WORKSPACE_INPUT_MODE: i32 = INPUT_MODE_PASSTHROUGH;
 
 #[no_mangle]
 pub extern "C" fn manifold_arena_alloc(capacity: i32, align: i32) -> i32 {
@@ -84,9 +90,29 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
     let output = response_buffer_mut();
     let input = KeyInput::parse(query);
 
+    if input.modifiers & MOD_CTRL != 0
+        && input.modifiers & MOD_SHIFT != 0
+        && input.key_code == KEY_ESC
+    {
+        return if input.key_state == KEY_RELEASED {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::ToggleShortcutPassthrough])
+        };
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.key_code == KEY_B {
+        if input.key_state == KEY_PRESSED {
+            toggle_workspace_input_mode();
+        }
+        return write_consume(output, &[]);
+    }
+
+    let workspace_input_mode = workspace_input_mode();
+
     if input.modifiers & MOD_ALT != 0
         && input.key_code == KEY_SPACE
-        && input.input_mode == INPUT_MODE_NORMAL
+        && workspace_input_mode == INPUT_MODE_NORMAL
     {
         return if input.key_state == KEY_RELEASED {
             write_consume(output, &[])
@@ -104,7 +130,7 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
     }
 
     if input.key_state != KEY_PRESSED
-        || input.input_mode != INPUT_MODE_NORMAL
+        || workspace_input_mode != INPUT_MODE_NORMAL
         || input.modifiers & MOD_CTRL == 0
     {
         return OUTPUT_ABSTAIN;
@@ -113,6 +139,13 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
     let messages = match input.key_code {
         KEY_N => &[Message::CreateAndAttachSession][..],
         KEY_O => &[Message::SpawnApp(&["foot"])][..],
+        KEY_W => &[Message::SpawnApp(&[
+            "flatpak",
+            "run",
+            "--env=GDK_BACKEND=wayland",
+            "--env=QT_QPA_PLATFORM=wayland",
+            "org.wezfurlong.wezterm",
+        ])][..],
         KEY_J => &[Message::LayoutAction("focus-next")][..],
         KEY_K => &[Message::LayoutAction("focus-previous")][..],
         KEY_Q => &[Message::LayoutAction("close-active-pane")][..],
@@ -128,7 +161,7 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
             Message::LayoutAction("toggle-left-dock"),
             Message::LayoutAction("toggle-right-dock"),
         ][..],
-        _ => return OUTPUT_ABSTAIN,
+        _ => return write_consume(output, &[]),
     };
     write_consume(output, messages)
 }
@@ -242,6 +275,20 @@ fn is_global_workspace_key(key_code: i32) -> bool {
     )
 }
 
+fn workspace_input_mode() -> i32 {
+    unsafe { WORKSPACE_INPUT_MODE }
+}
+
+fn toggle_workspace_input_mode() {
+    unsafe {
+        WORKSPACE_INPUT_MODE = if WORKSPACE_INPUT_MODE == INPUT_MODE_NORMAL {
+            INPUT_MODE_PASSTHROUGH
+        } else {
+            INPUT_MODE_NORMAL
+        };
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Message<'a> {
     LayoutAction(&'a str),
@@ -252,6 +299,7 @@ enum Message<'a> {
     },
     SwitchActiveSessionNext,
     CreateAndAttachSession,
+    ToggleShortcutPassthrough,
 }
 
 fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
@@ -289,6 +337,9 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             }
             Message::CreateAndAttachSession => {
                 payload.bytes(br#"{"type":"create-and-attach-session"}"#)
+            }
+            Message::ToggleShortcutPassthrough => {
+                payload.bytes(br#"{"type":"toggle-shortcut-passthrough"}"#)
             }
         }
         writer.bytes(br#"]}"#);
@@ -328,7 +379,6 @@ struct KeyInput {
     key_code: i32,
     key_state: i32,
     modifiers: i32,
-    input_mode: i32,
 }
 
 impl KeyInput {
@@ -337,7 +387,6 @@ impl KeyInput {
             key_code: parse_i32_field(bytes, b"\"key_code\":").unwrap_or(0),
             key_state: parse_i32_field(bytes, b"\"key_state\":").unwrap_or(0),
             modifiers: parse_i32_field(bytes, b"\"modifiers\":").unwrap_or(0),
-            input_mode: parse_i32_field(bytes, b"\"input_mode\":").unwrap_or(0),
         }
     }
 }
@@ -385,6 +434,11 @@ impl<'a> Writer<'a> {
     }
 
     fn f32(&mut self, value: f32) {
+        let mut value = value;
+        if value < 0.0 {
+            self.byte(b'-');
+            value = -value;
+        }
         let whole = value as u64;
         self.u64(whole);
         let frac = ((value - (whole as f32)) * 1000.0) as u64;

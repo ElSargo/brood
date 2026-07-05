@@ -73,7 +73,7 @@ use crate::{
     MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_PANE_ID_ENV, MANIFOLD_SESSION_ENV,
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
-    command::{SurfaceCommand, WorkspaceCommand},
+    command::{InputCommand, SurfaceCommand, WorkspaceCommand},
     layout::{
         HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind,
         LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
@@ -772,10 +772,11 @@ impl Manifold {
             modifiers,
             input_mode,
         );
+        let publication = self.latest_wasm_policy_state_publication();
         let outcome = self
             .wasm_global_key_policy
             .as_mut()
-            .map(|policy| policy.handle_key(input, None))?;
+            .map(|policy| policy.handle_key(input, publication.as_ref()))?;
         match outcome {
             Ok(outcome) => Some(self.apply_wasm_global_key_policy_outcome(outcome)),
             Err(err) => {
@@ -814,6 +815,19 @@ impl Manifold {
         }
         self.drain_wasm_host_mailbox();
         handled
+    }
+
+    fn latest_wasm_policy_state_publication(&self) -> Option<manifold_wasm::PublicationFrameLease> {
+        let actor_names = self.wasm_actor_names.clone();
+        self.block_on_wasm_registry(|registry| {
+            actor_names.iter().find_map(|actor| {
+                let actor_id = registry.actor_id_for_name(actor)?;
+                registry
+                    .latest_default_publication_frame(actor_id)
+                    .ok()
+                    .flatten()
+            })
+        })
     }
 
     fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
@@ -928,6 +942,7 @@ impl Manifold {
     fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
         match event {
             PluginHostEvent::DrainWasmHostMailbox => self.drain_wasm_host_mailbox(),
+            PluginHostEvent::RefreshWasmLayoutPolicy => self.refresh_resolved_layout_from_policy(),
             PluginHostEvent::AppendPublicationFrame {
                 actor_id,
                 slot,
@@ -1803,7 +1818,7 @@ impl Manifold {
         self.apply_registered_extension_grants_for_surface(surface);
         if registered.presentation {
             self.mark_presentation_child_surface(surface);
-            self.refresh_resolved_layout_from_native_policy();
+            self.refresh_resolved_layout_from_policy();
             return self.active_content_surface_for_layout_action();
         }
         self.emit_wasm_actor_event_to_all(format!(
@@ -2076,16 +2091,27 @@ impl Manifold {
     }
 
     fn apply_map_hook_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
+        self.refresh_resolved_layout_from_policy_with_extra_pane(Some(pending_pane));
+        self.surface_for_pane(pending_pane)
+    }
+
+    fn refresh_resolved_layout_from_policy(&mut self) {
+        self.refresh_resolved_layout_from_policy_with_extra_pane(None);
+    }
+
+    fn refresh_resolved_layout_from_policy_with_extra_pane(&mut self, extra_pane: Option<u64>) {
+        if self.wasm_layout_policy.is_none() {
+            self.refresh_resolved_layout_from_native_policy();
+            return;
+        }
         let mut visible_panes = self.active_surface_session_panes();
-        if !visible_panes.contains(&pending_pane) {
-            visible_panes.push(pending_pane);
+        if let Some(extra_pane) = extra_pane
+            && !visible_panes.contains(&extra_pane)
+        {
+            visible_panes.push(extra_pane);
         }
         let focused_pane = self.focused_pane();
         let size = self.presentation_layout_size();
-        let Some(policy) = self.wasm_layout_policy.as_mut() else {
-            self.refresh_resolved_layout_from_native_policy();
-            return self.surface_for_pane(pending_pane);
-        };
         let input = manifold_wasm::LayoutPolicyInput::new(
             visible_panes,
             focused_pane,
@@ -2094,26 +2120,27 @@ impl Manifold {
                 h: size.h,
             },
         );
-        let outcome = match policy.resolve_layout(input, None) {
+        let publication = self.latest_wasm_policy_state_publication();
+        let policy = self
+            .wasm_layout_policy
+            .as_mut()
+            .expect("checked wasm layout policy presence");
+        let outcome = match policy.resolve_layout(input, publication.as_ref()) {
             Ok(Some(outcome)) => outcome,
             Ok(None) => {
                 self.refresh_resolved_layout_from_native_policy();
-                return self.surface_for_pane(pending_pane);
+                return;
             }
             Err(err) => {
-                warn!(
-                    ?err,
-                    pending_pane, "WASM layout policy failed; using native placement"
-                );
+                warn!(?err, "WASM layout policy failed; using native fallback");
                 self.refresh_resolved_layout_from_native_policy();
-                return self.surface_for_pane(pending_pane);
+                return;
             }
         };
         self.apply_map_hook_resolved_layout(
             convert_wasm_resolved_layout(outcome.layout),
             outcome.focus,
-        )
-        .or_else(|| self.surface_for_pane(pending_pane))
+        );
     }
 
     fn apply_map_hook_resolved_layout(
@@ -2268,7 +2295,7 @@ impl Manifold {
         self.save_active_native_session_layout();
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -2525,7 +2552,7 @@ impl Manifold {
                 .unwrap_or(SurfaceSessionId(1));
         }
         self.restore_native_session_layout(self.active_surface_session);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -2582,7 +2609,7 @@ impl Manifold {
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
         self.record_surface_session_interaction(session);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -2610,7 +2637,7 @@ impl Manifold {
             self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
         self.restore_native_session_layout(self.active_surface_session);
         self.record_surface_session_interaction(self.active_surface_session);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -2645,7 +2672,7 @@ impl Manifold {
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
         self.record_surface_session_interaction(session);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         session
     }
@@ -2854,7 +2881,7 @@ impl Manifold {
         }
         self.active_toplevel_surface.clone_from(&active_surface);
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            self.refresh_resolved_layout_from_native_policy();
+            self.refresh_resolved_layout_from_policy();
         }
         self.activate_window_exclusively(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
@@ -2885,7 +2912,7 @@ impl Manifold {
             };
             self.layout.set_active_leaf(leaf);
             self.set_layout_leaf_selected_pane(leaf, pane);
-            self.refresh_resolved_layout_from_native_policy();
+            self.refresh_resolved_layout_from_policy();
         } else if !self.surface_has_visible_pane_item(&surface) {
             return false;
         }
@@ -3608,7 +3635,11 @@ impl Manifold {
                                 if let Err(err) = dispatch {
                                     warn!(actor = %actor_name, error = %err, "WASM plugin actor outbox dispatch failed");
                                 }
+                                let refresh_layout = !outbox.publications.is_empty();
                                 let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
+                                if refresh_layout {
+                                    let _ = host_events.send(PluginHostEvent::RefreshWasmLayoutPolicy);
+                                }
                             }
                         }
                         manifold_wasm::ActorEpochOutcome::Stop => {
@@ -3996,7 +4027,7 @@ impl Manifold {
             .retain(|(assigned_surface, _)| assigned_surface != surface);
         self.window_surface_sessions
             .push((surface.clone(), session));
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -4080,7 +4111,7 @@ impl Manifold {
             return false;
         }
         self.set_layout_leaf_selected_pane(active_leaf, next_pane);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         let Some(next_surface) = self.surface_for_pane(next_pane) else {
             return false;
         };
@@ -4118,7 +4149,7 @@ impl Manifold {
             }
         }
 
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
     }
@@ -4165,7 +4196,7 @@ impl Manifold {
         if next_leaf == previous_leaf {
             return false;
         }
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
             self.focus_toplevel_surface(Some(next_surface));
         } else {
@@ -4184,7 +4215,7 @@ impl Manifold {
         };
         self.layout_leaf_selected_panes
             .retain(|(leaf, _)| *leaf != removed_leaf);
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_resolved_layout_from_policy();
         if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
             self.focus_toplevel_surface(Some(next_surface));
         } else {
@@ -4279,14 +4310,6 @@ impl Manifold {
         }
     }
 
-    pub const fn toggle_input_mode(&mut self) -> InputMode {
-        self.input_mode = match self.input_mode {
-            InputMode::Passthrough => InputMode::Normal,
-            InputMode::Normal => InputMode::Passthrough,
-        };
-        self.input_mode
-    }
-
     pub fn toggle_managed_fullscreen(&mut self) -> bool {
         self.managed_fullscreen = !self.managed_fullscreen;
         self.reconfigure_focus_stack();
@@ -4369,16 +4392,6 @@ impl Manifold {
             warn!(?err, "flush clients after close request failed");
         }
         true
-    }
-
-    pub fn spawn_wezterm_pane(&mut self) -> Result<()> {
-        self.spawn_hosted_app_argv(&[
-            "flatpak".to_string(),
-            "run".to_string(),
-            "--env=GDK_BACKEND=wayland".to_string(),
-            "--env=QT_QPA_PLATFORM=wayland".to_string(),
-            "org.wezfurlong.wezterm".to_string(),
-        ])
     }
 
     pub fn refresh_window_state(&mut self) {
@@ -4553,7 +4566,7 @@ impl Manifold {
     fn repair_resolved_layout_for_current_inventory(&mut self) {
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             self.collapse_empty_native_layout_leaves();
-            self.refresh_resolved_layout_from_native_policy();
+            self.refresh_resolved_layout_from_policy();
             return;
         }
 
@@ -4580,7 +4593,7 @@ impl Manifold {
                     ?err,
                     "accepted WASM resolved layout became invalid; using native fallback"
                 );
-                self.refresh_resolved_layout_from_native_policy();
+                self.refresh_resolved_layout_from_policy();
             }
         }
     }
@@ -5306,6 +5319,12 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
         }
         manifold_wasm::HostMessage::CreateAndAttachSession => {
             WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession)
+        }
+        manifold_wasm::HostMessage::ToggleShortcutPassthrough => {
+            WorkspaceCommand::Input(InputCommand::ToggleShortcutPassthrough)
+        }
+        manifold_wasm::HostMessage::SetShortcutPassthrough { enabled } => {
+            WorkspaceCommand::Input(InputCommand::SetShortcutPassthrough(enabled))
         }
     })
 }

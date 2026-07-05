@@ -54,6 +54,8 @@ pub enum HostMessage {
     FocusOrSpawnApp { app_id: String, argv: Vec<String> },
     SwitchActiveSessionNext,
     CreateAndAttachSession,
+    ToggleShortcutPassthrough,
+    SetShortcutPassthrough { enabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
