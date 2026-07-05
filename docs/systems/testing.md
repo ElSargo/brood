@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/compositor.rs
   - tools/audit-v1-capabilities.sh
@@ -11,7 +11,7 @@ code-links:
 
 # Testing
 
-The supported behavior-test path is the built-in `manifold test` CLI. It owns nested topology policy and avoids creating a host OS window by default.
+The supported behavior-test path is the built-in `manifold test` CLI, run through the Nix development shell for checked-in workflows. It owns nested topology policy and avoids creating a host OS window by default.
 
 Use product runtime commands such as `manifold run` for runtime/manual use, not automated behavior validation.
 
@@ -35,9 +35,9 @@ See [[../workflows/test-nested]].
 
 ## Smoke Suites
 
-Use `tools/audit-v1-capabilities.sh` for the concise acceptance audit. It runs Rust checks, headless compositor checks, host-backed checks when a host display is available, and DMA-BUF/explicit-sync capability checks.
+Use `nix develop --command tools/audit-v1-capabilities.sh` for the concise acceptance audit. It runs Rust checks, headless compositor checks, host-backed checks when a host display is available, and DMA-BUF/explicit-sync capability checks.
 
-Use `tools/smoke-v1-full.sh` for the larger full proof suite on a host display.
+Use `nix develop --command tools/smoke-v1-full.sh` for the larger full proof suite on a host display.
 
 ## Related Pages
 

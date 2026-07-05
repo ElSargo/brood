@@ -1,14 +1,14 @@
 # WASM Test Harness Prototype
 
-This page records the focused target and current usability shape of the WASM test-harness lane.
+This archived page records the focused target and current usability shape of the WASM test-harness lane.
 
-Use [WASM Integration](wasm-integration.md) as the canonical overview for the broader WASM model.
+Use [Plugin Runtime](../systems/plugin-runtime.md) for the current plugin execution model. Use [WASM Integration](wasm-integration.md) only as historical context for the broader WASM model.
 
 The first async test-harness prototype is currently exposed through the `run` CLI. For the exact arguments, see `crates/manifoldd/src/main.rs`.
 
 This is intentionally separate from `--wasm-key-handler`.
 
-- `--wasm-key-handler` is a synchronous fast-lane hook for key handling.
+- `--wasm-key-handler` is the current prototype synchronous key hook. The target shape is a key policy provider.
 - `--test-harness` is an async controller lane for behavior testing.
 
 ## Current Guest ABI

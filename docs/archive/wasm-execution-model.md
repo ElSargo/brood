@@ -1,13 +1,13 @@
 # WASM Execution Model
 
-This page records one focused part of the WASM target design: execution lanes and failure policy.
+This archived page records an earlier focused target for execution lanes and failure policy. The current target has been promoted to [Plugin Runtime](../systems/plugin-runtime.md), with related input and layout policy in [Input And Keyboard Shortcuts](../systems/input-shortcuts.md) and [Layout Policy](../systems/layout-policy.md).
 
-Use [WASM Integration](wasm-integration.md) as the canonical overview for the broader app and module model.
+Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
 Manifold should run user code through two execution lanes with different contracts:
 
-- a synchronous fast lane for bounded pre-commit policy
-- an asynchronous lane for normal app, controller, extension, and agent behavior
+- a synchronous policy lane for bounded pre-commit policy
+- asynchronous actor/mailbox execution for normal app, controller, extension, and agent behavior
 
 The lanes should share the same workspace command and event model, but they should not share queues, budgets, or failure policy. Slow async work must not make latency-sensitive policy hooks contend with unrelated module activity.
 
@@ -19,16 +19,16 @@ That loop should remain the session process authority. Async plugin work can liv
 
 ```text
 calloop/session thread
-  -> synchronous fast lane policy hooks
+  -> synchronous policy lane hooks
   -> commit workspace transaction
   -> append workspace events
-  -> async plugin lane
+  -> async actor/mailbox lane
   -> command requests back to calloop/session thread
 ```
 
-## Fast Lane
+## Policy Provider
 
-The fast lane is for user-defined policy that must participate in a state transition before Manifold commits it. It exists for cases where asynchronous reaction would be too late or could create inconsistent ownership.
+The policy provider is for user-defined policy that must participate in a state transition before Manifold commits it. It exists for cases where asynchronous reaction would be too late or could create inconsistent ownership.
 
 Examples:
 
@@ -37,7 +37,7 @@ Examples:
 - a command needs preflight validation or rewrite
 - a focus change needs allow, deny, redirect, or abstain policy
 
-Fast lane hooks are synchronous and bounded. They must not perform slow or unbounded work.
+Policy provider hooks are synchronous and bounded. They must not perform slow or unbounded work.
 
 Allowed:
 
@@ -54,7 +54,7 @@ Not allowed:
 - call arbitrary host APIs
 - observe unrelated async plugin state unless the host snapshotted it into the hook context
 
-Fast hooks should run with hard limits:
+Sync policy hooks should run with hard limits:
 
 - strict CPU/time budget
 - memory limit
@@ -64,9 +64,9 @@ Fast hooks should run with hard limits:
 
 The failure behavior should be defined per hook type. Most policy hooks should fail neutral, meaning Manifold ignores the failed hook and continues with host defaults. Security or validation hooks may fail closed if their manifest declares that behavior and the user/session grants it.
 
-## Async Lane
+## Async Actor Lane
 
-The async lane is for ordinary user code. It should be event-driven and actor-like: each module owns its state, receives ordered events, and returns command requests instead of mutating Manifold directly.
+The async actor lane is for ordinary user code. It should be event-driven and actor-like: each module owns its state, receives ordered events through mailboxes, and returns command requests instead of mutating Manifold directly.
 
 Examples:
 
@@ -77,7 +77,7 @@ Examples:
 - perform storage or slow computation
 - launch follow-up app actions through capability-checked commands
 
-The async lane should support:
+The apolicy provider should support:
 
 - bounded event queues
 - backpressure diagnostics
@@ -89,9 +89,9 @@ The async lane should support:
 
 Async module code should not run on the calloop thread. A Tokio runtime can own this lane, but Manifold state remains authoritative on the calloop/session thread.
 
-## Published Fast-Path State
+## Published Sync-Path State
 
-Async plugin work often needs to prepare state that a synchronous fast hook can use without replaying events or waiting on async code.
+Async plugin work often needs to prepare state that a synchronous policy hook can use without replaying events or waiting on async code.
 
 Manifold should provide a host-owned publication area for this. The publication area is not shared mutable WASM memory and it is not a message queue. It is an immutable latest-state surface maintained by the host for a plugin instance.
 
@@ -103,7 +103,7 @@ async plugin worker
   -> publishes immutable payload to a slot
   -> host atomically publishes a new composite root
 
-fast hook
+policy provider
   -> receives the current root reference
   -> reads the default slot or a named slot
   -> returns a bounded decision immediately
@@ -138,19 +138,19 @@ publish(some("editor"), EditorNavState { target })
 publish(some("git"), GitNavState { target })
 ```
 
-The host should internally retain enough old generations to keep fast-hook references valid for the duration of a call. The internal representation may use a publication log, linked nodes, or another RCU-like structure, but the fast hook should only see the current immutable root.
+The host should internally retain enough old frames to keep sync-policy references valid for the duration of a call. The internal representation may use an Arc linked list, publication log, ring, or another RCU-like structure, but the policy provider should only see the current immutable root.
 
 Host guarantees:
 
 - publish is atomic
 - published records are immutable
-- fast-hook references remain valid for the hook call
-- each publish receives a monotonic generation
+- sync-policy references remain valid for the hook call
+- host metadata is sufficient to trace and debug frame publication without making generation numbers part of the plugin contract
 - payload size, slot count, and reference depth are bounded
 - malformed payloads are rejected before becoming visible
 - trapping plugin code cannot corrupt host or plugin publication state
 
-Published fast-path state should contain materialized decisions, not event history. Events remain the ordered stream of what happened. Published slots are the latest cache of what the plugin wants latency-sensitive hooks to see.
+Published sync-path state should contain materialized decisions, not event history. Events remain the ordered stream of what happened. Published slots are the latest cache of what the plugin wants latency-sensitive hooks to see.
 
 ## Transactions And Events
 
@@ -159,19 +159,19 @@ Manifold should treat backend observations and user input as candidate workspace
 ```text
 observe backend/input/control event
 build pending transaction
-run relevant fast hooks
+run relevant policy providers
 resolve hook decisions
 commit one workspace transaction
 emit durable workspace events
-deliver events to async modules
+deliver events to async actors
 apply returned command requests through the command executor
 ```
 
-This keeps Manifold as the only committer. Hooks and async modules can propose decisions or request commands, but they do not directly mutate compositor, presentation, or workspace state.
+This keeps Manifold as the only committer. Hooks and async actors can propose decisions or request commands, but they do not directly mutate compositor, presentation, or workspace state.
 
 ## Claim Resolution
 
-Fast lane hooks should not take ownership directly. They should return claims that Manifold resolves once.
+Sync policy hooks should not take ownership directly. They should return claims that Manifold resolves once.
 
 ```rust
 enum PolicyDecision {
@@ -193,7 +193,7 @@ For example, on a managed app map event:
 ```text
 surface mapped
   -> PendingPane { surface, app_id, title, pid, ... }
-  -> fast hooks return claim/place/deny decisions
+  -> policy providers return claim/place/deny decisions
   -> host resolves the winning namespace and placement request
   -> host commits PaneOpened with final owner
   -> losing hooks receive PaneClaimRejected or observe PaneOpened with final owner
@@ -226,7 +226,7 @@ For controller-backed bindings:
 ```text
 key input
   -> host matches shortcut
-  -> fast lane may resolve or rewrite the command
+  -> policy provider may resolve or rewrite the command
   -> host emits ShortcutInvoked
   -> async controller may request follow-up commands
 ```
@@ -238,25 +238,25 @@ The first implementation should keep shortcut bindings in normal mode only. That
 The first native implementation can avoid Wasmtime while proving the API:
 
 - route existing normal-mode commands through a `WorkspaceCommand` executor
-- add a native fast hook registry
+- add a native policy provider registry
 - add a native async controller queue or mock executor
 - expose hook and command counters through `status-json`
 
 When Wasmtime is added:
 
 - use one host-owned command/event model for both lanes
-- keep fast lane instances separate from async lane instances
-- use strict Wasmtime limits for fast hooks
+- keep policy provider instances separate from async actor lane instances
+- use strict Wasmtime limits for policy providers
 - run async guest calls on the async runtime
 - send all command requests back to the calloop/session thread
 
-The fast lane should be an admission-controlled feature. A module should have to declare fast hooks in its manifest and receive explicit capabilities for them.
+The policy provider should be an admission-controlled feature. A module should have to declare sync hooks in its manifest and receive explicit capabilities for them.
 
 ## Diagnostics
 
 Both lanes need separate diagnostics.
 
-Fast lane counters:
+Policy provider counters:
 
 - registered hooks
 - hook calls
@@ -268,7 +268,7 @@ Fast lane counters:
 - claims rejected
 - policy denials
 
-Async lane counters:
+Apolicy provider counters:
 
 - registered modules
 - event queue length
@@ -283,6 +283,6 @@ These should eventually appear in `status-json` so real workload tests can verif
 
 ## Design Rule
 
-Use the fast lane only when Manifold needs a decision before committing workspace state. Use the async lane for everything else.
+Use a policy provider only when Manifold needs a decision before committing workspace state. Use the async actor lane for everything else.
 
 That preserves consistency for map, focus, command, and shortcut policy while keeping ordinary plugin work isolated from latency-sensitive paths.

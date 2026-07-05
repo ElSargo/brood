@@ -1,8 +1,8 @@
 # WASM Realms
 
-This page records the current target design for WASM realm kinds, binding rules, and cross-realm interaction.
+This archived page records an earlier target design for WASM realm kinds, binding rules, and cross-realm interaction.
 
-Use [WASM Integration](wasm-integration.md) as the canonical overview for the broader app and module model.
+Use [Plugin](../concepts/plugin.md) and [Plugin Runtime](../systems/plugin-runtime.md) for the current target plugin model. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
 In this design, a realm is an API and lifetime contract for a WASM module instance. It is not a separate trust boundary and it does not replace the workspace and session object model.
 
@@ -140,10 +140,11 @@ The initial built-in primitives should be:
 
 - a registry
 - mailbox-style messaging
+- plugin-scoped publications for latest-state publication to policy providers
 
 These should prefer instance ids as the default addressing model. Higher-level aliases or named services may be layered on top later through the registry or through a global broker module.
 
-RPC can remain a later addition if real workloads prove it necessary. The first coordination model should stay asynchronous and actor-like.
+RPC can remain a later addition if real workloads prove it necessary. The first coordination model should stay asynchronous and actor-like, with policy providers reserved for immediate host decisions rather than general RPC.
 
 ## Event Shape
 

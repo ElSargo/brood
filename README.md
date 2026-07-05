@@ -11,14 +11,14 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 - managed apps and session state survive presentation window close/reopen
 - editor, browser, terminal, agent, git, and app panes share one pane model
 - browser and Wayland app surfaces are composited as first-class panes
-- built-in apps can be sandboxed WASM modules that emit native scene primitives
+- built-in apps can be sandboxed plugins, often WASM-backed, that describe native component panes or scene primitives
 
 ## Initial Shape
 
 - `manifold`: authoritative local session process and MVP presentation owner.
 - `manifold-client`: deferred presentation endpoint for future isolation or multi-window attach experiments.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
-- WASM apps: sandboxed built-in or user applications that emit scene patches.
+- plugins/WASM apps: sandboxed built-in or user applications that use actor mailboxes, optional sync policy lanes, and host-rendered UI or scene patches.
 
 ## Current Status
 
@@ -40,10 +40,10 @@ The intended default behavior-testing mode is nested Manifold-in-Manifold execut
 
 ## Common Commands
 
-Run the project:
+Run the project through the Nix development shell:
 
 ```sh
-cargo run
+nix develop --command cargo run
 ```
 
 By default this starts `manifold run`, attaches a presentation surface, and
@@ -53,16 +53,16 @@ first checks the XDG config location and then falls back to the checked-in
 config enables the local `dev` WASM key handler when its built `.wasm` artifact
 exists and starts the pi agent workspace pane.
 
-Run Rust unit tests:
+Run Rust unit tests through Nix:
 
 ```sh
-cargo test
+nix develop --command cargo test
 ```
 
-Run Manifold behavior tests:
+Run Manifold behavior tests through Nix:
 
 ```sh
-cargo run -- test
+nix develop --command cargo run -- test
 ```
 
 Behavior tests own their presentation policy. Outside Manifold, the default test topology starts an offscreen-attached outer supervisor and a normal subject compositor inside it, so graphical behavior can be exercised without opening a host OS window. Inside a managed Manifold session, `manifold_session` is present, so the test command skips the extra outer supervisor and starts only the subject compositor.
@@ -70,7 +70,7 @@ Behavior tests own their presentation policy. Outside Manifold, the default test
 For automated graphical behavior checks, keep using `test`, for example:
 
 ```sh
-cargo run -- test nested --inner-command 'weston-simple-egl -f'
+nix develop --command cargo run -- test nested --inner-command 'weston-simple-egl -f'
 ```
 
 The outer supervisor is offscreen-attached unless `--outer-headful` is explicitly
@@ -81,12 +81,12 @@ development and opens a presentation window on the current desktop.
 Run the session service without attaching it to a desktop presentation:
 
 ```sh
-cargo run -- run --headless
+nix develop --command cargo run -- run --headless
 ```
 
 `run --headless` is for service managers and long-lived runtime processes, such as a future systemd unit. Use `test` rather than `run --headless` for behavior validation.
 
-The repo also includes `flake.nix`. Its default package is the Manifold app; heavier development environments are exposed through explicit `full` outputs.
+The repo includes `flake.nix`, and checked-in development workflows should prefer it for builds and tests. Its default package is the Manifold app; heavier development environments are exposed through explicit `full` outputs.
 
 Start the one-line development workflow from Nix:
 
@@ -108,13 +108,13 @@ nix run github:ElSargo/manifold#dev-workflow-full
 Useful variants:
 
 ```sh
-cargo run -- check
-cargo run -- run --no-default-modules
-cargo run -- run --config ./manifold.toml
-cargo run -- ctl status-json
-cargo run -- test
-cargo run -- test nested
-cargo run -- test nested --force-outer
+nix develop --command cargo run -- check
+nix develop --command cargo run -- run --no-default-modules
+nix develop --command cargo run -- run --config ./manifold.toml
+nix develop --command cargo run -- ctl status-json
+nix develop --command cargo run -- test
+nix develop --command cargo run -- test nested
+nix develop --command cargo run -- test nested --force-outer
 ```
 
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
@@ -132,6 +132,10 @@ The docs are organized as a wiki-style knowledge base.
 - [Testing](docs/systems/testing.md)
 - [Configuration](docs/systems/configuration.md)
 - [Extension Host](docs/systems/extension-host.md)
+- [Plugin Runtime Target](docs/systems/plugin-runtime.md)
+- [Input And Shortcuts Target](docs/systems/input-shortcuts.md)
+- [Layout Policy Target](docs/systems/layout-policy.md)
+- [Plugin UI Target](docs/systems/plugin-ui.md)
 - [CLI Reference Pointers](docs/reference/cli.md)
 - [Decision Records](docs/decisions/README.md)
 

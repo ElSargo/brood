@@ -25,20 +25,40 @@ A unit of presentation in a Manifold workspace whose state lives behind a layer 
 _Avoid_: app, process, native child window, tab
 
 **Pane producer**:
-Anything that can create or supply content for one or more panes, including a supervised pane client process, a managed app surface, or a WASM program.
-_Avoid_: plugin, renderer
+Anything that can create or supply content for one or more panes, including a supervised pane client process, a managed app surface, or a plugin/WASM program.
+_Avoid_: treating plugin, actor, process, renderer, or pane as interchangeable
 
 **Pane client**:
 A supervised process that produces scene data or surfaces for one or more panes.
 _Avoid_: native child window, OS window
 
+**Plugin**:
+A capability-scoped extension package that may contain async actors, sync policy lanes, pane producers, UI views, commands, and private internal workers.
+_Avoid_: pane, process, renderer, compositor plugin
+
+**Plugin actor**:
+The normal host-visible unit of plugin execution. Actors receive mailbox messages and request host work through capability-checked APIs.
+_Avoid_: sync policy lane, thread, direct host callback
+
+**Mailbox**:
+The host-provided durable message path between actors, host services, panes, and other granted targets.
+_Avoid_: sync key/layout path, shared mutable memory
+
+**Sync policy lane**:
+A special plugin-owned synchronous routine that the host may invoke for immediate pre-commit decisions such as key routing or layout. It reads immutable published state and returns a bounded answer plus messages.
+_Avoid_: actor, background worker, blocking RPC
+
+**Swapchain**:
+A host-owned latest-state publication path. Plugin actors ask the host to append immutable frames; sync policy lanes read the latest valid frame without draining a queue.
+_Avoid_: event log, mailbox, shared mutable heap
+
 **WASM app host**:
-The session-process component that loads sandboxed WASM modules, grants capabilities, calls module lifecycle functions, and applies their requested workspace or scene changes.
-_Avoid_: plugin runner, renderer
+The session-process component that loads sandboxed WASM modules, grants capabilities, calls module lifecycle functions, and applies their requested workspace, scene, or plugin-runtime changes.
+_Avoid_: renderer, compositor plugin
 
 **WASM controller**:
-A WASM module that changes workspace behavior through host APIs, such as focus rules, presentation requests, commands, or automation.
-_Avoid_: compositor plugin
+A WASM-backed plugin role that changes workspace behavior through host APIs, such as focus rules, presentation requests, commands, sync policy lanes, or automation.
+_Avoid_: compositor plugin, direct state mutator
 
 **WASM pane app**:
 A WASM module that owns durable app state in the session process and may create any number of panes by producing scene patches.
@@ -63,6 +83,10 @@ _Avoid_: session, pane owner
 **Presentation request**:
 A message from a pane producer to a presentation surface describing desired presentation behavior, such as size, grouping, modality, attention, or placement hints.
 _Avoid_: layout command, guaranteed placement
+
+**Native component pane**:
+A plugin pane whose content is described as host-rendered components instead of plugin-drawn pixels.
+_Avoid_: webview requirement, raw framebuffer by default
 
 **Session DBus proxy**:
 A session-scoped DBus bridge for external apps that need normal desktop-style communication inside a Manifold session.
@@ -132,14 +156,19 @@ _Avoid_: ambient permission, unrestricted access
 - A **WASM pane app** can create any number of **panes** without being one pane itself.
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
 - **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with correctness fallbacks.
-- The **WASM app host** should talk to Manifold through workspace, scene, event, storage, and capability APIs rather than Smithay, Weston, or renderer internals.
+- The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, Weston, or renderer internals.
+- A **plugin** may contain multiple **plugin actors** and optional **sync policy lanes**.
+- **Mailbox** delivery is the normal path for durable plugin work; **swapchains** are the latest-state path for sync policy decisions.
+- **Sync policy lanes** are only for immediate host pre-commit decisions and must not block on actor queues or mutate host state directly.
+- The host owns final shortcut routing, accepted layout, pane lifecycle, native chrome, focus, hit testing, and rendering.
 
 ## Flagged Ambiguities
 
 - "hosted app" is too narrow. Use **managed app** for the product concept, and **hosted Wayland app** for the nested Wayland implementation.
 - "managed app" should not be used for WASM-hosted UI. Use **WASM pane app** for sandboxed UI modules whose state lives in the session process.
-- "pane" should not imply the state owner. A pane is the presentation unit; the state may live in a WASM module, external process, session model, browser runtime, or other producer behind indirection.
-- "layout" should not imply session-owned pane state. Layout, visibility, dragging, and animation are presentation-surface concerns unless explicitly saved as workspace preferences.
+- "pane" should not imply the state owner. A pane is the presentation unit; the state may live in a plugin, WASM module, external process, session model, browser runtime, or other producer behind indirection.
+- "plugin" should not imply one actor, one pane, one thread, or direct compositor authority. A plugin package can expose multiple actors, sync policy lanes, pane producers, and UI views behind host-owned boundaries.
+- "layout" should not imply session-owned pane state. Layout, visibility, dragging, and animation are presentation-surface concerns unless explicitly saved as workspace preferences. Plugins may propose layout through sync policy lanes, but the host owns the accepted layout.
 - "presentation request" should not imply authority. Producers can ask for presentation behavior, but the presentation surface decides what is possible and appropriate.
 - "session trust boundary" is not a claim of internet-safe multi-user security. It is the first-phase local trust model for isolating sessions from each other.
 - "DBus proxy" should mean session-scoped mediation. Avoid implying unmanaged access to the host user's global DBus session.

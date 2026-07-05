@@ -2,20 +2,33 @@ use tracing::warn;
 
 use crate::{layout::LayoutAction, state::Manifold};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceCommand {
     Layout(LayoutAction),
     SpawnApp(Vec<String>),
     FocusPane(u64),
-    FocusOrSpawnApp { app_id: String, argv: Vec<String> },
+    FocusOrSpawnApp {
+        app_id: String,
+        argv: Vec<String>,
+    },
+    SetResolvedLayout {
+        layout: crate::layout::ResolvedLayout,
+        focus: Option<u64>,
+    },
     Surface(SurfaceCommand),
+    Input(InputCommand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceCommand {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
-    CloseActiveSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCommand {
+    ToggleShortcutPassthrough,
+    SetShortcutPassthrough(bool),
 }
 
 impl WorkspaceCommand {
@@ -31,7 +44,11 @@ impl WorkspaceCommand {
             },
             Self::FocusPane(pane) => state.focus_pane(pane),
             Self::FocusOrSpawnApp { app_id, argv } => state.focus_app_id_or_spawn(&app_id, &argv),
+            Self::SetResolvedLayout { layout, focus } => {
+                state.apply_plugin_resolved_layout(layout, focus)
+            }
             Self::Surface(command) => command.apply(state),
+            Self::Input(command) => command.apply(state),
         }
     }
 }
@@ -44,7 +61,18 @@ impl SurfaceCommand {
                 state.create_and_attach_surface_session();
                 true
             }
-            Self::CloseActiveSession => state.close_active_surface_session(),
+        }
+    }
+}
+
+impl InputCommand {
+    fn apply(self, state: &mut Manifold) -> bool {
+        match self {
+            Self::ToggleShortcutPassthrough => {
+                state.toggle_shortcut_passthrough();
+                true
+            }
+            Self::SetShortcutPassthrough(enabled) => state.set_shortcut_passthrough(enabled),
         }
     }
 }

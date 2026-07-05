@@ -1714,6 +1714,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "manifold-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
 name = "manifoldd"
 version = "0.1.0"
 dependencies = [
@@ -1722,6 +1735,7 @@ dependencies = [
  "calloop-wayland-source 0.4.1",
  "clap",
  "image",
+ "manifold-wasm",
  "serde",
  "serde_json",
  "smithay",

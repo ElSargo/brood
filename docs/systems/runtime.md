@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
@@ -24,7 +24,7 @@ Current high-level startup order:
 - create the `Manifold` state and Wayland display
 - optionally clear the initial surface session
 - load config modules unless disabled
-- load CLI-specified WASM lanes
+- load CLI-specified prototype WASM lanes
 - start the DBus control service
 - print `WAYLAND_DISPLAY` and DBus endpoint variables
 - attach offscreen, attach Winit presentation, or remain headless
@@ -48,5 +48,6 @@ Offscreen presentation is used by nested tests so composition can run without cr
 
 - [[configuration]]
 - [[testing]]
+- [[plugin-runtime]]
 - [[../workflows/run-manifold]]
 - [[../workflows/enter-session]]

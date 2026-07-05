@@ -65,7 +65,7 @@ test topology with an inner client command and a temporary artifact directory,
 then inspects the printed DBus control endpoints, status, logs, and debug dumps:
 
 ```sh
-cargo run -- test nested --out-dir /tmp/manifold-test --inner-command 'weston-simple-egl -f'
+nix develop --command cargo run -- test nested --out-dir /tmp/manifold-test --inner-command 'weston-simple-egl -f'
 ```
 
 Use `--keep-running` only when the verification script also cleans up the

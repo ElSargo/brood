@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/config.rs
   - manifold.toml
@@ -31,10 +31,12 @@ Current section families:
 - `[startup.<id>]` for startup hosted apps
 - `[session.runner]` for project environment activation
 
-Current module kinds:
+Current module kinds are prototype WASM lanes:
 
 - `fast-key-handler`
 - `fast-map-hook`
+
+The target plugin configuration should move from these lane-specific module kinds to plugin manifests that declare actors, capabilities, policy providers, actions, pane types, and publications.
 
 Startup apps can target the session realm or presentation realm. Presentation startup apps remain available when an auto-started global control server skips creating its own initial surface session.
 
@@ -42,4 +44,5 @@ Startup apps can target the session realm or presentation realm. Presentation st
 
 - [[../reference/config-schema]]
 - [[runtime]]
+- [[plugin-runtime]]
 - [[../concepts/session-runner]]

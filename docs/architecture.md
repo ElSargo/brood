@@ -2,7 +2,7 @@
 status: canonical
 type: system-map
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
@@ -55,6 +55,12 @@ Hosted Wayland apps connect to Manifold's nested Wayland compositor. Manifold tr
 
 User-facing commands such as `enter`, `show`, `hide`, `list`, `switch`, `plug`, and `ctl` resolve a DBus control target. The default target is the entered session when available, otherwise the global Manifold session server. See [[systems/dbus-control]] and [[reference/cli]].
 
-## Extension Boundary
+## Plugin And Extension Boundary
 
-WASM and extension APIs should operate on workspace, session, pane, command, status, and layout concepts. They should not expose Smithay, Winit, EGL, DMA-BUF, or renderer internals as the product API. See [[systems/extension-host]].
+The target plugin architecture is actor-oriented. Normal plugin behavior runs through host-provided mailboxes, registry entries, capability checks, and native APIs. Latency-critical keyboard, focus, map, and layout decisions use policy providers that read immutable published state and return bounded decision envelopes.
+
+WASM and extension APIs should operate on workspace, session, pane, command, status, input, and layout concepts. They should not expose Smithay, Winit, EGL, DMA-BUF, or renderer internals as the product API.
+
+The host owns final commits, shortcut routing, accepted layout validation, pane lifecycle, native chrome, hit testing, focus, and rendering. Plugins can request commands, send messages, publish latest state, and propose layouts or UI trees, but the host validates and applies accepted results.
+
+See [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-policy]], [[systems/plugin-ui]], and [[systems/extension-host]].

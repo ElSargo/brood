@@ -2,14 +2,15 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-03
 code-links:
   - crates/manifoldd/src/lib.rs
+  - crates/manifoldd/src/control.rs
 ---
 
 # CLI Reference Pointers
 
-Exact CLI flags, defaults, aliases, and hidden test options are defined in `crates/manifoldd/src/lib.rs`.
+Exact top-level CLI flags, defaults, aliases, and hidden test options are defined in `crates/manifoldd/src/lib.rs`. `ctl` subcommands and typed DBus helper commands are defined in `crates/manifoldd/src/control.rs`.
 
 Current top-level commands:
 

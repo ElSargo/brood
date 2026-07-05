@@ -68,3 +68,8 @@ warnings without pretending these areas are already structurally clean.
 - `crates/manifoldd/src/wasm_test.rs`: harness process lifecycle is procedural
   and relies on best-effort child cleanup. The target design should model child
   handles, lifecycle events, and cleanup results explicitly.
+- Target-shape WASM plugin actor loading is wired enough for interactive testing,
+  but reload/lifecycle ownership is still provisional. Actor tasks currently run
+  indefinitely without cancellation handles, reloading a module with the same
+  actor names can fail registry registration, and pane-mapped events are
+  broadcast to all WASM actors rather than subscription-routed.

@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::{state::Manifold, wasm_key::WasmKeyHandler, wasm_map::WasmMapHook};
+use crate::state::Manifold;
 
 const MANIFOLD_CONFIG_ENV: &str = "MANIFOLD_CONFIG";
 
@@ -138,7 +138,6 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
     }
 
     let config = read_config(config_path)?;
-    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
     for (id, module) in config.module {
         if !module.enabled {
@@ -147,46 +146,34 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
         }
 
         match module.kind.as_str() {
-            "fast-key-handler" => {
-                let module_path = resolve_path(config_dir, &module.path);
+            "wasm-plugin" | "plugin" => {
+                let module_path = resolve_path(
+                    config_path.parent().unwrap_or_else(|| Path::new(".")),
+                    &module.path,
+                );
                 if !module_path.exists() {
                     warn!(
                         module = %id,
                         path = %module_path.display(),
-                        "configured WASM key handler does not exist; skipping module"
+                        "configured WASM plugin does not exist; skipping module"
                     );
                     continue;
                 }
-                state.wasm_key_handler = Some(
-                    WasmKeyHandler::load(&module_path)
-                        .with_context(|| format!("load config module {id}"))?,
-                );
+                state
+                    .replace_wasm_plugin(&module_path)
+                    .with_context(|| format!("load config module {id}"))?;
                 info!(
                     module = %id,
                     path = %module_path.display(),
                     capabilities = ?module.capabilities,
-                    "loaded config WASM key handler"
+                    "loaded config WASM plugin"
                 );
             }
-            "fast-map-hook" => {
-                let module_path = resolve_path(config_dir, &module.path);
-                if !module_path.exists() {
-                    warn!(
-                        module = %id,
-                        path = %module_path.display(),
-                        "configured WASM map hook does not exist; skipping module"
-                    );
-                    continue;
-                }
-                state.wasm_map_hook = Some(
-                    WasmMapHook::load(&module_path)
-                        .with_context(|| format!("load config module {id}"))?,
-                );
-                info!(
+            "fast-key-handler" | "fast-map-hook" => {
+                warn!(
                     module = %id,
-                    path = %module_path.display(),
-                    capabilities = ?module.capabilities,
-                    "loaded config WASM map hook"
+                    kind = %module.kind,
+                    "legacy WASM module kind is no longer supported; skipping module"
                 );
             }
             unsupported => {
