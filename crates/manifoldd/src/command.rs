@@ -2,12 +2,19 @@ use tracing::warn;
 
 use crate::{layout::LayoutAction, state::Manifold};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceCommand {
     Layout(LayoutAction),
     SpawnApp(Vec<String>),
     FocusPane(u64),
-    FocusOrSpawnApp { app_id: String, argv: Vec<String> },
+    FocusOrSpawnApp {
+        app_id: String,
+        argv: Vec<String>,
+    },
+    SetResolvedLayout {
+        layout: crate::layout::ResolvedLayout,
+        focus: Option<u64>,
+    },
     Surface(SurfaceCommand),
     Input(InputCommand),
 }
@@ -37,6 +44,9 @@ impl WorkspaceCommand {
             },
             Self::FocusPane(pane) => state.focus_pane(pane),
             Self::FocusOrSpawnApp { app_id, argv } => state.focus_app_id_or_spawn(&app_id, &argv),
+            Self::SetResolvedLayout { layout, focus } => {
+                state.apply_plugin_resolved_layout(layout, focus)
+            }
             Self::Surface(command) => command.apply(state),
             Self::Input(command) => command.apply(state),
         }

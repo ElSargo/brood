@@ -4,6 +4,7 @@ use core::{panic::PanicInfo, ptr, slice};
 
 const HEAP_BYTES: usize = 256 * 1024;
 const RESPONSE_BYTES: usize = 64 * 1024;
+const OUTBOX_BYTES: usize = 64 * 1024;
 const OUTPUT_ERROR: i32 = -1;
 const OUTPUT_ABSTAIN: i32 = 0;
 const OUTPUT_OK: i32 = 1;
@@ -47,7 +48,13 @@ static mut HEAP: [u8; HEAP_BYTES] = [0; HEAP_BYTES];
 static mut HEAP_CURSOR: usize = 0;
 static mut RESPONSE: [u8; RESPONSE_BYTES] = [0; RESPONSE_BYTES];
 static mut RESPONSE_DESC: [i32; 4] = [0; 4];
+static mut OUTBOX: [u8; OUTBOX_BYTES] = [0; OUTBOX_BYTES];
 static mut WORKSPACE_INPUT_MODE: i32 = INPUT_MODE_PASSTHROUGH;
+
+#[link(wasm_import_module = "manifold")]
+unsafe extern "C" {
+    fn read_message() -> i32;
+}
 
 #[no_mangle]
 pub extern "C" fn manifold_arena_alloc(capacity: i32, align: i32) -> i32 {
@@ -164,6 +171,32 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
         _ => return write_consume(output, &[]),
     };
     write_consume(output, messages)
+}
+
+#[no_mangle]
+pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32, _inbox_cap: i32) -> i64 {
+    let message_len = unsafe { read_message() };
+    if message_len <= 0 {
+        return 0;
+    }
+    let Some(message) = guest_slice(inbox_ptr, message_len) else {
+        return -2;
+    };
+    if find_after(message, br#""type":"layout-state""#).is_none() {
+        return 0;
+    }
+    let output = outbox_buffer_mut();
+    let mut panes = [0_u64; 64];
+    let pane_count = parse_visible_panes(message, &mut panes);
+    if pane_count == 0 {
+        return 0;
+    }
+    let focus = parse_optional_u64_field(message, b"\"focused_pane\":");
+    let len = write_layout_actor_outbox(output, &panes[..pane_count], focus);
+    if len <= 0 {
+        return -2;
+    }
+    pack_actor_outbox(output.as_ptr() as i32, len)
 }
 
 #[no_mangle]
@@ -300,6 +333,83 @@ enum Message<'a> {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
+}
+
+fn write_layout_actor_outbox(output: &mut [u8], panes: &[u64], focus: Option<u64>) -> i32 {
+    let mut writer = Writer::new(output);
+    writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    let mut payload = PayloadWriter::new(&mut writer);
+    write_set_resolved_layout_payload(&mut payload, panes, focus);
+    writer.bytes(br#"]}],"publications":[{"payload":["#);
+    let mut publication = PayloadWriter::new(&mut writer);
+    publication.bytes(br#"{"kind":"workspace-state","mode":"#);
+    publication.u64(workspace_input_mode() as u64);
+    publication.bytes(br#", "panes":["#);
+    let mut index = 0;
+    while index < panes.len() {
+        if index > 0 {
+            publication.byte(b',');
+        }
+        publication.u64(panes[index]);
+        index += 1;
+    }
+    publication.bytes(br#"]}"#);
+    writer.bytes(br#"]}]}"#);
+    writer.finish()
+}
+
+fn write_set_resolved_layout_payload(
+    payload: &mut PayloadWriter<'_, '_>,
+    panes: &[u64],
+    focus: Option<u64>,
+) {
+    payload.bytes(br#"{"type":"set-resolved-layout","layout":{"items":["#);
+    let pane_count = panes.len();
+    if pane_count == 1 {
+        write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, 2.0, 2.0);
+    } else if pane_count > 1 {
+        write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, 1.0, 2.0);
+        let each = 2.0 / ((pane_count - 1) as f32);
+        let mut index = 1;
+        while index < pane_count {
+            payload.byte(b',');
+            write_pane_item_payload(
+                payload,
+                panes[index],
+                index as f32,
+                0.0,
+                -1.0 + each * ((index - 1) as f32),
+                1.0,
+                each,
+            );
+            index += 1;
+        }
+    }
+    payload.bytes(br#"]},"focus":"#);
+    if let Some(focus) = focus {
+        payload.u64(focus);
+    } else {
+        payload.bytes(b"null");
+    }
+    payload.byte(b'}');
+}
+
+fn write_pane_item_payload(
+    payload: &mut PayloadWriter<'_, '_>,
+    pane: u64,
+    z: f32,
+    offset_u: f32,
+    offset_v: f32,
+    size_u: f32,
+    size_v: f32,
+) {
+    let mut item = [0_u8; 512];
+    let mut writer = Writer::new(&mut item);
+    write_pane_item(&mut writer, pane, z, offset_u, offset_v, size_u, size_v);
+    let len = writer.finish();
+    if len > 0 {
+        payload.bytes(&item[..len as usize]);
+    }
 }
 
 fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
@@ -472,6 +582,23 @@ impl<'a, 'b> PayloadWriter<'a, 'b> {
         self.output.u64(byte as u64);
     }
 
+    fn u64(&mut self, mut value: u64) {
+        let mut digits = [0_u8; 20];
+        let mut len = 0;
+        loop {
+            digits[len] = b'0' + (value % 10) as u8;
+            len += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        while len > 0 {
+            len -= 1;
+            self.byte(digits[len]);
+        }
+    }
+
     fn bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.byte(*byte);
@@ -611,6 +738,10 @@ fn response_buffer_mut() -> &'static mut [u8] {
     unsafe { slice::from_raw_parts_mut(ptr::addr_of_mut!(RESPONSE).cast::<u8>(), RESPONSE_BYTES) }
 }
 
+fn outbox_buffer_mut() -> &'static mut [u8] {
+    unsafe { slice::from_raw_parts_mut(ptr::addr_of_mut!(OUTBOX).cast::<u8>(), OUTBOX_BYTES) }
+}
+
 fn finish_response(written: i32) -> i32 {
     if written <= 0 {
         return written;
@@ -626,6 +757,13 @@ fn finish_response(written: i32) -> i32 {
 
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
+}
+
+fn pack_actor_outbox(ptr: i32, len: i32) -> i64 {
+    if ptr <= 0 || len <= 0 {
+        return -2;
+    }
+    ((ptr as i64) << 32) | (len as u32 as i64)
 }
 
 #[panic_handler]

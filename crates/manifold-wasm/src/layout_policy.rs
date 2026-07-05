@@ -147,7 +147,18 @@ impl WasmLayoutPolicy {
             "policy provider {:?} is not a layout provider",
             declaration.name
         );
-        let linker = Linker::new(&engine);
+        let mut linker = Linker::new(&engine);
+        linker
+            .func_wrap(
+                crate::HOST_IMPORT_MODULE,
+                crate::READ_MESSAGE_IMPORT,
+                || -> i32 { crate::READ_MESSAGE_CLOSED },
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "define inert actor read_message import for policy provider module: {err}"
+                )
+            })?;
         let mut store = Store::new(&engine, ());
         let instance = linker
             .instantiate(&mut store, module)

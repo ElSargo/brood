@@ -830,6 +830,28 @@ impl Manifold {
         })
     }
 
+    fn emit_wasm_layout_snapshot_event(&mut self, extra_pane: Option<u64>) {
+        let mut visible_panes = self.active_surface_session_panes();
+        if let Some(extra_pane) = extra_pane
+            && !visible_panes.contains(&extra_pane)
+        {
+            visible_panes.push(extra_pane);
+        }
+        let size = self.presentation_layout_size();
+        let panes = visible_panes
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let focused = self
+            .focused_pane()
+            .map_or_else(|| "null".to_string(), |pane| pane.to_string());
+        self.emit_wasm_actor_event_to_all(format!(
+            r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"size":{{"w":{},"h":{}}}}}"#,
+            panes, focused, size.w, size.h
+        ));
+    }
+
     fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
         let actor_names = self.wasm_actor_names.clone();
         for actor in actor_names {
@@ -2100,47 +2122,20 @@ impl Manifold {
     }
 
     fn refresh_resolved_layout_from_policy_with_extra_pane(&mut self, extra_pane: Option<u64>) {
-        if self.wasm_layout_policy.is_none() {
+        if self.wasm_actor_names.is_empty() {
             self.refresh_resolved_layout_from_native_policy();
             return;
         }
-        let mut visible_panes = self.active_surface_session_panes();
-        if let Some(extra_pane) = extra_pane
-            && !visible_panes.contains(&extra_pane)
-        {
-            visible_panes.push(extra_pane);
-        }
-        let focused_pane = self.focused_pane();
-        let size = self.presentation_layout_size();
-        let input = manifold_wasm::LayoutPolicyInput::new(
-            visible_panes,
-            focused_pane,
-            manifold_wasm::LayoutSize {
-                w: size.w,
-                h: size.h,
-            },
-        );
-        let publication = self.latest_wasm_policy_state_publication();
-        let policy = self
-            .wasm_layout_policy
-            .as_mut()
-            .expect("checked wasm layout policy presence");
-        let outcome = match policy.resolve_layout(input, publication.as_ref()) {
-            Ok(Some(outcome)) => outcome,
-            Ok(None) => {
-                self.refresh_resolved_layout_from_native_policy();
-                return;
-            }
-            Err(err) => {
-                warn!(?err, "WASM layout policy failed; using native fallback");
-                self.refresh_resolved_layout_from_native_policy();
-                return;
-            }
-        };
-        self.apply_map_hook_resolved_layout(
-            convert_wasm_resolved_layout(outcome.layout),
-            outcome.focus,
-        );
+        self.emit_wasm_layout_snapshot_event(extra_pane);
+    }
+
+    pub fn apply_plugin_resolved_layout(
+        &mut self,
+        layout: ResolvedLayout,
+        focus: Option<u64>,
+    ) -> bool {
+        self.apply_map_hook_resolved_layout(layout, focus).is_some()
+            || self.resolved_layout_source == ResolvedLayoutSource::WasmPolicy
     }
 
     fn apply_map_hook_resolved_layout(
@@ -3567,15 +3562,12 @@ impl Manifold {
             info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
         }
 
-        if let Some(provider) = select_policy_provider(
-            &inventory.policy_providers,
-            manifold_wasm::PolicyProviderKind::Layout,
-            "tile",
-        )? {
-            self.wasm_layout_policy = Some(manifold_wasm::WasmLayoutPolicy::load_from_module(
-                engine, &module, provider,
-            )?);
-            info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin layout policy");
+        for provider in inventory
+            .policy_providers
+            .iter()
+            .filter(|provider| provider.kind == manifold_wasm::PolicyProviderKind::Layout)
+        {
+            info!(provider = %provider.name, path = %path.display(), "discovered WASM plugin layout policy (message-based layout is preferred)");
         }
 
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
@@ -5325,6 +5317,12 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
         }
         manifold_wasm::HostMessage::SetShortcutPassthrough { enabled } => {
             WorkspaceCommand::Input(InputCommand::SetShortcutPassthrough(enabled))
+        }
+        manifold_wasm::HostMessage::SetResolvedLayout { layout, focus } => {
+            WorkspaceCommand::SetResolvedLayout {
+                layout: convert_wasm_resolved_layout(layout),
+                focus,
+            }
         }
     })
 }

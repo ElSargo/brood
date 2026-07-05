@@ -45,17 +45,32 @@ pub enum GlobalKeyDecision {
     ForwardWithModifiers,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum HostMessage {
-    LayoutAction { action: String },
-    FocusPane { pane: u64 },
-    SpawnApp { argv: Vec<String> },
-    FocusOrSpawnApp { app_id: String, argv: Vec<String> },
+    LayoutAction {
+        action: String,
+    },
+    FocusPane {
+        pane: u64,
+    },
+    SpawnApp {
+        argv: Vec<String>,
+    },
+    FocusOrSpawnApp {
+        app_id: String,
+        argv: Vec<String>,
+    },
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
-    SetShortcutPassthrough { enabled: bool },
+    SetShortcutPassthrough {
+        enabled: bool,
+    },
+    SetResolvedLayout {
+        layout: crate::layout_policy::ResolvedLayout,
+        focus: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +143,18 @@ impl WasmGlobalKeyPolicy {
             "policy provider {:?} is not a key provider",
             declaration.name
         );
-        let linker = Linker::new(&engine);
+        let mut linker = Linker::new(&engine);
+        linker
+            .func_wrap(
+                crate::HOST_IMPORT_MODULE,
+                crate::READ_MESSAGE_IMPORT,
+                || -> i32 { crate::READ_MESSAGE_CLOSED },
+            )
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "define inert actor read_message import for policy provider module: {err}"
+                )
+            })?;
         let mut store = Store::new(&engine, ());
         let instance = linker
             .instantiate(&mut store, module)
