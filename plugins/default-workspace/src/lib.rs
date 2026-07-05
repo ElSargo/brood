@@ -199,52 +199,6 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32
     pack_actor_outbox(output.as_ptr() as i32, len)
 }
 
-#[no_mangle]
-pub extern "C" fn manifold_policy_provider_layout_tile(
-    query_ptr: i32,
-    query_len: i32,
-    _state_ptr: i32,
-    _state_len: i32,
-) -> i32 {
-    let Some(query) = guest_slice(query_ptr, query_len) else {
-        return OUTPUT_ERROR;
-    };
-    let output = response_buffer_mut();
-    let mut panes = [0_u64; 64];
-    let pane_count = parse_visible_panes(query, &mut panes);
-    if pane_count == 0 {
-        return OUTPUT_ABSTAIN;
-    }
-    let focus = parse_optional_u64_field(query, b"\"focused_pane\":").unwrap_or(panes[0]);
-
-    let mut writer = Writer::new(output);
-    writer.bytes(br#"{"layout":{"items":["#);
-    if pane_count == 1 {
-        write_pane_item(&mut writer, panes[0], 0.0, -1.0, -1.0, 2.0, 2.0);
-    } else {
-        write_pane_item(&mut writer, panes[0], 0.0, -1.0, -1.0, 1.0, 2.0);
-        let each = 2.0 / ((pane_count - 1) as f32);
-        let mut index = 1;
-        while index < pane_count {
-            writer.byte(b',');
-            write_pane_item(
-                &mut writer,
-                panes[index],
-                index as f32,
-                0.0,
-                -1.0 + each * ((index - 1) as f32),
-                1.0,
-                each,
-            );
-            index += 1;
-        }
-    }
-    writer.bytes(br#"]},"focus":"#);
-    writer.u64(focus);
-    writer.byte(b'}');
-    finish_response(writer.finish())
-}
-
 fn messages_for_global_key(key_code: i32) -> &'static [Message<'static>] {
     match key_code {
         KEY_J => &[Message::LayoutAction("focus-next")],

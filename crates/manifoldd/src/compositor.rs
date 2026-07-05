@@ -152,11 +152,6 @@ fn serve_session_on_calloop_thread(
         info!(provider = %provider, path = %path.display(), "loaded CLI WASM key policy");
     }
 
-    if let Some((provider, path)) = cli_policy_arg(args.wasm_layout_policy.as_deref())? {
-        state.replace_wasm_layout_policy(&path, &provider)?;
-        info!(provider = %provider, path = %path.display(), "loaded CLI WASM layout policy");
-    }
-
     if let Some(path) = args.test_harness.as_deref() {
         state.test_harness = Some(TestHarnessRuntime::start_on_runtime(path, &runtime));
         info!(path = %path.display(), "loaded CLI test harness");

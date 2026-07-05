@@ -25,7 +25,7 @@ A plugin package may declare any number of actors and optional policy providers.
 Plugin
   Actor: background/index/status/command/pane state
   Actor: pane UI or service worker
-  Policy provider: key policy, layout policy, map policy, focus preflight
+  Policy provider: key policy, focus preflight
   Publications: default and named latest-state publications
 ```
 
@@ -132,14 +132,15 @@ Native in-process frames do not need to serialize through JSON. The safety rule 
 
 ## WASM ABI Direction
 
-The current prototype uses narrow core-WASM paths for key handling and map hooks. Those paths prove the latency requirement but are not the final plugin API.
+The current prototype uses a narrow core-WASM path for key handling. That path proves the latency requirement but is not the final plugin API.
 
-The target WASM ABI should preserve the same immediate-call property while replacing direct side-effect imports with a returned decision envelope:
+The target WASM ABI should preserve the same immediate-call property for pre-commit decisions while replacing direct side-effect imports with a returned decision envelope:
 
 ```text
 key_policy(query, state_ref) -> KeyPolicyResult
-layout_policy(query, state_ref) -> LayoutPolicyResult
 ```
+
+Layout is actor/message based rather than a policy provider. Layout actors receive host events and send validated `SetResolvedLayout` host messages.
 
 A `state_ref` for WASM should be a runtime-safe handle, copied buffer, or explicit read-only view. Do not require plugins to dereference raw host pointers unless the runtime model makes that safe and portable.
 
@@ -147,7 +148,7 @@ When the host needs to copy state into a guest policy provider, the guest should
 
 The actor scaffold also defines the first async loop shape: the guest exports `manifold_epoch_run(epoch, mailbox_ptr, mailbox_cap) -> i32` and imports `manifold.read_message() -> i32` plus `manifold.publish(slot_ptr, slot_len, payload_ptr, payload_len) -> i32`. The host allocates the mailbox arena up front, passes its pointer/capacity to each epoch call, and services `read_message` by awaiting the actor mailbox and copying the message bytes directly into that arena. The import returns the copied byte length, `-1` for a closed mailbox, or `-2` for host-side copy/allocation errors. When the guest calls `publish`, the host copies the named payload out of guest memory into a pending immutable publication frame. After the epoch returns, the host drains pending frames into the publication registry so policy providers can read the latest frame without touching actor state.
 
-A single WASM module should self-declare its host-visible pieces through exports, so no sidecar manifest is needed for the first scaffold. `manifold_epoch_run` declares one default actor. `manifold_actor_<name>_epoch_run` declares a named actor. `manifold_policy_provider_key_<name>`, `manifold_policy_provider_layout_<name>`, `manifold_policy_provider_map_<name>`, and `manifold_policy_provider_focus_<name>` declare policy providers. The `manifold-wasm` crate discovers these exports, registers actor mailboxes, instantiates one actor runtime per actor export, and records policy-provider handles for the next implementation step.
+A single WASM module should self-declare its host-visible pieces through exports, so no sidecar manifest is needed for the first scaffold. `manifold_epoch_run` declares one default actor. `manifold_actor_<name>_epoch_run` declares a named actor. `manifold_policy_provider_key_<name>`, `manifold_policy_provider_map_<name>`, and `manifold_policy_provider_focus_<name>` declare policy providers. The `manifold-wasm` crate discovers these exports, registers actor mailboxes, instantiates one actor runtime per actor export, and records policy-provider handles for the next implementation step.
 
 ## Command And Event Flow
 
@@ -168,7 +169,7 @@ Actors and policy providers may request commands or send messages. They do not d
 
 ## Performance Policy
 
-Mailbox passing is sufficient for normal plugin work. The policy provider and publication model exists for the narrow set of paths where queueing would create visible latency or inconsistent input/layout ownership.
+Mailbox passing is sufficient for normal plugin work. The policy provider and publication model exists for the narrow set of paths where queueing would create visible latency or inconsistent pre-commit ownership.
 
 Performance-sensitive rules:
 

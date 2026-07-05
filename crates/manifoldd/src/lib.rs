@@ -107,9 +107,6 @@ pub struct SessionArgs {
     /// Load a target-shape WASM key policy provider as NAME from PATH.
     #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     pub(crate) wasm_key_policy: Option<Vec<String>>,
-    /// Load a target-shape WASM layout policy provider as NAME from PATH.
-    #[arg(long = "wasm-layout-policy", value_names = ["NAME", "PATH"], num_args = 2)]
-    pub(crate) wasm_layout_policy: Option<Vec<String>>,
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     pub(crate) test_harness: Option<PathBuf>,
@@ -151,7 +148,6 @@ impl Default for SessionArgs {
             browser: None,
             wasm_plugin: None,
             wasm_key_policy: None,
-            wasm_layout_policy: None,
             test_harness: None,
             nested_inner_dbus_name: None,
             nested_inner_dbus_address: None,

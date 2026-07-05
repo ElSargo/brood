@@ -515,7 +515,6 @@ pub struct Manifold {
     pub(crate) test_surface_markers: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
     pub(crate) wasm_global_key_policy: Option<manifold_wasm::WasmGlobalKeyPolicy>,
-    pub(crate) wasm_layout_policy: Option<manifold_wasm::WasmLayoutPolicy>,
     pub(crate) test_harness: Option<TestHarnessRuntime>,
     pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
     pub(crate) nested_inner_dbus_destination: Option<String>,
@@ -670,7 +669,6 @@ impl Manifold {
             test_surface_markers: false,
             presenter: None,
             wasm_global_key_policy: None,
-            wasm_layout_policy: None,
             test_harness: None,
             test_harness_completion: None,
             nested_inner_dbus_destination: None,
@@ -964,7 +962,7 @@ impl Manifold {
     fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
         match event {
             PluginHostEvent::DrainWasmHostMailbox => self.drain_wasm_host_mailbox(),
-            PluginHostEvent::RefreshWasmLayoutPolicy => self.refresh_resolved_layout_from_policy(),
+            PluginHostEvent::RefreshWasmLayout => self.refresh_resolved_layout_from_policy(),
             PluginHostEvent::AppendPublicationFrame {
                 actor_id,
                 slot,
@@ -3562,14 +3560,6 @@ impl Manifold {
             info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
         }
 
-        for provider in inventory
-            .policy_providers
-            .iter()
-            .filter(|provider| provider.kind == manifold_wasm::PolicyProviderKind::Layout)
-        {
-            info!(provider = %provider.name, path = %path.display(), "discovered WASM plugin layout policy (message-based layout is preferred)");
-        }
-
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
         Ok(())
     }
@@ -3630,7 +3620,7 @@ impl Manifold {
                                 let refresh_layout = !outbox.publications.is_empty();
                                 let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
                                 if refresh_layout {
-                                    let _ = host_events.send(PluginHostEvent::RefreshWasmLayoutPolicy);
+                                    let _ = host_events.send(PluginHostEvent::RefreshWasmLayout);
                                 }
                             }
                         }
@@ -3653,16 +3643,6 @@ impl Manifold {
     ) -> Result<()> {
         let policy = manifold_wasm::WasmGlobalKeyPolicy::load(path, provider_name)?;
         self.wasm_global_key_policy = Some(policy);
-        Ok(())
-    }
-
-    pub(crate) fn replace_wasm_layout_policy(
-        &mut self,
-        path: &Path,
-        provider_name: &str,
-    ) -> Result<()> {
-        let policy = manifold_wasm::WasmLayoutPolicy::load(path, provider_name)?;
-        self.wasm_layout_policy = Some(policy);
         Ok(())
     }
 

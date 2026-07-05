@@ -3317,7 +3317,6 @@ enum WasmPlugKind {
     Auto,
     Plugin,
     KeyPolicy,
-    LayoutPolicy,
 }
 
 impl WasmPlugKind {
@@ -3326,8 +3325,7 @@ impl WasmPlugKind {
             "auto" => Ok(Self::Auto),
             "plugin" | "wasm-plugin" => Ok(Self::Plugin),
             "key-policy" | "key" => Ok(Self::KeyPolicy),
-            "layout-policy" | "layout" => Ok(Self::LayoutPolicy),
-            _ => bail!("plug kind must be auto, plugin, key-policy, or layout-policy"),
+            _ => bail!("plug kind must be auto, plugin, or key-policy"),
         }
     }
 }
@@ -3360,7 +3358,7 @@ fn parse_plug_args(args: &[String]) -> Result<(WasmPlugKind, PathBuf)> {
         index += 1;
     }
 
-    let path = path.context("usage: plug [--kind auto|plugin|key-policy|layout-policy] <path>")?;
+    let path = path.context("usage: plug [--kind auto|plugin|key-policy] <path>")?;
     Ok((kind, path))
 }
 
@@ -3378,10 +3376,6 @@ fn plug_wasm_module(state: &mut Manifold, path: &Path, kind: WasmPlugKind) -> Re
         WasmPlugKind::KeyPolicy => {
             state.replace_wasm_global_key_policy(path, "workspace")?;
             Ok("key-policy")
-        }
-        WasmPlugKind::LayoutPolicy => {
-            state.replace_wasm_layout_policy(path, "tile")?;
-            Ok("layout-policy")
         }
         WasmPlugKind::Auto => {
             state.replace_wasm_plugin(path)?;
@@ -4184,13 +4178,13 @@ mod tests {
     fn plug_args_accept_kind_option() {
         let (kind, path) = parse_plug_args(&[
             "--kind".to_string(),
-            "layout-policy".to_string(),
-            "layout.wasm".to_string(),
+            "plugin".to_string(),
+            "workspace.wasm".to_string(),
         ])
         .unwrap();
 
-        assert_eq!(kind, WasmPlugKind::LayoutPolicy);
-        assert_eq!(path, std::path::PathBuf::from("layout.wasm"));
+        assert_eq!(kind, WasmPlugKind::Plugin);
+        assert_eq!(path, std::path::PathBuf::from("workspace.wasm"));
     }
 
     #[test]

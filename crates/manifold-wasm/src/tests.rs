@@ -2,10 +2,8 @@ use anyhow::{Context, Result, ensure};
 use wasmtime::{Engine, Module};
 
 use crate::{
-    ActorEpochOutcome, ActorOutbox, GlobalKeyDecision, GlobalKeyPolicyInput, InputBehavior,
-    LayoutItemId, LayoutItemKind, LayoutPolicyInput, LayoutPolicyOutcome, LayoutSize, LocalPoint,
-    LocalTransform, Registry, ResolvedLayout, ResolvedLayoutItem, WasmActor, WasmActorConfig,
-    WasmGlobalKeyPolicy, WasmLayoutPolicy, WasmModuleInventory, actor::pack_actor_outbox_slice,
+    ActorEpochOutcome, ActorOutbox, GlobalKeyDecision, GlobalKeyPolicyInput, Registry, WasmActor,
+    WasmActorConfig, WasmGlobalKeyPolicy, WasmModuleInventory, actor::pack_actor_outbox_slice,
     api::async_epoch_engine, global_key_policy::enqueue_policy_messages,
     policy_provider::PolicyProviderDeclaration,
 };
@@ -79,8 +77,8 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
             let policy_module = module_from_wat(&policy_engine, &policy_module_wat()?)?;
             let policy_inventory = WasmModuleInventory::discover(&policy_module)?;
             ensure!(
-                policy_inventory.policy_providers.len() == 3,
-                "expected three policy providers"
+                policy_inventory.policy_providers.len() == 2,
+                "expected two policy providers"
             );
 
             let consume_decl = policy_provider(&policy_inventory.policy_providers, "consume")?;
@@ -130,30 +128,6 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
             ensure!(
                 outcome.messages.is_empty(),
                 "abstain policy should not send messages"
-            );
-
-            let layout_decl = policy_provider(&policy_inventory.policy_providers, "tile")?;
-            let mut layout_policy =
-                WasmLayoutPolicy::load_from_module(policy_engine, &policy_module, layout_decl)?;
-            let outcome = layout_policy
-                .resolve_layout(
-                    LayoutPolicyInput::new(vec![7], Some(7), LayoutSize { w: 1920, h: 1080 }),
-                    Some(&b_state),
-                )?
-                .context("layout policy should return a layout")?;
-            ensure!(
-                outcome.focus == Some(7),
-                "layout policy should request focus"
-            );
-            ensure!(
-                matches!(
-                    outcome.layout.items.as_slice(),
-                    [ResolvedLayoutItem {
-                        kind: LayoutItemKind::Pane { pane: 7 },
-                        ..
-                    }]
-                ),
-                "layout policy should return a pane item"
             );
 
             Ok(())
@@ -240,25 +214,8 @@ fn policy_module_wat() -> Result<String> {
             payload: b"ok".to_vec(),
         }],
     })?;
-    let layout = serde_json::to_vec(&LayoutPolicyOutcome {
-        layout: ResolvedLayout {
-            items: vec![ResolvedLayoutItem {
-                id: LayoutItemId(1),
-                kind: LayoutItemKind::Pane { pane: 7 },
-                z: 0.0,
-                transform: LocalTransform {
-                    offset: LocalPoint { u: -1.0, v: -1.0 },
-                    size: LocalPoint { u: 2.0, v: 2.0 },
-                },
-                input: InputBehavior::Pane,
-            }],
-        },
-        focus: Some(7),
-    })?;
     let consume_ptr = 4096;
-    let layout_ptr = consume_ptr + consume.len() + 64;
-    let consume_response_ptr = layout_ptr + layout.len() + 64;
-    let layout_response_ptr = consume_response_ptr + crate::PolicyProviderResponse::BYTE_LEN + 64;
+    let consume_response_ptr = consume_ptr + consume.len() + 64;
     Ok(format!(
         r#"(module
   (memory (export "memory") 32)
@@ -314,20 +271,10 @@ fn policy_module_wat() -> Result<String> {
   (func (export "manifold_policy_provider_key_abstain")
     (param i32) (param i32) (param i32) (param i32) (result i32)
     i32.const 0)
-  (func (export "manifold_policy_provider_layout_tile")
-    (param $query_ptr i32) (param $query_len i32) (param $state_ptr i32) (param $state_len i32) (result i32)
-    i32.const {layout_response_ptr}
-    i32.const {layout_ptr}
-    i32.const {layout_len}
-    call $response)
-  (data (i32.const {consume_ptr}) "{consume_data}")
-  (data (i32.const {layout_ptr}) "{layout_data}"))"#,
+  (data (i32.const {consume_ptr}) "{consume_data}"))"#,
         consume_len = consume.len(),
         consume_response_ptr = consume_response_ptr,
         consume_data = wat_data(&consume),
-        layout_len = layout.len(),
-        layout_response_ptr = layout_response_ptr,
-        layout_data = wat_data(&layout),
     ))
 }
 

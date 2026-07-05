@@ -2,16 +2,18 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-05
 ---
 
-# Layout Policy
+# Message-Based Layout
 
-The target layout model gives plugins flexible policy control while keeping presentation execution native-owned.
+The target layout model gives plugins flexible policy control while keeping presentation execution native-owned. Layout is not a synchronous policy-provider lane. It is an actor-owned convergence path:
 
 ```text
-pane inventory + presentation constraints + layout event + plugin state frame
-    -> layout policy provider result
+host layout event
+    -> plugin actor mailbox
+    -> actor updates plugin layout state
+    -> actor sends SetResolvedLayout host message
     -> host validation
     -> accepted resolved layout
     -> native render, hit testing, focus, and input delivery
@@ -25,111 +27,61 @@ The host owns:
 - final layout validation and canonicalization
 - pane bounds, clipping, hit testing, and focus routing
 - pointer capture and drag bookkeeping
-- fallback layout when plugin policy is missing or invalid
-- persistence of user-approved layout preferences
+- fallback layout when plugin layout is missing or invalid
 
 Plugins own:
 
-- policy state and preferences
+- layout policy state and preferences
 - split/tab/stack/floating/dock models internal to the plugin
-- rules for initial placement, resizing, focus preference, and visibility
-- materialized latest state published through publications
-- policy provider logic that returns candidate resolved layouts
+- rules for placement, resizing, focus preference, and visibility
+- actor logic that turns host events into candidate resolved layouts
 
-The plugin's internal layout tree is not the host ABI. The host accepts only a bounded resolved layout or host-validated directives.
+The plugin's internal layout tree is not the host ABI. The host accepts only a bounded resolved layout through a host-validated message.
 
-## Layout Policy Provider
+## Layout Events
 
-Layout is a policy provider because the host often needs an immediate answer when a pane maps, the presentation resizes, or a pointer drag affects visible bounds.
+The host emits normal actor messages when layout-relevant state changes. Examples include:
 
 ```text
-LayoutQuery {
-  reason,
-  pane_inventory,
-  constraints,
-  current_focus,
-  pointer_or_command_context,
-}
-+ latest plugin publication frame
-    -> LayoutPolicyResult
+PaneMapped
+PaneUnmapped
+ActiveSessionChanged
+FocusChanged
+OutputResized
+LayoutStateSnapshot
 ```
 
-Candidate result shape:
+The current scaffold emits a `layout-state` snapshot containing visible panes, focused pane, and presentation size. This should evolve toward typed event envelopes with revisions so stale actor responses can be rejected.
+
+## SetResolvedLayout
+
+Actors request a visual layout by sending a host message equivalent to:
 
 ```text
-LayoutPolicyResult {
-  disposition: Abstain | CandidateLayout | Reject,
-  layout: optional<ResolvedLayout>,
+SetResolvedLayout {
+  layout: ResolvedLayout,
   focus: optional<PaneId>,
-  directives: list<host-validated-directive>,
-  messages: list<mailbox-message>,
 }
 ```
 
-The host validates the candidate before accepting it. Invalid candidates fall back to native policy and produce diagnostics.
+The host validates that pane items reference real active panes, canonicalizes the result, rejects invalid or oversized layouts, and then commits it as the accepted resolved layout.
 
-## Resolved Layout
+## Why Layout Is Not A Provider
 
-A resolved layout is a flat, host-validated presentation description. It is not the plugin's persistent state and not necessarily a split tree.
+The synchronous presenter/consumer provider model remains valuable for global key handling because the host must decide whether to consume or forward a key before it can continue.
 
-Resolved items can include:
-
-- pane items
-- empty regions and placeholders
-- handles and drag targets
-- native chrome items
-- overlays and transient controls
-
-Pane items reference real panes from the host inventory. Non-pane items use stable IDs so the host can report pointer, keyboard, or focus events back without understanding the plugin's internal policy model.
-
-## Interactive Layout
-
-Interactive behavior such as live split resizing should not require the policy provider to mutate private state during the host call.
-
-The host query should include enough context to compute an immediate candidate:
-
-```text
-PointerDrag {
-  item_id,
-  drag_start,
-  current_position,
-  original_layout_snapshot,
-}
-```
-
-The policy provider can return the current visual result from the latest state plus the drag delta. On commit or release it may also return a message asking the owning actor to persist the new ratio. The actor later publishes a new publication frame reflecting that durable state.
-
-## Initial Pane Placement
-
-Initial map policy follows the same pattern:
-
-```text
-PaneMapped pending pane
-  -> host builds pane inventory and query
-  -> layout policy provider returns candidate layout/focus or abstains
-  -> host validates and commits
-  -> actors observe committed events
-```
-
-This generalizes the current map-hook prototype without making a queued actor response part of the critical path.
+Layout is different. It is usually an eventual-convergence problem: the world changes, then the visible layout should update promptly. If layout depends on plugin-owned split trees, session layout state, focus history, or dock state, a provider would still need a host-to-actor-to-publication round trip before it had current state. At that point the synchronous provider adds complexity without eliminating the real latency source.
 
 ## Fallback
 
 Manifold must always have a deterministic native fallback layout. Fallback is used when:
 
-- no layout policy provider is registered
-- the provider abstains
-- the provider traps, times out, or is disabled
+- no layout actor is registered
+- the actor does not produce a layout yet
+- the actor traps, stalls, or is disabled
 - the candidate layout is invalid or too large
-- required plugin state is missing or stale beyond host policy
 
-Fallback should keep panes visible enough for recovery and should expose clear status so users can repair or disable a failing plugin.
-
-## Relation To The Current WASM Map Hook
-
-The current `wasm_map` lane asks a WASM module for a resolved layout when a pane maps. That is the prototype of the target layout policy provider.
-
-The target changes the boundary from ad hoc JSON response plus host imports to a typed decision envelope backed by immutable published state. The performance goal remains the same: no actor queue or message backlog is needed before the host can place a pane.
+Fallback should keep panes visible enough for recovery and expose clear status so users can repair or disable a failing plugin.
 
 Related:
 
@@ -138,4 +90,3 @@ Related:
 - [[input-shortcuts]]
 - [[plugin-ui]]
 - [[../concepts/presentation-surface]]
-- [[../reference/wasm-fast-lanes]]

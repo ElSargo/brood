@@ -11,7 +11,6 @@ mod api_link;
 pub mod global_key_policy;
 mod global_key_policy_link;
 pub mod layout_policy;
-mod layout_policy_link;
 pub mod mailbox;
 pub mod module;
 mod module_link;
@@ -45,13 +44,8 @@ pub use global_key_policy_link::{
     GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GLOBAL_KEY_POLICY_RESULT_OK,
 };
 pub use layout_policy::{
-    DEFAULT_LAYOUT_POLICY_ARENA_BYTES, InputBehavior, LayoutItemId, LayoutItemKind,
-    LayoutPolicyInput, LayoutPolicyInvocationBuffers, LayoutPolicyOutcome, LayoutSize, LocalPoint,
-    LocalTransform, MAX_LAYOUT_POLICY_ARENA_BYTES, MAX_LAYOUT_POLICY_QUERY_BYTES,
-    MAX_LAYOUT_POLICY_RESULT_BYTES, ResolvedLayout, ResolvedLayoutItem, WasmLayoutPolicy,
-};
-pub use layout_policy_link::{
-    LAYOUT_POLICY_RESULT_ABSTAIN, LAYOUT_POLICY_RESULT_ERROR, LAYOUT_POLICY_RESULT_OK,
+    InputBehavior, LayoutItemId, LayoutItemKind, LayoutSize, LocalPoint, LocalTransform,
+    ResolvedLayout, ResolvedLayoutItem,
 };
 pub use mailbox::{ActorId, Mailbox, MailboxRegistry};
 pub use module::{
