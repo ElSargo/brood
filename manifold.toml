@@ -26,7 +26,7 @@ auto_split_visible_limit = 3
 
 [startup.agent]
 enabled = true
-argv = ["foot", "--app-id", "manifold-pi", "pi"]
+argv = ["foot", "--app-id", "pi-foot", "pi"]
 
 [startup.session-switcher]
 enabled = true

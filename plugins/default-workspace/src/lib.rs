@@ -88,12 +88,13 @@ pub extern "C" fn manifold_arena_free(_ptr: i32, _capacity: i32, _align: i32) {}
 pub extern "C" fn manifold_policy_provider_key_workspace(
     query_ptr: i32,
     query_len: i32,
-    _state_ptr: i32,
-    _state_len: i32,
+    state_ptr: i32,
+    state_len: i32,
 ) -> i32 {
     let Some(query) = guest_slice(query_ptr, query_len) else {
         return OUTPUT_ERROR;
     };
+    let state = guest_slice(state_ptr, state_len).unwrap_or(&[]);
     let output = response_buffer_mut();
     let input = KeyInput::parse(query);
 
@@ -132,7 +133,8 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
         return if input.key_state == KEY_RELEASED {
             write_consume(output, &[])
         } else {
-            write_consume(output, messages_for_global_key(input.key_code))
+            let mut buffer = [Message::Noop; 1];
+            write_consume(output, messages_for_global_key(input.key_code, state, &mut buffer))
         };
     }
 
@@ -192,14 +194,18 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32
         return 0;
     }
     let focus = parse_optional_u64_field(message, b"\"focused_pane\":");
-    let len = write_layout_actor_outbox(output, &panes[..pane_count], focus);
+    let len = write_layout_actor_outbox(output, message, &panes[..pane_count], focus);
     if len <= 0 {
         return -2;
     }
     pack_actor_outbox(output.as_ptr() as i32, len)
 }
 
-fn messages_for_global_key(key_code: i32) -> &'static [Message<'static>] {
+fn messages_for_global_key<'a>(
+    key_code: i32,
+    state: &[u8],
+    buffer: &'a mut [Message<'static>; 1],
+) -> &'a [Message<'static>] {
     match key_code {
         KEY_J => &[Message::LayoutAction("focus-next")],
         KEY_K => &[Message::LayoutAction("focus-previous")],
@@ -207,38 +213,111 @@ fn messages_for_global_key(key_code: i32) -> &'static [Message<'static>] {
         KEY_L => &[Message::LayoutAction("split-active-right")],
         KEY_S => &[Message::LayoutAction("split-active-smart")],
         KEY_U => &[Message::LayoutAction("join-active-pane")],
-        KEY_DOT => &[Message::LayoutAction("focus-next-split")],
-        KEY_COMMA => &[Message::LayoutAction("focus-previous-split")],
+        KEY_DOT => focus_cycle_terminal(state, true, buffer)
+            .unwrap_or(&[Message::LayoutAction("focus-next-split")]),
+        KEY_COMMA => focus_cycle_terminal(state, false, buffer)
+            .unwrap_or(&[Message::LayoutAction("focus-previous-split")]),
         KEY_G => &[Message::FocusOrSpawnApp {
             app_id: "manifold-lazygit",
             argv: &["foot", "--app-id", "manifold-lazygit", "lazygit"],
         }],
-        KEY_ENTER => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-codex",
-            argv: &["foot", "--app-id", "manifold-codex", "codex", "--yolo"],
-        }],
-        KEY_1 => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-terminal-1",
-            argv: &["foot", "--app-id", "manifold-terminal-1"],
-        }],
-        KEY_2 => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-terminal-2",
-            argv: &["foot", "--app-id", "manifold-terminal-2"],
-        }],
-        KEY_3 => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-terminal-3",
-            argv: &["foot", "--app-id", "manifold-terminal-3"],
-        }],
-        KEY_4 => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-terminal-4",
-            argv: &["foot", "--app-id", "manifold-terminal-4"],
-        }],
-        KEY_5 => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-terminal-5",
-            argv: &["foot", "--app-id", "manifold-terminal-5"],
-        }],
+        KEY_ENTER => focus_or_spawn_app(
+            state,
+            b"pi-foot",
+            &["foot", "--app-id", "pi-foot", "pi"],
+            buffer,
+        ),
+        KEY_1 => focus_or_spawn_app(
+            state,
+            b"manifold-terminal-1",
+            &["foot", "--app-id", "manifold-terminal-1"],
+            buffer,
+        ),
+        KEY_2 => focus_or_spawn_app(
+            state,
+            b"manifold-terminal-2",
+            &["foot", "--app-id", "manifold-terminal-2"],
+            buffer,
+        ),
+        KEY_3 => focus_or_spawn_app(
+            state,
+            b"manifold-terminal-3",
+            &["foot", "--app-id", "manifold-terminal-3"],
+            buffer,
+        ),
+        KEY_4 => focus_or_spawn_app(
+            state,
+            b"manifold-terminal-4",
+            &["foot", "--app-id", "manifold-terminal-4"],
+            buffer,
+        ),
+        KEY_5 => focus_or_spawn_app(
+            state,
+            b"manifold-terminal-5",
+            &["foot", "--app-id", "manifold-terminal-5"],
+            buffer,
+        ),
         _ => &[],
     }
+}
+
+fn focus_or_spawn_app<'a>(
+    state: &[u8],
+    app_id: &'static [u8],
+    argv: &'static [&'static str],
+    buffer: &'a mut [Message<'static>; 1],
+) -> &'a [Message<'static>] {
+    if let Some(pane) = pane_for_app_id(state, app_id) {
+        buffer[0] = Message::FocusPane(pane);
+    } else {
+        buffer[0] = Message::SpawnApp(argv);
+    }
+    buffer
+}
+
+fn focus_cycle_terminal<'a>(
+    state: &[u8],
+    next: bool,
+    buffer: &'a mut [Message<'static>; 1],
+) -> Option<&'a [Message<'static>]> {
+    let mut panes = [0_u64; 5];
+    let mut count = 0;
+    for app_id in [
+        b"manifold-terminal-1" as &[u8],
+        b"manifold-terminal-2" as &[u8],
+        b"manifold-terminal-3" as &[u8],
+        b"manifold-terminal-4" as &[u8],
+        b"manifold-terminal-5" as &[u8],
+    ] {
+        if let Some(pane) = pane_for_app_id(state, app_id) {
+            panes[count] = pane;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+
+    let focused = parse_optional_u64_field(state, b"\"focused_pane\":");
+    let current = focused.and_then(|focused| {
+        let mut index = 0;
+        while index < count {
+            if panes[index] == focused {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    });
+    let target = match (current, next) {
+        (Some(index), true) => (index + 1) % count,
+        (Some(0), false) => count - 1,
+        (Some(index), false) => index - 1,
+        (None, true) => 0,
+        (None, false) => count - 1,
+    };
+    buffer[0] = Message::FocusPane(panes[target]);
+    Some(buffer)
 }
 
 fn is_global_workspace_key(key_code: i32) -> bool {
@@ -278,8 +357,10 @@ fn toggle_workspace_input_mode() {
 
 #[derive(Clone, Copy)]
 enum Message<'a> {
+    Noop,
     LayoutAction(&'a str),
     SpawnApp(&'a [&'a str]),
+    FocusPane(u64),
     FocusOrSpawnApp {
         app_id: &'a str,
         argv: &'a [&'a str],
@@ -289,7 +370,12 @@ enum Message<'a> {
     ToggleShortcutPassthrough,
 }
 
-fn write_layout_actor_outbox(output: &mut [u8], panes: &[u64], focus: Option<u64>) -> i32 {
+fn write_layout_actor_outbox(
+    output: &mut [u8],
+    layout_message: &[u8],
+    panes: &[u64],
+    focus: Option<u64>,
+) -> i32 {
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
@@ -298,7 +384,13 @@ fn write_layout_actor_outbox(output: &mut [u8], panes: &[u64], focus: Option<u64
     let mut publication = PayloadWriter::new(&mut writer);
     publication.bytes(br#"{"kind":"workspace-state","mode":"#);
     publication.u64(workspace_input_mode() as u64);
-    publication.bytes(br#", "panes":["#);
+    publication.bytes(br#", "focused_pane":"#);
+    if let Some(focus) = focus {
+        publication.u64(focus);
+    } else {
+        publication.bytes(b"null");
+    }
+    publication.bytes(br#", "focus_rules":[{"key":36,"modifiers":1,"app_id":"pi-foot","argv":["foot","--app-id","pi-foot","pi"]},{"key":10,"modifiers":1,"app_id":"manifold-terminal-1","argv":["foot","--app-id","manifold-terminal-1"]},{"key":11,"modifiers":1,"app_id":"manifold-terminal-2","argv":["foot","--app-id","manifold-terminal-2"]},{"key":12,"modifiers":1,"app_id":"manifold-terminal-3","argv":["foot","--app-id","manifold-terminal-3"]},{"key":13,"modifiers":1,"app_id":"manifold-terminal-4","argv":["foot","--app-id","manifold-terminal-4"]},{"key":14,"modifiers":1,"app_id":"manifold-terminal-5","argv":["foot","--app-id","manifold-terminal-5"]}], "panes":["#);
     let mut index = 0;
     while index < panes.len() {
         if index > 0 {
@@ -307,9 +399,62 @@ fn write_layout_actor_outbox(output: &mut [u8], panes: &[u64], focus: Option<u64
         publication.u64(panes[index]);
         index += 1;
     }
+    publication.bytes(br#"],"app_panes":["#);
+    let mut first_app_pane = true;
+    write_app_pane(&mut publication, layout_message, b"pi-foot", &mut first_app_pane);
+    write_app_pane(
+        &mut publication,
+        layout_message,
+        b"manifold-terminal-1",
+        &mut first_app_pane,
+    );
+    write_app_pane(
+        &mut publication,
+        layout_message,
+        b"manifold-terminal-2",
+        &mut first_app_pane,
+    );
+    write_app_pane(
+        &mut publication,
+        layout_message,
+        b"manifold-terminal-3",
+        &mut first_app_pane,
+    );
+    write_app_pane(
+        &mut publication,
+        layout_message,
+        b"manifold-terminal-4",
+        &mut first_app_pane,
+    );
+    write_app_pane(
+        &mut publication,
+        layout_message,
+        b"manifold-terminal-5",
+        &mut first_app_pane,
+    );
     publication.bytes(br#"]}"#);
     writer.bytes(br#"]}]}"#);
     writer.finish()
+}
+
+fn write_app_pane(
+    publication: &mut PayloadWriter<'_, '_>,
+    layout_message: &[u8],
+    app_id: &[u8],
+    first: &mut bool,
+) {
+    let Some(pane) = pane_for_app_id_in_layout_message(layout_message, app_id) else {
+        return;
+    };
+    if !*first {
+        publication.byte(b',');
+    }
+    *first = false;
+    publication.bytes(br#"{"pane":"#);
+    publication.u64(pane);
+    publication.bytes(br#", "app_id":""#);
+    publication.quoted_body(app_id);
+    publication.bytes(br#""}"#);
 }
 
 fn write_set_resolved_layout_payload(
@@ -377,6 +522,7 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
         writer.bytes(br#"{"actor":"host","payload":["#);
         let mut payload = PayloadWriter::new(&mut writer);
         match messages[index] {
+            Message::Noop => {}
             Message::LayoutAction(action) => {
                 payload.bytes(br#"{"type":"layout-action","action":"#);
                 payload.byte(b'"');
@@ -386,6 +532,11 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::SpawnApp(argv) => {
                 payload.bytes(br#"{"type":"spawn-app","argv":"#);
                 payload.argv(argv);
+                payload.byte(b'}');
+            }
+            Message::FocusPane(pane) => {
+                payload.bytes(br#"{"type":"focus-pane","pane":"#);
+                payload.u64(pane);
                 payload.byte(b'}');
             }
             Message::FocusOrSpawnApp { app_id, argv } => {
@@ -599,6 +750,48 @@ fn write_u64(writer: &mut Writer<'_>, mut value: u64) {
         len -= 1;
         writer.byte(digits[len]);
     }
+}
+
+fn pane_for_app_id(state: &[u8], app_id: &[u8]) -> Option<u64> {
+    pane_for_app_id_in_list(state, b"\"app_panes\":[", app_id)
+}
+
+fn pane_for_app_id_in_layout_message(message: &[u8], app_id: &[u8]) -> Option<u64> {
+    pane_for_app_id_in_list(message, b"\"pane_app_ids\":[", app_id)
+}
+
+fn pane_for_app_id_in_list(bytes: &[u8], list_needle: &[u8], app_id: &[u8]) -> Option<u64> {
+    let mut cursor = find_after(bytes, list_needle)?;
+    loop {
+        cursor = skip_ws(bytes, cursor);
+        if cursor >= bytes.len() || bytes[cursor] == b']' {
+            return None;
+        }
+        let object_end = find_after(&bytes[cursor..], b"}")? + cursor;
+        let object = &bytes[cursor..object_end];
+        let pane = parse_optional_u64_field(object, b"\"pane\":");
+        if pane.is_some() && object_has_string_field(object, b"\"app_id\":", app_id) {
+            return pane;
+        }
+        cursor = object_end;
+        if cursor < bytes.len() && bytes[cursor] == b',' {
+            cursor += 1;
+        }
+    }
+}
+
+fn object_has_string_field(object: &[u8], needle: &[u8], expected: &[u8]) -> bool {
+    let Some(cursor) = find_after(object, needle) else {
+        return false;
+    };
+    let cursor = skip_ws(object, cursor);
+    if object.get(cursor).copied() != Some(b'"') {
+        return false;
+    }
+    let value_start = cursor + 1;
+    let value_end = value_start + expected.len();
+    object.get(value_start..value_end) == Some(expected)
+        && object.get(value_end).copied() == Some(b'"')
 }
 
 fn parse_visible_panes(bytes: &[u8], output: &mut [u64]) -> usize {

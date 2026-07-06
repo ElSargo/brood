@@ -881,9 +881,18 @@ impl Manifold {
         let focused = self
             .focused_pane()
             .map_or_else(|| "null".to_string(), |pane| pane.to_string());
+        let pane_app_ids = self
+            .active_surface_session_pane_app_ids()
+            .into_iter()
+            .map(|(pane, app_id)| {
+                let app_id = serde_json::to_string(&app_id).unwrap_or_else(|_| "\"\"".to_string());
+                format!(r#"{{"pane":{pane},"app_id":{app_id}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         self.emit_wasm_actor_event_to_all(format!(
-            r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"size":{{"w":{},"h":{}}}}}"#,
-            panes, focused, size.w, size.h
+            r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"pane_app_ids":[{}],"size":{{"w":{},"h":{}}}}}"#,
+            panes, focused, pane_app_ids, size.w, size.h
         ));
     }
 
@@ -2155,6 +2164,24 @@ impl Manifold {
                     panes.push(pane);
                 }
                 panes
+            })
+    }
+
+    fn active_surface_session_pane_app_ids(&self) -> Vec<(u64, String)> {
+        self.window_surface_sessions
+            .iter()
+            .filter(|(_, session)| *session == self.active_surface_session)
+            .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
+            .filter_map(|(surface, _)| {
+                let pane = self.pane_for_toplevel_surface(surface)?;
+                let app_id = toplevel_app_id(surface)?;
+                Some((pane, app_id))
+            })
+            .fold(Vec::new(), |mut entries, entry| {
+                if !entries.iter().any(|(pane, _)| *pane == entry.0) {
+                    entries.push(entry);
+                }
+                entries
             })
     }
 
