@@ -1,5 +1,16 @@
-[module.dev]
+[module.default-workspace]
 enabled = true
+kind = "plugin"
+path = "plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
+capabilities = [
+  "shortcuts:handle",
+  "apps:run-argv",
+  "workspace:session",
+  "workspace:layout",
+]
+
+[module.dev]
+enabled = false
 kind = "fast-key-handler"
 path = "examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm"
 capabilities = [

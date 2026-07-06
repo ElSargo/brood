@@ -198,8 +198,8 @@ let
     touch "$out/passed"
   '';
 
-  wasmExamples = pkgs.stdenvNoCC.mkDerivation {
-    name = "manifold-wasm-examples";
+  wasmModules = pkgs.stdenvNoCC.mkDerivation {
+    name = "manifold-wasm-modules";
     inherit src;
     nativeBuildInputs = [ profiles.rustToolchain ];
 
@@ -217,10 +217,15 @@ let
         echo "building_wasm=$manifest"
         CARGO_TARGET_DIR="$PWD/$crate_dir/target" \
           cargo build --manifest-path "$manifest" --target wasm32-unknown-unknown --release --locked
-      done < <(find examples -mindepth 2 -maxdepth 2 -path 'examples/wasm-*/Cargo.toml' -print | sort)
+      done < <(
+        {
+          find examples -mindepth 2 -maxdepth 2 -path 'examples/wasm-*/Cargo.toml' -print
+          find plugins -mindepth 2 -maxdepth 2 -path 'plugins/*/Cargo.toml' -print
+        } | sort
+      )
 
       if [[ "$found" != "1" ]]; then
-        echo "ERR no WASM example Cargo.toml files found under examples" >&2
+        echo "ERR no WASM module Cargo.toml files found under examples or plugins" >&2
         exit 2
       fi
 
@@ -233,7 +238,12 @@ let
       mkdir -p "$out"
       while IFS= read -r wasm; do
         install -D "$wasm" "$out/$wasm"
-      done < <(find examples -path '*/target/wasm32-unknown-unknown/release/*.wasm' -print | sort)
+      done < <(
+        {
+          find examples -path '*/target/wasm32-unknown-unknown/release/*.wasm' -print
+          find plugins -path '*/target/wasm32-unknown-unknown/release/*.wasm' -print
+        } | sort
+      )
 
       runHook postInstall
     '';
@@ -248,10 +258,17 @@ let
     cp -R ${src}/apps/. "$out/apps/"
     rm -rf "$out/apps/__pycache__"
 
-    if [[ -d ${wasmExamples}/examples ]]; then
-      cp -R ${wasmExamples}/examples "$out/examples"
+    if [[ -d ${wasmModules}/examples ]]; then
+      cp -R ${wasmModules}/examples "$out/examples"
     else
-      echo "ERR packaged WASM examples did not include an examples directory" >&2
+      echo "ERR packaged WASM modules did not include an examples directory" >&2
+      exit 2
+    fi
+
+    if [[ -d ${wasmModules}/plugins ]]; then
+      cp -R ${wasmModules}/plugins "$out/plugins"
+    else
+      echo "ERR packaged WASM modules did not include a plugins directory" >&2
       exit 2
     fi
   '';
@@ -760,7 +777,8 @@ in
   "software-e2e-capture" = softwareE2eCapture;
   "software-e2e-artifacts" = softwareE2eArtifacts;
   "runtime-files" = runtimeFiles;
-  "wasm-examples" = wasmExamples;
+  "wasm-modules" = wasmModules;
+  "wasm-examples" = wasmModules;
   inherit formatter linter;
 
   inherit
@@ -789,6 +807,6 @@ in
     softwareE2eCapture
     softwareE2eCheck
     testCheck
-    wasmExamples
+    wasmModules
     ;
 }
