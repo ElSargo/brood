@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-10
 code-links:
   - crates/manifoldd/src/config.rs
   - manifold.toml
@@ -31,12 +31,19 @@ Current section families:
 - `[startup.<id>]` for startup hosted apps
 - `[session.runner]` for project environment activation
 
-Current module kinds are prototype WASM lanes:
+Current supported module kinds load self-contained WASM plugin artifacts:
 
-- `fast-key-handler`
-- `fast-map-hook`
+- `plugin`
+- `wasm-plugin`
 
-The target plugin configuration should move from these lane-specific module kinds to plugin manifests that declare actors, capabilities, policy providers, actions, pane types, and publications.
+The old `fast-key-handler` and `fast-map-hook` names are rejected with a legacy
+warning rather than loaded.
+
+The target plugin configuration should move from these startup entries to
+plugin manifests that declare actors, per-actor worker and I/O budgets,
+WASI/capability grants, policy providers, actions, pane types, and publications.
+Workers remain dynamically scoped to actors rather than top-level manifest
+components.
 
 Startup apps can target the session realm or presentation realm. Presentation startup apps remain available when an auto-started global control server skips creating its own initial surface session.
 

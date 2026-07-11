@@ -2,7 +2,7 @@
 status: canonical
 type: index
 authority: documentation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-11
 ---
 
 # Manifold Knowledge Base
@@ -26,7 +26,8 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 ## Target Design
 
-- [[systems/plugin-runtime]] describes the actor mailbox runtime, policy providers, and publications.
+- [[systems/plugin-runtime]] describes actors, actor-scoped workers, completion-based I/O, WASI, policy providers, and publications.
+- [[systems/plugin-io-and-resources]] specifies notifications, worker select, streams, processes, PTYs, networking, watches, resource scopes, supervision, and implementation phases.
 - [[systems/input-shortcuts]] describes host-owned shortcut routing with privileged sync key policy.
 - [[systems/layout-policy]] describes host-validated layout policy and resolved layouts.
 - [[systems/plugin-ui]] describes native component panes, chrome, and custom drawing escape hatches.

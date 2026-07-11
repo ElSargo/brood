@@ -8,7 +8,7 @@ This note scopes the first WASM API spike to workspace navigation, managed app l
 
 The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Manifold should execute those requests through the same session process paths used by native input and control commands.
 
-The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): normal plugin work runs through actors and mailboxes, while only bounded pre-commit policy hooks and immediate shortcut decisions run through policy providers that read immutable published state.
+The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): actors provide public isolation and mailbox addressing, actor-scoped workers provide shared-memory concurrency and blocking-looking WASI, and bounded pre-commit policy hooks read immutable published state.
 
 ## First Prototype Order
 

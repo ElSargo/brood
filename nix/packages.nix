@@ -29,7 +29,26 @@ let
   ];
 
   craneLib = (crane.mkLib pkgs).overrideToolchain profiles.rustToolchainWithTools;
-  craneSrc = craneLib.cleanCargoSource src;
+  # The host bindings are generated from WIT/WITX at compile time. Crane's
+  # default Cargo filter does not recognize those extensions, so retain them
+  # explicitly in every sandboxed host build.
+  craneSrc = lib.cleanSourceWith {
+    inherit src;
+    filter =
+      path: type:
+      craneLib.filterCargoSources path type || lib.hasSuffix ".wit" path || lib.hasSuffix ".witx" path;
+  };
+
+  # The guest examples are independent Cargo workspaces. Vendor their lock
+  # files explicitly so the derivation remains network-free in the Nix
+  # sandbox. The conditional entries keep older source snapshots evaluable
+  # before the new examples exist in the tree.
+  wasmCargoVendorDir = craneLib.vendorMultipleCargoDeps {
+    cargoLockList = builtins.filter builtins.pathExists [
+      "${src}/examples/wasm-component-actor/Cargo.lock"
+      "${src}/examples/wasm-preview1-worker/Cargo.lock"
+    ];
+  };
 
   craneBaseArgs = {
     pname = "manifold";
@@ -65,7 +84,9 @@ let
     craneBaseArgs
     // {
       inherit cargoArtifacts;
-      cargoExtraArgs = "--locked -p manifoldd";
+      # Coordination and worker lifecycle invariants live in manifold-wasm;
+      # running only the daemon package silently skipped those unit tests.
+      cargoExtraArgs = "--locked --workspace";
       env = {
         CARGO_PROFILE = "";
         LD_LIBRARY_PATH = nativeLibraryPath;
@@ -149,8 +170,10 @@ let
 
   testCheck = pkgs.runCommand "manifold-test-check" { } ''
     echo "test=rust cargo=${cargoTestCheck}"
+    echo "test=wasm-io check=${wasmIoCheck}"
     echo "test=software-e2e check=${softwareE2eCheck}"
     mkdir -p "$out"
+    ln -s ${wasmIoCheck} "$out/wasm-io"
     ln -s ${softwareE2eCheck} "$out/software-e2e"
     touch "$out/passed"
   '';
@@ -201,22 +224,42 @@ let
   wasmModules = pkgs.stdenvNoCC.mkDerivation {
     name = "manifold-wasm-modules";
     inherit src;
-    nativeBuildInputs = [ profiles.rustToolchain ];
+    cargoVendorDir = wasmCargoVendorDir;
+    nativeBuildInputs = [
+      craneLib.configureCargoVendoredDepsHook
+      profiles.rustToolchain
+    ]
+    ++ profiles.wasmTools;
+
+    preConfigure = ''
+      export CARGO_HOME="$TMPDIR/cargo-home"
+      export HOME="$TMPDIR/home"
+      mkdir -p "$CARGO_HOME" "$HOME"
+    '';
 
     buildPhase = ''
       runHook preBuild
 
-      export CARGO_HOME="$TMPDIR/cargo-home"
-      export HOME="$TMPDIR/home"
-      mkdir -p "$CARGO_HOME" "$HOME"
+      export CARGO_NET_OFFLINE=true
 
       found=0
       while IFS= read -r manifest; do
         found=1
         crate_dir="$(dirname "$manifest")"
-        echo "building_wasm=$manifest"
-        CARGO_TARGET_DIR="$PWD/$crate_dir/target" \
-          cargo build --manifest-path "$manifest" --target wasm32-unknown-unknown --release --locked
+        case "$crate_dir" in
+          examples/wasm-preview1-worker)
+            wasm_target=wasm32-wasip1-threads
+            ;;
+          *)
+            wasm_target=wasm32-unknown-unknown
+            ;;
+        esac
+        echo "building_wasm=$manifest target=$wasm_target"
+        (
+          cd "$crate_dir"
+          CARGO_TARGET_DIR="$PWD/target" \
+            cargo build --manifest-path Cargo.toml --target "$wasm_target" --release --locked
+        )
       done < <(
         {
           find examples -mindepth 2 -maxdepth 2 -path 'examples/wasm-*/Cargo.toml' -print
@@ -229,6 +272,19 @@ let
         exit 2
       fi
 
+      if [[ -f examples/wasm-component-actor/Cargo.toml ]]; then
+        component_core="examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.wasm"
+        component_output="examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR component actor core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       runHook postBuild
     '';
 
@@ -237,17 +293,56 @@ let
 
       mkdir -p "$out"
       while IFS= read -r wasm; do
+        # The raw core module is an intermediate input to the Component Model
+        # encoder. Only its validated component is a runnable plugin artifact.
+        if [[ "$wasm" == "examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.wasm" ]]; then
+          continue
+        fi
         install -D "$wasm" "$out/$wasm"
       done < <(
         {
-          find examples -path '*/target/wasm32-unknown-unknown/release/*.wasm' -print
-          find plugins -path '*/target/wasm32-unknown-unknown/release/*.wasm' -print
+          find examples -path '*/target/wasm32-*/release/*.wasm' ! -path '*/release/deps/*' -print
+          find plugins -path '*/target/wasm32-*/release/*.wasm' ! -path '*/release/deps/*' -print
         } | sort
       )
 
       runHook postInstall
     '';
   };
+
+  wasmIoWorkloads = craneLib.buildPackage (
+    craneBaseArgs
+    // {
+      inherit cargoArtifacts;
+      pname = "manifold-wasm-io-workloads";
+      cargoBuildExtraArgs = "-p manifold-wasm --examples";
+      doCheck = false;
+      installPhase = ''
+        runHook preInstall
+        mkdir -p "$out/bin"
+        install -m755 target/release/examples/actor_worker_workload \
+          "$out/bin/manifold-component-io-workload"
+        install -m755 target/release/examples/preview1_worker_workload \
+          "$out/bin/manifold-preview1-io-workload"
+        runHook postInstall
+      '';
+    }
+  );
+
+  wasmIoCheck =
+    pkgs.runCommand "manifold-wasm-io-check"
+      {
+        nativeBuildInputs = [ wasmIoWorkloads ];
+      }
+      ''
+        manifold-component-io-workload \
+          ${wasmModules}/examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm
+        manifold-preview1-io-workload \
+          ${wasmModules}/examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/manifold_preview1_worker_example.wasm
+
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
 
   runtimeFiles = pkgs.runCommand "manifold-runtime-files" { } ''
     mkdir -p "$out"
@@ -779,6 +874,7 @@ in
   "runtime-files" = runtimeFiles;
   "wasm-modules" = wasmModules;
   "wasm-examples" = wasmModules;
+  "wasm-io-check" = wasmIoCheck;
   inherit formatter linter;
 
   inherit
@@ -807,6 +903,8 @@ in
     softwareE2eCapture
     softwareE2eCheck
     testCheck
+    wasmIoCheck
+    wasmIoWorkloads
     wasmModules
     ;
 }

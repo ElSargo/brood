@@ -2397,15 +2397,7 @@ fn print_plugin_actor(
     ): &DbusPluginActor,
 ) {
     println!(
-        "actor id={} kind={} enqueued_messages={} dropped_messages={} mailbox_capacity={} published_frames={} latest_frame={} mailbox_slots={}",
-        id,
-        kind,
-        enqueued_messages,
-        dropped_messages,
-        mailbox_capacity,
-        published_frames,
-        latest_frame,
-        mailbox_slots
+        "actor id={id} kind={kind} enqueued_messages={enqueued_messages} dropped_messages={dropped_messages} mailbox_capacity={mailbox_capacity} published_frames={published_frames} latest_frame={latest_frame} mailbox_slots={mailbox_slots}"
     );
 }
 
@@ -2414,8 +2406,7 @@ fn print_plugin_mailbox(
     (slot, enqueued_messages, dropped_messages, capacity): &DbusPluginMailbox,
 ) {
     println!(
-        "actor id={} mailbox_slot={} enqueued_messages={} dropped_messages={} capacity={}",
-        actor_id, slot, enqueued_messages, dropped_messages, capacity
+        "actor id={actor_id} mailbox_slot={slot} enqueued_messages={enqueued_messages} dropped_messages={dropped_messages} capacity={capacity}"
     );
 }
 
@@ -2953,7 +2944,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
             format!(
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_window_focused={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} shortcut_passthrough={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} resolved_layout_source={} resolved_layout_items={} resolved_layout_panes={} resolved_layout_placeholders={} left_panel_visible={} left_panel_width={} browsers={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_window_focused={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} shortcut_passthrough={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} resolved_layout_source={} resolved_layout_items={} resolved_layout_panes={} resolved_layout_placeholders={} left_panel_visible={} left_panel_width={} browsers={} preview1_compat_active={} preview1_compat_generation={} preview1_compat_mailbox_queued={} preview1_compat_mailbox_dispatched={} preview1_compat_completion_delivered={} preview1_compat_notifications_delivered={} preview1_compat_notifications={} preview1_compat_pollables={} preview1_compat_wait_registrations={} preview1_compat_pending_notification_events={} preview1_compat_workers_started={} preview1_compat_worker_reads_started={} preview1_compat_workers_finished={} preview1_compat_workers_failed={} preview1_compat_workers_cancelled={} preview1_compat_last_worker_value={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
                 snapshot.wayland_display,
                 snapshot.wayland_client_insert_errors,
                 snapshot.wayland_dispatch_errors,
@@ -2988,6 +2979,22 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 snapshot.left_panel_visible,
                 snapshot.left_panel_width,
                 snapshot.browsers,
+                snapshot.preview1_compat_active,
+                snapshot.preview1_compat_generation,
+                snapshot.preview1_compat_mailbox_queued,
+                snapshot.preview1_compat_mailbox_dispatched,
+                snapshot.preview1_compat_completion_delivered,
+                snapshot.preview1_compat_notifications_delivered,
+                snapshot.preview1_compat_notifications,
+                snapshot.preview1_compat_pollables,
+                snapshot.preview1_compat_wait_registrations,
+                snapshot.preview1_compat_pending_notification_events,
+                snapshot.preview1_compat_workers_started,
+                snapshot.preview1_compat_worker_reads_started,
+                snapshot.preview1_compat_workers_finished,
+                snapshot.preview1_compat_workers_failed,
+                snapshot.preview1_compat_workers_cancelled,
+                snapshot.preview1_compat_last_worker_value,
                 snapshot.hosted_children,
                 snapshot.hosted_child_exits,
                 snapshot.hosted_child_failures,
@@ -3422,17 +3429,13 @@ fn plug_wasm_module(state: &mut Manifold, path: &Path, kind: WasmPlugKind) -> Re
         path.display()
     );
     match kind {
-        WasmPlugKind::Plugin => {
+        WasmPlugKind::Plugin | WasmPlugKind::Auto => {
             state.replace_wasm_plugin(path)?;
             Ok("plugin")
         }
         WasmPlugKind::KeyPolicy => {
             state.replace_wasm_global_key_policy(path, "workspace")?;
             Ok("key-policy")
-        }
-        WasmPlugKind::Auto => {
-            state.replace_wasm_plugin(path)?;
-            Ok("plugin")
         }
     }
 }
@@ -3480,6 +3483,22 @@ struct StatusSnapshot {
     plugin_actor_messages: u64,
     plugin_actor_failures: u64,
     plugin_actor_last_status: String,
+    preview1_compat_active: bool,
+    preview1_compat_generation: u64,
+    preview1_compat_mailbox_queued: u64,
+    preview1_compat_mailbox_dispatched: u64,
+    preview1_compat_completion_delivered: u64,
+    preview1_compat_notifications_delivered: u64,
+    preview1_compat_notifications: usize,
+    preview1_compat_pollables: usize,
+    preview1_compat_wait_registrations: usize,
+    preview1_compat_pending_notification_events: usize,
+    preview1_compat_workers_started: u64,
+    preview1_compat_worker_reads_started: u64,
+    preview1_compat_workers_finished: u64,
+    preview1_compat_workers_failed: u64,
+    preview1_compat_workers_cancelled: u64,
+    preview1_compat_last_worker_value: u64,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -3626,6 +3645,7 @@ impl StatusSnapshot {
             || "none".to_string(),
             |rect| format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h),
         );
+        let preview1_compat_stats = state.preview1_compat_stats();
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
@@ -3681,6 +3701,35 @@ impl StatusSnapshot {
             plugin_actor_last_status: sanitize_ctl_field(
                 state.plugin_actor_last_status().unwrap_or("none"),
             ),
+            preview1_compat_active: preview1_compat_stats.is_some(),
+            preview1_compat_generation: preview1_compat_stats.map_or(0, |stats| stats.generation),
+            preview1_compat_mailbox_queued: preview1_compat_stats
+                .map_or(0, |stats| stats.mailbox_queued),
+            preview1_compat_mailbox_dispatched: preview1_compat_stats
+                .map_or(0, |stats| stats.mailbox_dispatched),
+            preview1_compat_completion_delivered: preview1_compat_stats
+                .map_or(0, |stats| stats.completion_delivered),
+            preview1_compat_notifications_delivered: preview1_compat_stats
+                .map_or(0, |stats| stats.notifications_delivered),
+            preview1_compat_notifications: preview1_compat_stats
+                .map_or(0, |stats| stats.notifications),
+            preview1_compat_pollables: preview1_compat_stats.map_or(0, |stats| stats.pollables),
+            preview1_compat_wait_registrations: preview1_compat_stats
+                .map_or(0, |stats| stats.wait_registrations),
+            preview1_compat_pending_notification_events: preview1_compat_stats
+                .map_or(0, |stats| stats.pending_notification_events),
+            preview1_compat_workers_started: preview1_compat_stats
+                .map_or(0, |stats| stats.workers_started),
+            preview1_compat_worker_reads_started: preview1_compat_stats
+                .map_or(0, |stats| stats.worker_reads_started),
+            preview1_compat_workers_finished: preview1_compat_stats
+                .map_or(0, |stats| stats.workers_finished),
+            preview1_compat_workers_failed: preview1_compat_stats
+                .map_or(0, |stats| stats.workers_failed),
+            preview1_compat_workers_cancelled: preview1_compat_stats
+                .map_or(0, |stats| stats.workers_cancelled),
+            preview1_compat_last_worker_value: preview1_compat_stats
+                .map_or(0, |stats| stats.last_worker_value),
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),

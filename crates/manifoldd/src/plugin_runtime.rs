@@ -1,3 +1,8 @@
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "crate visibility documents the daemon boundary even though this implementation module is private"
+)]
+
 use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Result, bail};
@@ -70,6 +75,7 @@ struct PluginActorHandle {
     kind: String,
     mailboxes: Vec<PluginMailboxHandle>,
     publications: Vec<PluginPublication>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -97,7 +103,7 @@ pub(crate) enum PluginFramePayload {
 #[derive(Debug)]
 struct PluginFrameNode {
     payload: PluginFramePayload,
-    previous: Option<Arc<PluginFrameNode>>,
+    previous: Option<Arc<Self>>,
     depth: usize,
 }
 
@@ -196,12 +202,18 @@ impl PluginRuntime {
 }
 
 impl PluginActorHandle {
-    fn new(id: String, kind: String, mailboxes: Vec<PluginMailboxHandle>) -> Self {
+    const fn new(
+        id: String,
+        kind: String,
+        mailboxes: Vec<PluginMailboxHandle>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self {
             id,
             kind,
             mailboxes,
             publications: Vec::new(),
+            task,
         }
     }
 
@@ -274,6 +286,12 @@ impl PluginActorHandle {
             .iter()
             .find(|publication| publication.slot == DEFAULT_PUBLICATION_SLOT)
             .map_or_else(|| "none".to_string(), PluginPublication::latest_label)
+    }
+}
+
+impl Drop for PluginActorHandle {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -370,7 +388,7 @@ impl PluginFramePayload {
 }
 
 impl PluginPublication {
-    fn new(slot: String) -> Self {
+    const fn new(slot: String) -> Self {
         Self {
             slot,
             latest: None,
@@ -427,7 +445,7 @@ fn start_toggle_actor(
     );
     let actor_id = DEBUG_TOGGLE_ACTOR_ID.to_string();
     let task_actor_id = actor_id.clone();
-    let task_host_sender = host_sender.clone();
+    let task_host_sender = host_sender;
     let task = runtime.spawn(async move {
         info!(plugin_actor = %task_actor_id, "plugin actor started");
         let mut spawn_btop_next = false;
@@ -445,12 +463,11 @@ fn start_toggle_actor(
         }
         info!(plugin_actor = %task_actor_id, "plugin actor stopped");
     });
-    drop(task);
-
     PluginActorHandle::new(
         actor_id,
         DEBUG_TOGGLE_ACTOR_KIND.to_string(),
         vec![default_mailbox],
+        task,
     )
 }
 

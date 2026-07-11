@@ -77,6 +77,10 @@ impl Registry {
         self.mailboxes.actor_id_for_name(name)
     }
 
+    pub fn unregister_actor(&mut self, name: &str) -> bool {
+        self.mailboxes.unregister_actor(name)
+    }
+
     pub fn host_actor_id(&self) -> Option<ActorId> {
         self.actor_id_for_name(crate::global_key_policy::HOST_ACTOR_NAME)
     }

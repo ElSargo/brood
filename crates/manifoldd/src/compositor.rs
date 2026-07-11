@@ -362,14 +362,7 @@ fn run_nested_test_with_outer(
             &[vec!["spawn".to_string()], inner_command].concat(),
             false,
         )?;
-        if !args.inner_headless {
-            wait_for_hosted_inner_command(
-                &inner_target,
-                &inner_log,
-                &mut outer_child,
-                status_before,
-            )?;
-        }
+        wait_for_hosted_inner_command(&inner_target, &inner_log, &mut outer_child, status_before)?;
     }
     let outer_dump = capture_outer_debug_dump(&outer_target, &out_dir)?;
 
@@ -717,7 +710,7 @@ fn wait_for_hosted_inner_command(
     loop {
         if let Some(status) = outer_child.try_wait().context("poll outer process")? {
             let log_tail = read_log_tail(log_path);
-            bail!("outer exited before inner command rendered: {status}\n{log_tail}");
+            bail!("outer exited before inner command completed: {status}\n{log_tail}");
         }
         if let Ok(response) =
             control::request_dbus_command(inner_target, &[String::from("status-json")], false)
@@ -746,9 +739,9 @@ fn wait_for_hosted_inner_command(
                 return Ok(());
             }
         }
-        if start.elapsed() > Duration::from_secs(15) {
+        if start.elapsed() > Duration::from_mins(1) {
             let log_tail = read_log_tail(log_path);
-            bail!("timed out waiting for inner command to render\n{log_tail}");
+            bail!("timed out waiting for inner command to complete\n{log_tail}");
         }
         thread::sleep(Duration::from_millis(100));
     }

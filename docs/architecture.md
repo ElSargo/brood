@@ -2,11 +2,15 @@
 status: canonical
 type: system-map
 authority: implementation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-11
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
   - crates/manifoldd/src/control.rs
+  - crates/manifoldd/src/state.rs
+  - crates/manifold-wasm/src/module.rs
+  - crates/manifold-wasm/src/component_actor.rs
+  - crates/manifold-wasm/src/preview1_worker.rs
 ---
 
 # Architecture
@@ -42,7 +46,9 @@ The current `manifold` runtime owns:
 - session and surface-session state
 - startup module and startup app loading
 - DBus control interfaces
-- fast WASM key-handler and map-hook lanes
+- core-WASM actors and synchronous key-policy providers
+- Component Model and Preview 1 actor/worker runtimes with completion I/O and
+  notification-based coordination
 - async WASM test harness lane
 
 The long-term architecture may split presentation into a separate endpoint process. That split is deferred until the current single-process prototype has proven the behavior contract.
@@ -57,10 +63,23 @@ User-facing commands such as `enter`, `show`, `hide`, `list`, `switch`, `plug`, 
 
 ## Plugin And Extension Boundary
 
-The target plugin architecture is actor-oriented. Normal plugin behavior runs through host-provided mailboxes, registry entries, capability checks, and native APIs. Latency-critical keyboard, focus, map, and layout decisions use policy providers that read immutable published state and return bounded decision envelopes.
+The target plugin architecture uses actors as public isolation, addressing, and
+lifecycle domains. The host leaves actors dormant between events; once invoked,
+their dispatchers communicate through host-provided mailboxes and completions
+without suspending or blocking. Actors may spawn private workers that share
+actor memory and capabilities. Workers may use ordinary blocking-looking WASI
+and select through host pollables because only the calling worker is suspended;
+their synchronization data structures remain guest-owned. Immediate host
+pre-commit decisions use policy providers that read immutable published state
+and return bounded decision envelopes. See
+[[systems/plugin-io-and-resources]] for the resource contract.
 
 WASM and extension APIs should operate on workspace, session, pane, command, status, input, and layout concepts. They should not expose Smithay, Winit, EGL, DMA-BUF, or renderer internals as the product API.
 
-The host owns final commits, shortcut routing, accepted layout validation, pane lifecycle, native chrome, hit testing, focus, and rendering. Plugins can request commands, send messages, publish latest state, and propose layouts or UI trees, but the host validates and applies accepted results.
+The host owns final commits, worker scheduling and limits, completion delivery,
+shortcut routing, accepted layout validation, pane lifecycle, native chrome,
+hit testing, focus, and rendering. Plugin actors and workers can request
+commands, send messages, publish latest state, and propose layouts or UI trees,
+but the host validates and applies accepted results.
 
 See [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-policy]], [[systems/plugin-ui]], and [[systems/extension-host]].

@@ -1,0 +1,15 @@
+[package]
+name = "manifold-preview1-worker-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+lto = true
+
+# This guest is deliberately independent of Manifold's native workspace.
+[workspace]

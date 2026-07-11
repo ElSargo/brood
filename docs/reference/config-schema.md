@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-10
 code-links:
   - crates/manifoldd/src/config.rs
   - manifold.toml
@@ -15,15 +15,23 @@ Exact config schema behavior is defined by the deserializers in `crates/manifold
 Current top-level config families:
 
 - `session`
+- `layout`
 - `module`
 - `startup`
 
-Current module kinds are prototype WASM lanes:
+Current supported module kinds load self-contained WASM plugin artifacts:
 
-- `fast-key-handler`
-- `fast-map-hook`
+- `plugin`
+- `wasm-plugin`
 
-Target plugin manifests should eventually replace these lane-specific kinds with declarations for actors, policy providers, capabilities, actions, pane types, and publications.
+The parser recognizes the old `fast-key-handler` and `fast-map-hook` names only
+to warn and skip them.
+
+Target plugin manifests should eventually replace these startup entries with
+declarations for actors, per-actor worker and I/O budgets, WASI/capability
+grants, policy providers, actions, pane types, and publications. Workers
+themselves are spawned dynamically inside actors rather than registered as
+top-level plugin components.
 
 Current startup realms:
 

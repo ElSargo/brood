@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-11
 code-links:
   - crates/manifoldd/src/compositor.rs
   - tools/audit-v1-capabilities.sh
@@ -26,6 +26,12 @@ The outer supervisor is offscreen-attached unless `--outer-headful` is passed.
 Nested tests render surface-local fiducial markers in hosted surfaces before final composition. Debug dumps include the composed framebuffer and matching marker IDs in `state.json`, so image-based checks can verify that the captured pixels and Manifold's expected pane/layout metadata agree.
 
 The sandboxed graphical E2E path is `checks.software-e2e`. It forces Mesa software rendering, starts its own DBus session bus, runs an offscreen outer presentation, runs a normal inner presentation inside it, spawns real Weston clients, applies a split layout, and exports inner and outer debug dumps. This check is intended to cover real composition and capture without depending on a host GPU or host-visible presentation window.
+
+The sandboxed plugin I/O path is `checks.wasm-io`, also available as the
+`wasm-io-check` package. It builds the Component and Preview 1 guests plus their
+host workloads, then proves completion I/O, guest-owned shared-memory
+coordination, notification coalescing, worker `wait-any`, cancellation teardown,
+ordinary WASI read compatibility, and structured shutdown.
 
 See [[../workflows/test-nested]].
 

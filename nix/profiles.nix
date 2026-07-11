@@ -2,7 +2,15 @@
 
 let
   rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-    targets = [ "wasm32-unknown-unknown" ];
+    targets = [
+      "wasm32-unknown-unknown"
+      # Rust 1.96 knows the wasip3 target specification, but the upstream
+      # distribution does not ship rust-std for it yet. P1/P2 are retained as
+      # buildable compatibility/tooling paths while the target ABI moves to P3.
+      "wasm32-wasip1"
+      "wasm32-wasip1-threads"
+      "wasm32-wasip2"
+    ];
   };
 
   rustToolchainWithTools = pkgs.rust-bin.stable.latest.default.override {
@@ -12,7 +20,12 @@ let
       "rust-src"
       "rustfmt"
     ];
-    targets = [ "wasm32-unknown-unknown" ];
+    targets = [
+      "wasm32-unknown-unknown"
+      "wasm32-wasip1"
+      "wasm32-wasip1-threads"
+      "wasm32-wasip2"
+    ];
   };
 
   nativeLibs = with pkgs; [
@@ -91,6 +104,8 @@ let
     pkgs.jq
   ];
 
+  wasmTools = [ pkgs.wasm-tools ];
+
   smokeTools = [
     pkgs.dbus
     pkgs.foot
@@ -112,9 +127,10 @@ in
     rustToolchainWithTools
     sessionSwitcherPython
     smokeTools
+    wasmTools
     westonWithSimpleClients
     ;
 
-  devTools = devToolsFor rustToolchain;
-  devToolsWithTools = devToolsFor rustToolchainWithTools;
+  devTools = devToolsFor rustToolchain ++ wasmTools;
+  devToolsWithTools = devToolsFor rustToolchainWithTools ++ wasmTools;
 }

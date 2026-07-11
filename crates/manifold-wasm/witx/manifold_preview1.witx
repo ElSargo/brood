@@ -1,0 +1,137 @@
+(typename $errno
+  (enum (@witx tag u32)
+    $success
+    $invalid
+    $unavailable
+    $limit
+  )
+)
+(typename $word u32)
+(typename $identifier u64)
+
+(module $manifold_preview1
+  (import "memory" (memory))
+
+  (@interface func (export "event_kind")
+    (result $result (expected $word (error $errno)))
+  )
+  (@interface func (export "event_sender_len")
+    (result $result (expected $word (error $errno)))
+  )
+  (@interface func (export "event_payload_len")
+    (result $result (expected $word (error $errno)))
+  )
+  (@interface func (export "event_operation")
+    (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "event_value")
+    (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "event_token")
+    (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "event_read")
+    (param $sender (@witx pointer u8))
+    (param $sender_len u32)
+    (param $payload (@witx pointer u8))
+    (param $payload_len u32)
+    (result $result (expected (error $errno)))
+  )
+
+  (@interface func (export "completion_submit_read")
+    (param $path (@witx pointer u8))
+    (param $path_len u32)
+    (param $offset u64)
+    (param $max_bytes u32)
+    (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "completion_submit_write")
+    (param $path (@witx pointer u8))
+    (param $path_len u32)
+    (param $offset u64)
+    (param $bytes (@witx pointer u8))
+    (param $bytes_len u32)
+    (result $result (expected $identifier (error $errno)))
+  )
+  ;; A nonzero word means the cancellation request was admitted. If it wins
+  ;; the race with result delivery, a terminal cancellation event arrives later.
+  (@interface func (export "completion_cancel")
+    (param $operation u64)
+    (result $result (expected $word (error $errno)))
+  )
+
+  (@interface func (export "worker_spawn")
+    (param $argument u32)
+    (result $result (expected $identifier (error $errno)))
+  )
+  ;; Optional compatibility adapter. Normal workers receive closed stdin and
+  ;; coordinate through shared memory plus notifications.
+  (@interface func (export "worker_spawn_with_stdin")
+    (param $argument u32)
+    (result $result (expected $identifier (error $errno)))
+  )
+  ;; A nonzero word means the worker was current and the request was admitted;
+  ;; terminal worker-cancelled delivery happens asynchronously.
+  (@interface func (export "worker_cancel")
+    (param $worker u64)
+    (result $result (expected $word (error $errno)))
+  )
+  (@interface func (export "worker_input")
+    (param $worker u64)
+    (param $bytes (@witx pointer u8))
+    (param $bytes_len u32)
+    (result $result (expected (error $errno)))
+  )
+
+  ;; Notifications carry only scheduling state. Payloads, queue indices, and
+  ;; synchronization protocols remain guest-owned in shared linear memory.
+  (@interface func (export "notification_create")
+    (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "notification_drop")
+    (param $notification u64)
+    (result $result (expected (error $errno)))
+  )
+  (@interface func (export "notification_signal")
+    (param $notification u64)
+    (param $generation u64)
+    (result $result (expected $identifier (error $errno)))
+  )
+  ;; Zero means armed. One means readiness was already known and the event was
+  ;; queued. Actor watches are one-shot and must be re-armed after dispatch.
+  (@interface func (export "notification_watch")
+    (param $notification u64)
+    (param $observed_generation u64)
+    (param $token u64)
+    (result $result (expected $word (error $errno)))
+  )
+  (@interface func (export "notification_unwatch")
+    (param $notification u64)
+    (result $result (expected $word (error $errno)))
+  )
+
+  ;; Pollables are worker scheduling handles, not guest synchronization data.
+  (@interface func (export "notification_pollable")
+    (param $notification u64)
+    (param $observed_generation u64)
+    (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "pollable_drop")
+    (param $pollable u64)
+    (result $result (expected (error $errno)))
+  )
+  ;; Return the latest generation when ready; unavailable means not ready.
+  (@interface func (export "pollable_generation")
+    (param $pollable u64)
+    (result $result (expected $identifier (error $errno)))
+  )
+  ;; Suspend only the calling worker and return the ready pollable ID. Timeout
+  ;; is relative milliseconds; u64::MAX means no deadline. Mode zero is biased
+  ;; and one is rotating fair selection.
+  (@interface func (export "worker_wait_any")
+    (param $pollables (list u64))
+    (param $timeout_ms u64)
+    (param $mode u32)
+    (result $result (expected $identifier (error $errno)))
+  )
+)

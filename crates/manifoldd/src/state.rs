@@ -13,6 +13,7 @@
     clippy::needless_pass_by_value,
     clippy::option_if_let_else,
     clippy::question_mark,
+    clippy::significant_drop_tightening,
     clippy::struct_field_names,
     clippy::too_many_arguments,
     clippy::undocumented_unsafe_blocks,
@@ -20,7 +21,7 @@
     clippy::unused_self,
     clippy::unwrap_used,
     clippy::useless_let_if_seq,
-    reason = "tracked in issues.md: central runtime state currently owns too many invariants and conversions directly"
+    reason = "tracked in issues.md: central runtime state intentionally keeps coupled event-loop and plugin lifecycle resources alive together"
 )]
 // TODO(lint-structure): decompose Manifold state into typed geometry, session, focus, and registry services.
 
@@ -533,6 +534,11 @@ pub struct Manifold {
     wasm_registry: Arc<tokio::sync::Mutex<manifold_wasm::Registry>>,
     wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
     wasm_actor_names: Vec<String>,
+    wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
+    wasm_component_actor: Option<manifold_wasm::ComponentActor>,
+    wasm_component_actor_name: Option<String>,
+    wasm_preview1_actor: Option<manifold_wasm::Preview1CompatActor>,
+    wasm_preview1_actor_name: Option<String>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
@@ -701,6 +707,11 @@ impl Manifold {
             wasm_registry: Arc::new(tokio::sync::Mutex::new(wasm_registry)),
             wasm_host_mailbox: Some(wasm_host_mailbox),
             wasm_actor_names: Vec::new(),
+            wasm_actor_tasks: Vec::new(),
+            wasm_component_actor: None,
+            wasm_component_actor_name: None,
+            wasm_preview1_actor: None,
+            wasm_preview1_actor_name: None,
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
@@ -742,6 +753,27 @@ impl Manifold {
         sender: String,
         body: String,
     ) -> Result<()> {
+        self.drain_component_actor_events();
+        if self.wasm_component_actor_name.as_deref() == Some(actor_id) {
+            let actor = self
+                .wasm_component_actor
+                .as_ref()
+                .context("component actor is not running")?;
+            actor.try_send_message(sender, body.into_bytes())?;
+            self.plugin_actor_messages += 1;
+            self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+            return Ok(());
+        }
+        if self.wasm_preview1_actor_name.as_deref() == Some(actor_id) {
+            let actor = self
+                .wasm_preview1_actor
+                .as_ref()
+                .context("Preview 1 compatibility actor is not running")?;
+            actor.try_send_message(sender, body.into_bytes())?;
+            self.plugin_actor_messages += 1;
+            self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+            return Ok(());
+        }
         let plugin_runtime = self
             .plugin_runtime
             .as_mut()
@@ -760,6 +792,20 @@ impl Manifold {
         sender: String,
         body: String,
     ) -> Result<()> {
+        if self.wasm_component_actor_name.as_deref() == Some(actor_id) {
+            ensure!(
+                mailbox_slot == "default",
+                "component actor {actor_id:?} has no mailbox slot {mailbox_slot:?}"
+            );
+            return self.send_plugin_actor_message(actor_id, sender, body);
+        }
+        if self.wasm_preview1_actor_name.as_deref() == Some(actor_id) {
+            ensure!(
+                mailbox_slot == "default",
+                "Preview 1 actor {actor_id:?} has no mailbox slot {mailbox_slot:?}"
+            );
+            return self.send_plugin_actor_message(actor_id, sender, body);
+        }
         let plugin_runtime = self
             .plugin_runtime
             .as_mut()
@@ -771,13 +817,88 @@ impl Manifold {
         Ok(())
     }
 
-    pub fn plugin_actor_summaries(&self) -> Vec<PluginActorSummary> {
-        self.plugin_runtime
+    pub fn plugin_actor_summaries(&mut self) -> Vec<PluginActorSummary> {
+        self.drain_component_actor_events();
+        let mut summaries = self
+            .plugin_runtime
             .as_ref()
-            .map_or_else(Vec::new, PluginRuntime::actor_summaries)
+            .map_or_else(Vec::new, PluginRuntime::actor_summaries);
+        if let (Some(actor_id), Some(actor)) = (
+            self.wasm_component_actor_name.as_ref(),
+            self.wasm_component_actor.as_ref(),
+        ) {
+            let stats = actor.mailbox_stats();
+            summaries.push(PluginActorSummary {
+                id: actor_id.clone(),
+                kind: "wasm-component".to_string(),
+                enqueued_messages: stats.enqueued_messages,
+                dropped_messages: stats.dropped_messages,
+                mailbox_capacity: stats.capacity,
+                mailbox_slots: vec![PluginMailboxSummary {
+                    slot: "default".to_string(),
+                    enqueued_messages: stats.enqueued_messages,
+                    dropped_messages: stats.dropped_messages,
+                    capacity: stats.capacity,
+                }],
+                published_frames: 0,
+                latest_frame: "none".to_string(),
+            });
+        }
+        if let (Some(actor_id), Some(actor)) = (
+            self.wasm_preview1_actor_name.as_ref(),
+            self.wasm_preview1_actor.as_ref(),
+        ) {
+            let stats = actor.stats();
+            summaries.push(PluginActorSummary {
+                id: actor_id.clone(),
+                kind: "wasm-preview1-compat".to_string(),
+                enqueued_messages: stats.mailbox_queued,
+                dropped_messages: 0,
+                mailbox_capacity: 128,
+                mailbox_slots: vec![PluginMailboxSummary {
+                    slot: "default".to_string(),
+                    enqueued_messages: stats.mailbox_queued,
+                    dropped_messages: 0,
+                    capacity: 128,
+                }],
+                published_frames: 0,
+                latest_frame: "none".to_string(),
+            });
+        }
+        summaries
     }
 
-    pub fn plugin_mailbox_summaries(&self, actor_id: &str) -> Result<Vec<PluginMailboxSummary>> {
+    pub fn plugin_mailbox_summaries(
+        &mut self,
+        actor_id: &str,
+    ) -> Result<Vec<PluginMailboxSummary>> {
+        self.drain_component_actor_events();
+        if self.wasm_component_actor_name.as_deref() == Some(actor_id) {
+            let stats = self
+                .wasm_component_actor
+                .as_ref()
+                .context("component actor is not running")?
+                .mailbox_stats();
+            return Ok(vec![PluginMailboxSummary {
+                slot: "default".to_string(),
+                enqueued_messages: stats.enqueued_messages,
+                dropped_messages: stats.dropped_messages,
+                capacity: stats.capacity,
+            }]);
+        }
+        if self.wasm_preview1_actor_name.as_deref() == Some(actor_id) {
+            let stats = self
+                .wasm_preview1_actor
+                .as_ref()
+                .context("Preview 1 compatibility actor is not running")?
+                .stats();
+            return Ok(vec![PluginMailboxSummary {
+                slot: "default".to_string(),
+                enqueued_messages: stats.mailbox_queued,
+                dropped_messages: 0,
+                capacity: 128,
+            }]);
+        }
         let plugin_runtime = self
             .plugin_runtime
             .as_ref()
@@ -785,14 +906,26 @@ impl Manifold {
         plugin_runtime.mailbox_summaries(actor_id)
     }
 
+    pub fn preview1_compat_stats(&self) -> Option<manifold_wasm::Preview1CompatStats> {
+        self.wasm_preview1_actor
+            .as_ref()
+            .map(manifold_wasm::Preview1CompatActor::stats)
+    }
+
     pub fn try_wasm_global_key_policy(
         &mut self,
         key_code: Keycode,
         key_state: KeyState,
     ) -> Option<bool> {
-        let modifiers = (self.ctrl_pressed as i32 * manifold_wasm::ABI_MOD_CTRL)
-            | (self.alt_pressed as i32 * manifold_wasm::ABI_MOD_ALT)
-            | (self.shift_pressed as i32 * manifold_wasm::ABI_MOD_SHIFT);
+        // Do not enter the async registry just to discover that no policy is
+        // installed. This also keeps ordinary input handling usable before the
+        // daemon has attached its Tokio runtime.
+        if self.wasm_global_key_policy.is_none() {
+            return None;
+        }
+        let modifiers = (i32::from(self.ctrl_pressed) * manifold_wasm::ABI_MOD_CTRL)
+            | (i32::from(self.alt_pressed) * manifold_wasm::ABI_MOD_ALT)
+            | (i32::from(self.shift_pressed) * manifold_wasm::ABI_MOD_SHIFT);
         let input_mode = match self.input_mode {
             InputMode::Passthrough => manifold_wasm::ABI_INPUT_MODE_PASSTHROUGH,
             InputMode::Normal => manifold_wasm::ABI_INPUT_MODE_NORMAL,
@@ -897,6 +1030,41 @@ impl Manifold {
     }
 
     fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
+        self.drain_component_actor_events();
+        if let Some(actor) = self.wasm_component_actor.as_ref() {
+            let component_name = self
+                .wasm_component_actor_name
+                .as_deref()
+                .unwrap_or("component");
+            match actor.try_send_message("host".to_string(), payload.as_bytes().to_vec()) {
+                Ok(()) => {
+                    self.plugin_actor_messages += 1;
+                    self.plugin_actor_last_status = Some(format!("{component_name}:event_queued"));
+                }
+                Err(err) => {
+                    self.plugin_actor_failures += 1;
+                    self.plugin_actor_last_status = Some(format!("{component_name}:event_error"));
+                    warn!(actor = %component_name, error = %err, "failed to enqueue component actor event");
+                }
+            }
+        }
+        if let Some(actor) = self.wasm_preview1_actor.as_ref() {
+            let actor_name = self
+                .wasm_preview1_actor_name
+                .as_deref()
+                .unwrap_or("preview1-compat");
+            match actor.try_send_message("host".to_string(), payload.as_bytes().to_vec()) {
+                Ok(()) => {
+                    self.plugin_actor_messages += 1;
+                    self.plugin_actor_last_status = Some(format!("{actor_name}:event_queued"));
+                }
+                Err(err) => {
+                    self.plugin_actor_failures += 1;
+                    self.plugin_actor_last_status = Some(format!("{actor_name}:event_error"));
+                    warn!(actor = %actor_name, error = %err, "failed to enqueue Preview 1 actor event");
+                }
+            }
+        }
         let actor_names = self.wasm_actor_names.clone();
         for actor in actor_names {
             let result = self.block_on_wasm_registry(|registry| {
@@ -1050,6 +1218,42 @@ impl Manifold {
 
     pub fn plugin_actor_last_status(&self) -> Option<&str> {
         self.plugin_actor_last_status.as_deref()
+    }
+
+    fn drain_component_actor_events(&mut self) {
+        let Some(actor) = self.wasm_component_actor.as_mut() else {
+            return;
+        };
+        let actor_name = self
+            .wasm_component_actor_name
+            .as_deref()
+            .unwrap_or("component")
+            .to_string();
+        let mut events = Vec::new();
+        while let Some(event) = actor.try_recv_event() {
+            events.push(event);
+        }
+
+        for event in events {
+            match event {
+                manifold_wasm::ComponentActorEvent::DispatcherFailed { message } => {
+                    self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                    self.plugin_actor_last_status = Some(format!("{actor_name}:dispatcher_failed"));
+                    warn!(actor = %actor_name, error = %message, "component actor dispatcher failed");
+                }
+                manifold_wasm::ComponentActorEvent::WorkerFailed { worker, message } => {
+                    self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                    self.plugin_actor_last_status =
+                        Some(format!("{actor_name}:worker_{}_failed", worker.raw()));
+                    warn!(actor = %actor_name, worker = worker.raw(), error = %message, "component actor worker failed");
+                }
+                manifold_wasm::ComponentActorEvent::Stopped => {
+                    self.plugin_actor_last_status = Some(format!("{actor_name}:stopped"));
+                    info!(actor = %actor_name, "component actor stopped");
+                }
+                _ => {}
+            }
+        }
     }
 
     pub const fn set_native_auto_split_visible_limit(&mut self, limit: usize) {
@@ -3703,9 +3907,26 @@ impl Manifold {
     }
 
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
-        let engine = wasmtime::Engine::default();
-        let module = wasmtime::Module::from_file(&engine, path)
-            .map_err(|err| anyhow::anyhow!("load {}: {err}", path.display()))?;
+        let mut engine_config = wasmtime::Config::new();
+        engine_config.wasm_threads(true).shared_memory(true);
+        let engine = wasmtime::Engine::new(&engine_config)
+            .map_err(|error| anyhow::anyhow!("create WASM plugin inspection engine: {error}"))?;
+        let module = match wasmtime::Module::from_file(&engine, path) {
+            Ok(module) => module,
+            Err(core_error) => {
+                return self
+                    .replace_wasm_component_actor(path)
+                    .with_context(|| {
+                        format!(
+                            "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
+                            path.display()
+                        )
+                });
+            }
+        };
+        if manifold_wasm::declares_preview1_compat(&module) {
+            return self.replace_wasm_preview1_actor(path);
+        }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
         ensure!(
             !inventory.is_empty(),
@@ -3717,16 +3938,125 @@ impl Manifold {
             manifold_wasm::PolicyProviderKind::Key,
             "workspace",
         )? {
-            self.wasm_global_key_policy =
-                Some(manifold_wasm::WasmGlobalKeyPolicy::load_from_module(
-                    engine.clone(),
-                    &module,
-                    provider,
-                )?);
+            self.wasm_global_key_policy = Some(
+                manifold_wasm::WasmGlobalKeyPolicy::load_from_module(engine, &module, provider)?,
+            );
             info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
         }
 
+        self.stop_wasm_plugin_actors()?;
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
+        Ok(())
+    }
+
+    fn replace_wasm_component_actor(&mut self, path: &Path) -> Result<()> {
+        let Some(runtime) = self.async_runtime.clone() else {
+            anyhow::bail!("async runtime is not initialized");
+        };
+        // A component owns its Store, workers, completion supervisor, and
+        // epoch ticker. Fully join the old generation before loading (and
+        // therefore activating) the replacement generation.
+        self.stop_wasm_plugin_actors()?;
+        let capability_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let actor = runtime.block_on(manifold_wasm::ComponentActor::load(
+            path,
+            manifold_wasm::ComponentActorConfig {
+                // Until manifest grants are wired through configuration, the
+                // daemon gives the component the narrowest useful default:
+                // read-only access to its own package directory.
+                filesystem: Some(manifold_wasm::FilesystemGrant {
+                    host_path: capability_root.to_path_buf(),
+                    guest_path: ".".to_string(),
+                    writable: false,
+                }),
+                ..manifold_wasm::ComponentActorConfig::default()
+            },
+        ))?;
+        let actor_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("component")
+            .to_string();
+
+        self.wasm_component_actor = Some(actor);
+        self.wasm_component_actor_name = Some(actor_name.clone());
+        self.wasm_global_key_policy = None;
+        self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
+        info!(actor = %actor_name, path = %path.display(), "started component plugin actor");
+        Ok(())
+    }
+
+    fn replace_wasm_preview1_actor(&mut self, path: &Path) -> Result<()> {
+        let Some(runtime) = self.async_runtime.clone() else {
+            anyhow::bail!("async runtime is not initialized");
+        };
+        // The actor owns all worker Stores and its completion supervisor. Join
+        // the entire old generation before activating the replacement.
+        self.stop_wasm_plugin_actors()?;
+        let capability_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let actor = runtime.block_on(manifold_wasm::Preview1CompatActor::load(
+            path,
+            manifold_wasm::Preview1ActorCapabilities {
+                filesystem: Some(manifold_wasm::Preview1FilesystemGrant {
+                    host_path: capability_root.to_path_buf(),
+                    guest_path: ".".to_string(),
+                    writable: false,
+                }),
+            },
+            manifold_wasm::Preview1WorkerConfig::default(),
+        ))?;
+        let actor_name = actor.name().to_string();
+
+        self.wasm_preview1_actor = Some(actor);
+        self.wasm_preview1_actor_name = Some(actor_name.clone());
+        self.wasm_global_key_policy = None;
+        self.plugin_actor_last_status = Some(format!("{actor_name}:preview1_started"));
+        info!(actor = %actor_name, path = %path.display(), "started Preview 1 compatibility plugin actor");
+        Ok(())
+    }
+
+    fn stop_wasm_plugin_actors(&mut self) -> Result<()> {
+        self.drain_component_actor_events();
+        let tasks = self.wasm_actor_tasks.drain(..).collect::<Vec<_>>();
+        for task in &tasks {
+            task.abort();
+        }
+        let old_names = std::mem::take(&mut self.wasm_actor_names);
+        let old_component = self.wasm_component_actor.take();
+        let old_preview1 = self.wasm_preview1_actor.take();
+        self.wasm_component_actor_name = None;
+        self.wasm_preview1_actor_name = None;
+        if let Some(runtime) = self.async_runtime.as_ref() {
+            let registry = Arc::clone(&self.wasm_registry);
+            runtime.block_on(async move {
+                if let Some(mut actor) = old_component
+                    && let Err(err) = actor.shutdown().await
+                {
+                    // A guest trap must not prevent an operator from replacing
+                    // the failed generation. shutdown has still joined all of
+                    // the generation's owned tasks before returning the error.
+                    warn!(error = %err, "old component actor stopped with an error");
+                }
+                if let Some(mut actor) = old_preview1
+                    && let Err(err) = actor.shutdown().await
+                {
+                    warn!(error = %err, "old Preview 1 actor stopped with an error");
+                }
+                for task in tasks {
+                    let _ = task.await;
+                }
+                let mut registry = registry.lock().await;
+                for name in old_names {
+                    registry.unregister_actor(&name);
+                }
+            });
+        } else {
+            ensure!(
+                old_component.is_none() && old_preview1.is_none() && tasks.is_empty(),
+                "cannot join WASM actors without the async runtime"
+            );
+        }
         Ok(())
     }
 
@@ -3797,7 +4127,7 @@ impl Manifold {
                     }
                 }
             });
-            drop(task);
+            self.wasm_actor_tasks.push(task);
         }
         Ok(())
     }

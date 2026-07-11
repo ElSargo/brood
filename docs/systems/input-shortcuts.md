@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-10
 ---
 
 # Input And Keyboard Shortcuts
@@ -83,22 +83,17 @@ KeyPolicyResult {
 
 The provider may read its latest published state and return a message batch, but it does not mutate host state or wait for actor work. The host applies accepted directives and enqueues messages only after the call returns.
 
-The current native prototype handles `Ctrl+O` this way: it reads the `debug-toggle` actor's latest publication frame, returns a host command for `foot htop` or `foot btop`, and returns a mailbox message asking the actor to toggle and publish the next frame.
-
-## Relation To The Current WASM Key Handler
-
-The current `wasm_key` implementation proves that a synchronous key path is useful: the host calls a WASM export during key handling and needs an immediate handled/unhandled answer.
-
-The target keeps that property but changes the boundary:
-
-- current prototype: guest calls side-effect-style imports that append pending host commands
-- target model: guest returns a bounded key decision envelope and message batch
-
-This avoids reentrancy and deadlock while preserving fast key handling.
+The checked-in default-workspace plugin uses this boundary today: its
+`WasmGlobalKeyPolicy` returns a bounded decision envelope and actor-message
+batch after reading the latest immutable publication frame. The native host
+validates and applies the result only after the provider returns.
 
 ## Actor Follow-Up
 
-When a shortcut invokes long-running behavior, the policy path should only make the immediate routing decision. Follow-up work belongs to actors:
+When a shortcut invokes long-running behavior, the policy path should only make
+the immediate routing decision. Follow-up coordination belongs to an actor; the
+actor delegates blocking-looking I/O or shared-state concurrent work to its
+workers:
 
 ```text
 key press

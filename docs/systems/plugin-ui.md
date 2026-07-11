@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-10
 ---
 
 # Plugin UI And Pane Rendering
@@ -22,7 +22,8 @@ The host owns:
 Plugins own:
 
 - pane-local app state
-- actor logic for UI events and commands
+- actor logic for UI events, completions, and commands
+- actor-scoped workers for blocking-looking I/O and shared-state concurrent work
 - semantic view models or component trees
 - optional custom drawing resources when granted
 
@@ -78,7 +79,11 @@ Custom drawing should not be the default pane API. It should bypass native compo
 
 ## Relation To Policy Providers
 
-UI actors are asynchronous. They can publish latest state to publications when a policy provider needs that state for keyboard or layout decisions, but the view tree itself should not become a policy-path backlog.
+UI actor dispatchers are completion-driven and must not block. They may delegate
+I/O or long-running work to workers and handle the resulting completion
+messages. Actors can publish latest state when a policy provider needs that
+state for keyboard or layout decisions, but the view tree itself should not
+become a policy-path backlog.
 
 For example, a session switcher actor can own picker query state and render a native component tree. A host shortcut or key policy provider can open the picker immediately by sending a message or host directive, while the actor performs filtering and UI updates through normal mailbox delivery.
 

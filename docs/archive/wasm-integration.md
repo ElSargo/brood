@@ -34,7 +34,7 @@ This means the first useful milestone is not the WASM runtime itself. The first 
 
 The runtime then becomes an adapter over this model. Linux-native `manifold` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
-The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold should keep the session process authoritative, run ordinary plugin work as actor/mailbox traffic, and reserve policy providers for bounded pre-commit policy hooks that read immutable published state.
+The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold keeps the session process authoritative, uses actors as public mailbox and isolation domains, uses actor-scoped workers for shared-memory concurrency and blocking-looking WASI, and reserves policy providers for bounded pre-commit policy hooks that read immutable published state.
 
 The layout policy boundary is now promoted into [Layout Policy](../systems/layout-policy.md). In short, plugins return candidate resolved layout items through a policy provider, while the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
 

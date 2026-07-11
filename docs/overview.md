@@ -2,7 +2,7 @@
 status: canonical
 type: overview
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-10
 ---
 
 # Overview
@@ -16,10 +16,13 @@ The product model is:
 - A [[concepts/presentation-surface]] shows one session at a time.
 - A [[concepts/pane]] is the unit of presentation.
 - A [[concepts/managed-app]] is an external native app tracked by Manifold.
-- A [[concepts/plugin]] can extend behavior through host-owned mailboxes, policy providers, publications, and capability-checked native APIs.
+- A [[concepts/plugin]] can extend behavior through addressed actors, private actor-scoped workers, completion-based I/O, WASI resources, policy providers, and publications.
 - A [[concepts/wasm-controller]] is one plugin role for changing workspace behavior through host APIs.
 
-The current implementation is a single Rust package named `manifoldd` that builds the user-facing `manifold` binary. That binary currently owns the session process, nested Wayland compositor, DBus control endpoint, and MVP presentation endpoint.
+The current Rust workspace contains `manifoldd`, which builds the user-facing
+`manifold` binary, and `manifold-wasm`, which implements the hosted WASM
+runtimes. The daemon binary currently owns the session process, nested Wayland
+compositor, DBus control endpoint, and MVP presentation endpoint.
 
 See [[architecture]] for the implementation map.
 
@@ -32,7 +35,8 @@ The repository is currently proving:
 - keyboard and pointer forwarding
 - session switching
 - startup modules and startup apps from config
-- prototype fast WASM key-handler and map-hook lanes that inform the target [[systems/plugin-runtime]] policy-provider model
+- core-WASM actors and synchronous key policy, plus Component Model and Preview
+  1 actor/worker runtimes with completion I/O and notification coordination
 - DBus control, status, agent, extension, and notification surfaces
 - nested Manifold-in-Manifold behavior tests
 

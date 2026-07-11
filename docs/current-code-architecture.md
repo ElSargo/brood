@@ -1,21 +1,32 @@
 # Current Code Architecture, Data Flow, and Control Flow
 
-This document describes the architecture that exists in the code today. It is based on direct inspection of the implementation under `crates/manifoldd/src`, the Rust sidecar binaries, and the checked-in GTK session switcher application. It intentionally describes current behavior rather than a target design.
+This document describes the architecture that exists in the code today. It is
+based on direct inspection of `crates/manifoldd`, `crates/manifold-wasm`, the
+Rust sidecar binaries, and the checked-in GTK session switcher application. It
+intentionally describes current behavior rather than a target design.
 
 ## 1. High-level shape
 
-Manifold currently consists of one Rust workspace package, `manifoldd`, plus support applications and scripts. The main runtime is a nested Wayland compositor with an optional presentation frontend. It hosts Wayland clients on an internal Wayland socket, exposes control APIs over DBus, can attach or detach a visible/offscreen presentation target, and keeps most mutable runtime state inside one central `Manifold` state object.
+Manifold currently consists of two Rust workspace packages, `manifoldd` and
+`manifold-wasm`, plus support applications, plugins, examples, and scripts. The
+main runtime is a nested Wayland compositor with an optional presentation
+frontend. It hosts Wayland clients on an internal Wayland socket, exposes
+control APIs over DBus, can attach or detach a visible/offscreen presentation
+target, and keeps most mutable compositor state inside one central `Manifold`
+state object.
 
 At runtime, the core process combines these roles:
 
 - **Wayland compositor/server**: accepts nested Wayland clients, implements Smithay compositor, xdg-shell, seat, data device, output, dmabuf, and explicit-sync handler traits.
 - **Window/session manager**: assigns each top-level surface a pane id and a surface-session id, tracks focus, remembers per-directory session defaults, and maintains native or WASM-provided layout state.
 - **Presentation renderer**: renders hosted Wayland surfaces into a Winit/EGL window or an offscreen EGL renderbuffer.
-- **Input router**: translates presentation keyboard/mouse/scroll events into nested Wayland seat events, while intercepting Manifold shortcuts, normal-mode commands, WASM key handlers, and plugin synchronous key decisions.
+- **Input router**: translates presentation keyboard/mouse/scroll events into nested Wayland seat events and offers keys to the synchronous WASM global-key policy before forwarding them to the focused client.
 - **DBus control service**: serves token-oriented control commands and typed DBus interfaces. DBus handler tasks marshal requests back to the compositor thread before mutating state.
 - **Session-local DBus bus provider**: can start a tiny in-process DBus broker per surface session for hosted clients, including limited forwarding of desktop notifications to the host session bus.
 - **Process supervisor for hosted apps**: launches managed Wayland apps, presentation helper apps, browser panes, and test subjects; tracks child pids/exits.
-- **WASM/plugin host**: hot-loads WASM key/map/test modules and starts a small built-in plugin actor runtime.
+- **WASM/plugin host**: hot-loads core-module actors and key policy providers,
+  Component Model actors, marked Preview 1 compatibility actors, and async test
+  harnesses, and starts a small built-in plugin actor runtime.
 
 The most important architectural fact is that **`Manifold` is the actor-like state container for nearly everything**. The compositor thread owns it and mutates it from calloop callbacks. Async subsystems do not take direct mutable references; they communicate through channels and one-shot response senders.
 
@@ -32,8 +43,9 @@ The most important architectural fact is that **`Manifold` is the actor-like sta
 | Control plane | `control.rs` | DBus service/proxies, CLI control helpers, token command interpreter, status snapshots, inject/debug commands. |
 | Config and runner | `config.rs`, `session_runner.rs`, `launch_context.rs`, `src/bin/*runner*`, `src/bin/manifold-sessiond.rs` | Config loading, startup modules/apps, project session runner discovery, systemd scope launch records, sidecar activation. |
 | DBus isolation | `session_bus.rs` | In-process DBus bus per session, DBus auth/message router, name registry, host notification proxy. |
-| WASM | `wasm_key.rs`, `wasm_map.rs`, `wasm_test.rs` | Wasmtime ABIs for key handlers, map hooks, and async test harnesses. |
-| Plugins | `plugin_runtime.rs` | Built-in actor/mailbox/publication runtime and synchronous key decision hook. |
+| WASM core plugins and host integration | `crates/manifold-wasm/src/module.rs`, `crates/manifold-wasm/src/actor.rs`, `crates/manifold-wasm/src/global_key_policy.rs`, `crates/manifold-wasm/src/policy_provider.rs`, `state.rs`, `wasm_test.rs` | Core-module actor/policy discovery and execution, daemon artifact routing/lifecycle, and the async test harness. |
+| WASM actor/worker runtime | `crates/manifold-wasm/src/component_actor.rs`, `crates/manifold-wasm/src/preview1_worker.rs`, `crates/manifold-wasm/src/completion_io.rs`, `crates/manifold-wasm/src/coordination.rs` | Component Model actors, the Preview 1 POSIX compatibility actor/worker runtime, completion I/O, and shared notification/pollable coordination. |
+| Plugins | `plugin_runtime.rs` | Built-in actor, host-mailbox, and publication scaffold used by the DBus plugin surface. |
 | Browser | `browser.rs` | Chromium process manager and DevTools HTTP helper under control commands. |
 | Diagnostics | `debug_dump.rs` | Status/composed/surface capture bundle. |
 | External sidebar app | `apps/manifold-session-switcher.py` | GTK/Libadwaita DBus client, session switcher, sidebar registration, agent/status UI, notifications. |
@@ -62,6 +74,8 @@ The Tokio runtime remains alive around the calloop thread. It hosts:
 - zbus DBus service tasks,
 - blocking spawned child-process launch/wait tasks,
 - plugin actor tasks,
+- Component actor dispatcher/worker/completion tasks and Preview 1 worker
+  Stores,
 - in-process DBus accept/client tasks when a session bus is started through the Tokio runtime,
 - test harness blocking tasks.
 
@@ -97,7 +111,7 @@ The main `run` flow is:
    - applies test flags and optional clearing of the initial surface session,
    - loads runtime settings from config,
    - loads default configured WASM modules unless disabled,
-   - loads CLI WASM key/map/test modules,
+   - loads CLI WASM plugin, key-policy, and test-harness artifacts,
    - records nested-test inner DBus target fields,
    - starts the DBus control service with `control::listen()`,
    - writes Manifold session/control metadata into state,
@@ -171,7 +185,8 @@ The state owns:
 
 - `hosted_children` and a hosted child event sender,
 - `browsers: BrowserManager`,
-- optional `wasm_key_handler`, `wasm_map_hook`, `test_harness`,
+- optional `wasm_global_key_policy` and `test_harness`, core-module actor tasks
+  and registry state, and optional Component Model and Preview 1 actor runtimes,
 - optional `plugin_runtime`, plugin counters/status,
 - optional in-process per-session DBus bus handles.
 
@@ -219,7 +234,10 @@ The `commit()` handler then:
 - `MANIFOLD_SURFACE_SESSION_ID` in the process tree,
 - default surface session.
 
-It then applies extension grants, handles presentation-child surfaces specially, places new native panes if native layout is active, and invokes the WASM map hook if configured.
+It then applies extension grants, handles presentation-child surfaces specially,
+places new native panes when native fallback is active, and emits pane/layout
+state messages to loaded WASM actors. A plugin actor can answer through the
+host mailbox with a validated resolved-layout command.
 
 ### 6.4 Fullscreen, decorations, popups, seat, and data device
 
@@ -319,23 +337,23 @@ Input usually enters through `PresenterEvent` values handled in `presentation.rs
 
 ### 8.1 Keyboard path
 
-`forward_keyboard_key()` maintains modifier state and decides whether Manifold consumes or forwards each key.
+`forward_keyboard_key()` maintains modifier state and decides whether Manifold
+consumes or forwards each key. Ctrl, Alt, and Shift presses are initially
+compositor-owned. Releases are forwarded only if a later key caused the held
+modifier to be synthesized to the client.
 
-Current order of handling:
+Every non-modifier event is first offered to the installed
+`WasmGlobalKeyPolicy`. The provider receives the key, state, modifier mask,
+input mode, and the latest actor publication frame. It returns a bounded
+decision envelope plus actor messages. The host applies the decision, enqueues
+the messages, and drains the host actor mailbox. If the provider abstains or no
+provider is installed, the key is forwarded to the focused Wayland client;
+held modifiers are forwarded first when shortcut passthrough is active or the
+input mode is not normal.
 
-1. Suppressed releases for the mode-toggle key or shortcut-prefix key are consumed.
-2. Ctrl/Alt/Shift presses are tracked and consumed until a later non-consumed key requires forwarding the modifier to the client.
-3. `Ctrl+Shift+Esc` toggles workspace shortcut passthrough and consumes the key.
-4. `Ctrl+B` toggles `InputMode` between passthrough and normal, unless shortcut passthrough is enabled.
-5. If `shortcut_prefix_active` is true, the next pressed key is consumed and may enable passthrough for `P`. The state field exists, but current non-test code does not appear to set it true.
-6. If shortcut passthrough is enabled, pressed modifiers are forwarded and the key is forwarded to the focused client.
-7. The built-in plugin sync key handler gets a chance. Currently the built-in plugin runtime handles `Ctrl+O`.
-8. Built-in Ctrl layout shortcuts are applied.
-9. In passthrough mode, Ctrl/Alt modified keys can be intercepted by a WASM key handler.
-10. In normal mode, Manifold consumes the key and runs normal-mode behavior: `W` spawns a wezterm Flatpak command; otherwise `LayoutKeymap::default()` maps keys to layout actions.
-11. If none of the above handles the key, pressed modifiers are forwarded as needed, then the key is sent to the focused Wayland client through Smithay keyboard input.
-
-This means modifier key presses are initially compositor-owned. If a later key is forwarded to the client, `forward_pressed_modifiers_to_focused_client()` synthesizes the held modifier press first, and release handling knows whether it must forward the release.
+The checked-in default-workspace plugin supplies the current shortcut and mode
+policy. These behaviors are therefore plugin policy, not hard-coded branches in
+`input.rs`.
 
 ### 8.2 Pointer motion/button/axis path
 
@@ -397,7 +415,8 @@ Actions in `LayoutAction` can focus/cycle panes, split active panes, join/remove
 The current state can accept resolved layouts from two sources:
 
 - **Native fallback**: generated from `LayoutState` and `layout_leaf_selected_panes`.
-- **WASM policy**: returned by a WASM map hook on new window map.
+- **WASM policy**: supplied by a validated `set-resolved-layout` message from a
+  plugin actor after the host publishes pane/layout state.
 
 When windows close or inventory changes, `repair_resolved_layout_for_current_inventory()` either rebuilds native layout or prunes/revalidates the accepted WASM layout. If a WASM layout becomes invalid, Manifold falls back to native layout.
 
@@ -558,7 +577,8 @@ This is currently a focused, hand-written DBus router, not a full DBus broker.
 The TOML model supports runtime layout settings, module definitions, startup apps, and a session runner configuration. Current code uses it for:
 
 - `layout.auto_split_visible_limit`,
-- modules of kind `fast-key-handler` and `fast-map-hook`,
+- modules of kind `plugin` or `wasm-plugin` (the old `fast-key-handler` and
+  `fast-map-hook` kinds are recognized only to emit a legacy warning and skip),
 - startup apps in `session` or `presentation` realm,
 - session runner detection.
 
@@ -587,36 +607,29 @@ The systemd scope name embeds the launch id, allowing `launch_context::current_l
 
 ## 15. WASM extension points
 
-### 15.1 Key handler ABI
+### 15.1 Core-module actors and global key policy
 
-`wasm_key.rs` loads a Wasmtime module and looks for either `on_key_v2(key, state, mode, ctrl, modifiers) -> i32` or legacy `on_key(key, state, mode, ctrl) -> i32`.
+`crates/manifold-wasm/src/module.rs` discovers named actor and policy-provider
+exports in a self-contained core module. `WasmActor` runs one bounded actor
+epoch at a time against a registered mailbox and dispatches its outbox through
+the host registry.
 
-Imports allow guest code to enqueue `WorkspaceCommand` values:
+`crates/manifold-wasm/src/global_key_policy.rs` invokes the selected synchronous
+key provider with a serialized key query and an optional immutable publication
+frame. The provider returns a bounded decision envelope and message batch; the
+daemon applies the decision and enqueues messages to named actors. The checked-in
+default-workspace plugin combines this key provider with a workspace actor.
+See the source files that define module export discovery and policy response
+decoding for the exact ABI.
 
-- focus next/previous,
-- toggle fullscreen,
-- close active window,
-- arbitrary layout action by ABI number,
-- query focused pane id,
-- query pane by app id,
-- focus pane,
-- switch or create surface session,
-- spawn an app from a whitespace-split command string,
-- focus-or-spawn an app by app id and command.
+### 15.2 Actor-driven layout policy
 
-Before each call, the host store is populated with focused pane id and visible active-session panes. After the call, `WasmKeyOutcome::apply()` applies queued commands to `Manifold`. The handler's return value controls whether the original key was handled.
-
-### 15.2 Map hook ABI
-
-`wasm_map.rs` loads `on_map_v1(pending_pane, visible_count) -> i32`. Imports let the guest query visible pane ids and set a JSON response string.
-
-If the guest handles the map and sets a response, the host parses `MapHookResponse`:
-
-- `abstain` falls back to native placement,
-- `reject` logs a reason and falls back,
-- `resolved-layout` supplies a `ResolvedLayout` plus optional focus pane.
-
-The returned layout is validated against active-session panes before it is accepted.
+Layout is no longer a standalone direct map-hook import lane. When pane
+inventory changes, the daemon emits `pane-mapped` and `layout-state` messages
+to the loaded plugin actors. An actor can post a `set-resolved-layout` command
+to the host actor mailbox. The daemon validates pane identity, geometry, focus,
+and input behavior before accepting the layout, and falls back to native layout
+when validation fails.
 
 ### 15.3 Test harness ABI
 
@@ -632,18 +645,91 @@ Imports include:
 
 Harness requests are sent over std mpsc to the calloop thread. `Manifold::service_test_harness()` drains requests, serves control/status calls, and reacts to completion by stopping the loop for pass/fail or keeping it paused for inspection.
 
+### 15.4 Component actor prototype
+
+When plugin replacement cannot parse an artifact as a core module,
+`Manifold::replace_wasm_plugin()` attempts to load it as a Component Model
+actor. `ComponentActor` owns one component instance and Store, a bounded normal
+mailbox, a reserved completion queue, actor-scoped worker tasks, an epoch
+ticker, and the completion-I/O supervisor. The runnable component imports only
+the Manifold actor/worker WIT in
+`crates/manifold-wasm/wit/manifold-plugin.wit`; task identity gates worker-only
+async calls, and dispatch has no standard blocking-looking WASI surface.
+
+The dispatcher submits reads and writes and later receives typed completion
+events. Async workers execute exports from the same component instance and may
+await worker I/O or an explicit cooperative `worker-yield`, releasing the Store
+so dispatcher traffic can proceed. Epoch deadlines are correlated to the
+dispatcher guest task, so they do not trap an unrelated worker. Until package
+manifests supply grants, the daemon gives worker/completion I/O read-only access
+to the artifact's parent directory.
+
+The same ABI exposes generation-scoped notifications and notification
+pollables. Actor watches are one-shot and coalesced; workers use bounded
+`worker-wait-any` with biased or rotating-fair selection and implicit worker
+cancellation. The guest owns its shared-memory queue or synchronization layout.
+The host reports live resources and wait registrations but never implements a
+guest mutex or channel.
+
+Individual worker cancellation is cooperative and becomes terminal only after
+the guest export returns. Replacement calls `ComponentActor::shutdown()`,
+terminates the owning Store, and joins the old generation's runtime, I/O
+supervisor, tracked blocking I/O, and epoch task before activating a new
+generation. `tools/test-wasm-component-worker.sh` exercises this runtime
+directly.
+
+### 15.5 Preview 1 compatibility actor and workers
+
+A core module exporting the Preview 1 compatibility marker is routed to
+`Preview1CompatActor`. The module imports one shared memory. Its actor
+dispatcher and each worker use separate Wasmtime Stores and instances over that
+memory; this preserves shared-memory communication while keeping descriptor
+tables and worker-local WASI state private to each Store.
+
+The actor Store has no blocking filesystem or stdin resources and uses the
+completion imports. Worker Stores derive standard Preview 1 WASI filesystem and
+stream authority from the actor grant, so ordinary calls such as Rust
+`std::io::Read::read_exact` suspend only the worker's Tokio task. Worker
+stack/TLS reservations are allocated and released through the guest
+compatibility ABI. CPU-running Preview 1 workers yield through epoch async
+scheduling because they have independent Stores.
+
+The compatibility ABI shares the same notification/pollable hub across the
+actor and every worker Store. The example's primary actor/worker path is a
+guest-owned atomic queue; host notifications suspend workers and schedule a
+coalesced actor event. The host-owned stdin duplex is retained only for an
+explicit ordinary-WASI compatibility case.
+
+The compatibility facade appears in the normal plugin actor list, accepts
+messages through the existing DBus/control actor surface, and reports mailbox,
+completion, notification, pollable, active-wait, worker, generation, and
+last-result counters in status output. Replacement cancels pending workers and
+waits for their Stores, wait-registration teardown, and the completion
+supervisor before the new actor becomes reachable.
+
+`tools/test-wasm-preview1-worker.sh` exercises the low-level runtime and actor
+facade in-process. `tools/test-wasm-preview1-worker-nested.sh` loads the artifact
+through the daemon's built-in nested test topology and proves control-surface
+routing, actor progress during notification select, completion I/O, ordinary
+WASI read compatibility, and hot replacement while two notification wait sets
+are pending.
+
 ## 16. Plugin runtime
 
-`plugin_runtime.rs` is separate from WASM. `Manifold::set_async_runtime()` starts `PluginRuntime::start_builtin()`, which currently creates a single built-in actor:
+`plugin_runtime.rs` is separate from WASM. `Manifold::set_async_runtime()` starts
+`PluginRuntime::start_builtin()`, which currently creates a native host mailbox
+and one built-in actor:
 
 - id `debug-toggle`,
 - kind `builtin-toggle-launcher`,
 - one bounded mailbox slot named `default`,
 - one publication slot named `default`.
 
-The actor toggles a `spawn_btop_next` boolean each time it receives a mailbox message and publishes a `ToggleChoice` frame back to the host through a calloop channel. The host appends frames into the actor's publication state.
-
-`try_plugin_sync_key_handler()` consults this runtime before built-in Ctrl layout shortcuts. The current sync key decision handles `Ctrl+O`: on press it spawns `foot htop` or `foot btop` based on the latest toggle frame and sends a mailbox message that flips the next choice.
+The actor toggles a `spawn_btop_next` boolean each time it receives a mailbox
+message and publishes a `ToggleChoice` frame back to the host through a calloop
+channel. The host appends frames into the actor's publication state. No input
+path currently consults this frame; synchronous key decisions are handled by
+the WASM global-key policy described above.
 
 The DBus plugin interface can list actors/mailboxes and enqueue actor messages. Status snapshots expose plugin actor summaries and counters.
 
@@ -705,7 +791,7 @@ CLI/control/startup requests spawn
   -> optionally start session-local DBus bus and set DBUS_SESSION_BUS_ADDRESS
   -> child connects to Manifold Wayland socket
   -> Smithay xdg new_toplevel callback
-  -> assign pane/session, apply grants, native placement or WASM map hook
+  -> assign pane/session, apply grants, native placement or actor layout event
   -> map Window in Space
   -> focus/reconfigure
   -> client commits buffer
@@ -772,7 +858,9 @@ These are not future plans; they are observable properties of the current code:
 - The compositor thread is the single mutation point for `Manifold`; async DBus/plugin/test tasks must use channels.
 - The control command interpreter is token-oriented and manually parsed. Typed DBus interfaces coexist with the token command path.
 - Native layout is a binary split tree of client leaves only. Docks are represented mostly by booleans and the special left-panel reservation path; several dock movement actions are placeholders.
-- The accepted presentation layout may be native-generated or WASM-generated. WASM layouts are accepted only after validation but are still repaired/fallbacked when window inventory changes.
+- The accepted presentation layout may be native-generated or supplied through
+  a WASM actor's host message. Plugin layouts are accepted only after validation
+  but are still repaired or replaced by fallback when window inventory changes.
 - Presentation can be detached while the Wayland compositor continues running. Hosted clients can still be present; visible latency stats only sample when presentation is attached and relevant windows/targets exist.
 - The in-process DBus bus is intentionally limited. It implements enough for session-local name ownership/routing and notifications, but not full broker features such as Unix FD passing.
 - Browser support is process/DevTools based and Chromium-specific.

@@ -2,119 +2,263 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-11
 ---
 
 # Plugin Runtime
 
-The target plugin runtime combines actor-style asynchronous execution with narrow policy providers for latency-critical host decisions.
-
-The design rule is:
+The target plugin runtime has three distinct execution roles:
 
 ```text
-async actors own plugin behavior and durable local state
+actors are public isolation, addressing, and lifecycle domains
+workers are private shared-memory execution contexts inside an actor
 policy providers answer immediate host queries from immutable published state
-the host validates and commits all workspace, layout, input, and pane effects
 ```
+
+The host validates and commits all workspace, layout, input, pane, and process
+effects. Neither actors nor workers receive direct authority over compositor or
+renderer internals.
 
 ## Runtime Shape
 
 A plugin package may declare any number of actors and optional policy providers.
+Each actor may create many workers.
 
 ```text
 Plugin
-  Actor: background/index/status/command/pane state
-  Actor: pane UI or service worker
-  Policy provider: key policy, focus preflight
-  Publications: default and named latest-state publications
+  Actor: address + mailbox slots + memory + capabilities
+    Dispatcher: completion-driven, must not block
+    Worker: actor-scoped task with shared memory
+    Worker: actor-scoped task with shared memory
+  Actor: independent address space and mailbox
+    Worker: actor-scoped task with shared memory
+  Policy provider: bounded synchronous decision routine
+  Publications: host-owned immutable latest-state frames
 ```
 
-The host provides:
+Only actors and policy providers are registered with the host. Workers are
+private implementation details of their owning actor and are never globally
+addressable.
 
-- actor registry and addressing
-- mailbox creation, routing, bounds, and diagnostics
-- capability-checked native APIs
-- policy provider registration and invocation
-- named latest-state publication
-- plugin lifecycle and failure handling
-- command execution after validation
+## Actors
 
-Plugins may be internally multi-threaded, but that is an implementation detail. The host-visible contract is actors, mailboxes, policy providers, and published immutable frames.
+An actor is the public unit of plugin isolation and communication. A WASM actor
+owns a component instance or equivalent runtime container with its own:
 
-## Current Prototype
+- address space and durable local state
+- globally addressable mailbox and named mailbox slots
+- capability and resource table
+- publication namespace
+- lifecycle, diagnostics, and failure state
 
-The first runtime slice is intentionally small: Manifold starts a built-in actor named `debug-toggle` on the Tokio runtime. The actor owns a bounded default mailbox slot backed by a Tokio `mpsc` channel and publishes an immutable boolean frame to its default publication. Each actor message toggles that boolean and appends a new host-owned frame.
+“Globally addressable” means addressable through the granted Manifold actor
+registry. It does not imply ambient cross-session or cross-plugin access.
 
-A prototype key policy provider handles `Ctrl+O`. It reads the latest actor frame without waiting on the actor mailbox. If the frame says `spawn_btop_next=false`, the provider returns a host command to spawn `foot htop`; if it says `true`, the provider returns a host command to spawn `foot btop`. The provider also returns a mailbox message asking `debug-toggle` to toggle and publish the next frame.
+The actor is dormant while the host waits for its next event. Once invoked, the
+actor dispatcher consumes one event, coordinates actor state, and returns
+promptly. It must not suspend or block inside dispatch on filesystem, network,
+process, timer, channel, lock, join, or other potentially unbounded operations.
+It may:
 
-Debugging entry points:
+- submit completion-based operations
+- handle previously delivered completions
+- spawn workers
+- use non-blocking `try_*` synchronization operations
+- send messages, publish state, and request host commands
 
-- DBus interface: `org.manifold.Plugin` at `/org/manifold/Plugin`
-- CLI helper: `manifold ctl actors list`
-- CLI helper: `manifold ctl actors mailboxes debug-toggle`
-- CLI helper: `manifold ctl actors send debug-toggle <message>`
-- CLI helper: `manifold ctl actors send-slot debug-toggle default <message>`
+This rule keeps actors responsive to input, lifecycle, cancellation, and host
+control even while their workers are waiting on I/O.
 
-This prototype exercises actor mailboxes, host-owned publication append, synchronous key policy reads, returned host commands, and returned actor messages without making the actor a final plugin API.
+## Workers
+
+A worker is a lightweight execution context scoped to the actor that spawned
+it. It acts like a thread inside the actor:
+
+- it shares the actor's address space, local state, resources, and capabilities
+- it may use ordinary blocking-looking WASI calls such as `read` and `write`
+- it may use the same completion-based APIs as the actor
+- it may use guest-owned shared-memory coordination with sibling workers
+- it has a distinct stack or coroutine state and worker-local storage
+- it has no actor ID, public mailbox, publication identity, or independent grant
+- it cannot outlive its actor
+
+A blocking-looking worker call suspends only that worker. The host runs the
+underlying operation asynchronously and schedules other actor work while the
+worker is waiting. Worker creation, join, cancellation, exit, and failure are
+observable through actor-local handles and completion events rather than public
+actor addressing.
+
+Workers are the default tool for concurrent work that needs shared state or
+ordinary library I/O. A separate actor is appropriate when work needs an
+independent address, address space, capability set, failure boundary, or
+lifecycle.
+
+## Concurrency And Parallelism
+
+The initial worker contract is cooperative concurrency. Many workers may have
+I/O in flight, but only one execution context is required to execute guest code
+at a time. A worker must yield at I/O, synchronization, explicit yield points,
+or runtime scheduling boundaries so that it cannot monopolize its actor.
+
+Cooperative workers do not promise multicore execution. Parallel shared-memory
+workers would change synchronization and data-race semantics and must be
+introduced as a separate explicit capability and API if a real workload
+justifies them. The runtime must not silently turn cooperative workers into
+parallel threads.
+
+## I/O Model
+
+Actors and workers use the same host I/O engine through two interfaces:
+
+```text
+actor submits operation
+  -> host starts asynchronous work
+  -> host posts a typed completion to the actor's completion lane
+  -> actor handles the completion as a message
+
+worker calls blocking-looking WASI operation
+  -> host starts asynchronous work
+  -> only that worker is suspended
+  -> completion resumes that worker and returns the ordinary WASI result
+```
+
+The completion protocol is the canonical actor I/O contract. Language SDKs may
+wrap it in futures or `async`/`await`, but those are ergonomic projections over
+operation submission, suspension, completion, cancellation, and resumption.
+
+Completion delivery uses a reserved actor-private mailbox lane so I/O results
+do not compete with ordinary application messages. Each operation has a stable
+actor-scoped ID and a typed terminal result. The runtime must bound outstanding
+operations, preserve completion causality, support cancellation, and prevent a
+completion from being delivered to a replacement actor generation after reload.
+
+Large results should use owned buffers or capability handles rather than
+unbounded message copies. A completion must not expose raw host pointers or
+write into actor memory after ownership of the supplied buffer has returned to
+the actor.
+
+## WASI Compatibility
+
+The plugin ABI should expose standard WASI interfaces with a Manifold-owned host
+implementation. Manifold decides which files, streams, sockets, clocks,
+processes, and other resources an actor receives; WASI supplies the portable
+program-facing contract.
+
+In worker context, normal language and libc operations such as `open`, `read`,
+and `write` should work when the corresponding capability has been granted.
+This is a WASI-supported POSIX-like compatibility promise, not a promise to
+emulate every Linux syscall, signal, `ioctl`, `fork`, or ambient filesystem
+behavior.
+
+The preferred target is the WASI 0.3 Component Model concurrency and I/O shape.
+Compatibility adapters may run WASIp1 or WASIp2 command-style code as a worker
+inside an actor. Legacy blocking entry points must not become actor dispatchers.
+
+Manifold-specific WIT interfaces should cover actors, mailbox slots,
+publications, workers, capability-checked commands, and completion metadata.
+They should extend standard WASI rather than replacing ordinary I/O with a
+Manifold-only syscall vocabulary.
+
+## Shared-Memory Coordination
+
+The host does not implement mutexes, channels, condition variables, semaphores,
+or ring-buffer layouts. Workers may build those structures in shared actor
+memory using guest atomics plus host notification and pollable primitives.
+
+Workers may wait on notifications or select across notifications, streams,
+timers, process exit, joins, and cancellation. Waiting suspends only the worker.
+The actor never waits on a worker synchronization primitive. Workers send
+semantic actor-local events, or publish shared queue/snapshot changes by
+incrementing an atomic generation and notifying the host. The host then delivers
+a coalesced actor-private notification event.
+
+SDKs should distinguish actor-owned state from memory explicitly shared with
+workers. Actor dispatch uses acquire loads and bounded `try_*` operations after
+a notification; mutex fairness and data-structure policy remain guest-owned.
+
+The complete notification, worker-select, external-resource, and lifecycle
+contract is specified in [[plugin-io-and-resources]].
+
+## Capabilities, Limits, And Lifecycle
+
+Workers inherit the owning actor's capabilities and may receive a narrower
+derived set. Spawning a worker never grants new authority. Resource handles and
+actor-local synchronization objects remain scoped to the actor address space.
+
+The runtime must bound and report at least:
+
+- live and peak worker count
+- runnable, waiting, completed, cancelled, and failed workers
+- outstanding I/O operations and completion backlog
+- worker CPU/fuel use and time between yield points
+- worker stack or coroutine-state memory
+- actor mailbox depth and completion-lane depth
+- notification and pollable counts, pending actor notification events, and
+  active worker wait registrations
+
+Stopping, crashing, or replacing an actor cancels its workers and outstanding
+operations before releasing its address space and capabilities. A normal worker
+failure terminates that worker and reports a typed completion to the actor.
+Failures that invalidate shared runtime state may terminate the actor. Neither
+case should tear down the session process.
 
 ## Mailboxes
 
-Mailboxes are the normal communication path. They carry durable messages between plugin actors, host services, panes, agents, and other granted targets.
+Mailboxes are the normal durable communication path between actors, host
+services, panes, agents, and other granted targets. Workers do not add another
+host-visible addressing layer.
 
-A mailbox is addressed by actor ID plus mailbox slot. The default slot is enough for simple actors; named slots let actors separate control, lifecycle, UI, and work traffic without making every message compete in one queue.
-
-The native prototype backs each mailbox slot with a bounded Tokio `mpsc` channel. Host-side sends use `try_send`, including messages returned by policy providers, so the policy path never waits for actor work. Rejection increments diagnostics and is reported to the caller.
+A mailbox is addressed by actor ID plus mailbox slot. The default slot is enough
+for simple actors; named slots separate control, lifecycle, UI, work, and
+completion traffic without making every message compete in one queue.
 
 Mailbox delivery should support:
 
 - bounded queues or explicit backpressure
 - priority classes for lifecycle and shutdown
-- sender/target/slot capability checks
+- sender, target, and slot capability checks
 - traceable message IDs and causality
 - failure diagnostics for dropped, rejected, or delayed messages
 
-A mailbox message may request a command, publish status, update pane UI, notify another actor, or report work completion. It should not assume immediate execution on the input or presentation thread.
+A mailbox message may request a command, publish status, update pane UI, notify
+another actor, or report work completion. It must not assume immediate execution
+on the input or presentation thread.
 
 ## Policy Providers
 
-Some host decisions cannot wait behind arbitrary actor queues. Keyboard routing, initial pane placement, focus preflight, and presentation layout often need a deterministic answer before the host can safely continue.
+Some host decisions cannot wait behind arbitrary actor queues. Keyboard routing,
+focus preflight, and other pre-commit decisions may need a deterministic answer
+before the host can safely continue.
 
-A policy provider exists for that bounded case. The host invokes a provider as a synchronous pure decision routine:
+A policy provider is a synchronous, bounded, side-effect-free decision routine:
 
 ```text
 HostQuery + immutable published state + host-provided query context
     -> PolicyResult { answer, directives, message_batch }
 ```
 
-During the call, a policy provider may:
+During the call, a policy provider may read its presented state and query
+context, compute a bounded result, and return a bounded message batch. It must
+not spawn or join workers, block on actor state, perform I/O, mutate host state,
+or call arbitrary side-effecting APIs.
 
-- read its presented state frame
-- read host-provided query context
-- compute a bounded result
-- return a bounded message batch for later enqueueing
-
-During the call, a policy provider must not:
-
-- block on a mailbox or async task
-- mutate host state directly
-- perform filesystem, network, process, or storage I/O
-- call arbitrary host APIs with side effects
-- rely on processing a backlog of pending policy-path events
-
-After the call returns, the host validates the result, applies accepted immediate decisions, and enqueues returned messages through normal mailbox rules.
+After the call returns, the host validates its result, applies accepted
+immediate decisions, and enqueues returned messages through normal mailbox
+rules.
 
 ## Publications
 
-Publications are the bridge from async actors to policy providers.
+Publications bridge mutable actor state and synchronous policy providers.
 
 ```text
-actor processes events asynchronously
+actor and workers update actor-owned state
 actor asks host to append an immutable frame to a named publication
-host atomically publishes the latest Arc-backed frame node
+host atomically publishes the latest frame
 policy provider reads the latest frame during a host call
 ```
 
-The default publication is enough for simple plugins. Named publications let a plugin split materialized policy state by worker, feature, or provider without inventing shared mutable memory.
+Publications are actor-owned even when a worker prepared the data. Workers do
+not receive independent publication identities.
 
 Required guarantees:
 
@@ -122,77 +266,87 @@ Required guarantees:
 - frames are immutable once visible
 - frame count, size, and schema are bounded
 - invalid frames are rejected before publication
-- a policy invocation pins the `Arc` frame it reads for the duration of the call
-- old frames are reclaimed only when no invocation can still read them
-- frame payloads live in a host-owned namespace and do not contain plugin heap pointers
+- an invocation pins the frame it reads for the duration of the call
+- frame payloads contain owned data, offsets, handles, or resource IDs rather
+  than pointers into mutable actor memory
 
-The policy provider should normally read the latest frame, not walk an unbounded history. The prototype stores frames as a bounded `Arc` linked list for pinning and diagnostics, but policy reads are latest-frame reads. If a policy needs history, the actor should materialize the needed bounded history into the latest frame.
+If a policy needs history, the actor should materialize the required bounded
+history into its latest frame rather than making the provider drain a log.
 
-Native in-process frames do not need to serialize through JSON. The safety rule is that plugins publish values into a host-owned frame namespace: owned data, offsets, handles, and resource IDs are valid; raw pointers or references into plugin heap/task memory are not valid published state. For WASM, host append should copy out of guest memory into this namespace before publication.
+## WASM Runtime Direction
 
-## WASM ABI Direction
+The target WASM runtime should instantiate an independent Component Model actor
+container for each actor declaration. Workers execute within that container and
+share its guest state. The host event loop owns scheduling, asynchronous I/O,
+completion delivery, cancellation, and resource limits.
 
-The current prototype uses a narrow core-WASM path for key handling. That path proves the latency requirement but is not the final plugin API.
+Two runnable prototypes now exercise that execution model. `ComponentActor`
+owns one component instance and Store, schedules cooperative async workers in
+that container, and delivers typed I/O results through a reserved completion
+lane. `Preview1CompatActor` is the POSIX-compatibility path: separate worker
+Stores share an imported memory and standard Preview 1 authority, allowing an
+ordinary blocking-looking worker `read` while the actor dispatcher continues.
+Their actor completion APIs are backed by one bounded, generation-scoped
+completion engine, and both runtimes apply structured worker/I/O shutdown
+during replacement.
 
-The target WASM ABI should preserve the same immediate-call property for pre-commit decisions while replacing direct side-effect imports with a returned decision envelope:
+The runnable Component actor links only the Manifold WIT. Dispatch uses the
+completion lane, and worker file/yield imports are admitted only from registered
+worker guest tasks. Ordinary standard-library and libc I/O is currently provided
+by the Preview 1 compatibility backend.
 
-```text
-key_policy(query, state_ref) -> KeyPolicyResult
-```
+These implementations are evidence for the target, not a commitment to their
+prototype export names. Package-manifest actor declarations and grants, the
+complete registry/publication/policy surface, and an SDK that enforces the
+dispatcher/worker type split remain target work. The Preview 1 path also has
+Store-local descriptor tables even though its memory and authority are shared.
+See [[extension-host]] for the runnable actor/worker proofs and
+[[../reference/wasm-fast-lanes]] for the current core-WASM actor/policy lanes.
 
-Layout is actor/message based rather than a policy provider. Layout actors receive host events and send validated `SetResolvedLayout` host messages.
-
-A `state_ref` for WASM should be a runtime-safe handle, copied buffer, or explicit read-only view. Do not require plugins to dereference raw host pointers unless the runtime model makes that safe and portable.
-
-When the host needs to copy state into a guest policy provider, the guest should export a small arena allocator. The native scaffold expects `memory`, `manifold_arena_alloc(capacity, align) -> ptr`, and optionally `manifold_arena_free(ptr, capacity, align)`. The host calls the allocator, validates that the returned range is inside guest memory, then copies immutable frame/query bytes into that arena before invoking the policy export.
-
-The actor scaffold also defines the first async loop shape: the guest exports `manifold_epoch_run(epoch, mailbox_ptr, mailbox_cap) -> i32` and imports `manifold.read_message() -> i32` plus `manifold.publish(slot_ptr, slot_len, payload_ptr, payload_len) -> i32`. The host allocates the mailbox arena up front, passes its pointer/capacity to each epoch call, and services `read_message` by awaiting the actor mailbox and copying the message bytes directly into that arena. The import returns the copied byte length, `-1` for a closed mailbox, or `-2` for host-side copy/allocation errors. When the guest calls `publish`, the host copies the named payload out of guest memory into a pending immutable publication frame. After the epoch returns, the host drains pending frames into the publication registry so policy providers can read the latest frame without touching actor state.
-
-A single WASM module should self-declare its host-visible pieces through exports, so no sidecar manifest is needed for the first scaffold. `manifold_epoch_run` declares one default actor. `manifold_actor_<name>_epoch_run` declares a named actor. `manifold_policy_provider_key_<name>`, `manifold_policy_provider_map_<name>`, and `manifold_policy_provider_focus_<name>` declare policy providers. The `manifold-wasm` crate discovers these exports, registers actor mailboxes, instantiates one actor runtime per actor export, and records policy-provider handles for the next implementation step.
+Policy providers remain isolated from mutable actor execution. They receive
+host-owned immutable publication state rather than dereferencing worker or actor
+memory.
 
 ## Command And Event Flow
 
-The host is the only committer:
+The host remains the only committer:
 
 ```text
 backend/input/control observation
   -> build candidate transaction or host query
-  -> invoke relevant policy providers when needed
-  -> validate decisions
-  -> commit workspace/presentation state
-  -> emit events
-  -> deliver events to actor mailboxes
-  -> execute accepted command requests on the host thread
+  -> invoke a policy provider when an immediate decision is required
+  -> validate and commit workspace/presentation state
+  -> deliver durable events to actor mailboxes
+  -> dispatch actor work or resume workers from completions
+  -> validate and execute accepted command requests on the host thread
 ```
 
-Actors and policy providers may request commands or send messages. They do not directly mutate compositor state, presentation state, workspace state, pane focus, or native layout.
+Actors and workers may request commands or send messages. They do not directly
+mutate compositor state, presentation state, workspace state, pane focus, or
+native layout.
 
-## Performance Policy
+## Performance And Failure Policy
 
-Mailbox passing is sufficient for normal plugin work. The policy provider and publication model exists for the narrow set of paths where queueing would create visible latency or inconsistent pre-commit ownership.
+Use actors for isolation and durable communication. Use workers for cheap
+shared-state concurrency and blocking-looking compatibility I/O. Use policy
+providers only for immediate host pre-commit decisions. Use publications for
+latest immutable policy state.
 
-Performance-sensitive rules:
-
-- use mailboxes for commands, events, and durable work
-- use publications for latest policy state
-- use policy providers only for host pre-commit decisions
-- coalesce high-rate input before actor delivery when possible
-- return handles or resource IDs for large payloads instead of copying through messages
-- validate queue lengths and policy-provider latency in diagnostics
-
-## Failure Policy
-
-Every policy provider and actor should have observable failure state.
-
-Policy provider failures should be neutral by default: disable or skip the failing provider, report the failure, and fall back to native policy. Security-style fail-closed hooks require an explicit manifest choice and grant.
-
-Actor failures should not tear down the session process. The host should stop or restart the affected plugin components, preserve host-owned pane shells where possible, and render recovery UI for affected panes.
+Diagnostics must make actor latency, worker starvation, mailbox pressure,
+completion pressure, policy-provider latency, cancellation, and failure visible.
+The host should stop or restart affected plugin components, preserve host-owned
+pane shells where possible, and render recovery UI without tearing down the
+session process.
 
 Related:
 
+- [[plugin-io-and-resources]]
 - [[../concepts/plugin]]
+- [[../decisions/0006-plugin-actors-and-workers]]
 - [[input-shortcuts]]
 - [[layout-policy]]
 - [[plugin-ui]]
 - [[extension-host]]
 - [[../reference/wasm-fast-lanes]]
+- [WASI 0.3](https://bytecodealliance.org/articles/WASI-0.3)
+- [Component Model concurrency](https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md)

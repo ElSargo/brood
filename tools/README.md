@@ -20,6 +20,10 @@ The full suite and compositor smoke scripts require a host display socket for th
 
 ## Focused Checks
 
+Run `nix build .#wasm-io-check` for the sandboxed actor/worker I/O proof. It
+builds both guest ABIs and runs completion I/O, shared-memory notifications,
+worker select/cancellation, ordinary WASI read, and shutdown workloads.
+
 Run `./tools/manifold-behavior-probe.sh` to start Manifold with a strict dmabuf-capable test client and emit JSONL behavior telemetry.
 
 Run `./tools/profile-native-scroll.sh` on a native Linux Wayland session to profile the Smithay presentation path with a real browser autoscroll workload.

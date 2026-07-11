@@ -8,6 +8,9 @@ pub mod actor;
 mod actor_link;
 pub mod api;
 mod api_link;
+pub mod completion_io;
+pub mod component_actor;
+pub mod coordination;
 pub mod global_key_policy;
 mod global_key_policy_link;
 pub mod layout_policy;
@@ -16,6 +19,7 @@ pub mod module;
 mod module_link;
 pub mod policy_provider;
 mod policy_provider_link;
+pub mod preview1_worker;
 
 pub use actor::{
     ACTOR_EMPTY_OUTBOX, ActorEpochOutcome, ActorOutbox, ActorOutboxMessage, ActorPublication,
@@ -31,6 +35,17 @@ pub use api::{
 pub use api_link::{
     ARENA_ALLOC_EXPORT, ARENA_FREE_EXPORT, EPOCH_RUN_EXPORT, GUEST_MEMORY_EXPORT,
     HOST_IMPORT_MODULE, READ_MESSAGE_IMPORT,
+};
+pub use completion_io::{
+    ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoError, FilesystemGrant,
+    OperationId,
+};
+pub use component_actor::{
+    ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorMailboxStats, WorkerId,
+};
+pub use coordination::{
+    ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, CoordinationStats,
+    NotificationError, NotificationId, PollError, PollableId, ReadyPollable, WaitMode,
 };
 pub use global_key_policy::{
     ABI_INPUT_MODE_NORMAL, ABI_INPUT_MODE_PASSTHROUGH, ABI_KEY_PRESSED, ABI_KEY_RELEASED,
@@ -60,6 +75,13 @@ pub use policy_provider::{
     WasmPolicyProvider,
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
+pub use preview1_worker::{
+    COMPAT_DISPATCH_EXPORT, COMPAT_MARKER_EXPORT, COMPAT_MARKER_MAGIC, COMPAT_WORKER_EXPORT,
+    Preview1ActorCapabilities, Preview1CompatActor, Preview1CompatStats, Preview1FilesystemGrant,
+    Preview1Worker, Preview1WorkerConfig, Preview1WorkerError, Preview1WorkerId,
+    Preview1WorkerRuntime, SHARED_MEMORY_IMPORT_MODULE, SHARED_MEMORY_IMPORT_NAME,
+    WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
+};
 
 #[cfg(test)]
 mod tests;

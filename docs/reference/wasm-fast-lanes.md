@@ -2,59 +2,55 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-11
 code-links:
-  - crates/manifoldd/src/wasm_key.rs
-  - crates/manifoldd/src/wasm_map.rs
+  - crates/manifold-wasm/src/module.rs
+  - crates/manifold-wasm/src/module_link.rs
+  - crates/manifold-wasm/src/actor.rs
+  - crates/manifold-wasm/src/actor_link.rs
+  - crates/manifold-wasm/src/global_key_policy.rs
+  - crates/manifold-wasm/src/global_key_policy_link.rs
+  - crates/manifold-wasm/src/policy_provider.rs
   - crates/manifoldd/src/wasm_test.rs
+  - crates/manifoldd/src/control.rs
+  - crates/manifoldd/src/state.rs
 ---
 
-# WASM Fast Lanes
+# WASM Core-Module Lanes
 
-The current runnable WASM surface is a set of narrow core-WASM lanes. These are implementation lanes, not the final product API.
+The current core-WASM surface supports named actors, synchronous policy
+providers, and the behavior-test harness. These are implementation lanes, not
+the complete plugin SDK.
 
-The target plugin model keeps the useful synchronous property of these lanes but replaces direct side-effect-style host imports with policy providers that read immutable published state and return bounded decision envelopes plus message batches. See [[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and [[../systems/layout-policy]].
+The target plugin model keeps the useful synchronous property for decisions
+that must complete before host processing can continue. Policy providers read
+immutable published state and return bounded decision envelopes plus message
+batches; ordinary plugin work stays in actors and workers. See
+[[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and
+[[../systems/layout-policy]].
 
-## Fast Key Handler
+## Core-Module Actors
 
-Preferred export:
+Core plugins declare actors through named exports discovered by
+`module_link.rs`. Each actor processes one bounded mailbox epoch and returns an
+outbox containing messages and publication frames. Layout policy uses this
+path: the host sends pane/layout state to actors, and an actor sends a validated
+`set-resolved-layout` command back through the host mailbox.
 
-```text
-on_key_v2(key_code: i32, key_state: i32, input_mode: i32, ctrl_pressed: i32, modifiers: i32) -> i32
-```
+See `module.rs`, `module_link.rs`, `actor.rs`, and `actor_link.rs` for the exact
+export and outbox ABI.
 
-Compatibility export:
+## Global Key Policy
 
-```text
-on_key(key_code: i32, key_state: i32, input_mode: i32, ctrl_pressed: i32) -> i32
-```
+The daemon selects a named key policy provider from the module inventory. It
+passes a serialized key query plus the latest immutable actor publication. The
+provider returns `consume`, `forward`, or `abstain` semantics and may include a
+bounded batch of actor messages. The host validates and applies the envelope;
+the provider does not perform host side effects directly.
 
-Modifier bits:
-
-- `1`: Ctrl
-- `2`: Alt
-- `4`: Shift
-
-Selected imports include layout actions, pane lookup, exact pane focus, spawn, session switching, session creation, and active-session close. See `crates/manifoldd/src/wasm_key.rs`.
-
-Those imports currently append pending host commands while the synchronous call is active. In the target model, the key lane returns `Consume`, `Forward`, or `Abstain` plus host-validated directives/messages after reading its latest state frame.
-
-## Fast Map Hook
-
-Export:
-
-```text
-on_map_v1(pending: i64, visible_count: i32) -> i32
-```
-
-Selected imports:
-
-- `visible_pane_id(index: i32) -> i64`
-- `set_map_response(ptr: i32, len: i32) -> i32`
-
-Responses are JSON and are validated by the host before affecting presentation.
-
-This is the current prototype of the target layout policy provider. The target response should become a typed layout decision envelope backed by immutable published state, with the host still owning validation, fallback, hit testing, focus, and rendering.
+See `global_key_policy.rs`, `global_key_policy_link.rs`, and
+`policy_provider.rs` for the exact export, descriptor, bounds, and decision
+encoding.
 
 ## Async Test Harness
 
@@ -74,7 +70,10 @@ Selected imports include `sleep_ms`, `log`, `status_json`, `control_json`, and `
 
 ## Hot Replacement
 
-`manifold plug <path>` replaces a running WASM lane. `--kind auto` tries fast key handler first, then fast map hook.
+Plugin replacement accepts a self-contained plugin artifact or an explicitly
+selected key-policy artifact. Component Model and marked Preview 1 artifacts
+are routed by the same daemon replacement entry point. See `control.rs` and
+`state.rs` for exact parser and artifact-selection behavior.
 
 Related:
 

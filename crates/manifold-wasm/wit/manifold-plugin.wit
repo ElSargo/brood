@@ -1,0 +1,211 @@
+package manifold:plugin@0.1.0;
+
+interface host {
+    type operation-id = u64;
+    type notification-id = u64;
+    type pollable-id = u64;
+
+    enum submit-error {
+        actor-stopped,
+        limit-reached,
+        backlog-full,
+        not-permitted,
+        invalid-argument,
+        cancelled,
+    }
+
+    enum notification-error {
+        actor-stopped,
+        limit-reached,
+        backlog-full,
+        invalid-handle,
+        invalid-generation,
+        already-watched,
+    }
+
+    variant watch-result {
+        armed,
+        queued(u64),
+    }
+
+    enum wait-mode {
+        biased,
+        fair,
+    }
+
+    enum wait-error {
+        actor-stopped,
+        limit-reached,
+        invalid-pollable,
+        duplicate-pollable,
+        empty-wait-set,
+        timed-out,
+        cancelled,
+    }
+
+    record ready-pollable {
+        index: u32,
+        pollable: pollable-id,
+        generation: u64,
+    }
+
+    submit-read: func(
+        path: string,
+        offset: u64,
+        max-bytes: u64,
+    ) -> result<operation-id, submit-error>;
+
+    submit-write: func(
+        path: string,
+        offset: u64,
+        bytes: list<u8>,
+    ) -> result<operation-id, submit-error>;
+
+    /// Queue cancellation. True reports queue admission, not that cancellation
+    /// won a race with completion. If it wins, one terminal cancelled event is
+    /// delivered later.
+    cancel: func(operation: operation-id) -> bool;
+
+    /// Worker-only blocking-looking file read. The async canonical ABI
+    /// suspends only the calling component task. The host rejects this import
+    /// outside a registered worker guest task.
+    worker-read-file: async func(
+        path: string,
+        offset: u64,
+        max-bytes: u64,
+    ) -> result<list<u8>, submit-error>;
+
+    /// Worker-only blocking-looking file write. The host rejects this import
+    /// outside a registered worker guest task.
+    worker-write-file: async func(
+        path: string,
+        offset: u64,
+        bytes: list<u8>,
+    ) -> result<u64, submit-error>;
+
+    /// Cooperatively yield a CPU-running stackless worker. Native async host
+    /// calls release the component Store so the owning actor can dispatch.
+    /// A true result asks the cooperative worker to return without doing more
+    /// actor-visible work; cancellation is terminal only after it does so.
+    worker-yield: async func() -> bool;
+
+    /// Create an actor-generation-scoped scheduling notification. Shared data
+    /// and its atomic generation counter remain guest-owned.
+    notification-create: func() -> result<notification-id, notification-error>;
+    notification-drop: func(notification: notification-id) -> result<_, notification-error>;
+    notification-signal: func(
+        notification: notification-id,
+        published-generation: u64,
+    ) -> result<u64, notification-error>;
+    notification-watch-actor: func(
+        notification: notification-id,
+        observed-generation: u64,
+        token: u64,
+    ) -> result<watch-result, notification-error>;
+    notification-unwatch-actor: func(
+        notification: notification-id,
+    ) -> result<bool, notification-error>;
+
+    notification-pollable: func(
+        notification: notification-id,
+        observed-generation: u64,
+    ) -> result<pollable-id, wait-error>;
+    pollable-drop: func(pollable: pollable-id) -> result<_, wait-error>;
+    pollable-try: func(
+        pollables: list<pollable-id>,
+    ) -> result<list<ready-pollable>, wait-error>;
+    /// Worker-only bounded wait. Timeout is relative milliseconds; absent
+    /// means no deadline. Worker cancellation is always selected implicitly.
+    worker-wait-any: async func(
+        pollables: list<pollable-id>,
+        timeout-ms: option<u64>,
+        mode: wait-mode,
+    ) -> result<ready-pollable, wait-error>;
+}
+
+interface actor {
+    type operation-id = u64;
+    type worker-id = u64;
+
+    record mailbox-message {
+        sender: string,
+        body: list<u8>,
+    }
+
+    record read-completed {
+        operation: operation-id,
+        bytes: list<u8>,
+    }
+
+    record write-completed {
+        operation: operation-id,
+        bytes-written: u64,
+    }
+
+    record operation-failed {
+        operation: operation-id,
+        message: string,
+    }
+
+    variant completion {
+        read(read-completed),
+        write(write-completed),
+        cancelled(operation-id),
+        failed(operation-failed),
+    }
+
+    record worker-request {
+        worker: worker-id,
+        payload: list<u8>,
+    }
+
+    record worker-finished {
+        worker: worker-id,
+        output: list<u8>,
+    }
+
+    record worker-failed {
+        worker: worker-id,
+        message: string,
+    }
+
+    record notification-event {
+        notification: u64,
+        generation: u64,
+        token: u64,
+    }
+
+    variant worker-event {
+        /// The worker was admitted and its guest call was scheduled. This does
+        /// not assert that it has reached a particular I/O operation.
+        started(worker-id),
+        finished(worker-finished),
+        failed(worker-failed),
+        /// A cooperative cancellation request was observed and the worker
+        /// export has now terminated.
+        cancelled(worker-id),
+    }
+
+    variant event {
+        mailbox(mailbox-message),
+        completion(completion),
+        worker(worker-event),
+        notification(notification-event),
+    }
+
+    variant command {
+        spawn-worker(worker-request),
+        /// Request cooperative cancellation. The worker must reach a host call
+        /// or yield point and return before the terminal cancelled event.
+        cancel-worker(worker-id),
+        stop,
+    }
+
+    dispatch: func(event: event) -> list<command>;
+    worker-run: async func(worker: worker-id, payload: list<u8>) -> result<list<u8>, string>;
+}
+
+world manifold-plugin {
+    import host;
+    export actor;
+}

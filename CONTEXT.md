@@ -33,16 +33,32 @@ A supervised process that produces scene data or surfaces for one or more panes.
 _Avoid_: native child window, OS window
 
 **Plugin**:
-A capability-scoped extension package that may contain async actors, sync policy lanes, pane producers, UI views, commands, and private internal workers.
+A capability-scoped extension package that may contain actors, actor-scoped workers, sync policy lanes, pane producers, UI views, and commands.
 _Avoid_: pane, process, renderer, compositor plugin
 
 **Plugin actor**:
-The normal host-visible unit of plugin execution. Actors receive mailbox messages and request host work through capability-checked APIs.
+The host-visible plugin isolation, addressing, authority, and lifecycle domain. An actor owns an address space, mailbox slots, capabilities, resources, publications, and durable local state. It may be dormant while the host waits for an event; once invoked, its completion-driven dispatcher must not suspend or block.
 _Avoid_: sync policy lane, thread, direct host callback
+
+**Plugin worker**:
+An actor-scoped execution context that shares its actor's memory, resources, and capabilities. Workers may use blocking-looking WASI calls because only the calling worker is suspended. A worker has no public address or mailbox and cannot outlive its actor.
+_Avoid_: actor, independent capability boundary, globally addressable service, guaranteed parallel thread
 
 **Mailbox**:
 The host-provided durable message path between actors, host services, panes, and other granted targets.
 _Avoid_: sync key/layout path, shared mutable memory
+
+**Completion**:
+A typed terminal result for an actor-submitted operation or worker wait. Actor completions are delivered through a reserved actor-private mailbox lane; worker completions resume the waiting worker or notify the actor through an actor-local handle.
+_Avoid_: readiness notification, blocking actor call, unbounded callback
+
+**Notification**:
+A level-triggered, generation-based scheduling signal paired with guest-owned shared memory. Workers may wait or select on it; actors receive a coalesced actor-private event and never wait on the underlying worker synchronization structure.
+_Avoid_: semantic mailbox message, mutex, one event per increment
+
+**Pollable**:
+A host resource representing readiness or terminal state for a notification, timer, stream, process, worker, watch, socket, or cancellation source. Workers may select across pollables; actors receive corresponding events.
+_Avoid_: blocking actor future, guest mutex layout
 
 **Sync policy lane**:
 A special plugin-owned synchronous routine that the host may invoke for immediate pre-commit decisions such as key routing or layout. It reads immutable published state and returns a bounded answer plus messages.
@@ -157,7 +173,11 @@ _Avoid_: ambient permission, unrestricted access
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
 - **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with correctness fallbacks.
 - The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, Weston, or renderer internals.
-- A **plugin** may contain multiple **plugin actors** and optional **sync policy lanes**.
+- A **plugin** may contain multiple **plugin actors**, actor-scoped **plugin workers**, and optional **sync policy lanes**.
+- A **plugin actor** is the public address-space and mailbox boundary. It is dormant between events; once invoked its dispatcher must not suspend or block, and instead submits work and handles **completion** messages.
+- A **plugin worker** shares its actor's memory and capabilities, may use blocking-looking WASI, has no public mailbox, and is cancelled with its actor.
+- Worker coordination is guest-owned shared memory plus atomics. Host **notifications** and **pollables** provide wakeup and worker `select`; the actor receives events rather than waiting on worker locks.
+- Use another **plugin actor** for independent isolation, addressing, capabilities, or lifecycle. Use a **plugin worker** for cheap shared-state concurrency.
 - **Mailbox** delivery is the normal path for durable plugin work; **swapchains** are the latest-state path for sync policy decisions.
 - **Sync policy lanes** are only for immediate host pre-commit decisions and must not block on actor queues or mutate host state directly.
 - The host owns final shortcut routing, accepted layout, pane lifecycle, native chrome, focus, hit testing, and rendering.
@@ -167,7 +187,8 @@ _Avoid_: ambient permission, unrestricted access
 - "hosted app" is too narrow. Use **managed app** for the product concept, and **hosted Wayland app** for the nested Wayland implementation.
 - "managed app" should not be used for WASM-hosted UI. Use **WASM pane app** for sandboxed UI modules whose state lives in the session process.
 - "pane" should not imply the state owner. A pane is the presentation unit; the state may live in a plugin, WASM module, external process, session model, browser runtime, or other producer behind indirection.
-- "plugin" should not imply one actor, one pane, one thread, or direct compositor authority. A plugin package can expose multiple actors, sync policy lanes, pane producers, and UI views behind host-owned boundaries.
+- "plugin" should not imply one actor, one pane, one worker, or direct compositor authority. A plugin package can expose multiple actors, each with private workers, plus sync policy lanes, pane producers, and UI views behind host-owned boundaries.
+- "worker" should not imply a second actor or an independently addressable service. Workers are private shared-memory execution contexts inside one actor. Cooperative workers do not promise multicore parallelism.
 - "layout" should not imply session-owned pane state. Layout, visibility, dragging, and animation are presentation-surface concerns unless explicitly saved as workspace preferences. Plugins may propose layout through sync policy lanes, but the host owns the accepted layout.
 - "presentation request" should not imply authority. Producers can ask for presentation behavior, but the presentation surface decides what is possible and appropriate.
 - "session trust boundary" is not a claim of internet-safe multi-user security. It is the first-phase local trust model for isolating sessions from each other.

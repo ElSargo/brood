@@ -84,6 +84,16 @@ impl MailboxRegistry {
         self.names.get(name).copied()
     }
 
+    /// Remove an actor generation from the registry. Any retained mailbox
+    /// sender becomes disconnected and late posts cannot reach a replacement
+    /// actor which happens to reuse the same public name.
+    pub fn unregister_actor(&mut self, name: &str) -> bool {
+        let Some(actor_id) = self.names.remove(name) else {
+            return false;
+        };
+        self.mailboxes.remove(&actor_id).is_some()
+    }
+
     pub fn contains_actor(&self, actor_id: ActorId) -> bool {
         self.mailboxes.contains_key(&actor_id)
     }

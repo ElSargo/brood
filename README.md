@@ -18,7 +18,7 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 - `manifold`: authoritative local session process and MVP presentation owner.
 - `manifold-client`: deferred presentation endpoint for future isolation or multi-window attach experiments.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
-- plugins/WASM apps: sandboxed built-in or user applications that use actor mailboxes, optional sync policy lanes, and host-rendered UI or scene patches.
+- plugins/WASM apps: sandboxed built-in or user applications that use addressed actors, private shared-memory workers, completion-based I/O, WASI resources, optional sync policy lanes, and host-rendered UI or scene patches.
 
 ## Current Status
 
@@ -50,8 +50,8 @@ By default this starts `manifold run`, attaches a presentation surface, and
 loads enabled modules and startup apps from the global Manifold config. Manifold
 first checks the XDG config location and then falls back to the checked-in
 `manifold.toml` found from the development binary's repo checkout. The checked-in
-config enables the local `dev` WASM key handler when its built `.wasm` artifact
-exists and starts the pi agent workspace pane.
+config enables the target-shape default-workspace WASM plugin when its built
+artifact exists and starts the pi agent workspace pane.
 
 Run Rust unit tests through Nix:
 
@@ -119,7 +119,11 @@ nix develop --command cargo run -- test nested --force-outer
 
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
 
-Concrete choices for renderer stack, CEF integration, IPC, protocol encoding, WASM runtime, and crate layout are intentionally deferred. Remote presentation is a non-goal for the current prototype.
+The current prototype uses Smithay with Winit/EGL for presentation, Wasmtime for
+WASM, DBus plus in-process channels for control, and a two-crate Rust workspace.
+CEF integration, durable plugin protocol encoding, and longer-term crate
+boundaries remain open. Remote presentation is a non-goal for the current
+prototype.
 
 ## Docs
 
