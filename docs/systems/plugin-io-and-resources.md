@@ -488,8 +488,11 @@ an actor event, or share the handle with a worker which projects it into the
 normal `wait-any` pollable set. Reading drains complete UTF-8 event records up
 to the supplied buffer capacity and returns the last drained generation; a
 concurrent later event therefore makes the next poll immediately ready instead
-of being lost. Native access-only events are ignored. Queue exhaustion replaces
-the pending batch with `rescan`, never a silent partial history.
+of being lost. Recursive backend registration is host-owned background work so
+walking a large existing tree never consumes the actor's dispatch deadline. Its
+first readiness batch is `rescan`, because changes can race registration. Native
+access-only events are ignored. Queue exhaustion also replaces the pending
+batch with `rescan`, never a silent partial history.
 
 ## Clocks And Timers
 

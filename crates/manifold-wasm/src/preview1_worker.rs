@@ -1088,6 +1088,7 @@ pub struct Preview1WorkerRuntime {
     stats: Arc<Preview1CompatStatsInner>,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    terminal_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Preview1WorkerRuntime {
@@ -1234,24 +1235,37 @@ impl Preview1WorkerRuntime {
             }
         };
 
-        let parent = tokio::spawn(parent_loop(
-            engine,
-            module,
-            memory,
-            actor_store,
-            actor_instance,
-            capabilities,
-            completion_rx,
-            notification_rx,
-            coordination.clone(),
-            completion_supervisor,
-            next_worker,
-            worker_inputs,
-            Arc::clone(&stats),
-            config,
-            receiver,
-            epoch_ticker,
-        ));
+        let terminal_error = Arc::new(Mutex::new(None));
+        let parent_terminal_error = Arc::clone(&terminal_error);
+        let parent_coordination = coordination.clone();
+        let parent_stats = Arc::clone(&stats);
+        let parent = tokio::spawn(async move {
+            let result = parent_loop(
+                engine,
+                module,
+                memory,
+                actor_store,
+                actor_instance,
+                capabilities,
+                completion_rx,
+                notification_rx,
+                parent_coordination,
+                completion_supervisor,
+                next_worker,
+                worker_inputs,
+                parent_stats,
+                config,
+                receiver,
+                epoch_ticker,
+            )
+            .await;
+            if let Err(error) = &result
+                && let Ok(mut terminal_error) = parent_terminal_error.lock()
+            {
+                *terminal_error = Some(error.to_string());
+            }
+            result
+        });
         Ok(Self {
             commands,
             mailbox_slots,
@@ -1261,6 +1275,7 @@ impl Preview1WorkerRuntime {
             stats,
             coordination,
             filesystem_watches,
+            terminal_error,
         })
     }
 
@@ -1316,6 +1331,10 @@ impl Preview1WorkerRuntime {
             workers_cancelled: self.stats.workers_cancelled.load(Ordering::Relaxed),
             last_worker_value: self.stats.last_worker_value.load(Ordering::Relaxed),
         }
+    }
+
+    fn try_take_terminal_error(&self) -> Option<String> {
+        self.terminal_error.lock().ok()?.take()
     }
 
     /// Call a one-argument actor export.
@@ -1492,6 +1511,11 @@ impl Preview1CompatActor {
     /// Current lifecycle counters, including the reload generation.
     pub fn stats(&self) -> Preview1CompatStats {
         self.runtime.stats()
+    }
+
+    /// Consume a terminal dispatcher error for daemon status reporting.
+    pub fn try_take_failure(&self) -> Option<String> {
+        self.runtime.try_take_terminal_error()
     }
 
     /// Call an actor export while preserving actor-store serialization.
@@ -2899,6 +2923,7 @@ mod tests {
             filesystem_watches: FilesystemWatchHub::new(None, coordination.clone(), 1, 1)
                 .map_err(|error| anyhow::anyhow!(error))?,
             coordination,
+            terminal_error: Arc::new(Mutex::new(None)),
         };
 
         runtime.try_send_message("test".to_string(), b"one".to_vec())?;

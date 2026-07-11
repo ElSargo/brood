@@ -10,6 +10,6 @@ Native watch batches record `created`, `modified`, or `removed`; no periodic
 rescan is used. `.git`, `.direnv`, `.manifold`, and `target` are excluded so
 repository metadata, the log itself, and build output do not feed the watcher.
 
-An explicit `rescan` record means the bounded host event queue overflowed. A
-stateful consumer must reconcile its state through the granted filesystem when
-that marker appears.
+An explicit `rescan` record means the recursive native registration window
+closed or the bounded host event queue overflowed. A stateful consumer must
+reconcile its state through the granted filesystem when that marker appears.

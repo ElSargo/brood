@@ -861,7 +861,7 @@ impl Manifold {
         sender: String,
         body: String,
     ) -> Result<()> {
-        self.drain_component_actor_events();
+        self.drain_hosted_actor_events();
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             actor.try_send_message(sender, body.into_bytes())?;
             self.plugin_actor_messages += 1;
@@ -906,7 +906,7 @@ impl Manifold {
     }
 
     pub fn plugin_actor_summaries(&mut self) -> Vec<PluginActorSummary> {
-        self.drain_component_actor_events();
+        self.drain_hosted_actor_events();
         let mut summaries = self
             .plugin_runtime
             .as_ref()
@@ -953,7 +953,7 @@ impl Manifold {
         &mut self,
         actor_id: &str,
     ) -> Result<Vec<PluginMailboxSummary>> {
-        self.drain_component_actor_events();
+        self.drain_hosted_actor_events();
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             let (enqueued_messages, dropped_messages, capacity) = match actor {
                 HostedIoActor::Component(actor) => {
@@ -1131,7 +1131,7 @@ impl Manifold {
     }
 
     fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
-        self.drain_component_actor_events();
+        self.drain_hosted_actor_events();
         let io_actor_deliveries = self
             .wasm_io_actors
             .iter()
@@ -1313,18 +1313,33 @@ impl Manifold {
         self.plugin_actor_last_status.as_deref()
     }
 
-    fn drain_component_actor_events(&mut self) {
+    fn drain_hosted_actor_events(&mut self) {
         let mut events = Vec::new();
         for (actor_name, actor) in &mut self.wasm_io_actors {
-            let HostedIoActor::Component(actor) = actor else {
-                continue;
-            };
-            while let Some(event) = actor.try_recv_event() {
-                events.push((actor_name.clone(), event));
+            match actor {
+                HostedIoActor::Component(actor) => {
+                    while let Some(event) = actor.try_recv_event() {
+                        events.push((actor_name.clone(), Ok(event)));
+                    }
+                }
+                HostedIoActor::Preview1(actor) => {
+                    if let Some(message) = actor.try_take_failure() {
+                        events.push((actor_name.clone(), Err(message)));
+                    }
+                }
             }
         }
 
         for (actor_name, event) in events {
+            let event = match event {
+                Ok(event) => event,
+                Err(message) => {
+                    self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                    self.plugin_actor_last_status = Some(format!("{actor_name}:dispatcher_failed"));
+                    warn!(actor = %actor_name, error = %message, "Preview 1 actor dispatcher failed");
+                    continue;
+                }
+            };
             match event {
                 manifold_wasm::ComponentActorEvent::DispatcherFailed { message } => {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
@@ -4229,7 +4244,7 @@ impl Manifold {
     }
 
     fn stop_hosted_io_actor(&mut self, actor_name: &str) -> Result<()> {
-        self.drain_component_actor_events();
+        self.drain_hosted_actor_events();
         let Some(mut actor) = self.wasm_io_actors.remove(actor_name) else {
             return Ok(());
         };

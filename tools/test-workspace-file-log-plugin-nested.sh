@@ -35,6 +35,11 @@ run_controller() {
   done
   grep -q $'^initial\talpha.txt$' "$log"
 
+  # Recursive registration is host-owned background work. Its rescan marker
+  # proves the full pre-existing directory tree is registered before the
+  # mutations below are used as assertions.
+  wait_for_log "$log" "rescan"
+
   printf 'created\n' > "$workspace/new-file.txt"
   printf 'changed\n' >> "$workspace/alpha.txt"
   rm "$workspace/src/removed.txt"
@@ -81,6 +86,9 @@ nix develop --command cargo build --quiet -p manifoldd --bins
 OUT="${MANIFOLD_WORKSPACE_LOG_OUT:-$(mktemp -d /tmp/manifold-workspace-log.XXXXXX)}"
 WORKSPACE="$OUT/workspace"
 mkdir -p "$WORKSPACE/src"
+# A realistic ignored build tree must not make recursive native registration
+# consume the actor's short mailbox-dispatch deadline.
+mkdir -p "$WORKSPACE"/target/generated/{0001..6000}
 printf 'alpha\n' > "$WORKSPACE/alpha.txt"
 printf 'remove me\n' > "$WORKSPACE/src/removed.txt"
 

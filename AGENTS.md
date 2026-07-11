@@ -1,9 +1,5 @@
 # Agent Instructions
 
-## Reference Code
-
-When implementing features, check the code in `reference/` for relevant examples before designing a new approach from scratch.
-Refer patterns that fit Manifold's own architecture and terminology. Treat the reference repositories as examples, not source to copy wholesale.
 
 ## Documentation
 

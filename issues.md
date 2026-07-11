@@ -6,6 +6,12 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
+- Native watches currently create one `notify` backend per logical watch
+  resource. Replace that with a daemon-wide watcher service which deduplicates
+  native path registrations and routes events into bounded, actor-generation
+  scoped subscription queues. Keep the existing guest watch/notification ABI;
+  capability-relative path projection, overflow, and teardown remain private
+  to each logical handle even when the kernel registration is shared.
 - Native capability-rooted filesystem watches currently exist only in the
   Preview 1 compatibility ABI. The Component backend still needs an equivalent
   WIT resource and SDK wrapper before both plugin backends have one I/O model.

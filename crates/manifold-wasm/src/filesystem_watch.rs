@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    thread::{self, JoinHandle},
 };
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -60,10 +61,14 @@ struct FilesystemWatchInner {
     max_watches: usize,
     max_events: usize,
     watches: Mutex<HashMap<FilesystemWatchId, FilesystemWatchEntry>>,
+    setup_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 struct FilesystemWatchEntry {
-    watcher: RecommendedWatcher,
+    // Recursive backend registration may walk a large tree. The entry is
+    // reachable while that host-owned setup is pending, then owns the live
+    // watcher after setup completes.
+    watcher: Option<RecommendedWatcher>,
     notification: NotificationId,
     queue: Arc<Mutex<WatchQueue>>,
 }
@@ -102,6 +107,7 @@ impl FilesystemWatchHub {
                 max_watches,
                 max_events,
                 watches: Mutex::new(HashMap::new()),
+                setup_threads: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -152,7 +158,7 @@ impl FilesystemWatchHub {
         let callback_root = root.clone();
         let callback_coordination = self.inner.coordination.clone();
         let max_events = self.inner.max_events;
-        let mut watcher = notify::recommended_watcher(move |result| {
+        let watcher = notify::recommended_watcher(move |result| {
             record_callback(
                 &callback_queue,
                 &callback_coordination,
@@ -163,26 +169,54 @@ impl FilesystemWatchHub {
             );
         })
         .map_err(|error| FilesystemWatchError::Backend(error.to_string()))?;
-        if let Err(error) = watcher.watch(
-            &watched_path,
-            if recursive {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
-            },
-        ) {
-            let _drop_result = self.inner.coordination.drop_notification(notification);
-            return Err(FilesystemWatchError::Backend(error.to_string()));
-        }
         watches.insert(
             id,
             FilesystemWatchEntry {
-                watcher,
+                watcher: None,
                 notification,
                 queue,
             },
         );
         drop(watches);
+
+        // `notify` recursively registers every existing directory before
+        // returning. Doing that in this host call would block the actor which
+        // requested the watch and can exceed its dispatcher deadline for a
+        // real build tree. Registration is therefore host-owned background
+        // work. Its first notification is always a rescan marker because
+        // changes can race the registration walk.
+        let mut setup_threads = self
+            .inner
+            .setup_threads
+            .lock()
+            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
+        if !self.inner.alive.load(Ordering::Acquire) {
+            let _removed = self
+                .inner
+                .watches
+                .lock()
+                .map(|mut watches| watches.remove(&id));
+            let _drop_result = self.inner.coordination.drop_notification(notification);
+            return Err(FilesystemWatchError::Stopped);
+        }
+        let inner = Arc::clone(&self.inner);
+        let mode = if recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        let setup = thread::Builder::new()
+            .name("manifold-fs-watch-setup".to_string())
+            .spawn(move || finish_watch_setup(inner, id, watcher, watched_path, mode))
+            .map_err(|error| {
+                if let Ok(mut watches) = self.inner.watches.lock() {
+                    watches.remove(&id);
+                }
+                let _drop_result = self.inner.coordination.drop_notification(notification);
+                FilesystemWatchError::Backend(error.to_string())
+            })?;
+        setup_threads.push(setup);
+        drop(setup_threads);
         Ok((id, notification))
     }
 
@@ -265,6 +299,13 @@ impl FilesystemWatchHub {
                     .drop_notification(entry.notification);
             }
         }
+        if let Ok(mut setup_threads) = self.inner.setup_threads.lock() {
+            let threads = setup_threads.drain(..).collect::<Vec<_>>();
+            drop(setup_threads);
+            for thread in threads {
+                let _join_result = thread.join();
+            }
+        }
     }
 
     fn with_entry<T>(
@@ -283,6 +324,43 @@ impl FilesystemWatchHub {
             .map(function)
             .ok_or(FilesystemWatchError::Invalid)
     }
+}
+
+fn finish_watch_setup(
+    inner: Arc<FilesystemWatchInner>,
+    watch: FilesystemWatchId,
+    mut watcher: RecommendedWatcher,
+    watched_path: PathBuf,
+    mode: RecursiveMode,
+) {
+    let result = watcher.watch(&watched_path, mode);
+    let Ok(mut watches) = inner.watches.lock() else {
+        return;
+    };
+    let Some(entry) = watches.get_mut(&watch) else {
+        return;
+    };
+    if !inner.alive.load(Ordering::Acquire) {
+        return;
+    }
+    if result.is_ok() {
+        entry.watcher = Some(watcher);
+    }
+    let queue = Arc::clone(&entry.queue);
+    let notification = entry.notification;
+    drop(watches);
+
+    // Whether registration succeeded or failed, consumers must reconcile the
+    // interval during which the recursive tree was being installed. On a
+    // backend failure this also makes the otherwise inert handle observable.
+    let Ok(mut queue) = queue.lock() else {
+        return;
+    };
+    queue.generation = queue.generation.saturating_add(1).max(1);
+    let generation = queue.generation;
+    push_overflow(&mut queue.events, generation);
+    drop(queue);
+    let _signal_result = inner.coordination.signal(notification, generation);
 }
 
 fn record_callback(
@@ -419,7 +497,20 @@ mod tests {
             32,
         )?;
         let (watch, notification) = watches.create(Path::new("."), true)?;
-        let pollable = coordination.notification_pollable(notification, 0)?;
+        let setup_pollable = coordination.notification_pollable(notification, 0)?;
+
+        let setup_ready = tokio::time::timeout(
+            Duration::from_secs(5),
+            coordination.wait_any(&[setup_pollable], None, WaitMode::Biased),
+        )
+        .await??;
+        ensure!(setup_ready.pollable == setup_pollable);
+        let setup_bytes = watches.pending_bytes(watch)?;
+        let (setup_generation, setup_events) = watches.read(watch, setup_bytes)?;
+        ensure!(String::from_utf8(setup_events)?.contains("rescan\t."));
+        coordination.drop_pollable(setup_pollable)?;
+
+        let pollable = coordination.notification_pollable(notification, setup_generation)?;
 
         fs::write(root.path().join("created.txt"), b"created")?;
         let ready = tokio::time::timeout(
