@@ -318,6 +318,9 @@ struct NestedTestArgs {
     /// Load a target-shape WASM key policy provider into the inner system under test.
     #[arg(long = "inner-wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     inner_wasm_key_policy: Option<Vec<String>>,
+    /// Load modules and settings from this config in the inner system under test.
+    #[arg(long = "inner-config", value_name = "PATH")]
+    inner_config: Option<PathBuf>,
     /// Spawn a hosted Wayland app inside the inner instance after startup.
     #[arg(long = "inner-command", value_name = "CMD")]
     inner_command: Option<String>,

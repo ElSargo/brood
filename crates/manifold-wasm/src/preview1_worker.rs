@@ -2277,8 +2277,18 @@ async fn prepare_worker(
 ) -> Result<PreparedWorker, Preview1WorkerError> {
     // Read the immutable TLS metadata from the actor instance so the actor can
     // reserve memory before the secondary instance's start function runs.
-    let tls_bytes = global_u32(actor_store, actor_instance, "__tls_size")?;
-    let tls_align = global_u32(actor_store, actor_instance, "__tls_align")?;
+    let tls_size = global_u32_optional(actor_store, actor_instance, "__tls_size")?;
+    let tls_alignment = global_u32_optional(actor_store, actor_instance, "__tls_align")?;
+    let (tls_bytes, tls_align) = match (tls_size, tls_alignment) {
+        (None, None) => (0, 1),
+        (Some(bytes), Some(align)) => (bytes, align),
+        _ => {
+            return Err(Preview1WorkerError::InvalidModule(
+                "__tls_size and __tls_align must either both be exported or both be absent"
+                    .to_string(),
+            ));
+        }
+    };
     if tls_align == 0 || !tls_align.is_power_of_two() {
         return Err(Preview1WorkerError::InvalidModule(
             "__tls_align must be a non-zero power of two".to_string(),
@@ -2377,16 +2387,19 @@ async fn configure_worker_context(
             Val::I32(i32::from_ne_bytes(reservation.stack_top.to_ne_bytes())),
         )
         .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
-    let init_tls = instance
-        .get_typed_func::<u32, ()>(&mut *store, "__wasm_init_tls")
-        .map_err(|error| Preview1WorkerError::InvalidModule(error.to_string()))?;
-    init_tls
-        .call_async(&mut *store, reservation.tls_base)
-        .await
-        .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
+    if reservation.tls_bytes != 0 {
+        let init_tls = instance
+            .get_typed_func::<u32, ()>(&mut *store, "__wasm_init_tls")
+            .map_err(|error| Preview1WorkerError::InvalidModule(error.to_string()))?;
+        init_tls
+            .call_async(&mut *store, reservation.tls_base)
+            .await
+            .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
+    }
 
     if global_u32(store, instance, "__stack_pointer")? != reservation.stack_top
-        || global_u32(store, instance, "__tls_base")? != reservation.tls_base
+        || (reservation.tls_bytes != 0
+            && global_u32(store, instance, "__tls_base")? != reservation.tls_base)
     {
         return Err(Preview1WorkerError::Guest(
             "worker stack/TLS globals did not retain their reservation".to_string(),
@@ -2610,6 +2623,21 @@ fn global_u32(
         .i32()
         .ok_or_else(|| Preview1WorkerError::InvalidModule(format!("{name} must be i32")))?;
     Ok(u32::from_ne_bytes(value.to_ne_bytes()))
+}
+
+fn global_u32_optional(
+    store: &mut Store<Preview1Store>,
+    instance: Instance,
+    name: &str,
+) -> Result<Option<u32>, Preview1WorkerError> {
+    let Some(global) = instance.get_global(&mut *store, name) else {
+        return Ok(None);
+    };
+    let value = global
+        .get(&mut *store)
+        .i32()
+        .ok_or_else(|| Preview1WorkerError::InvalidModule(format!("{name} must be i32")))?;
+    Ok(Some(u32::from_ne_bytes(value.to_ne_bytes())))
 }
 
 fn decode_reservation(

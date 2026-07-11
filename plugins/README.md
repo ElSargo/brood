@@ -1,5 +1,9 @@
 # Plugins
 
+`workspace-file-log` is a complete Preview 1 actor-and-worker plugin. It watches
+the active workspace through ordinary WASI filesystem calls and records changed
+file names in `.manifold/workspace-file-log.log`.
+
 Root-level target-shape Manifold plugins live here.
 
 - `default-workspace/` ports the existing prototype key handler and map/layout hook into the new `manifold-wasm` ABI shape: exported policy providers plus guest arena allocation.

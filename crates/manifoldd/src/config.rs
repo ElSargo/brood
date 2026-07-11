@@ -97,6 +97,8 @@ struct ModuleConfig {
     path: PathBuf,
     #[serde(default)]
     capabilities: Vec<String>,
+    #[serde(default, rename = "startup-message")]
+    startup_message: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -159,9 +161,15 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                     );
                     continue;
                 }
+                let workspace_filesystem = workspace_filesystem_capability(&module.capabilities);
                 state
-                    .replace_configured_wasm_plugin(&id, &module_path)
+                    .replace_configured_wasm_plugin(&id, &module_path, workspace_filesystem)
                     .with_context(|| format!("load config module {id}"))?;
+                if let Some(message) = module.startup_message {
+                    state
+                        .send_plugin_actor_message(&id, "host".to_string(), message)
+                        .with_context(|| format!("send startup message to config module {id}"))?;
+                }
                 info!(
                     module = %id,
                     path = %module_path.display(),
@@ -187,6 +195,22 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
     }
 
     Ok(())
+}
+
+fn workspace_filesystem_capability(capabilities: &[String]) -> Option<bool> {
+    if capabilities
+        .iter()
+        .any(|capability| capability == "filesystem:workspace-write")
+    {
+        Some(true)
+    } else if capabilities
+        .iter()
+        .any(|capability| capability == "filesystem:workspace-read")
+    {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,7 +444,7 @@ mod tests {
     use super::{
         BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, SessionRunnerSource,
         discover_session_runner, read_config, repo_config_path_from_current_exe, resolve_path,
-        resolve_startup_argv,
+        resolve_startup_argv, workspace_filesystem_capability,
     };
 
     #[test]
@@ -580,6 +604,19 @@ mod tests {
             .expect("flake detector");
         assert_eq!(detector.priority, None);
         assert_eq!(detector.priority(), DEFAULT_RUNNER_PRIORITY);
+    }
+
+    #[test]
+    fn workspace_write_capability_implies_read_write_grant() {
+        assert_eq!(
+            workspace_filesystem_capability(&["filesystem:workspace-write".to_string()]),
+            Some(true)
+        );
+        assert_eq!(
+            workspace_filesystem_capability(&["filesystem:workspace-read".to_string()]),
+            Some(false)
+        );
+        assert_eq!(workspace_filesystem_capability(&[]), None);
     }
 
     fn temp_dir(name: &str) -> PathBuf {

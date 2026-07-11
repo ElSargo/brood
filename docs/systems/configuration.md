@@ -41,6 +41,14 @@ and Preview 1 modules. Multiple entries may therefore instantiate the same
 artifact independently. Replacement and shutdown are per ID; one actor's
 workers and resources are joined without removing its peers.
 
+Configured hosted actors may request `filesystem:workspace-read` or
+`filesystem:workspace-write` in `capabilities`. The daemon preopens the active
+session's working directory at guest `.` with the requested access. Without one
+of those grants, the hosted actor keeps the narrow package-directory,
+read-only default. `startup-message` queues one mailbox message after a module
+has loaded; long-lived services use it to let the actor spawn their workers
+without adding a separate host lifecycle ABI.
+
 For legacy core-module artifacts, the config table key remains only a module
 label. Those artifacts keep their declared actor/provider names and singular
 replacement lane. Runtime `manifold plug --id` rejects that legacy case rather

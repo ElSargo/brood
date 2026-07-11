@@ -660,9 +660,10 @@ The dispatcher submits reads and writes and later receives typed completion
 events. Async workers execute exports from the same component instance and may
 await worker I/O or an explicit cooperative `worker-yield`, releasing the Store
 so dispatcher traffic can proceed. Epoch deadlines are correlated to the
-dispatcher guest task, so they do not trap an unrelated worker. Until package
-manifests supply grants, the daemon gives worker/completion I/O read-only access
-to the artifact's parent directory.
+dispatcher guest task, so they do not trap an unrelated worker. Configured
+actors can receive read-only or writable access to the active session working
+directory through explicit workspace filesystem capabilities. Actors without
+one retain read-only access to the artifact's parent directory.
 
 The same ABI exposes generation-scoped notifications and notification
 pollables. Actor watches are one-shot and coalesced; workers use bounded

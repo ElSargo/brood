@@ -1,6 +1,6 @@
 # Manifold Context
 
-Manifold is a local persistent graphical workspace that explores whether an extra compositor/session layer can feel native.
+Manifold is a local persistent graphical workspace that explores whether an extra compositor/session layer can feel native
 
 ## Language
 

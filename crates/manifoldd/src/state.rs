@@ -440,6 +440,12 @@ enum HostedIoActor {
     Preview1(manifold_wasm::Preview1CompatActor),
 }
 
+#[derive(Clone)]
+struct HostedPluginFilesystem {
+    host_path: PathBuf,
+    writable: bool,
+}
+
 impl HostedIoActor {
     fn try_send_message(&self, sender: String, body: Vec<u8>) -> Result<()> {
         match self {
@@ -3991,7 +3997,7 @@ impl Manifold {
     }
 
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
-        self.replace_wasm_plugin_with_instance_id(None, false, path)
+        self.replace_wasm_plugin_with_instance_id(None, false, path, None)
     }
 
     pub(crate) fn replace_wasm_plugin_as(&mut self, instance_id: &str, path: &Path) -> Result<()> {
@@ -3999,13 +4005,14 @@ impl Manifold {
             !instance_id.trim().is_empty(),
             "WASM plugin instance id must not be empty"
         );
-        self.replace_wasm_plugin_with_instance_id(Some(instance_id), false, path)
+        self.replace_wasm_plugin_with_instance_id(Some(instance_id), false, path, None)
     }
 
     pub(crate) fn replace_configured_wasm_plugin(
         &mut self,
         module_id: &str,
         path: &Path,
+        workspace_filesystem_writable: Option<bool>,
     ) -> Result<()> {
         ensure!(
             !module_id.trim().is_empty(),
@@ -4015,7 +4022,20 @@ impl Manifold {
         // hosted actor id. Legacy core artifacts predate that namespace: the
         // key remains a config label while their declared names retain the
         // singular legacy lane.
-        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path)
+        let filesystem = if let Some(writable) = workspace_filesystem_writable {
+            let host_path = self
+                .surface_session_working_directories
+                .get(&self.active_surface_session)
+                .cloned()
+                .context("active workspace has no working directory")?;
+            Some(HostedPluginFilesystem {
+                host_path,
+                writable,
+            })
+        } else {
+            None
+        };
+        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path, filesystem)
     }
 
     fn replace_wasm_plugin_with_instance_id(
@@ -4023,6 +4043,7 @@ impl Manifold {
         instance_id: Option<&str>,
         allow_legacy_config_label: bool,
         path: &Path,
+        filesystem: Option<HostedPluginFilesystem>,
     ) -> Result<()> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.wasm_threads(true).shared_memory(true);
@@ -4034,7 +4055,7 @@ impl Manifold {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path)
+                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref())
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
@@ -4046,7 +4067,7 @@ impl Manifold {
         if manifold_wasm::declares_preview1_compat(&module) {
             let instance_id =
                 instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
-            return self.replace_wasm_preview1_actor(&instance_id, path);
+            return self.replace_wasm_preview1_actor(&instance_id, path, filesystem.as_ref());
         }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
         ensure!(
@@ -4075,7 +4096,12 @@ impl Manifold {
         Ok(())
     }
 
-    fn replace_wasm_component_actor(&mut self, actor_name: &str, path: &Path) -> Result<()> {
+    fn replace_wasm_component_actor(
+        &mut self,
+        actor_name: &str,
+        path: &Path,
+        filesystem: Option<&HostedPluginFilesystem>,
+    ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
         };
@@ -4084,17 +4110,21 @@ impl Manifold {
         // inserted below, so a load/instantiate failure leaves the old actor
         // serving normally.
         self.ensure_hosted_io_actor_id_available(actor_name)?;
-        let capability_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let default_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let host_path = filesystem.map_or_else(
+            || default_root.to_path_buf(),
+            |grant| grant.host_path.clone(),
+        );
+        let writable = filesystem.is_some_and(|grant| grant.writable);
         let actor = runtime.block_on(manifold_wasm::ComponentActor::load(
             path,
             manifold_wasm::ComponentActorConfig {
-                // Until manifest grants are wired through configuration, the
-                // daemon gives the component the narrowest useful default:
-                // read-only access to its own package directory.
+                // Actors without an explicit workspace grant receive the
+                // narrowest useful default: their package directory read-only.
                 filesystem: Some(manifold_wasm::FilesystemGrant {
-                    host_path: capability_root.to_path_buf(),
+                    host_path,
                     guest_path: ".".to_string(),
-                    writable: false,
+                    writable,
                 }),
                 ..manifold_wasm::ComponentActorConfig::default()
             },
@@ -4109,21 +4139,31 @@ impl Manifold {
         Ok(())
     }
 
-    fn replace_wasm_preview1_actor(&mut self, actor_name: &str, path: &Path) -> Result<()> {
+    fn replace_wasm_preview1_actor(
+        &mut self,
+        actor_name: &str,
+        path: &Path,
+        filesystem: Option<&HostedPluginFilesystem>,
+    ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
         };
         // Instantiate an unreachable candidate first so a bad replacement
         // cannot take a healthy actor offline.
         self.ensure_hosted_io_actor_id_available(actor_name)?;
-        let capability_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let default_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let host_path = filesystem.map_or_else(
+            || default_root.to_path_buf(),
+            |grant| grant.host_path.clone(),
+        );
+        let writable = filesystem.is_some_and(|grant| grant.writable);
         let actor = runtime.block_on(manifold_wasm::Preview1CompatActor::load(
             path,
             manifold_wasm::Preview1ActorCapabilities {
                 filesystem: Some(manifold_wasm::Preview1FilesystemGrant {
-                    host_path: capability_root.to_path_buf(),
+                    host_path,
                     guest_path: ".".to_string(),
-                    writable: false,
+                    writable,
                 }),
             },
             manifold_wasm::Preview1WorkerConfig::default(),

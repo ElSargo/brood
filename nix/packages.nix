@@ -47,6 +47,7 @@ let
     cargoLockList = builtins.filter builtins.pathExists [
       "${src}/examples/wasm-component-actor/Cargo.lock"
       "${src}/examples/wasm-preview1-worker/Cargo.lock"
+      "${src}/plugins/workspace-file-log/Cargo.lock"
     ];
   };
 
@@ -249,7 +250,7 @@ let
         found=1
         crate_dir="$(dirname "$manifest")"
         case "$crate_dir" in
-          examples/wasm-preview1-worker)
+          examples/wasm-preview1-worker|plugins/workspace-file-log)
             wasm_target=wasm32-wasip1-threads
             ;;
           *)

@@ -353,6 +353,7 @@ fn run_nested_test_with_outer(
         &inner_target,
         &inner_log,
         args.inner_headless,
+        args.inner_config.as_deref(),
         args.inner_wasm_plugin.clone(),
         cli_policy_arg(args.inner_wasm_key_policy.as_deref())?,
     )?;
@@ -432,6 +433,7 @@ fn run_nested_test_in_current_session(
         &subject_log,
         args.inner_headless,
         args.harness.as_deref(),
+        args.inner_config.as_deref(),
         args.inner_wasm_plugin.clone(),
         cli_policy_arg(args.inner_wasm_key_policy.as_deref())?,
     )?;
@@ -555,19 +557,28 @@ fn spawn_outer(
         .with_context(|| format!("spawn outer process {}", current_exe.display()))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "nested subject launch keeps each independently optional test input explicit"
+)]
 fn spawn_subject(
     current_exe: &Path,
     subject_target: &control::ControlTarget,
     subject_log: &Path,
     subject_headless: bool,
     harness: Option<&Path>,
+    config: Option<&Path>,
     wasm_plugin: Option<PathBuf>,
     wasm_key_policy: Option<(String, PathBuf)>,
 ) -> Result<Child> {
     let mut command = Command::new(current_exe);
     command.arg("run");
     command.arg("--no-session-runner");
-    command.arg("--no-default-modules");
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    } else {
+        command.arg("--no-default-modules");
+    }
     command
         .arg("--dbus-destination")
         .arg(&subject_target.destination);
@@ -602,20 +613,31 @@ fn spawn_subject(
         .with_context(|| format!("spawn subject process {}", current_exe.display()))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "nested inner launch keeps each independently optional test input explicit"
+)]
 fn spawn_inner(
     outer_target: &control::ControlTarget,
     current_exe: &Path,
     inner_target: &control::ControlTarget,
     inner_log: &Path,
     inner_headless: bool,
+    config: Option<&Path>,
     wasm_plugin: Option<PathBuf>,
     wasm_key_policy: Option<(String, PathBuf)>,
 ) -> Result<()> {
     let mut command = format!(
-        "exec {} run --no-session-runner --no-default-modules --dbus-destination {}",
+        "exec {} run --no-session-runner --dbus-destination {}",
         shell_quote(&current_exe.display().to_string()),
         shell_quote(&inner_target.destination),
     );
+    if let Some(config) = config {
+        command.push_str(" --config ");
+        command.push_str(&shell_quote(&config.display().to_string()));
+    } else {
+        command.push_str(" --no-default-modules");
+    }
     if let Some(address) = inner_target.address.as_deref() {
         command.push_str(" --dbus-address ");
         command.push_str(&shell_quote(address));
