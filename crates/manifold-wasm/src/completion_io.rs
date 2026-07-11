@@ -118,6 +118,23 @@ pub struct CompletionIo {
     inner: Arc<CompletionIoInner>,
 }
 
+/// Observable state for one actor-generation completion supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionIoStats {
+    /// Actor generation which owns every admitted operation.
+    pub generation: u64,
+    /// Operations which have not yet reached a terminal result.
+    pub outstanding: usize,
+    /// Configured admission bound.
+    pub max_outstanding: usize,
+    /// Whether new operations may still be admitted.
+    pub alive: bool,
+    /// Whether a filesystem capability was granted.
+    pub permitted: bool,
+    /// Whether that capability permits writes.
+    pub writable: bool,
+}
+
 #[derive(Debug)]
 struct CompletionIoInner {
     generation: u64,
@@ -221,6 +238,18 @@ impl CompletionIo {
     /// Actor generation owned by this handle.
     pub fn generation(&self) -> u64 {
         self.inner.generation
+    }
+
+    /// Snapshot admission and lifecycle state without blocking the actor.
+    pub fn stats(&self) -> CompletionIoStats {
+        CompletionIoStats {
+            generation: self.inner.generation,
+            outstanding: self.inner.outstanding.load(Ordering::Acquire),
+            max_outstanding: self.inner.max_outstanding,
+            alive: self.inner.alive.load(Ordering::Acquire),
+            permitted: self.inner.permitted,
+            writable: self.inner.writable,
+        }
     }
 
     fn submit(
@@ -634,6 +663,9 @@ mod tests {
         timeout(Duration::from_millis(100), task)
             .await
             .context("full I/O queue blocked shutdown")??;
+        let stats = io.stats();
+        ensure!(!stats.alive && stats.outstanding == 0);
+        ensure!(stats.generation == 73 && stats.max_outstanding == 1);
         Ok(())
     }
 
@@ -665,6 +697,8 @@ mod tests {
             "the exhausted allocator wrapped and reused an operation ID"
         );
         ensure!(io.inner.outstanding.load(Ordering::Acquire) == 0);
+        let stats = io.stats();
+        ensure!(stats.permitted && !stats.writable && stats.outstanding == 0);
         Ok(())
     }
 }

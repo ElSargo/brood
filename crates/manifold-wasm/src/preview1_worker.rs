@@ -26,7 +26,7 @@ use std::{
     sync::mpsc as std_mpsc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -839,15 +839,25 @@ impl Preview1WorkerId {
 #[derive(Debug, Default)]
 struct Preview1CompatStatsInner {
     mailbox_queued: AtomicU64,
+    mailbox_dropped: AtomicU64,
     mailbox_dispatched: AtomicU64,
     completion_delivered: AtomicU64,
     notifications_delivered: AtomicU64,
     workers_started: AtomicU64,
+    workers_active: AtomicUsize,
     worker_reads_started: AtomicU64,
     workers_finished: AtomicU64,
     workers_failed: AtomicU64,
     workers_cancelled: AtomicU64,
     last_worker_value: AtomicU64,
+}
+
+fn increment_saturating(counter: &AtomicU64) {
+    let _previous = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_add(1))
+        })
+        .unwrap_or(u64::MAX);
 }
 
 /// Observable lifecycle counters for daemon status and nested tests.
@@ -857,6 +867,10 @@ pub struct Preview1CompatStats {
     pub generation: u64,
     /// Mailbox messages accepted by the bounded runtime command queue.
     pub mailbox_queued: u64,
+    /// Mailbox messages rejected before admission.
+    pub mailbox_dropped: u64,
+    /// Configured global mailbox backlog.
+    pub mailbox_capacity: usize,
     /// Mailbox events whose guest dispatcher returned successfully.
     pub mailbox_dispatched: u64,
     /// Typed completion events delivered to the guest dispatcher.
@@ -873,6 +887,8 @@ pub struct Preview1CompatStats {
     pub pending_notification_events: usize,
     /// Workers admitted after Store/export preparation and scheduled to run.
     pub workers_started: u64,
+    /// Workers whose guest calls are currently live.
+    pub workers_active: usize,
     /// Worker standard-WASI stdin streams first requested by guest execution.
     pub worker_reads_started: u64,
     /// Workers which returned normally.
@@ -978,6 +994,7 @@ impl Drop for Preview1CompletionSupervisor {
 pub struct Preview1WorkerRuntime {
     commands: mpsc::Sender<Command>,
     mailbox_slots: Arc<Semaphore>,
+    mailbox_capacity: usize,
     parent: Option<TokioJoinHandle<Result<(), Preview1WorkerError>>>,
     generation: u64,
     stats: Arc<Preview1CompatStatsInner>,
@@ -1078,6 +1095,7 @@ impl Preview1WorkerRuntime {
         observe_completion(completion_supervisor.io());
         let (commands, receiver) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
+        let mailbox_capacity = config.mailbox_backlog;
         let stats = Arc::new(Preview1CompatStatsInner::default());
         let next_worker = Arc::new(AtomicU64::new(1));
         let worker_inputs = Arc::new(Mutex::new(HashMap::new()));
@@ -1139,6 +1157,7 @@ impl Preview1WorkerRuntime {
         Ok(Self {
             commands,
             mailbox_slots,
+            mailbox_capacity,
             parent: Some(parent),
             generation,
             stats,
@@ -1154,19 +1173,23 @@ impl Preview1WorkerRuntime {
     ) -> Result<(), Preview1WorkerError> {
         let permit = Arc::clone(&self.mailbox_slots)
             .try_acquire_owned()
-            .map_err(|_no_permit| Preview1WorkerError::AtCapacity("mailbox backlog"))?;
-        self.commands
-            .try_send(Command::Mailbox {
-                sender,
-                payload,
-                permit,
-            })
-            .map_err(|error| match error {
+            .map_err(|_no_permit| {
+                increment_saturating(&self.stats.mailbox_dropped);
+                Preview1WorkerError::AtCapacity("mailbox backlog")
+            })?;
+        if let Err(error) = self.commands.try_send(Command::Mailbox {
+            sender,
+            payload,
+            permit,
+        }) {
+            increment_saturating(&self.stats.mailbox_dropped);
+            return Err(match error {
                 mpsc::error::TrySendError::Full(_) => {
                     Preview1WorkerError::AtCapacity("mailbox command queue")
                 }
                 mpsc::error::TrySendError::Closed(_) => Preview1WorkerError::RuntimeStopped,
-            })?;
+            });
+        }
         self.stats.mailbox_queued.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1177,6 +1200,8 @@ impl Preview1WorkerRuntime {
         Preview1CompatStats {
             generation: self.generation,
             mailbox_queued: self.stats.mailbox_queued.load(Ordering::Relaxed),
+            mailbox_dropped: self.stats.mailbox_dropped.load(Ordering::Relaxed),
+            mailbox_capacity: self.mailbox_capacity,
             mailbox_dispatched: self.stats.mailbox_dispatched.load(Ordering::Relaxed),
             completion_delivered: self.stats.completion_delivered.load(Ordering::Relaxed),
             notifications_delivered: self.stats.notifications_delivered.load(Ordering::Relaxed),
@@ -1185,6 +1210,7 @@ impl Preview1WorkerRuntime {
             wait_registrations: coordination.wait_registrations,
             pending_notification_events: coordination.pending_actor_events,
             workers_started: self.stats.workers_started.load(Ordering::Relaxed),
+            workers_active: self.stats.workers_active.load(Ordering::Acquire),
             worker_reads_started: self.stats.worker_reads_started.load(Ordering::Relaxed),
             workers_finished: self.stats.workers_finished.load(Ordering::Relaxed),
             workers_failed: self.stats.workers_failed.load(Ordering::Relaxed),
@@ -1861,7 +1887,9 @@ async fn parent_loop(
                                         &calls,
                                         &mut actor_operations,
                                     );
-                                    if !started {
+                                    if started {
+                                        stats.workers_active.fetch_add(1, Ordering::AcqRel);
+                                    } else {
                                         worker_slots = worker_slots.saturating_sub(1);
                                         if guest_owned {
                                             remove_worker_input(&worker_inputs, worker);
@@ -1898,6 +1926,7 @@ async fn parent_loop(
                         worker_slots = worker_slots.saturating_sub(1);
                         remove_worker_input(&worker_inputs, worker);
                         if let Some(mut active) = active_workers.remove(&worker) {
+                            stats.workers_active.fetch_sub(1, Ordering::AcqRel);
                             if active.guest_owned
                                 && let Ok(value) = &result
                             {
@@ -1959,6 +1988,7 @@ async fn parent_loop(
     drop(completion_rx);
     drop(notification_rx);
     coordination.stop();
+    stats.workers_active.store(0, Ordering::Release);
     completion_supervisor.shutdown().await;
     if let Some(reply) = shutdown_reply.take() {
         let _result = reply.send(());
@@ -2720,6 +2750,7 @@ mod tests {
         let runtime = Preview1WorkerRuntime {
             commands,
             mailbox_slots: Arc::new(Semaphore::new(1)),
+            mailbox_capacity: 1,
             parent: None,
             generation: 1,
             stats: Arc::new(Preview1CompatStatsInner::default()),
@@ -2744,6 +2775,10 @@ mod tests {
         );
         drop(accepted);
         runtime.try_send_message("test".to_string(), b"three".to_vec())?;
+        let stats = runtime.stats();
+        ensure!(stats.mailbox_queued == 2);
+        ensure!(stats.mailbox_dropped == 2);
+        ensure!(stats.mailbox_capacity == 1);
         drop(runtime);
         Ok(())
     }

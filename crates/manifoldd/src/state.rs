@@ -26,7 +26,7 @@
 // TODO(lint-structure): decompose Manifold state into typed geometry, session, focus, and registry services.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -435,6 +435,114 @@ struct StatusItemRecord {
     metadata: ExtensionMetadata,
 }
 
+enum HostedIoActor {
+    Component(manifold_wasm::ComponentActor),
+    Preview1(manifold_wasm::Preview1CompatActor),
+}
+
+impl HostedIoActor {
+    fn try_send_message(&self, sender: String, body: Vec<u8>) -> Result<()> {
+        match self {
+            Self::Component(actor) => actor.try_send_message(sender, body),
+            Self::Preview1(actor) => actor
+                .try_send_message(sender, body)
+                .map_err(anyhow::Error::from),
+        }
+    }
+
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Component(_) => "wasm-component",
+            Self::Preview1(_) => "wasm-preview1-compat",
+        }
+    }
+}
+
+fn aggregate_preview1_compat_stats(
+    stats: impl IntoIterator<Item = manifold_wasm::Preview1CompatStats>,
+) -> Option<manifold_wasm::Preview1CompatStats> {
+    let mut stats = stats.into_iter();
+    let mut aggregate = stats.next()?;
+    let mut instances = 1_usize;
+    for next in stats {
+        instances = instances.saturating_add(1);
+        aggregate.mailbox_queued = aggregate.mailbox_queued.saturating_add(next.mailbox_queued);
+        aggregate.mailbox_dropped = aggregate
+            .mailbox_dropped
+            .saturating_add(next.mailbox_dropped);
+        aggregate.mailbox_capacity = aggregate
+            .mailbox_capacity
+            .saturating_add(next.mailbox_capacity);
+        aggregate.mailbox_dispatched = aggregate
+            .mailbox_dispatched
+            .saturating_add(next.mailbox_dispatched);
+        aggregate.completion_delivered = aggregate
+            .completion_delivered
+            .saturating_add(next.completion_delivered);
+        aggregate.notifications_delivered = aggregate
+            .notifications_delivered
+            .saturating_add(next.notifications_delivered);
+        aggregate.notifications = aggregate.notifications.saturating_add(next.notifications);
+        aggregate.pollables = aggregate.pollables.saturating_add(next.pollables);
+        aggregate.wait_registrations = aggregate
+            .wait_registrations
+            .saturating_add(next.wait_registrations);
+        aggregate.pending_notification_events = aggregate
+            .pending_notification_events
+            .saturating_add(next.pending_notification_events);
+        aggregate.workers_started = aggregate
+            .workers_started
+            .saturating_add(next.workers_started);
+        aggregate.workers_active = aggregate.workers_active.saturating_add(next.workers_active);
+        aggregate.worker_reads_started = aggregate
+            .worker_reads_started
+            .saturating_add(next.worker_reads_started);
+        aggregate.workers_finished = aggregate
+            .workers_finished
+            .saturating_add(next.workers_finished);
+        aggregate.workers_failed = aggregate.workers_failed.saturating_add(next.workers_failed);
+        aggregate.workers_cancelled = aggregate
+            .workers_cancelled
+            .saturating_add(next.workers_cancelled);
+    }
+    if instances != 1 {
+        // There is no meaningful aggregate generation or latest worker. Keep
+        // the legacy flat status truthful while the actor list identifies the
+        // individual instances.
+        aggregate.generation = 0;
+        aggregate.last_worker_value = 0;
+    }
+    Some(aggregate)
+}
+
+fn wasm_plugin_instance_id(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("plugin")
+        .to_string()
+}
+
+fn ensure_legacy_instance_id_supported(instance_id: Option<&str>) -> Result<()> {
+    ensure!(
+        instance_id.is_none(),
+        "custom instance IDs are unsupported for legacy core WASM plugins; \
+         they register their declared actor export names and replace the singular legacy lane"
+    );
+    Ok(())
+}
+
+const fn legacy_instance_id_to_validate(
+    instance_id: Option<&str>,
+    allow_config_label: bool,
+) -> Option<&str> {
+    if allow_config_label {
+        None
+    } else {
+        instance_id
+    }
+}
+
 pub struct Manifold {
     pub start_time: Instant,
     pub socket_name: OsString,
@@ -535,10 +643,7 @@ pub struct Manifold {
     wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
     wasm_actor_names: Vec<String>,
     wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
-    wasm_component_actor: Option<manifold_wasm::ComponentActor>,
-    wasm_component_actor_name: Option<String>,
-    wasm_preview1_actor: Option<manifold_wasm::Preview1CompatActor>,
-    wasm_preview1_actor_name: Option<String>,
+    wasm_io_actors: BTreeMap<String, HostedIoActor>,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
@@ -708,10 +813,7 @@ impl Manifold {
             wasm_host_mailbox: Some(wasm_host_mailbox),
             wasm_actor_names: Vec::new(),
             wasm_actor_tasks: Vec::new(),
-            wasm_component_actor: None,
-            wasm_component_actor_name: None,
-            wasm_preview1_actor: None,
-            wasm_preview1_actor_name: None,
+            wasm_io_actors: BTreeMap::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
@@ -754,21 +856,7 @@ impl Manifold {
         body: String,
     ) -> Result<()> {
         self.drain_component_actor_events();
-        if self.wasm_component_actor_name.as_deref() == Some(actor_id) {
-            let actor = self
-                .wasm_component_actor
-                .as_ref()
-                .context("component actor is not running")?;
-            actor.try_send_message(sender, body.into_bytes())?;
-            self.plugin_actor_messages += 1;
-            self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
-            return Ok(());
-        }
-        if self.wasm_preview1_actor_name.as_deref() == Some(actor_id) {
-            let actor = self
-                .wasm_preview1_actor
-                .as_ref()
-                .context("Preview 1 compatibility actor is not running")?;
+        if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             actor.try_send_message(sender, body.into_bytes())?;
             self.plugin_actor_messages += 1;
             self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
@@ -792,17 +880,11 @@ impl Manifold {
         sender: String,
         body: String,
     ) -> Result<()> {
-        if self.wasm_component_actor_name.as_deref() == Some(actor_id) {
+        if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             ensure!(
                 mailbox_slot == "default",
-                "component actor {actor_id:?} has no mailbox slot {mailbox_slot:?}"
-            );
-            return self.send_plugin_actor_message(actor_id, sender, body);
-        }
-        if self.wasm_preview1_actor_name.as_deref() == Some(actor_id) {
-            ensure!(
-                mailbox_slot == "default",
-                "Preview 1 actor {actor_id:?} has no mailbox slot {mailbox_slot:?}"
+                "{} actor {actor_id:?} has no mailbox slot {mailbox_slot:?}",
+                actor.kind()
             );
             return self.send_plugin_actor_message(actor_id, sender, body);
         }
@@ -823,43 +905,36 @@ impl Manifold {
             .plugin_runtime
             .as_ref()
             .map_or_else(Vec::new, PluginRuntime::actor_summaries);
-        if let (Some(actor_id), Some(actor)) = (
-            self.wasm_component_actor_name.as_ref(),
-            self.wasm_component_actor.as_ref(),
-        ) {
-            let stats = actor.mailbox_stats();
+        for (actor_id, actor) in &self.wasm_io_actors {
+            let (enqueued_messages, dropped_messages, mailbox_capacity) = match actor {
+                HostedIoActor::Component(actor) => {
+                    let stats = actor.mailbox_stats();
+                    (
+                        stats.enqueued_messages,
+                        stats.dropped_messages,
+                        stats.capacity,
+                    )
+                }
+                HostedIoActor::Preview1(actor) => {
+                    let stats = actor.stats();
+                    (
+                        stats.mailbox_queued,
+                        stats.mailbox_dropped,
+                        stats.mailbox_capacity,
+                    )
+                }
+            };
             summaries.push(PluginActorSummary {
                 id: actor_id.clone(),
-                kind: "wasm-component".to_string(),
-                enqueued_messages: stats.enqueued_messages,
-                dropped_messages: stats.dropped_messages,
-                mailbox_capacity: stats.capacity,
+                kind: actor.kind().to_string(),
+                enqueued_messages,
+                dropped_messages,
+                mailbox_capacity,
                 mailbox_slots: vec![PluginMailboxSummary {
                     slot: "default".to_string(),
-                    enqueued_messages: stats.enqueued_messages,
-                    dropped_messages: stats.dropped_messages,
-                    capacity: stats.capacity,
-                }],
-                published_frames: 0,
-                latest_frame: "none".to_string(),
-            });
-        }
-        if let (Some(actor_id), Some(actor)) = (
-            self.wasm_preview1_actor_name.as_ref(),
-            self.wasm_preview1_actor.as_ref(),
-        ) {
-            let stats = actor.stats();
-            summaries.push(PluginActorSummary {
-                id: actor_id.clone(),
-                kind: "wasm-preview1-compat".to_string(),
-                enqueued_messages: stats.mailbox_queued,
-                dropped_messages: 0,
-                mailbox_capacity: 128,
-                mailbox_slots: vec![PluginMailboxSummary {
-                    slot: "default".to_string(),
-                    enqueued_messages: stats.mailbox_queued,
-                    dropped_messages: 0,
-                    capacity: 128,
+                    enqueued_messages,
+                    dropped_messages,
+                    capacity: mailbox_capacity,
                 }],
                 published_frames: 0,
                 latest_frame: "none".to_string(),
@@ -873,30 +948,30 @@ impl Manifold {
         actor_id: &str,
     ) -> Result<Vec<PluginMailboxSummary>> {
         self.drain_component_actor_events();
-        if self.wasm_component_actor_name.as_deref() == Some(actor_id) {
-            let stats = self
-                .wasm_component_actor
-                .as_ref()
-                .context("component actor is not running")?
-                .mailbox_stats();
+        if let Some(actor) = self.wasm_io_actors.get(actor_id) {
+            let (enqueued_messages, dropped_messages, capacity) = match actor {
+                HostedIoActor::Component(actor) => {
+                    let stats = actor.mailbox_stats();
+                    (
+                        stats.enqueued_messages,
+                        stats.dropped_messages,
+                        stats.capacity,
+                    )
+                }
+                HostedIoActor::Preview1(actor) => {
+                    let stats = actor.stats();
+                    (
+                        stats.mailbox_queued,
+                        stats.mailbox_dropped,
+                        stats.mailbox_capacity,
+                    )
+                }
+            };
             return Ok(vec![PluginMailboxSummary {
                 slot: "default".to_string(),
-                enqueued_messages: stats.enqueued_messages,
-                dropped_messages: stats.dropped_messages,
-                capacity: stats.capacity,
-            }]);
-        }
-        if self.wasm_preview1_actor_name.as_deref() == Some(actor_id) {
-            let stats = self
-                .wasm_preview1_actor
-                .as_ref()
-                .context("Preview 1 compatibility actor is not running")?
-                .stats();
-            return Ok(vec![PluginMailboxSummary {
-                slot: "default".to_string(),
-                enqueued_messages: stats.mailbox_queued,
-                dropped_messages: 0,
-                capacity: 128,
+                enqueued_messages,
+                dropped_messages,
+                capacity,
             }]);
         }
         let plugin_runtime = self
@@ -907,9 +982,12 @@ impl Manifold {
     }
 
     pub fn preview1_compat_stats(&self) -> Option<manifold_wasm::Preview1CompatStats> {
-        self.wasm_preview1_actor
-            .as_ref()
-            .map(manifold_wasm::Preview1CompatActor::stats)
+        aggregate_preview1_compat_stats(self.wasm_io_actors.values().filter_map(
+            |actor| match actor {
+                HostedIoActor::Preview1(actor) => Some(actor.stats()),
+                HostedIoActor::Component(_) => None,
+            },
+        ))
     }
 
     pub fn try_wasm_global_key_policy(
@@ -969,9 +1047,11 @@ impl Manifold {
                 | manifold_wasm::GlobalKeyDecision::ForwardWithModifiers
         );
         for message in outcome.messages {
-            let result = self.block_on_wasm_registry(|registry| {
-                registry.try_post_named_message(&message.actor, message.payload)
-            });
+            let result = self.try_route_wasm_actor_message(
+                &message.actor,
+                "host".to_string(),
+                message.payload,
+            );
             if let Err(err) = result {
                 self.plugin_actor_failures += 1;
                 self.plugin_actor_last_status =
@@ -983,6 +1063,21 @@ impl Manifold {
         }
         self.drain_wasm_host_mailbox();
         handled
+    }
+
+    /// Route a byte-oriented policy message through the shared public actor
+    /// namespace. Hosted Component/Preview actors carry sender metadata in
+    /// their mailbox ABI; legacy actors retain their older byte-only mailbox.
+    fn try_route_wasm_actor_message(
+        &self,
+        actor_id: &str,
+        sender: String,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        if let Some(actor) = self.wasm_io_actors.get(actor_id) {
+            return actor.try_send_message(sender, payload);
+        }
+        self.block_on_wasm_registry(|registry| registry.try_post_named_message(actor_id, payload))
     }
 
     fn latest_wasm_policy_state_publication(&self) -> Option<manifold_wasm::PublicationFrameLease> {
@@ -1031,29 +1126,21 @@ impl Manifold {
 
     fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
         self.drain_component_actor_events();
-        if let Some(actor) = self.wasm_component_actor.as_ref() {
-            let component_name = self
-                .wasm_component_actor_name
-                .as_deref()
-                .unwrap_or("component");
-            match actor.try_send_message("host".to_string(), payload.as_bytes().to_vec()) {
-                Ok(()) => {
-                    self.plugin_actor_messages += 1;
-                    self.plugin_actor_last_status = Some(format!("{component_name}:event_queued"));
-                }
-                Err(err) => {
-                    self.plugin_actor_failures += 1;
-                    self.plugin_actor_last_status = Some(format!("{component_name}:event_error"));
-                    warn!(actor = %component_name, error = %err, "failed to enqueue component actor event");
-                }
-            }
-        }
-        if let Some(actor) = self.wasm_preview1_actor.as_ref() {
-            let actor_name = self
-                .wasm_preview1_actor_name
-                .as_deref()
-                .unwrap_or("preview1-compat");
-            match actor.try_send_message("host".to_string(), payload.as_bytes().to_vec()) {
+        let io_actor_deliveries = self
+            .wasm_io_actors
+            .iter()
+            .map(|(actor_name, actor)| {
+                (
+                    actor_name.clone(),
+                    actor.kind(),
+                    actor
+                        .try_send_message("host".to_string(), payload.as_bytes().to_vec())
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (actor_name, actor_kind, delivery) in io_actor_deliveries {
+            match delivery {
                 Ok(()) => {
                     self.plugin_actor_messages += 1;
                     self.plugin_actor_last_status = Some(format!("{actor_name}:event_queued"));
@@ -1061,7 +1148,7 @@ impl Manifold {
                 Err(err) => {
                     self.plugin_actor_failures += 1;
                     self.plugin_actor_last_status = Some(format!("{actor_name}:event_error"));
-                    warn!(actor = %actor_name, error = %err, "failed to enqueue Preview 1 actor event");
+                    warn!(actor = %actor_name, kind = actor_kind, error = %err, "failed to enqueue hosted I/O actor event");
                 }
             }
         }
@@ -1221,20 +1308,17 @@ impl Manifold {
     }
 
     fn drain_component_actor_events(&mut self) {
-        let Some(actor) = self.wasm_component_actor.as_mut() else {
-            return;
-        };
-        let actor_name = self
-            .wasm_component_actor_name
-            .as_deref()
-            .unwrap_or("component")
-            .to_string();
         let mut events = Vec::new();
-        while let Some(event) = actor.try_recv_event() {
-            events.push(event);
+        for (actor_name, actor) in &mut self.wasm_io_actors {
+            let HostedIoActor::Component(actor) = actor else {
+                continue;
+            };
+            while let Some(event) = actor.try_recv_event() {
+                events.push((actor_name.clone(), event));
+            }
         }
 
-        for event in events {
+        for (actor_name, event) in events {
             match event {
                 manifold_wasm::ComponentActorEvent::DispatcherFailed { message } => {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
@@ -3907,6 +3991,39 @@ impl Manifold {
     }
 
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
+        self.replace_wasm_plugin_with_instance_id(None, false, path)
+    }
+
+    pub(crate) fn replace_wasm_plugin_as(&mut self, instance_id: &str, path: &Path) -> Result<()> {
+        ensure!(
+            !instance_id.trim().is_empty(),
+            "WASM plugin instance id must not be empty"
+        );
+        self.replace_wasm_plugin_with_instance_id(Some(instance_id), false, path)
+    }
+
+    pub(crate) fn replace_configured_wasm_plugin(
+        &mut self,
+        module_id: &str,
+        path: &Path,
+    ) -> Result<()> {
+        ensure!(
+            !module_id.trim().is_empty(),
+            "configured WASM module id must not be empty"
+        );
+        // Component and Preview 1 artifacts use the config table key as their
+        // hosted actor id. Legacy core artifacts predate that namespace: the
+        // key remains a config label while their declared names retain the
+        // singular legacy lane.
+        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path)
+    }
+
+    fn replace_wasm_plugin_with_instance_id(
+        &mut self,
+        instance_id: Option<&str>,
+        allow_legacy_config_label: bool,
+        path: &Path,
+    ) -> Result<()> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.wasm_threads(true).shared_memory(true);
         let engine = wasmtime::Engine::new(&engine_config)
@@ -3914,8 +4031,10 @@ impl Manifold {
         let module = match wasmtime::Module::from_file(&engine, path) {
             Ok(module) => module,
             Err(core_error) => {
+                let instance_id =
+                    instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(path)
+                    .replace_wasm_component_actor(&instance_id, path)
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
@@ -3925,13 +4044,20 @@ impl Manifold {
             }
         };
         if manifold_wasm::declares_preview1_compat(&module) {
-            return self.replace_wasm_preview1_actor(path);
+            let instance_id =
+                instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
+            return self.replace_wasm_preview1_actor(&instance_id, path);
         }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
         ensure!(
             !inventory.is_empty(),
             "WASM plugin does not declare any actors or policy providers"
         );
+        ensure_legacy_instance_id_supported(legacy_instance_id_to_validate(
+            instance_id,
+            allow_legacy_config_label,
+        ))?;
+        self.ensure_legacy_wasm_actor_ids_available(&inventory.actors)?;
 
         if let Some(provider) = select_policy_provider(
             &inventory.policy_providers,
@@ -3944,19 +4070,20 @@ impl Manifold {
             info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
         }
 
-        self.stop_wasm_plugin_actors()?;
+        self.stop_legacy_wasm_plugin_actors()?;
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
         Ok(())
     }
 
-    fn replace_wasm_component_actor(&mut self, path: &Path) -> Result<()> {
+    fn replace_wasm_component_actor(&mut self, actor_name: &str, path: &Path) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
         };
-        // A component owns its Store, workers, completion supervisor, and
-        // epoch ticker. Fully join the old generation before loading (and
-        // therefore activating) the replacement generation.
-        self.stop_wasm_plugin_actors()?;
+        // Build the candidate before disturbing the currently reachable
+        // generation. The candidate cannot receive messages until it is
+        // inserted below, so a load/instantiate failure leaves the old actor
+        // serving normally.
+        self.ensure_hosted_io_actor_id_available(actor_name)?;
         let capability_root = path.parent().unwrap_or_else(|| Path::new("."));
         let actor = runtime.block_on(manifold_wasm::ComponentActor::load(
             path,
@@ -3972,28 +4099,23 @@ impl Manifold {
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
-        let actor_name = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("component")
-            .to_string();
-
-        self.wasm_component_actor = Some(actor);
-        self.wasm_component_actor_name = Some(actor_name.clone());
-        self.wasm_global_key_policy = None;
+        // Once the candidate is known-good, fully join the old generation
+        // before making the replacement reachable under the stable id.
+        self.stop_hosted_io_actor(actor_name)?;
+        self.wasm_io_actors
+            .insert(actor_name.to_string(), HostedIoActor::Component(actor));
         self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
         info!(actor = %actor_name, path = %path.display(), "started component plugin actor");
         Ok(())
     }
 
-    fn replace_wasm_preview1_actor(&mut self, path: &Path) -> Result<()> {
+    fn replace_wasm_preview1_actor(&mut self, actor_name: &str, path: &Path) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
         };
-        // The actor owns all worker Stores and its completion supervisor. Join
-        // the entire old generation before activating the replacement.
-        self.stop_wasm_plugin_actors()?;
+        // Instantiate an unreachable candidate first so a bad replacement
+        // cannot take a healthy actor offline.
+        self.ensure_hosted_io_actor_id_available(actor_name)?;
         let capability_root = path.parent().unwrap_or_else(|| Path::new("."));
         let actor = runtime.block_on(manifold_wasm::Preview1CompatActor::load(
             path,
@@ -4006,43 +4128,113 @@ impl Manifold {
             },
             manifold_wasm::Preview1WorkerConfig::default(),
         ))?;
-        let actor_name = actor.name().to_string();
-
-        self.wasm_preview1_actor = Some(actor);
-        self.wasm_preview1_actor_name = Some(actor_name.clone());
-        self.wasm_global_key_policy = None;
+        // All work owned by the old generation is joined before the candidate
+        // is published under the stable id.
+        self.stop_hosted_io_actor(actor_name)?;
+        self.wasm_io_actors
+            .insert(actor_name.to_string(), HostedIoActor::Preview1(actor));
         self.plugin_actor_last_status = Some(format!("{actor_name}:preview1_started"));
         info!(actor = %actor_name, path = %path.display(), "started Preview 1 compatibility plugin actor");
         Ok(())
     }
 
-    fn stop_wasm_plugin_actors(&mut self) -> Result<()> {
+    fn ensure_hosted_io_actor_id_available(&self, actor_name: &str) -> Result<()> {
+        ensure!(
+            !self.wasm_actor_names.iter().any(|name| name == actor_name),
+            "hosted I/O actor id {actor_name:?} conflicts with a legacy WASM actor"
+        );
+        let conflicts_with_builtin = self.plugin_runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .actor_summaries()
+                .iter()
+                .any(|summary| summary.id == actor_name)
+        });
+        ensure!(
+            !conflicts_with_builtin,
+            "hosted I/O actor id {actor_name:?} conflicts with a built-in plugin actor"
+        );
+        Ok(())
+    }
+
+    fn ensure_legacy_wasm_actor_ids_available(
+        &self,
+        actors: &[manifold_wasm::WasmActorDeclaration],
+    ) -> Result<()> {
+        let builtin_ids = self
+            .plugin_runtime
+            .as_ref()
+            .map_or_else(Vec::new, PluginRuntime::actor_summaries)
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        for actor in actors {
+            ensure!(
+                seen.insert(actor.name.as_str()),
+                "legacy WASM plugin declares duplicate actor id {:?}",
+                actor.name
+            );
+            ensure!(
+                !self.wasm_io_actors.contains_key(&actor.name),
+                "legacy WASM actor id {:?} conflicts with a hosted I/O actor",
+                actor.name
+            );
+            ensure!(
+                !builtin_ids.iter().any(|id| id == &actor.name),
+                "legacy WASM actor id {:?} conflicts with a built-in plugin actor",
+                actor.name
+            );
+        }
+        Ok(())
+    }
+
+    fn stop_hosted_io_actor(&mut self, actor_name: &str) -> Result<()> {
         self.drain_component_actor_events();
+        let Some(mut actor) = self.wasm_io_actors.remove(actor_name) else {
+            return Ok(());
+        };
+        let Some(runtime) = self.async_runtime.as_ref() else {
+            anyhow::bail!("cannot join hosted I/O actor without the async runtime");
+        };
+        runtime.block_on(async {
+            let result = match &mut actor {
+                HostedIoActor::Component(actor) => actor.shutdown().await,
+                HostedIoActor::Preview1(actor) => {
+                    actor.shutdown().await.map_err(anyhow::Error::from)
+                }
+            };
+            if let Err(error) = result {
+                // Guest failure does not prevent replacement: both backends
+                // join their generation-owned work before returning it.
+                warn!(actor = %actor_name, error = %error, "old hosted I/O actor stopped with an error");
+            }
+        });
+        Ok(())
+    }
+
+    pub(crate) fn stop_all_hosted_io_actors(&mut self) -> Result<()> {
+        let actor_names = self.wasm_io_actors.keys().cloned().collect::<Vec<_>>();
+        let mut first_error = None;
+        for actor_name in actor_names {
+            if let Err(error) = self.stop_hosted_io_actor(&actor_name) {
+                warn!(actor = %actor_name, error = %error, "failed to join hosted I/O actor during shutdown");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn stop_legacy_wasm_plugin_actors(&mut self) -> Result<()> {
         let tasks = self.wasm_actor_tasks.drain(..).collect::<Vec<_>>();
         for task in &tasks {
             task.abort();
         }
         let old_names = std::mem::take(&mut self.wasm_actor_names);
-        let old_component = self.wasm_component_actor.take();
-        let old_preview1 = self.wasm_preview1_actor.take();
-        self.wasm_component_actor_name = None;
-        self.wasm_preview1_actor_name = None;
         if let Some(runtime) = self.async_runtime.as_ref() {
             let registry = Arc::clone(&self.wasm_registry);
             runtime.block_on(async move {
-                if let Some(mut actor) = old_component
-                    && let Err(err) = actor.shutdown().await
-                {
-                    // A guest trap must not prevent an operator from replacing
-                    // the failed generation. shutdown has still joined all of
-                    // the generation's owned tasks before returning the error.
-                    warn!(error = %err, "old component actor stopped with an error");
-                }
-                if let Some(mut actor) = old_preview1
-                    && let Err(err) = actor.shutdown().await
-                {
-                    warn!(error = %err, "old Preview 1 actor stopped with an error");
-                }
                 for task in tasks {
                     let _ = task.await;
                 }
@@ -4053,8 +4245,8 @@ impl Manifold {
             });
         } else {
             ensure!(
-                old_component.is_none() && old_preview1.is_none() && tasks.is_empty(),
-                "cannot join WASM actors without the async runtime"
+                tasks.is_empty(),
+                "cannot join legacy WASM actors without the async runtime"
             );
         }
         Ok(())
@@ -5846,7 +6038,9 @@ struct WindowRefreshOutcome {
 )]
 mod tests {
     use super::{
-        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, fullscreen_layout_rect,
+        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, aggregate_preview1_compat_stats,
+        ensure_legacy_instance_id_supported, fullscreen_layout_rect,
+        legacy_instance_id_to_validate, wasm_plugin_instance_id,
         window_surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
@@ -5854,7 +6048,113 @@ mod tests {
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn preview1_stats(generation: u64, scale: u64) -> manifold_wasm::Preview1CompatStats {
+        manifold_wasm::Preview1CompatStats {
+            generation,
+            mailbox_queued: scale,
+            mailbox_dropped: scale,
+            mailbox_capacity: usize::try_from(scale).unwrap(),
+            mailbox_dispatched: scale,
+            completion_delivered: scale,
+            notifications_delivered: scale,
+            notifications: usize::try_from(scale).unwrap(),
+            pollables: usize::try_from(scale).unwrap(),
+            wait_registrations: usize::try_from(scale).unwrap(),
+            pending_notification_events: usize::try_from(scale).unwrap(),
+            workers_started: scale,
+            workers_active: usize::try_from(scale).unwrap(),
+            worker_reads_started: scale,
+            workers_finished: scale,
+            workers_failed: scale,
+            workers_cancelled: scale,
+            last_worker_value: scale,
+        }
+    }
+
+    #[test]
+    fn preview1_compat_status_preserves_one_instance_identity() {
+        let aggregate = aggregate_preview1_compat_stats([preview1_stats(41, 3)]).unwrap();
+
+        assert_eq!(aggregate.generation, 41);
+        assert_eq!(aggregate.last_worker_value, 3);
+        assert_eq!(aggregate.workers_active, 3);
+    }
+
+    #[test]
+    fn preview1_compat_status_sums_multiple_instances_without_false_identity() {
+        let aggregate =
+            aggregate_preview1_compat_stats([preview1_stats(41, 3), preview1_stats(42, 5)])
+                .unwrap();
+
+        assert_eq!(aggregate.generation, 0);
+        assert_eq!(aggregate.last_worker_value, 0);
+        assert_eq!(aggregate.mailbox_queued, 8);
+        assert_eq!(aggregate.mailbox_dropped, 8);
+        assert_eq!(aggregate.mailbox_capacity, 8);
+        assert_eq!(aggregate.completion_delivered, 8);
+        assert_eq!(aggregate.notifications, 8);
+        assert_eq!(aggregate.pollables, 8);
+        assert_eq!(aggregate.wait_registrations, 8);
+        assert_eq!(aggregate.workers_started, 8);
+        assert_eq!(aggregate.workers_active, 8);
+        assert_eq!(aggregate.workers_finished, 8);
+    }
+
+    #[test]
+    fn plugin_instance_id_defaults_to_artifact_stem() {
+        assert_eq!(
+            wasm_plugin_instance_id(Path::new("/tmp/plugins/rube-worker.wasm")),
+            "rube-worker"
+        );
+    }
+
+    #[test]
+    fn legacy_plugins_reject_custom_instance_ids_instead_of_ignoring_them() {
+        assert!(ensure_legacy_instance_id_supported(None).is_ok());
+        assert!(ensure_legacy_instance_id_supported(Some("reported-but-not-registered")).is_err());
+    }
+
+    #[test]
+    fn configured_legacy_module_ids_remain_labels() {
+        assert_eq!(
+            legacy_instance_id_to_validate(Some("default-workspace"), true),
+            None
+        );
+        assert_eq!(
+            legacy_instance_id_to_validate(Some("runtime-id"), false),
+            Some("runtime-id")
+        );
+    }
+
+    #[test]
+    fn hosted_actor_id_cannot_shadow_a_legacy_actor() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        state.wasm_actor_names.push("taken".to_string());
+
+        assert!(state.ensure_hosted_io_actor_id_available("taken").is_err());
+        assert!(state.ensure_hosted_io_actor_id_available("free").is_ok());
+    }
+
+    #[test]
+    fn legacy_inventory_rejects_duplicate_actor_ids_before_activation() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let state = Manifold::new(&mut event_loop, display);
+        let actor = manifold_wasm::WasmActorDeclaration {
+            name: "duplicate".to_string(),
+            export_name: "actor_duplicate".to_string(),
+        };
+
+        assert!(
+            state
+                .ensure_legacy_wasm_actor_ids_available(&[actor.clone(), actor])
+                .is_err()
+        );
+    }
 
     #[test]
     fn fullscreen_layout_covers_the_presentation_from_origin() {

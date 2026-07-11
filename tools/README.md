@@ -24,6 +24,29 @@ Run `nix build .#wasm-io-check` for the sandboxed actor/worker I/O proof. It
 builds both guest ABIs and runs completion I/O, shared-memory notifications,
 worker select/cancellation, ordinary WASI read, and shutdown workloads.
 
+Run `nix build .#wasm-io-rube-quick-check` for the deterministic, thousand-step
+cross-runtime Rube Goldberg proof used by CI. Use the following command for the
+larger finite profile, or select `soak` for repeated deterministic epochs:
+
+```sh
+nix run .#wasm-io-rube -- --profile stress --out-dir ./rube-stress
+```
+
+Stress and soak are deliberately manual because their duration is unsuitable
+for every pull request.
+
+Run `./tools/test-wasm-io-rube-goldberg.sh --profile quick` while developing the
+workload itself. It builds the existing Component and Preview 1 guests through
+Nix, runs the source-tree host example, and always reports the artifact
+directory. Supply an output directory and fixed seed when preserving a replay.
+
+Run `./tools/test-wasm-io-registry-nested.sh` for the real nested-daemon shard.
+It loads four Component and four Preview 1 instances with distinct actor IDs,
+rejects a corrupt candidate while proving the old generation remains routable,
+then replaces that generation while its workers are suspended and proves the
+other seven continue independently. The shard also checks implicit legacy-core
+loading and rejection of an unsupported legacy `--id`.
+
 Run `./tools/manifold-behavior-probe.sh` to start Manifold with a strict dmabuf-capable test client and emit JSONL behavior telemetry.
 
 Run `./tools/profile-native-scroll.sh` on a native Linux Wayland session to profile the Smithay presentation path with a real browser autoscroll workload.

@@ -250,9 +250,12 @@ pub(crate) struct PlugArgs {
     /// `DBus` bus address for the session control endpoint.
     #[arg(long = "dbus-address")]
     pub(crate) dbus_address: Option<String>,
-    /// WASM lane to replace. Auto tries the key handler ABI, then the map hook ABI.
+    /// WASM lane to load. Auto detects a plugin artifact; key-policy selects a policy provider.
     #[arg(long = "kind", value_name = "KIND", default_value = "auto")]
     pub(crate) kind: String,
+    /// Stable actor instance id. Defaults to the module file stem.
+    #[arg(long = "id", value_name = "INSTANCE_ID")]
+    pub(crate) id: Option<String>,
     /// WASM module path to load into the running session.
     #[arg(value_name = "PATH")]
     pub(crate) path: PathBuf,

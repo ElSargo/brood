@@ -60,6 +60,7 @@
           lint = packages.lintCheck;
           test = packages.testCheck;
           wasm-io = packages.wasmIoCheck;
+          wasm-io-rube = packages.wasmIoRubeQuickCheck;
           software-e2e = packages.softwareE2eCheck;
         }
       );

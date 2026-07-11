@@ -678,6 +678,18 @@ supervisor, tracked blocking I/O, and epoch task before activating a new
 generation. `tools/test-wasm-component-worker.sh` exercises this runtime
 directly.
 
+The daemon stores Component and Preview 1 instances together in a deterministic
+hosted-I/O actor map keyed by stable instance ID. Configuration uses the
+`[module.<id>]` ID, while `manifold plug --id <id>` exposes the same operation at
+runtime. Replacement removes and joins only that entry. Routing, actor lists,
+mailbox counters, broadcast delivery, and shutdown iterate the full map rather
+than a singular compatibility slot. This instance-ID contract applies to the
+Component and Preview 1 hosted backends. Legacy core-module inventories keep
+their declared actor names and singular replacement lane, so the loader rejects
+a custom runtime instance ID for them instead of pretending that ID was
+registered. Their configuration table key remains a module label for backward
+compatibility with the checked-in workspace policy.
+
 ### 15.5 Preview 1 compatibility actor and workers
 
 A core module exporting the Preview 1 compatibility marker is routed to
@@ -713,6 +725,10 @@ through the daemon's built-in nested test topology and proves control-surface
 routing, actor progress during notification select, completion I/O, ordinary
 WASI read compatibility, and hot replacement while two notification wait sets
 are pending.
+
+`tools/test-wasm-io-registry-nested.sh` loads four instances of each backend,
+holds workers pending in one generation, replaces only that actor, and verifies
+the other seven continue accepting independently accounted mailbox traffic.
 
 ## 16. Plugin runtime
 

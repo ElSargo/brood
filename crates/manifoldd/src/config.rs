@@ -160,7 +160,7 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                     continue;
                 }
                 state
-                    .replace_wasm_plugin(&module_path)
+                    .replace_configured_wasm_plugin(&id, &module_path)
                     .with_context(|| format!("load config module {id}"))?;
                 info!(
                     module = %id,

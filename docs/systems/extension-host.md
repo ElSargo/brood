@@ -66,6 +66,15 @@ if it wins before result delivery, the operation produces exactly one typed
 terminal cancellation completion. Actor generations prevent a stale completion
 from reaching a replacement actor.
 
+Runnable Component and Preview 1 actors are registered by stable instance ID.
+Configuration module IDs and `manifold plug --id` can host the same artifact
+more than once; replacement is generation-scoped and does not stop unrelated
+instances. Actor listing and mailbox diagnostics expose every entry. Legacy
+core-module actor inventories retain their singular lane and declared export
+names. Configuration table IDs remain labels for those artifacts, while custom
+runtime instance IDs are rejected rather than being silently reported without
+a matching registered actor.
+
 The Component Model example currently uses only the native async worker file
 calls. The Preview 1 compatibility example is the runnable proof that an
 ordinary Rust `std::io::Read` can wait in a worker without blocking its actor;

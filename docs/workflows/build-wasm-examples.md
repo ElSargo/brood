@@ -75,20 +75,44 @@ ordinary-WASI, and structured-shutdown proofs:
 nix build .#wasm-io-check
 ```
 
+The packaged Rube Goldberg runner supplies those same two guest artifacts to a
+multi-actor workload. `quick` is the deterministic CI profile, `stress` is the
+larger finite profile, and `soak` repeats deterministic epochs until its
+configured bound:
+
+```sh
+nix run .#wasm-io-rube -- --profile quick --out-dir ./rube-quick
+nix run .#wasm-io-rube -- --profile stress --seed 5566816691025824836 --out-dir ./rube-stress
+nix run .#wasm-io-rube -- --profile soak --seed 5566816691025824836 --out-dir ./rube-soak
+```
+
+For a source-tree run that rebuilds the packaged guests first, use
+`tools/test-wasm-io-rube-goldberg.sh`. Its exact development overrides are
+defined by that script. Profile, seed, and output directory belong to the
+wrapper before `--`; actor, worker, step, epoch, and duration overrides after
+`--` are forwarded to the Rust runner. The wrapper applies a profile-specific
+hard timeout, configurable with `MANIFOLD_WASM_IO_RUBE_TIMEOUT_SECONDS`.
+Preserve its reported output directory and replay line when reproducing a
+failure.
+
 For the end-to-end daemon proof, run:
 
 ```sh
-tools/test-wasm-preview1-worker-nested.sh
+nix develop --command bash tools/test-wasm-preview1-worker-nested.sh
+nix develop --command bash tools/test-wasm-io-registry-nested.sh
 ```
 
-That workload uses `manifold test nested` with an offscreen outer presentation,
+Those workloads use `manifold test nested` with an offscreen outer presentation.
+The Preview 1 workload
 loads the compatibility actor through the daemon plugin path, sends mailbox
 traffic through the normal control surface, proves actor completion I/O while
 workers select over a guest-owned shared-memory queue, retains an ordinary
 worker `read` compatibility case, and hot-reloads the actor while two worker
 wait sets are pending. It verifies that the old generation's notification,
 pollable, and wait-registration state is gone before the replacement handles
-traffic.
+traffic. The registry workload hosts eight independently addressed Component
+and Preview 1 actors, replaces one suspended generation, and proves its seven
+peers continue without losing their state.
 
 Related:
 

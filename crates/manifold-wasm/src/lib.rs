@@ -37,8 +37,8 @@ pub use api_link::{
     HOST_IMPORT_MODULE, READ_MESSAGE_IMPORT,
 };
 pub use completion_io::{
-    ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoError, FilesystemGrant,
-    OperationId,
+    ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoError, CompletionIoStats,
+    FilesystemGrant, OperationId,
 };
 pub use component_actor::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorMailboxStats, WorkerId,

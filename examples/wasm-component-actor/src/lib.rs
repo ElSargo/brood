@@ -15,6 +15,10 @@ static INPUT_GENERATION: AtomicU64 = AtomicU64::new(0);
 static RESULT_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SHARED_VALUE: AtomicU64 = AtomicU64::new(0);
 
+const RUBE_MESSAGE_MAGIC: &[u8; 8] = b"RUBEIO01";
+const RUBE_ACK_MAGIC: &[u8; 8] = b"RUBEACK1";
+const RUBE_WORKER_BASE: u64 = 1_u64 << 40;
+
 struct ExampleActor;
 
 impl Guest for ExampleActor {
@@ -30,6 +34,26 @@ impl Guest for ExampleActor {
             }
         }
         match event {
+            Event::Mailbox(message) if message.body.starts_with(RUBE_MESSAGE_MAGIC) => {
+                let Some((transition, input, generation, claimed)) =
+                    parse_rube_message(&message.body)
+                else {
+                    return Vec::new();
+                };
+                let actual = rube_mix(input, transition, generation);
+                let mut payload = RUBE_ACK_MAGIC.to_vec();
+                payload.extend_from_slice(&actual.to_le_bytes());
+                // A malformed claimed checksum remains externally visible as
+                // the independently computed value, so the host oracle fails
+                // the exact transition instead of silently accepting it.
+                if claimed != actual {
+                    payload.extend_from_slice(b"bad-claim");
+                }
+                vec![Command::SpawnWorker(WorkerRequest {
+                    worker: RUBE_WORKER_BASE.saturating_add(transition),
+                    payload,
+                })]
+            }
             Event::Mailbox(message) if message.body == b"spawn-worker" => {
                 vec![Command::SpawnWorker(WorkerRequest {
                     worker: 1,
@@ -110,6 +134,9 @@ impl Guest for ExampleActor {
     }
 
     async fn worker_run(worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        if worker >= RUBE_WORKER_BASE && payload.starts_with(RUBE_ACK_MAGIC) {
+            return Ok(payload[RUBE_ACK_MAGIC.len()..].to_vec());
+        }
         if worker == 99 {
             return Ok(payload);
         }
@@ -190,6 +217,29 @@ impl Guest for ExampleActor {
         }
         Ok(bytes)
     }
+}
+
+fn parse_rube_message(bytes: &[u8]) -> Option<(u64, u64, u64, u64)> {
+    if bytes.len() != 40 || !bytes.starts_with(RUBE_MESSAGE_MAGIC) {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(24..32)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(32..40)?.try_into().ok()?),
+    ))
+}
+
+fn rube_mix(input: u64, transition: u64, generation: u64) -> u64 {
+    let mut value = input
+        ^ transition.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ generation.rotate_left(17);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 /// Small SDK-side worker file wrapper over the native async host ABI.

@@ -27,6 +27,16 @@ static COORDINATED_RESULTS: AtomicU32 = AtomicU32::new(0);
 static QUEUE_HEAD: AtomicU32 = AtomicU32::new(0);
 static QUEUE_TAIL: AtomicU32 = AtomicU32::new(0);
 static QUEUE: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+static RUBE_TRANSITION: AtomicU64 = AtomicU64::new(0);
+static RUBE_INPUT: AtomicU64 = AtomicU64::new(0);
+static RUBE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RUBE_CLAIMED: AtomicU64 = AtomicU64::new(0);
+static RUBE_OUTPUT: AtomicU64 = AtomicU64::new(0);
+static RUBE_COMPLETED: AtomicU32 = AtomicU32::new(0);
+static RUBE_ERROR: AtomicU32 = AtomicU32::new(0);
+
+const RUBE_MESSAGE_MAGIC: &[u8; 8] = b"RUBEIO01";
+const RUBE_WORKER_ARGUMENT: u32 = u32::MAX - 1;
 
 const EVENT_MAILBOX: u32 = 1;
 const EVENT_COMPLETION_READ: u32 = 2;
@@ -146,6 +156,8 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
 pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
     if argument == u32::MAX {
         worker_read(argument)
+    } else if argument == RUBE_WORKER_ARGUMENT {
+        worker_rube()
     } else {
         worker_select(argument)
     }
@@ -171,13 +183,35 @@ pub extern "C" fn actor_coordinated_results(_unused: u32) -> u32 {
     COORDINATED_RESULTS.load(Ordering::Acquire)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn actor_rube_output_low(_unused: u32) -> u32 {
+    RUBE_OUTPUT.load(Ordering::Acquire) as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn actor_rube_output_high(_unused: u32) -> u32 {
+    (RUBE_OUTPUT.load(Ordering::Acquire) >> 32) as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn actor_rube_completed(_unused: u32) -> u32 {
+    RUBE_COMPLETED.load(Ordering::Acquire)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn actor_rube_error(_unused: u32) -> u32 {
+    RUBE_ERROR.load(Ordering::Acquire)
+}
+
 fn dispatch_mailbox() {
     let Some((_sender, payload)) = read_event() else {
         COMPAT_FLAGS.fetch_or(FLAG_ERROR, Ordering::Release);
         return;
     };
     COMPAT_FLAGS.fetch_or(FLAG_MAILBOX, Ordering::Release);
-    if payload == b"start-notify" {
+    if payload.starts_with(RUBE_MESSAGE_MAGIC) {
+        dispatch_rube_message(&payload);
+    } else if payload == b"start-notify" {
         start_notification_workers();
     } else if let Some(value) = payload
         .strip_prefix(b"queue:")
@@ -226,6 +260,58 @@ fn dispatch_mailbox() {
             COMPAT_FLAGS.fetch_or(FLAG_ERROR, Ordering::Release);
         }
     }
+}
+
+fn dispatch_rube_message(bytes: &[u8]) {
+    let Some((transition, input, generation, claimed)) = parse_rube_message(bytes) else {
+        RUBE_ERROR.store(1, Ordering::Release);
+        return;
+    };
+    RUBE_TRANSITION.store(transition, Ordering::Release);
+    RUBE_INPUT.store(input, Ordering::Release);
+    RUBE_GENERATION.store(generation, Ordering::Release);
+    RUBE_CLAIMED.store(claimed, Ordering::Release);
+    let mut worker = 0_u64;
+    if host_worker_spawn(RUBE_WORKER_ARGUMENT, &raw mut worker) != 0 {
+        RUBE_ERROR.store(2, Ordering::Release);
+    }
+}
+
+fn parse_rube_message(bytes: &[u8]) -> Option<(u64, u64, u64, u64)> {
+    if bytes.len() != 40 || !bytes.starts_with(RUBE_MESSAGE_MAGIC) {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(24..32)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(32..40)?.try_into().ok()?),
+    ))
+}
+
+fn worker_rube() -> u32 {
+    let output = rube_mix(
+        RUBE_INPUT.load(Ordering::Acquire),
+        RUBE_TRANSITION.load(Ordering::Acquire),
+        RUBE_GENERATION.load(Ordering::Acquire),
+    );
+    if output != RUBE_CLAIMED.load(Ordering::Acquire) {
+        RUBE_ERROR.store(3, Ordering::Release);
+    }
+    RUBE_OUTPUT.store(output, Ordering::Release);
+    RUBE_COMPLETED.fetch_add(1, Ordering::AcqRel);
+    output as u32
+}
+
+fn rube_mix(input: u64, transition: u64, generation: u64) -> u64 {
+    let mut value = input
+        ^ transition.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ generation.rotate_left(17);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn start_notification_workers() {

@@ -237,13 +237,21 @@ fn serve_session_on_calloop_thread(
     }
 
     info!("manifoldd compositor running");
-    event_loop.run(None, &mut state, |state| {
+    let event_loop_result = event_loop.run(None, &mut state, |state| {
         state.service_test_harness();
         if state.attach_requested && !state.presentation_started && !state.attach_schedule_pending {
             state.attach_schedule_pending = true;
             state.schedule_attach();
         }
-    })?;
+    });
+
+    // Teardown is unconditional: even a calloop error must not strand plugin
+    // Stores, workers, completion tasks, or legacy actor tasks.
+    let hosted_shutdown = state.stop_all_hosted_io_actors();
+    let legacy_shutdown = state.stop_legacy_wasm_plugin_actors();
+    event_loop_result?;
+    hosted_shutdown?;
+    legacy_shutdown?;
 
     if let Some(completion) = state.test_harness_completion.as_ref() {
         println!(

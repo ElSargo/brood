@@ -171,9 +171,11 @@ let
   testCheck = pkgs.runCommand "manifold-test-check" { } ''
     echo "test=rust cargo=${cargoTestCheck}"
     echo "test=wasm-io check=${wasmIoCheck}"
+    echo "test=wasm-io-rube check=${wasmIoRubeQuickCheck}"
     echo "test=software-e2e check=${softwareE2eCheck}"
     mkdir -p "$out"
     ln -s ${wasmIoCheck} "$out/wasm-io"
+    ln -s ${wasmIoRubeQuickCheck} "$out/wasm-io-rube"
     ln -s ${softwareE2eCheck} "$out/software-e2e"
     touch "$out/passed"
   '';
@@ -324,6 +326,8 @@ let
           "$out/bin/manifold-component-io-workload"
         install -m755 target/release/examples/preview1_worker_workload \
           "$out/bin/manifold-preview1-io-workload"
+        install -m755 target/release/examples/io_rube_goldberg \
+          "$out/bin/manifold-wasm-io-rube-goldberg-host"
         runHook postInstall
       '';
     }
@@ -341,6 +345,134 @@ let
           ${wasmModules}/examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/manifold_preview1_worker_example.wasm
 
         mkdir -p "$out"
+        touch "$out/passed"
+      '';
+
+  wasmIoRube = pkgs.writeShellApplication {
+    name = "manifold-wasm-io-rube-goldberg";
+    runtimeInputs = [ wasmIoWorkloads ];
+    text = ''
+      exec manifold-wasm-io-rube-goldberg-host \
+        ${wasmModules}/examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm \
+        ${wasmModules}/examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/manifold_preview1_worker_example.wasm \
+        "$@"
+    '';
+  };
+
+  wasmIoRubeQuickCheck =
+    pkgs.runCommand "manifold-wasm-io-rube-goldberg-quick-check"
+      {
+        nativeBuildInputs = [
+          pkgs.coreutils
+          pkgs.python3
+          wasmIoRube
+        ];
+      }
+      ''
+        artifacts="$out/artifacts"
+        mkdir -p "$artifacts"
+
+        timeout --kill-after=10s 180s \
+          manifold-wasm-io-rube-goldberg \
+          --profile quick \
+          --seed 5566816691025824836 \
+          --out-dir "$artifacts"
+
+        test -s "$artifacts/trace.jsonl"
+        test -s "$artifacts/manifest.json"
+        test -s "$artifacts/resource-samples.jsonl"
+        test -s "$artifacts/summary.json"
+        test ! -e "$artifacts/failure.json"
+        python3 - \
+          "$artifacts/manifest.json" \
+          "$artifacts/trace.jsonl" \
+          "$artifacts/resource-samples.jsonl" \
+          "$artifacts/summary.json" <<'PY'
+        import json
+        import sys
+
+        def load_json(path):
+            with open(path, encoding="utf-8") as stream:
+                return json.load(stream)
+
+        def load_jsonl(path):
+            with open(path, encoding="utf-8") as stream:
+                records = [json.loads(line) for line in stream if line.strip()]
+            assert records, path
+            return records
+
+        manifest = load_json(sys.argv[1])
+        trace = load_jsonl(sys.argv[2])
+        resources = load_jsonl(sys.argv[3])
+        summary = load_json(sys.argv[4])
+
+        assert manifest["schema"] == "manifold.io-rube-goldberg.manifest.v1", manifest
+        assert manifest["plan_version"] == 1, manifest
+        assert manifest["profile"] == "quick", manifest
+        assert manifest["seed"] == 5566816691025824836, manifest
+        assert manifest["topology"] == {
+            "actors": 32,
+            "component_actors": 16,
+            "preview1_actors": 16,
+            "workers_per_actor": 4,
+        }, manifest
+        assert manifest["work"]["steps_per_epoch"] == 1536, manifest
+        assert manifest["work"]["epochs"] == 1, manifest
+
+        assert summary["status"] == "ok", summary
+        assert summary["plan_version"] == manifest["plan_version"], summary
+        assert summary["profile"] == "quick", summary
+        assert summary["seed"] == manifest["seed"], summary
+        assert summary["actors"] == 32, summary
+        assert summary["workers_per_actor"] == 4, summary
+        assert summary["epochs_completed"] == 1, summary
+        assert summary["transitions_planned_per_epoch"] == 1536, summary
+        assert summary["transitions_completed"] == 1536, summary
+        assert summary["terminal_receipts"] == (
+            summary["high_volume_terminal_receipts"]
+            + summary["replacement_receipts"]
+        ), summary
+        assert summary["mailbox_pressure_accepted"] > 0, summary
+        assert summary["mailbox_pressure_rejected"] > 0, summary
+        pressure = summary["mailbox_pressure_by_backend"]
+        assert all(pressure[k]["accepted"] > 0 for k in ("component", "preview1")), pressure
+        assert all(pressure[k]["rejected"] > 0 for k in ("component", "preview1")), pressure
+        assert summary["mailbox_pressure_accepted"] == sum(
+            pressure[k]["accepted"] for k in ("component", "preview1")
+        ), pressure
+        assert summary["mailbox_pressure_rejected"] == sum(
+            pressure[k]["rejected"] for k in ("component", "preview1")
+        ), pressure
+        assert summary["duplicates"] == 0, summary
+        assert summary["lost"] == 0, summary
+        assert summary["stale_deliveries"] == 0, summary
+        assert summary["stale_operations_rejected"] > 0, summary
+        assert all(value == 0 for value in summary["coordination_after_shutdown"].values()), summary
+
+        assert trace[0]["kind"] == "header", trace[0]
+        transitions = [record for record in trace if record.get("kind") == "transition"]
+        assert len(transitions) == summary["transitions_completed"], len(transitions)
+        assert [record["id"] for record in transitions] == list(range(1536))
+
+        assert resources[-1]["phase"] == "after-shutdown", resources[-1]
+        pressure_resources = next(
+            record for record in resources if record["phase"] == "after-mailbox-backpressure"
+        )
+        assert any(actor["mailbox_dropped"] > 0 for actor in pressure_resources["preview1"])
+        for actor in resources[-1]["component"]:
+            assert actor["completion_alive"] is False, actor
+            assert actor["completion_outstanding"] == 0, actor
+            assert actor["notifications"] == 0, actor
+            assert actor["pollables"] == 0, actor
+            assert actor["wait_registrations"] == 0, actor
+            assert actor["pending_actor_events"] == 0, actor
+        for actor in resources[-1]["preview1"]:
+            assert actor["workers_active"] == 0, actor
+            assert actor["notifications"] == 0, actor
+            assert actor["pollables"] == 0, actor
+            assert actor["wait_registrations"] == 0, actor
+            assert actor["pending_actor_events"] == 0, actor
+        PY
         touch "$out/passed"
       '';
 
@@ -875,6 +1007,8 @@ in
   "wasm-modules" = wasmModules;
   "wasm-examples" = wasmModules;
   "wasm-io-check" = wasmIoCheck;
+  "wasm-io-rube" = wasmIoRube;
+  "wasm-io-rube-quick-check" = wasmIoRubeQuickCheck;
   inherit formatter linter;
 
   inherit
@@ -904,6 +1038,8 @@ in
     softwareE2eCheck
     testCheck
     wasmIoCheck
+    wasmIoRube
+    wasmIoRubeQuickCheck
     wasmIoWorkloads
     wasmModules
     ;

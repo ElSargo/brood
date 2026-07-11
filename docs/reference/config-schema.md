@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-10
+last-reviewed: 2026-07-11
 code-links:
   - crates/manifoldd/src/config.rs
   - manifold.toml
@@ -23,6 +23,15 @@ Current supported module kinds load self-contained WASM plugin artifacts:
 
 - `plugin`
 - `wasm-plugin`
+
+For Component and Preview 1 artifacts, `<id>` is the stable hosted actor
+instance ID. Different IDs may load the same artifact concurrently, and
+reloading one ID replaces only that actor generation. Actor IDs must not
+collide with built-in, legacy, or other hosted actors.
+
+For a legacy core-module artifact, `<id>` remains a configuration label. The
+artifact keeps its declared actor/provider names and singular replacement
+lane; it does not claim the label as a hosted actor ID.
 
 The parser recognizes the old `fast-key-handler` and `fast-map-hook` names only
 to warn and skip them.

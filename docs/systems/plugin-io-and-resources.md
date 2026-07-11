@@ -952,6 +952,49 @@ The implementation is not complete until real workloads prove these cases:
   resource survives shutdown unless explicitly session scoped.
 - Every rejected or coalesced action is observable in diagnostics.
 
+### Cross-Runtime Rube Goldberg Workload
+
+See [[plugin-io-interaction-graph]] for the source-linked host, actor, worker,
+completion, coordination, shared-memory, and WASI interaction map.
+
+The coordination implementation is exercised as one deterministic state
+machine spanning dozens of Component and Preview 1 actor generations and their
+workers. Each high-volume transition carries its logical sequence, actor
+generation, previous chain value, and claimed next checksum. The guest computes
+the checksum independently, while a bounded host ledger matches the terminal
+receipt to its transition, backend, actor slot, and generation. Duplicate,
+lost, reordered, wrong-output, and stale receipts therefore fail at the exact
+wave where they occur.
+
+The run is staged. Every actor first crosses completion-I/O, ordinary worker
+WASI file/stdin, shared-memory queue/atomic, notification, biased/fair select,
+and cancellation barriers. The high-volume phase then admits one transition
+per actor before collecting the wave, creating real cross-Store contention
+without making checksum results depend on wake order. Backpressure, hot
+replacement, stale-generation rejection, and structured shutdown close the
+run. Epoch resource samples and final checkpoints require operations,
+pollables, notifications, wait registrations, and workers to return to their
+expected bounds.
+
+Three profiles use the same oracle:
+
+- `quick` executes 1,536 transitions across 32 actors with four workers each
+  from a fixed seed and is required by CI;
+- `stress` executes 100,000 transitions across 48 actors with eight workers
+  each and increases contention and total worker churn;
+- `soak` continues the deterministic chain through 8,192-step indexed epochs
+  across 48 actors with 12 workers each and searches for accumulation,
+  starvation, and lifecycle leaks for one hour by default.
+
+The conductor assigns every wave's transition IDs, actor slots, and expected
+chain before collecting any receipt, so logical results do not depend on task
+wake order. A report records the plan version, profile, base seed, epoch index,
+trace schema, bounded transition trace, per-epoch resource samples, and
+terminal accounting. Failure output includes the contextual operation and a
+shell-safe command using the exact host and guest artifact paths. Quick-profile
+failures print that replay to stderr because a failed sandboxed Nix check does
+not publish its output path.
+
 ## Migration From The Current Prototype
 
 The coordination foundation is implemented in both runtime backends. It
