@@ -713,6 +713,13 @@ guest-owned atomic queue; host notifications suspend workers and schedule a
 coalesced actor event. The host-owned stdin duplex is retained only for an
 explicit ordinary-WASI compatibility case.
 
+Capability-rooted filesystem watches use the platform's native watcher through
+`filesystem_watch.rs`. A watch owns one generation notification shared across
+the actor and worker Stores. Workers therefore select watch readiness through
+the existing bounded `wait-any` path, then drain relative-path event batches;
+overflow is surfaced as an explicit rescan marker. Watchers and their native
+threads are dropped before the actor generation's coordination hub stops.
+
 The compatibility facade appears in the normal plugin actor list, accepts
 messages through the existing DBus/control actor surface, and reports mailbox,
 completion, notification, pollable, active-wait, worker, generation, and

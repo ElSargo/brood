@@ -4,6 +4,32 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
+## Plugin I/O follow-ups exposed by the real workspace watcher
+
+- Native capability-rooted filesystem watches currently exist only in the
+  Preview 1 compatibility ABI. The Component backend still needs an equivalent
+  WIT resource and SDK wrapper before both plugin backends have one I/O model.
+- Preview 1 watch batches currently encode paths as lossy UTF-8 text. The
+  resource is capability safe, but a typed SDK/Component surface must preserve
+  arbitrary platform path bytes without collisions.
+- Native watcher backends may coalesce, duplicate, or classify rename events
+  differently. Overflow is safely reported as `rescan`, but consumers that
+  maintain state must implement reconciliation; the example logger records the
+  marker rather than rebuilding an indexed model.
+- A configured workspace filesystem grant captures the active session working
+  directory when the plugin loads. It is not retargeted when another surface
+  session becomes active. Session-scoped plugin instantiation or an explicit
+  rebind lifecycle is still needed.
+- `startup-message` is an untyped bootstrap convenience, not a complete plugin
+  lifecycle interface. Manifest-level start/stop hooks and structured startup
+  data remain to be designed.
+- Watch and event-queue limits currently use runtime defaults. They are bounded,
+  but plugin manifests cannot yet request narrower budgets and status output
+  does not expose live watch counts or overflow totals.
+- Subprocesses, pipe streams, PTYs, sockets, and timers remain deliberately
+  absent. They should reuse the same generation-owned resource and pollable
+  lifecycle rather than grow separate wait mechanisms.
+
 ## Control and DBus API shape
 
 - `crates/manifoldd/src/control.rs`: `exit` in the command path shows that CLI

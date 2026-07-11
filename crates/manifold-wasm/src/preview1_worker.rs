@@ -57,6 +57,7 @@ use crate::coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError,
     NotificationId, PollError, PollableId, WaitMode,
 };
+use crate::filesystem_watch::{FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
@@ -142,6 +143,10 @@ pub struct Preview1WorkerConfig {
     pub max_outstanding_io: usize,
     /// Maximum completion read/write payload.
     pub max_completion_bytes: usize,
+    /// Maximum live capability-rooted filesystem watches.
+    pub max_filesystem_watches: usize,
+    /// Maximum queued filesystem events before a rescan marker replaces them.
+    pub max_filesystem_watch_events: usize,
     /// Maximum live shared-memory notification resources.
     pub max_notifications: usize,
     /// Maximum live worker pollables.
@@ -173,6 +178,8 @@ impl Default for Preview1WorkerConfig {
             mailbox_backlog: 128,
             max_outstanding_io: 64,
             max_completion_bytes: 1024 * 1024,
+            max_filesystem_watches: 16,
+            max_filesystem_watch_events: 4096,
             max_notifications: 64,
             max_pollables: 256,
             max_wait_set: 64,
@@ -300,6 +307,7 @@ struct Preview1Host {
     event: Option<CompatEvent>,
     completion_io: Option<CompletionIo>,
     coordination: CoordinationHub,
+    filesystem_watches: FilesystemWatchHub,
     commands: mpsc::Sender<Command>,
     next_worker: Arc<AtomicU64>,
     worker_input_capacity: usize,
@@ -449,6 +457,74 @@ impl host_abi::manifold_preview1::ManifoldPreview1 for Preview1Host {
         Ok(u32::from(
             io.cancel(OperationId::new(io.generation(), operation)),
         ))
+    }
+
+    fn filesystem_watch_create(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        path: wiggle::GuestPtr<u8>,
+        path_len: u32,
+        recursive: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_actor()?;
+        let path = read_guest_string(memory, path, path_len)?;
+        let recursive = match recursive {
+            0 => false,
+            1 => true,
+            _ => return Err(host_abi::types::Errno::Invalid),
+        };
+        self.filesystem_watches
+            .create(Path::new(&path), recursive)
+            .map(|(watch, _notification)| watch.raw())
+            .map_err(map_filesystem_watch_error)
+    }
+
+    fn filesystem_watch_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        watch: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.filesystem_watches
+            .notification(FilesystemWatchId::from_raw(watch))
+            .map(NotificationId::raw)
+            .map_err(map_filesystem_watch_error)
+    }
+
+    fn filesystem_watch_event_bytes(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        watch: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.filesystem_watches
+            .pending_bytes(FilesystemWatchId::from_raw(watch))
+            .and_then(|bytes| u32::try_from(bytes).map_err(|_overflow| FilesystemWatchError::Limit))
+            .map_err(map_filesystem_watch_error)
+    }
+
+    fn filesystem_watch_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        watch: u64,
+        events: wiggle::GuestPtr<u8>,
+        events_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        let (generation, bytes) = self
+            .filesystem_watches
+            .read(FilesystemWatchId::from_raw(watch), events_len as usize)
+            .map_err(map_filesystem_watch_error)?;
+        copy_to_guest(memory, events, events_len, &bytes)?;
+        Ok(generation)
+    }
+
+    fn filesystem_watch_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        watch: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.ensure_actor()?;
+        self.filesystem_watches
+            .drop_watch(FilesystemWatchId::from_raw(watch))
+            .map_err(map_filesystem_watch_error)
     }
 
     fn worker_spawn(
@@ -786,6 +862,18 @@ const fn map_poll_error(error: PollError) -> host_abi::types::Errno {
     }
 }
 
+fn map_filesystem_watch_error(error: FilesystemWatchError) -> host_abi::types::Errno {
+    match error {
+        FilesystemWatchError::Invalid => host_abi::types::Errno::Invalid,
+        FilesystemWatchError::Limit => host_abi::types::Errno::Limit,
+        FilesystemWatchError::Stopped
+        | FilesystemWatchError::NotPermitted
+        | FilesystemWatchError::NotReady
+        | FilesystemWatchError::Backend(_)
+        | FilesystemWatchError::Unavailable => host_abi::types::Errno::Unavailable,
+    }
+}
+
 fn map_command_error<T>(error: mpsc::error::TrySendError<T>) -> host_abi::types::Errno {
     match error {
         mpsc::error::TrySendError::Full(_) => host_abi::types::Errno::Limit,
@@ -999,6 +1087,7 @@ pub struct Preview1WorkerRuntime {
     generation: u64,
     stats: Arc<Preview1CompatStatsInner>,
     coordination: CoordinationHub,
+    filesystem_watches: FilesystemWatchHub,
 }
 
 impl Preview1WorkerRuntime {
@@ -1087,6 +1176,13 @@ impl Preview1WorkerRuntime {
             max_outstanding: config.max_outstanding_io,
             max_completion_bytes: config.max_completion_bytes,
         };
+        let filesystem_watches = FilesystemWatchHub::new(
+            completion_config.filesystem.as_ref(),
+            coordination.clone(),
+            config.max_filesystem_watches,
+            config.max_filesystem_watch_events,
+        )
+        .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
         let (completion_io, completion_rx, completion_task) =
             start_completion_io(generation, &completion_config)
                 .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
@@ -1113,6 +1209,7 @@ impl Preview1WorkerRuntime {
                         event: None,
                         completion_io: Some(completion_supervisor.io().clone()),
                         coordination: coordination.clone(),
+                        filesystem_watches: filesystem_watches.clone(),
                         commands: commands.clone(),
                         next_worker: Arc::clone(&next_worker),
                         worker_input_capacity: config.worker_input_capacity,
@@ -1132,6 +1229,7 @@ impl Preview1WorkerRuntime {
             Ok(initialized) => initialized,
             Err(error) => {
                 completion_supervisor.shutdown().await;
+                filesystem_watches.stop();
                 return Err(error);
             }
         };
@@ -1162,6 +1260,7 @@ impl Preview1WorkerRuntime {
             generation,
             stats,
             coordination,
+            filesystem_watches,
         })
     }
 
@@ -1315,6 +1414,7 @@ impl Preview1WorkerRuntime {
             return Ok(());
         }
 
+        self.filesystem_watches.stop();
         self.coordination.stop();
 
         let (reply, response) = oneshot::channel();
@@ -1343,6 +1443,7 @@ impl Preview1WorkerRuntime {
 
 impl Drop for Preview1WorkerRuntime {
     fn drop(&mut self) {
+        self.filesystem_watches.stop();
         self.coordination.stop();
         if let Some(parent) = self.parent.take() {
             parent.abort();
@@ -2319,6 +2420,7 @@ async fn prepare_worker(
     let (
         worker_completion_io,
         worker_coordination,
+        worker_filesystem_watches,
         worker_commands,
         worker_next_id,
         worker_input_capacity,
@@ -2330,6 +2432,7 @@ async fn prepare_worker(
         (
             actor_host.completion_io.clone(),
             actor_host.coordination.clone(),
+            actor_host.filesystem_watches.clone(),
             actor_host.commands.clone(),
             Arc::clone(&actor_host.next_worker),
             actor_host.worker_input_capacity,
@@ -2345,6 +2448,7 @@ async fn prepare_worker(
             event: None,
             completion_io: worker_completion_io,
             coordination: worker_coordination,
+            filesystem_watches: worker_filesystem_watches,
             commands: worker_commands,
             next_worker: worker_next_id,
             worker_input_capacity,
@@ -2518,6 +2622,16 @@ const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1Wor
     if config.max_completion_bytes == 0 {
         return Err(Preview1WorkerError::InvalidConfig(
             "max_completion_bytes must be non-zero",
+        ));
+    }
+    if config.max_filesystem_watches == 0 {
+        return Err(Preview1WorkerError::InvalidConfig(
+            "max_filesystem_watches must be non-zero",
+        ));
+    }
+    if config.max_filesystem_watch_events == 0 {
+        return Err(Preview1WorkerError::InvalidConfig(
+            "max_filesystem_watch_events must be non-zero",
         ));
     }
     if config.max_notifications == 0 {
@@ -2782,6 +2896,8 @@ mod tests {
             parent: None,
             generation: 1,
             stats: Arc::new(Preview1CompatStatsInner::default()),
+            filesystem_watches: FilesystemWatchHub::new(None, coordination.clone(), 1, 1)
+                .map_err(|error| anyhow::anyhow!(error))?,
             coordination,
         };
 

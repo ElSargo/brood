@@ -38,6 +38,7 @@ flowchart LR
         RUB["[2] Stress conductor<br/>wave planner + receipt ledger"]:::host
         CIO["[5] Completion supervisor<br/>OperationId + cancellation + typed result"]:::io
         COORD["[6] CoordinationHub<br/>notification/watch/pollable/wait-any"]:::io
+        FW["[10] FilesystemWatchHub<br/>native events + bounded batches"]:::io
         WASI["[8] Preview 1 WASI host<br/>filesystem + stdin"]:::io
         FS["Capability-scoped host files / stdin"]:::external
     end
@@ -80,6 +81,10 @@ flowchart LR
     PW -->|"wait-any; suspends this worker only"| COORD
     COORD -->|"coalesced notification event"| CA
     COORD -->|"coalesced notification event"| PA
+    PA -->|"create capability-rooted watch"| FW
+    FW -->|"signal watch generation"| COORD
+    FW -->|"native recursive watch"| FS
+    PW -->|"drain relative-path event batch"| FW
 
     PA -->|"write queue/token then spawn"| SM
     SM -->|"shared input"| PW
@@ -115,6 +120,7 @@ flowchart LR
 | 7 | Guest-owned shared-memory communication | No host-managed channel wait is required; workers may combine atomics with notification waits | Acquire/release atomics publish queue data and terminal counters to the actor | [`wasm-preview1-worker`](../../examples/wasm-preview1-worker/src/lib.rs#L265), [`wasm-preview1-worker`](../../examples/wasm-preview1-worker/src/lib.rs#L292) |
 | 8 | Ordinary Preview 1 WASI from a worker | Only the worker Store/coroutine waits; sibling workers and the actor continue | Standard WASI return value resumes the worker, which publishes or returns its result | [`preview1_worker.rs`](../../crates/manifold-wasm/src/preview1_worker.rs#L2177), [`wasm-preview1-worker`](../../examples/wasm-preview1-worker/src/lib.rs#L588), [`wasm-preview1-worker`](../../examples/wasm-preview1-worker/src/lib.rs#L599) |
 | 9 | Replacement and structured shutdown | The old generation is quiesced and joined; unrelated actors remain live | A new generation is published under the same ID; old operation IDs and coordination handles are rejected | [`state.rs`](../../crates/manifoldd/src/state.rs#L4078), [`state.rs`](../../crates/manifoldd/src/state.rs#L4191), [`io_rube_goldberg.rs`](../../crates/manifold-wasm/examples/io_rube_goldberg.rs#L1598) |
+| 10 | Capability-rooted native filesystem watch | Only a worker waiting on the watch notification suspends; an actor may instead arm a one-shot event | A bounded batch of relative paths plus its last generation; overflow is an explicit `rescan` record | [`filesystem_watch.rs`](../../crates/manifold-wasm/src/filesystem_watch.rs), [`preview1_worker.rs`](../../crates/manifold-wasm/src/preview1_worker.rs), [`workspace-file-log`](../../plugins/workspace-file-log/src/lib.rs) |
 
 ## One Transition, End To End
 

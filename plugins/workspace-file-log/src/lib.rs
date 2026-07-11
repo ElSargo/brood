@@ -5,9 +5,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     ptr,
-    sync::atomic::{AtomicU32, Ordering},
-    thread,
-    time::{Duration, UNIX_EPOCH},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    time::UNIX_EPOCH,
 };
 
 const EVENT_MAILBOX: u32 = 1;
@@ -19,6 +18,8 @@ const WORKER_ARGUMENT: u32 = 1;
 static WATCH_STARTED: AtomicU32 = AtomicU32::new(0);
 static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
 static ERROR_CODE: AtomicU32 = AtomicU32::new(0);
+static WATCH: AtomicU64 = AtomicU64::new(0);
+static NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
@@ -43,6 +44,40 @@ unsafe extern "C" {
     ) -> u32;
     #[link_name = "worker_spawn"]
     safe fn host_worker_spawn(argument: u32, worker: *mut u64) -> u32;
+    #[link_name = "filesystem_watch_create"]
+    unsafe fn host_filesystem_watch_create(
+        path: *const u8,
+        path_len: u32,
+        recursive: u32,
+        watch: *mut u64,
+    ) -> u32;
+    #[link_name = "filesystem_watch_notification"]
+    safe fn host_filesystem_watch_notification(watch: u64, notification: *mut u64) -> u32;
+    #[link_name = "filesystem_watch_event_bytes"]
+    safe fn host_filesystem_watch_event_bytes(watch: u64, bytes: *mut u32) -> u32;
+    #[link_name = "filesystem_watch_read"]
+    unsafe fn host_filesystem_watch_read(
+        watch: u64,
+        events: *mut u8,
+        events_len: u32,
+        generation: *mut u64,
+    ) -> u32;
+    #[link_name = "notification_pollable"]
+    safe fn host_notification_pollable(
+        notification: u64,
+        observed_generation: u64,
+        pollable: *mut u64,
+    ) -> u32;
+    #[link_name = "pollable_drop"]
+    safe fn host_pollable_drop(pollable: u64) -> u32;
+    #[link_name = "worker_wait_any"]
+    unsafe fn host_worker_wait_any(
+        pollables: *const u64,
+        pollables_len: u32,
+        timeout_ms: u64,
+        mode: u32,
+        ready: *mut u64,
+    ) -> u32;
 }
 
 #[unsafe(no_mangle)]
@@ -64,9 +99,24 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     {
+        let mut watch = 0_u64;
+        let path = b".";
+        let watch_status = unsafe {
+            host_filesystem_watch_create(path.as_ptr(), path.len() as u32, 1, &raw mut watch)
+        };
+        let mut notification = 0_u64;
+        if watch_status != 0
+            || host_filesystem_watch_notification(watch, &raw mut notification) != 0
+        {
+            ERROR_CODE.store(2, Ordering::Release);
+            WATCH_STARTED.store(0, Ordering::Release);
+            return 0;
+        }
+        WATCH.store(watch, Ordering::Release);
+        NOTIFICATION.store(notification, Ordering::Release);
         let mut worker = 0_u64;
         if host_worker_spawn(WORKER_ARGUMENT, &raw mut worker) != 0 {
-            ERROR_CODE.store(2, Ordering::Release);
+            ERROR_CODE.store(3, Ordering::Release);
             WATCH_STARTED.store(0, Ordering::Release);
         }
     }
@@ -89,23 +139,56 @@ pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
 
 fn watch_workspace() -> Result<u32, u32> {
     fs::create_dir_all(LOG_DIRECTORY).map_err(|_| 10_u32)?;
-    let mut previous = scan_workspace().map_err(|_| 11_u32)?;
+    let previous = scan_workspace().map_err(|_| 11_u32)?;
     append_initial(&previous).map_err(|_| 12_u32)?;
     SCAN_COUNT.fetch_add(1, Ordering::AcqRel);
+    let watch = WATCH.load(Ordering::Acquire);
+    let notification = NOTIFICATION.load(Ordering::Acquire);
+    if watch == 0 || notification == 0 {
+        return Err(13);
+    }
+    let mut observed_generation = 0_u64;
 
     loop {
-        thread::sleep(Duration::from_millis(250));
-        let current = match scan_workspace() {
-            Ok(current) => current,
-            Err(_) => {
-                ERROR_CODE.store(13, Ordering::Release);
-                continue;
-            }
-        };
-        if current != previous && append_changes(&previous, &current).is_err() {
-            ERROR_CODE.store(14, Ordering::Release);
+        let mut pollable = 0_u64;
+        if host_notification_pollable(notification, observed_generation, &raw mut pollable) != 0 {
+            return Err(14);
         }
-        previous = current;
+        let pollables = [pollable];
+        let mut ready = 0_u64;
+        let wait_status = unsafe {
+            host_worker_wait_any(
+                pollables.as_ptr(),
+                pollables.len() as u32,
+                u64::MAX,
+                0,
+                &raw mut ready,
+            )
+        };
+        let _drop_status = host_pollable_drop(pollable);
+        if wait_status != 0 || ready != pollable {
+            return Err(15);
+        }
+
+        let mut bytes_len = 0_u32;
+        if host_filesystem_watch_event_bytes(watch, &raw mut bytes_len) != 0 || bytes_len == 0 {
+            return Err(16);
+        }
+        let mut bytes = vec![0_u8; bytes_len as usize];
+        let mut generation = 0_u64;
+        let read_status = unsafe {
+            host_filesystem_watch_read(
+                watch,
+                bytes.as_mut_ptr(),
+                bytes_len,
+                &raw mut generation,
+            )
+        };
+        if read_status != 0 || generation == 0 {
+            return Err(17);
+        }
+        append_watch_events(&bytes).map_err(|_| 18_u32)?;
+        observed_generation = generation;
         SCAN_COUNT.fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -157,24 +240,26 @@ fn append_initial(files: &BTreeMap<String, FileStamp>) -> std::io::Result<()> {
     log.flush()
 }
 
-fn append_changes(
-    previous: &BTreeMap<String, FileStamp>,
-    current: &BTreeMap<String, FileStamp>,
-) -> std::io::Result<()> {
+fn append_watch_events(bytes: &[u8]) -> std::io::Result<()> {
     let mut log = open_log()?;
-    for (path, stamp) in current {
-        match previous.get(path) {
-            None => writeln!(log, "created\t{path}")?,
-            Some(old) if old != stamp => writeln!(log, "modified\t{path}")?,
-            Some(_) => {}
-        }
-    }
-    for path in previous.keys() {
-        if !current.contains_key(path) {
-            writeln!(log, "removed\t{path}")?;
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let Some((kind, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if !excluded_path(Path::new(path)) {
+            writeln!(log, "{kind}\t{path}")?;
         }
     }
     log.flush()
+}
+
+fn excluded_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(".git" | ".direnv" | ".manifold" | "target")
+        )
+    })
 }
 
 fn open_log() -> std::io::Result<fs::File> {

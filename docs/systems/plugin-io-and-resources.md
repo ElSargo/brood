@@ -481,6 +481,16 @@ Events are advisory and may coalesce. Overflow must be explicit; consumers then
 rescan through the granted filesystem capability. Watches must not reveal paths
 outside their root through rename or symlink metadata.
 
+The initial Preview 1 watch ABI makes this contract concrete. The actor creates
+a bounded watch relative to its preopened filesystem root and receives the
+watch's generation-scoped notification handle. It may arm that notification as
+an actor event, or share the handle with a worker which projects it into the
+normal `wait-any` pollable set. Reading drains complete UTF-8 event records up
+to the supplied buffer capacity and returns the last drained generation; a
+concurrent later event therefore makes the next poll immediately ready instead
+of being lost. Native access-only events are ignored. Queue exhaustion replaces
+the pending batch with `rescan`, never a silent partial history.
+
 ## Clocks And Timers
 
 Workers receive monotonic and wall clocks through WASI. Timers are host
@@ -882,9 +892,10 @@ Worker-only waiting imports must reject invocation from actor dispatch.
 - Add session-scoped process promotion and authorized reattachment.
 - Verify terminal actor replacement without terminating its shell.
 
-### Phase 5: Filesystem Watches And Networking
+### Phase 5: Filesystem Watch Completion And Networking
 
-- Add capability-rooted watches and overflow/rescan semantics.
+- Expose the implemented capability-rooted watch contract through Component
+  WIT resources and SDK wrappers, including typed non-UTF-8 path handling.
 - Add capability-filtered TCP/UDP/DNS and pollable readiness.
 - Add Unix-domain sockets only after path capability semantics are defined.
 
@@ -1012,9 +1023,11 @@ worker stdin `read`, filesystem `open`/`read`/`write` through Rust `std::fs`,
 shared linear memory, and generation-safe replacement while workers are
 suspended in notification wait sets.
 
-Generic streams and timers, processes, PTYs, networking, file watches, blobs,
-supervision, and privileged transactions remain later phases. Notification
-pollables are therefore the only currently implemented pollable kind.
+Preview 1 now also has bounded, capability-rooted native filesystem watches.
+Each watch owns a generation notification, so the same worker pollable engine
+provides cancellation-safe readiness without polling. Generic streams and
+timers, processes, PTYs, networking, Component watch resources, blobs,
+supervision, and privileged transactions remain later phases.
 
 ## Explicit Non-Goals
 

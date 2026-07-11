@@ -11,6 +11,7 @@ mod api_link;
 pub mod completion_io;
 pub mod component_actor;
 pub mod coordination;
+mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
 pub mod layout_policy;
