@@ -2,7 +2,7 @@
 status: canonical
 type: index
 authority: documentation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-13
 ---
 
 # Manifold Knowledge Base
@@ -32,7 +32,8 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
   worker select, external resources, scopes, shutdown, and diagnostics.
 - [[systems/input-shortcuts]] describes host-owned shortcut routing with privileged sync key policy.
 - [[systems/layout-policy]] describes host-validated layout policy and resolved layouts.
-- [[systems/plugin-ui]] describes native component panes, chrome, and custom drawing escape hatches.
+- [[systems/plugin-ui]] describes native component panes, chrome, interaction semantics, and the relationship to custom drawing.
+- [[systems/plugin-graphics]] specifies render packets, graphics resources, shaders, host text, submission, and replay.
 
 ## Core Concepts
 

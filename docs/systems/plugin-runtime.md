@@ -199,3 +199,4 @@ Related:
 - [[input-shortcuts]]
 - [[layout-policy]]
 - [[plugin-ui]]
+- [[plugin-graphics]]

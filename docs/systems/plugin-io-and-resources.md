@@ -11,7 +11,7 @@ This page specifies the I/O, coordination, external-resource, and shutdown
 contract for [[plugin-runtime]]. It describes the target design, not prototype
 export names or a complete POSIX emulation.
 
-Graphics and pane rendering belong to [[plugin-ui]]. Exact current ABI details
+Graphics and pane rendering belong to [[plugin-ui]] and [[plugin-graphics]]. Exact current ABI details
 belong to [[extension-host]] and the code-linked
 [[plugin-io-interaction-graph]].
 

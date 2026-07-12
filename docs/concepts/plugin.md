@@ -67,4 +67,5 @@ Related:
 - [[session]]
 - [[../decisions/0006-plugin-actors-and-workers]]
 - [[../systems/plugin-ui]]
+- [[../systems/plugin-graphics]]
 - [[wasm-controller]]

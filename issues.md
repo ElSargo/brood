@@ -6,6 +6,40 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
+- Wasm stores and actor message paths are not yet bounded by bytes. Mailbox
+  bodies, sender strings, worker payloads, worker results, and aggregate guest
+  memory can therefore exhaust daemon memory even though queue item counts are
+  bounded. Address this before stabilizing the runtime by adding Wasmtime
+  memory/table limits plus per-message, per-result, and per-generation byte
+  budgets. These limits should be deliberately very generous: they are
+  fault-containment ceilings for runaway plugins, not constraints that normal
+  coding workloads should approach.
+- The Preview 1 parent drains completion results into `actor_operations`
+  without applying `max_pending_actor_operations` or a separate completion-lane
+  bound. A completion handler which submits more operations can grow this queue
+  indefinitely while the outstanding-operation count remains within its limit.
+  Add a reserved bounded completion lane and stop draining the supervisor while
+  it is full. As with byte budgets, use a very generous limit so ordinary bursty
+  completion traffic is unaffected while unbounded growth is impossible.
+- Preview 1 shutdown cancels workers which are already active, but a worker
+  preparation which completes after shutdown begins can still start a new
+  worker. That worker missed the cancellation pass and can delay or hang hot
+  replacement. Once stopping begins, every late preparation result must drop
+  its prepared Store, release its reservation, and report cancellation instead
+  of starting the worker.
+- Completion writes run through `spawn_blocking`, but cancellation and shutdown
+  abort only the async wrapper. A blocking filesystem operation which has
+  already started can continue mutating the filesystem after a cancellation
+  completion or actor replacement. Track and join completion-engine blocking
+  work as Component worker I/O already does, or explicitly weaken and document
+  the cancellation contract for external side effects.
+- Filesystem watch churn is not fully bounded. Each watch creation retains a
+  setup-thread handle until the entire hub stops, including after that watch is
+  dropped, so repeated create/drop cycles grow `setup_threads`. In addition,
+  `drop_watch` removes the watch before dropping its notification; if a queued
+  actor event makes `drop_notification` fail, the notification remains live
+  after its owning watch is gone. Reap keyed setup tasks and make watch plus
+  notification teardown atomic or safely deferred.
 - Native watches currently create one `notify` backend per logical watch
   resource. Replace that with a daemon-wide watcher service which deduplicates
   native path registrations and routes events into bounded, actor-generation

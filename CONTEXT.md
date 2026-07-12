@@ -77,7 +77,7 @@ A WASM-backed plugin role that changes workspace behavior through host APIs, suc
 _Avoid_: compositor plugin, direct state mutator
 
 **WASM pane app**:
-A WASM module that owns durable app state in the session process and may create any number of panes by producing scene patches.
+A WASM module that owns durable app state in the session process and may create any number of panes by producing semantic UI patches or custom render packets.
 _Avoid_: managed app
 
 **Managed app**:
@@ -103,6 +103,10 @@ _Avoid_: layout command, guaranteed placement
 **Native component pane**:
 A plugin pane whose content is described as host-rendered components instead of plugin-drawn pixels.
 _Avoid_: webview requirement, raw framebuffer by default
+
+**Render packet**:
+A bounded, versioned, replayable command buffer submitted by an actor as the latest custom-drawn visual state of one pane. It may reference host-managed graphics resources, while the host owns validation, GPU synchronization, composition, and presentation.
+_Avoid_: native GPU command buffer, graphics swapchain, pointer into retained guest memory
 
 **Session DBus proxy**:
 A session-scoped DBus bridge for external apps that need normal desktop-style communication inside a Manifold session.

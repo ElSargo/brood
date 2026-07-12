@@ -2,12 +2,12 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-10
+last-reviewed: 2026-07-13
 ---
 
 # Plugin UI And Pane Rendering
 
-The target pane UI model favors host-rendered native chrome and rich default components. Plugins describe UI and behavior; the host owns presentation lifecycle, focus, theme, accessibility, and final rendering.
+The target pane UI model provides host-rendered native chrome and rich default components without making those components the limit of plugin graphics. Plugins may describe semantic UI or submit custom render packets; the host owns presentation lifecycle, focus, theme integration, accessibility infrastructure, and final rendering. The low-level graphics protocol is specified in [[plugin-graphics]].
 
 ## Ownership
 
@@ -17,7 +17,7 @@ The host owns:
 - layout integration and resize/focus/visibility events
 - input routing between native widgets, plugin actors, policy providers, and managed clients
 - theming, accessibility, text editing primitives, and platform integration
-- validation of plugin-provided UI trees or patches
+- validation of plugin-provided UI trees, semantic interaction trees, and render packets
 
 Plugins own:
 
@@ -25,7 +25,7 @@ Plugins own:
 - actor logic for UI events, completions, and commands
 - actor-scoped workers for blocking-looking I/O and shared-state concurrent work
 - semantic view models or component trees
-- optional custom drawing resources when granted
+- custom graphics resources, shaders, and pane render packets when needed
 
 If a plugin actor exits or crashes, the pane identity can remain host-owned. The host can replace the content with native recovery chrome such as restart, close, and logs actions.
 
@@ -53,11 +53,12 @@ A plugin actor may request or be assigned a pane. The host creates the pane shel
 ```text
 Host -> Actor: CreatePane { pane_id, kind, constraints, capabilities }
 Actor -> Host: SetViewTree or PatchViewTree { pane_id, ... }
+Actor -> Host: SubmitRenderPacket { pane_handle, guest_range }
 Host -> Actor: PaneResized / PaneFocused / PaneHidden / PaneDestroyed
 Actor -> Host: CommandRequest / ViewPatch / Status
 ```
 
-Pane content updates flow through actor mailboxes and host validation. They do not run on the synchronous key/layout path unless a separate policy provider is explicitly involved.
+Semantic pane updates flow through actor mailboxes and host validation. Custom graphics use the bounded render submission path so an actor can batch a pane update in guest memory and cross the WASM boundary once. Neither path runs on the synchronous key/layout path unless a separate policy provider is explicitly involved.
 
 ## Native Chrome
 
@@ -65,17 +66,13 @@ Native chrome should be available by default so plugin panes feel coherent acros
 
 Plugin-provided layout or UI may request chrome roles and actions, but the host decides final placement, style, and interaction details.
 
-## Custom Drawing Escape Hatches
+## Low-Level Graphics Path
 
-Some plugins need lower-level rendering. The target model can support explicit escape hatches, each guarded by capabilities and lifecycle rules:
+Custom drawing is a supported first-class path, although it is not the shortest path for conventional UI. Actors can create host-managed buffers, textures, samplers, shaders, pipelines, render targets, text layouts, and related resources. They submit a bounded, replayable render packet as the latest visual state of a pane.
 
-- canvas-like retained drawing primitives
-- terminal or text grid surface
-- host-managed texture/resource handles
-- imported external client surfaces
-- later GPU or shared-buffer paths if justified
+The protocol can express textured quads, custom geometry, indexed and instanced drawing, arbitrary validated shaders, and offscreen effects. It deliberately does not expose physical devices, swapchains, GPU queues, barriers, fences, or backend-native objects. The host copies and validates a submitted guest-memory range, then owns lowering, synchronization, composition, and presentation.
 
-Custom drawing should not be the default pane API. It should bypass native components only when real workloads need it.
+Canvas, terminal, text-grid, and other domain APIs belong in the SDK above this protocol. Imported client surfaces and external GPU or shared-buffer paths remain separately negotiated capabilities with explicit lifecycle rules. See [[plugin-graphics]] for the complete graphics and text contract.
 
 ## Relation To Policy Providers
 
@@ -97,12 +94,13 @@ The host should validate:
 - unsupported component features by backend
 - patch application order and generation
 
-Diagnostics should report rejected UI updates, backend feature adaptation, actor latency, frame/update counters, and recovery state.
+Diagnostics should report rejected UI updates, backend feature adaptation, actor latency, frame/update counters, and recovery state. Render-packet, shader, resource, and presentation diagnostics are specified in [[plugin-graphics]].
 
 Related:
 
 - [[../concepts/plugin]]
 - [[plugin-runtime]]
+- [[plugin-graphics]]
 - [[input-shortcuts]]
 - [[layout-policy]]
 - [[../concepts/pane]]
