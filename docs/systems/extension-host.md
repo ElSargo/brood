@@ -92,22 +92,12 @@ boundary.
 
 ## Target Plugin Host Shape
 
-The target extension host should provide:
-
-- plugin actors addressed through host-provided mailboxes
-- actor-scoped workers that share actor memory, resources, and capabilities
-- completion-based actor I/O and blocking-looking worker WASI over one host I/O engine
-- a registry for actor identities, services, actions, pane types, and capabilities
-- named publications for latest immutable state publication
-- policy providers for immediate key, focus, and other pre-commit decisions
-- host-owned command execution, layout validation, input routing, pane lifecycle, and native UI rendering
-
-Actors are the only host-visible execution addresses. They are dormant between
-events; once invoked, their dispatchers must not suspend or block. Workers are
-private cooperative execution contexts and may use ordinary blocking-looking
-WASI because only the calling worker is suspended. Policy
-providers are neither actors nor workers and must not block, perform I/O, or
-inspect mutable actor memory.
+The durable model is specified once in [[plugin-runtime]], with its resource
+protocol in [[plugin-io-and-resources]]. In short: actors are public fault
+domains, workers are private shared-memory tasks, policy providers are bounded
+synchronous decisions, and installed plugins are trusted within the enclosing
+session environment. This page only records how the current prototypes map to
+that target.
 
 ## Hot Replacement
 

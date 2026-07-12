@@ -20,7 +20,9 @@ For the MVP prototype, this split is narrowed by [0002: Local MVP Presentation](
 - `manifold-client` owns local presentation execution when the presenter is split out.
 - pane clients produce surfaces or scene data under session-process supervision.
 - browser integration is modeled as a first-party pane client.
-- WASM apps are the preferred direction for sandboxed built-in apps.
+- WASM is the preferred portable plugin format and fault-isolation runtime.
+  Authority isolation belongs to the enclosing session environment, as refined
+  by [0006](0006-plugin-actors-and-workers.md).
 
 ## Consequences
 

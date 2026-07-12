@@ -1,4 +1,4 @@
-# 0006: Actors Are Public Isolation Domains And Workers Are Private Tasks
+# 0006: Actors Are Fault Domains And Workers Are Private Tasks
 
 ## Status
 
@@ -18,10 +18,10 @@ language state and synchronization.
 
 ## Decision
 
-An actor is the public plugin isolation, authority, addressing, and lifecycle
-domain. It owns an address space, mailbox slots, capabilities, resources,
-publications, and failure state. The host may leave it dormant while waiting for
-its next event, but once invoked its completion-driven dispatcher must not
+An actor is the public plugin fault-isolation, addressing, resource-ownership,
+and lifecycle domain. It owns an address space, mailbox slots, resources,
+publications, and failure state. The host may leave it dormant while waiting
+for its next event, but once invoked its completion-driven dispatcher must not
 suspend or block on I/O or synchronization.
 
 A worker is a private execution context scoped to an actor. Workers share their
@@ -43,9 +43,14 @@ Policy providers remain separate bounded synchronous routines. They read
 host-owned immutable publications and cannot block, spawn workers, perform I/O,
 or inspect mutable actor memory.
 
+Installed plugins inside one session are trusted user code. Actor address-space
+separation remains essential for crash containment and clear ownership, but is
+not advertised as an adversarial security boundary. Authority isolation belongs
+to the enclosing local, containerized, or remote session environment.
+
 ## Consequences
 
-- Actors remain the only host-visible message and isolation boundary.
+- Actors remain the only host-visible message and fault-isolation boundary.
 - Worker creation is cheaper than actor creation because it reuses the actor's
   address space, resource table, capabilities, and lifecycle.
 - Plugin SDKs need distinct actor-dispatch and worker contexts so blocking
@@ -58,6 +63,8 @@ or inspect mutable actor memory.
   completion backlog, starvation, cancellation, and worker state memory.
 - The durable ABI should use standard WASI plus Manifold-specific WIT APIs rather
   than a bespoke replacement for normal file and stream I/O.
+- Normal trusted-plugin operation does not add per-I/O approval prompts. Host
+  bridges and authority are configured at the session boundary.
 - The current core-WASM epoch ABI remains a prototype and is not the target
   execution contract.
 

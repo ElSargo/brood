@@ -63,23 +63,20 @@ User-facing commands such as `enter`, `show`, `hide`, `list`, `switch`, `plug`, 
 
 ## Plugin And Extension Boundary
 
-The target plugin architecture uses actors as public isolation, addressing, and
-lifecycle domains. The host leaves actors dormant between events; once invoked,
-their dispatchers communicate through host-provided mailboxes and completions
-without suspending or blocking. Actors may spawn private workers that share
-actor memory and capabilities. Workers may use ordinary blocking-looking WASI
-and select through host pollables because only the calling worker is suspended;
-their synchronization data structures remain guest-owned. Immediate host
-pre-commit decisions use policy providers that read immutable published state
-and return bounded decision envelopes. See
-[[systems/plugin-io-and-resources]] for the resource contract.
+Installed plugins are trusted code inside a session environment. Actors provide
+public addressing, separate address spaces, lifecycle, and fault containment;
+private workers share actor memory and may wait on ordinary WASI without
+blocking actor dispatch. Policy providers handle immediate bounded decisions
+from immutable publications. Authority comes from the enclosing local,
+containerized, or remote execution environment, not from a security boundary
+between individual plugins.
 
 WASM and extension APIs should operate on workspace, session, pane, command, status, input, and layout concepts. They should not expose Smithay, Winit, EGL, DMA-BUF, or renderer internals as the product API.
 
-The host owns final commits, worker scheduling and limits, completion delivery,
-shortcut routing, accepted layout validation, pane lifecycle, native chrome,
-hit testing, focus, and rendering. Plugin actors and workers can request
-commands, send messages, publish latest state, and propose layouts or UI trees,
-but the host validates and applies accepted results.
+The host owns scheduler and product invariants: final commits, worker limits,
+completion delivery, input routing, layout validation, pane lifecycle, native
+chrome, focus, rendering, and bridges across the session boundary. Validation
+keeps host state coherent; it is not presented as containment of malicious
+installed plugin code.
 
 See [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-policy]], [[systems/plugin-ui]], and [[systems/extension-host]].

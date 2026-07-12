@@ -42,7 +42,12 @@ The repository is currently proving:
 
 ## Design Bias
 
-Manifold is local-first and power-user-oriented. Explicit user/session actions should work without confirmation prompts by default, but effects should be observable, debuggable, and reversible where practical.
+Manifold is local-first and power-user-oriented. Installed plugins are trusted
+session code, so normal file, process, and network work should not trigger
+repeated permission prompts. Effects should instead be observable, debuggable,
+and reversible where practical. Direct local sessions have normal user
+authority; containerized and remote sessions add the clear environment boundary
+when isolation is required.
 
 ## Where To Read Next
 
