@@ -4,12 +4,6 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Geometry and conversion model
-
-- `crates/manifoldd/src/launch_context.rs`: environment previews slice strings
-  by byte offsets. The target design should define truncation in Unicode scalar
-  or grapheme terms before changing behavior.
-
 ## Unsafe and raw buffers
 
 - `crates/manifoldd/src/winit_presenter.rs`,
@@ -43,6 +37,21 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- The launch-context issue's preview premise was stale: repository history
+  confirms launch records have always been lossless transport data and no
+  environment-preview bound or truncation function exists. The real
+  `string_slice` debt was cgroup scope parsing; it now matches an exact,
+  nonempty path component with structural prefix/suffix operations, preserving
+  arbitrary Unicode without byte indexing. Tests cover malformed delimiters,
+  long Japanese/combining/ZWJ/skin-tone/flag identifiers, and complete
+  `PathBuf`/`OsString` record round trips. A plugin is not applicable before the
+  session/plugin runtime starts, so `tools/test-unicode-launch-context.sh`
+  provides the real proof: an actual user systemd scope and
+  `manifold-runner-exec` restore full Japanese/emoji project paths,
+  combining-mark/flag working paths, Cyrillic/emoji cache paths, and a
+  CJK/combining/skin-tone/flag argument into both the process environment and
+  cwd. Any future bounded UI preview must define its own bound and truncate at
+  extended-grapheme boundaries while retaining the record as source of truth.
 - Normalized plugin transforms, signed layout pixels, unsigned host/capture
   extents, physical pointer positions, and Wayland axis values now cross one
   checked geometry layer with explicit rounding, saturation, clamping, empty-

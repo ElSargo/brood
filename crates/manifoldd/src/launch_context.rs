@@ -1,10 +1,3 @@
-#![allow(
-    clippy::let_underscore_must_use,
-    clippy::string_slice,
-    reason = "tracked in issues.md: launch context logging still truncates display strings by byte offsets"
-)]
-// TODO(lint-structure): define environment preview truncation in Unicode scalar terms.
-
 use std::{
     env,
     ffi::{OsStr, OsString},
@@ -76,8 +69,11 @@ pub fn write_launch_record(record: &LaunchRecord) -> Result<PathBuf> {
 }
 
 pub fn remove_launch_record(id: &str) {
-    if let Ok(path) = record_path(id) {
-        let _ = fs::remove_file(path);
+    if let Ok(path) = record_path(id)
+        && let Err(error) = fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(?error, path = %path.display(), "failed to remove Manifold launch record");
     }
 }
 
@@ -102,10 +98,13 @@ fn current_launch_id() -> Result<String> {
 
 fn launch_id_from_cgroup_line(line: &str) -> Option<String> {
     let path = line.rsplit_once(':').map_or(line, |(_, path)| path);
-    let start = path.find(SCOPE_PREFIX)? + SCOPE_PREFIX.len();
-    let rest = &path[start..];
-    let end = rest.find(".scope")?;
-    Some(rest[..end].to_string())
+    path.rsplit('/').find_map(|component| {
+        component
+            .strip_prefix(SCOPE_PREFIX)?
+            .strip_suffix(".scope")
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 fn record_path(id: &str) -> Result<PathBuf> {
@@ -126,11 +125,12 @@ pub fn os_args(args: &[OsString]) -> impl Iterator<Item = &OsStr> {
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    clippy::let_underscore_must_use,
-    reason = "unit tests use direct temp directory setup and best-effort cleanup"
+    reason = "launch-context unit tests require decoded fixtures before checking exact values"
 )]
 mod tests {
-    use super::{LaunchRecord, launch_id_from_cgroup_line};
+    use std::{ffi::OsString, path::PathBuf};
+
+    use super::{LaunchRecord, SCOPE_PREFIX, launch_id_from_cgroup_line};
 
     #[test]
     fn extracts_launch_id_from_systemd_scope_cgroup() {
@@ -138,6 +138,45 @@ mod tests {
         assert_eq!(
             launch_id_from_cgroup_line(line),
             Some("p123t456".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_scope_parser_preserves_unicode_id_and_surrounding_components() {
+        let id = "ascii-日本語-e\u{301}-👩🏽\u{200d}💻-🇳🇿";
+        let line = format!("0::/ユーザー.slice/проект.service/{SCOPE_PREFIX}{id}.scope");
+
+        assert_eq!(launch_id_from_cgroup_line(&line).as_deref(), Some(id));
+    }
+
+    #[test]
+    fn launch_scope_parser_requires_an_exact_nonempty_path_component() {
+        for malformed in [
+            "0::/manifold-launch-.scope",
+            "0::/manifold-launch-p123.scope.extra",
+            "0::/prefix-manifold-launch-p123.scope",
+            "0::/unrelated.scope",
+        ] {
+            assert_eq!(launch_id_from_cgroup_line(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn launch_scope_parser_accepts_a_bare_scope_path() {
+        assert_eq!(
+            launch_id_from_cgroup_line("/app.slice/manifold-launch-p123t456.scope"),
+            Some("p123t456".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_scope_parser_does_not_truncate_a_long_multibyte_identifier() {
+        let id = format!("p{}t{}", "日e\u{301}👩🏽\u{200d}💻🇳🇿".repeat(256), 456);
+        let line = format!("0::/app.slice/{SCOPE_PREFIX}{id}.scope");
+
+        assert_eq!(
+            launch_id_from_cgroup_line(&line).as_deref(),
+            Some(id.as_str())
         );
     }
 
@@ -157,5 +196,27 @@ mod tests {
 
         assert_eq!(record.id, "p123t456");
         assert_eq!(record.runner_cache_root, None);
+    }
+
+    #[test]
+    fn launch_record_round_trip_preserves_unicode_paths_and_argv() {
+        let record = LaunchRecord {
+            id: "p123t456".to_string(),
+            project_dir: PathBuf::from("/tmp/プロジェクト-👩🏽\u{200d}💻"),
+            working_dir: PathBuf::from("/tmp/e\u{301}tude-🇳🇿"),
+            cache_dir: PathBuf::from("/tmp/кэш-🧑🏽\u{200d}🚀"),
+            runner_cache_root: None,
+            runner_kind: "proof".to_string(),
+            program_argv: vec![OsString::from("参数-e\u{301}-👍🏽-🇯🇵")],
+            session_args: None,
+        };
+
+        let encoded = serde_json::to_vec(&record).expect("encode launch record");
+        let decoded: LaunchRecord = serde_json::from_slice(&encoded).expect("decode launch record");
+
+        assert_eq!(decoded.project_dir, record.project_dir);
+        assert_eq!(decoded.working_dir, record.working_dir);
+        assert_eq!(decoded.cache_dir, record.cache_dir);
+        assert_eq!(decoded.program_argv, record.program_argv);
     }
 }
