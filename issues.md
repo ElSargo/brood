@@ -4,14 +4,6 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Session bus routing
-
-- `crates/manifoldd/src/session_bus.rs`: the in-process DBus router operates on
-  raw message bytes, manual owner maps, and callback tuples. That drives
-  `type_complexity`, `unreachable`, pass-by-value, ignored-send-result, and
-  indexing warnings. A proper fix should model session bus messages, owners, and
-  notification forwarding as typed state transitions.
-
 ## WASM invocation and harness lifecycle
 
 - `crates/manifoldd/src/wasm_key.rs`: key-handler calls pass event context as
@@ -28,6 +20,19 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Session-local DBus routing now separates the audited bounded-wire layer from
+  a typed `BusRouter`. Connection allocation, unique and well-known ownership,
+  replacement flags, release, disconnect cleanup, route decisions, delivery
+  failures, notification proxy results, and matching notification signals are
+  explicit fallible transitions; built-in daemon and notification owners have
+  stable unique identities and rejected requests leave owner tables unchanged.
+  The real proof in `tools/test-typed-session-bus-nested.sh` renders the GTK
+  session switcher with two live realms, observes different ordinary
+  `DBUS_SESSION_BUS_ADDRESS` sockets and owner visibility, and drives four real
+  Python DBus clients through introspection, a property round trip, methods,
+  replies, and two signal hops. The last client sends a substantive
+  notification over its managed session bus, and the transcript records the
+  real notification ID returned by the host desktop service.
 - Unsafe renderer, SHM, DBus-wire, and calloop access now sits behind narrow
   audited helpers with typed owners and documented lifetime, alignment, and
   validity invariants. Winit/EGL/GBM/Wayland handles cannot escape the presenter

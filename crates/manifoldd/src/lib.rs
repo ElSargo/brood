@@ -20,6 +20,7 @@ mod plugin_runtime;
 mod presentation;
 mod runtime;
 mod session_bus;
+mod session_bus_state;
 mod session_runner;
 pub(crate) mod state;
 pub(crate) mod state_services;

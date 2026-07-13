@@ -181,11 +181,17 @@ class SignalBridge:
         )
 
     def send_notification(self, token, value, detail):
-        if not self.host_bus_address:
-            raise RuntimeError("host DBus address is required for the notification hop")
-        host_bus = dbus.bus.BusConnection(self.host_bus_address)
+        # In a managed Manifold client the ordinary session bus is the realm
+        # bus. Its typed notification transition proxies this call to the host
+        # desktop and returns the host service's real notification id. The
+        # explicit address remains available for the older standalone smoke.
+        notification_bus = (
+            dbus.bus.BusConnection(self.host_bus_address)
+            if self.host_bus_address
+            else self.bus
+        )
         notifications = dbus.Interface(
-            host_bus.get_object(NOTIFICATIONS, "/org/freedesktop/Notifications"),
+            notification_bus.get_object(NOTIFICATIONS, "/org/freedesktop/Notifications"),
             NOTIFICATIONS,
         )
         return int(

@@ -1,19 +1,5 @@
-#![allow(
-    clippy::allow_attributes_without_reason,
-    clippy::branches_sharing_code,
-    clippy::cast_possible_truncation,
-    clippy::let_underscore_must_use,
-    clippy::needless_pass_by_ref_mut,
-    clippy::needless_pass_by_value,
-    clippy::option_if_let_else,
-    clippy::type_complexity,
-    clippy::unreachable,
-    reason = "tracked in issues.md: session bus routing ownership and transition typing remain separate design work"
-)]
-// TODO(lint-structure): replace the ad hoc DBus router ownership with typed session abstractions.
-
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -25,6 +11,11 @@ use std::{
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
+};
+
+use crate::session_bus_state::{
+    BusRouter, ConnectionId, MessageClass, NameOwnerChange, NotificationForwardDecision,
+    NotificationProxyTransition, NotificationSignal, RouteDecision, route_notification_signal,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -40,11 +31,11 @@ use zbus::{
     },
 };
 
-const DBUS_DESTINATION: &str = "org.freedesktop.DBus";
+pub const DBUS_DESTINATION: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
-const NOTIFICATIONS_DESTINATION: &str = "org.freedesktop.Notifications";
-const NOTIFICATIONS_UNIQUE_NAME: &str = ":1.999999";
+pub const NOTIFICATIONS_DESTINATION: &str = "org.freedesktop.Notifications";
+pub const NOTIFICATIONS_UNIQUE_NAME: &str = ":1.999999";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
 const DBUS_PRIMARY_HEADER_LEN: usize = 16;
@@ -98,7 +89,7 @@ const NOTIFICATIONS_INTROSPECTION_XML: &str = r#"<node>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionBusRealm {
     Surface(u64),
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "reserved for non-surface managed realms")]
     Headless(u64),
 }
 
@@ -125,7 +116,7 @@ impl SessionBusHandle {
         let thread_state = Arc::clone(&state);
         let thread = thread::Builder::new()
             .name(format!("manifold-dbus-{}", realm.label()))
-            .spawn(move || accept_loop(listener, thread_state, thread_stop))
+            .spawn(move || accept_loop(&listener, &thread_state, &thread_stop))
             .context("spawn in-process DBus realm thread")?;
 
         Ok(Self {
@@ -155,7 +146,7 @@ impl SessionBusHandle {
         let task_state = Arc::clone(&state);
         let task_runtime = runtime.clone();
         let task = runtime.spawn_blocking(move || {
-            accept_loop_on_runtime(listener, task_state, task_stop, task_runtime);
+            accept_loop_on_runtime(&listener, &task_state, &task_stop, &task_runtime);
         });
 
         Ok(Self {
@@ -174,7 +165,11 @@ impl SessionBusHandle {
             std::process::id(),
             realm.label()
         ));
-        let _ = fs::remove_dir_all(&dir);
+        if let Err(error) = fs::remove_dir_all(&dir)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| format!("remove stale {}", dir.display()));
+        }
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let socket_path = dir.join("bus");
         let listener = UnixListener::bind(&socket_path)
@@ -206,14 +201,22 @@ impl SessionBusHandle {
 impl Drop for SessionBusHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = UnixStream::connect(&self.socket_path);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Err(error) = UnixStream::connect(&self.socket_path) {
+            debug!(?error, path = %self.socket_path.display(), "session bus stop wakeup failed");
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            warn!("in-process DBus realm thread panicked during shutdown");
         }
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        let _ = fs::remove_dir_all(&self.dir);
+        if let Err(error) = fs::remove_dir_all(&self.dir)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            warn!(?error, path = %self.dir.display(), "remove session bus directory failed");
+        }
     }
 }
 
@@ -230,9 +233,7 @@ struct RealmState {
     realm: SessionBusRealm,
     guid: String,
     host_bus_address: Option<String>,
-    next_connection: u64,
-    connections: BTreeMap<u64, ConnectionState>,
-    names: BTreeMap<String, u64>,
+    router: BusRouter,
 }
 
 impl RealmState {
@@ -240,85 +241,27 @@ impl RealmState {
         Self {
             realm,
             guid,
+            router: BusRouter::new(host_bus_address.is_some()),
             host_bus_address,
-            next_connection: 1,
-            connections: BTreeMap::new(),
-            names: BTreeMap::new(),
-        }
-    }
-
-    fn insert_connection(&mut self, tx: mpsc::Sender<Vec<u8>>) -> u64 {
-        let id = self.next_connection;
-        self.next_connection += 1;
-        self.connections.insert(
-            id,
-            ConnectionState {
-                unique_name: None,
-                owned_names: BTreeSet::new(),
-                tx,
-            },
-        );
-        id
-    }
-
-    fn unique_name(&mut self, connection_id: u64) -> String {
-        let name = format!(":1.{connection_id}");
-        if let Some(connection) = self.connections.get_mut(&connection_id)
-            && connection.unique_name.is_none()
-        {
-            connection.unique_name = Some(name.clone());
-            self.names.insert(name.clone(), connection_id);
-        }
-        name
-    }
-
-    fn name_owner(&self, name: &str) -> Option<u64> {
-        if name == DBUS_DESTINATION {
-            return Some(0);
-        }
-        if matches!(name, NOTIFICATIONS_DESTINATION | NOTIFICATIONS_UNIQUE_NAME)
-            && self.host_bus_address.is_some()
-        {
-            return Some(0);
-        }
-        if let Some(stripped) = name.strip_prefix(':') {
-            let _ = stripped;
-            self.names.get(name).copied()
-        } else {
-            self.names.get(name).copied()
-        }
-    }
-
-    fn remove_connection(&mut self, connection_id: u64) {
-        if let Some(connection) = self.connections.remove(&connection_id) {
-            if let Some(unique) = connection.unique_name {
-                self.names.remove(&unique);
-            }
-            for name in connection.owned_names {
-                self.names.remove(&name);
-            }
         }
     }
 }
 
-struct ConnectionState {
-    unique_name: Option<String>,
-    owned_names: BTreeSet<String>,
-    tx: mpsc::Sender<Vec<u8>>,
-}
-
-fn accept_loop(listener: UnixListener, state: Arc<Mutex<RealmState>>, stop: Arc<AtomicBool>) {
+fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<RealmState>>, stop: &Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let connection_state = Arc::clone(&state);
-                let _ = thread::Builder::new()
+                let connection_state = Arc::clone(state);
+                match thread::Builder::new()
                     .name("manifold-dbus-client".to_string())
                     .spawn(move || {
-                        if let Err(err) = handle_connection(stream, connection_state) {
+                        if let Err(err) = handle_connection(stream, &connection_state) {
                             debug!(?err, "in-process DBus client disconnected");
                         }
-                    });
+                    }) {
+                    Ok(handle) => drop(handle),
+                    Err(error) => warn!(?error, "spawn in-process DBus client failed"),
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(std::time::Duration::from_millis(10));
@@ -332,17 +275,17 @@ fn accept_loop(listener: UnixListener, state: Arc<Mutex<RealmState>>, stop: Arc<
 }
 
 fn accept_loop_on_runtime(
-    listener: UnixListener,
-    state: Arc<Mutex<RealmState>>,
-    stop: Arc<AtomicBool>,
-    runtime: TokioHandle,
+    listener: &UnixListener,
+    state: &Arc<Mutex<RealmState>>,
+    stop: &Arc<AtomicBool>,
+    runtime: &TokioHandle,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let connection_state = Arc::clone(&state);
+                let connection_state = Arc::clone(state);
                 let task = runtime.spawn_blocking(move || {
-                    if let Err(err) = handle_connection(stream, connection_state) {
+                    if let Err(err) = handle_connection(stream, &connection_state) {
                         debug!(?err, "in-process DBus client disconnected");
                     }
                 });
@@ -359,7 +302,7 @@ fn accept_loop_on_runtime(
     }
 }
 
-fn handle_connection(stream: UnixStream, state: Arc<Mutex<RealmState>>) -> Result<()> {
+fn handle_connection(stream: UnixStream, state: &Arc<Mutex<RealmState>>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("clone DBus client stream")?);
     let guid = state
         .lock()
@@ -372,7 +315,8 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<RealmState>>) -> Resul
     let connection_id = state
         .lock()
         .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
-        .insert_connection(tx);
+        .router
+        .connect(tx)?;
 
     let mut writer = stream.try_clone().context("clone DBus writer stream")?;
     let writer_thread = thread::Builder::new()
@@ -386,14 +330,28 @@ fn handle_connection(stream: UnixStream, state: Arc<Mutex<RealmState>>) -> Resul
         })
         .context("spawn DBus writer")?;
 
-    let result = read_messages(&mut reader, connection_id, Arc::clone(&state));
-    state
-        .lock()
-        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
-        .remove_connection(connection_id);
+    let result = read_messages(&mut reader, connection_id, state);
+    let cleanup = disconnect_connection(connection_id, state);
     drop(stream);
-    let _ = writer_thread.join();
-    result
+    writer_thread
+        .join()
+        .map_err(|_panic_payload| anyhow!("DBus writer thread panicked"))?;
+    result.and(cleanup)
+}
+
+fn disconnect_connection(
+    connection_id: ConnectionId,
+    state: &Arc<Mutex<RealmState>>,
+) -> Result<()> {
+    let mut state = state
+        .lock()
+        .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
+    let transition = state.router.disconnect(connection_id)?;
+    for owner_change in transition.owner_changes {
+        emit_name_owner_changed(&state, &owner_change)?;
+    }
+    drop(state);
+    Ok(())
 }
 
 fn authenticate(reader: &mut BufReader<UnixStream>, guid: &str) -> Result<()> {
@@ -461,13 +419,13 @@ fn authenticate(reader: &mut BufReader<UnixStream>, guid: &str) -> Result<()> {
 
 fn read_messages(
     reader: &mut BufReader<UnixStream>,
-    connection_id: u64,
-    state: Arc<Mutex<RealmState>>,
+    connection_id: ConnectionId,
+    state: &Arc<Mutex<RealmState>>,
 ) -> Result<()> {
     loop {
         let bytes = read_message_bytes(reader)?;
         let message = parse_message(bytes.clone()).context("parse DBus message")?;
-        route_message(connection_id, message, bytes, Arc::clone(&state))?;
+        route_message(connection_id, &message, bytes, state)?;
     }
 }
 
@@ -510,7 +468,7 @@ impl DbusFrameHeader {
             Some(b'l') => Endian::Little,
             Some(b'B') => Endian::Big,
             Some(other) => return Err(anyhow!("unsupported DBus endian marker {other}")),
-            None => unreachable!("fixed-size primary header is non-empty"),
+            None => return Err(anyhow!("missing DBus endian marker")),
         };
         let body_len = usize::try_from(read_u32(
             primary
@@ -550,10 +508,10 @@ impl DbusFrameHeader {
 }
 
 fn route_message(
-    connection_id: u64,
-    message: Message,
+    connection_id: ConnectionId,
+    message: &Message,
     original_bytes: Vec<u8>,
-    state: Arc<Mutex<RealmState>>,
+    state: &Arc<Mutex<RealmState>>,
 ) -> Result<()> {
     let header = message.header();
     let destination = header.destination().map(ToString::to_string);
@@ -566,7 +524,7 @@ fn route_message(
         && path.as_deref() == Some(DBUS_PATH)
         && interface.as_deref() == Some(DBUS_INTERFACE)
     {
-        return handle_dbus_method(connection_id, &message, member.as_deref(), state);
+        return handle_dbus_method(connection_id, message, member.as_deref(), state);
     }
 
     if header.message_type() == Type::MethodCall
@@ -577,130 +535,112 @@ fn route_message(
             Some(NOTIFICATIONS_INTERFACE | INTROSPECTABLE_INTERFACE)
         )
     {
-        return handle_notifications_method(connection_id, &message, member.as_deref(), state);
+        return handle_notifications_method(connection_id, message, member.as_deref(), state);
     }
 
-    let unique = ensure_unique(connection_id, &state)?;
+    let unique = ensure_unique(connection_id, state)?;
     let outbound = match header.message_type() {
-        Type::MethodCall => inject_sender(&message, &unique)?,
-        Type::Signal => inject_signal_sender(&message, &unique)?,
+        Type::MethodCall => inject_sender(message, &unique)?,
+        Type::Signal => inject_signal_sender(message, &unique)?,
         Type::MethodReturn | Type::Error => original_bytes,
     };
 
-    let mut state = state
+    let state = state
         .lock()
         .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
-    if let Some(destination) = destination
-        && let Some(owner) = state.name_owner(&destination)
-        && owner != connection_id
+    let class = match header.message_type() {
+        Type::MethodCall => MessageClass::MethodCall,
+        Type::MethodReturn => MessageClass::MethodReturn,
+        Type::Error => MessageClass::Error,
+        Type::Signal => MessageClass::Signal,
+    };
+    match state
+        .router
+        .route(connection_id, class, destination.as_deref())?
     {
-        send_to(&mut state, owner, outbound);
-        return Ok(());
-    }
-
-    if header.message_type() == Type::Signal {
-        for (&id, connection) in &state.connections {
-            if id != connection_id {
-                let _ = connection.tx.send(outbound.clone());
+        RouteDecision::Unicast(recipient) => state.router.deliver(recipient, outbound)?,
+        RouteDecision::Broadcast(recipients) => {
+            for recipient in recipients {
+                state.router.deliver(recipient, outbound.clone())?;
             }
         }
-    } else if header.message_type() == Type::MethodCall {
-        send_error(
-            &mut state,
+        RouteDecision::UnknownDestination => send_error(
+            &state,
             connection_id,
-            &message,
+            message,
             "org.freedesktop.DBus.Error.ServiceUnknown",
             "destination has no owner",
-        )?;
+        )?,
+        RouteDecision::Drop => {}
     }
+    drop(state);
     Ok(())
 }
 
 fn handle_dbus_method(
-    connection_id: u64,
+    connection_id: ConnectionId,
     message: &Message,
     member: Option<&str>,
-    state: Arc<Mutex<RealmState>>,
+    state: &Arc<Mutex<RealmState>>,
 ) -> Result<()> {
     let mut state = state
         .lock()
         .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
     match member {
         Some("Hello") => {
-            let name = state.unique_name(connection_id);
-            send_reply(&mut state, connection_id, message, &(name,))?;
+            let name = state.router.ensure_unique(connection_id)?;
+            send_reply(&state, connection_id, message, &(name.as_str(),))?;
         }
         Some("RequestName") => {
-            let owner_unique = state.unique_name(connection_id);
-            let (name, _flags): (String, u32) = message.body().deserialize()?;
-            if valid_well_known_name(&name) {
-                if let Some(existing) = state.names.get(&name).copied()
-                    && existing != connection_id
-                {
-                    send_reply(&mut state, connection_id, message, &(3u32,))?;
-                    return Ok(());
+            let (name, flags): (String, u32) = message.body().deserialize()?;
+            match state.router.request_name(connection_id, name, flags) {
+                Ok(transition) => {
+                    send_reply(
+                        &state,
+                        connection_id,
+                        message,
+                        &(transition.outcome.reply_code(),),
+                    )?;
+                    if let Some(owner_change) = transition.owner_change {
+                        emit_name_owner_changed(&state, &owner_change)?;
+                    }
                 }
-                state.names.insert(name.clone(), connection_id);
-                if let Some(connection) = state.connections.get_mut(&connection_id) {
-                    connection.owned_names.insert(name.clone());
+                Err(error) => {
+                    send_error(
+                        &state,
+                        connection_id,
+                        message,
+                        "org.freedesktop.DBus.Error.InvalidArgs",
+                        &error.to_string(),
+                    )?;
                 }
-                send_reply(&mut state, connection_id, message, &(1u32,))?;
-                emit_name_owner_changed(&mut state, &name, "", &owner_unique)?;
-            } else {
-                send_error(
-                    &mut state,
-                    connection_id,
-                    message,
-                    "org.freedesktop.DBus.Error.InvalidArgs",
-                    "invalid bus name",
-                )?;
             }
         }
         Some("ReleaseName") => {
             let (name,): (String,) = message.body().deserialize()?;
-            let old_owner = state
-                .connections
-                .get(&connection_id)
-                .and_then(|connection| connection.unique_name.clone())
-                .unwrap_or_default();
-            let released = if state.names.get(&name) == Some(&connection_id) {
-                state.names.remove(&name);
-                if let Some(connection) = state.connections.get_mut(&connection_id) {
-                    connection.owned_names.remove(&name);
-                }
-                1u32
-            } else {
-                2u32
-            };
-            send_reply(&mut state, connection_id, message, &(released,))?;
-            if released == 1 {
-                emit_name_owner_changed(&mut state, &name, &old_owner, "")?;
+            let transition = state.router.release_name(connection_id, &name)?;
+            send_reply(
+                &state,
+                connection_id,
+                message,
+                &(transition.outcome.reply_code(),),
+            )?;
+            if let Some(owner_change) = transition.owner_change {
+                emit_name_owner_changed(&state, &owner_change)?;
             }
         }
         Some("NameHasOwner") => {
             let (name,): (String,) = message.body().deserialize()?;
-            let has_owner = state.name_owner(&name).is_some();
-            send_reply(&mut state, connection_id, message, &(has_owner,))?;
+            let has_owner = state.router.name_owner(&name).is_some();
+            send_reply(&state, connection_id, message, &(has_owner,))?;
         }
         Some("GetNameOwner") => {
             let (name,): (String,) = message.body().deserialize()?;
-            if name == NOTIFICATIONS_DESTINATION && state.host_bus_address.is_some() {
-                send_reply(
-                    &mut state,
-                    connection_id,
-                    message,
-                    &(NOTIFICATIONS_UNIQUE_NAME,),
-                )?;
-            } else if let Some(owner) = state.name_owner(&name) {
-                let owner_name = state
-                    .connections
-                    .get(&owner)
-                    .and_then(|connection| connection.unique_name.clone())
-                    .unwrap_or_else(|| format!(":1.{owner}"));
-                send_reply(&mut state, connection_id, message, &(owner_name,))?;
+            if let Some(owner_name) = state.router.owner_unique_name(&name) {
+                send_reply(&state, connection_id, message, &(owner_name,))?;
             } else {
                 send_error(
-                    &mut state,
+                    &state,
                     connection_id,
                     message,
                     "org.freedesktop.DBus.Error.NameHasNoOwner",
@@ -711,10 +651,10 @@ fn handle_dbus_method(
         Some("StartServiceByName") => {
             let (name, _flags): (String, u32) = message.body().deserialize()?;
             if name == NOTIFICATIONS_DESTINATION && state.host_bus_address.is_some() {
-                send_reply(&mut state, connection_id, message, &(2u32,))?;
+                send_reply(&state, connection_id, message, &(2u32,))?;
             } else {
                 send_error(
-                    &mut state,
+                    &state,
                     connection_id,
                     message,
                     "org.freedesktop.DBus.Error.ServiceUnknown",
@@ -723,20 +663,15 @@ fn handle_dbus_method(
             }
         }
         Some("ListNames") => {
-            let mut names = vec![DBUS_DESTINATION.to_string()];
-            if state.host_bus_address.is_some() {
-                names.push(NOTIFICATIONS_DESTINATION.to_string());
-                names.push(NOTIFICATIONS_UNIQUE_NAME.to_string());
-            }
-            names.extend(state.names.keys().cloned());
-            send_reply(&mut state, connection_id, message, &(names,))?;
+            let names = state.router.list_names();
+            send_reply(&state, connection_id, message, &(names,))?;
         }
         Some("AddMatch" | "RemoveMatch") => {
-            send_reply(&mut state, connection_id, message, &())?;
+            send_reply(&state, connection_id, message, &())?;
         }
         Some("GetId") => {
             let guid = state.guid.clone();
-            send_reply(&mut state, connection_id, message, &(guid,))?;
+            send_reply(&state, connection_id, message, &(guid,))?;
         }
         Some(other) => {
             warn!(
@@ -745,7 +680,7 @@ fn handle_dbus_method(
                 "unsupported in-process DBus daemon method"
             );
             send_error(
-                &mut state,
+                &state,
                 connection_id,
                 message,
                 "org.freedesktop.DBus.Error.UnknownMethod",
@@ -754,7 +689,7 @@ fn handle_dbus_method(
         }
         None => {
             send_error(
-                &mut state,
+                &state,
                 connection_id,
                 message,
                 "org.freedesktop.DBus.Error.UnknownMethod",
@@ -773,11 +708,22 @@ enum NotificationMethodReply {
     NotificationId(u32),
 }
 
+type HostNotifyArguments = (
+    String,
+    u32,
+    String,
+    String,
+    String,
+    Vec<String>,
+    BTreeMap<String, OwnedValue>,
+    i32,
+);
+
 fn handle_notifications_method(
-    connection_id: u64,
+    connection_id: ConnectionId,
     message: &Message,
     member: Option<&str>,
-    state: Arc<Mutex<RealmState>>,
+    state: &Arc<Mutex<RealmState>>,
 ) -> Result<()> {
     let host_bus_address = state
         .lock()
@@ -785,11 +731,11 @@ fn handle_notifications_method(
         .host_bus_address
         .clone();
     let Some(host_bus_address) = host_bus_address else {
-        let mut state = state
+        let state = state
             .lock()
             .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
         return send_error(
-            &mut state,
+            &state,
             connection_id,
             message,
             "org.freedesktop.DBus.Error.ServiceUnknown",
@@ -797,79 +743,80 @@ fn handle_notifications_method(
         );
     };
 
-    let reply = match call_host_notifications_method(&host_bus_address, message, member) {
-        Ok(reply) => reply,
-        Err(err) => {
+    let reply = match NotificationProxyTransition::from_result(call_host_notifications_method(
+        &host_bus_address,
+        message,
+        member,
+    )) {
+        NotificationProxyTransition::Succeeded(reply) => reply,
+        NotificationProxyTransition::Failed(error) => {
             warn!(
-                ?err,
+                %error,
                 ?member,
                 "failed to proxy notification method to host session bus"
             );
-            let mut state = state
+            let state = state
                 .lock()
                 .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
             return send_error(
-                &mut state,
+                &state,
                 connection_id,
                 message,
                 "org.freedesktop.DBus.Error.Failed",
-                &err.to_string(),
+                &error,
             );
         }
     };
 
-    if let NotificationMethodReply::NotificationId(notification_id) = reply {
-        spawn_notification_signal_forwarder(
-            host_bus_address,
-            Arc::clone(&state),
-            connection_id,
-            notification_id,
-        );
-        let mut state = state
-            .lock()
-            .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
-        return send_reply_from(
-            &mut state,
-            connection_id,
-            message,
-            NOTIFICATIONS_UNIQUE_NAME,
-            &(notification_id,),
-        );
-    }
-
-    let mut state = state
+    let state_guard = state
         .lock()
         .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
     match reply {
         NotificationMethodReply::Unit => send_reply_from(
-            &mut state,
+            &state_guard,
             connection_id,
             message,
             NOTIFICATIONS_UNIQUE_NAME,
             &(),
         ),
         NotificationMethodReply::Capabilities(capabilities) => send_reply_from(
-            &mut state,
+            &state_guard,
             connection_id,
             message,
             NOTIFICATIONS_UNIQUE_NAME,
             &(capabilities,),
         ),
         NotificationMethodReply::Introspection(xml) => send_reply_from(
-            &mut state,
+            &state_guard,
             connection_id,
             message,
             NOTIFICATIONS_UNIQUE_NAME,
             &(xml,),
         ),
         NotificationMethodReply::ServerInformation(info) => send_reply_from(
-            &mut state,
+            &state_guard,
             connection_id,
             message,
             NOTIFICATIONS_UNIQUE_NAME,
             &info,
         ),
-        NotificationMethodReply::NotificationId(_) => unreachable!(),
+        NotificationMethodReply::NotificationId(notification_id) => {
+            send_reply_from(
+                &state_guard,
+                connection_id,
+                message,
+                NOTIFICATIONS_UNIQUE_NAME,
+                &(notification_id,),
+            )?;
+            drop(state_guard);
+            spawn_notification_signal_forwarder(
+                host_bus_address,
+                Arc::clone(state),
+                connection_id,
+                notification_id,
+            );
+            Ok(())
+        }
     }
 }
 
@@ -913,16 +860,8 @@ fn call_host_notifications_method(
             Ok(NotificationMethodReply::Unit)
         }
         Some("Notify") => {
-            let (app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout): (
-                String,
-                u32,
-                String,
-                String,
-                String,
-                Vec<String>,
-                BTreeMap<String, OwnedValue>,
-                i32,
-            ) = message.body().deserialize()?;
+            let (app_name, replaces_id, app_icon, summary, body, actions, hints, expire_timeout):
+                HostNotifyArguments = message.body().deserialize()?;
             let notification_id: u32 = proxy
                 .call(
                     "Notify",
@@ -955,7 +894,7 @@ fn is_notifications_destination(destination: Option<&str>) -> bool {
 fn spawn_notification_signal_forwarder(
     host_bus_address: String,
     state: Arc<Mutex<RealmState>>,
-    connection_id: u64,
+    connection_id: ConnectionId,
     notification_id: u32,
 ) {
     let result = thread::Builder::new()
@@ -963,7 +902,7 @@ fn spawn_notification_signal_forwarder(
         .spawn(move || {
             if let Err(err) = forward_notification_signals(
                 &host_bus_address,
-                state,
+                &state,
                 connection_id,
                 notification_id,
             ) {
@@ -983,8 +922,8 @@ fn spawn_notification_signal_forwarder(
 
 fn forward_notification_signals(
     host_bus_address: &str,
-    state: Arc<Mutex<RealmState>>,
-    connection_id: u64,
+    state: &Arc<Mutex<RealmState>>,
+    connection_id: ConnectionId,
     notification_id: u32,
 ) -> Result<()> {
     let connection = ConnectionBuilder::address(host_bus_address)?
@@ -1003,82 +942,79 @@ fn forward_notification_signals(
 
     for signal in &mut signals {
         let member = signal.header().member().map(ToString::to_string);
-        match member.as_deref() {
+        let notification_signal = match member.as_deref() {
             Some("ActionInvoked") => {
                 let (id, action_key): (u32, String) = signal.body().deserialize()?;
-                if id == notification_id {
-                    send_notification_signal(
-                        &state,
-                        connection_id,
-                        "ActionInvoked",
-                        &(id, action_key),
-                    )?;
-                }
+                Some(NotificationSignal::ActionInvoked { id, action_key })
             }
             Some("ActivationToken") => {
-                let (id, activation_token): (u32, String) = signal.body().deserialize()?;
-                if id == notification_id {
-                    send_notification_signal(
-                        &state,
-                        connection_id,
-                        "ActivationToken",
-                        &(id, activation_token),
-                    )?;
-                }
+                let (id, token): (u32, String) = signal.body().deserialize()?;
+                Some(NotificationSignal::ActivationToken { id, token })
             }
             Some("NotificationClosed") => {
                 let (id, reason): (u32, u32) = signal.body().deserialize()?;
-                if id == notification_id {
-                    send_notification_signal(
-                        &state,
-                        connection_id,
-                        "NotificationClosed",
-                        &(id, reason),
-                    )?;
-                    return Ok(());
-                }
+                Some(NotificationSignal::Closed { id, reason })
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(notification_signal) = notification_signal
+            && let NotificationForwardDecision::Deliver(notification_signal) =
+                route_notification_signal(notification_id, notification_signal)
+        {
+            let closes_forwarder = notification_signal.closes_forwarder();
+            send_notification_signal(state, connection_id, &notification_signal)?;
+            if closes_forwarder {
+                return Ok(());
+            }
         }
     }
     Ok(())
 }
 
-fn send_notification_signal<B>(
+fn send_notification_signal(
     state: &Arc<Mutex<RealmState>>,
-    connection_id: u64,
-    member: &str,
-    body: &B,
-) -> Result<()>
-where
-    B: serde::Serialize + zbus::zvariant::DynamicType,
-{
-    let signal = Message::signal(NOTIFICATIONS_PATH, NOTIFICATIONS_INTERFACE, member)?
-        .sender(NOTIFICATIONS_UNIQUE_NAME)?
-        .build(body)?;
-    let mut state = state
+    connection_id: ConnectionId,
+    notification: &NotificationSignal,
+) -> Result<()> {
+    let builder = Message::signal(
+        NOTIFICATIONS_PATH,
+        NOTIFICATIONS_INTERFACE,
+        match notification {
+            NotificationSignal::ActionInvoked { .. } => "ActionInvoked",
+            NotificationSignal::ActivationToken { .. } => "ActivationToken",
+            NotificationSignal::Closed { .. } => "NotificationClosed",
+        },
+    )?
+    .sender(NOTIFICATIONS_UNIQUE_NAME)?;
+    let signal = match notification {
+        NotificationSignal::ActionInvoked { id, action_key } => {
+            builder.build(&(*id, action_key.as_str()))?
+        }
+        NotificationSignal::ActivationToken { id, token } => {
+            builder.build(&(*id, token.as_str()))?
+        }
+        NotificationSignal::Closed { id, reason } => builder.build(&(*id, *reason))?,
+    };
+    let state = state
         .lock()
         .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?;
-    send_to(&mut state, connection_id, signal.data().to_vec());
-    Ok(())
+    state.router.deliver(connection_id, signal.data().to_vec())
 }
 
-fn emit_name_owner_changed(
-    state: &mut RealmState,
-    name: &str,
-    old_owner: &str,
-    new_owner: &str,
-) -> Result<()> {
+fn emit_name_owner_changed(state: &RealmState, change: &NameOwnerChange) -> Result<()> {
     let signal = Message::signal(DBUS_PATH, DBUS_INTERFACE, "NameOwnerChanged")?
         .sender(":1.0")?
-        .build(&(name, old_owner, new_owner))?;
-    broadcast(state, signal.data().to_vec(), None);
-    Ok(())
+        .build(&(
+            change.name.as_str(),
+            change.old_owner.as_str(),
+            change.new_owner.as_str(),
+        ))?;
+    state.router.broadcast(signal.data(), None)
 }
 
 fn send_reply<B>(
-    state: &mut RealmState,
-    connection_id: u64,
+    state: &RealmState,
+    connection_id: ConnectionId,
     message: &Message,
     body: &B,
 ) -> Result<()>
@@ -1089,8 +1025,8 @@ where
 }
 
 fn send_reply_from<B>(
-    state: &mut RealmState,
-    connection_id: u64,
+    state: &RealmState,
+    connection_id: ConnectionId,
     message: &Message,
     sender: &str,
     body: &B,
@@ -1101,13 +1037,12 @@ where
     let reply = Message::method_return(&message.header())?
         .sender(sender)?
         .build(body)?;
-    send_to(state, connection_id, reply.data().to_vec());
-    Ok(())
+    state.router.deliver(connection_id, reply.data().to_vec())
 }
 
 fn send_error(
-    state: &mut RealmState,
-    connection_id: u64,
+    state: &RealmState,
+    connection_id: ConnectionId,
     message: &Message,
     name: &str,
     text: &str,
@@ -1115,29 +1050,17 @@ fn send_error(
     let reply = Message::error(&message.header(), name)?
         .sender(":1.0")?
         .build(&(text,))?;
-    send_to(state, connection_id, reply.data().to_vec());
-    Ok(())
+    state.router.deliver(connection_id, reply.data().to_vec())
 }
 
-fn send_to(state: &mut RealmState, connection_id: u64, bytes: Vec<u8>) {
-    if let Some(connection) = state.connections.get(&connection_id) {
-        let _ = connection.tx.send(bytes);
-    }
-}
-
-fn broadcast(state: &mut RealmState, bytes: Vec<u8>, except: Option<u64>) {
-    for (&id, connection) in &state.connections {
-        if Some(id) != except {
-            let _ = connection.tx.send(bytes.clone());
-        }
-    }
-}
-
-fn ensure_unique(connection_id: u64, state: &Arc<Mutex<RealmState>>) -> Result<String> {
+fn ensure_unique(connection_id: ConnectionId, state: &Arc<Mutex<RealmState>>) -> Result<String> {
     Ok(state
         .lock()
         .map_err(|err| anyhow!("DBus realm state poisoned: {err}"))?
-        .unique_name(connection_id))
+        .router
+        .ensure_unique(connection_id)?
+        .as_str()
+        .to_string())
 }
 
 fn inject_sender(message: &Message, sender: &str) -> Result<Vec<u8>> {
@@ -1243,10 +1166,6 @@ const fn padding_for_8_bytes(len: usize) -> usize {
     (8 - (len % 8)) % 8
 }
 
-fn valid_well_known_name(name: &str) -> bool {
-    !name.starts_with(':') && name.contains('.') && !name.is_empty()
-}
-
 fn make_guid(realm: SessionBusRealm) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1255,11 +1174,13 @@ fn make_guid(realm: SessionBusRealm) -> String {
     let realm_id = match realm {
         SessionBusRealm::Surface(id) | SessionBusRealm::Headless(id) => id,
     };
+    let now_low = u64::try_from(now & u128::from(u64::MAX)).unwrap_or_default();
+    let realm_low = u32::try_from(realm_id % (u64::from(u32::MAX) + 1)).unwrap_or_default();
     format!(
         "{:016x}{:08x}{:08x}",
-        now as u64,
+        now_low,
         std::process::id(),
-        realm_id as u32
+        realm_low
     )
 }
 
@@ -1396,7 +1317,11 @@ mod tests {
     #[test]
     fn wire_reader_rejects_short_and_oversized_frames_before_allocation() {
         assert!(read_message_bytes(&mut Cursor::new([b'l'; 8])).is_err());
-        let oversized = primary_header(b'l', MAX_DBUS_FRAME_LEN as u32, 0);
+        let oversized = primary_header(
+            b'l',
+            u32::try_from(MAX_DBUS_FRAME_LEN).expect("frame ceiling fits u32"),
+            0,
+        );
         assert!(read_message_bytes(&mut Cursor::new(oversized)).is_err());
         let overflowing = primary_header(b'l', u32::MAX, u32::MAX);
         assert!(read_message_bytes(&mut Cursor::new(overflowing)).is_err());

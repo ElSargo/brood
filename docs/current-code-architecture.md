@@ -549,20 +549,31 @@ Important CLI flows:
 
 `session_bus.rs` implements a small in-process DBus broker. `Manifold::ensure_session_dbus_bus()` starts one bus per `SessionBusRealm::Surface(session_id)` and stores its `SessionBusHandle`. Hosted clients receive this bus as `DBUS_SESSION_BUS_ADDRESS`.
 
-The bus:
+The bus has two independent layers. The audited wire layer validates bounded
+frames and rewrites only bus-owned headers. A typed `BusRouter` owns the realm's
+connection lifecycle and name tables, returning explicit routing and delivery
+transitions rather than mutating maps from message handlers.
+
+The service layer:
 
 - binds a Unix socket under a temp dir,
 - implements enough DBus authentication for local clients (`EXTERNAL`/`ANONYMOUS`, no Unix FD passing),
 - assigns unique names like `:1.N`,
-- tracks requested well-known names,
+- models requested well-known names, replacement flags, release, and disconnect
+  cleanup as fallible owner transitions,
 - handles core methods such as `Hello`, `RequestName`, `ReleaseName`, `NameHasOwner`, `GetNameOwner`, `StartServiceByName`, `ListNames`, `AddMatch`, `RemoveMatch`, and `GetId`,
 - injects sender names into method calls/signals when routing between clients,
-- broadcasts signals,
+- distinguishes unicast replies/errors, targeted signals, and broadcasts,
 - returns service-unknown errors for unresolved method-call destinations.
 
-If a host bus address is available, the in-process bus presents a virtual owner for `org.freedesktop.Notifications`. Notification methods are proxied to the host notification service. For each proxied notification id, a forwarding thread listens for host `ActionInvoked`, `ActivationToken`, and `NotificationClosed` signals and sends matching signals back to the original session client.
+If a host bus address is available, the in-process bus presents explicit virtual
+owners for `org.freedesktop.Notifications` and its unique name. Notification
+proxy success/failure and `ActionInvoked`, `ActivationToken`, and
+`NotificationClosed` forwarding are typed transitions; only the originating
+notification id is delivered to its client, and delivery failures are reported.
 
-This is currently a focused, hand-written DBus router, not a full DBus broker.
+This is a focused local DBus router, not a full DBus broker. The target contract
+and real nested proof are documented in `docs/systems/dbus-control.md`.
 
 ## 14. Config and project session runner flow
 
