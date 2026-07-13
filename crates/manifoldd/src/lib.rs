@@ -342,7 +342,18 @@ struct CtlArgs {
     command: Vec<String>,
 }
 
-pub fn run_cli() -> Result<()> {
+/// The process-level result of executing one parsed CLI command.
+///
+/// Library command handlers return this value instead of terminating the
+/// caller. The `manifold` binary entrypoint is the only layer that translates
+/// it into an operating-system exit status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandOutcome {
+    Completed,
+    Exit(i32),
+}
+
+pub fn run_cli() -> Result<CommandOutcome> {
     fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
@@ -359,17 +370,29 @@ pub fn run_cli() -> Result<()> {
     match command {
         Command::Check => {
             println!("manifold: ok");
-            Ok(())
+            Ok(CommandOutcome::Completed)
         }
         Command::Enter(args) => control::enter(args).context("enter session environment"),
-        Command::Show(args) => control::show(args).context("show session environment"),
-        Command::Hide(args) => control::hide(args).context("hide session environment"),
-        Command::List(args) => control::list(args).context("list session environments"),
-        Command::Run(args) => compositor::run(args),
-        Command::Plug(args) => control::plug(args).context("plug WASM module"),
-        Command::Switch(args) => control::switch(args).context("switch session"),
-        Command::Test(args) => compositor::run_test(args),
-        Command::Ctl(args) => control::send(args).context("send control command"),
+        Command::Show(args) => control::show(args)
+            .context("show session environment")
+            .map(|()| CommandOutcome::Completed),
+        Command::Hide(args) => control::hide(args)
+            .context("hide session environment")
+            .map(|()| CommandOutcome::Completed),
+        Command::List(args) => control::list(args)
+            .context("list session environments")
+            .map(|()| CommandOutcome::Completed),
+        Command::Run(args) => compositor::run(args).map(|()| CommandOutcome::Completed),
+        Command::Plug(args) => control::plug(args)
+            .context("plug WASM module")
+            .map(|()| CommandOutcome::Completed),
+        Command::Switch(args) => control::switch(args)
+            .context("switch session")
+            .map(|()| CommandOutcome::Completed),
+        Command::Test(args) => compositor::run_test(args).map(|()| CommandOutcome::Completed),
+        Command::Ctl(args) => control::send(args)
+            .context("send control command")
+            .map(|()| CommandOutcome::Completed),
     }
 }
 

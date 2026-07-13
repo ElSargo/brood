@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Control and DBus API shape
 
-- `crates/manifoldd/src/control.rs`: `exit` in the command path shows that CLI
-  process policy is still mixed into control logic. A proper fix should return
-  typed exit outcomes from command execution and let the binary entrypoint exit.
 - `crates/manifoldd/src/bin/manifold-runner-nix-develop.rs`: the runner must
   preserve the activated child process exit status. A proper fix should move the
   binary entrypoint to an explicit exit-status return model instead of calling
@@ -76,6 +73,13 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Session command execution returns a typed `CommandOutcome` instead of
+  terminating from `control.rs`; only the `manifold` binary entrypoint maps an
+  explicit child code to its process exit status, while signal termination
+  remains a fallible control result. A plugin is not applicable to binary exit
+  policy, so the user-facing proof runs the real CLI in the built-in offscreen
+  nested harness: an entered command visibly prints its domain rejection and
+  exits 37, and the invoking shell observes `manifold enter` exit status 37.
 - Subprocess pipes, real PTYs, loopback sockets, and timers now share one
   bounded byte-stream and notification/pollable lifecycle owned by the actor
   generation. Component and Preview 1 guests use the same capability grants,

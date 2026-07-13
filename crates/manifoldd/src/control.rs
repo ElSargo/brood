@@ -1,5 +1,4 @@
 #![allow(
-    clippy::exit,
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::let_underscore_must_use,
@@ -10,7 +9,7 @@
     clippy::unnecessary_wraps,
     reason = "tracked in issues.md: control.rs preserves token-oriented command plumbing while DBus waits cross the compositor actor boundary"
 )]
-// TODO(lint-structure): separate DBus proxy ABI, CLI parsing, and process entrypoint policy.
+// TODO(lint-structure): separate the DBus proxy ABI from CLI command parsing.
 
 use std::{
     collections::BTreeMap,
@@ -43,9 +42,9 @@ use tracing::{info, warn};
 use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy};
 
 use crate::{
-    CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
-    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs, ShowArgs, ShowTarget,
-    SwitchArgs, browser,
+    CommandOutcome, CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs,
+    MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs,
+    ShowArgs, ShowTarget, SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     config,
     debug_dump::{self, DumpOptions},
@@ -1251,7 +1250,7 @@ pub fn plug(args: PlugArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn enter(args: EnterArgs) -> Result<()> {
+pub fn enter(args: EnterArgs) -> Result<CommandOutcome> {
     let already_entered = entered_session_marker().is_some();
     if already_entered && !args.new {
         bail!(
@@ -1349,8 +1348,12 @@ pub fn enter(args: EnterArgs) -> Result<()> {
         command.status().context("run entered command")?
     };
 
+    entered_command_outcome(status)
+}
+
+fn entered_command_outcome(status: std::process::ExitStatus) -> Result<CommandOutcome> {
     match status.code() {
-        Some(code) => std::process::exit(code),
+        Some(code) => Ok(CommandOutcome::Exit(code)),
         None => bail!("entered command terminated by signal"),
     }
 }
@@ -4330,6 +4333,28 @@ mod tests {
             windows: 0,
             working_directory: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entered_command_returns_its_exit_code_without_exiting_control_logic() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome =
+            super::entered_command_outcome(std::process::ExitStatus::from_raw(37 << 8)).unwrap();
+
+        assert_eq!(outcome, crate::CommandOutcome::Exit(37));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entered_command_reports_signal_termination_as_an_error() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let err =
+            super::entered_command_outcome(std::process::ExitStatus::from_raw(9)).unwrap_err();
+
+        assert_eq!(err.to_string(), "entered command terminated by signal");
     }
 
     #[test]
