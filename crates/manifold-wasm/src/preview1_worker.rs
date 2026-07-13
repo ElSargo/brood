@@ -138,6 +138,12 @@ pub struct Preview1WorkerConfig {
     pub max_workers: usize,
     /// Maximum actor calls and worker preparations waiting for the actor store.
     pub max_pending_actor_operations: usize,
+    /// Maximum completed I/O results reserved for actor dispatch.
+    ///
+    /// Once this lane is full the parent stops receiving from the completion
+    /// supervisor, propagating backpressure without consuming general actor
+    /// operation capacity.
+    pub max_pending_completions: usize,
     /// Capacity of the public command channel.
     pub command_capacity: usize,
     /// Maximum mailbox events waiting for the actor dispatcher.
@@ -179,6 +185,7 @@ impl Default for Preview1WorkerConfig {
         Self {
             max_workers: 64,
             max_pending_actor_operations: 128,
+            max_pending_completions: 1024,
             command_capacity: 128,
             mailbox_backlog: 128,
             max_outstanding_io: 64,
@@ -1648,6 +1655,47 @@ enum ActorOperation {
     },
 }
 
+struct CompletionDispatchLane {
+    operations: VecDeque<ActorOperation>,
+    capacity: usize,
+}
+
+impl CompletionDispatchLane {
+    fn new(capacity: usize) -> Self {
+        Self {
+            operations: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn can_receive(&self) -> bool {
+        self.operations.len() < self.capacity
+    }
+
+    fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    fn push(&mut self, completion: ActorCompletion) {
+        assert!(
+            self.can_receive(),
+            "completion receiver was polled without reserved lane capacity"
+        );
+        self.operations
+            .push_back(ActorOperation::Dispatch(CompatEvent::Completion(
+                completion,
+            )));
+    }
+
+    fn pop(&mut self) -> Option<ActorOperation> {
+        self.operations.pop_front()
+    }
+
+    fn clear(&mut self) {
+        self.operations.clear();
+    }
+}
+
 fn pop_preview_actor_operation(
     operations: &mut VecDeque<ActorOperation>,
     prefer_mailbox: &mut bool,
@@ -1662,6 +1710,31 @@ fn pop_preview_actor_operation(
     };
     *prefer_mailbox = !*prefer_mailbox;
     selected.or_else(|| operations.pop_front())
+}
+
+fn pop_preview_dispatch_operation(
+    actor_operations: &mut VecDeque<ActorOperation>,
+    completion_operations: &mut CompletionDispatchLane,
+    prefer_completion: &mut bool,
+    prefer_mailbox: &mut bool,
+) -> Option<ActorOperation> {
+    let completion_first = *prefer_completion && !completion_operations.is_empty();
+    *prefer_completion = !*prefer_completion;
+    if completion_first || actor_operations.is_empty() {
+        completion_operations.pop()
+    } else {
+        pop_preview_actor_operation(actor_operations, prefer_mailbox)
+    }
+}
+
+const fn should_dispatch_notification(
+    notification_first: bool,
+    lanes_empty: (bool, bool, bool),
+) -> bool {
+    let (notification_operations_empty, actor_operations_empty, completion_operations_empty) =
+        lanes_empty;
+    !notification_operations_empty
+        && (notification_first || (actor_operations_empty && completion_operations_empty))
 }
 
 type GuestCall = Pin<Box<dyn Future<Output = CallDone> + Send>>;
@@ -1760,8 +1833,10 @@ async fn parent_loop(
     let completion_io = completion_supervisor.io().clone();
     let mut actor_store = Some(actor_store);
     let mut actor_operations = VecDeque::new();
+    let mut completion_operations = CompletionDispatchLane::new(config.max_pending_completions);
     let mut notification_operations = VecDeque::new();
     let mut prefer_notification = true;
+    let mut prefer_completion = true;
     let mut prefer_mailbox = true;
     let mut calls = FuturesUnordered::<GuestCall>::new();
     let mut input_pumps = FuturesUnordered::<InputPump>::new();
@@ -1779,12 +1854,20 @@ async fn parent_loop(
         }
 
         let actor_dispatch_available = shutdown_reply.is_none() && actor_store.is_some();
-        let actor_work_pending =
-            !actor_operations.is_empty() || !notification_operations.is_empty();
+        let actor_work_pending = !actor_operations.is_empty()
+            || !completion_operations.is_empty()
+            || !notification_operations.is_empty();
         if actor_dispatch_available && actor_work_pending {
             let notification_first = prefer_notification && !notification_operations.is_empty();
             prefer_notification = !prefer_notification;
-            let operation = if notification_first || actor_operations.is_empty() {
+            let operation = if should_dispatch_notification(
+                notification_first,
+                (
+                    notification_operations.is_empty(),
+                    actor_operations.is_empty(),
+                    completion_operations.is_empty(),
+                ),
+            ) {
                 let Some(notification) = notification_operations.pop_front() else {
                     continue;
                 };
@@ -1796,9 +1879,12 @@ async fn parent_loop(
                 };
                 ActorOperation::Dispatch(CompatEvent::Notification(event))
             } else {
-                let Some(operation) =
-                    pop_preview_actor_operation(&mut actor_operations, &mut prefer_mailbox)
-                else {
+                let Some(operation) = pop_preview_dispatch_operation(
+                    &mut actor_operations,
+                    &mut completion_operations,
+                    &mut prefer_completion,
+                    &mut prefer_mailbox,
+                ) else {
                     continue;
                 };
                 operation
@@ -1824,11 +1910,10 @@ async fn parent_loop(
         }
 
         tokio::select! {
-            completion = completion_rx.recv(), if completion_open => {
+            completion = completion_rx.recv(), if completion_open
+                && completion_operations.can_receive() => {
                 match completion {
-                    Some(completion) => actor_operations.push_back(
-                        ActorOperation::Dispatch(CompatEvent::Completion(completion)),
-                    ),
+                    Some(completion) => completion_operations.push(completion),
                     None => completion_open = false,
                 }
             }
@@ -1963,6 +2048,7 @@ async fn parent_loop(
                             inputs.clear();
                         }
                         actor_operations.clear();
+                        completion_operations.clear();
                         notification_operations.clear();
                         completion_io.stop();
                         completion_open = false;
@@ -2162,6 +2248,7 @@ async fn parent_loop(
     drop(calls);
     drop(actor_store);
     drop(actor_operations);
+    drop(completion_operations);
     drop(notification_operations);
     drop(completion_rx);
     drop(notification_rx);
@@ -2708,6 +2795,11 @@ const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1Wor
             "max_pending_actor_operations must be non-zero",
         ));
     }
+    if config.max_pending_completions == 0 {
+        return Err(Preview1WorkerError::InvalidConfig(
+            "max_pending_completions must be non-zero",
+        ));
+    }
     if config.command_capacity == 0 {
         return Err(Preview1WorkerError::InvalidConfig(
             "command_capacity must be non-zero",
@@ -2957,6 +3049,15 @@ mod tests {
 
     use super::*;
 
+    fn completion(sequence: u64) -> ActorCompletion {
+        ActorCompletion {
+            operation: OperationId::new(1, sequence),
+            kind: ActorCompletionKind::Write {
+                bytes_written: sequence,
+            },
+        }
+    }
+
     #[test]
     fn preview_scheduler_does_not_starve_mailbox_behind_system_events() -> Result<()> {
         let slots = Arc::new(Semaphore::new(1));
@@ -2985,6 +3086,69 @@ mod tests {
             pop_preview_actor_operation(&mut operations, &mut prefer_mailbox),
             Some(ActorOperation::Dispatch(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_completion_lane_backpressures_its_supervisor_receiver() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut lane = CompletionDispatchLane::new(1);
+
+        sender.send(completion(1)).await?;
+        lane.push(receiver.recv().await.context("first completion")?);
+        ensure!(!lane.can_receive());
+        ensure!(lane.operations.len() == 1);
+
+        sender.send(completion(2)).await?;
+        let blocked_sender = sender.clone();
+        let mut blocked_send =
+            tokio::spawn(async move { blocked_sender.send(completion(3)).await });
+        ensure!(
+            timeout(Duration::from_millis(25), &mut blocked_send)
+                .await
+                .is_err(),
+            "the completion producer advanced while the reserved lane and receiver were full"
+        );
+        ensure!(lane.operations.len() == 1);
+
+        drop(lane.pop().context("release first completion")?);
+        ensure!(lane.can_receive());
+        lane.push(receiver.recv().await.context("second completion")?);
+        timeout(Duration::from_secs(1), &mut blocked_send)
+            .await
+            .context("completion producer did not resume after lane ownership was released")???;
+        ensure!(lane.operations.len() == 1);
+
+        drop(lane.pop().context("release second completion")?);
+        lane.push(receiver.recv().await.context("third completion")?);
+        ensure!(lane.operations.len() == 1);
+        drop(lane);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_only_work_is_not_misrouted_to_the_empty_notification_lane() {
+        assert!(!should_dispatch_notification(true, (true, true, false)));
+        assert!(should_dispatch_notification(false, (false, true, true)));
+    }
+
+    #[tokio::test]
+    async fn full_completion_lane_does_not_gate_control_commands() -> Result<()> {
+        let (_completion_sender, mut completion_receiver) = mpsc::channel::<ActorCompletion>(1);
+        let (command_sender, mut command_receiver) = mpsc::channel(1);
+        let mut lane = CompletionDispatchLane::new(1);
+        lane.push(completion(1));
+        command_sender.send(()).await?;
+
+        tokio::select! {
+            completion = completion_receiver.recv(), if lane.can_receive() => {
+                anyhow::bail!("full completion lane unexpectedly received {completion:?}");
+            }
+            command = command_receiver.recv() => {
+                ensure!(command.is_some(), "control channel closed unexpectedly");
+            }
+        }
+        drop(lane);
         Ok(())
     }
 

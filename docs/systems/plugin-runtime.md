@@ -165,6 +165,14 @@ generation's queues and is released only when dispatch consumes or drops it.
 This prevents a queue containing a bounded number of unusually large values
 from bypassing fault containment.
 
+Terminal I/O results use a reserved bounded completion lane rather than the
+general actor-operation queue. When that lane is full, its owner stops draining
+the completion supervisor until the actor dispatches a result. Backpressure
+therefore reaches operation producers while mailbox, lifecycle, and shutdown
+commands retain their own admission and scheduling paths. The default lane is
+deliberately much larger than the normal outstanding-I/O window, so it contains
+pathological completion-producing handlers without throttling ordinary bursts.
+
 Wasmtime stores have linear-memory and table limits. A Component or core-Wasm
 generation cannot grow beyond its store limit. Preview 1 workers share their
 actor's imported memory, so the module must declare a maximum and that maximum

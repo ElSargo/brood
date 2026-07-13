@@ -10,9 +10,14 @@ use std::{
 };
 
 const EVENT_MAILBOX: u32 = 1;
+const EVENT_COMPLETION_READ: u32 = 2;
+const EVENT_COMPLETION_WRITE: u32 = 3;
+const EVENT_COMPLETION_FAILED: u32 = 5;
 const STACK_ALIGNMENT: usize = 16;
 const LOG_DIRECTORY: &str = ".manifold";
 const LOG_PATH: &str = ".manifold/workspace-file-log.log";
+const SNAPSHOT_PATH: &str = ".manifold/workspace-file-log.snapshot";
+const SNAPSHOT_MAX_BYTES: u32 = 1024 * 1024;
 const WORKER_ARGUMENT: u32 = 1;
 
 static WATCH_STARTED: AtomicU32 = AtomicU32::new(0);
@@ -20,6 +25,9 @@ static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
 static ERROR_CODE: AtomicU32 = AtomicU32::new(0);
 static WATCH: AtomicU64 = AtomicU64::new(0);
 static NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_READ_OPERATION: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_WRITE_OPERATION: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
@@ -35,12 +43,33 @@ unsafe extern "C" {
     safe fn host_event_sender_len(value: *mut u32) -> u32;
     #[link_name = "event_payload_len"]
     safe fn host_event_payload_len(value: *mut u32) -> u32;
+    #[link_name = "event_operation"]
+    safe fn host_event_operation(value: *mut u64) -> u32;
+    #[link_name = "event_value"]
+    safe fn host_event_value(value: *mut u64) -> u32;
     #[link_name = "event_read"]
     unsafe fn host_event_read(
         sender: *mut u8,
         sender_len: u32,
         payload: *mut u8,
         payload_len: u32,
+    ) -> u32;
+    #[link_name = "completion_submit_read"]
+    unsafe fn host_completion_submit_read(
+        path: *const u8,
+        path_len: u32,
+        offset: u64,
+        max_bytes: u32,
+        operation: *mut u64,
+    ) -> u32;
+    #[link_name = "completion_submit_write"]
+    unsafe fn host_completion_submit_write(
+        path: *const u8,
+        path_len: u32,
+        offset: u64,
+        bytes: *const u8,
+        bytes_len: u32,
+        operation: *mut u64,
     ) -> u32;
     #[link_name = "worker_spawn"]
     safe fn host_worker_spawn(argument: u32, worker: *mut u64) -> u32;
@@ -87,12 +116,24 @@ pub extern "C" fn manifold_preview1_compat_v1() -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
-    if host_u32(host_event_kind) != Some(EVENT_MAILBOX) {
-        return 0;
-    }
-    let Some(payload) = read_event() else {
+    let Some(kind) = host_u32(host_event_kind) else {
         ERROR_CODE.store(1, Ordering::Release);
         return 0;
+    };
+    match kind {
+        EVENT_MAILBOX => dispatch_mailbox(),
+        EVENT_COMPLETION_READ => dispatch_snapshot_read(),
+        EVENT_COMPLETION_WRITE => dispatch_snapshot_write(),
+        EVENT_COMPLETION_FAILED => ERROR_CODE.store(7, Ordering::Release),
+        _ => {}
+    }
+    0
+}
+
+fn dispatch_mailbox() {
+    let Some(payload) = read_event() else {
+        ERROR_CODE.store(1, Ordering::Release);
+        return;
     };
     if payload == b"start"
         && WATCH_STARTED
@@ -110,7 +151,7 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
         {
             ERROR_CODE.store(2, Ordering::Release);
             WATCH_STARTED.store(0, Ordering::Release);
-            return 0;
+            return;
         }
         WATCH.store(watch, Ordering::Release);
         NOTIFICATION.store(notification, Ordering::Release);
@@ -119,8 +160,67 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
             ERROR_CODE.store(3, Ordering::Release);
             WATCH_STARTED.store(0, Ordering::Release);
         }
+    } else if payload == b"snapshot" {
+        let mut operation = 0_u64;
+        let path = LOG_PATH.as_bytes();
+        let status = unsafe {
+            host_completion_submit_read(
+                path.as_ptr(),
+                path.len() as u32,
+                0,
+                SNAPSHOT_MAX_BYTES,
+                &raw mut operation,
+            )
+        };
+        if status == 0 && operation != 0 {
+            SNAPSHOT_READ_OPERATION.store(operation, Ordering::Release);
+        } else {
+            ERROR_CODE.store(4, Ordering::Release);
+        }
     }
-    0
+}
+
+fn dispatch_snapshot_read() {
+    let Some(operation) = host_u64(host_event_operation) else {
+        ERROR_CODE.store(5, Ordering::Release);
+        return;
+    };
+    let Some((_sender, bytes)) = read_event_with_sender() else {
+        ERROR_CODE.store(5, Ordering::Release);
+        return;
+    };
+    if operation != SNAPSHOT_READ_OPERATION.load(Ordering::Acquire) || bytes.is_empty() {
+        ERROR_CODE.store(5, Ordering::Release);
+        return;
+    }
+    let path = SNAPSHOT_PATH.as_bytes();
+    let mut write_operation = 0_u64;
+    let status = unsafe {
+        host_completion_submit_write(
+            path.as_ptr(),
+            path.len() as u32,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &raw mut write_operation,
+        )
+    };
+    if status == 0 && write_operation != 0 {
+        SNAPSHOT_BYTES.store(bytes.len() as u64, Ordering::Release);
+        SNAPSHOT_WRITE_OPERATION.store(write_operation, Ordering::Release);
+    } else {
+        ERROR_CODE.store(6, Ordering::Release);
+    }
+}
+
+fn dispatch_snapshot_write() {
+    let operation = host_u64(host_event_operation);
+    let bytes_written = host_u64(host_event_value);
+    if operation != Some(SNAPSHOT_WRITE_OPERATION.load(Ordering::Acquire))
+        || bytes_written != Some(SNAPSHOT_BYTES.load(Ordering::Acquire))
+    {
+        ERROR_CODE.store(8, Ordering::Release);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -177,12 +277,7 @@ fn watch_workspace() -> Result<u32, u32> {
         let mut bytes = vec![0_u8; bytes_len as usize];
         let mut generation = 0_u64;
         let read_status = unsafe {
-            host_filesystem_watch_read(
-                watch,
-                bytes.as_mut_ptr(),
-                bytes_len,
-                &raw mut generation,
-            )
+            host_filesystem_watch_read(watch, bytes.as_mut_ptr(), bytes_len, &raw mut generation)
         };
         if read_status != 0 || generation == 0 {
             return Err(17);
@@ -267,6 +362,10 @@ fn open_log() -> std::io::Result<fs::File> {
 }
 
 fn read_event() -> Option<Vec<u8>> {
+    read_event_with_sender().map(|(_sender, payload)| payload)
+}
+
+fn read_event_with_sender() -> Option<(Vec<u8>, Vec<u8>)> {
     let sender_len = host_u32(host_event_sender_len)?;
     let payload_len = host_u32(host_event_payload_len)?;
     let mut sender = vec![0_u8; sender_len as usize];
@@ -279,11 +378,16 @@ fn read_event() -> Option<Vec<u8>> {
             payload_len,
         )
     };
-    (status == 0).then_some(payload)
+    (status == 0).then_some((sender, payload))
 }
 
 fn host_u32(function: extern "C" fn(*mut u32) -> u32) -> Option<u32> {
     let mut value = 0_u32;
+    (function(&raw mut value) == 0).then_some(value)
+}
+
+fn host_u64(function: extern "C" fn(*mut u64) -> u32) -> Option<u64> {
+    let mut value = 0_u64;
     (function(&raw mut value) == 0).then_some(value)
 }
 

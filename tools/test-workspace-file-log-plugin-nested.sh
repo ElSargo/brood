@@ -51,8 +51,36 @@ run_controller() {
   grep -q $'^modified\talpha.txt$' "$log"
   grep -q $'^removed\tsrc/removed.txt$' "$log"
 
-  # The worker remains active while its host actor services another mailbox turn.
-  ctl actors send workspace-file-log probe >/dev/null
+  # The worker remains active while a second mailbox turn asks the actor to
+  # completion-read its live log and completion-write those bytes as a visible
+  # snapshot. The snapshot is host completion I/O, not ordinary worker WASI.
+  ctl actors send workspace-file-log snapshot >/dev/null
+  snapshot="$workspace/.manifold/workspace-file-log.snapshot"
+  for _ in $(seq 1 200); do
+    [[ -s "$snapshot" ]] && break
+    sleep 0.05
+  done
+  if [[ ! -s "$snapshot" ]]; then
+    ctl status-json >&2 || true
+    ctl actors list >&2 || true
+    echo "ERR completion snapshot was not created: $snapshot" >&2
+    return 1
+  fi
+  python3 - "$log" "$snapshot" <<'PY'
+from pathlib import Path
+import sys
+
+log = Path(sys.argv[1]).read_bytes()
+snapshot = Path(sys.argv[2]).read_bytes()
+assert snapshot, "completion snapshot is empty"
+# The worker only appends to the live log, so events arriving after the actor's
+# read may extend it but may not change the copied prefix.
+assert log.startswith(snapshot), (snapshot, log)
+lines = set(snapshot.splitlines())
+assert b"created\tnew-file.txt" in lines, lines
+assert b"modified\talpha.txt" in lines, lines
+assert b"removed\tsrc/removed.txt" in lines, lines
+PY
   actors="$(ctl actors list)"
   [[ "$actors" == *"id=workspace-file-log kind=wasm-preview1-compat"* ]]
   status="$(ctl status-json)"
@@ -63,6 +91,7 @@ import sys
 status = json.loads(sys.argv[1])
 assert status["preview1_compat_workers_active"] >= 1, status
 assert status["preview1_compat_mailbox_dispatched"] >= 2, status
+assert status["preview1_compat_completion_delivered"] >= 2, status
 assert status["plugin_actor_failures"] == 0, status
 PY
   echo "workspace_file_log_controller=ok log=$log"

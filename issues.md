@@ -6,13 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- The Preview 1 parent drains completion results into `actor_operations`
-  without applying `max_pending_actor_operations` or a separate completion-lane
-  bound. A completion handler which submits more operations can grow this queue
-  indefinitely while the outstanding-operation count remains within its limit.
-  Add a reserved bounded completion lane and stop draining the supervisor while
-  it is full. As with byte budgets, use a very generous limit so ordinary bursty
-  completion traffic is unaffected while unbounded growth is impossible.
 - Preview 1 shutdown cancels workers which are already active, but a worker
   preparation which completes after shutdown begins can still start a new
   worker. That worker missed the cancellation pass and can delay or hang hot
@@ -134,6 +127,16 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Preview 1 completion dispatch has its own generously sized bounded lane. The
+  parent stops receiving from the completion supervisor while that lane is full,
+  but continues servicing control and shutdown commands; completion, mailbox,
+  and notification dispatch remain fair. The observable proof is the
+  `workspace-file-log` plugin's `snapshot` action: actor completion I/O reads the
+  live watch log and writes an exact snapshot while the watcher worker stays
+  active. `tools/test-workspace-file-log-plugin-nested.sh` validates both real
+  filesystem artifacts and the delivered completion count. This proof also
+  caught and fixed a scheduler bug which misrouted completion-only work toward
+  an empty notification lane.
 - Wasm stores and actor message paths are byte-bounded. Shared, deliberately
   generous limits cover mailbox senders and bodies, Component worker payloads
   and results, generation-owned host queues, aggregate linear memory, and store
