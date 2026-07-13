@@ -11,6 +11,7 @@ mod compositor;
 mod config;
 mod control;
 mod debug_dump;
+mod geometry;
 mod input;
 pub mod launch_context;
 mod layout;

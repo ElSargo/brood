@@ -1,11 +1,9 @@
 #![allow(
-    clippy::cast_sign_loss,
     clippy::if_same_then_else,
     clippy::needless_for_each,
     clippy::needless_pass_by_ref_mut,
-    reason = "tracked in issues.md: presentation code still converts signed layout coordinates at the renderer boundary"
+    reason = "presentation lifecycle branches and Smithay callback signatures retain framework-shaped control flow"
 )]
-// TODO(lint-structure): separate presentation geometry from Smithay output conversion.
 
 use std::{
     cell::RefCell,
@@ -52,6 +50,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
+    geometry::capture_extent,
     layout::{LayoutItemKind, LayoutRect},
     state::{Manifold, PresentationStatus, SESSION_OUTPUT_REFRESH_MILLIHZ},
     winit_presenter::{
@@ -550,6 +549,10 @@ fn render_presenter_frame_with_capture(
         )
         .map_err(|err| PresentationRuntimeFailure::new("render_output", err))?;
         if let Some(path) = capture_path {
+            let capture_width = capture_extent("width", size.w)
+                .map_err(|err| PresentationRuntimeFailure::new("capture_dimensions", err))?;
+            let capture_height = capture_extent("height", size.h)
+                .map_err(|err| PresentationRuntimeFailure::new("capture_dimensions", err))?;
             let mapping = renderer
                 .copy_framebuffer(
                     &framebuffer,
@@ -563,8 +566,8 @@ fn render_presenter_frame_with_capture(
             image::save_buffer(
                 path,
                 copy,
-                size.w as u32,
-                size.h as u32,
+                capture_width,
+                capture_height,
                 image::ColorType::Rgba8,
             )
             .map_err(|err| PresentationRuntimeFailure::new("save_buffer", err))?;
@@ -890,7 +893,7 @@ fn push_border(
     push_rect(
         elements,
         LayoutRect {
-            y: rect.y + rect.h - thickness,
+            y: rect.y.saturating_add(rect.h).saturating_sub(thickness),
             h: thickness,
             ..rect
         },
@@ -909,7 +912,7 @@ fn push_border(
     push_rect(
         elements,
         LayoutRect {
-            x: rect.x + rect.w - thickness,
+            x: rect.x.saturating_add(rect.w).saturating_sub(thickness),
             w: thickness,
             ..rect
         },
@@ -923,10 +926,10 @@ fn inset(rect: LayoutRect, amount: i32) -> LayoutRect {
     let max_inset = (rect.w / 2).min(rect.h / 2).saturating_sub(1);
     let amount = amount.min(max_inset);
     LayoutRect {
-        x: rect.x + amount,
-        y: rect.y + amount,
-        w: rect.w - amount * 2,
-        h: rect.h - amount * 2,
+        x: rect.x.saturating_add(amount),
+        y: rect.y.saturating_add(amount),
+        w: rect.w.saturating_sub(amount.saturating_mul(2)),
+        h: rect.h.saturating_sub(amount.saturating_mul(2)),
     }
 }
 

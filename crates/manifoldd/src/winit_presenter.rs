@@ -1,6 +1,4 @@
 #![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
     clippy::clone_on_ref_ptr,
     clippy::expect_used,
     clippy::let_underscore_must_use,
@@ -69,6 +67,10 @@ use wayland_client::{
 use wayland_egl as wegl;
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 
+use crate::geometry::{
+    finite_axis_value, host_extent_to_layout, physical_to_logical_coordinate, truncating_axis_v120,
+};
+
 pub type SharedPresenterRuntime = Rc<RefCell<PresenterRuntime>>;
 
 #[derive(Debug, Clone, Copy)]
@@ -83,14 +85,14 @@ impl native::EGLNativeDisplay for RawWaylandDisplay {
                 ffi::egl::PLATFORM_WAYLAND_KHR,
                 "PLATFORM_WAYLAND_KHR",
                 self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
+                vec![ffi::egl::NONE.cast_signed()],
                 &["EGL_KHR_platform_wayland"],
             ),
             native::EGLPlatform::new(
                 ffi::egl::PLATFORM_WAYLAND_EXT,
                 "PLATFORM_WAYLAND_EXT",
                 self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
+                vec![ffi::egl::NONE.cast_signed()],
                 &["EGL_EXT_platform_wayland"],
             ),
         ]
@@ -113,14 +115,14 @@ impl native::EGLNativeDisplay for RawXlibDisplay {
                 ffi::egl::PLATFORM_X11_KHR,
                 "PLATFORM_X11_KHR",
                 self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
+                vec![ffi::egl::NONE.cast_signed()],
                 &["EGL_KHR_platform_x11"],
             ),
             native::EGLPlatform::new(
                 ffi::egl::PLATFORM_X11_EXT,
                 "PLATFORM_X11_EXT",
                 self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
+                vec![ffi::egl::NONE.cast_signed()],
                 &["EGL_EXT_platform_x11"],
             ),
         ]
@@ -608,7 +610,9 @@ impl PresenterBackend {
             .expect("presentation size requested without render target")
         {
             PresenterRenderTarget::Window(frontend) => {
-                let (w, h): (i32, i32) = frontend.window.inner_size().into();
+                let size = frontend.window.inner_size();
+                let w = host_extent_to_layout(size.width);
+                let h = host_extent_to_layout(size.height);
                 (w, h).into()
             }
             PresenterRenderTarget::Offscreen(target) => target.size,
@@ -888,12 +892,10 @@ fn create_egl_surface(
     match window.window_handle().map(|handle| handle.as_raw()) {
         Ok(RawWindowHandle::Wayland(handle)) => {
             let size = window.inner_size();
+            let width = host_extent_to_layout(size.width);
+            let height = host_extent_to_layout(size.height);
             let surface = unsafe {
-                wegl::WlEglSurface::new_from_raw(
-                    handle.surface.as_ptr().cast(),
-                    size.width as i32,
-                    size.height as i32,
-                )
+                wegl::WlEglSurface::new_from_raw(handle.surface.as_ptr().cast(), width, height)
             }
             .map_err(|err| PresenterBackendError::Surface(err.to_string()))?;
             unsafe {
@@ -1146,7 +1148,11 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 let scale_factor =
                     { self.runtime.borrow().active_window_scale_factor() }.unwrap_or(1.0);
                 (self.callback)(PresenterEvent::Resized {
-                    size: (size.width as i32, size.height as i32).into(),
+                    size: (
+                        host_extent_to_layout(size.width),
+                        host_extent_to_layout(size.height),
+                    )
+                        .into(),
                     scale_factor,
                 });
             }
@@ -1351,11 +1357,9 @@ fn pointer_position(
     scale_factor: f64,
 ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
     let scale_factor = normalize_host_scale_factor(scale_factor);
-    let width = f64::from(size.width.max(1)) / scale_factor;
-    let height = f64::from(size.height.max(1)) / scale_factor;
     smithay::utils::Point::from((
-        (position.x / scale_factor).clamp(0.0, width),
-        (position.y / scale_factor).clamp(0.0, height),
+        physical_to_logical_coordinate(position.x, size.width, scale_factor),
+        physical_to_logical_coordinate(position.y, size.height, scale_factor),
     ))
 }
 
@@ -1373,15 +1377,15 @@ fn axis_values(
         MouseScrollDelta::LineDelta(x, y) => (
             None,
             None,
-            Some((-x * 120.0) as i32),
-            Some((-y * 120.0) as i32),
+            truncating_axis_v120(-f64::from(x) * 120.0),
+            truncating_axis_v120(-f64::from(y) * 120.0),
             AxisSource::Wheel,
         ),
         MouseScrollDelta::PixelDelta(delta) => {
             let scale_factor = normalize_host_scale_factor(scale_factor);
             (
-                Some(-delta.x / scale_factor),
-                Some(-delta.y / scale_factor),
+                finite_axis_value(-delta.x / scale_factor),
+                finite_axis_value(-delta.y / scale_factor),
                 None,
                 None,
                 AxisSource::Continuous,
@@ -1459,6 +1463,25 @@ mod tests {
     }
 
     #[test]
+    fn pointer_position_sanitizes_non_finite_coordinates_and_empty_size() {
+        let non_finite = pointer_position(
+            PhysicalPosition::new(f64::NAN, f64::INFINITY),
+            PhysicalSize::new(1280, 800),
+            2.0,
+        );
+        assert_close(non_finite.x, 0.0);
+        assert_close(non_finite.y, 400.0);
+
+        let empty = pointer_position(
+            PhysicalPosition::new(20.0, 30.0),
+            PhysicalSize::new(0, 0),
+            0.0,
+        );
+        assert_close(empty.x, 0.0);
+        assert_close(empty.y, 0.0);
+    }
+
+    #[test]
     fn pixel_scroll_delta_uses_logical_coordinates_for_host_scale() {
         let (horizontal, vertical, horizontal_v120, vertical_v120, source) = axis_values(
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(12.0, -8.0)),
@@ -1469,5 +1492,29 @@ mod tests {
         assert!(horizontal_v120.is_none());
         assert!(vertical_v120.is_none());
         assert_eq!(source, AxisSource::Continuous);
+    }
+
+    #[test]
+    fn line_scroll_truncates_fractional_v120_and_rejects_non_finite_values() {
+        let (_, _, horizontal_v120, vertical_v120, source) =
+            axis_values(MouseScrollDelta::LineDelta(0.501, -0.999), 1.0);
+        assert_eq!(horizontal_v120, Some(-60));
+        assert_eq!(vertical_v120, Some(119));
+        assert_eq!(source, AxisSource::Wheel);
+
+        let (_, _, horizontal_v120, vertical_v120, _) =
+            axis_values(MouseScrollDelta::LineDelta(f32::INFINITY, f32::NAN), 1.0);
+        assert!(horizontal_v120.is_none());
+        assert!(vertical_v120.is_none());
+    }
+
+    #[test]
+    fn pixel_scroll_rejects_non_finite_values() {
+        let (horizontal, vertical, _, _, _) = axis_values(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(f64::INFINITY, f64::NAN)),
+            1.0,
+        );
+        assert!(horizontal.is_none());
+        assert!(vertical.is_none());
     }
 }

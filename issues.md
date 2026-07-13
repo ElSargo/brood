@@ -6,12 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Geometry and conversion model
 
-- `crates/manifoldd/src/layout.rs`, `crates/manifoldd/src/input.rs`,
-  `crates/manifoldd/src/presentation.rs`, and
-  `crates/manifoldd/src/winit_presenter.rs`: coordinate paths still mix float
-  ratios, signed layout pixels, unsigned renderer sizes, and raw casts. A proper
-  fix should introduce checked geometry conversion helpers and make truncation,
-  clamping, and overflow policy explicit.
 - `crates/manifoldd/src/launch_context.rs`: environment previews slice strings
   by byte offsets. The target design should define truncation in Unicode scalar
   or grapheme terms before changing behavior.
@@ -49,6 +43,21 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Normalized plugin transforms, signed layout pixels, unsigned host/capture
+  extents, physical pointer positions, and Wayland axis values now cross one
+  checked geometry layer with explicit rounding, saturation, clamping, empty-
+  size, invalid-scale, non-finite, and wheel-v120 policies. The old broad cast
+  allowances are gone, capture dimensions are fallible, hit rectangles and
+  split arithmetic cannot overflow, and boundary tests cover fractional values,
+  the full signed range, NaN/infinities, zero and tiny scales, and host-size
+  overflow. The current `workspace` provider in
+  `examples/wasm-geometry-layout-policy` is the observable plugin proof through
+  `tools/test-geometry-conversions-nested.sh`: it emits a typed
+  `SetResolvedLayout` for two real 640x800 panes, after which global input at
+  `(960,400)` visibly reaches Weston eventdemo at local `(320,400)`. The client
+  records motion, press/release, wheel value 15, and fractional scroll 7.5,
+  while compositor metrics record six target hits, zero misses, and the
+  screenshot shows the terminal/eventdemo split and eventdemo input region.
 - Smithay protocol wiring, product runtime startup, and built-in nested-test
   orchestration now live in separate compositor, runtime, and test modules with
   typed launch plans, supervised processes, and a narrow runtime-tick callback.

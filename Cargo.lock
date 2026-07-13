@@ -2110,6 +2110,7 @@ dependencies = [
  "clap",
  "image",
  "manifold-wasm",
+ "num-traits",
  "serde",
  "serde_json",
  "smithay",

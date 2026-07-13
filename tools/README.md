@@ -13,6 +13,12 @@ offscreen nested supervisor waits for its exact controller while a real Weston
 terminal maps and an unrelated hosted child exits. The proof exits normally
 without `--keep-running` and preserves a composed screenshot and transcript.
 
+Run `./tools/test-geometry-conversions-nested.sh` to load the real geometry
+layout policy plugin, render its accepted two-pane layout, and target
+Weston eventdemo with pointer motion, click, wheel-v120, and fractional scroll
+input. The offscreen proof preserves the composed screenshot, accepted layout
+rectangles, before/after compositor metrics, and client-observed local events.
+
 Run `./tools/audit-v1-capabilities.sh` from the repo root for the concise v1 acceptance audit. It runs formatting, offline checking, unit tests, headless compositor checks, supported host-backed smoke tests when a host display is available, and the dmabuf capability checks. Set `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1` on a DRM-capable backend to make capability skips fail the audit.
 
 Run `./tools/smoke-v1-full.sh` from the repo root for the full supported v1 proof suite: formatting, offline build/test, dmabuf validator/classifier fixtures, headless Wayland globals, headless native-client mapping, headless input forwarding, headless control-error handling, headless JSON status, headless status parity, headless client lifecycle checks, startup attach fallback, native nesting, detach/reattach, host input forwarding, dmabuf diagnostics, explicit-sync diagnostics, and latency/cadence.
