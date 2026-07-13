@@ -1812,6 +1812,9 @@ static WORKER_RELEASE_QUEUED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> =
 static WORKER_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
+static WORKER_RELEASE_TEST_WAKEUP: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(test)]
 async fn wait_at_preparation_test_gate() {
     let gate = PREPARATION_TEST_GATE
         .lock()
@@ -1826,6 +1829,16 @@ async fn wait_at_preparation_test_gate() {
 #[cfg(not(test))]
 fn wait_at_preparation_test_gate() -> std::future::Ready<()> {
     std::future::ready(())
+}
+
+#[cfg(test)]
+async fn wait_for_worker_release_test_wakeup() {
+    WORKER_RELEASE_TEST_WAKEUP.notified().await;
+}
+
+#[cfg(not(test))]
+fn wait_for_worker_release_test_wakeup() -> std::future::Pending<()> {
+    std::future::pending()
 }
 
 struct ActiveWorker {
@@ -1984,6 +1997,7 @@ async fn parent_loop(
         }
 
         tokio::select! {
+            () = wait_for_worker_release_test_wakeup(), if release_held => {}
             completion = completion_rx.recv(), if completion_open
                 && completion_operations.can_receive() => {
                 match completion {
@@ -3232,6 +3246,7 @@ mod tests {
     impl Drop for ReleaseHoldGuard {
         fn drop(&mut self) {
             HOLD_WORKER_RELEASE_TEST.store(false, Ordering::Release);
+            WORKER_RELEASE_TEST_WAKEUP.notify_one();
         }
     }
 
@@ -3447,6 +3462,7 @@ mod tests {
             .context("shutdown did not begin with a queued release")?
             .context("shutdown-start observer dropped")?;
         HOLD_WORKER_RELEASE_TEST.store(false, Ordering::Release);
+        WORKER_RELEASE_TEST_WAKEUP.notify_one();
         timeout(Duration::from_secs(1), shutdown_done)
             .await
             .context("shutdown discarded or failed to run the queued release")?
