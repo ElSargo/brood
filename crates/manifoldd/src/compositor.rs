@@ -163,16 +163,14 @@ fn serve_session_on_calloop_thread(
     }
 
     if let Some(path) = args.test_harness.as_deref() {
-        state.test_harness = Some(TestHarnessRuntime::start_on_runtime(path, &runtime));
+        state.install_test_harness(TestHarnessRuntime::start_on_runtime(path, &runtime))?;
         info!(path = %path.display(), "loaded CLI test harness");
     }
 
-    state
-        .nested_inner_dbus_destination
-        .clone_from(&args.nested_inner_dbus_name);
-    state
-        .nested_inner_dbus_address
-        .clone_from(&args.nested_inner_dbus_address);
+    state.configure_nested_test_target(
+        args.nested_inner_dbus_name.clone(),
+        args.nested_inner_dbus_address.clone(),
+    )?;
 
     let control_target =
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
@@ -253,7 +251,7 @@ fn serve_session_on_calloop_thread(
     hosted_shutdown?;
     legacy_shutdown?;
 
-    if let Some(completion) = state.test_harness_completion.as_ref() {
+    if let Some(completion) = state.test_harness_completion() {
         println!(
             "TEST_HARNESS_RESULT kind={:?} exit_code={} detail={}",
             completion.kind, completion.exit_code, completion.detail

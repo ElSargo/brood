@@ -18,7 +18,8 @@ mod plugin_runtime;
 mod presentation;
 mod session_bus;
 mod session_runner;
-mod state;
+pub(crate) mod state;
+pub(crate) mod state_services;
 mod wasm_test;
 mod winit_presenter;
 

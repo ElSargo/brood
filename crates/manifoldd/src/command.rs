@@ -57,10 +57,7 @@ impl SurfaceCommand {
     fn apply(self, state: &mut Manifold) -> bool {
         match self {
             Self::SwitchActiveSessionNext => state.switch_to_next_surface_session(),
-            Self::CreateAndAttachSession => {
-                state.create_and_attach_surface_session();
-                true
-            }
+            Self::CreateAndAttachSession => state.create_and_attach_surface_session().is_ok(),
         }
     }
 }

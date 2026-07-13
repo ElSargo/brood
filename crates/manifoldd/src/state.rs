@@ -10,21 +10,17 @@
     clippy::let_underscore_must_use,
     clippy::match_same_arms,
     clippy::needless_pass_by_ref_mut,
-    clippy::needless_pass_by_value,
     clippy::option_if_let_else,
     clippy::question_mark,
     clippy::significant_drop_tightening,
     clippy::struct_field_names,
-    clippy::too_many_arguments,
     clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_debug_formatting,
     clippy::unused_self,
     clippy::unwrap_used,
     clippy::useless_let_if_seq,
-    reason = "tracked in issues.md: central runtime state intentionally keeps coupled event-loop and plugin lifecycle resources alive together"
+    reason = "remaining suppressions cover checked geometry conversions, protocol-owned Smithay resources, and audited compositor/raw-memory boundaries tracked by their dedicated issues"
 )]
-// TODO(lint-structure): decompose Manifold state into typed geometry, session, focus, and registry services.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -92,6 +88,7 @@ use crate::{
     },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
+    state_services::{FocusService, SurfaceSessionService, TestHarnessService},
     wasm_test::{
         TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request,
     },
@@ -284,6 +281,8 @@ struct NativeSessionLayout {
 pub struct SurfaceSessionId(u64);
 
 impl SurfaceSessionId {
+    pub const NONE: Self = Self(0);
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -350,7 +349,7 @@ pub struct StatusItemSummary {
 }
 
 #[derive(Default)]
-struct ExtensionRegistry {
+struct RegistryService {
     extensions: Vec<ExtensionRecord>,
     windows: Vec<WindowRecord>,
     active_window_roles: BTreeMap<String, ActiveWindowRole>,
@@ -418,6 +417,16 @@ struct AgentNotificationRecord {
     unread: bool,
 }
 
+pub struct AgentNotification {
+    pub agent_id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    pub level: String,
+    pub metadata: ExtensionMetadata,
+    pub sender: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusPublisherRecord {
     id: String,
@@ -433,6 +442,143 @@ struct StatusItemRecord {
     label: String,
     publisher: String,
     metadata: ExtensionMetadata,
+}
+
+impl RegistryService {
+    fn register_agent(
+        &mut self,
+        kind: &str,
+        metadata: ExtensionMetadata,
+        sender: String,
+        session: SurfaceSessionId,
+    ) -> Result<String> {
+        let kind = normalize_registry_value(kind).context("agent kind must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let id = stable_agent_registry_id(&kind, &metadata);
+        let status = metadata
+            .get("status")
+            .and_then(|value| normalize_registry_value(value));
+        if let Some(record) = self.agents.iter_mut().find(|record| record.id == id) {
+            record.kind = kind;
+            if let Some(status) = status {
+                record.status = status;
+            }
+            merge_agent_metadata(&mut record.metadata, metadata);
+            record.sender = sender;
+            record.session = session;
+        } else {
+            self.agents.push(AgentRecord {
+                id: id.clone(),
+                kind,
+                status: status.unwrap_or_else(|| "unknown".to_string()),
+                metadata,
+                sender,
+                session,
+                attention: false,
+                unread_notifications: 0,
+            });
+        }
+        Ok(id)
+    }
+
+    fn update_agent(
+        &mut self,
+        agent_id: &str,
+        status: &str,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<bool> {
+        let status = normalize_registry_value(status).context("agent status must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let Some(record) = self.agents.iter_mut().find(|record| record.id == agent_id) else {
+            return Ok(false);
+        };
+        record.status = status;
+        merge_agent_metadata(&mut record.metadata, metadata);
+        record.sender = sender;
+        Ok(true)
+    }
+
+    fn notify_agent(&mut self, request: AgentNotification) -> Result<String> {
+        let title = normalize_registry_value(&request.title)
+            .context("notification title must not be empty")?;
+        let level = normalize_registry_value(&request.level).unwrap_or_else(|| "info".to_string());
+        ensure_metadata(&request.metadata)?;
+        let Some(record) = self
+            .agents
+            .iter_mut()
+            .find(|record| record.id == request.agent_id)
+        else {
+            anyhow::bail!("unknown agent {}", request.agent_id);
+        };
+        record.sender = request.sender;
+        record.attention = true;
+        record.unread_notifications = record.unread_notifications.saturating_add(1);
+        if matches!(level.as_str(), "waiting" | "blocked" | "error") {
+            record.status.clone_from(&level);
+        }
+
+        let mut id_metadata = request.metadata.clone();
+        id_metadata.insert("agent_id".to_string(), request.agent_id.clone());
+        id_metadata.insert("title".to_string(), title.clone());
+        id_metadata.insert("body".to_string(), request.body.clone());
+        let id = stable_registry_id("agent-notification", [&level], &id_metadata);
+        self.notifications.push(AgentNotificationRecord {
+            id: id.clone(),
+            agent_id: request.agent_id,
+            title,
+            subtitle: request.subtitle,
+            body: request.body,
+            level,
+            metadata: request.metadata,
+            unread: true,
+        });
+        Ok(id)
+    }
+
+    fn clear_agent_attention(&mut self, agent_id: &str) -> bool {
+        let Some(record) = self.agents.iter_mut().find(|record| record.id == agent_id) else {
+            return false;
+        };
+        record.attention = false;
+        record.unread_notifications = 0;
+        for notification in self
+            .notifications
+            .iter_mut()
+            .filter(|notification| notification.agent_id == agent_id)
+        {
+            notification.unread = false;
+        }
+        true
+    }
+
+    fn unregister_agent(&mut self, agent_id: &str) -> bool {
+        let before = self.agents.len();
+        self.agents.retain(|agent| agent.id != agent_id);
+        if before == self.agents.len() {
+            return false;
+        }
+        self.notifications
+            .retain(|notification| notification.agent_id != agent_id);
+        true
+    }
+
+    fn unregister_agents_for_pane(&mut self, pane_id: u64) -> Vec<String> {
+        let pane_id = pane_id.to_string();
+        let removed = self
+            .agents
+            .iter()
+            .filter(|agent| agent.metadata.get("pane_id") == Some(&pane_id))
+            .map(|agent| agent.id.clone())
+            .collect::<BTreeSet<_>>();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        self.agents.retain(|agent| !removed.contains(&agent.id));
+        self.notifications
+            .retain(|notification| !removed.contains(&notification.agent_id));
+        removed.into_iter().collect()
+    }
 }
 
 enum HostedIoActor {
@@ -667,8 +813,7 @@ pub struct Manifold {
     pub presentation_attach_failures: u64,
     pub presentation_runtime_failures: u64,
     pub presentation_last_error: Option<String>,
-    presentation_window_focused: bool,
-    pending_presentation_focus_activation_token: Option<String>,
+    focus: FocusService,
     pub attach_requested: bool,
     pub attach_schedule_pending: bool,
     pub detach_requested: bool,
@@ -679,9 +824,6 @@ pub struct Manifold {
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
-    active_toplevel_surface: Option<WlSurface>,
-    pointer_hover_toplevel_surface: Option<WlSurface>,
-    pending_pointer_focus_surface: Option<WlSurface>,
     layout_leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
     native_auto_split_visible_limit: usize,
     native_session_layouts: BTreeMap<SurfaceSessionId, NativeSessionLayout>,
@@ -706,22 +848,12 @@ pub struct Manifold {
     pub input_mode: InputMode,
     shortcut_passthrough: bool,
     managed_fullscreen: bool,
-    active_surface_session: SurfaceSessionId,
-    last_interacted_surface_session: SurfaceSessionId,
-    surface_session_interaction_order: Vec<SurfaceSessionId>,
-    next_surface_session: u64,
-    surface_sessions: Vec<SurfaceSessionId>,
-    surface_session_names: Vec<(SurfaceSessionId, String)>,
-    surface_session_working_directories: BTreeMap<SurfaceSessionId, PathBuf>,
-    surface_session_directories: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
-    surface_session_directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
-    window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
+    sessions: SurfaceSessionService,
     presentation_child_surfaces: Vec<WlSurface>,
     presentation_member_surfaces: Vec<WlSurface>,
     panel_reservations: Vec<PanelReservation>,
     left_panel_resizing: bool,
-    extension_registry: ExtensionRegistry,
-    session_dbus_buses: Vec<(SessionBusRealm, SessionBusHandle)>,
+    extension_registry: RegistryService,
     plugin_runtime: Option<PluginRuntime>,
     plugin_host_event_sender: channel::Sender<PluginHostEvent>,
     plugin_actor_messages: u64,
@@ -742,10 +874,7 @@ pub struct Manifold {
     pub(crate) test_surface_markers: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
     pub(crate) wasm_global_key_policy: Option<manifold_wasm::WasmGlobalKeyPolicy>,
-    pub(crate) test_harness: Option<TestHarnessRuntime>,
-    pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
-    pub(crate) nested_inner_dbus_destination: Option<String>,
-    pub(crate) nested_inner_dbus_address: Option<String>,
+    pub(crate) test_harness: TestHarnessService,
     pub(crate) manifold_session: Option<String>,
     pub(crate) host_dbus_address: Option<String>,
     pub(crate) manifold_dbus_destination: Option<String>,
@@ -834,8 +963,7 @@ impl Manifold {
             presentation_attach_failures: 0,
             presentation_runtime_failures: 0,
             presentation_last_error: None,
-            presentation_window_focused: false,
-            pending_presentation_focus_activation_token: None,
+            focus: FocusService::default(),
             attach_requested: false,
             attach_schedule_pending: false,
             detach_requested: false,
@@ -846,9 +974,6 @@ impl Manifold {
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
-            active_toplevel_surface: None,
-            pointer_hover_toplevel_surface: None,
-            pending_pointer_focus_surface: None,
             layout_leaf_selected_panes: Vec::new(),
             native_auto_split_visible_limit: DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT,
             native_session_layouts: BTreeMap::new(),
@@ -873,30 +998,15 @@ impl Manifold {
             input_mode: InputMode::Passthrough,
             shortcut_passthrough: false,
             managed_fullscreen: false,
-            active_surface_session: SurfaceSessionId(1),
-            last_interacted_surface_session: SurfaceSessionId(1),
-            surface_session_interaction_order: vec![SurfaceSessionId(1)],
-            next_surface_session: 2,
-            surface_sessions: vec![SurfaceSessionId(1)],
-            surface_session_names: vec![(
-                SurfaceSessionId(1),
-                default_surface_session_name(SurfaceSessionId(1)),
-            )],
-            surface_session_working_directories: [(
-                SurfaceSessionId(1),
+            sessions: SurfaceSessionService::new(
                 current_process_directory(),
-            )]
-            .into_iter()
-            .collect(),
-            surface_session_directories: BTreeMap::new(),
-            surface_session_directory_defaults: BTreeMap::new(),
-            window_surface_sessions: Vec::new(),
+                default_surface_session_name(SurfaceSessionId(1)),
+            ),
             presentation_child_surfaces: Vec::new(),
             presentation_member_surfaces: Vec::new(),
             panel_reservations: Vec::new(),
             left_panel_resizing: false,
-            extension_registry: ExtensionRegistry::default(),
-            session_dbus_buses: Vec::new(),
+            extension_registry: RegistryService::default(),
             plugin_runtime: None,
             plugin_host_event_sender,
             plugin_actor_messages: 0,
@@ -917,10 +1027,7 @@ impl Manifold {
             test_surface_markers: false,
             presenter: None,
             wasm_global_key_policy: None,
-            test_harness: None,
-            test_harness_completion: None,
-            nested_inner_dbus_destination: None,
-            nested_inner_dbus_address: None,
+            test_harness: TestHarnessService::default(),
             manifold_session: None,
             host_dbus_address: std::env::var(MANIFOLD_HOST_DBUS_ADDRESS_ENV)
                 .ok()
@@ -1194,7 +1301,10 @@ impl Manifold {
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             return actor.try_send_message(sender, payload);
         }
-        self.block_on_wasm_registry(|registry| registry.try_post_named_message(actor_id, payload))
+        self.block_on_wasm_registry(|registry| {
+            registry.try_post_named_message(actor_id, payload)
+        })??;
+        Ok(())
     }
 
     fn latest_wasm_policy_state_publication(&self) -> Option<manifold_wasm::PublicationFrameLease> {
@@ -1208,6 +1318,8 @@ impl Manifold {
                     .flatten()
             })
         })
+        .ok()
+        .flatten()
     }
 
     fn emit_wasm_layout_snapshot_event(&mut self, extra_pane: Option<u64>) {
@@ -1235,13 +1347,13 @@ impl Manifold {
             })
             .collect::<Vec<_>>()
             .join(",");
-        self.emit_wasm_actor_event_to_all(format!(
+        self.emit_wasm_actor_event_to_all(&format!(
             r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"pane_app_ids":[{}],"size":{{"w":{},"h":{}}}}}"#,
             panes, focused, pane_app_ids, size.w, size.h
         ));
     }
 
-    fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
+    fn emit_wasm_actor_event_to_all(&mut self, payload: &str) {
         self.drain_hosted_actor_events();
         let io_actor_deliveries = self
             .wasm_io_actors
@@ -1275,11 +1387,11 @@ impl Manifold {
                 registry.try_post_named_message(&actor, payload.as_bytes().to_vec())
             });
             match result {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     self.plugin_actor_messages += 1;
                     self.plugin_actor_last_status = Some(format!("{actor}:event_queued"));
                 }
-                Err(err) => {
+                Ok(Err(err)) | Err(err) => {
                     self.plugin_actor_failures += 1;
                     self.plugin_actor_last_status = Some(format!("{actor}:event_error"));
                     warn!(actor = %actor, error = %err, "failed to enqueue WASM actor event");
@@ -1288,15 +1400,19 @@ impl Manifold {
         }
     }
 
-    fn block_on_wasm_registry<T>(&self, f: impl FnOnce(&mut manifold_wasm::Registry) -> T) -> T {
+    fn block_on_wasm_registry<T>(
+        &self,
+        f: impl FnOnce(&mut manifold_wasm::Registry) -> T,
+    ) -> Result<T> {
         let registry = Arc::clone(&self.wasm_registry);
-        self.async_runtime
+        let runtime = self
+            .async_runtime
             .as_ref()
-            .expect("async runtime must be initialized before WASM registry use")
-            .block_on(async move {
-                let mut registry = registry.lock().await;
-                f(&mut registry)
-            })
+            .context("async runtime is not initialized for WASM registry use")?;
+        Ok(runtime.block_on(async move {
+            let mut registry = registry.lock().await;
+            f(&mut registry)
+        }))
     }
 
     fn drain_wasm_host_mailbox(&mut self) {
@@ -1346,11 +1462,11 @@ impl Manifold {
             return;
         };
         for message in plugin_runtime.drain_host_messages() {
-            self.apply_plugin_host_message(message);
+            self.apply_plugin_host_message(&message);
         }
     }
 
-    fn apply_plugin_host_message(&mut self, message: PluginHostMessage) {
+    fn apply_plugin_host_message(&mut self, message: &PluginHostMessage) {
         let command = match parse_plugin_host_command(&message.body) {
             Ok(command) => command,
             Err(err) => {
@@ -1604,7 +1720,7 @@ impl Manifold {
                         state.record_hosted_child_started(started);
                     }
                     HostedChildEvent::SpawnFailed(failure) => {
-                        state.record_hosted_child_spawn_failure(failure);
+                        state.record_hosted_child_spawn_failure(&failure);
                     }
                     HostedChildEvent::Exited(exit) => state.record_hosted_child_exit(exit),
                 }
@@ -1646,7 +1762,7 @@ impl Manifold {
     }
 
     pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
-        self.spawn_hosted_app_in_session(command, self.active_surface_session)
+        self.spawn_hosted_app_in_session(command, self.sessions.active())
     }
 
     pub fn spawn_hosted_app_in_session(
@@ -1655,7 +1771,7 @@ impl Manifold {
         session: SurfaceSessionId,
     ) -> Result<()> {
         ensure!(
-            self.surface_sessions.contains(&session),
+            self.sessions.contains(session),
             "unknown surface session {}",
             session.raw()
         );
@@ -1681,7 +1797,7 @@ impl Manifold {
     }
 
     pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<()> {
-        self.spawn_hosted_app_argv_in_session(argv, self.active_surface_session)
+        self.spawn_hosted_app_argv_in_session(argv, self.sessions.active())
     }
 
     pub fn spawn_hosted_app_argv_in_session(
@@ -1693,7 +1809,7 @@ impl Manifold {
             anyhow::bail!("spawn requires a command");
         };
         ensure!(
-            self.surface_sessions.contains(&session),
+            self.sessions.contains(session),
             "unknown surface session {}",
             session.raw()
         );
@@ -1727,7 +1843,7 @@ impl Manifold {
         };
 
         let pane_id = self.allocate_pane_id();
-        let session = self.active_surface_session;
+        let session = self.sessions.active();
         let mut command_builder = Command::new(program);
         command_builder
             .args(args)
@@ -1766,7 +1882,7 @@ impl Manifold {
             presentation,
         });
         if let Some(runtime) = self.async_runtime.clone() {
-            self.spawn_hosted_child_launch_task(runtime, command_label, command, pane_id, session);
+            self.spawn_hosted_child_launch_task(&runtime, command_label, command, pane_id, session);
             return Ok(());
         }
 
@@ -1820,7 +1936,7 @@ impl Manifold {
 
     fn spawn_hosted_child_launch_task(
         &self,
-        runtime: tokio::runtime::Handle,
+        runtime: &tokio::runtime::Handle,
         command: String,
         mut child_command: Command,
         pane_id: u64,
@@ -1874,7 +1990,7 @@ impl Manifold {
         self.track_hosted_child(started.command, started.pid, None, Some(started.pane_id));
     }
 
-    fn record_hosted_child_spawn_failure(&mut self, failure: HostedChildSpawnFailure) {
+    fn record_hosted_child_spawn_failure(&mut self, failure: &HostedChildSpawnFailure) {
         self.pending_child_panes
             .retain(|pending| pending.pane_id != failure.pane_id);
         self.hosted_child_failures += 1;
@@ -2012,7 +2128,7 @@ impl Manifold {
     }
 
     fn apply_session_working_directory(&self, child: &mut Command, session: SurfaceSessionId) {
-        if let Some(directory) = self.surface_session_working_directories.get(&session) {
+        if let Some(directory) = self.sessions.working_directory(session) {
             child.current_dir(directory);
         }
     }
@@ -2020,7 +2136,8 @@ impl Manifold {
     fn ensure_session_dbus_bus(&mut self, session: SurfaceSessionId) -> Result<String> {
         let realm = SessionBusRealm::Surface(session.raw());
         if let Some(bus) = self
-            .session_dbus_buses
+            .sessions
+            .buses()
             .iter()
             .find(|(bus_realm, _)| *bus_realm == realm)
         {
@@ -2034,7 +2151,7 @@ impl Manifold {
         }
         .context("start in-process session DBus bus")?;
         let address = handle.address().to_string();
-        self.session_dbus_buses.push((realm, handle));
+        self.sessions.add_bus(realm, handle);
         info!(
             session = session.raw(),
             dbus_address = %address,
@@ -2054,7 +2171,7 @@ impl Manifold {
         if self.presentation == PresentationStatus::Attached {
             self.stats.record_detach_request();
             self.detach_requested = true;
-            self.pending_presentation_focus_activation_token = None;
+            self.focus.clear_presentation_activation();
         }
     }
 
@@ -2069,7 +2186,7 @@ impl Manifold {
         self.presentation = PresentationStatus::Detached;
         self.attach_requested = false;
         self.attach_schedule_pending = false;
-        self.pending_presentation_focus_activation_token = None;
+        self.focus.clear_presentation_activation();
     }
 
     pub fn schedule_attach(&mut self) {
@@ -2244,7 +2361,7 @@ impl Manifold {
     }
 
     pub fn service_test_harness(&mut self) {
-        let Some(mut harness) = self.test_harness.take() else {
+        let Some(mut harness) = self.test_harness.take_runtime() else {
             return;
         };
 
@@ -2252,7 +2369,7 @@ impl Manifold {
             service_request(self, request);
         }
 
-        if self.test_harness_completion.is_none()
+        if !self.test_harness.is_complete()
             && let Some(completion) = harness.try_take_completion()
         {
             match completion.kind {
@@ -2276,17 +2393,45 @@ impl Manifold {
                     );
                 }
             }
-            self.test_harness_completion = Some(completion);
+            if let Err(err) = self.test_harness.record_completion(completion) {
+                warn!(err, "test harness completion transition rejected");
+            }
         }
 
-        self.test_harness = Some(harness);
+        if let Err(err) = self.test_harness.restore_runtime(harness) {
+            warn!(err, "test harness runtime ownership transition rejected");
+        }
     }
 
     pub fn signal_test_harness(&self, name: String) -> Result<()> {
-        let Some(harness) = self.test_harness.as_ref() else {
+        let Some(harness) = self.test_harness.runtime() else {
             anyhow::bail!("no running test harness");
         };
         harness.send_signal(name)
+    }
+
+    pub(crate) fn install_test_harness(&mut self, harness: TestHarnessRuntime) -> Result<()> {
+        self.test_harness
+            .install(harness)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn configure_nested_test_target(
+        &mut self,
+        destination: Option<String>,
+        address: Option<String>,
+    ) -> Result<()> {
+        self.test_harness
+            .configure_nested_target(destination, address)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn nested_test_target(&self) -> Option<(&str, Option<&str>)> {
+        self.test_harness.nested_target()
+    }
+
+    pub(crate) const fn test_harness_completion(&self) -> Option<&TestHarnessCompletion> {
+        self.test_harness.completion()
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
@@ -2342,21 +2487,23 @@ impl Manifold {
 
     pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) -> Option<WlSurface> {
         let registered = self.register_toplevel_pane_and_session(surface);
-        self.window_surface_sessions
-            .push((surface.clone(), registered.session));
+        if let Err(err) = self.sessions.assign_surface(surface, registered.session) {
+            warn!(?err, "refusing invalid toplevel session assignment");
+            return None;
+        }
         self.apply_registered_extension_grants_for_surface(surface);
         if registered.presentation {
             self.mark_presentation_child_surface(surface);
             self.refresh_resolved_layout_from_policy();
             return self.active_content_surface_for_layout_action();
         }
-        self.emit_wasm_actor_event_to_all(format!(
+        self.emit_wasm_actor_event_to_all(&format!(
             r#"{{"type":"pane-mapped","pane":{},"session":{}}}"#,
             registered.pane_id,
             registered.session.raw()
         ));
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-            && registered.session == self.active_surface_session
+            && registered.session == self.sessions.active()
         {
             self.place_new_native_pane(registered.pane_id);
         }
@@ -2532,7 +2679,7 @@ impl Manifold {
         process_tree_env_var(pid, MANIFOLD_SURFACE_SESSION_ID_ENV)
             .and_then(|value| value.parse::<u64>().ok())
             .map(SurfaceSessionId::from_raw)
-            .filter(|session| self.surface_sessions.contains(session))
+            .filter(|session| self.sessions.contains(*session))
     }
 
     fn toplevel_process_is_presentation(&self, surface: &WlSurface) -> bool {
@@ -2553,7 +2700,8 @@ impl Manifold {
     }
 
     fn default_surface_session(&self) -> SurfaceSessionId {
-        self.surface_sessions
+        self.sessions
+            .sessions()
             .first()
             .copied()
             .unwrap_or(SurfaceSessionId(1))
@@ -2574,9 +2722,10 @@ impl Manifold {
     }
 
     fn active_surface_session_panes(&self) -> Vec<u64> {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
-            .filter(|(_, session)| *session == self.active_surface_session)
+            .filter(|(_, session)| *session == self.sessions.active())
             .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
             .filter_map(|(surface, _)| self.pane_for_toplevel_surface(surface))
             .fold(Vec::new(), |mut panes, pane| {
@@ -2588,9 +2737,10 @@ impl Manifold {
     }
 
     fn active_surface_session_pane_app_ids(&self) -> Vec<(u64, String)> {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
-            .filter(|(_, session)| *session == self.active_surface_session)
+            .filter(|(_, session)| *session == self.sessions.active())
             .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
             .filter_map(|(surface, _)| {
                 let pane = self.pane_for_toplevel_surface(surface)?;
@@ -2631,7 +2781,7 @@ impl Manifold {
         (self
             .session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+            == self.sessions.active()
             && self.surface_participates_in_resolved_layout(&surface)
             && self.window_for_any_toplevel_surface(&surface).is_some())
         .then_some(surface)
@@ -2774,15 +2924,16 @@ impl Manifold {
     }
 
     pub const fn active_surface_session(&self) -> SurfaceSessionId {
-        self.active_surface_session
+        self.sessions.active()
     }
 
     fn save_active_native_session_layout(&mut self) {
-        if !self.surface_sessions.contains(&self.active_surface_session) {
+        let active = self.sessions.active();
+        if !self.sessions.contains(active) {
             return;
         }
         self.native_session_layouts.insert(
-            self.active_surface_session,
+            active,
             NativeSessionLayout {
                 layout: self.layout.clone(),
                 leaf_selected_panes: self.layout_leaf_selected_panes.clone(),
@@ -2812,12 +2963,14 @@ impl Manifold {
         let Some(session) = self.most_recent_live_surface_session() else {
             return false;
         };
-        if self.active_surface_session == session {
+        if self.sessions.active() == session {
             return false;
         }
         self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session = session;
+        if self.sessions.activate_recent(session).is_err() {
+            return false;
+        }
         self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
@@ -2827,11 +2980,12 @@ impl Manifold {
     }
 
     fn most_recent_live_surface_session(&self) -> Option<SurfaceSessionId> {
-        self.surface_session_interaction_order
+        self.sessions
+            .interaction_order()
             .iter()
             .copied()
             .find(|session| {
-                self.surface_sessions.contains(session)
+                self.sessions.contains(*session)
                     && self.space.elements().any(|window| {
                         let Some(surface) = Self::window_toplevel_surface(window) else {
                             return false;
@@ -2844,13 +2998,7 @@ impl Manifold {
     }
 
     fn record_surface_session_interaction(&mut self, session: SurfaceSessionId) {
-        if !self.surface_sessions.contains(&session) {
-            return;
-        }
-        self.last_interacted_surface_session = session;
-        self.surface_session_interaction_order
-            .retain(|existing| *existing != session);
-        self.surface_session_interaction_order.insert(0, session);
+        self.sessions.record_interaction(session);
     }
 
     pub fn reset_transient_input_state(&mut self) {
@@ -2880,37 +3028,24 @@ impl Manifold {
         self.suppress_mode_toggle_key_release = false;
         self.shortcut_prefix_active = false;
         self.suppress_shortcut_prefix_key_release = None;
-        self.pending_pointer_focus_surface = None;
-        self.pointer_hover_toplevel_surface = None;
+        self.focus.clear_transient_pointer_state();
     }
 
     pub const fn surface_session_count(&self) -> usize {
-        self.surface_sessions.len()
+        self.sessions.count()
     }
 
     pub fn clear_initial_surface_session(&mut self) {
-        if self.surface_sessions != [SurfaceSessionId(1)]
-            || !self.window_surface_sessions.is_empty()
-            || self.next_surface_session != 2
-        {
+        if self.sessions.clear_initial().is_err() {
             warn!("refusing to clear non-initial surface session state");
             return;
         }
-
-        self.active_surface_session = SurfaceSessionId(1);
-        self.last_interacted_surface_session = SurfaceSessionId(1);
-        self.surface_session_interaction_order.clear();
-        self.next_surface_session = 1;
-        self.surface_sessions.clear();
-        self.surface_session_names.clear();
-        self.surface_session_working_directories.clear();
-        self.surface_session_directories.clear();
-        self.surface_session_directory_defaults.clear();
         self.native_session_layouts.clear();
     }
 
     pub fn surface_session_summaries(&self) -> Vec<SurfaceSessionSummary> {
-        self.surface_sessions
+        self.sessions
+            .sessions()
             .iter()
             .copied()
             .filter_map(|session| self.surface_session_summary(session))
@@ -2921,33 +3056,30 @@ impl Manifold {
         &self,
         session: SurfaceSessionId,
     ) -> Option<SurfaceSessionSummary> {
-        self.surface_sessions
-            .contains(&session)
+        self.sessions
+            .contains(session)
             .then(|| SurfaceSessionSummary {
                 id: session.raw(),
                 name: self.surface_session_name(session).to_string(),
-                active: session == self.active_surface_session,
+                active: session == self.sessions.active(),
                 windows: self.surface_session_window_count(session),
                 working_directory: self
-                    .surface_session_working_directories
-                    .get(&session)
+                    .sessions
+                    .working_directory(session)
                     .map(|directory| directory.to_string_lossy().into_owned()),
             })
     }
 
-    pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: String) -> bool {
+    pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: &str) -> bool {
         let name = name.trim();
-        if name.is_empty() || !self.surface_sessions.contains(&session) {
+        if name.is_empty() {
             return false;
         }
-        self.surface_session_names
-            .retain(|(assigned_session, _)| *assigned_session != session);
-        self.surface_session_names.push((session, name.to_string()));
-        true
+        self.sessions.rename(session, name).is_ok()
     }
 
     pub fn active_surface_session_name(&self) -> &str {
-        self.surface_session_name(self.active_surface_session)
+        self.surface_session_name(self.sessions.active())
     }
 
     pub fn resolve_directory_surface_session(
@@ -2955,16 +3087,7 @@ impl Manifold {
         directory: &Path,
     ) -> Option<SurfaceSessionId> {
         self.prune_directory_surface_sessions(directory);
-        let session = self
-            .surface_session_directory_defaults
-            .get(directory)
-            .copied()?;
-        if self.surface_sessions.contains(&session) {
-            Some(session)
-        } else {
-            self.surface_session_directory_defaults.remove(directory);
-            None
-        }
+        self.sessions.directory_default(directory)
     }
 
     pub fn directory_surface_session_summaries(
@@ -2972,10 +3095,9 @@ impl Manifold {
         directory: &Path,
     ) -> Vec<SurfaceSessionSummary> {
         self.prune_directory_surface_sessions(directory);
-        self.surface_session_directories
-            .get(directory)
-            .into_iter()
-            .flatten()
+        self.sessions
+            .directory_sessions(directory)
+            .iter()
             .copied()
             .filter_map(|session| self.surface_session_summary(session))
             .collect()
@@ -2987,52 +3109,20 @@ impl Manifold {
         session: SurfaceSessionId,
         set_default: bool,
     ) -> bool {
-        if !self.surface_sessions.contains(&session) {
-            return false;
-        }
-        let sessions = self
-            .surface_session_directories
-            .entry(directory.clone())
-            .or_default();
-        if !sessions.contains(&session) {
-            sessions.push(session);
-        }
-        self.surface_session_working_directories
-            .entry(session)
-            .or_insert_with(|| directory.clone());
-        if set_default
-            || !self
-                .surface_session_directory_defaults
-                .get(&directory)
-                .is_some_and(|default| self.surface_sessions.contains(default))
-        {
-            self.surface_session_directory_defaults
-                .insert(directory, session);
-        }
-        true
+        self.sessions
+            .remember_directory(directory, session, set_default)
+            .is_ok()
     }
 
     fn prune_directory_surface_sessions(&mut self, directory: &Path) {
-        if let Some(sessions) = self.surface_session_directories.get_mut(directory) {
-            sessions.retain(|session| self.surface_sessions.contains(session));
-            if sessions.is_empty() {
-                self.surface_session_directories.remove(directory);
-            }
-        }
-        if self
-            .surface_session_directory_defaults
-            .get(directory)
-            .is_some_and(|session| !self.surface_sessions.contains(session))
-        {
-            self.surface_session_directory_defaults.remove(directory);
-        }
+        self.sessions.prune_directory(directory);
     }
 
     pub fn close_surface_session(&mut self, session: SurfaceSessionId) -> bool {
-        if !self.surface_sessions.contains(&session) {
+        if !self.sessions.contains(session) {
             return false;
         }
-        let closing_active = self.active_surface_session == session;
+        let closing_active = self.sessions.active() == session;
         if closing_active {
             self.stop_configured_workspace_plugins_for_rebind();
         } else {
@@ -3045,7 +3135,7 @@ impl Manifold {
         }
 
         self.remove_surface_session_record(session);
-        self.restore_native_session_layout(self.active_surface_session);
+        self.restore_native_session_layout(self.sessions.active());
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
         if closing_active {
@@ -3061,10 +3151,11 @@ impl Manifold {
 
     fn prune_empty_unfocused_surface_sessions(&mut self) -> bool {
         let sessions = self
-            .surface_sessions
+            .sessions
+            .sessions()
             .iter()
             .copied()
-            .filter(|session| *session != self.active_surface_session)
+            .filter(|session| *session != self.sessions.active())
             .filter(|session| !self.surface_session_has_content_panes_or_pending(*session))
             .collect::<Vec<_>>();
         if sessions.is_empty() {
@@ -3077,47 +3168,13 @@ impl Manifold {
     }
 
     fn remove_surface_session_record(&mut self, session: SurfaceSessionId) {
-        self.surface_sessions
-            .retain(|existing| *existing != session);
-        self.surface_session_names
-            .retain(|(assigned_session, _)| *assigned_session != session);
-        self.surface_session_working_directories.remove(&session);
-        self.surface_session_interaction_order
-            .retain(|existing| *existing != session);
-        self.surface_session_directories
-            .retain(|_, assigned_sessions| {
-                assigned_sessions.retain(|assigned_session| *assigned_session != session);
-                !assigned_sessions.is_empty()
-            });
-        self.surface_session_directory_defaults
-            .retain(|_, assigned_session| *assigned_session != session);
         self.native_session_layouts.remove(&session);
-        self.session_dbus_buses
-            .retain(|(realm, _)| *realm != SessionBusRealm::Surface(session.raw()));
-        if self.active_surface_session == session {
-            self.active_surface_session = self
-                .surface_session_interaction_order
-                .iter()
-                .copied()
-                .find(|candidate| self.surface_sessions.contains(candidate))
-                .or_else(|| self.surface_sessions.first().copied())
-                .unwrap_or(SurfaceSessionId(0));
-        }
-        if self.active_surface_session.raw() != 0
-            && !self
-                .surface_session_interaction_order
-                .contains(&self.active_surface_session)
-        {
-            self.surface_session_interaction_order
-                .insert(0, self.active_surface_session);
-        }
-        if self.last_interacted_surface_session == session {
-            self.last_interacted_surface_session = self.active_surface_session;
-        }
+        let _ = self.sessions.remove(session);
     }
 
     fn content_surfaces_for_session(&self, session: SurfaceSessionId) -> Vec<WlSurface> {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
             .filter(|(surface, assigned_session)| {
                 *assigned_session == session
@@ -3128,7 +3185,8 @@ impl Manifold {
     }
 
     fn surface_session_has_content_panes_or_pending(&self, session: SurfaceSessionId) -> bool {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
             .any(|(surface, assigned_session)| {
                 *assigned_session == session
@@ -3142,32 +3200,15 @@ impl Manifold {
     }
 
     pub fn resolve_surface_session(&self, query: &str) -> Option<SurfaceSessionId> {
-        let query = query.trim();
-        if query.is_empty() {
-            return None;
-        }
-        if let Ok(raw) = query.parse::<u64>() {
-            let session = SurfaceSessionId(raw);
-            if self.surface_sessions.contains(&session) {
-                return Some(session);
-            }
-        }
-        self.surface_sessions.iter().copied().find(|session| {
-            self.surface_session_name(*session)
-                .eq_ignore_ascii_case(query)
-        })
+        self.sessions.resolve(query)
     }
 
     pub fn surface_session_name(&self, session: SurfaceSessionId) -> &str {
-        self.surface_session_names
-            .iter()
-            .rev()
-            .find_map(|(assigned_session, name)| (*assigned_session == session).then_some(name))
-            .map_or("untitled", String::as_str)
+        self.sessions.name(session).unwrap_or("untitled")
     }
 
     pub fn active_surface_session_window_count(&self) -> usize {
-        self.surface_session_window_count(self.active_surface_session)
+        self.surface_session_window_count(self.sessions.active())
     }
 
     fn surface_session_window_count(&self, session: SurfaceSessionId) -> usize {
@@ -3186,14 +3227,15 @@ impl Manifold {
     }
 
     pub fn switch_to_surface_session(&mut self, session: SurfaceSessionId) -> bool {
-        if !self.surface_sessions.contains(&session) || self.active_surface_session == session {
+        if !self.sessions.contains(session) || self.sessions.active() == session {
             return false;
         }
         self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session = session;
+        if self.sessions.activate(session).is_err() {
+            return false;
+        }
         self.restore_native_session_layout(session);
-        self.record_surface_session_interaction(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
@@ -3202,31 +3244,16 @@ impl Manifold {
     }
 
     pub fn switch_to_next_surface_session(&mut self) -> bool {
-        let Some(active_index) = self
-            .surface_sessions
-            .iter()
-            .position(|session| *session == self.active_surface_session)
-        else {
-            self.stop_configured_workspace_plugins_for_rebind();
-            self.active_surface_session = self
-                .surface_sessions
-                .first()
-                .copied()
-                .unwrap_or(SurfaceSessionId(1));
-            self.restore_native_session_layout(self.active_surface_session);
-            self.reconfigure_focus_stack();
-            self.start_configured_workspace_plugins_after_rebind();
-            return true;
-        };
-        if self.surface_sessions.len() <= 1 {
+        if self.sessions.count() <= 1 {
             return false;
         }
         self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session =
-            self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
-        self.restore_native_session_layout(self.active_surface_session);
-        self.record_surface_session_interaction(self.active_surface_session);
+        let Ok(next) = self.sessions.activate_next() else {
+            self.start_configured_workspace_plugins_after_rebind();
+            return false;
+        };
+        self.restore_native_session_layout(next);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
@@ -3234,14 +3261,14 @@ impl Manifold {
         true
     }
 
-    pub fn create_and_attach_surface_session(&mut self) -> SurfaceSessionId {
+    pub fn create_and_attach_surface_session(&mut self) -> Result<SurfaceSessionId> {
         self.create_and_attach_named_surface_session(None)
     }
 
     pub fn create_and_attach_named_surface_session(
         &mut self,
         name: Option<String>,
-    ) -> SurfaceSessionId {
+    ) -> Result<SurfaceSessionId> {
         self.create_and_attach_named_surface_session_in_directory(name, current_process_directory())
     }
 
@@ -3249,43 +3276,30 @@ impl Manifold {
         &mut self,
         name: Option<String>,
         directory: PathBuf,
-    ) -> SurfaceSessionId {
-        let session = SurfaceSessionId(self.next_surface_session);
-        self.next_surface_session += 1;
-        self.surface_sessions.push(session);
-        self.surface_session_names.push((
-            session,
-            name.filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| default_surface_session_name(session)),
-        ));
-        self.surface_session_working_directories
-            .insert(session, directory);
+    ) -> Result<SurfaceSessionId> {
         self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session = session;
+        let next = self.sessions.next_id();
+        let session = self.sessions.create(
+            name.filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| default_surface_session_name(next)),
+            directory,
+        )?;
         self.restore_native_session_layout(session);
-        self.record_surface_session_interaction(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
-        session
+        Ok(session)
     }
 
     #[cfg(test)]
     pub fn surface_session_working_directory(&self, session: SurfaceSessionId) -> Option<&Path> {
-        self.surface_session_working_directories
-            .get(&session)
-            .map(PathBuf::as_path)
+        self.sessions.working_directory(session)
     }
 
     fn session_for_toplevel_surface(&self, surface: &WlSurface) -> Option<SurfaceSessionId> {
-        self.window_surface_sessions
-            .iter()
-            .rev()
-            .find_map(|(assigned_surface, session)| {
-                (assigned_surface == surface).then_some(*session)
-            })
+        self.sessions.surface_session(surface)
     }
 
     pub fn window_belongs_to_active_surface_session(&self, window: &Window) -> bool {
@@ -3294,7 +3308,7 @@ impl Manifold {
         };
         self.session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+            == self.sessions.active()
     }
 
     pub fn window_visible_in_presentation(&self, window: &Window) -> bool {
@@ -3438,8 +3452,8 @@ impl Manifold {
     pub fn focused_window_fullscreen(&self) -> bool {
         self.managed_fullscreen
             || self
-                .active_toplevel_surface
-                .as_ref()
+                .focus
+                .active_toplevel()
                 .is_some_and(|surface| self.toplevel_fullscreen_output(surface).is_some())
     }
 
@@ -3474,7 +3488,7 @@ impl Manifold {
         {
             self.layout.set_active_leaf(leaf);
         }
-        self.active_toplevel_surface.clone_from(&active_surface);
+        self.focus.set_active_toplevel(active_surface.clone());
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             self.refresh_resolved_layout_from_policy();
         }
@@ -3520,7 +3534,7 @@ impl Manifold {
     }
 
     pub fn active_window(&self) -> Option<Window> {
-        self.active_toplevel_surface.as_ref().and_then(|active| {
+        self.focus.active_toplevel().and_then(|active| {
             self.space
                 .elements()
                 .find(|window| {
@@ -3532,8 +3546,8 @@ impl Manifold {
     }
 
     pub fn active_presentation_window(&self) -> Option<Window> {
-        self.active_toplevel_surface
-            .as_ref()
+        self.focus
+            .active_toplevel()
             .and_then(|active| self.window_for_toplevel_surface(active))
     }
 
@@ -3546,7 +3560,7 @@ impl Manifold {
         if self
             .session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+            == self.sessions.active()
             && self.surface_participates_in_resolved_layout(&surface)
             && let Some(pane) = self.pane_for_toplevel_surface(&surface)
             && self.focus_pane(pane)
@@ -3595,14 +3609,13 @@ impl Manifold {
     }
 
     pub fn set_presentation_window_focused(&mut self, focused: bool) {
-        if self.presentation_window_focused && !focused {
+        if self.focus.set_presentation_window_focused(focused) {
             self.reset_transient_input_state();
         }
-        self.presentation_window_focused = focused;
     }
 
     pub const fn presentation_window_focused(&self) -> bool {
-        self.presentation_window_focused
+        self.focus.presentation_window_focused()
     }
 
     pub fn agent_has_focused_window(&self, agent_id: &str) -> bool {
@@ -3617,10 +3630,10 @@ impl Manifold {
         else {
             return false;
         };
-        if record.session != self.active_surface_session {
+        if record.session != self.sessions.active() {
             return false;
         }
-        let Some(surface) = self.active_toplevel_surface.as_ref() else {
+        let Some(surface) = self.focus.active_toplevel() else {
             return false;
         };
         if self
@@ -3647,11 +3660,12 @@ impl Manifold {
     ) -> bool {
         let token = (!activation_token.is_empty()).then(|| activation_token.to_string());
         if self.focus_presentation_window_now(token.as_deref()) {
-            self.pending_presentation_focus_activation_token = None;
+            self.focus.clear_presentation_activation();
             return true;
         }
         if self.attach_requested {
-            self.pending_presentation_focus_activation_token = Some(token.unwrap_or_default());
+            self.focus
+                .queue_presentation_activation(token.unwrap_or_default());
         }
         false
     }
@@ -3659,7 +3673,7 @@ impl Manifold {
     pub(crate) const fn take_pending_presentation_focus_activation_token(
         &mut self,
     ) -> Option<String> {
-        self.pending_presentation_focus_activation_token.take()
+        self.focus.take_presentation_activation()
     }
 
     fn focus_presentation_window_now(&self, activation_token: Option<&str>) -> bool {
@@ -3692,7 +3706,7 @@ impl Manifold {
     }
 
     pub fn focused_pane(&self) -> Option<u64> {
-        let surface = self.active_toplevel_surface.as_ref()?;
+        let surface = self.focus.active_toplevel()?;
         self.surface_has_visible_pane_item(surface)
             .then(|| self.pane_for_toplevel_surface(surface))
             .flatten()
@@ -3700,11 +3714,11 @@ impl Manifold {
 
     pub fn register_extension(
         &mut self,
-        role: String,
+        role: &str,
         metadata: ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
-        let role = normalize_registry_value(&role).context("extension role must not be empty")?;
+        let role = normalize_registry_value(role).context("extension role must not be empty")?;
         ensure_metadata(&metadata)?;
         let id = stable_registry_id("ext", [&role], &metadata);
         if let Some(record) = self
@@ -3791,197 +3805,65 @@ impl Manifold {
 
     pub fn register_agent(
         &mut self,
-        kind: String,
-        metadata: ExtensionMetadata,
+        kind: &str,
+        metadata: &ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
-        let kind = normalize_registry_value(&kind).context("agent kind must not be empty")?;
-        ensure_metadata(&metadata)?;
         let session = metadata
             .get("surface_session")
             .or_else(|| metadata.get("session_id"))
             .and_then(|value| self.resolve_surface_session(value))
-            .unwrap_or(self.active_surface_session);
-        let id = stable_agent_registry_id(&kind, &metadata);
-        let status = metadata
-            .get("status")
-            .and_then(|value| normalize_registry_value(value));
-        if let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == id)
-        {
-            record.kind = kind;
-            if let Some(status) = status {
-                record.status = status;
-            }
-            merge_agent_metadata(&mut record.metadata, metadata);
-            record.sender = sender;
-            record.session = session;
-        } else {
-            self.extension_registry.agents.push(AgentRecord {
-                id: id.clone(),
-                kind,
-                status: status.unwrap_or_else(|| "unknown".to_string()),
-                metadata,
-                sender,
-                session,
-                attention: false,
-                unread_notifications: 0,
-            });
-        }
-        Ok(id)
+            .unwrap_or_else(|| self.sessions.active());
+        self.extension_registry
+            .register_agent(kind, metadata.clone(), sender, session)
     }
 
     pub fn update_agent(
         &mut self,
         agent_id: &str,
-        status: String,
+        status: &str,
         metadata: ExtensionMetadata,
         sender: String,
     ) -> Result<bool> {
-        let status = normalize_registry_value(&status).context("agent status must not be empty")?;
-        ensure_metadata(&metadata)?;
-        let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == agent_id)
-        else {
-            return Ok(false);
-        };
-        record.status = status;
-        merge_agent_metadata(&mut record.metadata, metadata);
-        record.sender = sender;
-        Ok(true)
+        self.extension_registry
+            .update_agent(agent_id, status, metadata, sender)
     }
 
-    pub fn notify_agent(
-        &mut self,
-        agent_id: &str,
-        title: String,
-        subtitle: String,
-        body: String,
-        level: String,
-        metadata: ExtensionMetadata,
-        sender: String,
-    ) -> Result<String> {
-        let title =
-            normalize_registry_value(&title).context("notification title must not be empty")?;
-        let level = normalize_registry_value(&level).unwrap_or_else(|| "info".to_string());
-        ensure_metadata(&metadata)?;
-        let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == agent_id)
-        else {
-            anyhow::bail!("unknown agent {agent_id}");
-        };
-        record.sender = sender;
-        record.attention = true;
-        record.unread_notifications = record.unread_notifications.saturating_add(1);
-        if matches!(level.as_str(), "waiting" | "blocked" | "error") {
-            record.status.clone_from(&level);
-        }
-
-        let mut id_metadata = metadata.clone();
-        id_metadata.insert("agent_id".to_string(), agent_id.to_string());
-        id_metadata.insert("title".to_string(), title.clone());
-        id_metadata.insert("body".to_string(), body.clone());
-        let id = stable_registry_id("agent-notification", [&level], &id_metadata);
-        self.extension_registry
-            .notifications
-            .push(AgentNotificationRecord {
-                id: id.clone(),
-                agent_id: agent_id.to_string(),
-                title,
-                subtitle,
-                body,
-                level,
-                metadata,
-                unread: true,
-            });
-        Ok(id)
+    pub fn notify_agent(&mut self, request: AgentNotification) -> Result<String> {
+        self.extension_registry.notify_agent(request)
     }
 
     pub fn clear_agent_attention(&mut self, agent_id: &str) -> bool {
-        let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == agent_id)
-        else {
-            return false;
-        };
-        record.attention = false;
-        record.unread_notifications = 0;
-        for notification in self
-            .extension_registry
-            .notifications
-            .iter_mut()
-            .filter(|notification| notification.agent_id == agent_id)
-        {
-            notification.unread = false;
-        }
-        true
+        self.extension_registry.clear_agent_attention(agent_id)
     }
 
     pub fn unregister_agent(&mut self, agent_id: &str) -> bool {
-        let before = self.extension_registry.agents.len();
-        self.extension_registry
-            .agents
-            .retain(|agent| agent.id != agent_id);
-        if before == self.extension_registry.agents.len() {
-            return false;
-        }
-        self.extension_registry
-            .notifications
-            .retain(|notification| notification.agent_id != agent_id);
-        true
+        self.extension_registry.unregister_agent(agent_id)
     }
 
     pub fn unregister_agent_by_identity(
         &mut self,
-        kind: String,
-        metadata: ExtensionMetadata,
+        kind: &str,
+        metadata: &ExtensionMetadata,
     ) -> Result<Option<String>> {
-        let kind = normalize_registry_value(&kind).context("agent kind must not be empty")?;
-        ensure_metadata(&metadata)?;
-        let id = stable_agent_registry_id(&kind, &metadata);
+        let kind = normalize_registry_value(kind).context("agent kind must not be empty")?;
+        ensure_metadata(metadata)?;
+        let id = stable_agent_registry_id(&kind, metadata);
         Ok(self.unregister_agent(&id).then_some(id))
     }
 
     fn unregister_agents_for_pane(&mut self, pane_id: u64) -> Vec<String> {
-        let pane_id = pane_id.to_string();
-        let removed = self
-            .extension_registry
-            .agents
-            .iter()
-            .filter(|agent| agent.metadata.get("pane_id") == Some(&pane_id))
-            .map(|agent| agent.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        if removed.is_empty() {
-            return Vec::new();
-        }
-        self.extension_registry
-            .agents
-            .retain(|agent| !removed.contains(&agent.id));
-        self.extension_registry
-            .notifications
-            .retain(|notification| !removed.contains(&notification.agent_id));
-        removed.into_iter().collect()
+        self.extension_registry.unregister_agents_for_pane(pane_id)
     }
 
     pub fn register_status_publisher(
         &mut self,
-        role: String,
+        role: &str,
         metadata: ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
         let role =
-            normalize_registry_value(&role).context("status publisher role must not be empty")?;
+            normalize_registry_value(role).context("status publisher role must not be empty")?;
         ensure_metadata(&metadata)?;
         let id = stable_registry_id("status-pub", [&role], &metadata);
         if let Some(record) = self
@@ -4008,21 +3890,21 @@ impl Manifold {
 
     pub fn publish_status(
         &mut self,
-        publisher: String,
-        channel: String,
-        state: String,
-        label: String,
+        publisher: &str,
+        channel: &str,
+        state: &str,
+        label: &str,
         metadata: ExtensionMetadata,
     ) -> Result<bool> {
         let publisher =
-            normalize_registry_value(&publisher).context("status publisher must not be empty")?;
+            normalize_registry_value(publisher).context("status publisher must not be empty")?;
         if publisher != MANIFOLD_STATUS_PUBLISHER {
             self.ensure_status_publisher_exists(&publisher)?;
         }
         let channel =
-            normalize_registry_value(&channel).context("status channel must not be empty")?;
-        let state = normalize_registry_value(&state).context("status state must not be empty")?;
-        let label = normalize_registry_value(&label).unwrap_or_else(|| channel.clone());
+            normalize_registry_value(channel).context("status channel must not be empty")?;
+        let state = normalize_registry_value(state).context("status state must not be empty")?;
+        let label = normalize_registry_value(label).unwrap_or_else(|| channel.clone());
         ensure_metadata(&metadata)?;
 
         let next = StatusItemRecord {
@@ -4120,10 +4002,10 @@ impl Manifold {
             metadata.insert("scope".to_string(), "workspace".to_string());
             metadata.insert("click_action".to_string(), "disable".to_string());
             let _ = self.publish_status(
-                MANIFOLD_STATUS_PUBLISHER.to_string(),
-                PASSTHROUGH_STATUS_CHANNEL.to_string(),
-                "active".to_string(),
-                "Passthrough".to_string(),
+                MANIFOLD_STATUS_PUBLISHER,
+                PASSTHROUGH_STATUS_CHANNEL,
+                "active",
+                "Passthrough",
                 metadata,
             );
         } else {
@@ -4180,6 +4062,10 @@ impl Manifold {
             .unwrap_or_default()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "plugin replacement ABI keeps independently configured lifecycle/resource inputs; tracked outside central-state services"
+    )]
     pub(crate) fn replace_configured_wasm_plugin(
         &mut self,
         module_id: &str,
@@ -4201,9 +4087,9 @@ impl Manifold {
         // singular legacy lane.
         let filesystem = if let Some(writable) = workspace_filesystem_writable {
             let host_path = self
-                .surface_session_working_directories
-                .get(&self.active_surface_session)
-                .cloned()
+                .sessions
+                .working_directory(self.sessions.active())
+                .map(Path::to_path_buf)
                 .context("active workspace has no working directory")?;
             Some(HostedPluginFilesystem {
                 host_path,
@@ -4290,9 +4176,9 @@ impl Manifold {
 
     fn start_configured_workspace_plugins_after_rebind(&mut self) {
         let Some(host_path) = self
-            .surface_session_working_directories
-            .get(&self.active_surface_session)
-            .cloned()
+            .sessions
+            .working_directory(self.sessions.active())
+            .map(Path::to_path_buf)
         else {
             return;
         };
@@ -4349,7 +4235,7 @@ impl Manifold {
             instance_id: actor_name.to_string(),
             generation: actor.generation(),
             reason,
-            session_id: Some(self.active_surface_session.raw()),
+            session_id: Some(self.sessions.active().raw()),
             workspace_root: ".".to_string(),
             data: lifecycle
                 .data
@@ -4398,6 +4284,11 @@ impl Manifold {
             .context("plugin stop lifecycle failed")
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments,
+        reason = "plugin generation construction consumes these values conditionally across component and legacy branches; tracked outside central-state services"
+    )]
     fn replace_wasm_plugin_with_instance_id(
         &mut self,
         instance_id: Option<&str>,
@@ -4804,11 +4695,11 @@ impl Manifold {
         &mut self,
         extension_id: String,
         identity: ExtensionMetadata,
-        role: String,
+        role: &str,
         sender: String,
     ) -> Result<String> {
         self.ensure_extension_exists(&extension_id)?;
-        let role = normalize_registry_value(&role).context("window role must not be empty")?;
+        let role = normalize_registry_value(role).context("window role must not be empty")?;
         ensure_metadata(&identity)?;
         let id = stable_registry_id("win", [&extension_id, &role], &identity);
         if let Some(record) = self
@@ -4835,10 +4726,10 @@ impl Manifold {
     pub fn request_window_placement(
         &mut self,
         window_id: &str,
-        placement: ExtensionMetadata,
+        placement: &ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
-        ensure_metadata(&placement)?;
+        ensure_metadata(placement)?;
         let window = self.window_record(window_id)?;
         let mut detail = placement.clone();
         detail.insert("window_id".to_string(), window_id.to_string());
@@ -4860,8 +4751,8 @@ impl Manifold {
         {
             self.assign_toplevel_surface_session(&surface, session);
         }
-        if placement_requests_left_panel(&placement) {
-            let width = placement_panel_width(&placement).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
+        if placement_requests_left_panel(placement) {
+            let width = placement_panel_width(placement).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
             let visible = placement
                 .get("visible")
                 .and_then(|value| parse_boolish(value))
@@ -4885,13 +4776,13 @@ impl Manifold {
     pub fn replace_window_role(
         &mut self,
         window_id: &str,
-        role: String,
-        options: ExtensionMetadata,
+        role: &str,
+        options: &ExtensionMetadata,
         _sender: String,
     ) -> Result<bool> {
         let window = self.window_record(window_id)?;
-        let role = normalize_registry_value(&role).context("replacement role must not be empty")?;
-        ensure_metadata(&options)?;
+        let role = normalize_registry_value(role).context("replacement role must not be empty")?;
+        ensure_metadata(options)?;
         let dismiss_replaced = options
             .get("dismiss_replaced")
             .or_else(|| options.get("dismiss-replaced"))
@@ -4938,7 +4829,7 @@ impl Manifold {
         self.panel_reservations
             .retain(|panel| panel.surface != surface);
 
-        if self.active_toplevel_surface.as_ref() == Some(&surface) {
+        if self.focus.active_toplevel() == Some(&surface) {
             self.focus_toplevel_surface(None);
         }
 
@@ -5010,14 +4901,14 @@ impl Manifold {
 
     pub fn request_shortcut_grant(
         &mut self,
-        extension_id: String,
-        shortcut: String,
+        extension_id: &str,
+        shortcut: &str,
         scope: String,
         label: String,
         sender: String,
     ) -> Result<String> {
-        self.ensure_extension_exists(&extension_id)?;
-        let shortcut = normalize_registry_value(&shortcut).context("shortcut must not be empty")?;
+        self.ensure_extension_exists(extension_id)?;
+        let shortcut = normalize_registry_value(shortcut).context("shortcut must not be empty")?;
         ensure!(
             !manifold_owned_shortcut(&shortcut),
             "shortcut conflicts with an existing Manifold-owned shortcut"
@@ -5026,7 +4917,7 @@ impl Manifold {
         detail.insert("shortcut".to_string(), shortcut);
         detail.insert("scope".to_string(), scope);
         detail.insert("label".to_string(), label);
-        Ok(self.record_grant(&extension_id, "shortcut", detail, sender))
+        Ok(self.record_grant(extension_id, "shortcut", detail, sender))
     }
 
     pub fn request_extension_window_focus(&mut self, window_id: &str) -> Result<bool> {
@@ -5146,13 +5037,9 @@ impl Manifold {
         surface: &WlSurface,
         session: SurfaceSessionId,
     ) -> bool {
-        if !self.surface_sessions.contains(&session) {
+        if self.sessions.assign_surface(surface, session).is_err() {
             return false;
         }
-        self.window_surface_sessions
-            .retain(|(assigned_surface, _)| assigned_surface != surface);
-        self.window_surface_sessions
-            .push((surface.clone(), session));
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
@@ -5166,15 +5053,15 @@ impl Manifold {
     }
 
     pub fn set_pending_pointer_focus_surface(&mut self, surface: Option<WlSurface>) {
-        self.pending_pointer_focus_surface = surface;
+        self.focus.set_pending_pointer_focus(surface);
     }
 
     pub const fn take_pending_pointer_focus_surface(&mut self) -> Option<WlSurface> {
-        self.pending_pointer_focus_surface.take()
+        self.focus.take_pending_pointer_focus()
     }
 
     pub fn set_pointer_hover_toplevel_surface(&mut self, surface: Option<WlSurface>) {
-        self.pointer_hover_toplevel_surface = surface;
+        self.focus.set_pointer_hover(surface);
     }
 
     pub fn cycle_focus(&mut self, direction: FocusDirection) -> bool {
@@ -5191,8 +5078,8 @@ impl Manifold {
         }
 
         let active_index = self
-            .active_toplevel_surface
-            .as_ref()
+            .focus
+            .active_toplevel()
             .and_then(|active| {
                 windows.iter().position(|window| {
                     Self::window_toplevel_surface(window).as_ref() == Some(active)
@@ -5208,7 +5095,7 @@ impl Manifold {
     }
 
     fn cycle_focus_in_active_layout_leaf(&mut self, direction: FocusDirection) -> bool {
-        let Some(active_surface) = self.active_toplevel_surface.clone() else {
+        let Some(active_surface) = self.focus.active_toplevel().cloned() else {
             return false;
         };
         if !self.surface_has_visible_pane_item(&active_surface) {
@@ -5292,8 +5179,8 @@ impl Manifold {
     }
 
     fn active_content_surface_for_layout_action(&self) -> Option<WlSurface> {
-        self.active_toplevel_surface
-            .as_ref()
+        self.focus
+            .active_toplevel()
             .filter(|surface| self.surface_has_visible_pane_item(surface))
             .cloned()
             .or_else(|| self.surface_for_layout_leaf(self.layout.active_leaf()))
@@ -5363,7 +5250,7 @@ impl Manifold {
     }
 
     pub fn focused_window_index(&self) -> Option<usize> {
-        let active = self.active_toplevel_surface.as_ref()?;
+        let active = self.focus.active_toplevel()?;
         if !self.surface_can_receive_focus(active) {
             return None;
         }
@@ -5378,7 +5265,7 @@ impl Manifold {
     }
 
     pub fn focused_surface_id(&self) -> Option<String> {
-        let surface = self.active_toplevel_surface.as_ref()?;
+        let surface = self.focus.active_toplevel()?;
         if !self.surface_can_receive_focus(surface) {
             return None;
         }
@@ -5428,7 +5315,8 @@ impl Manifold {
         }
         if let Some(active_window) = self.active_window() {
             self.space.raise_element(&active_window, true);
-            self.activate_window_exclusively(self.active_toplevel_surface.clone().as_ref());
+            let active_surface = self.focus.active_toplevel().cloned();
+            self.activate_window_exclusively(active_surface.as_ref());
         } else if let Some(window) = visible_windows.last() {
             self.focus_window(window);
         } else {
@@ -5506,7 +5394,7 @@ impl Manifold {
     }
 
     pub fn close_active_window(&mut self) -> bool {
-        let Some(surface) = self.active_toplevel_surface.clone() else {
+        let Some(surface) = self.focus.active_toplevel().cloned() else {
             return false;
         };
         if !self.surface_has_visible_pane_item(&surface) {
@@ -5524,7 +5412,7 @@ impl Manifold {
         let Some(surface) = self.surface_for_pane(pane) else {
             return false;
         };
-        if self.active_toplevel_surface.as_ref() == Some(&surface) {
+        if self.focus.active_toplevel() == Some(&surface) {
             self.reset_transient_input_state();
         }
         let closed = self.send_close_to_toplevel_surface(&surface);
@@ -5576,8 +5464,7 @@ impl Manifold {
             .collect::<Vec<_>>();
         self.fullscreen_toplevels
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
-        self.window_surface_sessions
-            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.sessions.retain_live_surfaces(&live_toplevel_surfaces);
         self.presentation_child_surfaces
             .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.presentation_member_surfaces
@@ -5621,35 +5508,32 @@ impl Manifold {
         });
         self.repair_resolved_layout_for_current_inventory();
         if self
-            .pending_pointer_focus_surface
-            .as_ref()
+            .focus
+            .pending_pointer_focus()
             .is_some_and(|surface| !live_toplevel_surfaces.iter().any(|live| live == surface))
         {
-            self.pending_pointer_focus_surface = None;
+            self.focus.set_pending_pointer_focus(None);
         }
         if self
-            .pointer_hover_toplevel_surface
-            .as_ref()
+            .focus
+            .pointer_hover()
             .is_some_and(|surface| !live_toplevel_surfaces.iter().any(|live| live == surface))
         {
-            self.pointer_hover_toplevel_surface = None;
+            self.focus.set_pointer_hover(None);
         }
         let window_count = self.active_surface_session_window_count();
-        let active_surface_is_live = self
-            .active_toplevel_surface
-            .as_ref()
-            .is_some_and(|surface| {
-                self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
-            });
+        let active_surface_is_live = self.focus.active_toplevel().is_some_and(|surface| {
+            self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
+        });
 
-        if self.active_toplevel_surface.is_some() && !active_surface_is_live {
+        if self.focus.active_toplevel().is_some() && !active_surface_is_live {
             self.reset_transient_input_state();
             if let Some(next_focus) = live_toplevel_surfaces
                 .iter()
                 .find(|surface| {
                     self.session_for_toplevel_surface(surface)
                         .unwrap_or(SurfaceSessionId(1))
-                        == self.active_surface_session
+                        == self.sessions.active()
                 })
                 .cloned()
             {
@@ -5676,7 +5560,7 @@ impl Manifold {
                     .find(|surface| {
                         self.session_for_toplevel_surface(surface)
                             .unwrap_or(SurfaceSessionId(1))
-                            == self.active_surface_session
+                            == self.sessions.active()
                     })
                     .cloned()
                 {
@@ -5710,7 +5594,7 @@ impl Manifold {
             && (self
                 .session_for_toplevel_surface(surface)
                 .unwrap_or(SurfaceSessionId(1))
-                == self.active_surface_session
+                == self.sessions.active()
                 || self.surface_is_visible_presentation_member(surface)
                 || self.surface_has_visible_panel(surface))
     }
@@ -5802,7 +5686,7 @@ impl Manifold {
     }
 
     pub fn active_layout_rect(&self) -> Option<LayoutRect> {
-        if let Some(surface) = self.active_toplevel_surface.as_ref()
+        if let Some(surface) = self.focus.active_toplevel()
             && let Some(rect) = self.layout_rect_for_toplevel_surface(surface)
         {
             return Some(rect);
@@ -5837,20 +5721,16 @@ impl Manifold {
 
     pub fn resolved_layout_active_kind(&self) -> &'static str {
         if self
-            .active_toplevel_surface
-            .as_ref()
+            .focus
+            .active_toplevel()
             .is_some_and(|surface| self.surface_has_visible_pane_item(surface))
         {
             return "client";
         }
-        if self
-            .active_toplevel_surface
-            .as_ref()
-            .is_some_and(|surface| {
-                self.surface_is_visible_presentation_member(surface)
-                    || self.surface_has_visible_panel(surface)
-            })
-        {
+        if self.focus.active_toplevel().is_some_and(|surface| {
+            self.surface_is_visible_presentation_member(surface)
+                || self.surface_has_visible_panel(surface)
+        }) {
             return "presentation";
         }
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
@@ -5880,8 +5760,8 @@ impl Manifold {
     pub fn resolved_layout_item_active(&self, item: ResolvedLayoutItem) -> bool {
         match item.kind {
             LayoutItemKind::Pane { pane } => {
-                self.active_toplevel_surface
-                    .as_ref()
+                self.focus
+                    .active_toplevel()
                     .and_then(|surface| self.pane_for_toplevel_surface(surface))
                     == Some(pane)
             }
@@ -6504,9 +6384,10 @@ struct WindowRefreshOutcome {
 )]
 mod tests {
     use super::{
-        ConfiguredPluginResources, Manifold, PresentationStatus, SESSION_OUTPUT_SIZE,
-        aggregate_preview1_compat_stats, ensure_legacy_instance_id_supported,
-        fullscreen_layout_rect, legacy_instance_id_to_validate, wasm_plugin_instance_id,
+        AgentNotification, ConfiguredPluginResources, ExtensionMetadata, Manifold,
+        PresentationStatus, SESSION_OUTPUT_SIZE, aggregate_preview1_compat_stats,
+        ensure_legacy_instance_id_supported, fullscreen_layout_rect,
+        legacy_instance_id_to_validate, wasm_plugin_instance_id,
         window_surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
@@ -6698,10 +6579,12 @@ mod tests {
         let mut state = Manifold::new(&mut event_loop, display);
         let directory = PathBuf::from("/tmp/manifold-session-cwd/subdir");
 
-        let session = state.create_and_attach_named_surface_session_in_directory(
-            Some("subdir".to_string()),
-            directory.clone(),
-        );
+        let session = state
+            .create_and_attach_named_surface_session_in_directory(
+                Some("subdir".to_string()),
+                directory.clone(),
+            )
+            .unwrap();
         assert!(state.remember_directory_surface_session(directory.clone(), session, true));
 
         assert_eq!(
@@ -6727,7 +6610,7 @@ mod tests {
         let mut state = Manifold::new(&mut event_loop, display);
         let initial_session = state.active_surface_session();
 
-        let next_session = state.create_and_attach_surface_session();
+        let next_session = state.create_and_attach_surface_session().unwrap();
 
         assert_eq!(state.active_surface_session(), next_session);
         assert_eq!(state.surface_session_count(), 1);
@@ -6758,8 +6641,9 @@ mod tests {
         state.clear_initial_surface_session();
         assert_eq!(state.surface_session_count(), 0);
 
-        let session =
-            state.create_and_attach_named_surface_session_in_directory(None, directory.clone());
+        let session = state
+            .create_and_attach_named_surface_session_in_directory(None, directory.clone())
+            .unwrap();
         assert!(state.remember_directory_surface_session(directory.clone(), session, true));
 
         assert_eq!(session.raw(), 1);
@@ -6779,8 +6663,9 @@ mod tests {
         let original = PathBuf::from("/tmp/manifold-session-cwd/original");
         let alias = PathBuf::from("/tmp/manifold-session-cwd/alias");
 
-        let session =
-            state.create_and_attach_named_surface_session_in_directory(None, original.clone());
+        let session = state
+            .create_and_attach_named_surface_session_in_directory(None, original.clone())
+            .unwrap();
         assert!(state.remember_directory_surface_session(alias, session, true));
 
         assert_eq!(
@@ -6814,6 +6699,68 @@ mod tests {
         assert!(state.forwarded_pressed_keys.is_empty());
         assert!(!state.shortcut_prefix_active);
         assert_eq!(state.suppress_shortcut_prefix_key_release, None);
+    }
+
+    #[test]
+    fn registry_notification_transition_is_fallible_and_owned() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let mut metadata = ExtensionMetadata::new();
+        metadata.insert("pane_id".to_string(), "42".to_string());
+        let agent_id = state
+            .register_agent("terminal", &metadata, "test.sender".to_string())
+            .expect("register agent");
+
+        let unknown = state.notify_agent(AgentNotification {
+            agent_id: "missing-agent".to_string(),
+            title: "Build finished".to_string(),
+            subtitle: String::new(),
+            body: "Artifacts are ready".to_string(),
+            level: "waiting".to_string(),
+            metadata: ExtensionMetadata::new(),
+            sender: "test.sender".to_string(),
+        });
+        assert!(unknown.is_err());
+        let unchanged = state.agent_summaries();
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0].unread_notifications, 0);
+
+        state
+            .notify_agent(AgentNotification {
+                agent_id: agent_id.clone(),
+                title: "Build finished".to_string(),
+                subtitle: "io-fix".to_string(),
+                body: "Artifacts are ready".to_string(),
+                level: "waiting".to_string(),
+                metadata: ExtensionMetadata::new(),
+                sender: "test.sender".to_string(),
+            })
+            .expect("notify registered agent");
+        let notified = state.agent_summaries();
+        assert_eq!(notified[0].status, "waiting");
+        assert_eq!(notified[0].unread_notifications, 1);
+        assert!(notified[0].attention);
+
+        assert!(state.unregister_agent(&agent_id));
+        assert!(state.agent_summaries().is_empty());
+    }
+
+    #[test]
+    fn missing_async_runtime_is_a_fallible_registry_boundary() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+
+        assert!(state.latest_wasm_policy_state_publication().is_none());
+        state.wasm_actor_names.push("not-started".to_string());
+        state.emit_wasm_actor_event_to_all(r#"{"type":"ownership-proof"}"#);
+
+        assert_eq!(state.plugin_actor_failures, 1);
+        assert_eq!(
+            state.plugin_actor_last_status.as_deref(),
+            Some("not-started:event_error")
+        );
     }
 
     #[test]

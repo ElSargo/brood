@@ -6,6 +6,7 @@ last-reviewed: 2026-07-01
 code-links:
   - crates/manifoldd/src/compositor.rs
   - crates/manifoldd/src/state.rs
+  - crates/manifoldd/src/state_services.rs
   - crates/manifoldd/src/winit_presenter.rs
 ---
 
@@ -21,6 +22,10 @@ The current compositor path can:
 - preserve hosted apps across presentation detach and reattach
 - advertise Wayland globals required by the supported smoke tests
 - report frame, input, commit, DMA-BUF, and explicit-sync diagnostics
+
+Session, focus-identity, registry, and test-harness lifecycle facts are owned
+by typed services. The compositor coordinates their accepted transitions with
+Smithay effects; it does not mutate those catalogues as loose parallel fields.
 
 ## Surface Sharing
 

@@ -50,8 +50,8 @@ use crate::{
     layout::LayoutAction,
     session_runner,
     state::{
-        FocusDirection, MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL,
-        PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
+        AgentNotification, FocusDirection, MANIFOLD_STATUS_PUBLISHER, Manifold,
+        PASSTHROUGH_STATUS_CHANNEL, PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
     },
 };
 
@@ -2533,18 +2533,19 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             );
         }
         DbusStateRequest::CreateSurfaceSession { name, response } => {
-            let id = if let Some(name) = normalize_session_name(&name) {
+            let result = if let Some(name) = normalize_session_name(&name) {
                 state
                     .create_and_attach_named_surface_session(Some(name))
-                    .raw()
+                    .map(SurfaceSessionId::raw)
             } else {
-                WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
-                state.active_surface_session().raw()
+                state
+                    .create_and_attach_surface_session()
+                    .map(SurfaceSessionId::raw)
             };
-            send_response(response, Ok(id));
+            send_response(response, result);
         }
         DbusStateRequest::RenameSurfaceSession { id, name, response } => {
-            let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), name);
+            let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), &name);
             send_response(response, Ok(changed));
         }
         DbusStateRequest::CloseSurfaceSession { id, response } => {
@@ -2573,7 +2574,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.register_extension(role, metadata, sender_name),
+            state.register_extension(&role, metadata, sender_name),
         ),
         DbusStateRequest::UnregisterExtension {
             extension_id,
@@ -2647,7 +2648,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.register_status_publisher(role, metadata, sender_name),
+            state.register_status_publisher(&role, metadata, sender_name),
         ),
         DbusStateRequest::PublishStatus {
             publisher,
@@ -2658,7 +2659,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.publish_status(publisher, channel, status_state, label, metadata),
+            state.publish_status(&publisher, &channel, &status_state, &label, metadata),
         ),
         DbusStateRequest::ClearStatus {
             publisher,
@@ -2676,7 +2677,10 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             metadata,
             sender_name,
             response,
-        } => send_response(response, state.register_agent(kind, metadata, sender_name)),
+        } => send_response(
+            response,
+            state.register_agent(&kind, &metadata, sender_name),
+        ),
         DbusStateRequest::UpdateAgent {
             agent_id,
             status,
@@ -2685,7 +2689,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.update_agent(&agent_id, status, metadata, sender_name),
+            state.update_agent(&agent_id, &status, metadata, sender_name),
         ),
         DbusStateRequest::NotifyAgent {
             agent_id,
@@ -2698,15 +2702,15 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.notify_agent(
-                &agent_id,
+            state.notify_agent(AgentNotification {
+                agent_id,
                 title,
                 subtitle,
                 body,
                 level,
                 metadata,
-                sender_name,
-            ),
+                sender: sender_name,
+            }),
         ),
         DbusStateRequest::ClearAgentAttention { agent_id, response } => {
             send_response(response, Ok(state.clear_agent_attention(&agent_id)));
@@ -2721,7 +2725,10 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             kind,
             metadata,
             response,
-        } => send_response(response, state.unregister_agent_by_identity(kind, metadata)),
+        } => send_response(
+            response,
+            state.unregister_agent_by_identity(&kind, &metadata),
+        ),
         DbusStateRequest::RegisterWindow {
             extension_id,
             window_identity,
@@ -2730,7 +2737,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.register_extension_window(extension_id, window_identity, role, sender_name),
+            state.register_extension_window(extension_id, window_identity, &role, sender_name),
         ),
         DbusStateRequest::ReplaceRole {
             window_id,
@@ -2740,7 +2747,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.replace_window_role(&window_id, role, options, sender_name),
+            state.replace_window_role(&window_id, &role, &options, sender_name),
         ),
         DbusStateRequest::RequestPlacement {
             window_id,
@@ -2749,7 +2756,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.request_window_placement(&window_id, placement, sender_name),
+            state.request_window_placement(&window_id, &placement, sender_name),
         ),
         DbusStateRequest::RequestPresentationMembership {
             window_id,
@@ -2769,7 +2776,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.request_shortcut_grant(extension_id, shortcut, scope, label, sender_name),
+            state.request_shortcut_grant(&extension_id, &shortcut, scope, label, sender_name),
         ),
         DbusStateRequest::RequestFocus {
             window_id,
@@ -3259,7 +3266,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 let session = state.create_and_attach_named_surface_session_in_directory(
                     joined_name(name),
                     directory.clone(),
-                );
+                )?;
                 let changed = state.remember_directory_surface_session(
                     directory.clone(),
                     session,
@@ -3293,7 +3300,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             [subcommand, name @ ..] if subcommand == "new" => {
                 let name = joined_name(name);
                 if let Some(name) = name {
-                    state.create_and_attach_named_surface_session(Some(name));
+                    state.create_and_attach_named_surface_session(Some(name))?;
                 } else {
                     WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
                 }
@@ -3329,14 +3336,13 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             _ => bail!("usage: harness signal <name>"),
         },
         "nested-inner" => {
-            let destination = state
-                .nested_inner_dbus_destination
-                .clone()
+            let (destination, address) = state
+                .nested_test_target()
                 .context("nested inner DBus destination not configured")?;
             if args.is_empty() {
                 bail!("usage: nested-inner <command...>");
             }
-            let target = ControlTarget::new(destination, state.nested_inner_dbus_address.clone());
+            let target = ControlTarget::new(destination.to_string(), address.map(str::to_string));
             request_dbus_command(&target, args, false)?
         }
         "debug" => match args {

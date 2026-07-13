@@ -6,12 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Central runtime state
 
-- `crates/manifoldd/src/state.rs`: the `Manifold` state object owns session
-  routing, geometry, focus, agent registry, browser state, and test harness
-  coordination. That drives `too_many_arguments`, pass-by-value churn,
-  field-name repetition, unchecked indexing, and panic-like invariant checks.
-  The target design should split this into typed services with explicit
-  ownership and fallible boundaries.
 - `crates/manifoldd/src/compositor.rs`: runtime setup and nested-test
   orchestration are interleaved with compositor wiring. The target design should
   split test orchestration from compositor startup and give event-loop callbacks
@@ -62,6 +56,19 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- `Manifold` now coordinates typed surface-session, focus, registry, and test-
+  harness services instead of owning those transition tables as loose fields;
+  layout and browser state retain their existing service owners. Session
+  allocation, activation, routing, rename, directory assignment, and removal
+  are atomic and fallible, including explicit empty-catalogue and exhausted-ID
+  behavior. Agent notification requests are typed, harness ownership is single-
+  assignment, and an absent async runtime is an error rather than a registry
+  panic. The real GTK session-switcher is the observable proof in
+  `tools/test-state-services-nested.sh`: it renders a renamed Alpha session with
+  live windows and an agent, while the transcript proves Alpha/Beta switching,
+  Beta removal and directory-default retirement, and a substantive agent
+  notification changing the agent from running to waiting with attention and
+  unread state.
 - Raw argv and JSON control requests now cross typed `BrowserControlCommand`,
   `PlugCommand`, and `InjectCommand` parsing boundaries before compositor
   mutation. Exact arity and ambiguous browser URL forms are rejected without
