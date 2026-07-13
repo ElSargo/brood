@@ -48,6 +48,7 @@ let
       "${src}/examples/wasm-component-actor/Cargo.lock"
       "${src}/examples/wasm-preview1-worker/Cargo.lock"
       "${src}/plugins/component-workspace-watch/Cargo.lock"
+      "${src}/plugins/component-runtime-io/Cargo.lock"
       "${src}/plugins/workspace-file-log/Cargo.lock"
     ];
   };
@@ -302,6 +303,19 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/component-runtime-io/Cargo.toml ]]; then
+        component_core="plugins/component-runtime-io/target/wasm32-unknown-unknown/release/manifold_component_runtime_io_plugin.wasm"
+        component_output="plugins/component-runtime-io/target/wasm32-unknown-unknown/release/manifold_component_runtime_io_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR Component runtime I/O core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       runHook postBuild
     '';
 
@@ -316,6 +330,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/component-runtime-io/target/wasm32-unknown-unknown/release/manifold_component_runtime_io_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"

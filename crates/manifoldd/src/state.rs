@@ -453,6 +453,7 @@ struct ConfiguredWorkspacePlugin {
     startup_message: Option<String>,
     lifecycle: Option<ConfiguredPluginLifecycle>,
     resources: ConfiguredPluginResources,
+    runtime_io: manifold_wasm::RuntimeIoCapabilities,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -734,6 +735,7 @@ pub struct Manifold {
     configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
     configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
     configured_plugin_resources: BTreeMap<String, ConfiguredPluginResources>,
+    configured_plugin_runtime_io: BTreeMap<String, manifold_wasm::RuntimeIoCapabilities>,
     filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
@@ -908,6 +910,7 @@ impl Manifold {
             configured_workspace_plugins: BTreeMap::new(),
             configured_plugin_lifecycles: BTreeMap::new(),
             configured_plugin_resources: BTreeMap::new(),
+            configured_plugin_runtime_io: BTreeMap::new(),
             filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
@@ -4143,6 +4146,7 @@ impl Manifold {
             None,
             None,
             ConfiguredPluginResources::default(),
+            manifold_wasm::RuntimeIoCapabilities::default(),
         )
     }
 
@@ -4153,6 +4157,11 @@ impl Manifold {
         );
         let lifecycle = self.configured_plugin_lifecycles.get(instance_id).cloned();
         let resources = self.configured_resources_for_instance(instance_id);
+        let runtime_io = self
+            .configured_plugin_runtime_io
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_default();
         self.replace_wasm_plugin_with_instance_id(
             Some(instance_id),
             false,
@@ -4160,6 +4169,7 @@ impl Manifold {
             None,
             lifecycle.map(|config| (config, manifold_wasm::PluginStartReason::Replacement)),
             resources,
+            runtime_io,
         )
     }
 
@@ -4178,6 +4188,7 @@ impl Manifold {
         startup_message: Option<String>,
         lifecycle: Option<ConfiguredPluginLifecycle>,
         resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         ensure!(
             !module_id.trim().is_empty(),
@@ -4213,6 +4224,7 @@ impl Manifold {
             filesystem,
             lifecycle.clone().map(|config| (config, start_reason)),
             resources,
+            runtime_io.clone(),
         )?;
         if let Some(writable) = workspace_filesystem_writable
             && self.wasm_io_actors.contains_key(module_id)
@@ -4225,6 +4237,7 @@ impl Manifold {
                     startup_message: startup_message.clone(),
                     lifecycle: lifecycle.clone(),
                     resources,
+                    runtime_io: runtime_io.clone(),
                 },
             );
         } else {
@@ -4233,6 +4246,8 @@ impl Manifold {
         if self.wasm_io_actors.contains_key(module_id) {
             self.configured_plugin_resources
                 .insert(module_id.to_string(), resources);
+            self.configured_plugin_runtime_io
+                .insert(module_id.to_string(), runtime_io);
             if let Some(lifecycle) = lifecycle {
                 self.configured_plugin_lifecycles
                     .insert(module_id.to_string(), lifecycle);
@@ -4241,6 +4256,7 @@ impl Manifold {
             }
         } else {
             self.configured_plugin_resources.remove(module_id);
+            self.configured_plugin_runtime_io.remove(module_id);
             self.configured_plugin_lifecycles.remove(module_id);
         }
         if let Some(message) = startup_message {
@@ -4301,6 +4317,7 @@ impl Manifold {
                         .clone()
                         .map(|config| (config, manifold_wasm::PluginStartReason::SessionRebind)),
                     plugin.resources,
+                    plugin.runtime_io,
                 )
                 .and_then(|()| {
                     if let Some(message) = plugin.startup_message {
@@ -4389,6 +4406,7 @@ impl Manifold {
         filesystem: Option<HostedPluginFilesystem>,
         lifecycle: Option<(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
         resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.wasm_threads(true).shared_memory(true);
@@ -4400,7 +4418,7 @@ impl Manifold {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources)
+                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources, runtime_io)
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
@@ -4418,6 +4436,7 @@ impl Manifold {
                 filesystem.as_ref(),
                 lifecycle.as_ref(),
                 resources,
+                runtime_io,
             );
         }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
@@ -4454,6 +4473,7 @@ impl Manifold {
         filesystem: Option<&HostedPluginFilesystem>,
         lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
         resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4482,6 +4502,10 @@ impl Manifold {
                 filesystem_watcher_service: self.filesystem_watcher_service.clone(),
                 max_filesystem_watches: resources.filesystem_watches,
                 max_filesystem_watch_events: resources.filesystem_watch_events,
+                runtime_io: manifold_wasm::RuntimeIoConfig {
+                    capabilities: runtime_io,
+                    ..manifold_wasm::RuntimeIoConfig::default()
+                },
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
@@ -4516,6 +4540,7 @@ impl Manifold {
         filesystem: Option<&HostedPluginFilesystem>,
         lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
         resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4538,6 +4563,7 @@ impl Manifold {
                         guest_path: ".".to_string(),
                         writable,
                     }),
+                    runtime_io,
                 },
                 manifold_wasm::Preview1WorkerConfig {
                     max_filesystem_watches: resources.filesystem_watches,

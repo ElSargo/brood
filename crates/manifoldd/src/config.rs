@@ -228,6 +228,10 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                     continue;
                 }
                 let workspace_filesystem = workspace_filesystem_capability(&module.capabilities);
+                let runtime_io =
+                    runtime_io_capabilities(&module.capabilities).with_context(|| {
+                        format!("validate config module {id} runtime I/O capabilities")
+                    })?;
                 state
                     .replace_configured_wasm_plugin(
                         &id,
@@ -243,6 +247,7 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                             }),
                         configured_plugin_resources(&module.resources)
                             .with_context(|| format!("validate config module {id} resources"))?,
+                        runtime_io,
                     )
                     .with_context(|| format!("load config module {id}"))?;
                 info!(
@@ -286,6 +291,35 @@ fn workspace_filesystem_capability(capabilities: &[String]) -> Option<bool> {
     } else {
         None
     }
+}
+
+fn runtime_io_capabilities(
+    capabilities: &[String],
+) -> Result<manifold_wasm::RuntimeIoCapabilities> {
+    let mut commands = capabilities
+        .iter()
+        .filter_map(|capability| capability.strip_prefix("subprocess:"))
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure!(
+        commands.iter().all(|command| {
+            let mut components = Path::new(command).components();
+            !command.is_empty()
+                && matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+        }),
+        "subprocess capability must name one PATH command"
+    );
+    commands.sort();
+    commands.dedup();
+    Ok(manifold_wasm::RuntimeIoCapabilities {
+        commands,
+        allow_pty: capabilities.iter().any(|capability| capability == "pty"),
+        allow_loopback: capabilities
+            .iter()
+            .any(|capability| capability == "network:loopback"),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,8 +554,25 @@ mod tests {
         BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, ModuleResourceConfig,
         SessionRunnerSource, configured_plugin_resources, discover_session_runner, read_config,
         repo_config_path_from_current_exe, resolve_path, resolve_startup_argv,
-        workspace_filesystem_capability,
+        runtime_io_capabilities, workspace_filesystem_capability,
     };
+
+    #[test]
+    fn runtime_io_capabilities_are_explicit_sorted_and_bounded_by_kind() {
+        let capabilities = runtime_io_capabilities(&[
+            "subprocess:sed".to_string(),
+            "network:loopback".to_string(),
+            "subprocess:printf".to_string(),
+            "pty".to_string(),
+            "subprocess:sed".to_string(),
+        ])
+        .expect("runtime I/O capabilities");
+        assert_eq!(capabilities.commands, ["printf", "sed"]);
+        assert!(capabilities.allow_pty);
+        assert!(capabilities.allow_loopback);
+        assert!(runtime_io_capabilities(&["subprocess:".to_string()]).is_err());
+        assert!(runtime_io_capabilities(&["subprocess:../sh".to_string()]).is_err());
+    }
 
     #[test]
     fn plugin_watch_resources_default_and_accept_narrow_nonzero_limits() {

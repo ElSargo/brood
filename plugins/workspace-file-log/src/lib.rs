@@ -30,6 +30,8 @@ const SNAPSHOT_MAX_BYTES: u32 = 1024 * 1024;
 const WORKER_ARGUMENT: u32 = 1;
 const MIRROR_WORKER_ARGUMENT: u32 = 2;
 const LIFECYCLE_WORKER_ARGUMENT: u32 = 3;
+const RUNTIME_IO_WORKER_ARGUMENT: u32 = 4;
+const RUNTIME_IO_REPORT_PATH: &str = ".manifold/preview1-runtime-io-transcript.md";
 
 static WATCH_STARTED: AtomicU32 = AtomicU32::new(0);
 static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -44,6 +46,7 @@ static SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
 static PRIMARY_PAUSED: AtomicU32 = AtomicU32::new(0);
 static LIFECYCLE_WORKER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECORD: Mutex<Option<String>> = Mutex::new(None);
+static RUNTIME_IO_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
 
 #[link(wasm_import_module = "manifold_preview1")]
 unsafe extern "C" {
@@ -129,6 +132,8 @@ unsafe extern "C" {
     ) -> u32;
     #[link_name = "pollable_drop"]
     safe fn host_pollable_drop(pollable: u64) -> u32;
+    #[link_name = "pollable_generation"]
+    safe fn host_pollable_generation(pollable: u64, generation: *mut u64) -> u32;
     #[link_name = "worker_wait_any"]
     unsafe fn host_worker_wait_any(
         pollables: *const u64,
@@ -137,6 +142,61 @@ unsafe extern "C" {
         mode: u32,
         ready: *mut u64,
     ) -> u32;
+    #[link_name = "subprocess_spawn"]
+    unsafe fn host_subprocess_spawn(
+        command: *const u8,
+        command_len: u32,
+        arguments: *const u8,
+        arguments_len: u32,
+        child: *mut u64,
+    ) -> u32;
+    #[link_name = "pty_spawn"]
+    unsafe fn host_pty_spawn(
+        command: *const u8,
+        command_len: u32,
+        arguments: *const u8,
+        arguments_len: u32,
+        rows: u32,
+        cols: u32,
+        child: *mut u64,
+    ) -> u32;
+    #[link_name = "worker_loopback_connect"]
+    unsafe fn host_worker_loopback_connect(
+        address: *const u8,
+        address_len: u32,
+        stream: *mut u64,
+    ) -> u32;
+    #[link_name = "child_stream"]
+    safe fn host_child_stream(child: u64, kind: u32, stream: *mut u64) -> u32;
+    #[link_name = "child_notification"]
+    safe fn host_child_notification(child: u64, notification: *mut u64) -> u32;
+    #[link_name = "child_status"]
+    safe fn host_child_status(child: u64, status: *mut u32) -> u32;
+    #[link_name = "child_exit_code"]
+    safe fn host_child_exit_code(child: u64, code: *mut u32) -> u32;
+    #[link_name = "child_resolved_command_len"]
+    safe fn host_child_resolved_command_len(child: u64, len: *mut u32) -> u32;
+    #[link_name = "child_resolved_command_read"]
+    unsafe fn host_child_resolved_command_read(child: u64, path: *mut u8, path_len: u32) -> u32;
+    #[link_name = "stream_notification"]
+    safe fn host_stream_notification(stream: u64, notification: *mut u64) -> u32;
+    #[link_name = "stream_read"]
+    unsafe fn host_stream_read(stream: u64, bytes: *mut u8, bytes_len: u32, read: *mut u64) -> u32;
+    #[link_name = "stream_write"]
+    unsafe fn host_stream_write(
+        stream: u64,
+        bytes: *const u8,
+        bytes_len: u32,
+        written: *mut u32,
+    ) -> u32;
+    #[link_name = "stream_close_write"]
+    safe fn host_stream_close_write(stream: u64) -> u32;
+    #[link_name = "timer_create"]
+    safe fn host_timer_create(delay_ms: u64, timer: *mut u64) -> u32;
+    #[link_name = "timer_notification"]
+    safe fn host_timer_notification(timer: u64, notification: *mut u64) -> u32;
+    #[link_name = "timer_status"]
+    safe fn host_timer_status(timer: u64, status: *mut u32) -> u32;
 }
 
 #[unsafe(no_mangle)]
@@ -283,7 +343,15 @@ fn dispatch_mailbox() {
         ERROR_CODE.store(1, Ordering::Release);
         return;
     };
-    if payload == b"start"
+    if let Some(address) = payload.strip_prefix(b"runtime-io:") {
+        if let Ok(mut slot) = RUNTIME_IO_ADDRESS.lock() {
+            *slot = Some(String::from_utf8_lossy(address).into_owned());
+        }
+        let mut worker = 0;
+        if host_worker_spawn(RUNTIME_IO_WORKER_ARGUMENT, &raw mut worker) != 0 {
+            ERROR_CODE.store(25, Ordering::Release);
+        }
+    } else if payload == b"start"
         && WATCH_STARTED
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -400,6 +468,9 @@ fn dispatch_snapshot_write() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
+    if argument == RUNTIME_IO_WORKER_ARGUMENT {
+        return run_runtime_io_proof().map_or_else(|code| code, |()| 0);
+    }
     if argument == LIFECYCLE_WORKER_ARGUMENT {
         return match LIFECYCLE_RECORD
             .lock()
@@ -443,6 +514,278 @@ pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
             code
         }
     }
+}
+
+fn run_runtime_io_proof() -> Result<(), u32> {
+    let address = RUNTIME_IO_ADDRESS
+        .lock()
+        .map_err(|_| 26_u32)?
+        .take()
+        .ok_or(27_u32)?;
+    let pipeline = spawn_child(false, "tr", &["a-z", "A-Z"])?;
+    let pipeline_stdin = child_stream(pipeline, 0)?;
+    write_stream(pipeline_stdin, b"preview one\n")?;
+    if host_stream_close_write(pipeline_stdin) != 0 {
+        return Err(53);
+    }
+    let pipeline_output = read_stream(child_stream(pipeline, 1)?)?;
+    let pipeline_code = wait_child(pipeline)?;
+    let resolved = child_resolved(pipeline)?;
+
+    let nonzero = spawn_child(false, "sh", &["-c", "exit 7"])?;
+    let nonzero_code = wait_child(nonzero)?;
+
+    let pty = spawn_child(
+        true,
+        "sh",
+        &[
+            "-c",
+            "test -t 0 && printf 'stdin-is-tty '; test -t 1 && printf 'stdout-is-tty terminal-prompt> '; IFS= read -r x; printf 'terminal-reply=%s\\n' \"$x\"",
+        ],
+    )?;
+    let terminal = child_stream(pty, 3)?;
+    write_stream(terminal, b"preview1-typed-through-pty\n")?;
+    if host_stream_close_write(terminal) != 0 {
+        return Err(28);
+    }
+    let terminal_output = read_stream(terminal)?;
+    let pty_code = wait_child(pty)?;
+
+    let mut socket = 0;
+    if unsafe {
+        host_worker_loopback_connect(address.as_ptr(), address.len() as u32, &raw mut socket)
+    } != 0
+    {
+        return Err(29);
+    }
+    write_stream(socket, b"hello-from-preview1\n")?;
+    if host_stream_close_write(socket) != 0 {
+        return Err(30);
+    }
+    let peer_output = read_stream(socket)?;
+
+    let mut later = 0;
+    let mut sooner = 0;
+    if host_timer_create(80, &raw mut later) != 0 || host_timer_create(20, &raw mut sooner) != 0 {
+        return Err(31);
+    }
+    let first = wait_timer_pair(sooner, later)?;
+    let second = if first == "20ms" {
+        wait_timer(later)?;
+        "80ms"
+    } else {
+        wait_timer(sooner)?;
+        "20ms"
+    };
+
+    fs::create_dir_all(LOG_DIRECTORY).map_err(|_| 32_u32)?;
+    let report = format!(
+        "# Preview 1 runtime I/O transcript\n\n## Subprocess pipe streams\n\n- Resolved command: `{resolved}`\n- Stdin: `preview one\\n`\n- Transform: `tr a-z A-Z`\n- Stdout: `{}`\n- Exit: `{pipeline_code}`\n- Nonzero child exit: `{nonzero_code}`\n\n## Real PTY interaction\n\n- Sent: `preview1-typed-through-pty`\n- Terminal transcript: `{}`\n- Exit: `{pty_code}`\n\n## Loopback socket exchange\n\n- Peer: `{address}`\n- Sent: `hello-from-preview1`\n- Received: `{}`\n\n## Timer ordering\n\n1. `{first}` timer expired\n2. `{second}` timer expired\n",
+        display_runtime_bytes(&pipeline_output),
+        display_runtime_bytes(&terminal_output),
+        display_runtime_bytes(&peer_output),
+    );
+    fs::write(RUNTIME_IO_REPORT_PATH, report).map_err(|_| 33)
+}
+
+fn spawn_child(pty: bool, command: &str, arguments: &[&str]) -> Result<u64, u32> {
+    let encoded = arguments.join("\0");
+    let mut child = 0;
+    let status = if pty {
+        unsafe {
+            host_pty_spawn(
+                command.as_ptr(),
+                command.len() as u32,
+                encoded.as_ptr(),
+                encoded.len() as u32,
+                24,
+                80,
+                &raw mut child,
+            )
+        }
+    } else {
+        unsafe {
+            host_subprocess_spawn(
+                command.as_ptr(),
+                command.len() as u32,
+                encoded.as_ptr(),
+                encoded.len() as u32,
+                &raw mut child,
+            )
+        }
+    };
+    (status == 0 && child != 0).then_some(child).ok_or(34)
+}
+
+fn child_stream(child: u64, kind: u32) -> Result<u64, u32> {
+    let mut stream = 0;
+    (host_child_stream(child, kind, &raw mut stream) == 0 && stream != 0)
+        .then_some(stream)
+        .ok_or(35)
+}
+
+fn child_resolved(child: u64) -> Result<String, u32> {
+    let mut len = 0;
+    if host_child_resolved_command_len(child, &raw mut len) != 0 {
+        return Err(36);
+    }
+    let mut bytes = vec![0; len as usize];
+    if unsafe { host_child_resolved_command_read(child, bytes.as_mut_ptr(), len) } != 0 {
+        return Err(37);
+    }
+    String::from_utf8(bytes).map_err(|_| 38)
+}
+
+fn wait_child(child: u64) -> Result<u32, u32> {
+    let mut notification = 0;
+    if host_child_notification(child, &raw mut notification) != 0 {
+        return Err(39);
+    }
+    let mut generation = 0;
+    loop {
+        let mut status = 0;
+        if host_child_status(child, &raw mut status) != 0 {
+            return Err(40);
+        }
+        if status == 1 {
+            let mut code = 0;
+            return (host_child_exit_code(child, &raw mut code) == 0)
+                .then_some(code)
+                .ok_or(41);
+        }
+        if status == 2 {
+            return Err(42);
+        }
+        generation = wait_runtime_notification(notification, generation)?;
+    }
+}
+
+fn read_stream(stream: u64) -> Result<Vec<u8>, u32> {
+    let mut notification = 0;
+    if host_stream_notification(stream, &raw mut notification) != 0 {
+        return Err(43);
+    }
+    let mut generation = 0;
+    let mut output = Vec::new();
+    loop {
+        let mut bytes = vec![0; 4096];
+        let mut read = 0;
+        if unsafe {
+            host_stream_read(
+                stream,
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                &raw mut read,
+            )
+        } != 0
+        {
+            return Err(44);
+        }
+        if read == u64::MAX {
+            return Ok(output);
+        }
+        if read == u64::MAX - 1 {
+            generation = wait_runtime_notification(notification, generation)?;
+            continue;
+        }
+        bytes.truncate(read as usize);
+        output.extend(bytes);
+    }
+}
+
+fn write_stream(stream: u64, mut bytes: &[u8]) -> Result<(), u32> {
+    let mut notification = 0;
+    if host_stream_notification(stream, &raw mut notification) != 0 {
+        return Err(45);
+    }
+    let mut generation = 0;
+    while !bytes.is_empty() {
+        let mut written = 0;
+        let status = unsafe {
+            host_stream_write(stream, bytes.as_ptr(), bytes.len() as u32, &raw mut written)
+        };
+        if status == 3 {
+            generation = wait_runtime_notification(notification, generation)?;
+            continue;
+        }
+        if status != 0 || written == 0 {
+            return Err(45);
+        }
+        bytes = &bytes[written as usize..];
+    }
+    Ok(())
+}
+
+fn wait_timer(timer: u64) -> Result<(), u32> {
+    let mut notification = 0;
+    if host_timer_notification(timer, &raw mut notification) != 0 {
+        return Err(46);
+    }
+    let mut generation = 0;
+    loop {
+        let mut status = 0;
+        if host_timer_status(timer, &raw mut status) != 0 {
+            return Err(47);
+        }
+        if status == 1 {
+            return Ok(());
+        }
+        generation = wait_runtime_notification(notification, generation)?;
+    }
+}
+
+fn wait_timer_pair(sooner: u64, later: u64) -> Result<&'static str, u32> {
+    let mut first_notification = 0;
+    let mut second_notification = 0;
+    if host_timer_notification(sooner, &raw mut first_notification) != 0
+        || host_timer_notification(later, &raw mut second_notification) != 0
+    {
+        return Err(48);
+    }
+    let mut pollables = [0_u64; 2];
+    if host_notification_pollable(first_notification, 0, &raw mut pollables[0]) != 0
+        || host_notification_pollable(second_notification, 0, &raw mut pollables[1]) != 0
+    {
+        return Err(49);
+    }
+    let mut ready = 0;
+    if unsafe { host_worker_wait_any(pollables.as_ptr(), 2, u64::MAX, 1, &raw mut ready) } != 0 {
+        return Err(50);
+    }
+    let _ = host_pollable_drop(pollables[0]);
+    let _ = host_pollable_drop(pollables[1]);
+    Ok(if ready == pollables[0] {
+        "20ms"
+    } else {
+        "80ms"
+    })
+}
+
+fn wait_runtime_notification(notification: u64, generation: u64) -> Result<u64, u32> {
+    let mut pollable = 0;
+    if host_notification_pollable(notification, generation, &raw mut pollable) != 0 {
+        return Err(51);
+    }
+    let mut ready = 0;
+    let status =
+        unsafe { host_worker_wait_any(&raw const pollable, 1, u64::MAX, 1, &raw mut ready) };
+    if status != 0 {
+        let _ = host_pollable_drop(pollable);
+        return Err(52);
+    }
+    let mut ready_generation = 0;
+    let generation_status = host_pollable_generation(ready, &raw mut ready_generation);
+    let _ = host_pollable_drop(pollable);
+    if generation_status != 0 {
+        return Err(52);
+    }
+    Ok(ready_generation)
+}
+
+fn display_runtime_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
 }
 
 fn watch_workspace(

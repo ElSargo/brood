@@ -21,6 +21,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::mpsc as std_mpsc,
@@ -66,6 +67,10 @@ use crate::lifecycle::{
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
+use crate::runtime_io::{
+    ChildStatus, RuntimeIoCapabilities, RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, StreamRead,
+    TimerStatus,
+};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
@@ -75,7 +80,7 @@ use crate::resource_limits::{
 mod host_abi {
     wiggle::from_witx!({
         witx: ["witx/manifold_preview1.witx"],
-        async: { manifold_preview1::worker_wait_any },
+        async: { manifold_preview1::{worker_wait_any, worker_loopback_connect, child_drop, stream_drop, timer_drop} },
     });
 }
 
@@ -136,6 +141,8 @@ pub struct Preview1FilesystemGrant {
 pub struct Preview1ActorCapabilities {
     /// Optional preopened directory shared as authority, not as descriptor state.
     pub filesystem: Option<Preview1FilesystemGrant>,
+    /// Process, terminal, and loopback authority inherited by every worker.
+    pub runtime_io: RuntimeIoCapabilities,
 }
 
 /// Runtime limits for Preview 1 compatibility workers.
@@ -362,6 +369,8 @@ struct Preview1Host {
     completion_io: Option<CompletionIo>,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    runtime_io: RuntimeIoHub,
+    runtime_children: Arc<Mutex<HashMap<u64, [u64; 4]>>>,
     commands: mpsc::Sender<Command>,
     next_worker: Arc<AtomicU64>,
     worker_input_capacity: usize,
@@ -541,6 +550,312 @@ impl host_abi::manifold_preview1::ManifoldPreview1 for Preview1Host {
         self.commands
             .try_send(Command::GuestLifecycleComplete(result))
             .map_err(map_command_error)
+    }
+
+    fn subprocess_spawn(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        command: wiggle::GuestPtr<u8>,
+        command_len: u32,
+        arguments: wiggle::GuestPtr<u8>,
+        arguments_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let command = read_guest_string(memory, command, command_len)?;
+        let arguments = read_guest_arguments(memory, arguments, arguments_len)?;
+        let process = self
+            .runtime_io
+            .spawn_process(&command, &arguments)
+            .map_err(map_runtime_io_error)?;
+        let child = process.child.raw();
+        self.runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .insert(
+                child,
+                [
+                    process.stdin.raw(),
+                    process.stdout.raw(),
+                    process.stderr.raw(),
+                    0,
+                ],
+            );
+        Ok(child)
+    }
+
+    fn pty_spawn(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        command: wiggle::GuestPtr<u8>,
+        command_len: u32,
+        arguments: wiggle::GuestPtr<u8>,
+        arguments_len: u32,
+        rows: u32,
+        cols: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let command = read_guest_string(memory, command, command_len)?;
+        let arguments = read_guest_arguments(memory, arguments, arguments_len)?;
+        let rows = u16::try_from(rows).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let cols = u16::try_from(cols).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let pty = self
+            .runtime_io
+            .spawn_pty(&command, &arguments, rows, cols)
+            .map_err(map_runtime_io_error)?;
+        let child = pty.child.raw();
+        self.runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .insert(child, [0, 0, 0, pty.terminal.raw()]);
+        Ok(child)
+    }
+
+    async fn worker_loopback_connect(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        address: wiggle::GuestPtr<u8>,
+        address_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let address = read_guest_string(memory, address, address_len)?
+            .parse::<SocketAddr>()
+            .map_err(|_error| host_abi::types::Errno::Invalid)?;
+        self.runtime_io
+            .connect_loopback(address)
+            .await
+            .map(|stream| stream.raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn child_stream(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+        kind: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        let index = usize::try_from(kind).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let raw = self
+            .runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .get(&child)
+            .and_then(|streams| streams.get(index))
+            .copied()
+            .filter(|raw| *raw != 0)
+            .ok_or(host_abi::types::Errno::Invalid)?;
+        self.runtime_io.stream(raw).map_err(map_runtime_io_error)?;
+        Ok(raw)
+    }
+
+    fn child_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .child(child)
+            .map(|child| child.notification().raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn child_status(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.runtime_io
+            .child(child)
+            .and_then(|child| child.status())
+            .map(|status| match status {
+                ChildStatus::Running => 0,
+                ChildStatus::Exited(Some(_)) => 1,
+                ChildStatus::Exited(None) => 2,
+            })
+            .map_err(map_runtime_io_error)
+    }
+
+    fn child_exit_code(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        match self
+            .runtime_io
+            .child(child)
+            .and_then(|child| child.status())
+            .map_err(map_runtime_io_error)?
+        {
+            ChildStatus::Exited(Some(code)) => {
+                u32::try_from(code).map_err(|_negative| host_abi::types::Errno::Invalid)
+            }
+            ChildStatus::Running | ChildStatus::Exited(None) => {
+                Err(host_abi::types::Errno::Unavailable)
+            }
+        }
+    }
+
+    fn child_resolved_command_len(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        let child = self.runtime_io.child(child).map_err(map_runtime_io_error)?;
+        u32::try_from(
+            child
+                .resolved_command()
+                .as_os_str()
+                .as_encoded_bytes()
+                .len(),
+        )
+        .map_err(|_overflow| host_abi::types::Errno::Limit)
+    }
+
+    fn child_resolved_command_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+        path: wiggle::GuestPtr<u8>,
+        path_len: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        let child = self.runtime_io.child(child).map_err(map_runtime_io_error)?;
+        copy_to_guest(
+            memory,
+            path,
+            path_len,
+            child.resolved_command().as_os_str().as_encoded_bytes(),
+        )
+    }
+
+    async fn child_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .remove(&child);
+        self.runtime_io
+            .drop_child(child)
+            .await
+            .map_err(map_runtime_io_error)
+    }
+
+    fn stream_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .stream(stream)
+            .map(|stream| stream.notification().raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn stream_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+        bytes: wiggle::GuestPtr<u8>,
+        bytes_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        match self
+            .runtime_io
+            .stream(stream)
+            .and_then(|stream| stream.try_read(bytes_len as usize))
+            .map_err(map_runtime_io_error)?
+        {
+            StreamRead::Data(data) => {
+                copy_to_guest(memory, bytes, bytes_len, &data)?;
+                u64::try_from(data.len()).map_err(|_overflow| host_abi::types::Errno::Limit)
+            }
+            StreamRead::WouldBlock => Ok(u64::MAX - 1),
+            StreamRead::Eof => Ok(u64::MAX),
+        }
+    }
+
+    fn stream_write(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+        bytes: wiggle::GuestPtr<u8>,
+        bytes_len: u32,
+    ) -> Result<u32, host_abi::types::Errno> {
+        let bytes = read_guest_bytes(memory, bytes, bytes_len)?;
+        self.runtime_io
+            .stream(stream)
+            .and_then(|stream| stream.try_write(&bytes))
+            .and_then(|count| {
+                u32::try_from(count).map_err(|_overflow| RuntimeIoError::InvalidArgument)
+            })
+            .map_err(map_runtime_io_error)
+    }
+
+    fn stream_close_write(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_io
+            .stream(stream)
+            .and_then(|stream| stream.close_write())
+            .map_err(map_runtime_io_error)
+    }
+
+    async fn stream_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_io
+            .drop_stream(stream)
+            .await
+            .map_err(map_runtime_io_error)
+    }
+
+    fn timer_create(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        delay_ms: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .create_timer(Duration::from_millis(delay_ms))
+            .map(|timer| timer.raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn timer_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        timer: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .timer(timer)
+            .map(|timer| timer.notification().raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn timer_status(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        timer: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.runtime_io
+            .timer(timer)
+            .and_then(|timer| timer.status())
+            .map(|status| u32::from(matches!(status, TimerStatus::Expired)))
+            .map_err(map_runtime_io_error)
+    }
+
+    async fn timer_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        timer: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_io
+            .drop_timer(timer)
+            .await
+            .map_err(map_runtime_io_error)
     }
 
     fn completion_submit_read(
@@ -953,6 +1268,37 @@ fn read_guest_string(
         .map_err(|_utf8| host_abi::types::Errno::Invalid)
 }
 
+fn read_guest_arguments(
+    memory: &wiggle::GuestMemory<'_>,
+    arguments: wiggle::GuestPtr<u8>,
+    arguments_len: u32,
+) -> Result<Vec<String>, host_abi::types::Errno> {
+    let bytes = read_guest_bytes(memory, arguments, arguments_len)?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .map(|argument| {
+            std::str::from_utf8(argument)
+                .map(str::to_string)
+                .map_err(|_utf8| host_abi::types::Errno::Invalid)
+        })
+        .collect()
+}
+
+const fn map_runtime_io_error(error: RuntimeIoError) -> host_abi::types::Errno {
+    match error {
+        RuntimeIoError::StaleHandle | RuntimeIoError::Closed | RuntimeIoError::HostFailure => {
+            host_abi::types::Errno::Unavailable
+        }
+        RuntimeIoError::LimitReached | RuntimeIoError::WouldBlock => host_abi::types::Errno::Limit,
+        RuntimeIoError::NotPermitted | RuntimeIoError::InvalidArgument => {
+            host_abi::types::Errno::Invalid
+        }
+    }
+}
+
 const fn map_completion_error(error: CompletionIoError) -> host_abi::types::Errno {
     match error {
         CompletionIoError::InvalidArgument => host_abi::types::Errno::Invalid,
@@ -1225,6 +1571,7 @@ pub struct Preview1WorkerRuntime {
     stats: Arc<Preview1CompatStatsInner>,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    runtime_io: RuntimeIoHub,
     terminal_error: Arc<Mutex<Option<String>>>,
     limits: WasmResourceLimits,
     byte_budget: GenerationByteBudget,
@@ -1367,6 +1714,15 @@ impl Preview1WorkerRuntime {
             config.max_filesystem_watch_events,
         )
         .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
+        let runtime_io = RuntimeIoHub::new(
+            generation,
+            RuntimeIoConfig {
+                capabilities: capabilities.runtime_io.clone(),
+                ..RuntimeIoConfig::default()
+            },
+            coordination.clone(),
+        )
+        .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
         let (completion_io, completion_rx, completion_task) =
             start_completion_io(generation, &completion_config)
                 .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
@@ -1380,6 +1736,7 @@ impl Preview1WorkerRuntime {
         let stats = Arc::new(Preview1CompatStatsInner::default());
         let next_worker = Arc::new(AtomicU64::new(1));
         let worker_inputs = Arc::new(Mutex::new(HashMap::new()));
+        let runtime_children = Arc::new(Mutex::new(HashMap::new()));
         let initialized: Result<_, Preview1WorkerError> = async {
             let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
             // The dispatcher is completion-driven and receives no blocking WASI
@@ -1395,6 +1752,8 @@ impl Preview1WorkerRuntime {
                         completion_io: Some(completion_supervisor.io().clone()),
                         coordination: coordination.clone(),
                         filesystem_watches: filesystem_watches.clone(),
+                        runtime_io: runtime_io.clone(),
+                        runtime_children: Arc::clone(&runtime_children),
                         commands: commands.clone(),
                         next_worker: Arc::clone(&next_worker),
                         worker_input_capacity: config.worker_input_capacity,
@@ -1424,6 +1783,7 @@ impl Preview1WorkerRuntime {
         let terminal_error = Arc::new(Mutex::new(None));
         let parent_terminal_error = Arc::clone(&terminal_error);
         let parent_coordination = coordination.clone();
+        let parent_runtime_io = runtime_io.clone();
         let parent_stats = Arc::clone(&stats);
         let parent = tokio::spawn(async move {
             let result = parent_loop(
@@ -1436,6 +1796,7 @@ impl Preview1WorkerRuntime {
                 completion_rx,
                 notification_rx,
                 parent_coordination,
+                parent_runtime_io,
                 completion_supervisor,
                 next_worker,
                 worker_inputs,
@@ -1461,6 +1822,7 @@ impl Preview1WorkerRuntime {
             stats,
             coordination,
             filesystem_watches,
+            runtime_io,
             terminal_error,
             limits: config.limits,
             byte_budget,
@@ -1648,6 +2010,7 @@ impl Preview1WorkerRuntime {
         }
 
         self.filesystem_watches.stop();
+        self.runtime_io.teardown().await;
         self.coordination.stop();
 
         let (reply, response) = oneshot::channel();
@@ -2084,6 +2447,7 @@ async fn parent_loop(
     mut completion_rx: mpsc::Receiver<ActorCompletion>,
     mut notification_rx: mpsc::Receiver<NotificationId>,
     coordination: CoordinationHub,
+    runtime_io: RuntimeIoHub,
     mut completion_supervisor: Preview1CompletionSupervisor,
     next_worker: Arc<AtomicU64>,
     worker_inputs: WorkerInputRegistry,
@@ -2609,6 +2973,7 @@ async fn parent_loop(
     drop(notification_operations);
     drop(completion_rx);
     drop(notification_rx);
+    runtime_io.teardown().await;
     coordination.stop();
     stats.workers_active.store(0, Ordering::Release);
     completion_supervisor.shutdown().await;
@@ -2950,6 +3315,8 @@ async fn prepare_worker(
         worker_completion_io,
         worker_coordination,
         worker_filesystem_watches,
+        worker_runtime_io,
+        worker_runtime_children,
         worker_commands,
         worker_next_id,
         worker_input_capacity,
@@ -2962,6 +3329,8 @@ async fn prepare_worker(
             actor_host.completion_io.clone(),
             actor_host.coordination.clone(),
             actor_host.filesystem_watches.clone(),
+            actor_host.runtime_io.clone(),
+            Arc::clone(&actor_host.runtime_children),
             actor_host.commands.clone(),
             Arc::clone(&actor_host.next_worker),
             actor_host.worker_input_capacity,
@@ -2978,6 +3347,8 @@ async fn prepare_worker(
             completion_io: worker_completion_io,
             coordination: worker_coordination,
             filesystem_watches: worker_filesystem_watches,
+            runtime_io: worker_runtime_io,
+            runtime_children: worker_runtime_children,
             commands: worker_commands,
             next_worker: worker_next_id,
             worker_input_capacity,
@@ -3713,6 +4084,8 @@ mod tests {
         let (coordination, _notification_rx) =
             CoordinationHub::new(1, CoordinationConfig::default())
                 .map_err(|error| anyhow::anyhow!(error))?;
+        let runtime_io = RuntimeIoHub::new(1, RuntimeIoConfig::default(), coordination.clone())
+            .map_err(|error| anyhow::anyhow!(error))?;
         let runtime = Preview1WorkerRuntime {
             commands,
             mailbox_slots: Arc::new(Semaphore::new(1)),
@@ -3722,6 +4095,7 @@ mod tests {
             stats: Arc::new(Preview1CompatStatsInner::default()),
             filesystem_watches: FilesystemWatchHub::new(None, coordination.clone(), 1, 1)
                 .map_err(|error| anyhow::anyhow!(error))?,
+            runtime_io,
             coordination,
             terminal_error: Arc::new(Mutex::new(None)),
             limits: WasmResourceLimits::default(),

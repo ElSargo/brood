@@ -47,6 +47,13 @@ session's working directory at guest `.` with the requested access. Without one
 of those grants, the hosted actor keeps the narrow package-directory,
 read-only default.
 
+Runtime I/O authority is also explicit. `subprocess:<name>` admits one
+PATH-resolved command name, `pty` admits real pseudoterminal attachment for an
+otherwise-allowed command, and `network:loopback` admits outbound connections
+to loopback peers. These grants survive replacement and workspace rebind with
+the configured instance ID; they do not imply arbitrary process, terminal, or
+network authority.
+
 Hosted plugin watch budgets are declared in `[module.<id>.resources]`.
 `filesystem-watches` bounds live logical watch handles and
 `filesystem-watch-events` bounds queued events per handle before the queue is

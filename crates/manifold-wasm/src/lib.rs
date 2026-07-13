@@ -23,6 +23,7 @@ pub mod policy_provider;
 mod policy_provider_link;
 pub mod preview1_worker;
 mod resource_limits;
+pub mod runtime_io;
 
 pub use actor::{
     ACTOR_EMPTY_OUTBOX, ActorEpochOutcome, ActorOutbox, ActorOutboxMessage, ActorPublication,
@@ -95,6 +96,10 @@ pub use preview1_worker::{
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
 };
 pub use resource_limits::WasmResourceLimits;
+pub use runtime_io::{
+    ByteStream, ChildHandle, ChildStatus, ProcessIo, PtyIo, RuntimeIoCapabilities, RuntimeIoConfig,
+    RuntimeIoError, RuntimeIoHub, StreamRead, TimerHandle, TimerStatus,
+};
 
 #[cfg(test)]
 mod tests;

@@ -4,12 +4,6 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Plugin I/O follow-ups exposed by the real workspace watcher
-
-- Subprocesses, pipe streams, PTYs, sockets, and timers remain deliberately
-  absent. They should reuse the same generation-owned resource and pollable
-  lifecycle rather than grow separate wait mechanisms.
-
 ## Control and DBus API shape
 
 - `crates/manifoldd/src/control.rs`: `exit` in the command path shows that CLI
@@ -82,6 +76,19 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Subprocess pipes, real PTYs, loopback sockets, and timers now share one
+  bounded byte-stream and notification/pollable lifecycle owned by the actor
+  generation. Component and Preview 1 guests use the same capability grants,
+  PATH-selected process resolution, exit status, backpressure, async drop, and
+  structured teardown semantics; admission races, cancellation, stale handles,
+  resource churn, and blocked host work have deterministic coverage. The real
+  Component `component-runtime-io` plugin and the Preview 1
+  `workspace-file-log` worker write separate visible transcripts through
+  `tools/test-runtime-io-plugins-nested.sh`: both feed an allowlisted `tr`
+  process through guest-visible pipes, preserve exit 7, prove both ends of an
+  interactive PTY are terminals, exchange distinct requests with a real
+  controller-owned TCP peer whose independent log corroborates them, and
+  observe the 20 ms timer before the 80 ms timer through the ordinary wait set.
 - Hosted plugin manifests can narrow logical filesystem-watch and per-watch
   event ceilings through a validated resource table; zero, daemon-ceiling
   bypass, and policy loss across stable-ID replacement are covered by tests.

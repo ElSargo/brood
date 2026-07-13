@@ -105,3 +105,12 @@ related session or generation, instance ID, guest root, and sorted manifest
 data. After the nested daemon exits the active workspace ends with
 `reason=shutdown`; stable hashes after exit prove the joined generation cannot
 append afterward.
+
+The Preview 1 artifact also carries the compatibility half of the runtime-I/O
+proof. `tools/test-runtime-io-plugins-nested.sh` sends a dedicated worker a real
+loopback peer address and preserves
+`.manifold/preview1-runtime-io-transcript.md`. The report contains the
+PATH-selected command, pipe stdin and transformed stdout, exit 7, PTY terminal
+checks and interaction, the peer response, and distinct timer wake order. The
+peer independently records both request and response in
+`.manifold/runtime-io-peer.log`.

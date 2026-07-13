@@ -137,6 +137,40 @@ language I/O with a bespoke syscall vocabulary. Compatibility does not imply a
 complete Linux emulation: `fork`, arbitrary `ioctl`, ambient descriptors, and
 system-wide process control are outside the contract.
 
+### Bounded streams, processes, PTYs, sockets, and timers
+
+The portable host surface uses one bounded byte-stream resource for child
+standard input/output/error, PTY master traffic, and connected sockets. Reads
+are nonblocking and distinguish data, temporary unavailability, and EOF;
+writes either admit a bounded chunk or report backpressure. Closing the write
+side is explicit. There are no process-, terminal-, socket-, or timer-specific
+wait calls.
+
+Every host-owned resource exposes a scheduling notification. A stream advances
+its notification generation when bytes become readable, write capacity
+changes, EOF arrives, or an error becomes terminal. Child exit and timer expiry
+advance their own notifications. Workers turn those notifications into normal
+pollables and select with the same bounded `worker-wait-any` operation used for
+guest notifications and filesystem watches. After readiness, the guest reads
+typed stream, child-status, or timer-status state; notifications never carry
+the data themselves.
+
+Process authority is an explicit manifest allowlist of PATH-resolved command
+names (`subprocess:<name>`). The runtime reports the resolved executable used
+for a child so observable proofs and diagnostics do not hide environment
+selection. `pty` separately permits spawning a child attached to a real host
+pseudoterminal. `network:loopback` permits outbound connections only to a
+loopback peer; accepting listeners, DNS, ambient sockets, and arbitrary remote
+addresses are not part of this surface. PTY children still require their
+command allowlist entry.
+
+Children, streams, PTYs, connected sockets, timers, pump tasks, and their
+notifications belong to one actor generation. Generation stop first rejects
+new operations and invalidates all handles and derived pollables, then closes
+streams and sockets, kills live children, cancels timers and pumps, and joins
+all host work before replacement can be published. Count, buffered-byte, and
+write-chunk ceilings apply uniformly to Component and Preview 1 guests.
+
 ## Messaging, Policy, And Publications
 
 Mailboxes are the durable communication path between actors, host services,
@@ -243,6 +277,14 @@ The Component and Preview 1 runtimes are implementation proofs of this target.
 The Component path demonstrates completion I/O and cooperative workers; the
 Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
 memory. Their export names and Store layout are not the durable plugin ABI.
+
+`plugins/component-runtime-io` and the runtime-I/O worker in
+`plugins/workspace-file-log` exercise the same bounded stream and pollable
+contract through both backends. Their nested workload preserves separate
+Markdown transcripts containing PATH-selected commands, pipe input and
+transformed output, a nonzero child exit, explicit stdin/stdout PTY checks and
+interactive traffic, a real loopback request/response, and distinct timer wake
+order. The local peer independently records what it received and returned.
 
 `plugins/workspace-file-log` is the user-observable Preview 1 proof. Its module
 declares a bounded shared-memory maximum, then performs a real recursive

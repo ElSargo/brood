@@ -52,6 +52,56 @@ interface host {
         backend-unavailable,
     }
 
+    enum runtime-io-error {
+        actor-stopped,
+        limit-reached,
+        not-permitted,
+        invalid-argument,
+        host-failure,
+        would-block,
+        closed,
+        invalid-handle,
+    }
+
+    variant stream-read-result {
+        data(list<u8>),
+        would-block,
+        eof,
+    }
+
+    record process-io {
+        child: u64,
+        stdin: u64,
+        stdout: u64,
+        stderr: u64,
+        resolved-command: string,
+    }
+
+    record pty-io {
+        child: u64,
+        terminal: u64,
+        resolved-command: string,
+    }
+
+    enum child-state { running, exited, signalled }
+    enum timer-state { pending, expired }
+
+    subprocess-spawn: func(command: string, arguments: list<string>) -> result<process-io, runtime-io-error>;
+    pty-spawn: func(command: string, arguments: list<string>, rows: u16, cols: u16) -> result<pty-io, runtime-io-error>;
+    worker-loopback-connect: async func(address: string) -> result<u64, runtime-io-error>;
+    stream-notification: func(handle: u64) -> result<notification-id, runtime-io-error>;
+    stream-read: func(handle: u64, max-bytes: u32) -> result<stream-read-result, runtime-io-error>;
+    stream-write: func(handle: u64, bytes: list<u8>) -> result<u32, runtime-io-error>;
+    stream-close-write: func(handle: u64) -> result<_, runtime-io-error>;
+    stream-drop: async func(handle: u64) -> result<_, runtime-io-error>;
+    child-notification: func(child: u64) -> result<notification-id, runtime-io-error>;
+    child-status: func(child: u64) -> result<tuple<child-state, option<s32>>, runtime-io-error>;
+    child-drop: async func(child: u64) -> result<_, runtime-io-error>;
+    timer-create: func(delay-ms: u64) -> result<u64, runtime-io-error>;
+    timer-notification: func(timer: u64) -> result<notification-id, runtime-io-error>;
+    timer-status: func(timer: u64) -> result<timer-state, runtime-io-error>;
+    timer-drop: async func(timer: u64) -> result<_, runtime-io-error>;
+
     enum filesystem-event-kind {
         created,
         modified,

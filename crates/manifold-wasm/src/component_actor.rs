@@ -45,11 +45,15 @@ use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
+use crate::runtime_io::{
+    ChildStatus, RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, StreamRead, TimerStatus,
+};
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io::{Read, Seek, SeekFrom, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -151,6 +155,8 @@ pub struct ComponentActorConfig {
     pub max_notifications: usize,
     pub max_pollables: usize,
     pub max_wait_set: usize,
+    /// Generation-owned process, PTY, socket, stream, and timer policy.
+    pub runtime_io: RuntimeIoConfig,
     pub dispatcher_deadline: Duration,
     /// Wall-clock cadence for guest interruption checks. Epoch yields keep the
     /// executor responsive; cross-call worker fairness uses `worker-yield`.
@@ -176,6 +182,7 @@ impl Default for ComponentActorConfig {
             max_notifications: 64,
             max_pollables: 256,
             max_wait_set: 64,
+            runtime_io: RuntimeIoConfig::default(),
             dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
@@ -248,6 +255,7 @@ struct ActorStore {
     completion_io: CompletionIo,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    runtime_io: RuntimeIoHub,
     worker_filesystem: Option<WorkerFilesystem>,
     worker_cancellations: WorkerCancellationRegistry,
     blocking_io: BlockingIoTracker,
@@ -410,6 +418,207 @@ impl WorkerCancellationToken {
 }
 
 impl bindings::manifold::plugin::host::Host for ActorStore {
+    fn subprocess_spawn(
+        &mut self,
+        command: String,
+        arguments: Vec<String>,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            bindings::manifold::plugin::host::ProcessIo,
+            bindings::manifold::plugin::host::RuntimeIoError,
+        >,
+    > {
+        Ok(self
+            .runtime_io
+            .spawn_process(&command, &arguments)
+            .map(|process| bindings::manifold::plugin::host::ProcessIo {
+                child: process.child.raw(),
+                stdin: process.stdin.raw(),
+                stdout: process.stdout.raw(),
+                stderr: process.stderr.raw(),
+                resolved_command: process
+                    .child
+                    .resolved_command()
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn pty_spawn(
+        &mut self,
+        command: String,
+        arguments: Vec<String>,
+        rows: u16,
+        cols: u16,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            bindings::manifold::plugin::host::PtyIo,
+            bindings::manifold::plugin::host::RuntimeIoError,
+        >,
+    > {
+        Ok(self
+            .runtime_io
+            .spawn_pty(&command, &arguments, rows, cols)
+            .map(|pty| bindings::manifold::plugin::host::PtyIo {
+                child: pty.child.raw(),
+                terminal: pty.terminal.raw(),
+                resolved_command: pty.child.resolved_command().to_string_lossy().into_owned(),
+            })
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn stream_notification(
+        &mut self,
+        handle: u64,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::manifold::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .stream(handle)
+            .map(|stream| stream.notification().raw())
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn stream_read(
+        &mut self,
+        handle: u64,
+        max_bytes: u32,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            bindings::manifold::plugin::host::StreamReadResult,
+            bindings::manifold::plugin::host::RuntimeIoError,
+        >,
+    > {
+        Ok(self
+            .runtime_io
+            .stream(handle)
+            .and_then(|stream| stream.try_read(max_bytes as usize))
+            .map(|read| match read {
+                StreamRead::Data(bytes) => {
+                    bindings::manifold::plugin::host::StreamReadResult::Data(bytes)
+                }
+                StreamRead::WouldBlock => {
+                    bindings::manifold::plugin::host::StreamReadResult::WouldBlock
+                }
+                StreamRead::Eof => bindings::manifold::plugin::host::StreamReadResult::Eof,
+            })
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn stream_write(
+        &mut self,
+        handle: u64,
+        bytes: Vec<u8>,
+    ) -> wasmtime::Result<std::result::Result<u32, bindings::manifold::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .stream(handle)
+            .and_then(|stream| stream.try_write(&bytes))
+            .and_then(|count| {
+                u32::try_from(count).map_err(|_overflow| RuntimeIoError::InvalidArgument)
+            })
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn stream_close_write(
+        &mut self,
+        handle: u64,
+    ) -> wasmtime::Result<std::result::Result<(), bindings::manifold::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .stream(handle)
+            .and_then(|stream| stream.close_write())
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn child_notification(
+        &mut self,
+        child: u64,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::manifold::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .child(child)
+            .map(|child| child.notification().raw())
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn child_status(
+        &mut self,
+        child: u64,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            (bindings::manifold::plugin::host::ChildState, Option<i32>),
+            bindings::manifold::plugin::host::RuntimeIoError,
+        >,
+    > {
+        Ok(self
+            .runtime_io
+            .child(child)
+            .and_then(|child| child.status())
+            .map(|status| match status {
+                ChildStatus::Running => {
+                    (bindings::manifold::plugin::host::ChildState::Running, None)
+                }
+                ChildStatus::Exited(Some(code)) => (
+                    bindings::manifold::plugin::host::ChildState::Exited,
+                    Some(code),
+                ),
+                ChildStatus::Exited(None) => (
+                    bindings::manifold::plugin::host::ChildState::Signalled,
+                    None,
+                ),
+            })
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn timer_create(
+        &mut self,
+        delay_ms: u64,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::manifold::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .create_timer(Duration::from_millis(delay_ms))
+            .map(|timer| timer.raw())
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn timer_notification(
+        &mut self,
+        timer: u64,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::manifold::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .timer(timer)
+            .map(|timer| timer.notification().raw())
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn timer_status(
+        &mut self,
+        timer: u64,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            bindings::manifold::plugin::host::TimerState,
+            bindings::manifold::plugin::host::RuntimeIoError,
+        >,
+    > {
+        Ok(self
+            .runtime_io
+            .timer(timer)
+            .and_then(|timer| timer.status())
+            .map(|status| match status {
+                TimerStatus::Pending => bindings::manifold::plugin::host::TimerState::Pending,
+                TimerStatus::Expired => bindings::manifold::plugin::host::TimerState::Expired,
+            })
+            .map_err(map_component_runtime_io_error))
+    }
+
     fn filesystem_watch_create(
         &mut self,
         path: String,
@@ -637,6 +846,93 @@ impl bindings::manifold::plugin::host::HostFilesystemWatch for ActorStore {
 }
 
 impl bindings::manifold::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorStore> {
+    fn stream_drop(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        handle: u64,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<(), bindings::manifold::plugin::host::RuntimeIoError>,
+        >,
+    > + Send {
+        let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
+        async move {
+            Ok(runtime_io
+                .drop_stream(handle)
+                .await
+                .map_err(map_component_runtime_io_error))
+        }
+    }
+
+    fn child_drop(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        child: u64,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<(), bindings::manifold::plugin::host::RuntimeIoError>,
+        >,
+    > + Send {
+        let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
+        async move {
+            Ok(runtime_io
+                .drop_child(child)
+                .await
+                .map_err(map_component_runtime_io_error))
+        }
+    }
+
+    fn timer_drop(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        timer: u64,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<(), bindings::manifold::plugin::host::RuntimeIoError>,
+        >,
+    > + Send {
+        let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
+        async move {
+            Ok(runtime_io
+                .drop_timer(timer)
+                .await
+                .map_err(map_component_runtime_io_error))
+        }
+    }
+
+    fn worker_loopback_connect(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        address: String,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<u64, bindings::manifold::plugin::host::RuntimeIoError>,
+        >,
+    > + Send {
+        let current = current_component_worker(accessor);
+        let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
+        async move {
+            let (_worker, cancellation) = current?;
+            if cancellation.is_requested() {
+                return Ok(Err(
+                    bindings::manifold::plugin::host::RuntimeIoError::ActorStopped,
+                ));
+            }
+            let address = match address.parse::<SocketAddr>() {
+                Ok(address) => address,
+                Err(_error) => {
+                    return Ok(Err(
+                        bindings::manifold::plugin::host::RuntimeIoError::InvalidArgument,
+                    ));
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(RuntimeIoError::StaleHandle),
+                result = runtime_io.connect_loopback(address) => result,
+            };
+            Ok(result
+                .map(|stream| stream.raw())
+                .map_err(map_component_runtime_io_error))
+        }
+    }
+
     fn worker_wait_any(
         accessor: &wasmtime::component::Accessor<ActorStore, Self>,
         pollables: Vec<u64>,
@@ -997,6 +1293,21 @@ const fn map_component_poll_error(error: PollError) -> bindings::manifold::plugi
     }
 }
 
+const fn map_component_runtime_io_error(
+    error: RuntimeIoError,
+) -> bindings::manifold::plugin::host::RuntimeIoError {
+    use bindings::manifold::plugin::host::RuntimeIoError as AbiError;
+    match error {
+        RuntimeIoError::StaleHandle => AbiError::InvalidHandle,
+        RuntimeIoError::LimitReached => AbiError::LimitReached,
+        RuntimeIoError::NotPermitted => AbiError::NotPermitted,
+        RuntimeIoError::InvalidArgument => AbiError::InvalidArgument,
+        RuntimeIoError::HostFailure => AbiError::HostFailure,
+        RuntimeIoError::WouldBlock => AbiError::WouldBlock,
+        RuntimeIoError::Closed => AbiError::Closed,
+    }
+}
+
 fn component_ready_pollable(
     ready: crate::coordination::ReadyPollable,
 ) -> bindings::manifold::plugin::host::ReadyPollable {
@@ -1038,6 +1349,7 @@ pub struct ComponentActor {
     completion_io: CompletionIo,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    runtime_io: RuntimeIoHub,
     commands: mpsc::Sender<RuntimeCommand>,
     mailbox_slots: Arc<Semaphore>,
     mailbox_capacity: usize,
@@ -1116,6 +1428,9 @@ impl ComponentActor {
             config.max_filesystem_watch_events,
         )
         .map_err(|error| anyhow::anyhow!("create component filesystem watch hub: {error}"))?;
+        let runtime_io =
+            RuntimeIoHub::new(generation, config.runtime_io.clone(), coordination.clone())
+                .map_err(|error| anyhow::anyhow!("create component runtime I/O hub: {error}"))?;
 
         let engine = component_engine()?;
         let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
@@ -1142,6 +1457,7 @@ impl ComponentActor {
                 completion_io: completion_io.clone(),
                 coordination: coordination.clone(),
                 filesystem_watches,
+                runtime_io: runtime_io.clone(),
                 worker_filesystem,
                 worker_cancellations: WorkerCancellationRegistry::default(),
                 blocking_io: BlockingIoTracker::default(),
@@ -1177,7 +1493,7 @@ impl ComponentActor {
         };
 
         let (completion_tx, completion_rx) = mpsc::channel(config.max_outstanding_io);
-        let runtime_io = completion_io.clone();
+        let runtime_completion_io = completion_io.clone();
         let runtime_byte_budget = byte_budget.clone();
         let runtime_observer_result_bytes = Arc::clone(&observer_result_bytes);
         let limits = config.limits;
@@ -1195,7 +1511,7 @@ impl ComponentActor {
                 runtime_observer_result_bytes,
             )
             .await;
-            runtime_io.stop();
+            runtime_completion_io.stop();
             result
         });
 
@@ -1204,6 +1520,7 @@ impl ComponentActor {
             completion_io,
             coordination,
             filesystem_watches: actor_filesystem_watches,
+            runtime_io,
             commands: command_tx,
             mailbox_slots,
             mailbox_capacity,
@@ -1343,6 +1660,7 @@ impl ComponentActor {
 
     pub async fn shutdown(&mut self) -> Result<()> {
         self.completion_io.stop();
+        self.runtime_io.teardown().await;
         self.coordination.stop();
         let _ = self.commands.send(RuntimeCommand::Shutdown).await;
         let runtime_result = match self.runtime_task.take() {
