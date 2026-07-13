@@ -98,6 +98,7 @@ async fn main() -> Result<()> {
                 guest_path: ".".to_string(),
                 writable: true,
             }),
+            ..Preview1ActorCapabilities::default()
         },
         Preview1WorkerConfig::default(),
     )
@@ -131,6 +132,7 @@ async fn main() -> Result<()> {
             guest_path: ".".to_string(),
             writable: false,
         }),
+        ..Preview1ActorCapabilities::default()
     };
     let mut compat = Preview1CompatActor::load(
         &guest,

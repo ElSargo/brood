@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use wasmtime::{AsContext, AsContextMut, Config, Engine, Instance, Memory, Module, TypedFunc};
 
 use crate::{
-    mailbox::{ActorId, Mailbox, MailboxRegistry},
+    mailbox::{ActorId, Mailbox, MailboxRegistry, PreparedMailboxRegistration},
     policy_provider::{
         DEFAULT_PUBLICATION_SLOT, PublicationFrameLease, PublicationRegistry, PublicationSummary,
     },
@@ -50,7 +50,7 @@ pub struct GuestAllocation {
 }
 
 impl Registry {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             mailboxes: MailboxRegistry::new(),
             publications: PublicationRegistry::new(),
@@ -69,6 +69,32 @@ impl Registry {
         self.mailboxes.register_actor(name, capacity)
     }
 
+    pub fn prepare_actor(
+        &mut self,
+        name: impl Into<String>,
+        capacity: usize,
+    ) -> Result<(PreparedMailboxRegistration, Mailbox)> {
+        self.mailboxes.prepare_actor(name, capacity)
+    }
+
+    pub fn activate_prepared_actors(
+        &mut self,
+        registrations: Vec<PreparedMailboxRegistration>,
+        replace_names: &[String],
+    ) -> Result<()> {
+        self.mailboxes
+            .activate_prepared(registrations, replace_names)
+    }
+
+    pub fn validate_prepared_actors(
+        &self,
+        registrations: &[PreparedMailboxRegistration],
+        replace_names: &[String],
+    ) -> Result<()> {
+        self.mailboxes
+            .validate_prepared(registrations, replace_names)
+    }
+
     pub fn register_host_mailbox(&mut self, capacity: usize) -> Result<Mailbox> {
         self.register_actor(crate::global_key_policy::HOST_ACTOR_NAME, capacity)
     }
@@ -79,6 +105,10 @@ impl Registry {
 
     pub fn unregister_actor(&mut self, name: &str) -> bool {
         self.mailboxes.unregister_actor(name)
+    }
+
+    pub fn unregister_actor_generation(&mut self, name: &str, actor_id: ActorId) -> bool {
+        self.mailboxes.unregister_actor_generation(name, actor_id)
     }
 
     pub fn host_actor_id(&self) -> Option<ActorId> {

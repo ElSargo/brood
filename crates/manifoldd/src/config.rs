@@ -2,9 +2,10 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use tracing::{info, warn};
 
 use crate::state::Manifold;
@@ -99,6 +100,57 @@ struct ModuleConfig {
     capabilities: Vec<String>,
     #[serde(default, rename = "startup-message")]
     startup_message: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<ModuleLifecycleConfig>,
+    #[serde(default)]
+    resources: ModuleResourceConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ModuleResourceConfig {
+    #[serde(rename = "filesystem-watches")]
+    filesystem_watches: Option<usize>,
+    #[serde(rename = "filesystem-watch-events")]
+    filesystem_watch_events: Option<usize>,
+}
+
+fn configured_plugin_resources(
+    resources: &ModuleResourceConfig,
+) -> Result<crate::state::ConfiguredPluginResources> {
+    let defaults = crate::state::ConfiguredPluginResources::default();
+    let filesystem_watches = resources
+        .filesystem_watches
+        .unwrap_or(defaults.filesystem_watches);
+    let filesystem_watch_events = resources
+        .filesystem_watch_events
+        .unwrap_or(defaults.filesystem_watch_events);
+    ensure!(
+        filesystem_watches > 0 && filesystem_watch_events > 0,
+        "plugin filesystem watch resource limits must be non-zero"
+    );
+    ensure!(
+        filesystem_watches <= defaults.filesystem_watches
+            && filesystem_watch_events <= defaults.filesystem_watch_events,
+        "plugin filesystem watch resource limits cannot exceed daemon ceilings"
+    );
+    Ok(crate::state::ConfiguredPluginResources {
+        filesystem_watches,
+        filesystem_watch_events,
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ModuleLifecycleConfig {
+    #[serde(default = "default_lifecycle_timeout_ms", rename = "start-timeout-ms")]
+    start_timeout_ms: u64,
+    #[serde(default = "default_lifecycle_timeout_ms", rename = "stop-timeout-ms")]
+    stop_timeout_ms: u64,
+    #[serde(default)]
+    data: BTreeMap<String, String>,
+}
+
+const fn default_lifecycle_timeout_ms() -> u64 {
+    1_000
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -149,6 +201,20 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
 
         match module.kind.as_str() {
             "wasm-plugin" | "plugin" => {
+                ensure!(
+                    module.startup_message.is_none() || module.lifecycle.is_none(),
+                    "module {id} cannot combine legacy startup-message with lifecycle"
+                );
+                if let Some(lifecycle) = &module.lifecycle {
+                    ensure!(
+                        lifecycle.start_timeout_ms > 0 && lifecycle.stop_timeout_ms > 0,
+                        "module {id} lifecycle timeouts must be non-zero"
+                    );
+                    ensure!(
+                        lifecycle.data.keys().all(|key| !key.trim().is_empty()),
+                        "module {id} lifecycle data keys must not be empty"
+                    );
+                }
                 let module_path = resolve_path(
                     config_path.parent().unwrap_or_else(|| Path::new(".")),
                     &module.path,
@@ -162,14 +228,28 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                     continue;
                 }
                 let workspace_filesystem = workspace_filesystem_capability(&module.capabilities);
+                let runtime_io =
+                    runtime_io_capabilities(&module.capabilities).with_context(|| {
+                        format!("validate config module {id} runtime I/O capabilities")
+                    })?;
                 state
-                    .replace_configured_wasm_plugin(&id, &module_path, workspace_filesystem)
+                    .replace_configured_wasm_plugin(
+                        &id,
+                        &module_path,
+                        workspace_filesystem,
+                        module.startup_message,
+                        module
+                            .lifecycle
+                            .map(|lifecycle| crate::state::ConfiguredPluginLifecycle {
+                                start_timeout: Duration::from_millis(lifecycle.start_timeout_ms),
+                                stop_timeout: Duration::from_millis(lifecycle.stop_timeout_ms),
+                                data: lifecycle.data,
+                            }),
+                        configured_plugin_resources(&module.resources)
+                            .with_context(|| format!("validate config module {id} resources"))?,
+                        runtime_io,
+                    )
                     .with_context(|| format!("load config module {id}"))?;
-                if let Some(message) = module.startup_message {
-                    state
-                        .send_plugin_actor_message(&id, "host".to_string(), message)
-                        .with_context(|| format!("send startup message to config module {id}"))?;
-                }
                 info!(
                     module = %id,
                     path = %module_path.display(),
@@ -213,6 +293,35 @@ fn workspace_filesystem_capability(capabilities: &[String]) -> Option<bool> {
     }
 }
 
+fn runtime_io_capabilities(
+    capabilities: &[String],
+) -> Result<manifold_wasm::RuntimeIoCapabilities> {
+    let mut commands = capabilities
+        .iter()
+        .filter_map(|capability| capability.strip_prefix("subprocess:"))
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure!(
+        commands.iter().all(|command| {
+            let mut components = Path::new(command).components();
+            !command.is_empty()
+                && matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+        }),
+        "subprocess capability must name one PATH command"
+    );
+    commands.sort();
+    commands.dedup();
+    Ok(manifold_wasm::RuntimeIoCapabilities {
+        commands,
+        allow_pty: capabilities.iter().any(|capability| capability == "pty"),
+        allow_loopback: capabilities
+            .iter()
+            .any(|capability| capability == "network:loopback"),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupAppFilter {
     All,
@@ -243,7 +352,8 @@ pub fn load_startup_apps(
         match app.realm {
             StartupRealm::Session if filter == StartupAppFilter::All => state
                 .spawn_hosted_app_argv(&argv)
-                .with_context(|| format!("spawn config startup app {id}"))?,
+                .with_context(|| format!("spawn config startup app {id}"))
+                .map(|_| ())?,
             StartupRealm::Session => {
                 info!(
                     startup_app = %id,
@@ -253,7 +363,8 @@ pub fn load_startup_apps(
             }
             StartupRealm::Presentation => state
                 .spawn_presentation_app_argv(&argv)
-                .with_context(|| format!("spawn config presentation startup app {id}"))?,
+                .with_context(|| format!("spawn config presentation startup app {id}"))
+                .map(|_| ())?,
         }
         info!(startup_app = %id, realm = ?app.realm, argv = ?argv, "spawned config startup app");
     }
@@ -442,10 +553,91 @@ mod tests {
     };
 
     use super::{
-        BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, SessionRunnerSource,
-        discover_session_runner, read_config, repo_config_path_from_current_exe, resolve_path,
-        resolve_startup_argv, workspace_filesystem_capability,
+        BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, ModuleResourceConfig,
+        SessionRunnerSource, configured_plugin_resources, discover_session_runner, read_config,
+        repo_config_path_from_current_exe, resolve_path, resolve_startup_argv,
+        runtime_io_capabilities, workspace_filesystem_capability,
     };
+
+    #[test]
+    fn runtime_io_capabilities_are_explicit_sorted_and_bounded_by_kind() {
+        let capabilities = runtime_io_capabilities(&[
+            "subprocess:sed".to_string(),
+            "network:loopback".to_string(),
+            "subprocess:printf".to_string(),
+            "pty".to_string(),
+            "subprocess:sed".to_string(),
+        ])
+        .expect("runtime I/O capabilities");
+        assert_eq!(capabilities.commands, ["printf", "sed"]);
+        assert!(capabilities.allow_pty);
+        assert!(capabilities.allow_loopback);
+        assert!(runtime_io_capabilities(&["subprocess:".to_string()]).is_err());
+        assert!(runtime_io_capabilities(&["subprocess:../sh".to_string()]).is_err());
+    }
+
+    #[test]
+    fn plugin_watch_resources_default_and_accept_narrow_nonzero_limits() {
+        assert_eq!(
+            configured_plugin_resources(&ModuleResourceConfig::default())
+                .expect("default resources"),
+            crate::state::ConfiguredPluginResources::default()
+        );
+        let resources = configured_plugin_resources(&ModuleResourceConfig {
+            filesystem_watches: Some(3),
+            filesystem_watch_events: Some(8),
+        })
+        .expect("narrow resources");
+        assert_eq!(resources.filesystem_watches, 3);
+        assert_eq!(resources.filesystem_watch_events, 8);
+    }
+
+    #[test]
+    fn plugin_watch_resources_reject_zero_and_daemon_ceiling_bypass() {
+        assert!(
+            configured_plugin_resources(&ModuleResourceConfig {
+                filesystem_watches: Some(0),
+                filesystem_watch_events: Some(8),
+            })
+            .is_err()
+        );
+        assert!(
+            configured_plugin_resources(&ModuleResourceConfig {
+                filesystem_watches: Some(17),
+                filesystem_watch_events: Some(4097),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parser_reads_plugin_resource_table() {
+        let root = temp_dir("plugin-resources");
+        std::fs::create_dir_all(&root).expect("create resource config dir");
+        let path = root.join("manifold.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [module.watcher]
+            kind = "plugin"
+            path = "watcher.wasm"
+
+            [module.watcher.resources]
+            filesystem-watches = 3
+            filesystem-watch-events = 64
+            "#,
+        )
+        .expect("write resource config");
+        let config = read_config(&path).expect("parse resource config");
+        let resources = &config
+            .module
+            .get("watcher")
+            .expect("watcher module")
+            .resources;
+        assert_eq!(resources.filesystem_watches, Some(3));
+        assert_eq!(resources.filesystem_watch_events, Some(64));
+        std::fs::remove_dir_all(root).expect("remove resource config");
+    }
 
     #[test]
     fn resolves_relative_paths_against_config_dir() {

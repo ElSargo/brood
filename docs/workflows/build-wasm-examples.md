@@ -36,7 +36,10 @@ nix develop --command cargo run -p manifold-wasm --example componentize -- \
 
 The Preview 1 compatibility worker remains a core
 `wasm32-wasip1-threads` module. Its shared-memory import and private worker
-instances are the compatibility runtime contract, so do not componentize it:
+instances are the compatibility runtime contract, so do not componentize it.
+The checked-in linker configuration declares a 512 MiB maximum, large enough
+for the workload while remaining inside the runtime's aggregate per-generation
+guest-memory ceiling.
 
 ```sh
 nix develop --command cargo build \

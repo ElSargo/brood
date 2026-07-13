@@ -5,28 +5,22 @@
     clippy::cast_sign_loss,
     clippy::expect_used,
     clippy::filter_map_next,
-    clippy::indexing_slicing,
     clippy::iter_on_single_items,
     clippy::let_underscore_must_use,
     clippy::match_same_arms,
     clippy::needless_pass_by_ref_mut,
-    clippy::needless_pass_by_value,
     clippy::option_if_let_else,
     clippy::question_mark,
     clippy::significant_drop_tightening,
     clippy::struct_field_names,
-    clippy::too_many_arguments,
-    clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_debug_formatting,
     clippy::unused_self,
     clippy::unwrap_used,
     clippy::useless_let_if_seq,
-    reason = "tracked in issues.md: central runtime state intentionally keeps coupled event-loop and plugin lifecycle resources alive together"
+    reason = "remaining suppressions cover checked geometry conversions, protocol-owned Smithay resources, and experimental state policies tracked by dedicated issues"
 )]
-// TODO(lint-structure): decompose Manifold state into typed geometry, session, focus, and registry services.
-
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -92,6 +86,7 @@ use crate::{
     },
     presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
+    state_services::{FocusService, SurfaceSessionService, TestHarnessService},
     wasm_test::{
         TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime, service_request,
     },
@@ -147,6 +142,29 @@ struct HostedChild {
     pid: u32,
     pane_id: Option<u64>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostedChildToken(u64);
+
+impl HostedChildToken {
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostedChildStatus {
+    Launching,
+    Running,
+    Exited { success: bool, detail: String },
+    Unknown,
+}
+
+const HOSTED_CHILD_COMPLETION_HISTORY: usize = 256;
 
 struct HostedChildStarted {
     pid: u32,
@@ -220,6 +238,27 @@ fn record_hosted_child_exit_error(
     );
 }
 
+fn remember_hosted_child_completion(
+    completions: &mut VecDeque<(HostedChildToken, bool, String)>,
+    pane_id: Option<u64>,
+    success: bool,
+    detail: String,
+) {
+    let Some(pane_id) = pane_id else {
+        return;
+    };
+    completions.push_back((HostedChildToken(pane_id), success, detail));
+    while completions.len() > HOSTED_CHILD_COMPLETION_HISTORY {
+        completions.pop_front();
+    }
+}
+
+fn hosted_child_exit_detail(status: ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| format!("exit:{code}"))
+}
+
 fn set_fractional_scale_for_surface(surface: &WlSurface, scale: f64) {
     with_states(surface, |states| {
         fractional_scale::with_fractional_scale(states, |fractional_scale| {
@@ -284,6 +323,8 @@ struct NativeSessionLayout {
 pub struct SurfaceSessionId(u64);
 
 impl SurfaceSessionId {
+    pub const NONE: Self = Self(0);
+
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -350,7 +391,7 @@ pub struct StatusItemSummary {
 }
 
 #[derive(Default)]
-struct ExtensionRegistry {
+struct RegistryService {
     extensions: Vec<ExtensionRecord>,
     windows: Vec<WindowRecord>,
     active_window_roles: BTreeMap<String, ActiveWindowRole>,
@@ -418,6 +459,16 @@ struct AgentNotificationRecord {
     unread: bool,
 }
 
+pub struct AgentNotification {
+    pub agent_id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub body: String,
+    pub level: String,
+    pub metadata: ExtensionMetadata,
+    pub sender: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusPublisherRecord {
     id: String,
@@ -435,15 +486,274 @@ struct StatusItemRecord {
     metadata: ExtensionMetadata,
 }
 
+impl RegistryService {
+    fn register_agent(
+        &mut self,
+        kind: &str,
+        metadata: ExtensionMetadata,
+        sender: String,
+        session: SurfaceSessionId,
+    ) -> Result<String> {
+        let kind = normalize_registry_value(kind).context("agent kind must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let id = stable_agent_registry_id(&kind, &metadata);
+        let status = metadata
+            .get("status")
+            .and_then(|value| normalize_registry_value(value));
+        if let Some(record) = self.agents.iter_mut().find(|record| record.id == id) {
+            record.kind = kind;
+            if let Some(status) = status {
+                record.status = status;
+            }
+            merge_agent_metadata(&mut record.metadata, metadata);
+            record.sender = sender;
+            record.session = session;
+        } else {
+            self.agents.push(AgentRecord {
+                id: id.clone(),
+                kind,
+                status: status.unwrap_or_else(|| "unknown".to_string()),
+                metadata,
+                sender,
+                session,
+                attention: false,
+                unread_notifications: 0,
+            });
+        }
+        Ok(id)
+    }
+
+    fn update_agent(
+        &mut self,
+        agent_id: &str,
+        status: &str,
+        metadata: ExtensionMetadata,
+        sender: String,
+    ) -> Result<bool> {
+        let status = normalize_registry_value(status).context("agent status must not be empty")?;
+        ensure_metadata(&metadata)?;
+        let Some(record) = self.agents.iter_mut().find(|record| record.id == agent_id) else {
+            return Ok(false);
+        };
+        record.status = status;
+        merge_agent_metadata(&mut record.metadata, metadata);
+        record.sender = sender;
+        Ok(true)
+    }
+
+    fn notify_agent(&mut self, request: AgentNotification) -> Result<String> {
+        let title = normalize_registry_value(&request.title)
+            .context("notification title must not be empty")?;
+        let level = normalize_registry_value(&request.level).unwrap_or_else(|| "info".to_string());
+        ensure_metadata(&request.metadata)?;
+        let Some(record) = self
+            .agents
+            .iter_mut()
+            .find(|record| record.id == request.agent_id)
+        else {
+            anyhow::bail!("unknown agent {}", request.agent_id);
+        };
+        record.sender = request.sender;
+        record.attention = true;
+        record.unread_notifications = record.unread_notifications.saturating_add(1);
+        if matches!(level.as_str(), "waiting" | "blocked" | "error") {
+            record.status.clone_from(&level);
+        }
+
+        let mut id_metadata = request.metadata.clone();
+        id_metadata.insert("agent_id".to_string(), request.agent_id.clone());
+        id_metadata.insert("title".to_string(), title.clone());
+        id_metadata.insert("body".to_string(), request.body.clone());
+        let id = stable_registry_id("agent-notification", [&level], &id_metadata);
+        self.notifications.push(AgentNotificationRecord {
+            id: id.clone(),
+            agent_id: request.agent_id,
+            title,
+            subtitle: request.subtitle,
+            body: request.body,
+            level,
+            metadata: request.metadata,
+            unread: true,
+        });
+        Ok(id)
+    }
+
+    fn clear_agent_attention(&mut self, agent_id: &str) -> bool {
+        let Some(record) = self.agents.iter_mut().find(|record| record.id == agent_id) else {
+            return false;
+        };
+        record.attention = false;
+        record.unread_notifications = 0;
+        for notification in self
+            .notifications
+            .iter_mut()
+            .filter(|notification| notification.agent_id == agent_id)
+        {
+            notification.unread = false;
+        }
+        true
+    }
+
+    fn unregister_agent(&mut self, agent_id: &str) -> bool {
+        let before = self.agents.len();
+        self.agents.retain(|agent| agent.id != agent_id);
+        if before == self.agents.len() {
+            return false;
+        }
+        self.notifications
+            .retain(|notification| notification.agent_id != agent_id);
+        true
+    }
+
+    fn unregister_agents_for_pane(&mut self, pane_id: u64) -> Vec<String> {
+        let pane_id = pane_id.to_string();
+        let removed = self
+            .agents
+            .iter()
+            .filter(|agent| agent.metadata.get("pane_id") == Some(&pane_id))
+            .map(|agent| agent.id.clone())
+            .collect::<BTreeSet<_>>();
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        self.agents.retain(|agent| !removed.contains(&agent.id));
+        self.notifications
+            .retain(|notification| !removed.contains(&notification.agent_id));
+        removed.into_iter().collect()
+    }
+}
+
 enum HostedIoActor {
     Component(manifold_wasm::ComponentActor),
     Preview1(manifold_wasm::Preview1CompatActor),
+}
+
+struct LegacyWasmActorGeneration {
+    declarations: Vec<manifold_wasm::WasmActorDeclaration>,
+    actor_ids: BTreeMap<String, manifold_wasm::ActorId>,
+    cancellation: tokio::sync::watch::Sender<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl LegacyWasmActorGeneration {
+    fn actor_names(&self) -> Vec<String> {
+        self.declarations
+            .iter()
+            .map(|actor| actor.name.clone())
+            .collect()
+    }
+
+    fn subscribers(&self, event: manifold_wasm::WasmActorEventKind) -> Vec<String> {
+        self.declarations
+            .iter()
+            .filter(|actor| actor.subscribes_to(event))
+            .map(|actor| actor.name.clone())
+            .collect()
+    }
+}
+
+async fn cancel_and_join_legacy_generation(generation: LegacyWasmActorGeneration) {
+    let actor_names = generation.actor_names();
+    let _ = generation.cancellation.send(true);
+    for (actor_name, task) in actor_names.into_iter().zip(generation.tasks) {
+        match task.await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(actor = %actor_name, error = %error, "legacy WASM actor join failed");
+            }
+        }
+    }
+}
+
+fn spawn_legacy_actor_task(
+    runtime: &tokio::runtime::Handle,
+    mut actor: manifold_wasm::WasmActor,
+    declaration: manifold_wasm::WasmActorDeclaration,
+    registry: Arc<tokio::sync::Mutex<manifold_wasm::Registry>>,
+    host_events: channel::Sender<PluginHostEvent>,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
+    path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
+        info!(actor = %declaration.name, export = %declaration.export_name, path = %path.display(), "started WASM plugin actor generation");
+        loop {
+            let outcome = tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    if changed.is_err() || *cancellation.borrow() {
+                        info!(actor = %declaration.name, "cancelled WASM plugin actor generation");
+                        return;
+                    }
+                    continue;
+                }
+                outcome = actor.run_one_epoch() => outcome,
+            };
+            match outcome {
+                Ok(manifold_wasm::ActorEpochOutcome::Continue { outbox }) => {
+                    if let Some(outbox) = outbox {
+                        let refresh_layout = !outbox.publications.is_empty();
+                        let dispatch = {
+                            let mut registry = registry.lock().await;
+                            actor.dispatch_outbox(&mut registry, &outbox)
+                        };
+                        if let Err(error) = dispatch {
+                            warn!(actor = %declaration.name, error = %error, "WASM plugin actor outbox dispatch failed");
+                        }
+                        let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
+                        if refresh_layout {
+                            let _ = host_events.send(PluginHostEvent::RefreshWasmLayout);
+                        }
+                    }
+                }
+                Ok(manifold_wasm::ActorEpochOutcome::Stop) => {
+                    info!(actor = %declaration.name, "WASM plugin actor stopped");
+                    return;
+                }
+                Err(error) => {
+                    warn!(actor = %declaration.name, error = %error, "WASM plugin actor epoch failed");
+                    return;
+                }
+            }
+        }
+    })
 }
 
 #[derive(Clone)]
 struct HostedPluginFilesystem {
     host_path: PathBuf,
     writable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfiguredWorkspacePlugin {
+    path: PathBuf,
+    writable: bool,
+    startup_message: Option<String>,
+    lifecycle: Option<ConfiguredPluginLifecycle>,
+    resources: ConfiguredPluginResources,
+    runtime_io: manifold_wasm::RuntimeIoCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfiguredPluginResources {
+    pub filesystem_watches: usize,
+    pub filesystem_watch_events: usize,
+}
+
+impl Default for ConfiguredPluginResources {
+    fn default() -> Self {
+        Self {
+            filesystem_watches: 16,
+            filesystem_watch_events: 4096,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredPluginLifecycle {
+    pub start_timeout: Duration,
+    pub stop_timeout: Duration,
+    pub data: BTreeMap<String, String>,
 }
 
 impl HostedIoActor {
@@ -460,6 +770,41 @@ impl HostedIoActor {
         match self {
             Self::Component(_) => "wasm-component",
             Self::Preview1(_) => "wasm-preview1-compat",
+        }
+    }
+
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Component(actor) => actor.generation(),
+            Self::Preview1(actor) => actor.generation(),
+        }
+    }
+
+    fn filesystem_watch_stats(&self) -> manifold_wasm::FilesystemWatchStats {
+        match self {
+            Self::Component(actor) => actor.filesystem_watch_stats(),
+            Self::Preview1(actor) => actor.filesystem_watch_stats(),
+        }
+    }
+
+    async fn lifecycle(
+        &self,
+        event: manifold_wasm::PluginLifecycleEvent,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Component(actor) => actor.lifecycle(event, timeout).await,
+            Self::Preview1(actor) => actor
+                .lifecycle(event, timeout)
+                .await
+                .map_err(anyhow::Error::from),
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Component(actor) => actor.shutdown().await,
+            Self::Preview1(actor) => actor.shutdown().await.map_err(anyhow::Error::from),
         }
     }
 }
@@ -496,6 +841,21 @@ fn aggregate_preview1_compat_stats(
         aggregate.pending_notification_events = aggregate
             .pending_notification_events
             .saturating_add(next.pending_notification_events);
+        aggregate.filesystem_watches = aggregate
+            .filesystem_watches
+            .saturating_add(next.filesystem_watches);
+        aggregate.max_filesystem_watches = aggregate
+            .max_filesystem_watches
+            .saturating_add(next.max_filesystem_watches);
+        aggregate.max_filesystem_watch_events = aggregate
+            .max_filesystem_watch_events
+            .max(next.max_filesystem_watch_events);
+        aggregate.filesystem_watch_overflows = aggregate
+            .filesystem_watch_overflows
+            .saturating_add(next.filesystem_watch_overflows);
+        aggregate.filesystem_watch_rescans = aggregate
+            .filesystem_watch_rescans
+            .saturating_add(next.filesystem_watch_rescans);
         aggregate.workers_started = aggregate
             .workers_started
             .saturating_add(next.workers_started);
@@ -585,8 +945,7 @@ pub struct Manifold {
     pub presentation_attach_failures: u64,
     pub presentation_runtime_failures: u64,
     pub presentation_last_error: Option<String>,
-    presentation_window_focused: bool,
-    pending_presentation_focus_activation_token: Option<String>,
+    focus: FocusService,
     pub attach_requested: bool,
     pub attach_schedule_pending: bool,
     pub detach_requested: bool,
@@ -597,9 +956,6 @@ pub struct Manifold {
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
-    active_toplevel_surface: Option<WlSurface>,
-    pointer_hover_toplevel_surface: Option<WlSurface>,
-    pending_pointer_focus_surface: Option<WlSurface>,
     layout_leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
     native_auto_split_visible_limit: usize,
     native_session_layouts: BTreeMap<SurfaceSessionId, NativeSessionLayout>,
@@ -624,22 +980,12 @@ pub struct Manifold {
     pub input_mode: InputMode,
     shortcut_passthrough: bool,
     managed_fullscreen: bool,
-    active_surface_session: SurfaceSessionId,
-    last_interacted_surface_session: SurfaceSessionId,
-    surface_session_interaction_order: Vec<SurfaceSessionId>,
-    next_surface_session: u64,
-    surface_sessions: Vec<SurfaceSessionId>,
-    surface_session_names: Vec<(SurfaceSessionId, String)>,
-    surface_session_working_directories: BTreeMap<SurfaceSessionId, PathBuf>,
-    surface_session_directories: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
-    surface_session_directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
-    window_surface_sessions: Vec<(WlSurface, SurfaceSessionId)>,
+    sessions: SurfaceSessionService,
     presentation_child_surfaces: Vec<WlSurface>,
     presentation_member_surfaces: Vec<WlSurface>,
     panel_reservations: Vec<PanelReservation>,
     left_panel_resizing: bool,
-    extension_registry: ExtensionRegistry,
-    session_dbus_buses: Vec<(SessionBusRealm, SessionBusHandle)>,
+    extension_registry: RegistryService,
     plugin_runtime: Option<PluginRuntime>,
     plugin_host_event_sender: channel::Sender<PluginHostEvent>,
     plugin_actor_messages: u64,
@@ -647,18 +993,19 @@ pub struct Manifold {
     plugin_actor_last_status: Option<String>,
     wasm_registry: Arc<tokio::sync::Mutex<manifold_wasm::Registry>>,
     wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
-    wasm_actor_names: Vec<String>,
-    wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
+    legacy_wasm_actor_generation: Option<LegacyWasmActorGeneration>,
     wasm_io_actors: BTreeMap<String, HostedIoActor>,
+    configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
+    configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
+    configured_plugin_resources: BTreeMap<String, ConfiguredPluginResources>,
+    configured_plugin_runtime_io: BTreeMap<String, manifold_wasm::RuntimeIoCapabilities>,
+    filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
     pub(crate) presenter: Option<Rc<PresenterHandle>>,
     pub(crate) wasm_global_key_policy: Option<manifold_wasm::WasmGlobalKeyPolicy>,
-    pub(crate) test_harness: Option<TestHarnessRuntime>,
-    pub(crate) test_harness_completion: Option<TestHarnessCompletion>,
-    pub(crate) nested_inner_dbus_destination: Option<String>,
-    pub(crate) nested_inner_dbus_address: Option<String>,
+    pub(crate) test_harness: TestHarnessService,
     pub(crate) manifold_session: Option<String>,
     pub(crate) host_dbus_address: Option<String>,
     pub(crate) manifold_dbus_destination: Option<String>,
@@ -669,6 +1016,7 @@ pub struct Manifold {
     hosted_child_exits: u64,
     hosted_child_failures: u64,
     hosted_child_last_status: Option<String>,
+    hosted_child_completions: VecDeque<(HostedChildToken, bool, String)>,
 }
 
 impl Manifold {
@@ -747,8 +1095,7 @@ impl Manifold {
             presentation_attach_failures: 0,
             presentation_runtime_failures: 0,
             presentation_last_error: None,
-            presentation_window_focused: false,
-            pending_presentation_focus_activation_token: None,
+            focus: FocusService::default(),
             attach_requested: false,
             attach_schedule_pending: false,
             detach_requested: false,
@@ -759,9 +1106,6 @@ impl Manifold {
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
-            active_toplevel_surface: None,
-            pointer_hover_toplevel_surface: None,
-            pending_pointer_focus_surface: None,
             layout_leaf_selected_panes: Vec::new(),
             native_auto_split_visible_limit: DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT,
             native_session_layouts: BTreeMap::new(),
@@ -786,30 +1130,15 @@ impl Manifold {
             input_mode: InputMode::Passthrough,
             shortcut_passthrough: false,
             managed_fullscreen: false,
-            active_surface_session: SurfaceSessionId(1),
-            last_interacted_surface_session: SurfaceSessionId(1),
-            surface_session_interaction_order: vec![SurfaceSessionId(1)],
-            next_surface_session: 2,
-            surface_sessions: vec![SurfaceSessionId(1)],
-            surface_session_names: vec![(
-                SurfaceSessionId(1),
-                default_surface_session_name(SurfaceSessionId(1)),
-            )],
-            surface_session_working_directories: [(
-                SurfaceSessionId(1),
+            sessions: SurfaceSessionService::new(
                 current_process_directory(),
-            )]
-            .into_iter()
-            .collect(),
-            surface_session_directories: BTreeMap::new(),
-            surface_session_directory_defaults: BTreeMap::new(),
-            window_surface_sessions: Vec::new(),
+                default_surface_session_name(SurfaceSessionId(1)),
+            ),
             presentation_child_surfaces: Vec::new(),
             presentation_member_surfaces: Vec::new(),
             panel_reservations: Vec::new(),
             left_panel_resizing: false,
-            extension_registry: ExtensionRegistry::default(),
-            session_dbus_buses: Vec::new(),
+            extension_registry: RegistryService::default(),
             plugin_runtime: None,
             plugin_host_event_sender,
             plugin_actor_messages: 0,
@@ -817,18 +1146,19 @@ impl Manifold {
             plugin_actor_last_status: None,
             wasm_registry: Arc::new(tokio::sync::Mutex::new(wasm_registry)),
             wasm_host_mailbox: Some(wasm_host_mailbox),
-            wasm_actor_names: Vec::new(),
-            wasm_actor_tasks: Vec::new(),
+            legacy_wasm_actor_generation: None,
             wasm_io_actors: BTreeMap::new(),
+            configured_workspace_plugins: BTreeMap::new(),
+            configured_plugin_lifecycles: BTreeMap::new(),
+            configured_plugin_resources: BTreeMap::new(),
+            configured_plugin_runtime_io: BTreeMap::new(),
+            filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
             presenter: None,
             wasm_global_key_policy: None,
-            test_harness: None,
-            test_harness_completion: None,
-            nested_inner_dbus_destination: None,
-            nested_inner_dbus_address: None,
+            test_harness: TestHarnessService::default(),
             manifold_session: None,
             host_dbus_address: std::env::var(MANIFOLD_HOST_DBUS_ADDRESS_ENV)
                 .ok()
@@ -841,6 +1171,7 @@ impl Manifold {
             hosted_child_exits: 0,
             hosted_child_failures: 0,
             hosted_child_last_status: None,
+            hosted_child_completions: VecDeque::new(),
         }
     }
 
@@ -864,6 +1195,21 @@ impl Manifold {
         self.drain_hosted_actor_events();
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             actor.try_send_message(sender, body.into_bytes())?;
+            self.plugin_actor_messages += 1;
+            self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+            return Ok(());
+        }
+        if self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .is_some_and(|generation| {
+                generation
+                    .declarations
+                    .iter()
+                    .any(|actor| actor.name == actor_id)
+            })
+        {
+            self.try_route_wasm_actor_message(actor_id, sender, body.into_bytes())?;
             self.plugin_actor_messages += 1;
             self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
             return Ok(());
@@ -996,6 +1342,25 @@ impl Manifold {
         ))
     }
 
+    pub fn filesystem_watcher_stats(&self) -> manifold_wasm::NativeFilesystemWatcherStats {
+        self.filesystem_watcher_service.stats()
+    }
+
+    pub fn hosted_filesystem_watch_stats(&self) -> manifold_wasm::FilesystemWatchStats {
+        self.wasm_io_actors.values().fold(
+            manifold_wasm::FilesystemWatchStats::default(),
+            |mut aggregate, actor| {
+                let next = actor.filesystem_watch_stats();
+                aggregate.watches = aggregate.watches.saturating_add(next.watches);
+                aggregate.max_watches = aggregate.max_watches.saturating_add(next.max_watches);
+                aggregate.max_events = aggregate.max_events.max(next.max_events);
+                aggregate.overflows = aggregate.overflows.saturating_add(next.overflows);
+                aggregate.rescans = aggregate.rescans.saturating_add(next.rescans);
+                aggregate
+            },
+        )
+    }
+
     pub fn try_wasm_global_key_policy(
         &mut self,
         key_code: Keycode,
@@ -1025,10 +1390,12 @@ impl Manifold {
             input_mode,
         );
         let publication = self.latest_wasm_policy_state_publication();
-        let outcome = self
-            .wasm_global_key_policy
-            .as_mut()
-            .map(|policy| policy.handle_key(input, publication.as_ref()))?;
+        let outcome = self.wasm_global_key_policy.as_mut().map(|policy| {
+            policy.handle_key(manifold_wasm::GlobalKeyPolicyInvocation::new(
+                input,
+                publication.as_ref(),
+            ))
+        })?;
         match outcome {
             Ok(outcome) => Some(self.apply_wasm_global_key_policy_outcome(outcome)),
             Err(err) => {
@@ -1083,11 +1450,17 @@ impl Manifold {
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             return actor.try_send_message(sender, payload);
         }
-        self.block_on_wasm_registry(|registry| registry.try_post_named_message(actor_id, payload))
+        self.block_on_wasm_registry(|registry| {
+            registry.try_post_named_message(actor_id, payload)
+        })??;
+        Ok(())
     }
 
     fn latest_wasm_policy_state_publication(&self) -> Option<manifold_wasm::PublicationFrameLease> {
-        let actor_names = self.wasm_actor_names.clone();
+        let actor_names = self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .map_or_else(Vec::new, LegacyWasmActorGeneration::actor_names);
         self.block_on_wasm_registry(|registry| {
             actor_names.iter().find_map(|actor| {
                 let actor_id = registry.actor_id_for_name(actor)?;
@@ -1097,6 +1470,8 @@ impl Manifold {
                     .flatten()
             })
         })
+        .ok()
+        .flatten()
     }
 
     fn emit_wasm_layout_snapshot_event(&mut self, extra_pane: Option<u64>) {
@@ -1124,68 +1499,51 @@ impl Manifold {
             })
             .collect::<Vec<_>>()
             .join(",");
-        self.emit_wasm_actor_event_to_all(format!(
+        self.emit_wasm_actor_event(
+            manifold_wasm::WasmActorEventKind::LayoutState,
+            &format!(
             r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"pane_app_ids":[{}],"size":{{"w":{},"h":{}}}}}"#,
             panes, focused, pane_app_ids, size.w, size.h
-        ));
+            ),
+        );
     }
 
-    fn emit_wasm_actor_event_to_all(&mut self, payload: String) {
-        self.drain_hosted_actor_events();
-        let io_actor_deliveries = self
-            .wasm_io_actors
-            .iter()
-            .map(|(actor_name, actor)| {
-                (
-                    actor_name.clone(),
-                    actor.kind(),
-                    actor
-                        .try_send_message("host".to_string(), payload.as_bytes().to_vec())
-                        .map_err(|error| error.to_string()),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (actor_name, actor_kind, delivery) in io_actor_deliveries {
-            match delivery {
-                Ok(()) => {
-                    self.plugin_actor_messages += 1;
-                    self.plugin_actor_last_status = Some(format!("{actor_name}:event_queued"));
-                }
-                Err(err) => {
-                    self.plugin_actor_failures += 1;
-                    self.plugin_actor_last_status = Some(format!("{actor_name}:event_error"));
-                    warn!(actor = %actor_name, kind = actor_kind, error = %err, "failed to enqueue hosted I/O actor event");
-                }
-            }
-        }
-        let actor_names = self.wasm_actor_names.clone();
+    fn emit_wasm_actor_event(&mut self, event: manifold_wasm::WasmActorEventKind, payload: &str) {
+        let actor_names = self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .map_or_else(Vec::new, |generation| generation.subscribers(event));
         for actor in actor_names {
             let result = self.block_on_wasm_registry(|registry| {
                 registry.try_post_named_message(&actor, payload.as_bytes().to_vec())
             });
             match result {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     self.plugin_actor_messages += 1;
                     self.plugin_actor_last_status = Some(format!("{actor}:event_queued"));
                 }
-                Err(err) => {
+                Ok(Err(err)) | Err(err) => {
                     self.plugin_actor_failures += 1;
                     self.plugin_actor_last_status = Some(format!("{actor}:event_error"));
-                    warn!(actor = %actor, error = %err, "failed to enqueue WASM actor event");
+                    warn!(actor = %actor, event = event.message_type(), error = %err, "failed to enqueue subscribed WASM actor event");
                 }
             }
         }
     }
 
-    fn block_on_wasm_registry<T>(&self, f: impl FnOnce(&mut manifold_wasm::Registry) -> T) -> T {
+    fn block_on_wasm_registry<T>(
+        &self,
+        f: impl FnOnce(&mut manifold_wasm::Registry) -> T,
+    ) -> Result<T> {
         let registry = Arc::clone(&self.wasm_registry);
-        self.async_runtime
+        let runtime = self
+            .async_runtime
             .as_ref()
-            .expect("async runtime must be initialized before WASM registry use")
-            .block_on(async move {
-                let mut registry = registry.lock().await;
-                f(&mut registry)
-            })
+            .context("async runtime is not initialized for WASM registry use")?;
+        Ok(runtime.block_on(async move {
+            let mut registry = registry.lock().await;
+            f(&mut registry)
+        }))
     }
 
     fn drain_wasm_host_mailbox(&mut self) {
@@ -1235,11 +1593,11 @@ impl Manifold {
             return;
         };
         for message in plugin_runtime.drain_host_messages() {
-            self.apply_plugin_host_message(message);
+            self.apply_plugin_host_message(&message);
         }
     }
 
-    fn apply_plugin_host_message(&mut self, message: PluginHostMessage) {
+    fn apply_plugin_host_message(&mut self, message: &PluginHostMessage) {
         let command = match parse_plugin_host_command(&message.body) {
             Ok(command) => command,
             Err(err) => {
@@ -1445,14 +1803,7 @@ impl Manifold {
             .insert_source(
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
-                    // Smithay's display source is stored in calloop's Generic wrapper
-                    // and must not be dropped while this callback is active.
-                    unsafe {
-                        if let Err(err) = display.get_mut().dispatch_clients(state) {
-                            state.stats.wayland_dispatch_errors += 1;
-                            warn!(?err, "dispatch Wayland clients failed");
-                        }
-                    }
+                    dispatch_wayland_clients(display, state);
                     if let Err(err) = state.display_handle.flush_clients() {
                         warn!(?err, "flush clients after dispatch failed");
                     }
@@ -1493,7 +1844,7 @@ impl Manifold {
                         state.record_hosted_child_started(started);
                     }
                     HostedChildEvent::SpawnFailed(failure) => {
-                        state.record_hosted_child_spawn_failure(failure);
+                        state.record_hosted_child_spawn_failure(&failure);
                     }
                     HostedChildEvent::Exited(exit) => state.record_hosted_child_exit(exit),
                 }
@@ -1534,17 +1885,17 @@ impl Manifold {
         sender
     }
 
-    pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
-        self.spawn_hosted_app_in_session(command, self.active_surface_session)
+    pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<HostedChildToken> {
+        self.spawn_hosted_app_in_session(command, self.sessions.active())
     }
 
     pub fn spawn_hosted_app_in_session(
         &mut self,
         command: &OsString,
         session: SurfaceSessionId,
-    ) -> Result<()> {
+    ) -> Result<HostedChildToken> {
         ensure!(
-            self.surface_sessions.contains(&session),
+            self.sessions.contains(session),
             "unknown surface session {}",
             session.raw()
         );
@@ -1569,20 +1920,20 @@ impl Manifold {
         )
     }
 
-    pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<()> {
-        self.spawn_hosted_app_argv_in_session(argv, self.active_surface_session)
+    pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<HostedChildToken> {
+        self.spawn_hosted_app_argv_in_session(argv, self.sessions.active())
     }
 
     pub fn spawn_hosted_app_argv_in_session(
         &mut self,
         argv: &[String],
         session: SurfaceSessionId,
-    ) -> Result<()> {
+    ) -> Result<HostedChildToken> {
         let Some((program, args)) = argv.split_first() else {
             anyhow::bail!("spawn requires a command");
         };
         ensure!(
-            self.surface_sessions.contains(&session),
+            self.sessions.contains(session),
             "unknown surface session {}",
             session.raw()
         );
@@ -1610,13 +1961,13 @@ impl Manifold {
         )
     }
 
-    pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<()> {
+    pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<HostedChildToken> {
         let Some((program, args)) = argv.split_first() else {
             anyhow::bail!("spawn requires a command");
         };
 
         let pane_id = self.allocate_pane_id();
-        let session = self.active_surface_session;
+        let session = self.sessions.active();
         let mut command_builder = Command::new(program);
         command_builder
             .args(args)
@@ -1647,7 +1998,7 @@ impl Manifold {
         session: SurfaceSessionId,
         presentation: bool,
         spawn_context: String,
-    ) -> Result<()> {
+    ) -> Result<HostedChildToken> {
         self.pending_child_panes.push(PendingChildPane {
             pid: None,
             pane_id,
@@ -1655,8 +2006,8 @@ impl Manifold {
             presentation,
         });
         if let Some(runtime) = self.async_runtime.clone() {
-            self.spawn_hosted_child_launch_task(runtime, command_label, command, pane_id, session);
-            return Ok(());
+            self.spawn_hosted_child_launch_task(&runtime, command_label, command, pane_id, session);
+            return Ok(HostedChildToken(pane_id));
         }
 
         match command.spawn() {
@@ -1671,7 +2022,7 @@ impl Manifold {
                     "spawned hosted Wayland app"
                 );
                 self.track_hosted_child(command_label, pid, Some(child), Some(pane_id));
-                Ok(())
+                Ok(HostedChildToken(pane_id))
             }
             Err(err) => {
                 self.pending_child_panes
@@ -1709,7 +2060,7 @@ impl Manifold {
 
     fn spawn_hosted_child_launch_task(
         &self,
-        runtime: tokio::runtime::Handle,
+        runtime: &tokio::runtime::Handle,
         command: String,
         mut child_command: Command,
         pane_id: u64,
@@ -1763,11 +2114,17 @@ impl Manifold {
         self.track_hosted_child(started.command, started.pid, None, Some(started.pane_id));
     }
 
-    fn record_hosted_child_spawn_failure(&mut self, failure: HostedChildSpawnFailure) {
+    fn record_hosted_child_spawn_failure(&mut self, failure: &HostedChildSpawnFailure) {
         self.pending_child_panes
             .retain(|pending| pending.pane_id != failure.pane_id);
         self.hosted_child_failures += 1;
         self.hosted_child_last_status = Some(format!("{}:spawn_error", failure.command));
+        remember_hosted_child_completion(
+            &mut self.hosted_child_completions,
+            Some(failure.pane_id),
+            false,
+            format!("spawn_error:{}", failure.error),
+        );
         warn!(
             error = %failure.error,
             command = %failure.command,
@@ -1785,6 +2142,8 @@ impl Manifold {
             };
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let success = status.success();
+                    let detail = hosted_child_exit_detail(status);
                     record_hosted_child_exit_status(
                         &mut self.hosted_child_exits,
                         &mut self.hosted_child_failures,
@@ -1793,9 +2152,16 @@ impl Manifold {
                         hosted.pane_id,
                         status,
                     );
+                    remember_hosted_child_completion(
+                        &mut self.hosted_child_completions,
+                        hosted.pane_id,
+                        success,
+                        detail,
+                    );
                 }
                 Ok(None) => active.push(hosted),
                 Err(err) => {
+                    let detail = format!("poll_error:{err}");
                     record_hosted_child_exit_error(
                         &mut self.hosted_child_exits,
                         &mut self.hosted_child_failures,
@@ -1804,6 +2170,12 @@ impl Manifold {
                         hosted.pane_id,
                         &err,
                         "poll_error",
+                    );
+                    remember_hosted_child_completion(
+                        &mut self.hosted_child_completions,
+                        hosted.pane_id,
+                        false,
+                        detail,
                     );
                 }
             }
@@ -1826,25 +2198,79 @@ impl Manifold {
                 "hosted Wayland app exit arrived after child record was gone"
             );
         }
+        self.pending_child_panes
+            .retain(|pending| Some(pending.pane_id) != exit.pane_id);
         match exit.result {
-            Ok(status) => record_hosted_child_exit_status(
-                &mut self.hosted_child_exits,
-                &mut self.hosted_child_failures,
-                &mut self.hosted_child_last_status,
-                &exit.command,
-                exit.pane_id,
-                status,
-            ),
-            Err(err) => record_hosted_child_exit_error(
-                &mut self.hosted_child_exits,
-                &mut self.hosted_child_failures,
-                &mut self.hosted_child_last_status,
-                &exit.command,
-                exit.pane_id,
-                &err,
-                "wait_error",
-            ),
+            Ok(status) => {
+                let success = status.success();
+                let detail = hosted_child_exit_detail(status);
+                record_hosted_child_exit_status(
+                    &mut self.hosted_child_exits,
+                    &mut self.hosted_child_failures,
+                    &mut self.hosted_child_last_status,
+                    &exit.command,
+                    exit.pane_id,
+                    status,
+                );
+                remember_hosted_child_completion(
+                    &mut self.hosted_child_completions,
+                    exit.pane_id,
+                    success,
+                    detail,
+                );
+            }
+            Err(err) => {
+                let detail = format!("wait_error:{err}");
+                record_hosted_child_exit_error(
+                    &mut self.hosted_child_exits,
+                    &mut self.hosted_child_failures,
+                    &mut self.hosted_child_last_status,
+                    &exit.command,
+                    exit.pane_id,
+                    &err,
+                    "wait_error",
+                );
+                remember_hosted_child_completion(
+                    &mut self.hosted_child_completions,
+                    exit.pane_id,
+                    false,
+                    detail,
+                );
+            }
         }
+    }
+
+    pub(crate) fn hosted_child_status(&self, token: HostedChildToken) -> HostedChildStatus {
+        if self
+            .hosted_children
+            .iter()
+            .any(|child| child.pane_id == Some(token.raw()))
+        {
+            return HostedChildStatus::Running;
+        }
+        if let Some((_, success, detail)) = self
+            .hosted_child_completions
+            .iter()
+            .rev()
+            .find(|(completed, _, _)| *completed == token)
+        {
+            return HostedChildStatus::Exited {
+                success: *success,
+                detail: detail.clone(),
+            };
+        }
+        if self
+            .pending_child_panes
+            .iter()
+            .any(|pending| pending.pane_id == token.raw())
+        {
+            return HostedChildStatus::Launching;
+        }
+        HostedChildStatus::Unknown
+    }
+
+    pub(crate) fn hosted_child_visible(&self, token: HostedChildToken) -> bool {
+        self.surface_for_pane(token.raw()).is_some()
     }
 
     pub const fn hosted_child_count(&self) -> usize {
@@ -1901,7 +2327,7 @@ impl Manifold {
     }
 
     fn apply_session_working_directory(&self, child: &mut Command, session: SurfaceSessionId) {
-        if let Some(directory) = self.surface_session_working_directories.get(&session) {
+        if let Some(directory) = self.sessions.working_directory(session) {
             child.current_dir(directory);
         }
     }
@@ -1909,7 +2335,8 @@ impl Manifold {
     fn ensure_session_dbus_bus(&mut self, session: SurfaceSessionId) -> Result<String> {
         let realm = SessionBusRealm::Surface(session.raw());
         if let Some(bus) = self
-            .session_dbus_buses
+            .sessions
+            .buses()
             .iter()
             .find(|(bus_realm, _)| *bus_realm == realm)
         {
@@ -1923,7 +2350,7 @@ impl Manifold {
         }
         .context("start in-process session DBus bus")?;
         let address = handle.address().to_string();
-        self.session_dbus_buses.push((realm, handle));
+        self.sessions.add_bus(realm, handle);
         info!(
             session = session.raw(),
             dbus_address = %address,
@@ -1943,7 +2370,7 @@ impl Manifold {
         if self.presentation == PresentationStatus::Attached {
             self.stats.record_detach_request();
             self.detach_requested = true;
-            self.pending_presentation_focus_activation_token = None;
+            self.focus.clear_presentation_activation();
         }
     }
 
@@ -1958,7 +2385,7 @@ impl Manifold {
         self.presentation = PresentationStatus::Detached;
         self.attach_requested = false;
         self.attach_schedule_pending = false;
-        self.pending_presentation_focus_activation_token = None;
+        self.focus.clear_presentation_activation();
     }
 
     pub fn schedule_attach(&mut self) {
@@ -2133,7 +2560,7 @@ impl Manifold {
     }
 
     pub fn service_test_harness(&mut self) {
-        let Some(mut harness) = self.test_harness.take() else {
+        let Some(mut harness) = self.test_harness.take_runtime() else {
             return;
         };
 
@@ -2141,41 +2568,116 @@ impl Manifold {
             service_request(self, request);
         }
 
-        if self.test_harness_completion.is_none()
-            && let Some(completion) = harness.try_take_completion()
-        {
-            match completion.kind {
-                TestHarnessOutcomeKind::Passed => {
-                    info!(detail = %completion.detail, "test harness passed");
-                    self.loop_signal.stop();
-                }
-                TestHarnessOutcomeKind::Failed => {
-                    warn!(
-                        exit_code = completion.exit_code,
-                        detail = %completion.detail,
-                        "test harness failed"
-                    );
-                    self.loop_signal.stop();
-                }
-                TestHarnessOutcomeKind::Paused => {
-                    warn!(
-                        exit_code = completion.exit_code,
-                        detail = %completion.detail,
-                        "test harness paused for interactive inspection"
-                    );
+        if !self.test_harness.is_complete() {
+            match harness.try_take_completion() {
+                Ok(Some(completion)) => self.record_test_harness_completion(completion),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(?err, "test harness lifecycle transition rejected");
+                    self.record_test_harness_completion(TestHarnessCompletion {
+                        kind: TestHarnessOutcomeKind::Failed,
+                        exit_code: 1,
+                        detail: err.to_string(),
+                    });
                 }
             }
-            self.test_harness_completion = Some(completion);
         }
 
-        self.test_harness = Some(harness);
+        if let Err(err) = self.test_harness.restore_runtime(harness) {
+            warn!(err, "test harness runtime ownership transition rejected");
+        }
+    }
+
+    fn record_test_harness_completion(&mut self, completion: TestHarnessCompletion) {
+        match completion.kind {
+            TestHarnessOutcomeKind::Passed => {
+                info!(detail = %completion.detail, "test harness passed");
+                self.loop_signal.stop();
+            }
+            TestHarnessOutcomeKind::Failed => {
+                warn!(
+                    exit_code = completion.exit_code,
+                    detail = %completion.detail,
+                    "test harness failed"
+                );
+                self.loop_signal.stop();
+            }
+            TestHarnessOutcomeKind::Paused => {
+                warn!(
+                    exit_code = completion.exit_code,
+                    detail = %completion.detail,
+                    "test harness paused for interactive inspection"
+                );
+            }
+        }
+        if let Err(err) = self.test_harness.record_completion(completion) {
+            warn!(err, "test harness completion transition rejected");
+        }
+    }
+
+    pub(crate) fn shutdown_test_harness(&mut self) -> Result<()> {
+        let Some(mut harness) = self.test_harness.take_runtime() else {
+            return Ok(());
+        };
+        if !self.test_harness.is_complete()
+            && let Some(completion) = harness.try_take_completion()?
+        {
+            self.record_test_harness_completion(completion);
+        }
+        let cleanup = harness.cleanup();
+        if !self.test_harness.is_complete()
+            && let Some(completion) = harness.try_take_completion()?
+        {
+            self.record_test_harness_completion(completion);
+        }
+        let cleanup_succeeded = cleanup.is_success();
+        self.test_harness
+            .record_cleanup(cleanup.clone())
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            cleanup_succeeded,
+            "test harness cleanup failed: {cleanup:?}"
+        );
+        self.test_harness
+            .restore_runtime(harness)
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn signal_test_harness(&self, name: String) -> Result<()> {
-        let Some(harness) = self.test_harness.as_ref() else {
+        let Some(harness) = self.test_harness.runtime() else {
             anyhow::bail!("no running test harness");
         };
         harness.send_signal(name)
+    }
+
+    pub(crate) fn install_test_harness(&mut self, harness: TestHarnessRuntime) -> Result<()> {
+        self.test_harness
+            .install(harness)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn configure_nested_test_target(
+        &mut self,
+        destination: Option<String>,
+        address: Option<String>,
+    ) -> Result<()> {
+        self.test_harness
+            .configure_nested_target(destination, address)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn nested_test_target(&self) -> Option<(&str, Option<&str>)> {
+        self.test_harness.nested_target()
+    }
+
+    pub(crate) const fn test_harness_completion(&self) -> Option<&TestHarnessCompletion> {
+        self.test_harness.completion()
+    }
+
+    pub(crate) const fn test_harness_cleanup(
+        &self,
+    ) -> Option<&crate::wasm_test::TestHarnessCleanupResult> {
+        self.test_harness.cleanup()
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
@@ -2231,21 +2733,26 @@ impl Manifold {
 
     pub fn assign_new_toplevel_surface(&mut self, surface: &WlSurface) -> Option<WlSurface> {
         let registered = self.register_toplevel_pane_and_session(surface);
-        self.window_surface_sessions
-            .push((surface.clone(), registered.session));
+        if let Err(err) = self.sessions.assign_surface(surface, registered.session) {
+            warn!(?err, "refusing invalid toplevel session assignment");
+            return None;
+        }
         self.apply_registered_extension_grants_for_surface(surface);
         if registered.presentation {
             self.mark_presentation_child_surface(surface);
             self.refresh_resolved_layout_from_policy();
             return self.active_content_surface_for_layout_action();
         }
-        self.emit_wasm_actor_event_to_all(format!(
-            r#"{{"type":"pane-mapped","pane":{},"session":{}}}"#,
-            registered.pane_id,
-            registered.session.raw()
-        ));
+        self.emit_wasm_actor_event(
+            manifold_wasm::WasmActorEventKind::PaneMapped,
+            &format!(
+                r#"{{"type":"pane-mapped","pane":{},"session":{}}}"#,
+                registered.pane_id,
+                registered.session.raw()
+            ),
+        );
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-            && registered.session == self.active_surface_session
+            && registered.session == self.sessions.active()
         {
             self.place_new_native_pane(registered.pane_id);
         }
@@ -2421,7 +2928,7 @@ impl Manifold {
         process_tree_env_var(pid, MANIFOLD_SURFACE_SESSION_ID_ENV)
             .and_then(|value| value.parse::<u64>().ok())
             .map(SurfaceSessionId::from_raw)
-            .filter(|session| self.surface_sessions.contains(session))
+            .filter(|session| self.sessions.contains(*session))
     }
 
     fn toplevel_process_is_presentation(&self, surface: &WlSurface) -> bool {
@@ -2442,7 +2949,8 @@ impl Manifold {
     }
 
     fn default_surface_session(&self) -> SurfaceSessionId {
-        self.surface_sessions
+        self.sessions
+            .sessions()
             .first()
             .copied()
             .unwrap_or(SurfaceSessionId(1))
@@ -2463,9 +2971,10 @@ impl Manifold {
     }
 
     fn active_surface_session_panes(&self) -> Vec<u64> {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
-            .filter(|(_, session)| *session == self.active_surface_session)
+            .filter(|(_, session)| *session == self.sessions.active())
             .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
             .filter_map(|(surface, _)| self.pane_for_toplevel_surface(surface))
             .fold(Vec::new(), |mut panes, pane| {
@@ -2477,9 +2986,10 @@ impl Manifold {
     }
 
     fn active_surface_session_pane_app_ids(&self) -> Vec<(u64, String)> {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
-            .filter(|(_, session)| *session == self.active_surface_session)
+            .filter(|(_, session)| *session == self.sessions.active())
             .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
             .filter_map(|(surface, _)| {
                 let pane = self.pane_for_toplevel_surface(surface)?;
@@ -2520,7 +3030,7 @@ impl Manifold {
         (self
             .session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+            == self.sessions.active()
             && self.surface_participates_in_resolved_layout(&surface)
             && self.window_for_any_toplevel_surface(&surface).is_some())
         .then_some(surface)
@@ -2536,7 +3046,15 @@ impl Manifold {
     }
 
     fn refresh_resolved_layout_from_policy_with_extra_pane(&mut self, extra_pane: Option<u64>) {
-        if self.wasm_actor_names.is_empty() {
+        let has_layout_subscriber =
+            self.legacy_wasm_actor_generation
+                .as_ref()
+                .is_some_and(|generation| {
+                    !generation
+                        .subscribers(manifold_wasm::WasmActorEventKind::LayoutState)
+                        .is_empty()
+                });
+        if !has_layout_subscriber {
             self.refresh_resolved_layout_from_native_policy();
             return;
         }
@@ -2663,15 +3181,16 @@ impl Manifold {
     }
 
     pub const fn active_surface_session(&self) -> SurfaceSessionId {
-        self.active_surface_session
+        self.sessions.active()
     }
 
     fn save_active_native_session_layout(&mut self) {
-        if !self.surface_sessions.contains(&self.active_surface_session) {
+        let active = self.sessions.active();
+        if !self.sessions.contains(active) {
             return;
         }
         self.native_session_layouts.insert(
-            self.active_surface_session,
+            active,
             NativeSessionLayout {
                 layout: self.layout.clone(),
                 leaf_selected_panes: self.layout_leaf_selected_panes.clone(),
@@ -2701,24 +3220,29 @@ impl Manifold {
         let Some(session) = self.most_recent_live_surface_session() else {
             return false;
         };
-        if self.active_surface_session == session {
+        if self.sessions.active() == session {
             return false;
         }
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session = session;
+        if self.sessions.activate_recent(session).is_err() {
+            return false;
+        }
         self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         true
     }
 
     fn most_recent_live_surface_session(&self) -> Option<SurfaceSessionId> {
-        self.surface_session_interaction_order
+        self.sessions
+            .interaction_order()
             .iter()
             .copied()
             .find(|session| {
-                self.surface_sessions.contains(session)
+                self.sessions.contains(*session)
                     && self.space.elements().any(|window| {
                         let Some(surface) = Self::window_toplevel_surface(window) else {
                             return false;
@@ -2731,13 +3255,7 @@ impl Manifold {
     }
 
     fn record_surface_session_interaction(&mut self, session: SurfaceSessionId) {
-        if !self.surface_sessions.contains(&session) {
-            return;
-        }
-        self.last_interacted_surface_session = session;
-        self.surface_session_interaction_order
-            .retain(|existing| *existing != session);
-        self.surface_session_interaction_order.insert(0, session);
+        self.sessions.record_interaction(session);
     }
 
     pub fn reset_transient_input_state(&mut self) {
@@ -2767,37 +3285,24 @@ impl Manifold {
         self.suppress_mode_toggle_key_release = false;
         self.shortcut_prefix_active = false;
         self.suppress_shortcut_prefix_key_release = None;
-        self.pending_pointer_focus_surface = None;
-        self.pointer_hover_toplevel_surface = None;
+        self.focus.clear_transient_pointer_state();
     }
 
     pub const fn surface_session_count(&self) -> usize {
-        self.surface_sessions.len()
+        self.sessions.count()
     }
 
     pub fn clear_initial_surface_session(&mut self) {
-        if self.surface_sessions != [SurfaceSessionId(1)]
-            || !self.window_surface_sessions.is_empty()
-            || self.next_surface_session != 2
-        {
+        if self.sessions.clear_initial().is_err() {
             warn!("refusing to clear non-initial surface session state");
             return;
         }
-
-        self.active_surface_session = SurfaceSessionId(1);
-        self.last_interacted_surface_session = SurfaceSessionId(1);
-        self.surface_session_interaction_order.clear();
-        self.next_surface_session = 1;
-        self.surface_sessions.clear();
-        self.surface_session_names.clear();
-        self.surface_session_working_directories.clear();
-        self.surface_session_directories.clear();
-        self.surface_session_directory_defaults.clear();
         self.native_session_layouts.clear();
     }
 
     pub fn surface_session_summaries(&self) -> Vec<SurfaceSessionSummary> {
-        self.surface_sessions
+        self.sessions
+            .sessions()
             .iter()
             .copied()
             .filter_map(|session| self.surface_session_summary(session))
@@ -2808,33 +3313,30 @@ impl Manifold {
         &self,
         session: SurfaceSessionId,
     ) -> Option<SurfaceSessionSummary> {
-        self.surface_sessions
-            .contains(&session)
+        self.sessions
+            .contains(session)
             .then(|| SurfaceSessionSummary {
                 id: session.raw(),
                 name: self.surface_session_name(session).to_string(),
-                active: session == self.active_surface_session,
+                active: session == self.sessions.active(),
                 windows: self.surface_session_window_count(session),
                 working_directory: self
-                    .surface_session_working_directories
-                    .get(&session)
+                    .sessions
+                    .working_directory(session)
                     .map(|directory| directory.to_string_lossy().into_owned()),
             })
     }
 
-    pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: String) -> bool {
+    pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: &str) -> bool {
         let name = name.trim();
-        if name.is_empty() || !self.surface_sessions.contains(&session) {
+        if name.is_empty() {
             return false;
         }
-        self.surface_session_names
-            .retain(|(assigned_session, _)| *assigned_session != session);
-        self.surface_session_names.push((session, name.to_string()));
-        true
+        self.sessions.rename(session, name).is_ok()
     }
 
     pub fn active_surface_session_name(&self) -> &str {
-        self.surface_session_name(self.active_surface_session)
+        self.surface_session_name(self.sessions.active())
     }
 
     pub fn resolve_directory_surface_session(
@@ -2842,16 +3344,7 @@ impl Manifold {
         directory: &Path,
     ) -> Option<SurfaceSessionId> {
         self.prune_directory_surface_sessions(directory);
-        let session = self
-            .surface_session_directory_defaults
-            .get(directory)
-            .copied()?;
-        if self.surface_sessions.contains(&session) {
-            Some(session)
-        } else {
-            self.surface_session_directory_defaults.remove(directory);
-            None
-        }
+        self.sessions.directory_default(directory)
     }
 
     pub fn directory_surface_session_summaries(
@@ -2859,10 +3352,9 @@ impl Manifold {
         directory: &Path,
     ) -> Vec<SurfaceSessionSummary> {
         self.prune_directory_surface_sessions(directory);
-        self.surface_session_directories
-            .get(directory)
-            .into_iter()
-            .flatten()
+        self.sessions
+            .directory_sessions(directory)
+            .iter()
             .copied()
             .filter_map(|session| self.surface_session_summary(session))
             .collect()
@@ -2874,52 +3366,23 @@ impl Manifold {
         session: SurfaceSessionId,
         set_default: bool,
     ) -> bool {
-        if !self.surface_sessions.contains(&session) {
-            return false;
-        }
-        let sessions = self
-            .surface_session_directories
-            .entry(directory.clone())
-            .or_default();
-        if !sessions.contains(&session) {
-            sessions.push(session);
-        }
-        self.surface_session_working_directories
-            .entry(session)
-            .or_insert_with(|| directory.clone());
-        if set_default
-            || !self
-                .surface_session_directory_defaults
-                .get(&directory)
-                .is_some_and(|default| self.surface_sessions.contains(default))
-        {
-            self.surface_session_directory_defaults
-                .insert(directory, session);
-        }
-        true
+        self.sessions
+            .remember_directory(directory, session, set_default)
+            .is_ok()
     }
 
     fn prune_directory_surface_sessions(&mut self, directory: &Path) {
-        if let Some(sessions) = self.surface_session_directories.get_mut(directory) {
-            sessions.retain(|session| self.surface_sessions.contains(session));
-            if sessions.is_empty() {
-                self.surface_session_directories.remove(directory);
-            }
-        }
-        if self
-            .surface_session_directory_defaults
-            .get(directory)
-            .is_some_and(|session| !self.surface_sessions.contains(session))
-        {
-            self.surface_session_directory_defaults.remove(directory);
-        }
+        self.sessions.prune_directory(directory);
     }
 
     pub fn close_surface_session(&mut self, session: SurfaceSessionId) -> bool {
-        if !self.surface_sessions.contains(&session) {
+        if !self.sessions.contains(session) {
             return false;
         }
-        if self.active_surface_session != session {
+        let closing_active = self.sessions.active() == session;
+        if closing_active {
+            self.stop_configured_workspace_plugins_for_rebind();
+        } else {
             self.save_active_native_session_layout();
         }
 
@@ -2929,9 +3392,12 @@ impl Manifold {
         }
 
         self.remove_surface_session_record(session);
-        self.restore_native_session_layout(self.active_surface_session);
+        self.restore_native_session_layout(self.sessions.active());
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
+        if closing_active {
+            self.start_configured_workspace_plugins_after_rebind();
+        }
         if !surfaces.is_empty()
             && let Err(err) = self.display_handle.flush_clients()
         {
@@ -2942,10 +3408,11 @@ impl Manifold {
 
     fn prune_empty_unfocused_surface_sessions(&mut self) -> bool {
         let sessions = self
-            .surface_sessions
+            .sessions
+            .sessions()
             .iter()
             .copied()
-            .filter(|session| *session != self.active_surface_session)
+            .filter(|session| *session != self.sessions.active())
             .filter(|session| !self.surface_session_has_content_panes_or_pending(*session))
             .collect::<Vec<_>>();
         if sessions.is_empty() {
@@ -2958,47 +3425,13 @@ impl Manifold {
     }
 
     fn remove_surface_session_record(&mut self, session: SurfaceSessionId) {
-        self.surface_sessions
-            .retain(|existing| *existing != session);
-        self.surface_session_names
-            .retain(|(assigned_session, _)| *assigned_session != session);
-        self.surface_session_working_directories.remove(&session);
-        self.surface_session_interaction_order
-            .retain(|existing| *existing != session);
-        self.surface_session_directories
-            .retain(|_, assigned_sessions| {
-                assigned_sessions.retain(|assigned_session| *assigned_session != session);
-                !assigned_sessions.is_empty()
-            });
-        self.surface_session_directory_defaults
-            .retain(|_, assigned_session| *assigned_session != session);
         self.native_session_layouts.remove(&session);
-        self.session_dbus_buses
-            .retain(|(realm, _)| *realm != SessionBusRealm::Surface(session.raw()));
-        if self.active_surface_session == session {
-            self.active_surface_session = self
-                .surface_session_interaction_order
-                .iter()
-                .copied()
-                .find(|candidate| self.surface_sessions.contains(candidate))
-                .or_else(|| self.surface_sessions.first().copied())
-                .unwrap_or(SurfaceSessionId(0));
-        }
-        if self.active_surface_session.raw() != 0
-            && !self
-                .surface_session_interaction_order
-                .contains(&self.active_surface_session)
-        {
-            self.surface_session_interaction_order
-                .insert(0, self.active_surface_session);
-        }
-        if self.last_interacted_surface_session == session {
-            self.last_interacted_surface_session = self.active_surface_session;
-        }
+        let _ = self.sessions.remove(session);
     }
 
     fn content_surfaces_for_session(&self, session: SurfaceSessionId) -> Vec<WlSurface> {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
             .filter(|(surface, assigned_session)| {
                 *assigned_session == session
@@ -3009,7 +3442,8 @@ impl Manifold {
     }
 
     fn surface_session_has_content_panes_or_pending(&self, session: SurfaceSessionId) -> bool {
-        self.window_surface_sessions
+        self.sessions
+            .surface_assignments()
             .iter()
             .any(|(surface, assigned_session)| {
                 *assigned_session == session
@@ -3023,32 +3457,15 @@ impl Manifold {
     }
 
     pub fn resolve_surface_session(&self, query: &str) -> Option<SurfaceSessionId> {
-        let query = query.trim();
-        if query.is_empty() {
-            return None;
-        }
-        if let Ok(raw) = query.parse::<u64>() {
-            let session = SurfaceSessionId(raw);
-            if self.surface_sessions.contains(&session) {
-                return Some(session);
-            }
-        }
-        self.surface_sessions.iter().copied().find(|session| {
-            self.surface_session_name(*session)
-                .eq_ignore_ascii_case(query)
-        })
+        self.sessions.resolve(query)
     }
 
     pub fn surface_session_name(&self, session: SurfaceSessionId) -> &str {
-        self.surface_session_names
-            .iter()
-            .rev()
-            .find_map(|(assigned_session, name)| (*assigned_session == session).then_some(name))
-            .map_or("untitled", String::as_str)
+        self.sessions.name(session).unwrap_or("untitled")
     }
 
     pub fn active_surface_session_window_count(&self) -> usize {
-        self.surface_session_window_count(self.active_surface_session)
+        self.surface_session_window_count(self.sessions.active())
     }
 
     fn surface_session_window_count(&self, session: SurfaceSessionId) -> usize {
@@ -3067,56 +3484,48 @@ impl Manifold {
     }
 
     pub fn switch_to_surface_session(&mut self, session: SurfaceSessionId) -> bool {
-        if !self.surface_sessions.contains(&session) || self.active_surface_session == session {
+        if !self.sessions.contains(session) || self.sessions.active() == session {
             return false;
         }
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session = session;
+        if self.sessions.activate(session).is_err() {
+            return false;
+        }
         self.restore_native_session_layout(session);
-        self.record_surface_session_interaction(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         true
     }
 
     pub fn switch_to_next_surface_session(&mut self) -> bool {
-        let Some(active_index) = self
-            .surface_sessions
-            .iter()
-            .position(|session| *session == self.active_surface_session)
-        else {
-            self.active_surface_session = self
-                .surface_sessions
-                .first()
-                .copied()
-                .unwrap_or(SurfaceSessionId(1));
-            self.restore_native_session_layout(self.active_surface_session);
-            self.reconfigure_focus_stack();
-            return true;
-        };
-        if self.surface_sessions.len() <= 1 {
+        if self.sessions.count() <= 1 {
             return false;
         }
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session =
-            self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
-        self.restore_native_session_layout(self.active_surface_session);
-        self.record_surface_session_interaction(self.active_surface_session);
+        let Ok(next) = self.sessions.activate_next() else {
+            self.start_configured_workspace_plugins_after_rebind();
+            return false;
+        };
+        self.restore_native_session_layout(next);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         true
     }
 
-    pub fn create_and_attach_surface_session(&mut self) -> SurfaceSessionId {
+    pub fn create_and_attach_surface_session(&mut self) -> Result<SurfaceSessionId> {
         self.create_and_attach_named_surface_session(None)
     }
 
     pub fn create_and_attach_named_surface_session(
         &mut self,
         name: Option<String>,
-    ) -> SurfaceSessionId {
+    ) -> Result<SurfaceSessionId> {
         self.create_and_attach_named_surface_session_in_directory(name, current_process_directory())
     }
 
@@ -3124,41 +3533,30 @@ impl Manifold {
         &mut self,
         name: Option<String>,
         directory: PathBuf,
-    ) -> SurfaceSessionId {
-        let session = SurfaceSessionId(self.next_surface_session);
-        self.next_surface_session += 1;
-        self.surface_sessions.push(session);
-        self.surface_session_names.push((
-            session,
-            name.filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| default_surface_session_name(session)),
-        ));
-        self.surface_session_working_directories
-            .insert(session, directory);
+    ) -> Result<SurfaceSessionId> {
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
-        self.active_surface_session = session;
+        let next = self.sessions.next_id();
+        let session = self.sessions.create(
+            name.filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| default_surface_session_name(next)),
+            directory,
+        )?;
         self.restore_native_session_layout(session);
-        self.record_surface_session_interaction(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
-        session
+        self.start_configured_workspace_plugins_after_rebind();
+        Ok(session)
     }
 
     #[cfg(test)]
     pub fn surface_session_working_directory(&self, session: SurfaceSessionId) -> Option<&Path> {
-        self.surface_session_working_directories
-            .get(&session)
-            .map(PathBuf::as_path)
+        self.sessions.working_directory(session)
     }
 
     fn session_for_toplevel_surface(&self, surface: &WlSurface) -> Option<SurfaceSessionId> {
-        self.window_surface_sessions
-            .iter()
-            .rev()
-            .find_map(|(assigned_surface, session)| {
-                (assigned_surface == surface).then_some(*session)
-            })
+        self.sessions.surface_session(surface)
     }
 
     pub fn window_belongs_to_active_surface_session(&self, window: &Window) -> bool {
@@ -3167,7 +3565,7 @@ impl Manifold {
         };
         self.session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+            == self.sessions.active()
     }
 
     pub fn window_visible_in_presentation(&self, window: &Window) -> bool {
@@ -3311,8 +3709,8 @@ impl Manifold {
     pub fn focused_window_fullscreen(&self) -> bool {
         self.managed_fullscreen
             || self
-                .active_toplevel_surface
-                .as_ref()
+                .focus
+                .active_toplevel()
                 .is_some_and(|surface| self.toplevel_fullscreen_output(surface).is_some())
     }
 
@@ -3347,7 +3745,7 @@ impl Manifold {
         {
             self.layout.set_active_leaf(leaf);
         }
-        self.active_toplevel_surface.clone_from(&active_surface);
+        self.focus.set_active_toplevel(active_surface.clone());
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             self.refresh_resolved_layout_from_policy();
         }
@@ -3393,7 +3791,7 @@ impl Manifold {
     }
 
     pub fn active_window(&self) -> Option<Window> {
-        self.active_toplevel_surface.as_ref().and_then(|active| {
+        self.focus.active_toplevel().and_then(|active| {
             self.space
                 .elements()
                 .find(|window| {
@@ -3405,8 +3803,8 @@ impl Manifold {
     }
 
     pub fn active_presentation_window(&self) -> Option<Window> {
-        self.active_toplevel_surface
-            .as_ref()
+        self.focus
+            .active_toplevel()
             .and_then(|active| self.window_for_toplevel_surface(active))
     }
 
@@ -3419,7 +3817,7 @@ impl Manifold {
         if self
             .session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
-            == self.active_surface_session
+            == self.sessions.active()
             && self.surface_participates_in_resolved_layout(&surface)
             && let Some(pane) = self.pane_for_toplevel_surface(&surface)
             && self.focus_pane(pane)
@@ -3468,14 +3866,13 @@ impl Manifold {
     }
 
     pub fn set_presentation_window_focused(&mut self, focused: bool) {
-        if self.presentation_window_focused && !focused {
+        if self.focus.set_presentation_window_focused(focused) {
             self.reset_transient_input_state();
         }
-        self.presentation_window_focused = focused;
     }
 
     pub const fn presentation_window_focused(&self) -> bool {
-        self.presentation_window_focused
+        self.focus.presentation_window_focused()
     }
 
     pub fn agent_has_focused_window(&self, agent_id: &str) -> bool {
@@ -3490,10 +3887,10 @@ impl Manifold {
         else {
             return false;
         };
-        if record.session != self.active_surface_session {
+        if record.session != self.sessions.active() {
             return false;
         }
-        let Some(surface) = self.active_toplevel_surface.as_ref() else {
+        let Some(surface) = self.focus.active_toplevel() else {
             return false;
         };
         if self
@@ -3520,11 +3917,12 @@ impl Manifold {
     ) -> bool {
         let token = (!activation_token.is_empty()).then(|| activation_token.to_string());
         if self.focus_presentation_window_now(token.as_deref()) {
-            self.pending_presentation_focus_activation_token = None;
+            self.focus.clear_presentation_activation();
             return true;
         }
         if self.attach_requested {
-            self.pending_presentation_focus_activation_token = Some(token.unwrap_or_default());
+            self.focus
+                .queue_presentation_activation(token.unwrap_or_default());
         }
         false
     }
@@ -3532,7 +3930,7 @@ impl Manifold {
     pub(crate) const fn take_pending_presentation_focus_activation_token(
         &mut self,
     ) -> Option<String> {
-        self.pending_presentation_focus_activation_token.take()
+        self.focus.take_presentation_activation()
     }
 
     fn focus_presentation_window_now(&self, activation_token: Option<&str>) -> bool {
@@ -3551,7 +3949,7 @@ impl Manifold {
             return true;
         }
         match self.spawn_hosted_app_argv(argv) {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(err) => {
                 warn!(
                     ?err,
@@ -3565,7 +3963,7 @@ impl Manifold {
     }
 
     pub fn focused_pane(&self) -> Option<u64> {
-        let surface = self.active_toplevel_surface.as_ref()?;
+        let surface = self.focus.active_toplevel()?;
         self.surface_has_visible_pane_item(surface)
             .then(|| self.pane_for_toplevel_surface(surface))
             .flatten()
@@ -3573,11 +3971,11 @@ impl Manifold {
 
     pub fn register_extension(
         &mut self,
-        role: String,
+        role: &str,
         metadata: ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
-        let role = normalize_registry_value(&role).context("extension role must not be empty")?;
+        let role = normalize_registry_value(role).context("extension role must not be empty")?;
         ensure_metadata(&metadata)?;
         let id = stable_registry_id("ext", [&role], &metadata);
         if let Some(record) = self
@@ -3664,197 +4062,65 @@ impl Manifold {
 
     pub fn register_agent(
         &mut self,
-        kind: String,
-        metadata: ExtensionMetadata,
+        kind: &str,
+        metadata: &ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
-        let kind = normalize_registry_value(&kind).context("agent kind must not be empty")?;
-        ensure_metadata(&metadata)?;
         let session = metadata
             .get("surface_session")
             .or_else(|| metadata.get("session_id"))
             .and_then(|value| self.resolve_surface_session(value))
-            .unwrap_or(self.active_surface_session);
-        let id = stable_agent_registry_id(&kind, &metadata);
-        let status = metadata
-            .get("status")
-            .and_then(|value| normalize_registry_value(value));
-        if let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == id)
-        {
-            record.kind = kind;
-            if let Some(status) = status {
-                record.status = status;
-            }
-            merge_agent_metadata(&mut record.metadata, metadata);
-            record.sender = sender;
-            record.session = session;
-        } else {
-            self.extension_registry.agents.push(AgentRecord {
-                id: id.clone(),
-                kind,
-                status: status.unwrap_or_else(|| "unknown".to_string()),
-                metadata,
-                sender,
-                session,
-                attention: false,
-                unread_notifications: 0,
-            });
-        }
-        Ok(id)
+            .unwrap_or_else(|| self.sessions.active());
+        self.extension_registry
+            .register_agent(kind, metadata.clone(), sender, session)
     }
 
     pub fn update_agent(
         &mut self,
         agent_id: &str,
-        status: String,
+        status: &str,
         metadata: ExtensionMetadata,
         sender: String,
     ) -> Result<bool> {
-        let status = normalize_registry_value(&status).context("agent status must not be empty")?;
-        ensure_metadata(&metadata)?;
-        let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == agent_id)
-        else {
-            return Ok(false);
-        };
-        record.status = status;
-        merge_agent_metadata(&mut record.metadata, metadata);
-        record.sender = sender;
-        Ok(true)
+        self.extension_registry
+            .update_agent(agent_id, status, metadata, sender)
     }
 
-    pub fn notify_agent(
-        &mut self,
-        agent_id: &str,
-        title: String,
-        subtitle: String,
-        body: String,
-        level: String,
-        metadata: ExtensionMetadata,
-        sender: String,
-    ) -> Result<String> {
-        let title =
-            normalize_registry_value(&title).context("notification title must not be empty")?;
-        let level = normalize_registry_value(&level).unwrap_or_else(|| "info".to_string());
-        ensure_metadata(&metadata)?;
-        let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == agent_id)
-        else {
-            anyhow::bail!("unknown agent {agent_id}");
-        };
-        record.sender = sender;
-        record.attention = true;
-        record.unread_notifications = record.unread_notifications.saturating_add(1);
-        if matches!(level.as_str(), "waiting" | "blocked" | "error") {
-            record.status.clone_from(&level);
-        }
-
-        let mut id_metadata = metadata.clone();
-        id_metadata.insert("agent_id".to_string(), agent_id.to_string());
-        id_metadata.insert("title".to_string(), title.clone());
-        id_metadata.insert("body".to_string(), body.clone());
-        let id = stable_registry_id("agent-notification", [&level], &id_metadata);
-        self.extension_registry
-            .notifications
-            .push(AgentNotificationRecord {
-                id: id.clone(),
-                agent_id: agent_id.to_string(),
-                title,
-                subtitle,
-                body,
-                level,
-                metadata,
-                unread: true,
-            });
-        Ok(id)
+    pub fn notify_agent(&mut self, request: AgentNotification) -> Result<String> {
+        self.extension_registry.notify_agent(request)
     }
 
     pub fn clear_agent_attention(&mut self, agent_id: &str) -> bool {
-        let Some(record) = self
-            .extension_registry
-            .agents
-            .iter_mut()
-            .find(|record| record.id == agent_id)
-        else {
-            return false;
-        };
-        record.attention = false;
-        record.unread_notifications = 0;
-        for notification in self
-            .extension_registry
-            .notifications
-            .iter_mut()
-            .filter(|notification| notification.agent_id == agent_id)
-        {
-            notification.unread = false;
-        }
-        true
+        self.extension_registry.clear_agent_attention(agent_id)
     }
 
     pub fn unregister_agent(&mut self, agent_id: &str) -> bool {
-        let before = self.extension_registry.agents.len();
-        self.extension_registry
-            .agents
-            .retain(|agent| agent.id != agent_id);
-        if before == self.extension_registry.agents.len() {
-            return false;
-        }
-        self.extension_registry
-            .notifications
-            .retain(|notification| notification.agent_id != agent_id);
-        true
+        self.extension_registry.unregister_agent(agent_id)
     }
 
     pub fn unregister_agent_by_identity(
         &mut self,
-        kind: String,
-        metadata: ExtensionMetadata,
+        kind: &str,
+        metadata: &ExtensionMetadata,
     ) -> Result<Option<String>> {
-        let kind = normalize_registry_value(&kind).context("agent kind must not be empty")?;
-        ensure_metadata(&metadata)?;
-        let id = stable_agent_registry_id(&kind, &metadata);
+        let kind = normalize_registry_value(kind).context("agent kind must not be empty")?;
+        ensure_metadata(metadata)?;
+        let id = stable_agent_registry_id(&kind, metadata);
         Ok(self.unregister_agent(&id).then_some(id))
     }
 
     fn unregister_agents_for_pane(&mut self, pane_id: u64) -> Vec<String> {
-        let pane_id = pane_id.to_string();
-        let removed = self
-            .extension_registry
-            .agents
-            .iter()
-            .filter(|agent| agent.metadata.get("pane_id") == Some(&pane_id))
-            .map(|agent| agent.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        if removed.is_empty() {
-            return Vec::new();
-        }
-        self.extension_registry
-            .agents
-            .retain(|agent| !removed.contains(&agent.id));
-        self.extension_registry
-            .notifications
-            .retain(|notification| !removed.contains(&notification.agent_id));
-        removed.into_iter().collect()
+        self.extension_registry.unregister_agents_for_pane(pane_id)
     }
 
     pub fn register_status_publisher(
         &mut self,
-        role: String,
+        role: &str,
         metadata: ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
         let role =
-            normalize_registry_value(&role).context("status publisher role must not be empty")?;
+            normalize_registry_value(role).context("status publisher role must not be empty")?;
         ensure_metadata(&metadata)?;
         let id = stable_registry_id("status-pub", [&role], &metadata);
         if let Some(record) = self
@@ -3881,21 +4147,21 @@ impl Manifold {
 
     pub fn publish_status(
         &mut self,
-        publisher: String,
-        channel: String,
-        state: String,
-        label: String,
+        publisher: &str,
+        channel: &str,
+        state: &str,
+        label: &str,
         metadata: ExtensionMetadata,
     ) -> Result<bool> {
         let publisher =
-            normalize_registry_value(&publisher).context("status publisher must not be empty")?;
+            normalize_registry_value(publisher).context("status publisher must not be empty")?;
         if publisher != MANIFOLD_STATUS_PUBLISHER {
             self.ensure_status_publisher_exists(&publisher)?;
         }
         let channel =
-            normalize_registry_value(&channel).context("status channel must not be empty")?;
-        let state = normalize_registry_value(&state).context("status state must not be empty")?;
-        let label = normalize_registry_value(&label).unwrap_or_else(|| channel.clone());
+            normalize_registry_value(channel).context("status channel must not be empty")?;
+        let state = normalize_registry_value(state).context("status state must not be empty")?;
+        let label = normalize_registry_value(label).unwrap_or_else(|| channel.clone());
         ensure_metadata(&metadata)?;
 
         let next = StatusItemRecord {
@@ -3993,10 +4259,10 @@ impl Manifold {
             metadata.insert("scope".to_string(), "workspace".to_string());
             metadata.insert("click_action".to_string(), "disable".to_string());
             let _ = self.publish_status(
-                MANIFOLD_STATUS_PUBLISHER.to_string(),
-                PASSTHROUGH_STATUS_CHANNEL.to_string(),
-                "active".to_string(),
-                "Passthrough".to_string(),
+                MANIFOLD_STATUS_PUBLISHER,
+                PASSTHROUGH_STATUS_CHANNEL,
+                "active",
+                "Passthrough",
                 metadata,
             );
         } else {
@@ -4012,7 +4278,15 @@ impl Manifold {
     }
 
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
-        self.replace_wasm_plugin_with_instance_id(None, false, path, None)
+        self.replace_wasm_plugin_with_instance_id(
+            None,
+            false,
+            path,
+            None,
+            None,
+            ConfiguredPluginResources::default(),
+            manifold_wasm::RuntimeIoCapabilities::default(),
+        )
     }
 
     pub(crate) fn replace_wasm_plugin_as(&mut self, instance_id: &str, path: &Path) -> Result<()> {
@@ -4020,28 +4294,59 @@ impl Manifold {
             !instance_id.trim().is_empty(),
             "WASM plugin instance id must not be empty"
         );
-        self.replace_wasm_plugin_with_instance_id(Some(instance_id), false, path, None)
+        let lifecycle = self.configured_plugin_lifecycles.get(instance_id).cloned();
+        let resources = self.configured_resources_for_instance(instance_id);
+        let runtime_io = self
+            .configured_plugin_runtime_io
+            .get(instance_id)
+            .cloned()
+            .unwrap_or_default();
+        self.replace_wasm_plugin_with_instance_id(
+            Some(instance_id),
+            false,
+            path,
+            None,
+            lifecycle.map(|config| (config, manifold_wasm::PluginStartReason::Replacement)),
+            resources,
+            runtime_io,
+        )
     }
 
+    fn configured_resources_for_instance(&self, instance_id: &str) -> ConfiguredPluginResources {
+        self.configured_plugin_resources
+            .get(instance_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "plugin replacement ABI keeps independently configured lifecycle/resource inputs; tracked outside central-state services"
+    )]
     pub(crate) fn replace_configured_wasm_plugin(
         &mut self,
         module_id: &str,
         path: &Path,
         workspace_filesystem_writable: Option<bool>,
+        startup_message: Option<String>,
+        lifecycle: Option<ConfiguredPluginLifecycle>,
+        resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         ensure!(
             !module_id.trim().is_empty(),
             "configured WASM module id must not be empty"
         );
+        let replacing = self.wasm_io_actors.contains_key(module_id);
         // Component and Preview 1 artifacts use the config table key as their
         // hosted actor id. Legacy core artifacts predate that namespace: the
         // key remains a config label while their declared names retain the
         // singular legacy lane.
         let filesystem = if let Some(writable) = workspace_filesystem_writable {
             let host_path = self
-                .surface_session_working_directories
-                .get(&self.active_surface_session)
-                .cloned()
+                .sessions
+                .working_directory(self.sessions.active())
+                .map(Path::to_path_buf)
                 .context("active workspace has no working directory")?;
             Some(HostedPluginFilesystem {
                 host_path,
@@ -4050,15 +4355,206 @@ impl Manifold {
         } else {
             None
         };
-        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path, filesystem)
+        let start_reason = if replacing {
+            manifold_wasm::PluginStartReason::Replacement
+        } else {
+            manifold_wasm::PluginStartReason::Initial
+        };
+        self.replace_wasm_plugin_with_instance_id(
+            Some(module_id),
+            true,
+            path,
+            filesystem,
+            lifecycle.clone().map(|config| (config, start_reason)),
+            resources,
+            runtime_io.clone(),
+        )?;
+        if let Some(writable) = workspace_filesystem_writable
+            && self.wasm_io_actors.contains_key(module_id)
+        {
+            self.configured_workspace_plugins.insert(
+                module_id.to_string(),
+                ConfiguredWorkspacePlugin {
+                    path: path.to_path_buf(),
+                    writable,
+                    startup_message: startup_message.clone(),
+                    lifecycle: lifecycle.clone(),
+                    resources,
+                    runtime_io: runtime_io.clone(),
+                },
+            );
+        } else {
+            self.configured_workspace_plugins.remove(module_id);
+        }
+        if self.wasm_io_actors.contains_key(module_id) {
+            self.configured_plugin_resources
+                .insert(module_id.to_string(), resources);
+            self.configured_plugin_runtime_io
+                .insert(module_id.to_string(), runtime_io);
+            if let Some(lifecycle) = lifecycle {
+                self.configured_plugin_lifecycles
+                    .insert(module_id.to_string(), lifecycle);
+            } else {
+                self.configured_plugin_lifecycles.remove(module_id);
+            }
+        } else {
+            self.configured_plugin_resources.remove(module_id);
+            self.configured_plugin_runtime_io.remove(module_id);
+            self.configured_plugin_lifecycles.remove(module_id);
+        }
+        if let Some(message) = startup_message {
+            self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
+        }
+        Ok(())
     }
 
+    fn stop_configured_workspace_plugins_for_rebind(&mut self) {
+        let actor_names = self
+            .configured_workspace_plugins
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for actor_name in actor_names {
+            let lifecycle_result = self.stop_hosted_io_actor_lifecycle(
+                &actor_name,
+                manifold_wasm::PluginStopReason::SessionRebind,
+                None,
+            );
+            let hard_result = self.stop_hosted_io_actor(&actor_name);
+            let result = lifecycle_result.and(hard_result);
+            if let Err(error) = result {
+                self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                self.plugin_actor_last_status =
+                    Some(format!("{actor_name}:workspace_rebind_stop_failed"));
+                warn!(actor = %actor_name, error = %error, "failed to stop workspace plugin before session activation");
+            }
+        }
+    }
+
+    fn start_configured_workspace_plugins_after_rebind(&mut self) {
+        let Some(host_path) = self
+            .sessions
+            .working_directory(self.sessions.active())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let plugins = self
+            .configured_workspace_plugins
+            .iter()
+            .map(|(id, plugin)| (id.clone(), plugin.clone()))
+            .collect::<Vec<_>>();
+        for (actor_name, plugin) in plugins {
+            let filesystem = HostedPluginFilesystem {
+                host_path: host_path.clone(),
+                writable: plugin.writable,
+            };
+            let result = self
+                .replace_wasm_plugin_with_instance_id(
+                    Some(&actor_name),
+                    true,
+                    &plugin.path,
+                    Some(filesystem),
+                    plugin
+                        .lifecycle
+                        .clone()
+                        .map(|config| (config, manifold_wasm::PluginStartReason::SessionRebind)),
+                    plugin.resources,
+                    plugin.runtime_io,
+                )
+                .and_then(|()| {
+                    if let Some(message) = plugin.startup_message {
+                        self.send_plugin_actor_message(&actor_name, "host".to_string(), message)?;
+                    }
+                    Ok(())
+                });
+            if let Err(error) = result {
+                self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                self.plugin_actor_last_status =
+                    Some(format!("{actor_name}:workspace_rebind_start_failed"));
+                warn!(actor = %actor_name, path = %plugin.path.display(), error = %error, "failed to start workspace plugin for active session");
+            }
+        }
+    }
+
+    fn start_candidate_lifecycle(
+        &self,
+        actor_name: &str,
+        actor: &HostedIoActor,
+        lifecycle: &ConfiguredPluginLifecycle,
+        reason: manifold_wasm::PluginStartReason,
+    ) -> Result<()> {
+        let runtime = self
+            .async_runtime
+            .clone()
+            .context("async runtime is not initialized")?;
+        let context = manifold_wasm::PluginStartContext {
+            instance_id: actor_name.to_string(),
+            generation: actor.generation(),
+            reason,
+            session_id: Some(self.sessions.active().raw()),
+            workspace_root: ".".to_string(),
+            data: lifecycle
+                .data
+                .iter()
+                .map(|(key, value)| manifold_wasm::PluginLifecycleEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        };
+        runtime
+            .block_on(actor.lifecycle(
+                manifold_wasm::PluginLifecycleEvent::Start(context),
+                lifecycle.start_timeout,
+            ))
+            .context("plugin start lifecycle failed")
+    }
+
+    fn stop_hosted_io_actor_lifecycle(
+        &mut self,
+        actor_name: &str,
+        reason: manifold_wasm::PluginStopReason,
+        next_generation: Option<u64>,
+    ) -> Result<()> {
+        let Some(lifecycle) = self.configured_plugin_lifecycles.get(actor_name).cloned() else {
+            return Ok(());
+        };
+        let Some(actor) = self.wasm_io_actors.get(actor_name) else {
+            return Ok(());
+        };
+        let runtime = self
+            .async_runtime
+            .clone()
+            .context("async runtime is not initialized")?;
+        let context = manifold_wasm::PluginStopContext {
+            instance_id: actor_name.to_string(),
+            generation: actor.generation(),
+            reason,
+            next_generation,
+        };
+        runtime
+            .block_on(actor.lifecycle(
+                manifold_wasm::PluginLifecycleEvent::Stop(context),
+                lifecycle.stop_timeout,
+            ))
+            .context("plugin stop lifecycle failed")
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments,
+        reason = "plugin generation construction consumes these values conditionally across component and legacy branches; tracked outside central-state services"
+    )]
     fn replace_wasm_plugin_with_instance_id(
         &mut self,
         instance_id: Option<&str>,
         allow_legacy_config_label: bool,
         path: &Path,
         filesystem: Option<HostedPluginFilesystem>,
+        lifecycle: Option<(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
+        resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.wasm_threads(true).shared_memory(true);
@@ -4070,7 +4566,7 @@ impl Manifold {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref())
+                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources, runtime_io)
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
@@ -4082,7 +4578,14 @@ impl Manifold {
         if manifold_wasm::declares_preview1_compat(&module) {
             let instance_id =
                 instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
-            return self.replace_wasm_preview1_actor(&instance_id, path, filesystem.as_ref());
+            return self.replace_wasm_preview1_actor(
+                &instance_id,
+                path,
+                filesystem.as_ref(),
+                lifecycle.as_ref(),
+                resources,
+                runtime_io,
+            );
         }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
         ensure!(
@@ -4095,19 +4598,24 @@ impl Manifold {
         ))?;
         self.ensure_legacy_wasm_actor_ids_available(&inventory.actors)?;
 
-        if let Some(provider) = select_policy_provider(
+        let candidate_key_policy = if let Some(provider) = select_policy_provider(
             &inventory.policy_providers,
             manifold_wasm::PolicyProviderKind::Key,
             "workspace",
         )? {
-            self.wasm_global_key_policy = Some(
+            Some((
+                provider.name.clone(),
                 manifold_wasm::WasmGlobalKeyPolicy::load_from_module(engine, &module, provider)?,
-            );
-            info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
-        }
+            ))
+        } else {
+            None
+        };
 
-        self.stop_legacy_wasm_plugin_actors()?;
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
+        if let Some((provider_name, policy)) = candidate_key_policy {
+            self.wasm_global_key_policy = Some(policy);
+            info!(provider = %provider_name, path = %path.display(), "loaded WASM plugin key policy");
+        }
         Ok(())
     }
 
@@ -4116,6 +4624,9 @@ impl Manifold {
         actor_name: &str,
         path: &Path,
         filesystem: Option<&HostedPluginFilesystem>,
+        lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
+        resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4141,14 +4652,35 @@ impl Manifold {
                     guest_path: ".".to_string(),
                     writable,
                 }),
+                filesystem_watcher_service: self.filesystem_watcher_service.clone(),
+                max_filesystem_watches: resources.filesystem_watches,
+                max_filesystem_watch_events: resources.filesystem_watch_events,
+                runtime_io: manifold_wasm::RuntimeIoConfig {
+                    capabilities: runtime_io,
+                    ..manifold_wasm::RuntimeIoConfig::default()
+                },
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
-        // Once the candidate is known-good, fully join the old generation
-        // before making the replacement reachable under the stable id.
+        let mut candidate = HostedIoActor::Component(actor);
+        let next_generation = candidate.generation();
+        if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+            actor_name,
+            manifold_wasm::PluginStopReason::Replacement,
+            Some(next_generation),
+        ) {
+            warn!(actor = %actor_name, error = %error, "old plugin stop hook failed; continuing hard replacement teardown");
+        }
         self.stop_hosted_io_actor(actor_name)?;
+        if let Some((config, reason)) = lifecycle
+            && let Err(error) =
+                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason)
+        {
+            let _ = runtime.block_on(candidate.shutdown());
+            return Err(error);
+        }
         self.wasm_io_actors
-            .insert(actor_name.to_string(), HostedIoActor::Component(actor));
+            .insert(actor_name.to_string(), candidate);
         self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
         info!(actor = %actor_name, path = %path.display(), "started component plugin actor");
         Ok(())
@@ -4159,6 +4691,9 @@ impl Manifold {
         actor_name: &str,
         path: &Path,
         filesystem: Option<&HostedPluginFilesystem>,
+        lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
+        resources: ConfiguredPluginResources,
+        runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4172,22 +4707,44 @@ impl Manifold {
             |grant| grant.host_path.clone(),
         );
         let writable = filesystem.is_some_and(|grant| grant.writable);
-        let actor = runtime.block_on(manifold_wasm::Preview1CompatActor::load(
-            path,
-            manifold_wasm::Preview1ActorCapabilities {
-                filesystem: Some(manifold_wasm::Preview1FilesystemGrant {
-                    host_path,
-                    guest_path: ".".to_string(),
-                    writable,
-                }),
-            },
-            manifold_wasm::Preview1WorkerConfig::default(),
-        ))?;
-        // All work owned by the old generation is joined before the candidate
-        // is published under the stable id.
+        let actor = runtime.block_on(
+            manifold_wasm::Preview1CompatActor::load_with_watcher_service(
+                path,
+                manifold_wasm::Preview1ActorCapabilities {
+                    filesystem: Some(manifold_wasm::Preview1FilesystemGrant {
+                        host_path,
+                        guest_path: ".".to_string(),
+                        writable,
+                    }),
+                    runtime_io,
+                },
+                manifold_wasm::Preview1WorkerConfig {
+                    max_filesystem_watches: resources.filesystem_watches,
+                    max_filesystem_watch_events: resources.filesystem_watch_events,
+                    ..manifold_wasm::Preview1WorkerConfig::default()
+                },
+                self.filesystem_watcher_service.clone(),
+            ),
+        )?;
+        let mut candidate = HostedIoActor::Preview1(actor);
+        let next_generation = candidate.generation();
+        if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+            actor_name,
+            manifold_wasm::PluginStopReason::Replacement,
+            Some(next_generation),
+        ) {
+            warn!(actor = %actor_name, error = %error, "old plugin stop hook failed; continuing hard replacement teardown");
+        }
         self.stop_hosted_io_actor(actor_name)?;
+        if let Some((config, reason)) = lifecycle
+            && let Err(error) =
+                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason)
+        {
+            let _ = runtime.block_on(candidate.shutdown());
+            return Err(error);
+        }
         self.wasm_io_actors
-            .insert(actor_name.to_string(), HostedIoActor::Preview1(actor));
+            .insert(actor_name.to_string(), candidate);
         self.plugin_actor_last_status = Some(format!("{actor_name}:preview1_started"));
         info!(actor = %actor_name, path = %path.display(), "started Preview 1 compatibility plugin actor");
         Ok(())
@@ -4195,7 +4752,13 @@ impl Manifold {
 
     fn ensure_hosted_io_actor_id_available(&self, actor_name: &str) -> Result<()> {
         ensure!(
-            !self.wasm_actor_names.iter().any(|name| name == actor_name),
+            !self
+                .legacy_wasm_actor_generation
+                .as_ref()
+                .is_some_and(|generation| generation
+                    .declarations
+                    .iter()
+                    .any(|actor| actor.name == actor_name)),
             "hosted I/O actor id {actor_name:?} conflicts with a legacy WASM actor"
         );
         let conflicts_with_builtin = self.plugin_runtime.as_ref().is_some_and(|runtime| {
@@ -4271,6 +4834,13 @@ impl Manifold {
         let actor_names = self.wasm_io_actors.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
         for actor_name in actor_names {
+            if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+                &actor_name,
+                manifold_wasm::PluginStopReason::Shutdown,
+                None,
+            ) {
+                warn!(actor = %actor_name, error = %error, "plugin graceful shutdown hook failed; continuing hard teardown");
+            }
             if let Err(error) = self.stop_hosted_io_actor(&actor_name) {
                 warn!(actor = %actor_name, error = %error, "failed to join hosted I/O actor during shutdown");
                 if first_error.is_none() {
@@ -4282,28 +4852,21 @@ impl Manifold {
     }
 
     pub(crate) fn stop_legacy_wasm_plugin_actors(&mut self) -> Result<()> {
-        let tasks = self.wasm_actor_tasks.drain(..).collect::<Vec<_>>();
-        for task in &tasks {
-            task.abort();
-        }
-        let old_names = std::mem::take(&mut self.wasm_actor_names);
-        if let Some(runtime) = self.async_runtime.as_ref() {
-            let registry = Arc::clone(&self.wasm_registry);
-            runtime.block_on(async move {
-                for task in tasks {
-                    let _ = task.await;
-                }
-                let mut registry = registry.lock().await;
-                for name in old_names {
-                    registry.unregister_actor(&name);
-                }
-            });
-        } else {
-            ensure!(
-                tasks.is_empty(),
-                "cannot join legacy WASM actors without the async runtime"
-            );
-        }
+        let Some(generation) = self.legacy_wasm_actor_generation.take() else {
+            return Ok(());
+        };
+        let actor_ids = generation.actor_ids.clone();
+        let Some(runtime) = self.async_runtime.as_ref() else {
+            anyhow::bail!("cannot cancel and join legacy WASM actors without the async runtime");
+        };
+        let registry = Arc::clone(&self.wasm_registry);
+        runtime.block_on(async move {
+            cancel_and_join_legacy_generation(generation).await;
+            let mut registry = registry.lock().await;
+            for (name, actor_id) in actor_ids {
+                registry.unregister_actor_generation(&name, actor_id);
+            }
+        });
         Ok(())
     }
 
@@ -4315,67 +4878,83 @@ impl Manifold {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
         };
-        self.wasm_actor_names = actors.iter().map(|actor| actor.name.clone()).collect();
+        let registry = Arc::clone(&self.wasm_registry);
+        let mut candidates = Vec::with_capacity(actors.len());
+        let mut actor_ids = BTreeMap::new();
+        let mut registrations = Vec::with_capacity(actors.len());
         for actor in actors {
-            let path = path.to_path_buf();
-            let actor_name = actor.name.clone();
-            let export_name = actor.export_name.clone();
-            let registry = Arc::clone(&self.wasm_registry);
-            let host_events = self.plugin_host_event_sender.clone();
-            let mailbox = runtime.block_on({
+            let (registration, mailbox) = runtime.block_on({
                 let registry = Arc::clone(&registry);
-                let actor_name = actor_name.clone();
-                async move { registry.lock().await.register_actor(actor_name, 64) }
+                let actor_name = actor.name.clone();
+                async move { registry.lock().await.prepare_actor(actor_name, 64) }
             })?;
-            let task = runtime.spawn(async move {
-                let mut actor = match manifold_wasm::WasmActor::load_named(
-                    &path,
+            let candidate = runtime
+                .block_on(manifold_wasm::WasmActor::load_named(
+                    path,
                     mailbox,
-                    &export_name,
-                )
-                .await
-                {
-                    Ok(actor) => actor,
-                    Err(err) => {
-                        warn!(actor = %actor_name, error = %err, "failed to load WASM plugin actor");
-                        return;
-                    }
-                };
-                info!(actor = %actor_name, export = %export_name, path = %path.display(), "started WASM plugin actor");
-                loop {
-                    let outcome = match actor.run_one_epoch().await {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            warn!(actor = %actor_name, error = %err, "WASM plugin actor epoch failed");
-                            return;
-                        }
-                    };
-                    match outcome {
-                        manifold_wasm::ActorEpochOutcome::Continue { outbox } => {
-                            if let Some(outbox) = outbox {
-                                let dispatch = {
-                                    let mut registry = registry.lock().await;
-                                    actor.dispatch_outbox(&mut registry, &outbox)
-                                };
-                                if let Err(err) = dispatch {
-                                    warn!(actor = %actor_name, error = %err, "WASM plugin actor outbox dispatch failed");
-                                }
-                                let refresh_layout = !outbox.publications.is_empty();
-                                let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
-                                if refresh_layout {
-                                    let _ = host_events.send(PluginHostEvent::RefreshWasmLayout);
-                                }
-                            }
-                        }
-                        manifold_wasm::ActorEpochOutcome::Stop => {
-                            info!(actor = %actor_name, "WASM plugin actor stopped");
-                            return;
-                        }
-                    }
-                }
-            });
-            self.wasm_actor_tasks.push(task);
+                    &actor.export_name,
+                ))
+                .with_context(|| format!("load candidate WASM actor {:?}", actor.name))?;
+            actor_ids.insert(actor.name.clone(), candidate.actor_id());
+            registrations.push(registration);
+            candidates.push((actor.clone(), candidate));
         }
+
+        let old_names = self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .map_or_else(Vec::new, LegacyWasmActorGeneration::actor_names);
+        runtime.block_on({
+            let registry = Arc::clone(&registry);
+            let registrations = &registrations;
+            let old_names = &old_names;
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .validate_prepared_actors(registrations, old_names)
+            }
+        })?;
+
+        // The retiring generation remains the published owner through its
+        // cancellation and join. It cannot dispatch a host mutation after the
+        // registry switches to the candidate generation.
+        if let Some(old_generation) = self.legacy_wasm_actor_generation.take() {
+            runtime.block_on(cancel_and_join_legacy_generation(old_generation));
+        }
+
+        runtime.block_on({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .activate_prepared_actors(registrations, &old_names)
+            }
+        })?;
+
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        let tasks = candidates
+            .into_iter()
+            .map(|(declaration, actor)| {
+                spawn_legacy_actor_task(
+                    &runtime,
+                    actor,
+                    declaration,
+                    Arc::clone(&registry),
+                    self.plugin_host_event_sender.clone(),
+                    cancellation.subscribe(),
+                    path.to_path_buf(),
+                )
+            })
+            .collect();
+        self.legacy_wasm_actor_generation = Some(LegacyWasmActorGeneration {
+            declarations: actors.to_vec(),
+            actor_ids,
+            cancellation,
+            tasks,
+        });
+        self.refresh_resolved_layout_from_policy();
         Ok(())
     }
 
@@ -4393,11 +4972,11 @@ impl Manifold {
         &mut self,
         extension_id: String,
         identity: ExtensionMetadata,
-        role: String,
+        role: &str,
         sender: String,
     ) -> Result<String> {
         self.ensure_extension_exists(&extension_id)?;
-        let role = normalize_registry_value(&role).context("window role must not be empty")?;
+        let role = normalize_registry_value(role).context("window role must not be empty")?;
         ensure_metadata(&identity)?;
         let id = stable_registry_id("win", [&extension_id, &role], &identity);
         if let Some(record) = self
@@ -4424,10 +5003,10 @@ impl Manifold {
     pub fn request_window_placement(
         &mut self,
         window_id: &str,
-        placement: ExtensionMetadata,
+        placement: &ExtensionMetadata,
         sender: String,
     ) -> Result<String> {
-        ensure_metadata(&placement)?;
+        ensure_metadata(placement)?;
         let window = self.window_record(window_id)?;
         let mut detail = placement.clone();
         detail.insert("window_id".to_string(), window_id.to_string());
@@ -4449,8 +5028,8 @@ impl Manifold {
         {
             self.assign_toplevel_surface_session(&surface, session);
         }
-        if placement_requests_left_panel(&placement) {
-            let width = placement_panel_width(&placement).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
+        if placement_requests_left_panel(placement) {
+            let width = placement_panel_width(placement).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
             let visible = placement
                 .get("visible")
                 .and_then(|value| parse_boolish(value))
@@ -4474,13 +5053,13 @@ impl Manifold {
     pub fn replace_window_role(
         &mut self,
         window_id: &str,
-        role: String,
-        options: ExtensionMetadata,
+        role: &str,
+        options: &ExtensionMetadata,
         _sender: String,
     ) -> Result<bool> {
         let window = self.window_record(window_id)?;
-        let role = normalize_registry_value(&role).context("replacement role must not be empty")?;
-        ensure_metadata(&options)?;
+        let role = normalize_registry_value(role).context("replacement role must not be empty")?;
+        ensure_metadata(options)?;
         let dismiss_replaced = options
             .get("dismiss_replaced")
             .or_else(|| options.get("dismiss-replaced"))
@@ -4527,7 +5106,7 @@ impl Manifold {
         self.panel_reservations
             .retain(|panel| panel.surface != surface);
 
-        if self.active_toplevel_surface.as_ref() == Some(&surface) {
+        if self.focus.active_toplevel() == Some(&surface) {
             self.focus_toplevel_surface(None);
         }
 
@@ -4599,14 +5178,14 @@ impl Manifold {
 
     pub fn request_shortcut_grant(
         &mut self,
-        extension_id: String,
-        shortcut: String,
+        extension_id: &str,
+        shortcut: &str,
         scope: String,
         label: String,
         sender: String,
     ) -> Result<String> {
-        self.ensure_extension_exists(&extension_id)?;
-        let shortcut = normalize_registry_value(&shortcut).context("shortcut must not be empty")?;
+        self.ensure_extension_exists(extension_id)?;
+        let shortcut = normalize_registry_value(shortcut).context("shortcut must not be empty")?;
         ensure!(
             !manifold_owned_shortcut(&shortcut),
             "shortcut conflicts with an existing Manifold-owned shortcut"
@@ -4615,7 +5194,7 @@ impl Manifold {
         detail.insert("shortcut".to_string(), shortcut);
         detail.insert("scope".to_string(), scope);
         detail.insert("label".to_string(), label);
-        Ok(self.record_grant(&extension_id, "shortcut", detail, sender))
+        Ok(self.record_grant(extension_id, "shortcut", detail, sender))
     }
 
     pub fn request_extension_window_focus(&mut self, window_id: &str) -> Result<bool> {
@@ -4735,13 +5314,9 @@ impl Manifold {
         surface: &WlSurface,
         session: SurfaceSessionId,
     ) -> bool {
-        if !self.surface_sessions.contains(&session) {
+        if self.sessions.assign_surface(surface, session).is_err() {
             return false;
         }
-        self.window_surface_sessions
-            .retain(|(assigned_surface, _)| assigned_surface != surface);
-        self.window_surface_sessions
-            .push((surface.clone(), session));
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
         true
@@ -4755,15 +5330,15 @@ impl Manifold {
     }
 
     pub fn set_pending_pointer_focus_surface(&mut self, surface: Option<WlSurface>) {
-        self.pending_pointer_focus_surface = surface;
+        self.focus.set_pending_pointer_focus(surface);
     }
 
     pub const fn take_pending_pointer_focus_surface(&mut self) -> Option<WlSurface> {
-        self.pending_pointer_focus_surface.take()
+        self.focus.take_pending_pointer_focus()
     }
 
     pub fn set_pointer_hover_toplevel_surface(&mut self, surface: Option<WlSurface>) {
-        self.pointer_hover_toplevel_surface = surface;
+        self.focus.set_pointer_hover(surface);
     }
 
     pub fn cycle_focus(&mut self, direction: FocusDirection) -> bool {
@@ -4780,8 +5355,8 @@ impl Manifold {
         }
 
         let active_index = self
-            .active_toplevel_surface
-            .as_ref()
+            .focus
+            .active_toplevel()
             .and_then(|active| {
                 windows.iter().position(|window| {
                     Self::window_toplevel_surface(window).as_ref() == Some(active)
@@ -4792,12 +5367,15 @@ impl Manifold {
             FocusDirection::Next => (active_index + 1) % window_count,
             FocusDirection::Previous => (active_index + window_count - 1) % window_count,
         };
-        self.focus_window(&windows[next_index]);
+        let Some(next_window) = windows.get(next_index) else {
+            return false;
+        };
+        self.focus_window(next_window);
         true
     }
 
     fn cycle_focus_in_active_layout_leaf(&mut self, direction: FocusDirection) -> bool {
-        let Some(active_surface) = self.active_toplevel_surface.clone() else {
+        let Some(active_surface) = self.focus.active_toplevel().cloned() else {
             return false;
         };
         if !self.surface_has_visible_pane_item(&active_surface) {
@@ -4881,8 +5459,8 @@ impl Manifold {
     }
 
     fn active_content_surface_for_layout_action(&self) -> Option<WlSurface> {
-        self.active_toplevel_surface
-            .as_ref()
+        self.focus
+            .active_toplevel()
             .filter(|surface| self.surface_has_visible_pane_item(surface))
             .cloned()
             .or_else(|| self.surface_for_layout_leaf(self.layout.active_leaf()))
@@ -4952,7 +5530,7 @@ impl Manifold {
     }
 
     pub fn focused_window_index(&self) -> Option<usize> {
-        let active = self.active_toplevel_surface.as_ref()?;
+        let active = self.focus.active_toplevel()?;
         if !self.surface_can_receive_focus(active) {
             return None;
         }
@@ -4967,7 +5545,7 @@ impl Manifold {
     }
 
     pub fn focused_surface_id(&self) -> Option<String> {
-        let surface = self.active_toplevel_surface.as_ref()?;
+        let surface = self.focus.active_toplevel()?;
         if !self.surface_can_receive_focus(surface) {
             return None;
         }
@@ -5017,7 +5595,8 @@ impl Manifold {
         }
         if let Some(active_window) = self.active_window() {
             self.space.raise_element(&active_window, true);
-            self.activate_window_exclusively(self.active_toplevel_surface.clone().as_ref());
+            let active_surface = self.focus.active_toplevel().cloned();
+            self.activate_window_exclusively(active_surface.as_ref());
         } else if let Some(window) = visible_windows.last() {
             self.focus_window(window);
         } else {
@@ -5095,7 +5674,7 @@ impl Manifold {
     }
 
     pub fn close_active_window(&mut self) -> bool {
-        let Some(surface) = self.active_toplevel_surface.clone() else {
+        let Some(surface) = self.focus.active_toplevel().cloned() else {
             return false;
         };
         if !self.surface_has_visible_pane_item(&surface) {
@@ -5113,7 +5692,7 @@ impl Manifold {
         let Some(surface) = self.surface_for_pane(pane) else {
             return false;
         };
-        if self.active_toplevel_surface.as_ref() == Some(&surface) {
+        if self.focus.active_toplevel() == Some(&surface) {
             self.reset_transient_input_state();
         }
         let closed = self.send_close_to_toplevel_surface(&surface);
@@ -5165,8 +5744,7 @@ impl Manifold {
             .collect::<Vec<_>>();
         self.fullscreen_toplevels
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
-        self.window_surface_sessions
-            .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
+        self.sessions.retain_live_surfaces(&live_toplevel_surfaces);
         self.presentation_child_surfaces
             .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.presentation_member_surfaces
@@ -5210,35 +5788,32 @@ impl Manifold {
         });
         self.repair_resolved_layout_for_current_inventory();
         if self
-            .pending_pointer_focus_surface
-            .as_ref()
+            .focus
+            .pending_pointer_focus()
             .is_some_and(|surface| !live_toplevel_surfaces.iter().any(|live| live == surface))
         {
-            self.pending_pointer_focus_surface = None;
+            self.focus.set_pending_pointer_focus(None);
         }
         if self
-            .pointer_hover_toplevel_surface
-            .as_ref()
+            .focus
+            .pointer_hover()
             .is_some_and(|surface| !live_toplevel_surfaces.iter().any(|live| live == surface))
         {
-            self.pointer_hover_toplevel_surface = None;
+            self.focus.set_pointer_hover(None);
         }
         let window_count = self.active_surface_session_window_count();
-        let active_surface_is_live = self
-            .active_toplevel_surface
-            .as_ref()
-            .is_some_and(|surface| {
-                self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
-            });
+        let active_surface_is_live = self.focus.active_toplevel().is_some_and(|surface| {
+            self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
+        });
 
-        if self.active_toplevel_surface.is_some() && !active_surface_is_live {
+        if self.focus.active_toplevel().is_some() && !active_surface_is_live {
             self.reset_transient_input_state();
             if let Some(next_focus) = live_toplevel_surfaces
                 .iter()
                 .find(|surface| {
                     self.session_for_toplevel_surface(surface)
                         .unwrap_or(SurfaceSessionId(1))
-                        == self.active_surface_session
+                        == self.sessions.active()
                 })
                 .cloned()
             {
@@ -5265,7 +5840,7 @@ impl Manifold {
                     .find(|surface| {
                         self.session_for_toplevel_surface(surface)
                             .unwrap_or(SurfaceSessionId(1))
-                            == self.active_surface_session
+                            == self.sessions.active()
                     })
                     .cloned()
                 {
@@ -5299,7 +5874,7 @@ impl Manifold {
             && (self
                 .session_for_toplevel_surface(surface)
                 .unwrap_or(SurfaceSessionId(1))
-                == self.active_surface_session
+                == self.sessions.active()
                 || self.surface_is_visible_presentation_member(surface)
                 || self.surface_has_visible_panel(surface))
     }
@@ -5391,7 +5966,7 @@ impl Manifold {
     }
 
     pub fn active_layout_rect(&self) -> Option<LayoutRect> {
-        if let Some(surface) = self.active_toplevel_surface.as_ref()
+        if let Some(surface) = self.focus.active_toplevel()
             && let Some(rect) = self.layout_rect_for_toplevel_surface(surface)
         {
             return Some(rect);
@@ -5426,20 +6001,16 @@ impl Manifold {
 
     pub fn resolved_layout_active_kind(&self) -> &'static str {
         if self
-            .active_toplevel_surface
-            .as_ref()
+            .focus
+            .active_toplevel()
             .is_some_and(|surface| self.surface_has_visible_pane_item(surface))
         {
             return "client";
         }
-        if self
-            .active_toplevel_surface
-            .as_ref()
-            .is_some_and(|surface| {
-                self.surface_is_visible_presentation_member(surface)
-                    || self.surface_has_visible_panel(surface)
-            })
-        {
+        if self.focus.active_toplevel().is_some_and(|surface| {
+            self.surface_is_visible_presentation_member(surface)
+                || self.surface_has_visible_panel(surface)
+        }) {
             return "presentation";
         }
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
@@ -5469,8 +6040,8 @@ impl Manifold {
     pub fn resolved_layout_item_active(&self, item: ResolvedLayoutItem) -> bool {
         match item.kind {
             LayoutItemKind::Pane { pane } => {
-                self.active_toplevel_surface
-                    .as_ref()
+                self.focus
+                    .active_toplevel()
                     .and_then(|surface| self.pane_for_toplevel_surface(surface))
                     == Some(pane)
             }
@@ -5587,13 +6158,40 @@ impl Manifold {
     }
 }
 
+/// Dispatch the Wayland display retained inside its registered calloop source.
+///
+/// This is the only state-layer escape hatch for `Generic::get_mut`. Dispatch
+/// may mutate Smithay protocol state, but it neither replaces the display nor
+/// changes the file descriptor calloop registered for it.
+fn dispatch_wayland_clients(
+    display: &mut calloop::generic::NoIoDrop<Display<Manifold>>,
+    state: &mut Manifold,
+) {
+    // SAFETY: the callback runs while calloop exclusively owns this source;
+    // `dispatch_clients` preserves the display and its registered poll fd.
+    if let Err(err) = unsafe { display.get_mut().dispatch_clients(state) } {
+        state.stats.wayland_dispatch_errors += 1;
+        warn!(?err, "dispatch Wayland clients failed");
+    }
+}
+
 fn default_surface_session_name(session: SurfaceSessionId) -> String {
     let n = session.raw().saturating_sub(1) as usize;
-    let adjective = SESSION_NAME_ADJECTIVES[n % SESSION_NAME_ADJECTIVES.len()];
-    let noun = SESSION_NAME_NOUNS[(n / SESSION_NAME_ADJECTIVES.len()) % SESSION_NAME_NOUNS.len()];
-    let action = SESSION_NAME_ACTIONS[(n
-        / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
-        % SESSION_NAME_ACTIONS.len()];
+    let adjective = SESSION_NAME_ADJECTIVES
+        .get(n % SESSION_NAME_ADJECTIVES.len())
+        .copied()
+        .unwrap_or("quiet");
+    let noun = SESSION_NAME_NOUNS
+        .get((n / SESSION_NAME_ADJECTIVES.len()) % SESSION_NAME_NOUNS.len())
+        .copied()
+        .unwrap_or("workspace");
+    let action = SESSION_NAME_ACTIONS
+        .get(
+            (n / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
+                % SESSION_NAME_ACTIONS.len(),
+        )
+        .copied()
+        .unwrap_or("working");
     format!("{adjective}-{noun}-{action}")
 }
 
@@ -5640,7 +6238,7 @@ fn first_available_pane_from(
         } else {
             (start_index as isize + (offset + 1) * step).rem_euclid(len)
         } as usize;
-        let pane = panes[index];
+        let pane = panes.get(index).copied()?;
         if !excluded.contains(&pane) {
             return Some(pane);
         }
@@ -5815,8 +6413,9 @@ fn process_env_var(pid: u32, key: &str) -> Option<String> {
     let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
     environ.split(|byte| *byte == 0).find_map(|entry| {
         let (entry_key, entry_value) = entry.split_at_checked(key.len())?;
-        if entry_key == key.as_bytes() && entry_value.first() == Some(&b'=') {
-            Some(String::from_utf8_lossy(&entry_value[1..]).into_owned())
+        if entry_key == key.as_bytes() {
+            let value = entry_value.strip_prefix(b"=")?;
+            Some(String::from_utf8_lossy(value).into_owned())
         } else {
             None
         }
@@ -6088,14 +6687,20 @@ struct WindowRefreshOutcome {
 #[allow(
     clippy::expect_used,
     clippy::unwrap_used,
-    clippy::indexing_slicing,
     reason = "unit tests use direct fixture setup and focused state assertions"
 )]
 mod tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
     use super::{
+        AgentNotification, ConfiguredPluginResources, ExtensionMetadata, LegacyWasmActorGeneration,
         Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, aggregate_preview1_compat_stats,
-        ensure_legacy_instance_id_supported, fullscreen_layout_rect,
-        legacy_instance_id_to_validate, wasm_plugin_instance_id,
+        cancel_and_join_legacy_generation, ensure_legacy_instance_id_supported,
+        fullscreen_layout_rect, legacy_instance_id_to_validate, wasm_plugin_instance_id,
         window_surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
@@ -6103,8 +6708,78 @@ mod tests {
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
-    use std::path::{Path, PathBuf};
 
+    #[test]
+    fn event_routes_include_only_explicit_subscribers() {
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        let generation = LegacyWasmActorGeneration {
+            declarations: vec![
+                manifold_wasm::WasmActorDeclaration {
+                    name: "layout".to_string(),
+                    export_name: "manifold_actor_layout_epoch_run".to_string(),
+                    subscriptions: BTreeSet::from([
+                        manifold_wasm::WasmActorEventKind::PaneMapped,
+                        manifold_wasm::WasmActorEventKind::LayoutState,
+                    ]),
+                },
+                manifold_wasm::WasmActorDeclaration {
+                    name: "poison".to_string(),
+                    export_name: "manifold_actor_poison_epoch_run".to_string(),
+                    subscriptions: BTreeSet::new(),
+                },
+            ],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: Vec::new(),
+        };
+
+        assert_eq!(
+            generation.subscribers(manifold_wasm::WasmActorEventKind::PaneMapped),
+            vec!["layout"]
+        );
+        assert_eq!(
+            generation.subscribers(manifold_wasm::WasmActorEventKind::LayoutState),
+            vec!["layout"]
+        );
+    }
+
+    #[test]
+    fn retiring_generation_is_joined_before_replacement_can_continue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cancellation, mut receiver) = tokio::sync::watch::channel(false);
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let task_mutations = Arc::clone(&mutations);
+        let task = runtime.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = receiver.changed() => {}
+                _ = gate => {
+                    task_mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        let generation = LegacyWasmActorGeneration {
+            declarations: vec![manifold_wasm::WasmActorDeclaration {
+                name: "layout".to_string(),
+                export_name: "manifold_actor_layout_epoch_run".to_string(),
+                subscriptions: BTreeSet::new(),
+            }],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: vec![task],
+        };
+
+        runtime.block_on(cancel_and_join_legacy_generation(generation));
+        assert!(
+            release.send(()).is_err(),
+            "retiring task must already be gone"
+        );
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
     fn preview1_stats(generation: u64, scale: u64) -> manifold_wasm::Preview1CompatStats {
         manifold_wasm::Preview1CompatStats {
             generation,
@@ -6118,6 +6793,11 @@ mod tests {
             pollables: usize::try_from(scale).unwrap(),
             wait_registrations: usize::try_from(scale).unwrap(),
             pending_notification_events: usize::try_from(scale).unwrap(),
+            filesystem_watches: usize::try_from(scale).unwrap(),
+            max_filesystem_watches: usize::try_from(scale).unwrap(),
+            max_filesystem_watch_events: usize::try_from(scale).unwrap(),
+            filesystem_watch_overflows: scale,
+            filesystem_watch_rescans: scale,
             workers_started: scale,
             workers_active: usize::try_from(scale).unwrap(),
             worker_reads_started: scale,
@@ -6126,6 +6806,28 @@ mod tests {
             workers_cancelled: scale,
             last_worker_value: scale,
         }
+    }
+
+    #[test]
+    fn configured_watch_resources_survive_stable_id_replacement_lookup() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let resources = ConfiguredPluginResources {
+            filesystem_watches: 3,
+            filesystem_watch_events: 64,
+        };
+        state
+            .configured_plugin_resources
+            .insert("watcher".to_string(), resources);
+        assert_eq!(
+            state.configured_resources_for_instance("watcher"),
+            resources
+        );
+        assert_eq!(
+            state.configured_resources_for_instance("unconfigured"),
+            ConfiguredPluginResources::default()
+        );
     }
 
     #[test]
@@ -6188,7 +6890,17 @@ mod tests {
         let mut event_loop = EventLoop::try_new().expect("event loop");
         let display = Display::new().expect("display");
         let mut state = Manifold::new(&mut event_loop, display);
-        state.wasm_actor_names.push("taken".to_string());
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        state.legacy_wasm_actor_generation = Some(LegacyWasmActorGeneration {
+            declarations: vec![manifold_wasm::WasmActorDeclaration {
+                name: "taken".to_string(),
+                export_name: "manifold_actor_taken_epoch_run".to_string(),
+                subscriptions: BTreeSet::new(),
+            }],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: Vec::new(),
+        });
 
         assert!(state.ensure_hosted_io_actor_id_available("taken").is_err());
         assert!(state.ensure_hosted_io_actor_id_available("free").is_ok());
@@ -6202,6 +6914,7 @@ mod tests {
         let actor = manifold_wasm::WasmActorDeclaration {
             name: "duplicate".to_string(),
             export_name: "actor_duplicate".to_string(),
+            subscriptions: BTreeSet::new(),
         };
 
         assert!(
@@ -6260,10 +6973,12 @@ mod tests {
         let mut state = Manifold::new(&mut event_loop, display);
         let directory = PathBuf::from("/tmp/manifold-session-cwd/subdir");
 
-        let session = state.create_and_attach_named_surface_session_in_directory(
-            Some("subdir".to_string()),
-            directory.clone(),
-        );
+        let session = state
+            .create_and_attach_named_surface_session_in_directory(
+                Some("subdir".to_string()),
+                directory.clone(),
+            )
+            .unwrap();
         assert!(state.remember_directory_surface_session(directory.clone(), session, true));
 
         assert_eq!(
@@ -6289,7 +7004,7 @@ mod tests {
         let mut state = Manifold::new(&mut event_loop, display);
         let initial_session = state.active_surface_session();
 
-        let next_session = state.create_and_attach_surface_session();
+        let next_session = state.create_and_attach_surface_session().unwrap();
 
         assert_eq!(state.active_surface_session(), next_session);
         assert_eq!(state.surface_session_count(), 1);
@@ -6320,8 +7035,9 @@ mod tests {
         state.clear_initial_surface_session();
         assert_eq!(state.surface_session_count(), 0);
 
-        let session =
-            state.create_and_attach_named_surface_session_in_directory(None, directory.clone());
+        let session = state
+            .create_and_attach_named_surface_session_in_directory(None, directory.clone())
+            .unwrap();
         assert!(state.remember_directory_surface_session(directory.clone(), session, true));
 
         assert_eq!(session.raw(), 1);
@@ -6341,8 +7057,9 @@ mod tests {
         let original = PathBuf::from("/tmp/manifold-session-cwd/original");
         let alias = PathBuf::from("/tmp/manifold-session-cwd/alias");
 
-        let session =
-            state.create_and_attach_named_surface_session_in_directory(None, original.clone());
+        let session = state
+            .create_and_attach_named_surface_session_in_directory(None, original.clone())
+            .unwrap();
         assert!(state.remember_directory_surface_session(alias, session, true));
 
         assert_eq!(
@@ -6376,6 +7093,83 @@ mod tests {
         assert!(state.forwarded_pressed_keys.is_empty());
         assert!(!state.shortcut_prefix_active);
         assert_eq!(state.suppress_shortcut_prefix_key_release, None);
+    }
+
+    #[test]
+    fn registry_notification_transition_is_fallible_and_owned() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let mut metadata = ExtensionMetadata::new();
+        metadata.insert("pane_id".to_string(), "42".to_string());
+        let agent_id = state
+            .register_agent("terminal", &metadata, "test.sender".to_string())
+            .expect("register agent");
+
+        let unknown = state.notify_agent(AgentNotification {
+            agent_id: "missing-agent".to_string(),
+            title: "Build finished".to_string(),
+            subtitle: String::new(),
+            body: "Artifacts are ready".to_string(),
+            level: "waiting".to_string(),
+            metadata: ExtensionMetadata::new(),
+            sender: "test.sender".to_string(),
+        });
+        assert!(unknown.is_err());
+        let unchanged = state.agent_summaries();
+        assert_eq!(unchanged.len(), 1);
+        let unchanged_agent = unchanged.first().expect("one unchanged agent");
+        assert_eq!(unchanged_agent.unread_notifications, 0);
+
+        state
+            .notify_agent(AgentNotification {
+                agent_id: agent_id.clone(),
+                title: "Build finished".to_string(),
+                subtitle: "io-fix".to_string(),
+                body: "Artifacts are ready".to_string(),
+                level: "waiting".to_string(),
+                metadata: ExtensionMetadata::new(),
+                sender: "test.sender".to_string(),
+            })
+            .expect("notify registered agent");
+        let notified = state.agent_summaries();
+        let notified_agent = notified.first().expect("one notified agent");
+        assert_eq!(notified_agent.status, "waiting");
+        assert_eq!(notified_agent.unread_notifications, 1);
+        assert!(notified_agent.attention);
+
+        assert!(state.unregister_agent(&agent_id));
+        assert!(state.agent_summaries().is_empty());
+    }
+
+    #[test]
+    fn missing_async_runtime_is_a_fallible_registry_boundary() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+
+        assert!(state.latest_wasm_policy_state_publication().is_none());
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        state.legacy_wasm_actor_generation = Some(LegacyWasmActorGeneration {
+            declarations: vec![manifold_wasm::WasmActorDeclaration {
+                name: "not-started".to_string(),
+                export_name: "manifold_actor_not-started_epoch_run".to_string(),
+                subscriptions: BTreeSet::from([manifold_wasm::WasmActorEventKind::PaneMapped]),
+            }],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: Vec::new(),
+        });
+        state.emit_wasm_actor_event(
+            manifold_wasm::WasmActorEventKind::PaneMapped,
+            r#"{"type":"pane-mapped"}"#,
+        );
+
+        assert_eq!(state.plugin_actor_failures, 1);
+        assert_eq!(
+            state.plugin_actor_last_status.as_deref(),
+            Some("not-started:event_error")
+        );
     }
 
     #[test]

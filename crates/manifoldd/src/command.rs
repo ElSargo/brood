@@ -36,7 +36,7 @@ impl WorkspaceCommand {
         match self {
             Self::Layout(action) => state.apply_layout_action(action),
             Self::SpawnApp(argv) => match state.spawn_hosted_app_argv(&argv) {
-                Ok(()) => true,
+                Ok(_) => true,
                 Err(err) => {
                     warn!(?err, ?argv, "workspace command failed to spawn app");
                     false
@@ -57,10 +57,7 @@ impl SurfaceCommand {
     fn apply(self, state: &mut Manifold) -> bool {
         match self {
             Self::SwitchActiveSessionNext => state.switch_to_next_surface_session(),
-            Self::CreateAndAttachSession => {
-                state.create_and_attach_surface_session();
-                true
-            }
+            Self::CreateAndAttachSession => state.create_and_attach_surface_session().is_ok(),
         }
     }
 }

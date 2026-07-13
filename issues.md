@@ -4,138 +4,294 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Plugin I/O follow-ups exposed by the real workspace watcher
+## Resolved
 
-- Wasm stores and actor message paths are not yet bounded by bytes. Mailbox
-  bodies, sender strings, worker payloads, worker results, and aggregate guest
-  memory can therefore exhaust daemon memory even though queue item counts are
-  bounded. Address this before stabilizing the runtime by adding Wasmtime
-  memory/table limits plus per-message, per-result, and per-generation byte
-  budgets. These limits should be deliberately very generous: they are
-  fault-containment ceilings for runaway plugins, not constraints that normal
-  coding workloads should approach.
-- The Preview 1 parent drains completion results into `actor_operations`
-  without applying `max_pending_actor_operations` or a separate completion-lane
-  bound. A completion handler which submits more operations can grow this queue
-  indefinitely while the outstanding-operation count remains within its limit.
-  Add a reserved bounded completion lane and stop draining the supervisor while
-  it is full. As with byte budgets, use a very generous limit so ordinary bursty
-  completion traffic is unaffected while unbounded growth is impossible.
-- Preview 1 shutdown cancels workers which are already active, but a worker
-  preparation which completes after shutdown begins can still start a new
-  worker. That worker missed the cancellation pass and can delay or hang hot
-  replacement. Once stopping begins, every late preparation result must drop
-  its prepared Store, release its reservation, and report cancellation instead
-  of starting the worker.
-- Completion writes run through `spawn_blocking`, but cancellation and shutdown
-  abort only the async wrapper. A blocking filesystem operation which has
-  already started can continue mutating the filesystem after a cancellation
-  completion or actor replacement. Track and join completion-engine blocking
-  work as Component worker I/O already does, or explicitly weaken and document
-  the cancellation contract for external side effects.
-- Filesystem watch churn is not fully bounded. Each watch creation retains a
-  setup-thread handle until the entire hub stops, including after that watch is
-  dropped, so repeated create/drop cycles grow `setup_threads`. In addition,
-  `drop_watch` removes the watch before dropping its notification; if a queued
-  actor event makes `drop_notification` fail, the notification remains live
-  after its owning watch is gone. Reap keyed setup tasks and make watch plus
-  notification teardown atomic or safely deferred.
-- Native watches currently create one `notify` backend per logical watch
-  resource. Replace that with a daemon-wide watcher service which deduplicates
-  native path registrations and routes events into bounded, actor-generation
-  scoped subscription queues. Keep the existing guest watch/notification ABI;
-  capability-relative path projection, overflow, and teardown remain private
-  to each logical handle even when the kernel registration is shared.
-- Native capability-rooted filesystem watches currently exist only in the
-  Preview 1 compatibility ABI. The Component backend still needs an equivalent
-  WIT resource and SDK wrapper before both plugin backends have one I/O model.
-- Preview 1 watch batches currently encode paths as lossy UTF-8 text. The
-  resource is capability safe, but a typed SDK/Component surface must preserve
-  arbitrary platform path bytes without collisions.
-- Native watcher backends may coalesce, duplicate, or classify rename events
-  differently. Overflow is safely reported as `rescan`, but consumers that
-  maintain state must implement reconciliation; the example logger records the
-  marker rather than rebuilding an indexed model.
-- A configured workspace filesystem grant captures the active session working
-  directory when the plugin loads. It is not retargeted when another surface
-  session becomes active. Session-scoped plugin instantiation or an explicit
-  rebind lifecycle is still needed.
-- `startup-message` is an untyped bootstrap convenience, not a complete plugin
-  lifecycle interface. Manifest-level start/stop hooks and structured startup
-  data remain to be designed.
-- Watch and event-queue limits currently use runtime defaults. They are bounded,
-  but plugin manifests cannot yet request narrower budgets and status output
-  does not expose live watch counts or overflow totals.
-- Subprocesses, pipe streams, PTYs, sockets, and timers remain deliberately
-  absent. They should reuse the same generation-owned resource and pollable
-  lifecycle rather than grow separate wait mechanisms.
-
-## Control and DBus API shape
-
-- `crates/manifoldd/src/control.rs`: `exit` in the command path shows that CLI
-  process policy is still mixed into control logic. A proper fix should return
-  typed exit outcomes from command execution and let the binary entrypoint exit.
-- `crates/manifoldd/src/bin/manifold-runner-nix-develop.rs`: the runner must
-  preserve the activated child process exit status. A proper fix should move the
-  binary entrypoint to an explicit exit-status return model instead of calling
-  `process::exit` from helper code.
-- `crates/manifoldd/src/control.rs`, `crates/manifoldd/src/browser.rs`: command
-  handlers still parse token slices positionally, which drives
-  `indexing_slicing` warnings. The target design should move these paths to
-  typed parsers or typed command structs.
-
-## Central runtime state
-
-- `crates/manifoldd/src/state.rs`: the `Manifold` state object owns session
-  routing, geometry, focus, agent registry, browser state, and test harness
-  coordination. That drives `too_many_arguments`, pass-by-value churn,
-  field-name repetition, unchecked indexing, and panic-like invariant checks.
-  The target design should split this into typed services with explicit
-  ownership and fallible boundaries.
-- `crates/manifoldd/src/compositor.rs`: runtime setup and nested-test
-  orchestration are interleaved with compositor wiring. The target design should
-  split test orchestration from compositor startup and give event-loop callbacks
-  narrow typed inputs.
-
-## Geometry and conversion model
-
-- `crates/manifoldd/src/layout.rs`, `crates/manifoldd/src/input.rs`,
-  `crates/manifoldd/src/presentation.rs`, and
-  `crates/manifoldd/src/winit_presenter.rs`: coordinate paths still mix float
-  ratios, signed layout pixels, unsigned renderer sizes, and raw casts. A proper
-  fix should introduce checked geometry conversion helpers and make truncation,
-  clamping, and overflow policy explicit.
-- `crates/manifoldd/src/launch_context.rs`: environment previews slice strings
-  by byte offsets. The target design should define truncation in Unicode scalar
-  or grapheme terms before changing behavior.
-
-## Unsafe and raw buffers
-
-- `crates/manifoldd/src/winit_presenter.rs`,
-  `crates/manifoldd/src/debug_dump.rs`, `crates/manifoldd/src/session_bus.rs`,
-  and `crates/manifoldd/src/state.rs`: unsafe blocks and raw buffer indexing sit
-  at FFI, renderer, and DBus-message boundaries. The target design should wrap
-  those boundaries in audited safe helpers with documented invariants rather
-  than scattering safety comments around inline raw access.
-
-## Session bus routing
-
-- `crates/manifoldd/src/session_bus.rs`: the in-process DBus router operates on
-  raw message bytes, manual owner maps, and callback tuples. That drives
-  `type_complexity`, `unreachable`, pass-by-value, ignored-send-result, and
-  indexing warnings. A proper fix should model session bus messages, owners, and
-  notification forwarding as typed state transitions.
-
-## WASM invocation and harness lifecycle
-
-- `crates/manifoldd/src/wasm_key.rs`: key-handler calls pass event context as
-  parallel scalar arguments. The target design should group those fields into a
-  typed invocation context.
-- `crates/manifoldd/src/wasm_test.rs`: harness process lifecycle is procedural
-  and relies on best-effort child cleanup. The target design should model child
-  handles, lifecycle events, and cleanup results explicitly.
-- Target-shape WASM plugin actor loading is wired enough for interactive testing,
-  but reload/lifecycle ownership is still provisional. Actor tasks currently run
-  indefinitely without cancellation handles, reloading a module with the same
-  actor names can fail registry registration, and pane-mapped events are
-  broadcast to all WASM actors rather than subscription-routed.
+- Core-module actor generations now own their declarations, mailbox identities,
+  cancellation signal, and join handles. Replacement builds every actor against
+  unpublished mailboxes, validates the complete candidate set, cancels and joins
+  the retiring generation, and atomically publishes the prepared set before new
+  tasks run; invalid candidates leave the old names and actors reachable. Typed
+  `pane-mapped` and `layout-state` marker exports are validated and routed only
+  to declared subscribers, while direct actor messages share the public actor
+  namespace. The real `wasm-actor-lifecycle-proof` plugin and
+  `tools/test-wasm-actor-lifecycle-nested.sh` render a terminal and animated EGL
+  client in columns, reject a deliberately broken second actor while a mailbox
+  probe proves the old generation remains responsive, then hot-reload the same
+  actor names and visibly render the same two clients in rows. Its unsubscribed
+  poison actor would spawn an obvious third pane if broadcast routing returned;
+  all three compositor captures retain exactly two panes, and the daemon log
+  records both actors joined at replacement and final shutdown. Event marker
+  subscriptions currently describe core-module actors; Component and Preview 1
+  actors remain message-driven until their manifests gain an event-declaration
+  surface.
+- Core-WASM test harnesses now run as owned, checked child threads with typed
+  `Starting -> Running -> Exited` events and explicit joined, already-joined,
+  and panicked cleanup results. Signal, sleep, and host-response waits observe
+  cancellation; Wasmtime epoch interruption stops executing guest code; gates
+  before instantiation and `run()` close early-cancellation races; and a lost
+  lifecycle channel becomes a failed completion. Ordered daemon shutdown
+  records the cleanup outcome before the Tokio runtime is dropped, while the
+  destructor remains a hard-join fallback. The real
+  `wasm-harness-lifecycle-proof` plugin and
+  `tools/test-wasm-harness-lifecycle-nested.sh` provide two visible three-pane
+  workloads with an animated EGL client, terminal, and nested presentation.
+  One receives a real named signal, performs a final host request, returns pass,
+  and joins without cancellation. The other stays blocked in the signal import
+  while the controller captures it, then supervisor shutdown wakes, interrupts,
+  and joins the exact child without inventing a guest completion. Native module
+  compilation is joined rather than forcibly preempted mid-compilation.
+- The named `wasm_key.rs` premise was stale after the prototype moved into the
+  policy-provider runtime, but the remaining invocation boundary is now fully
+  typed: `GlobalKeyPolicyInput` groups code, press/release state, modifiers, and
+  input mode, while `GlobalKeyPolicyInvocation` couples that event envelope to
+  its immutable publication lease. Input routing passes one context, guest
+  allocation details are private, and only the core-WASM link adapter lowers
+  bounded buffers to the four pointer/length scalars required by the stable
+  guest ABI. `tools/test-typed-key-policy-nested.sh` proves this with the real
+  `default-workspace` plugin and real key injection: bare `B` plus `Ctrl+O`
+  leaves one visible terminal and emits no plugin message, while `Ctrl+B` plus
+  `Ctrl+O` applies one host message and visibly opens exactly one second Foot
+  terminal. The captured two-pane frame, matching compositor state, press and
+  release event counts, and zero plugin failures make the result observable.
+- Session-local DBus routing now separates the audited bounded-wire layer from
+  a typed `BusRouter`. Connection allocation, unique and well-known ownership,
+  replacement flags, release, disconnect cleanup, route decisions, delivery
+  failures, notification proxy results, and matching notification signals are
+  explicit fallible transitions; built-in daemon and notification owners have
+  stable unique identities and rejected requests leave owner tables unchanged.
+  The real proof in `tools/test-typed-session-bus-nested.sh` renders the GTK
+  session switcher with two live realms, observes different ordinary
+  `DBUS_SESSION_BUS_ADDRESS` sockets and owner visibility, and drives four real
+  Python DBus clients through introspection, a property round trip, methods,
+  replies, and two signal hops. The last client sends a substantive
+  notification over its managed session bus, and the transcript records the
+  real notification ID returned by the host desktop service.
+- Unsafe renderer, SHM, DBus-wire, and calloop access now sits behind narrow
+  audited helpers with typed owners and documented lifetime, alignment, and
+  validity invariants. Winit/EGL/GBM/Wayland handles cannot escape the presenter
+  adapter; Smithay display dispatch is one state-layer helper; SHM capture
+  validates dimensions, offset, stride, mapped span, complete pixels, and alpha
+  policy before slice-only conversion; and DBus frames validate endian,
+  alignment, exact length, checked arithmetic, and a 128 MiB ceiling before the
+  two private zbus raw constructors. Broad unsafe/index allowances are gone,
+  with malformed, short, zero-size/stride, overflow, padded-row, and alpha
+  fixtures covering non-observable seams. The real geometry plugin proves the
+  visible path in `tools/test-safe-boundaries-nested.sh`: it splits a terminal
+  and animated SHM client, the offscreen Winit/EGL frame is captured, the debug
+  manifest records both surfaces, and a substantive “Audited boundaries
+  crossed” notification traverses the isolated realm bus to the host desktop
+  service and returns its real notification ID. The manifest honestly records
+  `no_current_buffer` because Smithay consumes transient `BufferAssignment`
+  state before a later debug request; that SHM mapping boundary is therefore
+  accepted through deterministic fixtures rather than a fabricated plugin
+  result.
+- The launch-context issue's preview premise was stale: repository history
+  confirms launch records have always been lossless transport data and no
+  environment-preview bound or truncation function exists. The real
+  `string_slice` debt was cgroup scope parsing; it now matches an exact,
+  nonempty path component with structural prefix/suffix operations, preserving
+  arbitrary Unicode without byte indexing. Tests cover malformed delimiters,
+  long Japanese/combining/ZWJ/skin-tone/flag identifiers, and complete
+  `PathBuf`/`OsString` record round trips. A plugin is not applicable before the
+  session/plugin runtime starts, so `tools/test-unicode-launch-context.sh`
+  provides the real proof: an actual user systemd scope and
+  `manifold-runner-exec` restore full Japanese/emoji project paths,
+  combining-mark/flag working paths, Cyrillic/emoji cache paths, and a
+  CJK/combining/skin-tone/flag argument into both the process environment and
+  cwd. Any future bounded UI preview must define its own bound and truncate at
+  extended-grapheme boundaries while retaining the record as source of truth.
+- Normalized plugin transforms, signed layout pixels, unsigned host/capture
+  extents, physical pointer positions, and Wayland axis values now cross one
+  checked geometry layer with explicit rounding, saturation, clamping, empty-
+  size, invalid-scale, non-finite, and wheel-v120 policies. The old broad cast
+  allowances are gone, capture dimensions are fallible, hit rectangles and
+  split arithmetic cannot overflow, and boundary tests cover fractional values,
+  the full signed range, NaN/infinities, zero and tiny scales, and host-size
+  overflow. The current `workspace` provider in
+  `examples/wasm-geometry-layout-policy` is the observable plugin proof through
+  `tools/test-geometry-conversions-nested.sh`: it emits a typed
+  `SetResolvedLayout` for two real 640x800 panes, after which global input at
+  `(960,400)` visibly reaches Weston eventdemo at local `(320,400)`. The client
+  records motion, press/release, wheel value 15, and fractional scroll 7.5,
+  while compositor metrics record six target hits, zero misses, and the
+  screenshot shows the terminal/eventdemo split and eventdemo input region.
+- Smithay protocol wiring, product runtime startup, and built-in nested-test
+  orchestration now live in separate compositor, runtime, and test modules with
+  typed launch plans, supervised processes, and a narrow runtime-tick callback.
+  Hosted spawns return an exact token with bounded lifecycle history, so the
+  supervisor can wait either for that pane to be presented or, explicitly, for
+  that process to exit; unrelated windows and child exits satisfy neither
+  policy, and a known failure cannot be hidden by visibility. The real proof in
+  `tools/test-nested-command-ownership.sh` maps a substantive Weston terminal,
+  observes a different hosted child exit while its controller remains alive,
+  captures the rendered terminal, then observes the exact controller complete
+  and automatic nested cleanup without `--keep-running` or manual daemon quits.
+  A persistent `weston-simple-egl -f` run independently proves the default
+  visible-client policy remains compatible.
+- `Manifold` now coordinates typed surface-session, focus, registry, and test-
+  harness services instead of owning those transition tables as loose fields;
+  layout and browser state retain their existing service owners. Session
+  allocation, activation, routing, rename, directory assignment, and removal
+  are atomic and fallible, including explicit empty-catalogue and exhausted-ID
+  behavior. Agent notification requests are typed, harness ownership is single-
+  assignment, and an absent async runtime is an error rather than a registry
+  panic. The real GTK session-switcher is the observable proof in
+  `tools/test-state-services-nested.sh`: it renders a renamed Alpha session with
+  live windows and an agent, while the transcript proves Alpha/Beta switching,
+  Beta removal and directory-default retirement, and a substantive agent
+  notification changing the agent from running to waiting with attention and
+  unread state.
+- Raw argv and JSON control requests now cross typed `BrowserControlCommand`,
+  `PlugCommand`, and `InjectCommand` parsing boundaries before compositor
+  mutation. Exact arity and ambiguous browser URL forms are rejected without
+  token indexing, and the obsolete `indexing_slicing` allowances are gone. The
+  real `wasm-component-actor` example proves the plugin-facing route through
+  `tools/test-typed-control-parser-nested.sh`: a typed `plug --kind/--id/path`
+  command visibly registers the requested Component actor and its mailbox
+  counter advances, while the same artifact records JSON browser output, exact
+  invalid browser/inject diagnostics, and an unchanged input-event count.
+- The Nix development runner returns a typed `ActivatedChildExit` from its
+  activation helper and leaves OS termination to the binary entrypoint. Numeric
+  child codes are preserved and Unix signals follow the conventional
+  `128 + signal` shell status. A plugin is not applicable beneath the plugin
+  execution layer, so the real proof runs the actual runner through its cached
+  `nix print-dev-env` activation: the inner workload visibly records its
+  Nix-store Cargo path, project/working/cache context, and a deliberate
+  `configuration-rejected` result before the invoking shell observes status 37.
+- Session command execution returns a typed `CommandOutcome` instead of
+  terminating from `control.rs`; only the `manifold` binary entrypoint maps an
+  explicit child code to its process exit status, while signal termination
+  remains a fallible control result. A plugin is not applicable to binary exit
+  policy, so the user-facing proof runs the real CLI in the built-in offscreen
+  nested harness: an entered command visibly prints its domain rejection and
+  exits 37, and the invoking shell observes `manifold enter` exit status 37.
+- Subprocess pipes, real PTYs, loopback sockets, and timers now share one
+  bounded byte-stream and notification/pollable lifecycle owned by the actor
+  generation. Component and Preview 1 guests use the same capability grants,
+  PATH-selected process resolution, caller working directory, exit status,
+  backpressure, async drop, and structured teardown semantics; admission races,
+  cancellation, stale handles, resource churn, and blocked host work have
+  deterministic coverage. The real
+  Component `component-runtime-io` plugin and the Preview 1
+  `workspace-file-log` worker write separate visible transcripts through
+  `tools/test-runtime-io-plugins-nested.sh`: both feed an allowlisted `tr`
+  process through guest-visible pipes, preserve exit 7, prove both ends of an
+  interactive PTY are terminals, exchange distinct requests with a real
+  controller-owned TCP peer whose independent log corroborates them, and
+  observe the 20 ms timer before the 80 ms timer through the ordinary wait set.
+- Hosted plugin manifests can narrow logical filesystem-watch and per-watch
+  event ceilings through a validated resource table; zero, daemon-ceiling
+  bypass, and policy loss across stable-ID replacement are covered by tests.
+  The same limits apply to Component and Preview 1 generations and survive
+  workspace rebind. Generation stats expose live handles, configured ceilings,
+  overflows, and rescans, while the shared daemon watcher reports monotonic
+  totals; initial setup counts only as rescan and queue/backend collapse counts
+  as both. The real workspace plugin runs with 3 watches/64 events, keeps 2
+  handles live, pauses one consumer through an 80-file paced workload, and
+  records daemon and generation overflow changes from 0 to 1. Its visible
+  85-line index exactly reflects the reconciled workspace and its preserved
+  status JSON records the applied capacities and counters.
+- Configured hosted actors have a typed, explicitly acknowledged lifecycle on
+  both Component and Preview 1 backends. Manifest lifecycle tables provide
+  sorted structured start data and separate nonzero start/stop bounds; legacy
+  `startup-message` cannot be mixed with the target interface. Replacement
+  constructs an unreachable candidate, completes the old stop hook, hard-joins
+  old resources regardless of hook outcome, completes candidate start while it
+  is still unreachable, and only then publishes it. Rebind and final shutdown
+  use typed reasons and the same hard-teardown fallback. The real workspace
+  plugin delegates each hook artifact append to ordinary WASI work and only
+  acknowledges a zero-result worker. Its visible logs prove generations 1, 2,
+  and 3 in ordered initial/rebind/shutdown transitions, include session, guest
+  root, instance, and manifest data, and remain byte-stable after daemon exit.
+- Configured workspace grants follow active surface-session lifecycle through
+  an explicit stable-ID generation rebind. Every runtime activation path stops
+  and joins workspace-granted actor generations before changing the active
+  session, then starts new generations rooted at the target session cwd and
+  redelivers startup; a failed restart leaves the actor unavailable instead of
+  retaining old-workspace authority. The real workspace plugin proof activates
+  two live sessions with distinct directories and observes generations 1, 2,
+  and 3. Each directory receives only its own initial and active-time mutation
+  records, while hashes prove the inactive log remains unchanged and the live
+  control API confirms the expected session ID and working directory.
+- The Preview 1 workspace plugin is a stateful watch consumer, not merely an
+  event logger. It maintains a sorted, atomically replaced workspace index;
+  ordinary create/remove batches update membership, while any batch containing
+  `rescan` or a backend-generic `changed` event is discarded and rebuilt by a
+  recursive WASI scan before reconciliation is reported complete. Its nested
+  proof pauses the primary consumer with its watch live, routes 4,200 files
+  through the independently draining mirror to exceed the 4,096-event bound,
+  then resumes to an overflow rescan. The primary log contains no incremental
+  overflow rows, and the resulting 4,204-path index exactly matches an
+  independent walk of the final workspace, including additions, deletion, and
+  documented exclusions.
+- Filesystem-watch events preserve native path identity end to end: raw
+  `OsStr` bytes on Unix and little-endian UTF-16 units on Windows. Component
+  events expose opaque byte lists, while the line-oriented Preview 1 ABI uses
+  reversible uppercase `%HH` escaping for non-graphic bytes, `%`, tabs, and
+  newlines. Unit coverage includes delimiter bytes and two invalid-UTF-8 names
+  that lossy conversion would conflate. The real Component plugin renders those
+  names distinctly as `collision-\xFF.txt` and `collision-\xFE.txt`; the real
+  Preview 1 plugin records `preview1-collision-%FF.txt` and `%FE.txt` distinctly
+  in both watcher logs and the completion-created snapshot.
+- Component plugins own capability-rooted filesystem watches through a typed
+  WIT resource with typed event batches. The guest wrapper projects readiness
+  into the ordinary notification/pollable wait path, while the host reuses the
+  daemon-owned native watcher service and retires subscriptions before actor
+  replacement completes. `plugins/component-workspace-watch` is the observable
+  proof: its nested workload creates, edits, and removes real workspace files,
+  and the plugin maintains `.manifold/component-workspace-watch.md` with the
+  corresponding paths and event kinds. The same proof observes one live native
+  registration and logical subscription, then zero of each after generation
+  replacement.
+- Manifold owns one native filesystem-watcher service which deduplicates
+  canonical path plus recursion-mode registrations across actor generations.
+  Logical subscriptions keep private bounded queues, overflow, notification,
+  capability projection, and teardown; stale setup results cannot attach to a
+  recreated registration and backends are never destroyed under the registry
+  mutex. Status exposes native registrations, logical subscriptions, and setup
+  tasks. The real workspace plugin proves the shape with two active workers and
+  identical 198-byte logs backed by one registration and two subscriptions.
+- Filesystem-watch setup tasks are keyed and reaped, while unfinished orphan
+  setup still counts against the watch ceiling until it exits. Logical drop
+  never waits for recursive registration. Host teardown retires a watch's
+  notification before removing the watch, invalidates pollables, adjusts an
+  admitted actor-event count exactly once, and lets any stale queued ID drain as
+  a no-op. Unit tests cover 32 create/drop cycles and queued-event retirement;
+  the real workspace plugin repeats 32 guest teardown probes, returns to one
+  primary notification, and then visibly records `after-watch-churn.txt`.
+- Completion-I/O cancellation and replacement own blocking writes through their
+  terminal boundary. Cancellation can prevent queued work from starting but
+  does not roll back an already-started filesystem effect; once a write has
+  started, its blocking task is joined before `cancelled` is delivered. Shutdown
+  likewise drains admitted writes before replacement can activate, so an old
+  generation cannot mutate files afterward. Deterministic blocked-mutation
+  tests prove that ordering, while `workspace-file-log` leaves a real
+  completion-written snapshot as the user-observable guest-to-daemon proof.
+- Preview 1 shutdown treats queued and in-flight worker preparation as owned
+  lifecycle state. Stopping cancels queued preparations, waits for late Stores
+  to return, drops them before execution, releases every guest stack/TLS
+  reservation, and reports cancellation to host-owned spawns. Already-queued
+  reservation releases are preserved while other actor work is discarded. The
+  exact races have deterministic gated tests; the real
+  `tools/test-wasm-preview1-worker-nested.sh` workload proves two-generation hot
+  replacement and structured shutdown with worker values 90 and 81.
+- Preview 1 completion dispatch has its own generously sized bounded lane. The
+  parent stops receiving from the completion supervisor while that lane is full,
+  but continues servicing control and shutdown commands; completion, mailbox,
+  and notification dispatch remain fair. The observable proof is the
+  `workspace-file-log` plugin's `snapshot` action: actor completion I/O reads the
+  live watch log and writes an exact snapshot while the watcher worker stays
+  active. `tools/test-workspace-file-log-plugin-nested.sh` validates both real
+  filesystem artifacts and the delivered completion count. This proof also
+  caught and fixed a scheduler bug which misrouted completion-only work toward
+  an empty notification lane.
+- Wasm stores and actor message paths are byte-bounded. Shared, deliberately
+  generous limits cover mailbox senders and bodies, Component worker payloads
+  and results, generation-owned host queues, aggregate linear memory, and store
+  tables. Byte permits follow retained values until dispatch or observation,
+  and Preview 1 modules must declare shared-memory maxima within the generation
+  ceiling. The target contract is documented in
+  `docs/systems/plugin-runtime.md`. The observable proof is
+  `plugins/workspace-file-log`: its nested test performs a real workspace scan
+  and records file creation, modification, and removal under the bounded
+  runtime; see `tools/test-workspace-file-log-plugin-nested.sh`.

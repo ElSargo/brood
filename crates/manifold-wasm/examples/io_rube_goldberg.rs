@@ -1028,6 +1028,7 @@ async fn load_preview(settings: &Settings, slot: usize) -> Result<PreviewNode> {
                 guest_path: ".".to_string(),
                 writable: true,
             }),
+            ..Preview1ActorCapabilities::default()
         },
         Preview1WorkerConfig {
             max_workers: settings.workers_per_actor.saturating_add(16),

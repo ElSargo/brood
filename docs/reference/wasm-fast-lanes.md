@@ -31,11 +31,13 @@ batches; ordinary plugin work stays in actors and workers. See
 
 ## Core-Module Actors
 
-Core plugins declare actors through named exports discovered by
-`module_link.rs`. Each actor processes one bounded mailbox epoch and returns an
-outbox containing messages and publication frames. Layout policy uses this
-path: the host sends pane/layout state to actors, and an actor sends a validated
-`set-resolved-layout` command back through the host mailbox.
+Core plugins declare actors and typed event subscriptions through named exports
+discovered by `module_link.rs`. Each actor processes one bounded mailbox epoch
+and returns an outbox containing messages and publication frames. Layout policy
+uses this path: the host routes pane/layout state only to subscribing actors,
+and an actor sends a validated `set-resolved-layout` command back through the
+host mailbox. Marker typos and subscriptions without a declared actor reject
+the module; consult `module_link.rs` for exact export spellings.
 
 See `module.rs`, `module_link.rs`, `actor.rs`, and `actor_link.rs` for the exact
 export and outbox ABI.

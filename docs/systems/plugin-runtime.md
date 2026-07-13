@@ -143,6 +143,42 @@ language I/O with a bespoke syscall vocabulary. Compatibility does not imply a
 complete Linux emulation: `fork`, arbitrary `ioctl`, ambient descriptors, and
 system-wide process control are outside the contract.
 
+### Bounded streams, processes, PTYs, sockets, and timers
+
+The portable host surface uses one bounded byte-stream resource for child
+standard input/output/error, PTY master traffic, and connected sockets. Reads
+are nonblocking and distinguish data, temporary unavailability, and EOF;
+writes either admit a bounded chunk or report backpressure. Closing the write
+side is explicit. There are no process-, terminal-, socket-, or timer-specific
+wait calls.
+
+Every host-owned resource exposes a scheduling notification. A stream advances
+its notification generation when bytes become readable, write capacity
+changes, EOF arrives, or an error becomes terminal. Child exit and timer expiry
+advance their own notifications. Workers turn those notifications into normal
+pollables and select with the same bounded `worker-wait-any` operation used for
+guest notifications and filesystem watches. After readiness, the guest reads
+typed stream, child-status, or timer-status state; notifications never carry
+the data themselves.
+
+Process authority is an explicit manifest allowlist of PATH-resolved command
+names (`subprocess:<name>`). The runtime reports the resolved executable used
+for a child so observable proofs and diagnostics do not hide environment
+selection. Pipe and PTY children start from the same actor/session working
+directory; terminal setup must pass that directory explicitly rather than
+infer it from `HOME`. `pty` separately permits spawning a child attached to a
+real host pseudoterminal. `network:loopback` permits outbound connections only
+to a loopback peer; accepting listeners, DNS, ambient sockets, and arbitrary
+remote addresses are not part of this surface. PTY children still require
+their command allowlist entry.
+
+Children, streams, PTYs, connected sockets, timers, pump tasks, and their
+notifications belong to one actor generation. Generation stop first rejects
+new operations and invalidates all handles and derived pollables, then closes
+streams and sockets, kills live children, cancels timers and pumps, and joins
+all host work before replacement can be published. Count, buffered-byte, and
+write-chunk ceilings apply uniformly to Component and Preview 1 guests.
+
 ## Messaging, Policy, And Publications
 
 Mailboxes are the durable communication path between actors, host services,
@@ -159,6 +195,32 @@ late results fall back to host policy.
 Publications are host-owned immutable latest-state frames written by actors and
 read by policy providers. They are not queues and never contain pointers into
 mutable actor memory.
+
+## Resource Ceilings
+
+Every actor generation has two complementary forms of backpressure. Item
+counts bound queue scheduling, while byte budgets bound retained host and guest
+memory. The host rejects a mailbox body, sender identity, worker payload, or
+worker result before admitting it when that value exceeds its individual
+ceiling. An ownership permit then follows each admitted value through the
+generation's queues and is released only when dispatch consumes or drops it.
+This prevents a queue containing a bounded number of unusually large values
+from bypassing fault containment.
+
+Terminal I/O results use a reserved bounded completion lane rather than the
+general actor-operation queue. When that lane is full, its owner stops draining
+the completion supervisor until the actor dispatches a result. Backpressure
+therefore reaches operation producers while mailbox, lifecycle, and shutdown
+commands retain their own admission and scheduling paths. The default lane is
+deliberately much larger than the normal outstanding-I/O window, so it contains
+pathological completion-producing handlers without throttling ordinary bursts.
+
+Wasmtime stores have linear-memory and table limits. A Component or core-Wasm
+generation cannot grow beyond its store limit. Preview 1 workers share their
+actor's imported memory, so the module must declare a maximum and that maximum
+must fit the generation memory ceiling; every worker store separately retains
+the table limit. The defaults are deliberately generous daemon safety limits,
+not quotas that ordinary coding plugins should approach.
 
 ## Host Responsibilities
 
@@ -184,6 +246,37 @@ and operations, removes waits, closes actor-scoped resources, joins host work,
 and only then releases the address space. Session-scoped resources remain owned
 by the session service and may be reattached by a replacement actor.
 
+Configured hosted actors receive typed `start` and `stop` lifecycle contexts on
+the reserved system lane. Dispatch return is not acknowledgement: a hook may
+span worker or completion turns and ends only when the guest explicitly
+reports lifecycle completion. Start and stop have separate manifest bounds.
+Failure or timeout is terminal for that hook, after which the host performs
+hard generation teardown and joins every owned resource.
+
+Replacement constructs an unreachable candidate first. The old generation's
+stop hook receives the candidate generation, then the host hard-joins the old
+generation. The candidate start hook runs while it is still unreachable; only
+successful completion publishes it under the stable ID. A failed start is
+hard-joined and leaves the ID unavailable. Session rebind uses the same stop
+and start hooks around the authority change, while final daemon teardown uses
+the `shutdown` stop reason. No old-generation work may mutate state after the
+next generation is reachable or after final shutdown returns.
+
+A configured workspace filesystem grant belongs to one actor generation and
+the active surface session that selected its capability root. Activating a
+different session is an explicit generation-rebind barrier: the host first
+stops and joins the old generation, then changes the active session, creates a
+new generation rooted at that session's working directory, republishes it under
+the stable configured actor ID, and completes its structured start hook. A failed
+restart leaves the actor unavailable; it must never preserve access to the
+previous session's workspace as a fallback.
+
+Worker preparation is part of that ownership boundary. Once stopping begins, a
+preparation which returns late must drop its prepared Store, release its guest
+stack and TLS reservation, and report cancellation; it must never begin guest
+worker execution. Replacement cannot publish the new generation until that
+cleanup has joined.
+
 Diagnostics must expose mailbox pressure, dispatch latency, live and waiting
 workers, outstanding operations, wait registrations, resource counts,
 cancellation, and terminal failures. One actor failure must remain local to
@@ -195,6 +288,44 @@ The Component and Preview 1 runtimes are implementation proofs of this target.
 The Component path demonstrates completion I/O and cooperative workers; the
 Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
 memory. Their export names and Store layout are not the durable plugin ABI.
+
+`plugins/component-runtime-io` and the runtime-I/O worker in
+`plugins/workspace-file-log` exercise the same bounded stream and pollable
+contract through both backends. Their nested workload preserves separate
+Markdown transcripts containing PATH-selected commands, pipe input and
+transformed output, a nonzero child exit, explicit stdin/stdout PTY checks and
+interactive traffic, a real loopback request/response, and distinct timer wake
+order. The local peer independently records what it received and returned.
+
+`plugins/workspace-file-log` is the user-observable Preview 1 proof. Its module
+declares a bounded shared-memory maximum, then performs a real recursive
+workspace scan and live filesystem watch. Creating, editing, and removing
+files produces corresponding records in
+`.manifold/workspace-file-log.log`; the visible file history demonstrates that
+normal actor mailbox, worker, shared-memory, and filesystem behavior remains
+usable inside the ceilings. The nested workload also creates two invalid-UTF-8
+names which lossy conversion would conflate; both real guest logs retain them
+as distinct reversible `%FF` and `%FE` paths.
+
+`plugins/component-workspace-watch` proves the same capability-rooted watch
+model through the Component backend. Its typed WIT resource is an
+actor-generation-owned logical subscription backed by the daemon watcher
+service. The guest SDK wrapper projects its notification into the ordinary
+worker pollable set, and the plugin maintains a live Markdown history at
+`.manifold/component-workspace-watch.md`. The nested proof replaces the actor
+generation and observes the old subscription reach zero before the replacement
+is published. It also creates two invalid-UTF-8 Unix filenames which would
+collapse to the same replacement-character text under lossy conversion; the
+artifact shows their distinct native bytes as reversible `\xFF` and `\xFE`
+paths.
+
+Host-owned resource teardown retires a watch and its notification as one
+ownership transition. An actor event already admitted to the reserved lane may
+still carry the retired ID, but it drains as a stale no-op and no longer counts
+as pending. Recursive setup tasks are keyed by watch, reaped after completion,
+and remain inside the watch ceiling if logical teardown races setup. The
+workspace logger's teardown probe repeats real guest watch creation and drop,
+then records a later file mutation through the still-live primary watcher.
 
 Current implementation details and runnable tests live in [[extension-host]],
 [[plugin-io-interaction-graph]], and [[../reference/wasm-fast-lanes]].

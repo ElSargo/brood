@@ -15,12 +15,15 @@ mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
 pub mod layout_policy;
+mod lifecycle;
 pub mod mailbox;
 pub mod module;
 mod module_link;
 pub mod policy_provider;
 mod policy_provider_link;
 pub mod preview1_worker;
+mod resource_limits;
+pub mod runtime_io;
 
 pub use actor::{
     ACTOR_EMPTY_OUTBOX, ActorEpochOutcome, ActorOutbox, ActorOutboxMessage, ActorPublication,
@@ -48,13 +51,16 @@ pub use coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, CoordinationStats,
     NotificationError, NotificationId, PollError, PollableId, ReadyPollable, WaitMode,
 };
+pub use filesystem_watch::{
+    FilesystemWatchStats, NativeFilesystemWatcherService, NativeFilesystemWatcherStats,
+};
 pub use global_key_policy::{
     ABI_INPUT_MODE_NORMAL, ABI_INPUT_MODE_PASSTHROUGH, ABI_KEY_PRESSED, ABI_KEY_RELEASED,
     ABI_MOD_ALT, ABI_MOD_CTRL, ABI_MOD_SHIFT, DEFAULT_GLOBAL_KEY_POLICY_ARENA_BYTES,
-    GlobalKeyActorMessage, GlobalKeyDecision, GlobalKeyPolicyInput,
-    GlobalKeyPolicyInvocationBuffers, GlobalKeyPolicyOutcome, HOST_ACTOR_NAME, HostMessage,
-    MAX_GLOBAL_KEY_POLICY_ARENA_BYTES, MAX_GLOBAL_KEY_POLICY_QUERY_BYTES,
-    MAX_GLOBAL_KEY_POLICY_RESULT_BYTES, WasmGlobalKeyPolicy, host_message,
+    GlobalKeyActorMessage, GlobalKeyDecision, GlobalKeyPolicyInput, GlobalKeyPolicyInvocation,
+    GlobalKeyPolicyOutcome, HOST_ACTOR_NAME, HostMessage, MAX_GLOBAL_KEY_POLICY_ARENA_BYTES,
+    MAX_GLOBAL_KEY_POLICY_QUERY_BYTES, MAX_GLOBAL_KEY_POLICY_RESULT_BYTES, WasmGlobalKeyPolicy,
+    host_message,
 };
 pub use global_key_policy_link::{
     GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GLOBAL_KEY_POLICY_RESULT_OK,
@@ -63,12 +69,19 @@ pub use layout_policy::{
     InputBehavior, LayoutItemId, LayoutItemKind, LayoutSize, LocalPoint, LocalTransform,
     ResolvedLayout, ResolvedLayoutItem,
 };
-pub use mailbox::{ActorId, Mailbox, MailboxRegistry};
-pub use module::{
-    DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, WasmActorDeclaration, WasmModuleInventory,
-    WasmPluginConfig, WasmPluginModule,
+pub use lifecycle::{
+    PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext, PluginStartReason,
+    PluginStopContext, PluginStopReason,
 };
-pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX};
+pub use mailbox::{
+    ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxRegistry,
+    PreparedMailboxRegistration,
+};
+pub use module::{
+    DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, WasmActorDeclaration, WasmActorEventKind,
+    WasmModuleInventory, WasmPluginConfig, WasmPluginModule,
+};
+pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX, ACTOR_SUBSCRIPTION_INFIX};
 pub use policy_provider::{
     DEFAULT_PUBLICATION_SLOT, POLICY_PROVIDER_RESPONSE_ABSTAIN, POLICY_PROVIDER_RESPONSE_ERROR,
     POLICY_PROVIDER_RESPONSE_OK, PolicyProviderDeclaration, PolicyProviderKind,
@@ -82,6 +95,11 @@ pub use preview1_worker::{
     Preview1Worker, Preview1WorkerConfig, Preview1WorkerError, Preview1WorkerId,
     Preview1WorkerRuntime, SHARED_MEMORY_IMPORT_MODULE, SHARED_MEMORY_IMPORT_NAME,
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
+};
+pub use resource_limits::WasmResourceLimits;
+pub use runtime_io::{
+    ByteStream, ChildHandle, ChildStatus, ProcessIo, PtyIo, RuntimeIoCapabilities, RuntimeIoConfig,
+    RuntimeIoError, RuntimeIoHub, StreamRead, TimerHandle, TimerStatus,
 };
 
 #[cfg(test)]

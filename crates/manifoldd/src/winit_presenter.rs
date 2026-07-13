@@ -1,14 +1,10 @@
 #![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
     clippy::clone_on_ref_ptr,
     clippy::expect_used,
     clippy::let_underscore_must_use,
-    clippy::undocumented_unsafe_blocks,
     clippy::used_underscore_binding,
-    reason = "tracked in issues.md: presenter still keeps raw GL/Winit handles and FFI invariants inline"
+    reason = "presenter lifecycle intentionally retains reference-counted windows and explicit ignored teardown results"
 )]
-// TODO(lint-structure): wrap Winit/GL FFI state in audited safe renderer abstractions.
 
 use std::{
     cell::{Cell, RefCell},
@@ -69,65 +65,239 @@ use wayland_client::{
 use wayland_egl as wegl;
 use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1;
 
+use crate::geometry::{
+    finite_axis_value, host_extent_to_layout, physical_to_logical_coordinate, truncating_axis_v120,
+};
+
 pub type SharedPresenterRuntime = Rc<RefCell<PresenterRuntime>>;
 
-#[derive(Debug, Clone, Copy)]
-struct RawWaylandDisplay(*mut c_void);
+/// Audited adapters for APIs which require raw window-system handles.
+///
+/// Every unsafe operation in the presenter lives here. Public-to-this-file
+/// functions accept owning or borrowed typed objects so raw handles cannot
+/// outlive the Winit window, EGL context, GBM device, or calloop registration
+/// which proves their validity.
+mod audited_ffi {
+    #![allow(
+        clippy::wildcard_imports,
+        reason = "the boundary intentionally mirrors the presenter's private FFI type vocabulary"
+    )]
+    use super::*;
 
-unsafe impl Send for RawWaylandDisplay {}
+    #[derive(Debug, Clone, Copy)]
+    struct RawWaylandDisplay(*mut c_void);
 
-impl native::EGLNativeDisplay for RawWaylandDisplay {
-    fn supported_platforms(&self) -> Vec<native::EGLPlatform<'_>> {
-        vec![
-            native::EGLPlatform::new(
-                ffi::egl::PLATFORM_WAYLAND_KHR,
-                "PLATFORM_WAYLAND_KHR",
-                self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
-                &["EGL_KHR_platform_wayland"],
-            ),
-            native::EGLPlatform::new(
-                ffi::egl::PLATFORM_WAYLAND_EXT,
-                "PLATFORM_WAYLAND_EXT",
-                self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
-                &["EGL_EXT_platform_wayland"],
-            ),
-        ]
+    // SAFETY: This wrapper is copied only into `EGLDisplay::new`, which treats
+    // the pointer as an opaque display identity. Winit owns the connection and
+    // remains retained by the presenter while EGL can access it.
+    unsafe impl Send for RawWaylandDisplay {}
+
+    impl native::EGLNativeDisplay for RawWaylandDisplay {
+        fn supported_platforms(&self) -> Vec<native::EGLPlatform<'_>> {
+            vec![
+                native::EGLPlatform::new(
+                    ffi::egl::PLATFORM_WAYLAND_KHR,
+                    "PLATFORM_WAYLAND_KHR",
+                    self.0,
+                    vec![ffi::egl::NONE.cast_signed()],
+                    &["EGL_KHR_platform_wayland"],
+                ),
+                native::EGLPlatform::new(
+                    ffi::egl::PLATFORM_WAYLAND_EXT,
+                    "PLATFORM_WAYLAND_EXT",
+                    self.0,
+                    vec![ffi::egl::NONE.cast_signed()],
+                    &["EGL_EXT_platform_wayland"],
+                ),
+            ]
+        }
+
+        fn identifier(&self) -> Option<String> {
+            Some(format!("wayland:{:p}", self.0))
+        }
     }
 
-    fn identifier(&self) -> Option<String> {
-        Some(format!("wayland:{:p}", self.0))
+    #[derive(Debug, Clone, Copy)]
+    struct RawXlibDisplay(*mut c_void);
+
+    // SAFETY: Xlib display pointers are opaque identities here. Winit retains
+    // ownership of the display connection for the presenter's entire lifetime.
+    unsafe impl Send for RawXlibDisplay {}
+
+    impl native::EGLNativeDisplay for RawXlibDisplay {
+        fn supported_platforms(&self) -> Vec<native::EGLPlatform<'_>> {
+            vec![
+                native::EGLPlatform::new(
+                    ffi::egl::PLATFORM_X11_KHR,
+                    "PLATFORM_X11_KHR",
+                    self.0,
+                    vec![ffi::egl::NONE.cast_signed()],
+                    &["EGL_KHR_platform_x11"],
+                ),
+                native::EGLPlatform::new(
+                    ffi::egl::PLATFORM_X11_EXT,
+                    "PLATFORM_X11_EXT",
+                    self.0,
+                    vec![ffi::egl::NONE.cast_signed()],
+                    &["EGL_EXT_platform_x11"],
+                ),
+            ]
+        }
+
+        fn identifier(&self) -> Option<String> {
+            Some(format!("x11:{:p}", self.0))
+        }
     }
-}
 
-#[derive(Debug, Clone, Copy)]
-struct RawXlibDisplay(*mut c_void);
-
-unsafe impl Send for RawXlibDisplay {}
-
-impl native::EGLNativeDisplay for RawXlibDisplay {
-    fn supported_platforms(&self) -> Vec<native::EGLPlatform<'_>> {
-        vec![
-            native::EGLPlatform::new(
-                ffi::egl::PLATFORM_X11_KHR,
-                "PLATFORM_X11_KHR",
-                self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
-                &["EGL_KHR_platform_x11"],
-            ),
-            native::EGLPlatform::new(
-                ffi::egl::PLATFORM_X11_EXT,
-                "PLATFORM_X11_EXT",
-                self.0,
-                vec![ffi::egl::NONE as ffi::EGLint],
-                &["EGL_EXT_platform_x11"],
-            ),
-        ]
+    pub(super) fn display_for_window(
+        window: &Arc<WinitWindow>,
+    ) -> Result<EGLDisplay, PresenterBackendError> {
+        match window.display_handle().map(|handle| handle.as_raw()) {
+            Ok(RawDisplayHandle::Wayland(handle)) => {
+                // SAFETY: the handle is borrowed from `window`, whose Arc is
+                // retained by `PresenterFrontend` until after EGL teardown.
+                Ok(unsafe { EGLDisplay::new(RawWaylandDisplay(handle.display.as_ptr().cast()))? })
+            }
+            Ok(RawDisplayHandle::Xlib(handle)) => {
+                let display = handle
+                    .display
+                    .ok_or(PresenterBackendError::MissingXlibDisplay)?;
+                // SAFETY: as above, Winit retains the Xlib display while the
+                // presenter retains the window and its EGL objects.
+                Ok(unsafe { EGLDisplay::new(RawXlibDisplay(display.as_ptr().cast()))? })
+            }
+            _ => {
+                // SAFETY: the Arc makes the native-display owner live at least
+                // as long as the resulting `EGLDisplay` stored beside it.
+                Ok(unsafe { EGLDisplay::new(window.clone())? })
+            }
+        }
     }
 
-    fn identifier(&self) -> Option<String> {
-        Some(format!("x11:{:p}", self.0))
+    pub(super) fn renderer(context: EGLContext) -> Result<GlesRenderer, GlesError> {
+        // SAFETY: the context was freshly constructed, is unbound from the
+        // setup thread, and ownership moves uniquely into the renderer.
+        unsafe { GlesRenderer::new(context) }
+    }
+
+    pub(super) fn surfaceless_display() -> Result<EGLDisplay, smithay::backend::egl::Error> {
+        // SAFETY: Smithay's zero-sized native handle represents EGL's
+        // surfaceless platform and owns no external pointer or lifetime.
+        unsafe { EGLDisplay::new(native::EGLSurfacelessDisplay) }
+    }
+
+    pub(super) fn gbm_display(
+        gbm: GbmDevice<DrmDeviceFd>,
+    ) -> Result<EGLDisplay, smithay::backend::egl::Error> {
+        // SAFETY: ownership of the GBM device and its owned DRM fd moves into
+        // `EGLDisplay`; neither can be closed while EGL uses them.
+        unsafe { EGLDisplay::new(gbm) }
+    }
+
+    pub(super) fn surface_for_window(
+        window: &Arc<WinitWindow>,
+        display: &EGLDisplay,
+        context: &EGLContext,
+    ) -> Result<(EGLSurface, bool), PresenterBackendError> {
+        match window.window_handle().map(|handle| handle.as_raw()) {
+            Ok(RawWindowHandle::Wayland(handle)) => {
+                let size = window.inner_size();
+                let width = host_extent_to_layout(size.width);
+                let height = host_extent_to_layout(size.height);
+                // SAFETY: the wl_surface is borrowed from the retained Winit
+                // window and dimensions are checked host-to-layout extents.
+                let surface = unsafe {
+                    wegl::WlEglSurface::new_from_raw(handle.surface.as_ptr().cast(), width, height)
+                }
+                .map_err(|err| PresenterBackendError::Surface(err.to_string()))?;
+                // SAFETY: display, context/config, and native surface belong to
+                // the same retained Winit window and remain jointly owned by
+                // the presenter until the EGL surface is destroyed.
+                Ok((
+                    unsafe {
+                        EGLSurface::new(
+                            display,
+                            context
+                                .pixel_format()
+                                .expect("EGL context has pixel format"),
+                            context.config_id(),
+                            surface,
+                        )?
+                    },
+                    false,
+                ))
+            }
+            Ok(RawWindowHandle::Xlib(handle)) => {
+                // SAFETY: the XID belongs to the retained Winit window and the
+                // display/context/config all originate from that same window.
+                Ok((
+                    unsafe {
+                        EGLSurface::new(
+                            display,
+                            context
+                                .pixel_format()
+                                .expect("EGL context has pixel format"),
+                            context.config_id(),
+                            native::XlibWindow(handle.window),
+                        )?
+                    },
+                    true,
+                ))
+            }
+            _ => Err(PresenterBackendError::UnsupportedWindowHandle),
+        }
+    }
+
+    pub(super) fn activate_wayland_window(
+        window: &WinitWindow,
+        activation_token: &str,
+    ) -> AnyResult<bool> {
+        let display_ptr = match window
+            .display_handle()
+            .context("get window display handle")?
+            .as_raw()
+        {
+            RawDisplayHandle::Wayland(handle) => handle.display.as_ptr().cast(),
+            _ => return Ok(false),
+        };
+        let surface_ptr = match window
+            .window_handle()
+            .context("get window handle")?
+            .as_raw()
+        {
+            RawWindowHandle::Wayland(handle) => handle.surface.as_ptr().cast(),
+            _ => return Ok(false),
+        };
+
+        // SAFETY: both pointers are borrowed from `window`, which remains
+        // borrowed for this entire function. The temporary client connection
+        // and proxy are flushed and dropped before that borrow ends.
+        let backend = unsafe { Backend::from_foreign_display(display_ptr) };
+        let connection = Connection::from_backend(backend);
+        let (globals, event_queue) = registry_queue_init::<ActivationProxyState>(&connection)
+            .context("read Wayland globals")?;
+        let activation = globals
+            .bind::<xdg_activation_v1::XdgActivationV1, _, _>(&event_queue.handle(), 1..=1, ())
+            .context("bind xdg_activation_v1")?;
+        // SAFETY: `surface_ptr` is the live wl_surface of the same retained
+        // Winit window and the ObjectId/proxy cannot escape this function.
+        let surface_id = unsafe {
+            ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface_ptr)
+                .context("wrap presentation wl_surface")?
+        };
+        let surface =
+            wl_surface::WlSurface::from_id(&connection, surface_id).context("proxy wl_surface")?;
+        activation.activate(activation_token.to_string(), &surface);
+        connection
+            .flush()
+            .context("flush Wayland activation request")?;
+        Ok(true)
+    }
+
+    pub(super) fn event_loop(source: &mut Generic<EventLoop<()>>) -> &mut EventLoop<()> {
+        // SAFETY: callers only pump Winit events. They do not replace the event
+        // loop or mutate its registered file descriptor while calloop owns it.
+        unsafe { source.get_mut() }
     }
 }
 
@@ -385,7 +555,7 @@ impl PresenterBackend {
         let (egl_surface, is_x11) = create_egl_surface(&window, &display, &context)?;
 
         let _ = context.unbind();
-        let renderer = unsafe { GlesRenderer::new(context)? };
+        let renderer = audited_ffi::renderer(context)?;
         let damage_tracking = display.supports_damage();
         drop(_guard);
 
@@ -419,7 +589,7 @@ impl PresenterBackend {
             create_egl_context(&display, gl_attributes)?
         };
         let _ = context.unbind();
-        let mut renderer = unsafe { GlesRenderer::new(context)? };
+        let mut renderer = audited_ffi::renderer(context)?;
         let renderbuffer = create_offscreen_renderbuffer(&mut renderer, size)?;
         drop(_guard);
 
@@ -512,20 +682,7 @@ impl PresenterBackend {
 }
 
 fn display_for_window(window: &Arc<WinitWindow>) -> Result<EGLDisplay, PresenterBackendError> {
-    match window.display_handle().map(|handle| handle.as_raw()) {
-        Ok(RawDisplayHandle::Wayland(handle)) => unsafe {
-            Ok(EGLDisplay::new(RawWaylandDisplay(
-                handle.display.as_ptr().cast(),
-            ))?)
-        },
-        Ok(RawDisplayHandle::Xlib(handle)) => {
-            let display = handle
-                .display
-                .ok_or(PresenterBackendError::MissingXlibDisplay)?;
-            unsafe { Ok(EGLDisplay::new(RawXlibDisplay(display.as_ptr().cast()))?) }
-        }
-        _ => unsafe { Ok(EGLDisplay::new(window.clone())?) },
-    }
+    audited_ffi::display_for_window(window)
 }
 
 fn create_egl_context(
@@ -608,7 +765,9 @@ impl PresenterBackend {
             .expect("presentation size requested without render target")
         {
             PresenterRenderTarget::Window(frontend) => {
-                let (w, h): (i32, i32) = frontend.window.inner_size().into();
+                let size = frontend.window.inner_size();
+                let w = host_extent_to_layout(size.width);
+                let h = host_extent_to_layout(size.height);
                 (w, h).into()
             }
             PresenterRenderTarget::Offscreen(target) => target.size,
@@ -773,42 +932,7 @@ fn activate_wayland_window_with_token(
     window: &WinitWindow,
     activation_token: &str,
 ) -> AnyResult<bool> {
-    let display_ptr = match window
-        .display_handle()
-        .context("get window display handle")?
-        .as_raw()
-    {
-        RawDisplayHandle::Wayland(handle) => handle.display.as_ptr().cast(),
-        _ => return Ok(false),
-    };
-    let surface_ptr = match window
-        .window_handle()
-        .context("get window handle")?
-        .as_raw()
-    {
-        RawWindowHandle::Wayland(handle) => handle.surface.as_ptr().cast(),
-        _ => return Ok(false),
-    };
-
-    let backend = unsafe { Backend::from_foreign_display(display_ptr) };
-    let connection = Connection::from_backend(backend);
-    let (globals, event_queue) =
-        registry_queue_init::<ActivationProxyState>(&connection).context("read Wayland globals")?;
-    let activation = globals
-        .bind::<xdg_activation_v1::XdgActivationV1, _, _>(&event_queue.handle(), 1..=1, ())
-        .context("bind xdg_activation_v1")?;
-    let surface_id = unsafe {
-        ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface_ptr)
-            .context("wrap presentation wl_surface")?
-    };
-    let surface =
-        wl_surface::WlSurface::from_id(&connection, surface_id).context("proxy wl_surface")?;
-
-    activation.activate(activation_token.to_string(), &surface);
-    connection
-        .flush()
-        .context("flush Wayland activation request")?;
-    Ok(true)
+    audited_ffi::activate_wayland_window(window, activation_token)
 }
 
 fn create_offscreen_renderbuffer(
@@ -828,7 +952,7 @@ fn offscreen_egl_display() -> Result<EGLDisplay, PresenterBackendError> {
         }
     }
 
-    match unsafe { EGLDisplay::new(native::EGLSurfacelessDisplay) } {
+    match audited_ffi::surfaceless_display() {
         Ok(display) => Ok(display),
         Err(err) => {
             if failures.is_empty() {
@@ -848,7 +972,7 @@ fn gbm_egl_display_from_path(path: &PathBuf) -> Result<EGLDisplay, PresenterBack
     let owned_fd: OwnedFd = file.into();
     let drm_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
     let gbm = GbmDevice::new(drm_fd)?;
-    Ok(unsafe { EGLDisplay::new(gbm)? })
+    Ok(audited_ffi::gbm_display(gbm)?)
 }
 
 fn render_node_candidates() -> Vec<PathBuf> {
@@ -885,46 +1009,7 @@ fn create_egl_surface(
     display: &EGLDisplay,
     context: &EGLContext,
 ) -> Result<(EGLSurface, bool), PresenterBackendError> {
-    match window.window_handle().map(|handle| handle.as_raw()) {
-        Ok(RawWindowHandle::Wayland(handle)) => {
-            let size = window.inner_size();
-            let surface = unsafe {
-                wegl::WlEglSurface::new_from_raw(
-                    handle.surface.as_ptr().cast(),
-                    size.width as i32,
-                    size.height as i32,
-                )
-            }
-            .map_err(|err| PresenterBackendError::Surface(err.to_string()))?;
-            unsafe {
-                Ok((
-                    EGLSurface::new(
-                        display,
-                        context
-                            .pixel_format()
-                            .expect("EGL context has pixel format"),
-                        context.config_id(),
-                        surface,
-                    )?,
-                    false,
-                ))
-            }
-        }
-        Ok(RawWindowHandle::Xlib(handle)) => unsafe {
-            Ok((
-                EGLSurface::new(
-                    display,
-                    context
-                        .pixel_format()
-                        .expect("EGL context has pixel format"),
-                    context.config_id(),
-                    native::XlibWindow(handle.window),
-                )?,
-                true,
-            ))
-        },
-        _ => Err(PresenterBackendError::UnsupportedWindowHandle),
-    }
+    audited_ffi::surface_for_window(window, display, context)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1022,7 +1107,7 @@ impl PresenterEventSource {
     where
         F: FnMut(PresenterEvent),
     {
-        let event_loop = unsafe { self.event_loop.get_mut() };
+        let event_loop = audited_ffi::event_loop(&mut self.event_loop);
         let mut callback = callback;
         let mut status = event_loop.pump_app_events(
             Some(Duration::ZERO),
@@ -1146,7 +1231,11 @@ impl<F: FnMut(PresenterEvent)> ApplicationHandler for PresenterApp<'_, F> {
                 let scale_factor =
                     { self.runtime.borrow().active_window_scale_factor() }.unwrap_or(1.0);
                 (self.callback)(PresenterEvent::Resized {
-                    size: (size.width as i32, size.height as i32).into(),
+                    size: (
+                        host_extent_to_layout(size.width),
+                        host_extent_to_layout(size.height),
+                    )
+                        .into(),
                     scale_factor,
                 });
             }
@@ -1351,11 +1440,9 @@ fn pointer_position(
     scale_factor: f64,
 ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
     let scale_factor = normalize_host_scale_factor(scale_factor);
-    let width = f64::from(size.width.max(1)) / scale_factor;
-    let height = f64::from(size.height.max(1)) / scale_factor;
     smithay::utils::Point::from((
-        (position.x / scale_factor).clamp(0.0, width),
-        (position.y / scale_factor).clamp(0.0, height),
+        physical_to_logical_coordinate(position.x, size.width, scale_factor),
+        physical_to_logical_coordinate(position.y, size.height, scale_factor),
     ))
 }
 
@@ -1373,15 +1460,15 @@ fn axis_values(
         MouseScrollDelta::LineDelta(x, y) => (
             None,
             None,
-            Some((-x * 120.0) as i32),
-            Some((-y * 120.0) as i32),
+            truncating_axis_v120(-f64::from(x) * 120.0),
+            truncating_axis_v120(-f64::from(y) * 120.0),
             AxisSource::Wheel,
         ),
         MouseScrollDelta::PixelDelta(delta) => {
             let scale_factor = normalize_host_scale_factor(scale_factor);
             (
-                Some(-delta.x / scale_factor),
-                Some(-delta.y / scale_factor),
+                finite_axis_value(-delta.x / scale_factor),
+                finite_axis_value(-delta.y / scale_factor),
                 None,
                 None,
                 AxisSource::Continuous,
@@ -1459,6 +1546,25 @@ mod tests {
     }
 
     #[test]
+    fn pointer_position_sanitizes_non_finite_coordinates_and_empty_size() {
+        let non_finite = pointer_position(
+            PhysicalPosition::new(f64::NAN, f64::INFINITY),
+            PhysicalSize::new(1280, 800),
+            2.0,
+        );
+        assert_close(non_finite.x, 0.0);
+        assert_close(non_finite.y, 400.0);
+
+        let empty = pointer_position(
+            PhysicalPosition::new(20.0, 30.0),
+            PhysicalSize::new(0, 0),
+            0.0,
+        );
+        assert_close(empty.x, 0.0);
+        assert_close(empty.y, 0.0);
+    }
+
+    #[test]
     fn pixel_scroll_delta_uses_logical_coordinates_for_host_scale() {
         let (horizontal, vertical, horizontal_v120, vertical_v120, source) = axis_values(
             MouseScrollDelta::PixelDelta(PhysicalPosition::new(12.0, -8.0)),
@@ -1469,5 +1575,29 @@ mod tests {
         assert!(horizontal_v120.is_none());
         assert!(vertical_v120.is_none());
         assert_eq!(source, AxisSource::Continuous);
+    }
+
+    #[test]
+    fn line_scroll_truncates_fractional_v120_and_rejects_non_finite_values() {
+        let (_, _, horizontal_v120, vertical_v120, source) =
+            axis_values(MouseScrollDelta::LineDelta(0.501, -0.999), 1.0);
+        assert_eq!(horizontal_v120, Some(-60));
+        assert_eq!(vertical_v120, Some(119));
+        assert_eq!(source, AxisSource::Wheel);
+
+        let (_, _, horizontal_v120, vertical_v120, _) =
+            axis_values(MouseScrollDelta::LineDelta(f32::INFINITY, f32::NAN), 1.0);
+        assert!(horizontal_v120.is_none());
+        assert!(vertical_v120.is_none());
+    }
+
+    #[test]
+    fn pixel_scroll_rejects_non_finite_values() {
+        let (horizontal, vertical, _, _, _) = axis_values(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(f64::INFINITY, f64::NAN)),
+            1.0,
+        );
+        assert!(horizontal.is_none());
+        assert!(vertical.is_none());
     }
 }

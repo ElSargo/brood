@@ -1,12 +1,12 @@
 #![allow(
-    clippy::allow_attributes_without_reason,
-    clippy::cast_possible_truncation,
     clippy::expect_used,
-    reason = "tracked in issues.md: input state still encodes geometry and gesture invariants inline"
+    reason = "the compositor creates its keyboard and pointer seats before input dispatch"
 )]
-// TODO(lint-structure): make pointer coordinate conversion and gesture state explicitly fallible.
 
-use crate::state::{InputMode, Manifold, PresentationStatus};
+use crate::{
+    geometry::{finite_axis_value, truncating_axis_v120},
+    state::{InputMode, Manifold, PresentationStatus},
+};
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -28,7 +28,10 @@ const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
 
 impl Manifold {
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "real libinput backends call this generic dispatch path"
+    )]
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
@@ -53,26 +56,32 @@ impl Manifold {
             }
             InputEvent::PointerAxis { event, .. } => {
                 let source = event.source();
-                let horizontal_amount = event.amount(Axis::Horizontal).unwrap_or_else(|| {
-                    event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
-                });
-                let vertical_amount = event.amount(Axis::Vertical).unwrap_or_else(|| {
-                    event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0
-                });
-                let horizontal_discrete = event.amount_v120(Axis::Horizontal);
-                let vertical_discrete = event.amount_v120(Axis::Vertical);
+                let horizontal_amount =
+                    finite_axis_value(event.amount(Axis::Horizontal).unwrap_or_else(|| {
+                        event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
+                    }));
+                let vertical_amount =
+                    finite_axis_value(event.amount(Axis::Vertical).unwrap_or_else(|| {
+                        event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0
+                    }));
+                let horizontal_discrete = event
+                    .amount_v120(Axis::Horizontal)
+                    .and_then(truncating_axis_v120);
+                let vertical_discrete = event
+                    .amount_v120(Axis::Vertical)
+                    .and_then(truncating_axis_v120);
 
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
-                if horizontal_amount != 0.0 {
+                if let Some(horizontal_amount) = horizontal_amount.filter(|amount| *amount != 0.0) {
                     frame = frame.value(Axis::Horizontal, horizontal_amount);
                     if let Some(discrete) = horizontal_discrete {
-                        frame = frame.v120(Axis::Horizontal, discrete as i32);
+                        frame = frame.v120(Axis::Horizontal, discrete);
                     }
                 }
-                if vertical_amount != 0.0 {
+                if let Some(vertical_amount) = vertical_amount.filter(|amount| *amount != 0.0) {
                     frame = frame.value(Axis::Vertical, vertical_amount);
                     if let Some(discrete) = vertical_discrete {
-                        frame = frame.v120(Axis::Vertical, discrete as i32);
+                        frame = frame.v120(Axis::Vertical, discrete);
                     }
                 }
                 if source == AxisSource::Finger {

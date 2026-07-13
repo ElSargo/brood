@@ -3,9 +3,9 @@ use std::{
     ffi::OsString,
     fs::{self, File},
     io::ErrorKind,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, process::ExitStatusExt as _},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitCode, ExitStatus, Stdio, Termination},
     thread,
     time::Duration,
 };
@@ -21,11 +21,45 @@ const CACHE_NAMESPACE: &str = "nix-develop";
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
-fn main() -> Result<()> {
+fn main() -> Result<ActivatedChildExit> {
     let args = ActivationArgs::parse()?;
     let activation_script = cached_activation_script(&args)?;
 
     run_activation_script(&args, &activation_script)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivatedChildExit {
+    Code(u8),
+    Signal(i32),
+}
+
+impl ActivatedChildExit {
+    fn from_status(status: ExitStatus) -> Result<Self> {
+        if let Some(code) = status.code() {
+            let code = u8::try_from(code)
+                .with_context(|| format!("activated child returned invalid exit code {code}"))?;
+            return Ok(Self::Code(code));
+        }
+
+        status
+            .signal()
+            .map(Self::Signal)
+            .with_context(|| format!("activated child returned unrecognized exit status {status}"))
+    }
+
+    fn shell_code(self) -> u8 {
+        match self {
+            Self::Code(code) => code,
+            Self::Signal(signal) => u8::try_from(128_i32.saturating_add(signal)).unwrap_or(u8::MAX),
+        }
+    }
+}
+
+impl Termination for ActivatedChildExit {
+    fn report(self) -> ExitCode {
+        ExitCode::from(self.shell_code())
+    }
 }
 
 struct ActivationArgs {
@@ -85,11 +119,10 @@ fn cached_activation_script(args: &ActivationArgs) -> Result<PathBuf> {
     rebuild_cache(args, &cache_dir, &expected)
 }
 
-#[allow(
-    clippy::exit,
-    reason = "tracked in issues.md: runner entrypoint must preserve the activated child exit status until entrypoint policy is redesigned"
-)]
-fn run_activation_script(args: &ActivationArgs, activation_script: &Path) -> Result<()> {
+fn run_activation_script(
+    args: &ActivationArgs,
+    activation_script: &Path,
+) -> Result<ActivatedChildExit> {
     let status = Command::new("bash")
         .arg("-c")
         .arg(
@@ -119,10 +152,7 @@ fn run_activation_script(args: &ActivationArgs, activation_script: &Path) -> Res
         .status()
         .context("run cached nix develop activation")?;
 
-    match status.code() {
-        Some(code) => std::process::exit(code),
-        None => bail!("cached nix develop activation terminated by signal"),
-    }
+    ActivatedChildExit::from_status(status)
 }
 
 fn rebuild_cache(
@@ -337,12 +367,88 @@ struct FileChecksum {
     reason = "unit tests use direct temp directory setup and best-effort cleanup"
 )]
 mod tests {
-    use super::{checksum_bytes, file_checksum};
+    use super::{
+        ActivatedChildExit, ActivationArgs, checksum_bytes, file_checksum, run_activation_script,
+    };
     use std::{
         fs,
         path::PathBuf,
+        process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn activation_returns_inner_exit_code_and_exports_session_context() {
+        let root = temp_test_dir("activation-exit");
+        let working_dir = root.join("work");
+        let session_cache_dir = root.join("session-cache");
+        fs::create_dir_all(&working_dir).expect("create working directory");
+        fs::create_dir_all(&session_cache_dir).expect("create session cache directory");
+        let activation = root.join("activate.sh");
+        fs::write(&activation, "export RUNNER_ACTIVATED=visible\n").expect("write activation");
+        let output = root.join("inner-output");
+        let inner = executable_script(
+            &root,
+            "inner-exit",
+            &format!(
+                concat!(
+                    "printf '%s\\n%s\\n%s\\n%s\\n' ",
+                    "\"$RUNNER_ACTIVATED\" ",
+                    "\"$MANIFOLD_SESSION_PROJECT_DIR\" ",
+                    "\"$MANIFOLD_SESSION_WORKING_DIR\" ",
+                    "\"$MANIFOLD_SESSION_CACHE_DIR\" > '{}'\n",
+                    "exit 37\n"
+                ),
+                output.display()
+            ),
+        );
+        let args = activation_args(&root, working_dir.clone(), session_cache_dir.clone(), inner);
+
+        let status = run_activation_script(&args, &activation).expect("run activation");
+
+        assert_eq!(status, ActivatedChildExit::Code(37));
+        assert_eq!(
+            fs::read_to_string(&output).expect("read inner output"),
+            format!(
+                "visible\n{}\n{}\n{}\n",
+                root.display(),
+                working_dir.display(),
+                session_cache_dir.display()
+            )
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_exposes_signalled_inner_as_shell_status() {
+        let root = temp_test_dir("activation-signal");
+        let working_dir = root.join("work");
+        fs::create_dir_all(&working_dir).expect("create working directory");
+        let activation = root.join("activate.sh");
+        fs::write(&activation, "export RUNNER_ACTIVATED=visible\n").expect("write activation");
+        let inner = executable_script(&root, "inner-signal", "kill -TERM $$\n");
+        let args = activation_args(&root, working_dir, root.join("session-cache"), inner);
+
+        let status = run_activation_script(&args, &activation).expect("run activation");
+
+        assert_eq!(status, ActivatedChildExit::Code(143));
+        assert_eq!(status.shell_code(), 143);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_signal_status_has_conventional_shell_code() {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .expect("run signalled process");
+
+        let outcome = ActivatedChildExit::from_status(status).expect("classify signal");
+
+        assert_eq!(outcome, ActivatedChildExit::Signal(15));
+        assert_eq!(outcome.shell_code(), 143);
+    }
 
     #[test]
     fn checksum_tracks_missing_and_changed_files() {
@@ -368,6 +474,32 @@ mod tests {
     #[test]
     fn checksum_bytes_is_stable() {
         assert_eq!(checksum_bytes(b"flake"), "177aafa985d46da2");
+    }
+
+    fn activation_args(
+        project_dir: &std::path::Path,
+        working_dir: PathBuf,
+        cache_dir: PathBuf,
+        inner_binary: PathBuf,
+    ) -> ActivationArgs {
+        ActivationArgs {
+            project_dir: project_dir.to_path_buf(),
+            working_dir,
+            cache_dir,
+            runner_cache_root: project_dir.join("runner-cache"),
+            inner_binary,
+        }
+    }
+
+    fn executable_script(root: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = root.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write executable script");
+        let mut permissions = fs::metadata(&path).expect("stat script").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("make script executable");
+        path
     }
 
     fn temp_test_dir(name: &str) -> PathBuf {

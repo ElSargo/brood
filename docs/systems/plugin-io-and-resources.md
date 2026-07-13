@@ -66,6 +66,14 @@ Cancellation races are resolved once. If cancellation wins, a successful late
 result is discarded and cannot mutate guest memory. A completion is considered
 delivered only after admission to the reserved completion lane.
 
+Cancellation does not promise to roll back filesystem effects which began
+before the request won. It does promise an ownership boundary: a blocking write
+which has entered the host pool is joined before its `cancelled` completion is
+delivered. Actor shutdown and hot replacement likewise join admitted blocking
+writes before the old generation is considered stopped, so no filesystem
+mutation from that generation can occur after cancellation is observable or a
+replacement generation becomes active.
+
 Large results use owned buffers, immutable blobs, or resource handles rather
 than unbounded mailbox copies. Host pointers never enter guest memory, and the
 host never writes through a buffer after returning its ownership.
@@ -156,18 +164,39 @@ notification plus bounded event batches. Events are advisory and may be
 coalesced or duplicated by the platform. Every batch uses relative paths and
 classifies create, modify, remove, rename, or generic change.
 
+Both plugin backends use this model. Component guests own a typed WIT watch
+resource and read typed batches; its SDK wrapper waits through the resource's
+normal notification pollable. Preview 1 compatibility guests use the matching
+handle operations and encoded batches. Neither backend owns a separate native
+watcher or watcher-specific wait mechanism.
+
+Event paths retain their native platform identity rather than passing through
+lossy Unicode conversion. The Component record carries an opaque byte list:
+raw `OsStr` bytes on Unix and little-endian UTF-16 code units on Windows.
+Preview 1's line-oriented compatibility batch keeps printable ASCII readable
+and encodes every other byte, including `%`, tab, and newline, as uppercase
+`%HH`. This representation is reversible and cannot merge distinct filenames.
+
 Overflow and any interval without complete coverage produce an explicit
 `rescan` marker. Consumers maintaining state reconcile through the filesystem;
-the event stream is not a journal.
+the event stream is not a journal. Backend-generic `changed` events are also
+ambiguous for a stateful consumer: discard that entire batch and rebuild, just
+as for `rescan`. A reconciliation scan is published atomically as the new model
+before the consumer reports that reconciliation completed.
 
 Recursive native registration runs as host-owned background work so a large
 existing tree cannot consume an actor dispatch deadline. Registration
 completion produces the first `rescan` marker because changes may race setup.
 
-The target host uses one session/daemon watcher service, deduplicates native
-path registrations, and routes events into private bounded subscription queues.
+The host uses one daemon watcher service, deduplicates canonical native path
+and recursion-mode registrations, and routes events into private bounded
+subscription queues.
 Logical handles retain independent actor-generation ownership, relative-path
 projection, overflow, and teardown even when they share a kernel registration.
+Generation teardown removes its subscriptions without disturbing other actors;
+the final subscriber releases the native registration. Daemon status exposes
+native registration, logical subscription, and in-progress setup counts so
+operators can distinguish sharing from leaked resources.
 
 ### Streams And Blobs
 
@@ -329,6 +358,8 @@ mocked resource units. Required coverage includes:
 - process and PTY input/output, exit, cancellation, and backpressure;
 - filesystem registration, change, overflow, and reconciliation;
 - replacement under load with no stale completion or surviving actor resource;
+- cancellation and replacement barriers around already-started blocking
+  filesystem mutations;
 - bounded stress and soak runs across many actor generations and workers.
 
 The source-linked interaction map is [[plugin-io-interaction-graph]]. Current

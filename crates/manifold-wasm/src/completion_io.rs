@@ -18,7 +18,7 @@ use cap_std::{
 };
 use tokio::{
     sync::{Notify, mpsc},
-    task::{AbortHandle, JoinHandle, JoinSet},
+    task::{JoinHandle, JoinSet},
 };
 
 /// A stable operation identity within one actor generation.
@@ -176,6 +176,12 @@ enum IoOperation {
         path: PathBuf,
         offset: u64,
         bytes: Vec<u8>,
+    },
+    #[cfg(test)]
+    BlockingMutationProbe {
+        path: PathBuf,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     },
 }
 
@@ -383,7 +389,7 @@ async fn run_completion_io_supervisor(
     completions: mpsc::Sender<ActorCompletion>,
 ) {
     let mut tasks = JoinSet::new();
-    let mut running: HashMap<OperationId, AbortHandle> = HashMap::new();
+    let mut running: HashMap<OperationId, Arc<OperationCancellation>> = HashMap::new();
     loop {
         tokio::select! {
             () = state.shutdown.notified() => break,
@@ -391,31 +397,37 @@ async fn run_completion_io_supervisor(
                 Some(IoSupervisorCommand::Start(request)) => {
                     let id = request.id;
                     let root = root.as_ref().map(Arc::clone);
-                    let abort = tasks.spawn(async move {
-                        let result = execute_io_async(root, writable, request.operation).await;
+                    let cancellation = Arc::new(OperationCancellation::default());
+                    let operation_cancellation = Arc::clone(&cancellation);
+                    tasks.spawn(async move {
+                        let result = execute_io_async(
+                            root,
+                            writable,
+                            request.operation,
+                            &operation_cancellation,
+                        ).await;
                         (id, result)
                     });
-                    running.insert(id, abort);
+                    running.insert(id, cancellation);
                 }
                 Some(IoSupervisorCommand::Cancel(id)) => {
-                    if let Some(abort) = running.remove(&id) {
-                        abort.abort();
-                        finish_completion(
-                            &state,
-                            &completions,
-                            ActorCompletion { operation: id, kind: ActorCompletionKind::Cancelled },
-                        ).await;
+                    if let Some(cancellation) = running.get(&id) {
+                        cancellation.request();
                     }
                 }
                 None => break,
             },
             result = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(Ok((id, result))) = result
-                    && running.remove(&id).is_some()
+                    && let Some(cancellation) = running.remove(&id)
                 {
-                    let kind = result.unwrap_or_else(|error| ActorCompletionKind::Failed {
-                        message: error.to_string(),
-                    });
+                    let kind = if cancellation.is_requested() {
+                        ActorCompletionKind::Cancelled
+                    } else {
+                        result.unwrap_or_else(|error| ActorCompletionKind::Failed {
+                            message: error.to_string(),
+                        })
+                    };
                     finish_completion(
                         &state,
                         &completions,
@@ -426,12 +438,17 @@ async fn run_completion_io_supervisor(
         }
     }
     state.alive.store(false, Ordering::Release);
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    let abandoned = running.len();
-    if abandoned > 0 {
-        state.outstanding.fetch_sub(abandoned, Ordering::AcqRel);
+    // A blocking-pool task cannot be preempted once it starts. Request
+    // cancellation through each owned wrapper and join it so actor shutdown
+    // and replacement cannot return while an old-generation write can still
+    // mutate the filesystem.
+    for cancellation in running.values() {
+        cancellation.request();
     }
+    while tasks.join_next().await.is_some() {}
+    // Queued starts which lost the shutdown race were admitted but never
+    // entered `running`; all admitted ownership is terminal now.
+    state.outstanding.store(0, Ordering::Release);
     #[cfg(test)]
     {
         state.supervisor_exited.store(true, Ordering::Release);
@@ -443,6 +460,7 @@ async fn execute_io_async(
     root: Option<Arc<Dir>>,
     writable: bool,
     operation: IoOperation,
+    cancellation: &OperationCancellation,
 ) -> Result<ActorCompletionKind> {
     let root = root.context("filesystem capability is not granted")?;
     match operation {
@@ -451,20 +469,75 @@ async fn execute_io_async(
             offset,
             max_bytes,
         } => {
-            let bytes = completion_read_file(
+            let read = completion_read_file(
                 CompletionFilesystem { root, writable },
                 path,
                 offset,
                 max_bytes,
-            )
-            .await?;
+            );
+            tokio::pin!(read);
+            let bytes = tokio::select! {
+                result = &mut read => result?,
+                () = cancellation.cancelled() => return Ok(ActorCompletionKind::Cancelled),
+            };
             Ok(ActorCompletionKind::Read { bytes })
         }
-        operation @ IoOperation::Write { .. } => tokio::task::spawn_blocking(move || {
-            execute_io(Some(root.as_ref()), writable, operation)
-        })
-        .await
-        .context("join completion I/O write")?,
+        operation @ IoOperation::Write { .. } => {
+            execute_blocking_write(root, writable, operation, cancellation).await
+        }
+        #[cfg(test)]
+        operation @ IoOperation::BlockingMutationProbe { .. } => {
+            execute_blocking_write(root, writable, operation, cancellation).await
+        }
+    }
+}
+
+async fn execute_blocking_write(
+    root: Arc<Dir>,
+    writable: bool,
+    operation: IoOperation,
+    cancellation: &OperationCancellation,
+) -> Result<ActorCompletionKind> {
+    let task =
+        tokio::task::spawn_blocking(move || execute_io(Some(root.as_ref()), writable, operation));
+    tokio::pin!(task);
+    tokio::select! {
+        result = &mut task => result.context("join completion I/O write")?,
+        () = cancellation.cancelled() => {
+            // `abort` prevents work which has not entered the blocking pool.
+            // Once started it is deliberately ineffective, so joining here is
+            // the external-side-effect boundary.
+            task.as_ref().abort();
+            task.await.context("join cancelled completion I/O write")?
+        }
+    }
+}
+
+#[derive(Default)]
+struct OperationCancellation {
+    requested: AtomicBool,
+    notify: Notify,
+}
+
+impl OperationCancellation {
+    fn request(&self) {
+        if !self.requested.swap(true, Ordering::AcqRel) {
+            self.notify.notify_one();
+        }
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -526,6 +599,22 @@ fn execute_io(
             Ok(ActorCompletionKind::Write {
                 bytes_written: u64::try_from(bytes.len())?,
             })
+        }
+        #[cfg(test)]
+        IoOperation::BlockingMutationProbe {
+            path,
+            started,
+            release,
+        } => {
+            ensure!(writable, "filesystem capability is read-only");
+            let mut file = root.create(&path)?;
+            file.write_all(b"started\n")?;
+            file.flush()?;
+            started.send(()).context("announce blocking mutation")?;
+            release.recv().context("release blocking mutation")?;
+            file.write_all(b"finished\n")?;
+            file.flush()?;
+            Ok(ActorCompletionKind::Write { bytes_written: 17 })
         }
     }
 }
@@ -622,10 +711,107 @@ fn validate_capability_path(path: &Path) -> std::result::Result<PathBuf, Complet
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, sync::mpsc as std_mpsc};
+
     use anyhow::{Context, Result, ensure};
+    use tempfile::tempdir;
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    fn writable_config(path: &Path) -> CompletionIoConfig {
+        CompletionIoConfig {
+            filesystem: Some(FilesystemGrant {
+                host_path: path.to_path_buf(),
+                guest_path: "/workspace".to_owned(),
+                writable: true,
+            }),
+            max_outstanding: 2,
+            max_completion_bytes: 1024,
+        }
+    }
+
+    async fn wait_for_probe_started(started: std_mpsc::Receiver<()>) -> Result<()> {
+        timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || started.recv()),
+        )
+        .await
+        .context("blocking mutation did not start")??
+        .context("blocking mutation dropped its start signal")?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_is_terminal_only_after_blocking_mutation_is_joined() -> Result<()> {
+        let root = tempdir()?;
+        let (io, mut completions, task) = start_completion_io(81, &writable_config(root.path()))?;
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let operation = io.submit(IoOperation::BlockingMutationProbe {
+            path: PathBuf::from("cancel-proof.txt"),
+            started: started_tx,
+            release: release_rx,
+        })?;
+        wait_for_probe_started(started_rx).await?;
+
+        ensure!(io.cancel(operation), "cancellation request was rejected");
+        ensure!(
+            timeout(Duration::from_millis(50), completions.recv())
+                .await
+                .is_err(),
+            "cancelled completion escaped before its blocking mutation joined"
+        );
+        ensure!(
+            fs::read(root.path().join("cancel-proof.txt"))? == b"started\n",
+            "probe was not stopped at the external-side-effect barrier"
+        );
+
+        release_tx.send(())?;
+        let completion = timeout(Duration::from_secs(2), completions.recv())
+            .await
+            .context("joined cancellation did not complete")?
+            .context("completion lane closed")?;
+        ensure!(completion.operation == operation);
+        ensure!(completion.kind == ActorCompletionKind::Cancelled);
+        ensure!(
+            fs::read(root.path().join("cancel-proof.txt"))? == b"started\nfinished\n",
+            "cancel completion preceded the final external side effect"
+        );
+        io.stop();
+        task.await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_joins_started_blocking_mutation_before_replacement() -> Result<()> {
+        let root = tempdir()?;
+        let (io, _completions, mut task) = start_completion_io(82, &writable_config(root.path()))?;
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        io.submit(IoOperation::BlockingMutationProbe {
+            path: PathBuf::from("replacement-proof.txt"),
+            started: started_tx,
+            release: release_rx,
+        })?;
+        wait_for_probe_started(started_rx).await?;
+
+        io.stop();
+        ensure!(
+            timeout(Duration::from_millis(50), &mut task).await.is_err(),
+            "shutdown returned while old-generation filesystem work was live"
+        );
+        release_tx.send(())?;
+        timeout(Duration::from_secs(2), &mut task)
+            .await
+            .context("shutdown did not join blocking mutation")??;
+        ensure!(
+            fs::read(root.path().join("replacement-proof.txt"))? == b"started\nfinished\n",
+            "replacement became possible before the old generation finished mutating"
+        );
+        ensure!(!io.stats().alive && io.stats().outstanding == 0);
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_bypasses_a_full_operation_command_queue() -> Result<()> {

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use wasmtime::{Engine, Module};
@@ -16,6 +16,22 @@ pub const DEFAULT_ACTOR_MAILBOX_CAPACITY: usize = 64;
 pub struct WasmActorDeclaration {
     pub name: String,
     pub export_name: String,
+    pub subscriptions: BTreeSet<WasmActorEventKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WasmActorEventKind {
+    PaneMapped,
+    LayoutState,
+}
+
+impl WasmActorEventKind {
+    pub const fn message_type(self) -> &'static str {
+        match self {
+            Self::PaneMapped => "pane-mapped",
+            Self::LayoutState => "layout-state",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -48,6 +64,10 @@ impl Default for WasmPluginConfig {
 impl WasmActorDeclaration {
     pub fn from_export_name(export_name: &str) -> Option<Self> {
         parse_actor_export(export_name)
+    }
+
+    pub fn subscribes_to(&self, event: WasmActorEventKind) -> bool {
+        self.subscriptions.contains(&event)
     }
 }
 
@@ -94,10 +114,11 @@ impl WasmPluginModule {
         );
 
         let mut actors = Vec::new();
+        let mut registrations = Vec::new();
         for declaration in &inventory.actors {
-            let mailbox = registry
-                .register_actor(declaration.name.clone(), config.actor_mailbox_capacity)
-                .with_context(|| format!("register actor {:?}", declaration.name))?;
+            let (registration, mailbox) = registry
+                .prepare_actor(declaration.name.clone(), config.actor_mailbox_capacity)
+                .with_context(|| format!("prepare actor {:?}", declaration.name))?;
             let actor = WasmActor::load_from_module(
                 engine.clone(),
                 module,
@@ -107,8 +128,12 @@ impl WasmPluginModule {
             )
             .await
             .with_context(|| format!("load actor {:?}", declaration.name))?;
+            registrations.push(registration);
             actors.push(actor);
         }
+        registry
+            .activate_prepared_actors(registrations, &[])
+            .context("activate plugin actor set")?;
 
         let policy_providers = inventory
             .policy_providers

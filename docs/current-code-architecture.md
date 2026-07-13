@@ -549,20 +549,31 @@ Important CLI flows:
 
 `session_bus.rs` implements a small in-process DBus broker. `Manifold::ensure_session_dbus_bus()` starts one bus per `SessionBusRealm::Surface(session_id)` and stores its `SessionBusHandle`. Hosted clients receive this bus as `DBUS_SESSION_BUS_ADDRESS`.
 
-The bus:
+The bus has two independent layers. The audited wire layer validates bounded
+frames and rewrites only bus-owned headers. A typed `BusRouter` owns the realm's
+connection lifecycle and name tables, returning explicit routing and delivery
+transitions rather than mutating maps from message handlers.
+
+The service layer:
 
 - binds a Unix socket under a temp dir,
 - implements enough DBus authentication for local clients (`EXTERNAL`/`ANONYMOUS`, no Unix FD passing),
 - assigns unique names like `:1.N`,
-- tracks requested well-known names,
+- models requested well-known names, replacement flags, release, and disconnect
+  cleanup as fallible owner transitions,
 - handles core methods such as `Hello`, `RequestName`, `ReleaseName`, `NameHasOwner`, `GetNameOwner`, `StartServiceByName`, `ListNames`, `AddMatch`, `RemoveMatch`, and `GetId`,
 - injects sender names into method calls/signals when routing between clients,
-- broadcasts signals,
+- distinguishes unicast replies/errors, targeted signals, and broadcasts,
 - returns service-unknown errors for unresolved method-call destinations.
 
-If a host bus address is available, the in-process bus presents a virtual owner for `org.freedesktop.Notifications`. Notification methods are proxied to the host notification service. For each proxied notification id, a forwarding thread listens for host `ActionInvoked`, `ActivationToken`, and `NotificationClosed` signals and sends matching signals back to the original session client.
+If a host bus address is available, the in-process bus presents explicit virtual
+owners for `org.freedesktop.Notifications` and its unique name. Notification
+proxy success/failure and `ActionInvoked`, `ActivationToken`, and
+`NotificationClosed` forwarding are typed transitions; only the originating
+notification id is delivered to its client, and delivery failures are reported.
 
-This is currently a focused, hand-written DBus router, not a full DBus broker.
+This is a focused local DBus router, not a full DBus broker. The target contract
+and real nested proof are documented in `docs/systems/dbus-control.md`.
 
 ## 14. Config and project session runner flow
 
@@ -609,31 +620,42 @@ The systemd scope name embeds the launch id, allowing `launch_context::current_l
 
 ### 15.1 Core-module actors and global key policy
 
-`crates/manifold-wasm/src/module.rs` discovers named actor and policy-provider
-exports in a self-contained core module. `WasmActor` runs one bounded actor
-epoch at a time against a registered mailbox and dispatches its outbox through
-the host registry.
+`crates/manifold-wasm/src/module.rs` discovers named actors, their typed event
+subscriptions, and policy-provider exports in a self-contained core module.
+The daemon stages replacement actors against unreachable prepared mailboxes,
+cancels and joins the published generation, atomically activates the candidate
+mailbox set, and then starts the new generation tasks. Actor identities,
+declarations, cancellation, and joins are owned by that generation together.
+`WasmActor` runs one bounded actor epoch at a time and dispatches its outbox
+through the host registry.
 
-`crates/manifold-wasm/src/global_key_policy.rs` invokes the selected synchronous
-key provider with a serialized key query and an optional immutable publication
-frame. The provider returns a bounded decision envelope and message batch; the
-daemon applies the decision and enqueues messages to named actors. The checked-in
-default-workspace plugin combines this key provider with a workspace actor.
+`crates/manifold-wasm/src/global_key_policy.rs` constructs one typed invocation
+context for the selected synchronous key provider. The context groups the
+complete key-event query with an optional immutable publication lease; only the
+core-module link adapter lowers its bounded guest buffers to Wasmtime's raw
+pointer/length scalars. The provider returns a bounded decision envelope and
+message batch; the daemon applies the decision and enqueues messages to named
+actors. The checked-in default-workspace plugin combines this key provider with
+a workspace actor.
 See the source files that define module export discovery and policy response
 decoding for the exact ABI.
 
 ### 15.2 Actor-driven layout policy
 
 Layout is no longer a standalone direct map-hook import lane. When pane
-inventory changes, the daemon emits `pane-mapped` and `layout-state` messages
-to the loaded plugin actors. An actor can post a `set-resolved-layout` command
-to the host actor mailbox. The daemon validates pane identity, geometry, focus,
-and input behavior before accepting the layout, and falls back to native layout
-when validation fails.
+inventory changes, the daemon routes typed `pane-mapped` and `layout-state`
+messages only to actors whose declarations subscribe to that event kind. A
+new generation receives an initial layout snapshot. An actor can post a
+`set-resolved-layout` command to the host actor mailbox. The daemon validates
+pane identity, geometry, focus, and input behavior before accepting the layout,
+and falls back to native layout when no actor subscribes or validation fails.
 
 ### 15.3 Test harness ABI
 
-`wasm_test.rs` starts a harness in a blocking task. The guest exports `run() -> i32`; exit code `0` means passed, `2` means paused, anything else means failed.
+`wasm_test.rs` starts each harness as an explicitly owned child thread with a
+checked identity, a typed `Starting -> Running -> Exited` event stream, and one
+join result. The guest exports `run() -> i32`; exit code `0` means passed, `2`
+means paused, and anything else means failed.
 
 Imports include:
 
@@ -643,7 +665,15 @@ Imports include:
 - `control_json`,
 - `status_json`.
 
-Harness requests are sent over std mpsc to the calloop thread. `Manifold::service_test_harness()` drains requests, serves control/status calls, and reacts to completion by stopping the loop for pass/fail or keeping it paused for inspection.
+Harness requests are sent over std mpsc to the calloop thread.
+`Manifold::service_test_harness()` drains requests, serves control/status calls,
+and reacts to completion by stopping the loop for pass/fail or keeping it paused
+for inspection. Runtime shutdown wakes signal, sleep, and host-response waits,
+uses Wasmtime epoch interruption for guest execution, and joins the exact child
+before the Tokio runtime is dropped. Normal completion and cancellation both
+record their cleanup result; a panic or a lifecycle channel that closes without
+an exit event becomes an explicit failure rather than an indefinite pending
+state.
 
 ### 15.4 Component actor prototype
 
@@ -713,12 +743,17 @@ guest-owned atomic queue; host notifications suspend workers and schedule a
 coalesced actor event. The host-owned stdin duplex is retained only for an
 explicit ordinary-WASI compatibility case.
 
-Capability-rooted filesystem watches use the platform's native watcher through
-`filesystem_watch.rs`. A watch owns one generation notification shared across
+Capability-rooted filesystem watches use the daemon's shared native watcher
+service through `filesystem_watch.rs`. Canonical path and recursion-mode
+registrations are deduplicated while each logical watch owns a private bounded
+queue and one generation notification shared across
 the actor and worker Stores. Workers therefore select watch readiness through
 the existing bounded `wait-any` path, then drain relative-path event batches;
 recursive backend setup runs as host-owned work and publishes an initial rescan
 marker once registration finishes. Overflow uses the same explicit marker.
+Paths remain lossless native bytes in the shared queue and Component ABI;
+Preview 1 compatibility batches use reversible `%HH` escaping for non-graphic
+bytes and the escape introducer.
 Watchers and their native threads are dropped before the actor generation's
 coordination hub stops.
 

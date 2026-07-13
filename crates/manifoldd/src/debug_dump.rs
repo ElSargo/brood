@@ -1,12 +1,8 @@
 #![allow(
-    clippy::cast_sign_loss,
-    clippy::indexing_slicing,
     clippy::needless_pass_by_ref_mut,
-    clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_wraps,
-    reason = "tracked in issues.md: debug dump still works directly over renderer buffers and raw pixel memory"
+    reason = "debug-dump callbacks retain callback-shaped mutable state"
 )]
-// TODO(lint-structure): replace raw image-buffer indexing with typed pixel/stride helpers.
 
 use std::{
     fs,
@@ -278,8 +274,8 @@ fn save_surface_buffer_png(
     image::save_buffer(
         &path,
         &capture.bytes,
-        capture.width as u32,
-        capture.height as u32,
+        capture.width,
+        capture.height,
         image::ColorType::Rgba8,
     )
     .with_context(|| format!("write {}", path.display()))?;
@@ -287,57 +283,180 @@ fn save_surface_buffer_png(
 }
 
 struct SurfaceCapture {
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     bytes: Vec<u8>,
 }
 
+/// A validated view of one packed, four-byte-per-pixel SHM image.
+///
+/// Construction proves that every visible row fits inside the Smithay-provided
+/// mapping. Consumers therefore operate on slices and complete pixels rather
+/// than repeating offset, stride, and raw-pointer arithmetic.
+struct ShmImageView<'a> {
+    bytes: &'a [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
+impl ShmImageView<'_> {
+    /// Wrap the mapping passed to Smithay's `with_buffer_contents` callback.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must remain readable for `len` bytes for `'a`. This is precisely
+    /// the callback contract of `with_buffer_contents`; the view never escapes
+    /// that callback because it is converted into an owned `SurfaceCapture`.
+    unsafe fn from_smithay_mapping(ptr: *const u8, len: usize, data: &BufferData) -> Option<Self> {
+        let width = usize::try_from(data.width).ok()?;
+        let height = usize::try_from(data.height).ok()?;
+        let stride = usize::try_from(data.stride).ok()?;
+        let offset = usize::try_from(data.offset).ok()?;
+        if width == 0 || height == 0 || stride == 0 {
+            return None;
+        }
+        let row_bytes = width.checked_mul(4)?;
+        if stride < row_bytes {
+            return None;
+        }
+        let span = if height == 0 {
+            0
+        } else {
+            stride
+                .checked_mul(height.checked_sub(1)?)?
+                .checked_add(row_bytes)?
+        };
+        let end = offset.checked_add(span)?;
+        let pointer_limit = usize::try_from(isize::MAX).ok()?;
+        if end > len || end > pointer_limit || span > pointer_limit || ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: The caller supplies Smithay's live SHM mapping. `offset` and
+        // `span` were checked above to lie within its `len` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), span) };
+        Some(ShmImageView {
+            bytes,
+            width,
+            height,
+            stride,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_slice(
+        bytes: &[u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+        offset: usize,
+    ) -> Option<ShmImageView<'_>> {
+        let row_bytes = width.checked_mul(4)?;
+        if width == 0 || height == 0 || stride == 0 {
+            return None;
+        }
+        if stride < row_bytes {
+            return None;
+        }
+        let span = if height == 0 {
+            0
+        } else {
+            stride
+                .checked_mul(height.checked_sub(1)?)?
+                .checked_add(row_bytes)?
+        };
+        let end = offset.checked_add(span)?;
+        Some(ShmImageView {
+            bytes: bytes.get(offset..end)?,
+            width,
+            height,
+            stride,
+        })
+    }
+
+    fn rgba(self, format: wl_shm::Format) -> Option<Vec<u8>> {
+        let alpha = match format {
+            wl_shm::Format::Argb8888 => true,
+            wl_shm::Format::Xrgb8888 => false,
+            _ => return None,
+        };
+        let row_bytes = self.width.checked_mul(4)?;
+        let capacity = row_bytes.checked_mul(self.height)?;
+        let mut rgba = Vec::with_capacity(capacity);
+
+        for row in self.bytes.chunks(self.stride).take(self.height) {
+            let visible = row.get(..row_bytes)?;
+            for pixel in visible.chunks_exact(4) {
+                let [blue, green, red, source_alpha] = pixel else {
+                    return None;
+                };
+                rgba.extend_from_slice(&[
+                    *red,
+                    *green,
+                    *blue,
+                    if alpha { *source_alpha } else { 0xff },
+                ]);
+            }
+        }
+        (rgba.len() == capacity).then_some(rgba)
+    }
+}
+
 fn capture_shm_buffer(ptr: *const u8, len: usize, data: BufferData) -> Option<SurfaceCapture> {
-    let width = usize::try_from(data.width).ok()?;
-    let height = usize::try_from(data.height).ok()?;
-    let stride = usize::try_from(data.stride).ok()?;
-    let offset = usize::try_from(data.offset).ok()?;
-    let bytes_per_pixel = 4;
-    let needed = offset
-        .checked_add(stride.checked_mul(height.saturating_sub(1))?)?
-        .checked_add(width.checked_mul(bytes_per_pixel)?)?;
-    if needed > len {
-        return None;
-    }
-    let src = unsafe { std::slice::from_raw_parts(ptr.add(offset), len - offset) };
-    let mut rgba = vec![0_u8; width.checked_mul(height)?.checked_mul(4)?];
-    match data.format {
-        wl_shm::Format::Argb8888 => {
-            for y in 0..height {
-                let row = &src[y * stride..y * stride + width * 4];
-                for x in 0..width {
-                    let src_px = &row[x * 4..x * 4 + 4];
-                    let dst_px = &mut rgba[(y * width + x) * 4..(y * width + x + 1) * 4];
-                    dst_px[0] = src_px[2];
-                    dst_px[1] = src_px[1];
-                    dst_px[2] = src_px[0];
-                    dst_px[3] = src_px[3];
-                }
-            }
-        }
-        wl_shm::Format::Xrgb8888 => {
-            for y in 0..height {
-                let row = &src[y * stride..y * stride + width * 4];
-                for x in 0..width {
-                    let src_px = &row[x * 4..x * 4 + 4];
-                    let dst_px = &mut rgba[(y * width + x) * 4..(y * width + x + 1) * 4];
-                    dst_px[0] = src_px[2];
-                    dst_px[1] = src_px[1];
-                    dst_px[2] = src_px[0];
-                    dst_px[3] = 0xff;
-                }
-            }
-        }
-        _ => return None,
-    }
+    // SAFETY: Smithay invokes this function only while `ptr..ptr+len` is a
+    // readable mapping and keeps the mapping alive for the callback duration.
+    let view = unsafe { ShmImageView::from_smithay_mapping(ptr, len, &data) }?;
+    let rgba = view.rgba(data.format)?;
     Some(SurfaceCapture {
-        width: data.width,
-        height: data.height,
+        width: u32::try_from(data.width).ok()?,
+        height: u32::try_from(data.height).ok()?,
         bytes: rgba,
     })
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "pixel fixture tests fail immediately when constructing an invalid test view"
+)]
+mod tests {
+    use super::ShmImageView;
+    use smithay::reexports::wayland_server::protocol::wl_shm;
+
+    #[test]
+    fn shm_view_converts_stride_offset_and_alpha_without_indexing() {
+        let bytes = [
+            9, 9, 9, 9, // offset
+            3, 2, 1, 4, 6, 5, 4, 7, 0, 0, 0, 0, // row plus padding
+            9, 8, 7, 6, 12, 11, 10, 5,
+        ];
+        let view = ShmImageView::from_slice(&bytes, 2, 2, 12, 4).expect("valid view");
+        assert_eq!(
+            view.rgba(wl_shm::Format::Argb8888).expect("ARGB"),
+            [1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 6, 10, 11, 12, 5]
+        );
+    }
+
+    #[test]
+    fn shm_view_forces_xrgb_alpha_opaque() {
+        let bytes = [3, 2, 1, 0];
+        let view = ShmImageView::from_slice(&bytes, 1, 1, 4, 0).expect("valid view");
+        assert_eq!(
+            view.rgba(wl_shm::Format::Xrgb8888).expect("XRGB"),
+            [1, 2, 3, 0xff]
+        );
+    }
+
+    #[test]
+    fn shm_view_rejects_short_stride_short_mapping_and_overflow() {
+        let bytes = [0; 16];
+        assert!(ShmImageView::from_slice(&bytes, 2, 1, 7, 0).is_none());
+        assert!(ShmImageView::from_slice(&bytes, 2, 3, 8, 0).is_none());
+        assert!(ShmImageView::from_slice(&bytes, usize::MAX, 1, 4, 0).is_none());
+        assert!(ShmImageView::from_slice(&bytes, 1, usize::MAX, 4, 0).is_none());
+        assert!(ShmImageView::from_slice(&bytes, 1, 1, 4, usize::MAX).is_none());
+        assert!(ShmImageView::from_slice(&bytes, 0, 1, 0, 0).is_none());
+        assert!(ShmImageView::from_slice(&bytes, 1, 0, 4, 0).is_none());
+    }
 }

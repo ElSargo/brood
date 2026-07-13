@@ -6,6 +6,7 @@ last-reviewed: 2026-07-13
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
+  - crates/manifoldd/src/state_services.rs
   - crates/manifoldd/src/config.rs
   - crates/manifoldd/src/session_runner.rs
 ---
@@ -43,6 +44,40 @@ Offscreen presentation is used by nested tests so composition can run without cr
 ## Session Runners
 
 `run` may hand off to a [[../concepts/session-runner]] before serving the session. The Nix developer workflow deliberately bypasses configured session runners because the package already provides the runtime environment.
+
+## Runtime State Ownership
+
+The session thread remains the sole authority that commits compositor-visible
+changes, but `Manifold` is an orchestrator rather than the owner of every
+state transition:
+
+- `SurfaceSessionService` owns the session catalogue, directory routing,
+  surface assignments, interaction order, and session-local bus lifetimes.
+  It validates allocation, activation, assignment, and removal before the
+  compositor applies layout or focus effects. An empty catalogue has an
+  explicit no-active-session state.
+- `FocusService` owns focused and pointer-target identities plus pending
+  presentation activation. Smithay seat focus remains an effect applied by
+  the compositor after the service transition.
+- `RegistryService` owns extension, window, grant, agent, notification, and
+  status records. Agent notification input is typed as one request, and an
+  unknown agent is rejected without a partial attention or notification
+  mutation.
+- `TestHarnessService` owns harness runtime/completion and nested target
+  transitions. The compositor still decides when to service requests and stop
+  the loop; process orchestration is not part of the state container.
+
+`LayoutState` and `BrowserManager` are already independently owned service
+boundaries. Geometry conversion policy and compositor/test process
+orchestration are documented and evolved separately from these ownership
+services.
+
+The Nix-backed nested proof in
+`tools/test-state-services-nested.sh` launches the real GTK session-switcher
+extension, creates a directory-bound named session, publishes a substantive
+agent notification, and captures the rendered switcher plus compositor state.
+The screenshot and transcript expose the accepted behavior directly rather
+than reducing the proof to a success flag.
 
 ## Related Pages
 

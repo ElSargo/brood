@@ -1,13 +1,6 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    reason = "tracked in issues.md: layout math still mixes float ratios, integer pixels, and positional parse assertions"
-)]
-// TODO(lint-structure): introduce checked geometry and parser result helpers for layout math.
-
 use std::{collections::BTreeSet, fmt, str::FromStr};
+
+use crate::geometry::{rounded_layout_coordinate, rounded_layout_extent};
 
 const MAX_RESOLVED_LAYOUT_ITEMS: usize = 512;
 const NORMALIZED_MIN: f64 = -1.0;
@@ -106,8 +99,7 @@ impl ResolvedLayout {
         hits.sort_by(|(left_index, left, _), (right_index, right, _)| {
             right
                 .z
-                .partial_cmp(&left.z)
-                .expect("validated z values are finite")
+                .total_cmp(&left.z)
                 .then_with(|| right_index.cmp(left_index))
         });
         hits.into_iter()
@@ -265,13 +257,15 @@ impl LocalTransform {
     }
 
     pub fn pixel_rect(self, size: LayoutSize) -> LayoutRect {
-        let w = f64::from(size.w.max(1));
-        let h = f64::from(size.h.max(1));
+        let bounds_w = size.w.max(0);
+        let bounds_h = size.h.max(0);
+        let w = f64::from(bounds_w);
+        let h = f64::from(bounds_h);
         LayoutRect {
-            x: (((self.offset.u + 1.0) * 0.5) * w).round() as i32,
-            y: (((self.offset.v + 1.0) * 0.5) * h).round() as i32,
-            w: ((self.size.u * 0.5) * w).round().max(1.0) as i32,
-            h: ((self.size.v * 0.5) * h).round().max(1.0) as i32,
+            x: rounded_layout_coordinate(((self.offset.u + 1.0) * 0.5) * w),
+            y: rounded_layout_coordinate(((self.offset.v + 1.0) * 0.5) * h),
+            w: rounded_layout_extent((self.size.u * 0.5) * w, bounds_w),
+            h: rounded_layout_extent((self.size.v * 0.5) * h, bounds_h),
         }
     }
 }
@@ -490,8 +484,17 @@ impl LayoutState {
             .iter()
             .position(|leaf| *leaf == self.active_leaf)
             .unwrap_or(0);
-        let next_index = (active_index as isize + offset).rem_euclid(leaf_count as isize) as usize;
-        self.active_leaf = leaves[next_index];
+        let step = offset.unsigned_abs() % leaf_count;
+        let next_index = if offset.is_negative() {
+            active_index
+                .checked_sub(step)
+                .unwrap_or_else(|| leaf_count - (step - active_index))
+        } else if step < leaf_count - active_index {
+            active_index + step
+        } else {
+            step - (leaf_count - active_index)
+        };
+        self.active_leaf = *leaves.get(next_index)?;
         Some(self.active_leaf)
     }
 
@@ -531,8 +534,8 @@ impl LayoutState {
             LayoutRect {
                 x: 0,
                 y: 0,
-                w: size.w.max(1),
-                h: size.h.max(1),
+                w: size.w.max(0),
+                h: size.h.max(0),
             },
             self.active_leaf,
             &mut regions,
@@ -575,10 +578,9 @@ pub struct LayoutRect {
 
 impl LayoutRect {
     pub fn contains_f64(self, x: f64, y: f64) -> bool {
-        x >= f64::from(self.x)
-            && y >= f64::from(self.y)
-            && x < f64::from(self.x + self.w)
-            && y < f64::from(self.y + self.h)
+        let max_x = f64::from(self.x) + f64::from(self.w.max(0));
+        let max_y = f64::from(self.y) + f64::from(self.h.max(0));
+        x >= f64::from(self.x) && y >= f64::from(self.y) && x < max_x && y < max_y
     }
 }
 
@@ -729,7 +731,7 @@ const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRe
             (
                 LayoutRect { w: first_w, ..rect },
                 LayoutRect {
-                    x: rect.x + first_w,
+                    x: rect.x.saturating_add(first_w),
                     w: second_w,
                     ..rect
                 },
@@ -741,7 +743,7 @@ const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRe
             (
                 LayoutRect { h: first_h, ..rect },
                 LayoutRect {
-                    y: rect.y + first_h,
+                    y: rect.y.saturating_add(first_h),
                     h: second_h,
                     ..rect
                 },
@@ -758,8 +760,8 @@ const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRe
 )]
 mod tests {
     use super::{
-        InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutSize,
-        LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+        InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutRect,
+        LayoutSize, LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
     };
 
     #[test]
@@ -895,6 +897,70 @@ mod tests {
         .pixel_rect(LayoutSize { w: 1280, h: 800 });
 
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (640, 0, 640, 800));
+    }
+
+    #[test]
+    fn pixel_projection_rounds_fractional_edges_and_preserves_empty_bounds() {
+        let transform = LocalTransform {
+            offset: LocalPoint { u: -0.5, v: -0.5 },
+            size: LocalPoint { u: 0.5, v: 0.5 },
+        };
+
+        let fractional = transform.pixel_rect(LayoutSize { w: 5, h: 7 });
+        assert_eq!(
+            (fractional.x, fractional.y, fractional.w, fractional.h),
+            (1, 2, 1, 2)
+        );
+
+        let empty = transform.pixel_rect(LayoutSize { w: 0, h: -4 });
+        assert_eq!((empty.x, empty.y, empty.w, empty.h), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn layout_boundaries_do_not_overflow() {
+        let transform = LocalTransform {
+            offset: LocalPoint { u: 1.0, v: 1.0 },
+            size: LocalPoint {
+                u: f64::INFINITY,
+                v: f64::NAN,
+            },
+        };
+        let rect = transform.pixel_rect(LayoutSize {
+            w: i32::MAX,
+            h: i32::MAX,
+        });
+        assert_eq!(rect.x, i32::MAX);
+        assert_eq!(rect.y, i32::MAX);
+        assert_eq!(rect.w, i32::MAX);
+        assert_eq!(rect.h, 0);
+
+        assert!(
+            !LayoutRect {
+                x: i32::MAX,
+                y: i32::MAX,
+                w: i32::MAX,
+                h: i32::MAX,
+            }
+            .contains_f64(f64::from(i32::MIN), f64::from(i32::MIN))
+        );
+    }
+
+    #[test]
+    fn focus_offset_handles_full_signed_range() {
+        let mut layout = LayoutState::default();
+        let first = layout.active_leaf();
+        let second = layout
+            .split_active(LayoutAxis::Horizontal)
+            .expect("split creates second leaf");
+
+        assert!(matches!(
+            layout.focus_leaf_by_offset(isize::MIN),
+            Some(leaf) if leaf == first || leaf == second
+        ));
+        assert!(matches!(
+            layout.focus_leaf_by_offset(isize::MAX),
+            Some(leaf) if leaf == first || leaf == second
+        ));
     }
 
     fn pane_item(

@@ -16,7 +16,39 @@ code-links:
 
 The supported behavior-test path is the built-in `manifold test` CLI, run through the Nix development shell for checked-in workflows. It owns nested topology policy and avoids creating a host OS window by default.
 
+Nested command readiness belongs to the exact hosted child returned by the
+spawn transition. By default the supervisor returns after that child's pane is
+mapped and presented, which supports persistent graphical clients. Controller
+workloads can instead select owned process completion and wait for that exact
+child to exit. In either policy an unrelated window or hosted-child exit cannot
+complete the command. The supervisor owns normal inner/outer shutdown, so
+controller proofs do not need `--keep-running` or manual daemon quit calls. The
+real Weston terminal workload in `tools/test-nested-command-ownership.sh`
+exercises this boundary and preserves both its rendered screenshot and
+completion transcript.
+
 Use product runtime commands such as `manifold run` for runtime/manual use, not automated behavior validation.
+
+The core-WASM harness controller owns one checked child identity, lifecycle
+event stream, cancellation path, and join result. The focused real proof is
+`tools/test-wasm-harness-lifecycle-nested.sh`: its harness plugin starts an
+animated outer EGL client and interactive terminal beside the nested
+presentation, while the built-in offscreen test topology captures all three
+panes. One run
+delivers a named signal and records a passing guest completion plus an ordinary
+join; a second run leaves the guest blocked in the signal import and proves
+that supervisor shutdown wakes, interrupts, and joins that exact child without
+fabricating a guest result. The composed screenshots and daemon lifecycle
+transcripts are the acceptance evidence, not the guest's integer return alone.
+
+`tools/test-wasm-actor-lifecycle-nested.sh` is the observable core-actor
+replacement and routing proof. A real subscribed plugin actor changes a live
+terminal and animated EGL client from columns to rows across same-name hot
+reload. Between those generations, an invalid two-actor candidate is rejected;
+a real mailbox probe and a third column screenshot prove that the old actor set
+remains owned and responsive. The module also contains a real unsubscribed poison actor which would
+spawn a third client on an incorrectly broadcast host event; the compositor
+dumps and both screenshots prove that only two panes remain.
 
 ## Built-In Nested Tests
 
@@ -30,11 +62,36 @@ Nested tests render surface-local fiducial markers in hosted surfaces before fin
 
 The sandboxed graphical E2E path is `checks.software-e2e`. It forces Mesa software rendering, starts its own DBus session bus, runs an offscreen outer presentation, runs a normal inner presentation inside it, spawns real Weston clients, applies a split layout, and exports inner and outer debug dumps. This check is intended to cover real composition and capture without depending on a host GPU or host-visible presentation window.
 
+`tools/test-safe-boundaries-nested.sh` is the focused boundary proof. A real
+geometry policy plugin visibly splits a terminal and animated Weston SHM
+client. The managed terminal sends a substantive desktop notification through
+its isolated realm bus and records the host notification ID returned through
+the same wire path. A debug bundle records both live surfaces and the composed
+offscreen Winit/EGL frame. The proof deliberately does not claim that a later
+DBus request can read Smithay's already-consumed transient buffer assignment;
+the SHM mapping and pixel boundary instead has deterministic malformed,
+stride, zero-size, overflow, and alpha unit coverage.
+
 The sandboxed plugin I/O path is `checks.wasm-io`, also available as the
 `wasm-io-check` package. It builds the Component and Preview 1 guests plus their
 host workloads, then proves completion I/O, guest-owned shared-memory
 coordination, notification coalescing, worker `wait-any`, cancellation teardown,
 ordinary WASI read compatibility, and structured shutdown.
+
+The Preview 1 unit suite deterministically gates a worker after Store and
+reservation preparation, begins shutdown, and then releases the late result. It
+also holds a completed worker's queued reservation release across shutdown.
+Together they assert cancellation and cleanup without relying on scheduler
+timing. `tools/test-wasm-preview1-worker-nested.sh` is the real lifecycle proof:
+it replaces a live generation with suspended workers, observes the generation
+change, then runs workers in the replacement before structured shutdown. Its
+fixed workload produces worker values 90 before replacement and 81 afterward.
+
+`plugins/workspace-file-log` remains a user-observable normal-operation
+regression workload. Its real initial scan, live create/modify/remove history,
+and completion-backed snapshot prove useful worker and I/O behavior through
+filesystem artifacts rather than a plugin success return; it does not itself
+exercise generation replacement.
 
 The cross-runtime Rube Goldberg workload composes those mechanisms across
 dozens of actors and workers. Its `quick` profile executes more than one

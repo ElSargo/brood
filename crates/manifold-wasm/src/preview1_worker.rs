@@ -21,6 +21,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::mpsc as std_mpsc,
@@ -57,7 +58,19 @@ use crate::coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError,
     NotificationId, PollError, PollableId, WaitMode,
 };
-use crate::filesystem_watch::{FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId};
+use crate::filesystem_watch::{
+    FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId, NativeFilesystemWatcherService,
+};
+use crate::lifecycle::{
+    PluginLifecycleEvent, PluginStartReason, PluginStopReason, wait_for_lifecycle_reply,
+};
+use crate::resource_limits::{
+    GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
+};
+use crate::runtime_io::{
+    ChildStatus, RuntimeIoCapabilities, RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, StreamRead,
+    TimerStatus,
+};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
@@ -67,7 +80,7 @@ use crate::filesystem_watch::{FilesystemWatchError, FilesystemWatchHub, Filesyst
 mod host_abi {
     wiggle::from_witx!({
         witx: ["witx/manifold_preview1.witx"],
-        async: { manifold_preview1::worker_wait_any },
+        async: { manifold_preview1::{worker_wait_any, worker_loopback_connect, child_drop, stream_drop, timer_drop} },
     });
 }
 
@@ -104,6 +117,8 @@ const EVENT_WORKER_FINISHED: u32 = 7;
 const EVENT_WORKER_FAILED: u32 = 8;
 const EVENT_WORKER_CANCELLED: u32 = 9;
 const EVENT_NOTIFICATION: u32 = 10;
+const EVENT_LIFECYCLE_START: u32 = 11;
+const EVENT_LIFECYCLE_STOP: u32 = 12;
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const STACK_ALIGNMENT: u32 = 16;
@@ -126,6 +141,8 @@ pub struct Preview1FilesystemGrant {
 pub struct Preview1ActorCapabilities {
     /// Optional preopened directory shared as authority, not as descriptor state.
     pub filesystem: Option<Preview1FilesystemGrant>,
+    /// Process, terminal, and loopback authority inherited by every worker.
+    pub runtime_io: RuntimeIoCapabilities,
 }
 
 /// Runtime limits for Preview 1 compatibility workers.
@@ -135,6 +152,12 @@ pub struct Preview1WorkerConfig {
     pub max_workers: usize,
     /// Maximum actor calls and worker preparations waiting for the actor store.
     pub max_pending_actor_operations: usize,
+    /// Maximum completed I/O results reserved for actor dispatch.
+    ///
+    /// Once this lane is full the parent stops receiving from the completion
+    /// supervisor, propagating backpressure without consuming general actor
+    /// operation capacity.
+    pub max_pending_completions: usize,
     /// Capacity of the public command channel.
     pub command_capacity: usize,
     /// Maximum mailbox events waiting for the actor dispatcher.
@@ -167,6 +190,8 @@ pub struct Preview1WorkerConfig {
     pub worker_yield_ticks: u64,
     /// Wall-clock bound around every actor export call.
     pub actor_wall_timeout: Duration,
+    /// Host and guest byte ceilings for one actor generation.
+    pub limits: WasmResourceLimits,
 }
 
 impl Default for Preview1WorkerConfig {
@@ -174,6 +199,7 @@ impl Default for Preview1WorkerConfig {
         Self {
             max_workers: 64,
             max_pending_actor_operations: 128,
+            max_pending_completions: 1024,
             command_capacity: 128,
             mailbox_backlog: 128,
             max_outstanding_io: 64,
@@ -190,6 +216,7 @@ impl Default for Preview1WorkerConfig {
             actor_deadline_ticks: 50,
             worker_yield_ticks: 1,
             actor_wall_timeout: Duration::from_millis(100),
+            limits: WasmResourceLimits::default(),
         }
     }
 }
@@ -212,6 +239,7 @@ enum CompatEvent {
     },
     WorkerCancelled(Preview1WorkerId),
     Notification(ActorNotification),
+    Lifecycle(PluginLifecycleEvent),
 }
 
 impl CompatEvent {
@@ -239,12 +267,16 @@ impl CompatEvent {
             Self::WorkerFailed { .. } => EVENT_WORKER_FAILED,
             Self::WorkerCancelled(_) => EVENT_WORKER_CANCELLED,
             Self::Notification(_) => EVENT_NOTIFICATION,
+            Self::Lifecycle(PluginLifecycleEvent::Start(_)) => EVENT_LIFECYCLE_START,
+            Self::Lifecycle(PluginLifecycleEvent::Stop(_)) => EVENT_LIFECYCLE_STOP,
         }
     }
 
     const fn sender(&self) -> &[u8] {
         match self {
             Self::Mailbox { sender, .. } => sender.as_bytes(),
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => context.instance_id.as_bytes(),
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => context.instance_id.as_bytes(),
             _ => &[],
         }
     }
@@ -261,6 +293,9 @@ impl CompatEvent {
                 ..
             })
             | Self::WorkerFailed { message, .. } => message.as_bytes(),
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => {
+                context.workspace_root.as_bytes()
+            }
             _ => &[],
         }
     }
@@ -273,6 +308,8 @@ impl CompatEvent {
             | Self::WorkerFinished { worker, .. }
             | Self::WorkerFailed { worker, .. } => worker.raw(),
             Self::Notification(notification) => notification.notification.raw(),
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => context.generation,
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => context.generation,
             Self::Mailbox { .. } => 0,
         }
     }
@@ -285,14 +322,37 @@ impl CompatEvent {
             }) => *bytes_written,
             Self::WorkerFinished { value, .. } => *value as u64,
             Self::Notification(notification) => notification.generation,
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => match context.reason {
+                PluginStartReason::Initial => 1,
+                PluginStartReason::Replacement => 2,
+                PluginStartReason::SessionRebind => 3,
+            },
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => match context.reason {
+                PluginStopReason::Replacement => 1,
+                PluginStopReason::SessionRebind => 2,
+                PluginStopReason::Shutdown => 3,
+            },
             _ => 0,
         }
     }
 
-    const fn token(&self) -> u64 {
+    fn token(&self) -> u64 {
         match self {
             Self::Notification(notification) => notification.token,
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => {
+                context.session_id.unwrap_or(0)
+            }
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => {
+                context.next_generation.unwrap_or(0)
+            }
             _ => 0,
+        }
+    }
+
+    fn lifecycle_data(&self) -> &[crate::lifecycle::PluginLifecycleEntry] {
+        match self {
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => &context.data,
+            _ => &[],
         }
     }
 }
@@ -300,6 +360,7 @@ impl CompatEvent {
 struct Preview1Store {
     wasi: WasiP1Ctx,
     host: Preview1Host,
+    limits: GenerationStoreLimits,
 }
 
 struct Preview1Host {
@@ -308,6 +369,8 @@ struct Preview1Host {
     completion_io: Option<CompletionIo>,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    runtime_io: RuntimeIoHub,
+    runtime_children: Arc<Mutex<HashMap<u64, [u64; 4]>>>,
     commands: mpsc::Sender<Command>,
     next_worker: Arc<AtomicU64>,
     worker_input_capacity: usize,
@@ -414,6 +477,385 @@ impl host_abi::manifold_preview1::ManifoldPreview1 for Preview1Host {
         let event = self.actor_event()?;
         copy_to_guest(memory, sender, sender_len, event.sender())?;
         copy_to_guest(memory, payload, payload_len, event.payload())
+    }
+
+    fn event_lifecycle_data_count(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+    ) -> Result<u32, host_abi::types::Errno> {
+        u32::try_from(self.actor_event()?.lifecycle_data().len())
+            .map_err(|_overflow| host_abi::types::Errno::Limit)
+    }
+
+    fn event_lifecycle_key_len(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        index: u32,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.actor_event()?
+            .lifecycle_data()
+            .get(index as usize)
+            .ok_or(host_abi::types::Errno::Invalid)
+            .and_then(|entry| {
+                u32::try_from(entry.key.len()).map_err(|_overflow| host_abi::types::Errno::Limit)
+            })
+    }
+
+    fn event_lifecycle_value_len(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        index: u32,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.actor_event()?
+            .lifecycle_data()
+            .get(index as usize)
+            .ok_or(host_abi::types::Errno::Invalid)
+            .and_then(|entry| {
+                u32::try_from(entry.value.len()).map_err(|_overflow| host_abi::types::Errno::Limit)
+            })
+    }
+
+    fn event_lifecycle_data_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        index: u32,
+        key: wiggle::GuestPtr<u8>,
+        key_len: u32,
+        value: wiggle::GuestPtr<u8>,
+        value_len: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        let entry = self
+            .actor_event()?
+            .lifecycle_data()
+            .get(index as usize)
+            .ok_or(host_abi::types::Errno::Invalid)?;
+        copy_to_guest(memory, key, key_len, entry.key.as_bytes())?;
+        copy_to_guest(memory, value, value_len, entry.value.as_bytes())
+    }
+
+    fn lifecycle_complete(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        status: u32,
+        message: wiggle::GuestPtr<u8>,
+        message_len: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.ensure_actor()?;
+        let message = read_guest_string(memory, message, message_len)?;
+        let result = match status {
+            0 => Ok(()),
+            1 => Err(message),
+            _ => return Err(host_abi::types::Errno::Invalid),
+        };
+        self.commands
+            .try_send(Command::GuestLifecycleComplete(result))
+            .map_err(map_command_error)
+    }
+
+    fn subprocess_spawn(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        command: wiggle::GuestPtr<u8>,
+        command_len: u32,
+        arguments: wiggle::GuestPtr<u8>,
+        arguments_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let command = read_guest_string(memory, command, command_len)?;
+        let arguments = read_guest_arguments(memory, arguments, arguments_len)?;
+        let process = self
+            .runtime_io
+            .spawn_process(&command, &arguments)
+            .map_err(map_runtime_io_error)?;
+        let child = process.child.raw();
+        self.runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .insert(
+                child,
+                [
+                    process.stdin.raw(),
+                    process.stdout.raw(),
+                    process.stderr.raw(),
+                    0,
+                ],
+            );
+        Ok(child)
+    }
+
+    fn pty_spawn(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        command: wiggle::GuestPtr<u8>,
+        command_len: u32,
+        arguments: wiggle::GuestPtr<u8>,
+        arguments_len: u32,
+        rows: u32,
+        cols: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let command = read_guest_string(memory, command, command_len)?;
+        let arguments = read_guest_arguments(memory, arguments, arguments_len)?;
+        let rows = u16::try_from(rows).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let cols = u16::try_from(cols).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let pty = self
+            .runtime_io
+            .spawn_pty(&command, &arguments, rows, cols)
+            .map_err(map_runtime_io_error)?;
+        let child = pty.child.raw();
+        self.runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .insert(child, [0, 0, 0, pty.terminal.raw()]);
+        Ok(child)
+    }
+
+    async fn worker_loopback_connect(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        address: wiggle::GuestPtr<u8>,
+        address_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let address = read_guest_string(memory, address, address_len)?
+            .parse::<SocketAddr>()
+            .map_err(|_error| host_abi::types::Errno::Invalid)?;
+        self.runtime_io
+            .connect_loopback(address)
+            .await
+            .map(|stream| stream.raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn child_stream(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+        kind: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        let index = usize::try_from(kind).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let raw = self
+            .runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .get(&child)
+            .and_then(|streams| streams.get(index))
+            .copied()
+            .filter(|raw| *raw != 0)
+            .ok_or(host_abi::types::Errno::Invalid)?;
+        self.runtime_io.stream(raw).map_err(map_runtime_io_error)?;
+        Ok(raw)
+    }
+
+    fn child_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .child(child)
+            .map(|child| child.notification().raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn child_status(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.runtime_io
+            .child(child)
+            .and_then(|child| child.status())
+            .map(|status| match status {
+                ChildStatus::Running => 0,
+                ChildStatus::Exited(Some(_)) => 1,
+                ChildStatus::Exited(None) => 2,
+            })
+            .map_err(map_runtime_io_error)
+    }
+
+    fn child_exit_code(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        match self
+            .runtime_io
+            .child(child)
+            .and_then(|child| child.status())
+            .map_err(map_runtime_io_error)?
+        {
+            ChildStatus::Exited(Some(code)) => {
+                u32::try_from(code).map_err(|_negative| host_abi::types::Errno::Invalid)
+            }
+            ChildStatus::Running | ChildStatus::Exited(None) => {
+                Err(host_abi::types::Errno::Unavailable)
+            }
+        }
+    }
+
+    fn child_resolved_command_len(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        let child = self.runtime_io.child(child).map_err(map_runtime_io_error)?;
+        u32::try_from(
+            child
+                .resolved_command()
+                .as_os_str()
+                .as_encoded_bytes()
+                .len(),
+        )
+        .map_err(|_overflow| host_abi::types::Errno::Limit)
+    }
+
+    fn child_resolved_command_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+        path: wiggle::GuestPtr<u8>,
+        path_len: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        let child = self.runtime_io.child(child).map_err(map_runtime_io_error)?;
+        copy_to_guest(
+            memory,
+            path,
+            path_len,
+            child.resolved_command().as_os_str().as_encoded_bytes(),
+        )
+    }
+
+    async fn child_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_children
+            .lock()
+            .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
+            .remove(&child);
+        self.runtime_io
+            .drop_child(child)
+            .await
+            .map_err(map_runtime_io_error)
+    }
+
+    fn stream_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .stream(stream)
+            .map(|stream| stream.notification().raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn stream_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+        bytes: wiggle::GuestPtr<u8>,
+        bytes_len: u32,
+    ) -> Result<u64, host_abi::types::Errno> {
+        match self
+            .runtime_io
+            .stream(stream)
+            .and_then(|stream| stream.try_read(bytes_len as usize))
+            .map_err(map_runtime_io_error)?
+        {
+            StreamRead::Data(data) => {
+                copy_to_guest(memory, bytes, bytes_len, &data)?;
+                u64::try_from(data.len()).map_err(|_overflow| host_abi::types::Errno::Limit)
+            }
+            StreamRead::WouldBlock => Ok(u64::MAX - 1),
+            StreamRead::Eof => Ok(u64::MAX),
+        }
+    }
+
+    fn stream_write(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+        bytes: wiggle::GuestPtr<u8>,
+        bytes_len: u32,
+    ) -> Result<u32, host_abi::types::Errno> {
+        let bytes = read_guest_bytes(memory, bytes, bytes_len)?;
+        self.runtime_io
+            .stream(stream)
+            .and_then(|stream| stream.try_write(&bytes))
+            .and_then(|count| {
+                u32::try_from(count).map_err(|_overflow| RuntimeIoError::InvalidArgument)
+            })
+            .map_err(map_runtime_io_error)
+    }
+
+    fn stream_close_write(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_io
+            .stream(stream)
+            .and_then(|stream| stream.close_write())
+            .map_err(map_runtime_io_error)
+    }
+
+    async fn stream_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        stream: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_io
+            .drop_stream(stream)
+            .await
+            .map_err(map_runtime_io_error)
+    }
+
+    fn timer_create(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        delay_ms: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .create_timer(Duration::from_millis(delay_ms))
+            .map(|timer| timer.raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn timer_notification(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        timer: u64,
+    ) -> Result<u64, host_abi::types::Errno> {
+        self.runtime_io
+            .timer(timer)
+            .map(|timer| timer.notification().raw())
+            .map_err(map_runtime_io_error)
+    }
+
+    fn timer_status(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        timer: u64,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.runtime_io
+            .timer(timer)
+            .and_then(|timer| timer.status())
+            .map(|status| u32::from(matches!(status, TimerStatus::Expired)))
+            .map_err(map_runtime_io_error)
+    }
+
+    async fn timer_drop(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        timer: u64,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.runtime_io
+            .drop_timer(timer)
+            .await
+            .map_err(map_runtime_io_error)
     }
 
     fn completion_submit_read(
@@ -826,6 +1268,37 @@ fn read_guest_string(
         .map_err(|_utf8| host_abi::types::Errno::Invalid)
 }
 
+fn read_guest_arguments(
+    memory: &wiggle::GuestMemory<'_>,
+    arguments: wiggle::GuestPtr<u8>,
+    arguments_len: u32,
+) -> Result<Vec<String>, host_abi::types::Errno> {
+    let bytes = read_guest_bytes(memory, arguments, arguments_len)?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    bytes
+        .split(|byte| *byte == 0)
+        .map(|argument| {
+            std::str::from_utf8(argument)
+                .map(str::to_string)
+                .map_err(|_utf8| host_abi::types::Errno::Invalid)
+        })
+        .collect()
+}
+
+const fn map_runtime_io_error(error: RuntimeIoError) -> host_abi::types::Errno {
+    match error {
+        RuntimeIoError::StaleHandle | RuntimeIoError::Closed | RuntimeIoError::HostFailure => {
+            host_abi::types::Errno::Unavailable
+        }
+        RuntimeIoError::LimitReached | RuntimeIoError::WouldBlock => host_abi::types::Errno::Limit,
+        RuntimeIoError::NotPermitted | RuntimeIoError::InvalidArgument => {
+            host_abi::types::Errno::Invalid
+        }
+    }
+}
+
 const fn map_completion_error(error: CompletionIoError) -> host_abi::types::Errno {
     match error {
         CompletionIoError::InvalidArgument => host_abi::types::Errno::Invalid,
@@ -973,6 +1446,16 @@ pub struct Preview1CompatStats {
     pub wait_registrations: usize,
     /// Coalesced actor notification IDs waiting in the reserved lane.
     pub pending_notification_events: usize,
+    /// Live logical filesystem watches owned by this generation.
+    pub filesystem_watches: usize,
+    /// Configured logical-watch ceiling.
+    pub max_filesystem_watches: usize,
+    /// Configured per-watch queued-event ceiling.
+    pub max_filesystem_watch_events: usize,
+    /// Capacity/backend overflows collapsed to rescan markers.
+    pub filesystem_watch_overflows: u64,
+    /// All rescan markers, including initial native setup.
+    pub filesystem_watch_rescans: u64,
     /// Workers admitted after Store/export preparation and scheduled to run.
     pub workers_started: u64,
     /// Workers whose guest calls are currently live.
@@ -1088,7 +1571,10 @@ pub struct Preview1WorkerRuntime {
     stats: Arc<Preview1CompatStatsInner>,
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
+    runtime_io: RuntimeIoHub,
     terminal_error: Arc<Mutex<Option<String>>>,
+    limits: WasmResourceLimits,
+    byte_budget: GenerationByteBudget,
 }
 
 impl Preview1WorkerRuntime {
@@ -1101,13 +1587,37 @@ impl Preview1WorkerRuntime {
         capabilities: Preview1ActorCapabilities,
         config: Preview1WorkerConfig,
     ) -> Result<Self, Preview1WorkerError> {
-        Self::load_with_completion_observer(path.as_ref(), capabilities, config, |_io| {}).await
+        Self::load_with_watcher_service(
+            path,
+            capabilities,
+            config,
+            NativeFilesystemWatcherService::new(),
+        )
+        .await
+    }
+
+    /// Load using a daemon-owned native watcher service shared by generations.
+    pub async fn load_with_watcher_service(
+        path: impl AsRef<Path>,
+        capabilities: Preview1ActorCapabilities,
+        config: Preview1WorkerConfig,
+        watcher_service: NativeFilesystemWatcherService,
+    ) -> Result<Self, Preview1WorkerError> {
+        Self::load_with_completion_observer(
+            path.as_ref(),
+            capabilities,
+            config,
+            watcher_service,
+            |_io| {},
+        )
+        .await
     }
 
     async fn load_with_completion_observer<F>(
         path: &Path,
         capabilities: Preview1ActorCapabilities,
         config: Preview1WorkerConfig,
+        watcher_service: NativeFilesystemWatcherService,
         observe_completion: F,
     ) -> Result<Self, Preview1WorkerError>
     where
@@ -1143,6 +1653,25 @@ impl Preview1WorkerRuntime {
                 "env::memory must be shared".to_string(),
             ));
         }
+        let maximum_pages = memory_type.maximum().ok_or_else(|| {
+            Preview1WorkerError::InvalidModule(
+                "env::memory must declare a maximum for generation memory containment".to_string(),
+            )
+        })?;
+        let maximum_bytes = usize::try_from(maximum_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(64 * 1024))
+            .ok_or_else(|| {
+                Preview1WorkerError::InvalidModule(
+                    "env::memory maximum overflows host byte accounting".to_string(),
+                )
+            })?;
+        if maximum_bytes > config.limits.generation_memory_bytes {
+            return Err(Preview1WorkerError::InvalidModule(format!(
+                "env::memory maximum {maximum_bytes} exceeds {} byte generation limit",
+                config.limits.generation_memory_bytes
+            )));
+        }
         let memory = SharedMemory::new(&engine, memory_type)
             .map_err(|error| Preview1WorkerError::InvalidModule(error.to_string()))?;
 
@@ -1177,11 +1706,21 @@ impl Preview1WorkerRuntime {
             max_outstanding: config.max_outstanding_io,
             max_completion_bytes: config.max_completion_bytes,
         };
-        let filesystem_watches = FilesystemWatchHub::new(
+        let filesystem_watches = FilesystemWatchHub::new_with_service(
+            watcher_service,
             completion_config.filesystem.as_ref(),
             coordination.clone(),
             config.max_filesystem_watches,
             config.max_filesystem_watch_events,
+        )
+        .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
+        let runtime_io = RuntimeIoHub::new(
+            generation,
+            RuntimeIoConfig {
+                capabilities: capabilities.runtime_io.clone(),
+                ..RuntimeIoConfig::default()
+            },
+            coordination.clone(),
         )
         .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
         let (completion_io, completion_rx, completion_task) =
@@ -1193,9 +1732,11 @@ impl Preview1WorkerRuntime {
         let (commands, receiver) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
         let mailbox_capacity = config.mailbox_backlog;
+        let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
         let stats = Arc::new(Preview1CompatStatsInner::default());
         let next_worker = Arc::new(AtomicU64::new(1));
         let worker_inputs = Arc::new(Mutex::new(HashMap::new()));
+        let runtime_children = Arc::new(Mutex::new(HashMap::new()));
         let initialized: Result<_, Preview1WorkerError> = async {
             let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
             // The dispatcher is completion-driven and receives no blocking WASI
@@ -1211,6 +1752,8 @@ impl Preview1WorkerRuntime {
                         completion_io: Some(completion_supervisor.io().clone()),
                         coordination: coordination.clone(),
                         filesystem_watches: filesystem_watches.clone(),
+                        runtime_io: runtime_io.clone(),
+                        runtime_children: Arc::clone(&runtime_children),
                         commands: commands.clone(),
                         next_worker: Arc::clone(&next_worker),
                         worker_input_capacity: config.worker_input_capacity,
@@ -1218,8 +1761,10 @@ impl Preview1WorkerRuntime {
                         worker_inputs: Arc::clone(&worker_inputs),
                         stats: Arc::clone(&stats),
                     },
+                    limits: config.limits.store_limits(),
                 },
             );
+            actor_store.limiter(|data| &mut data.limits);
             configure_actor_deadline(&mut actor_store, config.actor_deadline_ticks);
             let actor_instance = instantiate(&engine, &module, &memory, &mut actor_store).await?;
             validate_actor_exports(&mut actor_store, actor_instance).await?;
@@ -1238,6 +1783,7 @@ impl Preview1WorkerRuntime {
         let terminal_error = Arc::new(Mutex::new(None));
         let parent_terminal_error = Arc::clone(&terminal_error);
         let parent_coordination = coordination.clone();
+        let parent_runtime_io = runtime_io.clone();
         let parent_stats = Arc::clone(&stats);
         let parent = tokio::spawn(async move {
             let result = parent_loop(
@@ -1250,6 +1796,7 @@ impl Preview1WorkerRuntime {
                 completion_rx,
                 notification_rx,
                 parent_coordination,
+                parent_runtime_io,
                 completion_supervisor,
                 next_worker,
                 worker_inputs,
@@ -1275,7 +1822,10 @@ impl Preview1WorkerRuntime {
             stats,
             coordination,
             filesystem_watches,
+            runtime_io,
             terminal_error,
+            limits: config.limits,
+            byte_budget,
         })
     }
 
@@ -1285,6 +1835,21 @@ impl Preview1WorkerRuntime {
         sender: String,
         payload: Vec<u8>,
     ) -> Result<(), Preview1WorkerError> {
+        if sender.len() > self.limits.mailbox_sender_bytes {
+            increment_saturating(&self.stats.mailbox_dropped);
+            return Err(Preview1WorkerError::AtCapacity("mailbox sender bytes"));
+        }
+        if payload.len() > self.limits.mailbox_body_bytes {
+            increment_saturating(&self.stats.mailbox_dropped);
+            return Err(Preview1WorkerError::AtCapacity("mailbox body bytes"));
+        }
+        let byte_permit = self
+            .byte_budget
+            .try_reserve(sender.len().saturating_add(payload.len()))
+            .map_err(|_error| {
+                increment_saturating(&self.stats.mailbox_dropped);
+                Preview1WorkerError::AtCapacity("generation host bytes")
+            })?;
         let permit = Arc::clone(&self.mailbox_slots)
             .try_acquire_owned()
             .map_err(|_no_permit| {
@@ -1295,6 +1860,7 @@ impl Preview1WorkerRuntime {
             sender,
             payload,
             permit,
+            byte_permit,
         }) {
             increment_saturating(&self.stats.mailbox_dropped);
             return Err(match error {
@@ -1311,6 +1877,7 @@ impl Preview1WorkerRuntime {
     /// Snapshot daemon-observable lifecycle counters.
     pub fn stats(&self) -> Preview1CompatStats {
         let coordination = self.coordination.stats();
+        let filesystem_watches = self.filesystem_watches.stats();
         Preview1CompatStats {
             generation: self.generation,
             mailbox_queued: self.stats.mailbox_queued.load(Ordering::Relaxed),
@@ -1323,6 +1890,11 @@ impl Preview1WorkerRuntime {
             pollables: coordination.pollables,
             wait_registrations: coordination.wait_registrations,
             pending_notification_events: coordination.pending_actor_events,
+            filesystem_watches: filesystem_watches.watches,
+            max_filesystem_watches: filesystem_watches.max_watches,
+            max_filesystem_watch_events: filesystem_watches.max_events,
+            filesystem_watch_overflows: filesystem_watches.overflows,
+            filesystem_watch_rescans: filesystem_watches.rescans,
             workers_started: self.stats.workers_started.load(Ordering::Relaxed),
             workers_active: self.stats.workers_active.load(Ordering::Acquire),
             worker_reads_started: self.stats.worker_reads_started.load(Ordering::Relaxed),
@@ -1331,6 +1903,10 @@ impl Preview1WorkerRuntime {
             workers_cancelled: self.stats.workers_cancelled.load(Ordering::Relaxed),
             last_worker_value: self.stats.last_worker_value.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
+        self.filesystem_watches.stats()
     }
 
     fn try_take_terminal_error(&self) -> Option<String> {
@@ -1434,6 +2010,7 @@ impl Preview1WorkerRuntime {
         }
 
         self.filesystem_watches.stop();
+        self.runtime_io.teardown().await;
         self.coordination.stop();
 
         let (reply, response) = oneshot::channel();
@@ -1494,6 +2071,30 @@ impl Preview1CompatActor {
         Ok(Self { name, runtime })
     }
 
+    /// Load with the daemon's shared native filesystem watcher service.
+    pub async fn load_with_watcher_service(
+        path: impl AsRef<Path>,
+        capabilities: Preview1ActorCapabilities,
+        config: Preview1WorkerConfig,
+        watcher_service: NativeFilesystemWatcherService,
+    ) -> Result<Self, Preview1WorkerError> {
+        let path = path.as_ref();
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("preview1-compat")
+            .to_string();
+        let runtime = Preview1WorkerRuntime::load_with_watcher_service(
+            path,
+            capabilities,
+            config,
+            watcher_service,
+        )
+        .await?;
+        Ok(Self { name, runtime })
+    }
+
     /// Actor name derived from the plugin artifact.
     pub fn name(&self) -> &str {
         &self.name
@@ -1511,6 +2112,30 @@ impl Preview1CompatActor {
     /// Current lifecycle counters, including the reload generation.
     pub fn stats(&self) -> Preview1CompatStats {
         self.runtime.stats()
+    }
+
+    pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
+        self.runtime.filesystem_watch_stats()
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.runtime.generation
+    }
+
+    pub async fn lifecycle(
+        &self,
+        event: PluginLifecycleEvent,
+        timeout: Duration,
+    ) -> Result<(), Preview1WorkerError> {
+        let (reply, response) = oneshot::channel();
+        self.runtime
+            .commands
+            .send(Command::Lifecycle { event, reply })
+            .await
+            .map_err(|_closed| Preview1WorkerError::RuntimeStopped)?;
+        wait_for_lifecycle_reply(response, timeout)
+            .await
+            .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?
     }
 
     /// Consume a terminal dispatcher error for daemon status reporting.
@@ -1545,6 +2170,7 @@ enum Command {
         sender: String,
         payload: Vec<u8>,
         permit: OwnedSemaphorePermit,
+        byte_permit: GenerationBytePermit,
     },
     ActorCall {
         export: String,
@@ -1564,6 +2190,11 @@ enum Command {
         input_pump: Option<(DuplexStream, mpsc::Receiver<Vec<u8>>)>,
     },
     GuestCancelWorker(Preview1WorkerId),
+    Lifecycle {
+        event: PluginLifecycleEvent,
+        reply: oneshot::Sender<Result<(), Preview1WorkerError>>,
+    },
+    GuestLifecycleComplete(std::result::Result<(), String>),
     CancelWorker {
         worker: Preview1WorkerId,
         reply: oneshot::Sender<Result<(), Preview1WorkerError>>,
@@ -1578,6 +2209,7 @@ enum ActorOperation {
     Mailbox {
         event: CompatEvent,
         permit: OwnedSemaphorePermit,
+        byte_permit: GenerationBytePermit,
     },
     Call {
         export: String,
@@ -1597,6 +2229,47 @@ enum ActorOperation {
     },
 }
 
+struct CompletionDispatchLane {
+    operations: VecDeque<ActorOperation>,
+    capacity: usize,
+}
+
+impl CompletionDispatchLane {
+    fn new(capacity: usize) -> Self {
+        Self {
+            operations: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn can_receive(&self) -> bool {
+        self.operations.len() < self.capacity
+    }
+
+    fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    fn push(&mut self, completion: ActorCompletion) {
+        assert!(
+            self.can_receive(),
+            "completion receiver was polled without reserved lane capacity"
+        );
+        self.operations
+            .push_back(ActorOperation::Dispatch(CompatEvent::Completion(
+                completion,
+            )));
+    }
+
+    fn pop(&mut self) -> Option<ActorOperation> {
+        self.operations.pop_front()
+    }
+
+    fn clear(&mut self) {
+        self.operations.clear();
+    }
+}
+
 fn pop_preview_actor_operation(
     operations: &mut VecDeque<ActorOperation>,
     prefer_mailbox: &mut bool,
@@ -1611,6 +2284,31 @@ fn pop_preview_actor_operation(
     };
     *prefer_mailbox = !*prefer_mailbox;
     selected.or_else(|| operations.pop_front())
+}
+
+fn pop_preview_dispatch_operation(
+    actor_operations: &mut VecDeque<ActorOperation>,
+    completion_operations: &mut CompletionDispatchLane,
+    prefer_completion: &mut bool,
+    prefer_mailbox: &mut bool,
+) -> Option<ActorOperation> {
+    let completion_first = *prefer_completion && !completion_operations.is_empty();
+    *prefer_completion = !*prefer_completion;
+    if completion_first || actor_operations.is_empty() {
+        completion_operations.pop()
+    } else {
+        pop_preview_actor_operation(actor_operations, prefer_mailbox)
+    }
+}
+
+const fn should_dispatch_notification(
+    notification_first: bool,
+    lanes_empty: (bool, bool, bool),
+) -> bool {
+    let (notification_operations_empty, actor_operations_empty, completion_operations_empty) =
+        lanes_empty;
+    !notification_operations_empty
+        && (notification_first || (actor_operations_empty && completion_operations_empty))
 }
 
 type GuestCall = Pin<Box<dyn Future<Output = CallDone> + Send>>;
@@ -1666,6 +2364,57 @@ struct PreparedWorker {
     reservation: WorkerReservation,
 }
 
+#[cfg(test)]
+struct PreparationTestGate {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static PREPARATION_TEST_GATE: Mutex<Option<PreparationTestGate>> = Mutex::new(None);
+
+#[cfg(test)]
+static SHUTDOWN_STARTED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+static HOLD_WORKER_RELEASE_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static WORKER_RELEASE_QUEUED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+static WORKER_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+static WORKER_RELEASE_TEST_WAKEUP: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(test)]
+async fn wait_at_preparation_test_gate() {
+    let gate = PREPARATION_TEST_GATE
+        .lock()
+        .ok()
+        .and_then(|mut gate| gate.take());
+    if let Some(gate) = gate {
+        let _result = gate.entered.send(());
+        let _result = gate.release.await;
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_preparation_test_gate() -> std::future::Ready<()> {
+    std::future::ready(())
+}
+
+#[cfg(test)]
+async fn wait_for_worker_release_test_wakeup() {
+    WORKER_RELEASE_TEST_WAKEUP.notified().await;
+}
+
+#[cfg(not(test))]
+fn wait_for_worker_release_test_wakeup() -> std::future::Pending<()> {
+    std::future::pending()
+}
+
 struct ActiveWorker {
     abort: AbortHandle,
     completion: Option<oneshot::Sender<Result<u32, Preview1WorkerError>>>,
@@ -1698,6 +2447,7 @@ async fn parent_loop(
     mut completion_rx: mpsc::Receiver<ActorCompletion>,
     mut notification_rx: mpsc::Receiver<NotificationId>,
     coordination: CoordinationHub,
+    runtime_io: RuntimeIoHub,
     mut completion_supervisor: Preview1CompletionSupervisor,
     next_worker: Arc<AtomicU64>,
     worker_inputs: WorkerInputRegistry,
@@ -1709,8 +2459,10 @@ async fn parent_loop(
     let completion_io = completion_supervisor.io().clone();
     let mut actor_store = Some(actor_store);
     let mut actor_operations = VecDeque::new();
+    let mut completion_operations = CompletionDispatchLane::new(config.max_pending_completions);
     let mut notification_operations = VecDeque::new();
     let mut prefer_notification = true;
+    let mut prefer_completion = true;
     let mut prefer_mailbox = true;
     let mut calls = FuturesUnordered::<GuestCall>::new();
     let mut input_pumps = FuturesUnordered::<InputPump>::new();
@@ -1721,36 +2473,84 @@ async fn parent_loop(
     let mut worker_slots = 0_usize;
     let mut completion_open = true;
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
+    let mut pending_lifecycle: Option<oneshot::Sender<Result<(), Preview1WorkerError>>> = None;
 
     let loop_result = loop {
-        if shutdown_reply.is_some() && active_workers.is_empty() {
+        if shutdown_reply.is_some()
+            && active_workers.is_empty()
+            && preparing_workers.is_empty()
+            && reservations.is_empty()
+        {
             break Ok(());
         }
 
-        let actor_dispatch_available = shutdown_reply.is_none() && actor_store.is_some();
-        let actor_work_pending =
-            !actor_operations.is_empty() || !notification_operations.is_empty();
+        let stopping = shutdown_reply.is_some();
+        let release_pending = actor_operations
+            .iter()
+            .any(|operation| matches!(operation, ActorOperation::ReleaseWorker { .. }));
+        #[cfg(test)]
+        let release_held = HOLD_WORKER_RELEASE_TEST.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let release_held = false;
+        #[cfg(test)]
+        if release_pending && release_held {
+            let observer = WORKER_RELEASE_QUEUED_TEST_OBSERVER
+                .lock()
+                .ok()
+                .and_then(|mut observer| observer.take());
+            if let Some(observer) = observer {
+                let _result = observer.send(());
+            }
+        }
+        let actor_dispatch_available = actor_store.is_some()
+            && (!stopping || release_pending)
+            && !(release_pending && release_held);
+        let actor_work_pending = !actor_operations.is_empty()
+            || !completion_operations.is_empty()
+            || !notification_operations.is_empty();
         if actor_dispatch_available && actor_work_pending {
-            let notification_first = prefer_notification && !notification_operations.is_empty();
-            prefer_notification = !prefer_notification;
-            let operation = if notification_first || actor_operations.is_empty() {
-                let Some(notification) = notification_operations.pop_front() else {
+            let operation = if stopping {
+                let Some(index) = actor_operations.iter().position(|operation| {
+                    matches!(operation, ActorOperation::ReleaseWorker { .. })
+                }) else {
                     continue;
                 };
-                let Some(event) = coordination
-                    .take_actor_event(notification)
-                    .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?
-                else {
-                    continue;
-                };
-                ActorOperation::Dispatch(CompatEvent::Notification(event))
-            } else {
-                let Some(operation) =
-                    pop_preview_actor_operation(&mut actor_operations, &mut prefer_mailbox)
-                else {
+                let Some(operation) = actor_operations.remove(index) else {
                     continue;
                 };
                 operation
+            } else {
+                let notification_first = prefer_notification && !notification_operations.is_empty();
+                prefer_notification = !prefer_notification;
+                if should_dispatch_notification(
+                    notification_first,
+                    (
+                        notification_operations.is_empty(),
+                        actor_operations.is_empty(),
+                        completion_operations.is_empty(),
+                    ),
+                ) {
+                    let Some(notification) = notification_operations.pop_front() else {
+                        continue;
+                    };
+                    let Some(event) = coordination
+                        .take_actor_event(notification)
+                        .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?
+                    else {
+                        continue;
+                    };
+                    ActorOperation::Dispatch(CompatEvent::Notification(event))
+                } else {
+                    let Some(operation) = pop_preview_dispatch_operation(
+                        &mut actor_operations,
+                        &mut completion_operations,
+                        &mut prefer_completion,
+                        &mut prefer_mailbox,
+                    ) else {
+                        continue;
+                    };
+                    operation
+                }
             };
             let Some(store) = actor_store.take() else {
                 continue;
@@ -1768,15 +2568,16 @@ async fn parent_loop(
                 config.actor_wall_timeout,
                 config.worker_yield_ticks,
                 reservations.values().copied().collect(),
+                config.limits,
             ));
         }
 
         tokio::select! {
-            completion = completion_rx.recv(), if completion_open => {
+            () = wait_for_worker_release_test_wakeup(), if release_held => {}
+            completion = completion_rx.recv(), if completion_open
+                && completion_operations.can_receive() => {
                 match completion {
-                    Some(completion) => actor_operations.push_back(
-                        ActorOperation::Dispatch(CompatEvent::Completion(completion)),
-                    ),
+                    Some(completion) => completion_operations.push(completion),
                     None => completion_open = false,
                 }
             }
@@ -1790,6 +2591,12 @@ async fn parent_loop(
                     cancel_all_workers(&mut active_workers);
                     coordination.stop();
                     completion_io.stop();
+                    prepare_actor_operations_for_shutdown(
+                        &mut actor_operations,
+                        &mut preparing_workers,
+                        &worker_inputs,
+                        &mut worker_slots,
+                    );
                     shutdown_reply = Some(oneshot::channel().0);
                     continue;
                 };
@@ -1800,13 +2607,34 @@ async fn parent_loop(
                     continue;
                 }
                 match command {
-                    Command::Mailbox { sender, payload, permit } => {
+                    Command::Lifecycle { event, reply } => {
+                        if pending_lifecycle.is_some() {
+                            let _result = reply.send(Err(Preview1WorkerError::Guest(
+                                "lifecycle hook already pending".to_string(),
+                            )));
+                        } else {
+                            pending_lifecycle = Some(reply);
+                            actor_operations.push_front(ActorOperation::Dispatch(
+                                CompatEvent::Lifecycle(event),
+                            ));
+                        }
+                    }
+                    Command::GuestLifecycleComplete(result) => {
+                        let Some(reply) = pending_lifecycle.take() else {
+                            break Err(Preview1WorkerError::Guest(
+                                "guest completed lifecycle with no pending hook".to_string(),
+                            ));
+                        };
+                        let _result = reply.send(result.map_err(Preview1WorkerError::Guest));
+                    }
+                    Command::Mailbox { sender, payload, permit, byte_permit } => {
                         // Admission was reserved before the public enqueue
                         // returned success. Retain it through dispatch so an
                         // accepted mailbox message cannot be silently dropped.
                         actor_operations.push_back(ActorOperation::Mailbox {
                             event: CompatEvent::Mailbox { sender, payload },
                             permit,
+                            byte_permit,
                         });
                     }
                     Command::ActorCall { export, argument, reply } => {
@@ -1837,6 +2665,7 @@ async fn parent_loop(
                                 continue;
                             };
                             worker_slots += 1;
+                            preparing_workers.insert(worker);
                             actor_operations.push_back(ActorOperation::PrepareWorker {
                                 worker,
                                 export,
@@ -1906,10 +2735,25 @@ async fn parent_loop(
                     Command::Shutdown { reply } => {
                         cancel_all_workers(&mut active_workers);
                         coordination.stop();
+                        #[cfg(test)]
+                        let shutdown_observer = SHUTDOWN_STARTED_TEST_OBSERVER
+                            .lock()
+                            .ok()
+                            .and_then(|mut observer| observer.take());
+                        #[cfg(test)]
+                        if let Some(observer) = shutdown_observer {
+                            let _result = observer.send(());
+                        }
+                        prepare_actor_operations_for_shutdown(
+                            &mut actor_operations,
+                            &mut preparing_workers,
+                            &worker_inputs,
+                            &mut worker_slots,
+                        );
                         if let Ok(mut inputs) = worker_inputs.lock() {
                             inputs.clear();
                         }
-                        actor_operations.clear();
+                        completion_operations.clear();
                         notification_operations.clear();
                         completion_io.stop();
                         completion_open = false;
@@ -1965,7 +2809,8 @@ async fn parent_loop(
                         actor_store = Some(store);
                         preparing_workers.remove(&worker);
                         let guest_owned = reply.is_none();
-                        let cancelled = pending_cancellations.remove(&worker);
+                        let cancelled = shutdown_reply.is_some()
+                            || pending_cancellations.remove(&worker);
                         match result {
                             Ok(prepared) => {
                                 if cancelled {
@@ -1975,13 +2820,21 @@ async fn parent_loop(
                                     // until the prepared worker Store is gone.
                                     drop(prepared);
                                     remove_worker_input(&worker_inputs, worker);
+                                    reservations.insert(worker, reservation);
                                     actor_operations.push_front(ActorOperation::ReleaseWorker {
                                         worker,
                                         reservation,
                                     });
-                                    actor_operations.push_front(ActorOperation::Dispatch(
-                                        CompatEvent::WorkerCancelled(worker),
-                                    ));
+                                    if let Some(reply) = reply {
+                                        let _result = reply.send(Err(Preview1WorkerError::Cancelled));
+                                    }
+                                    if shutdown_reply.is_none() {
+                                        actor_operations.push_front(ActorOperation::Dispatch(
+                                            CompatEvent::WorkerCancelled(worker),
+                                        ));
+                                    } else {
+                                        stats.workers_cancelled.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 } else if overlaps_existing(prepared.reservation, reservations.values().copied()) {
                                     worker_slots = worker_slots.saturating_sub(1);
                                     actor_operations.push_front(ActorOperation::ReleaseWorker {
@@ -2032,17 +2885,24 @@ async fn parent_loop(
                                 worker_slots = worker_slots.saturating_sub(1);
                                 let message = error.to_string();
                                 if let Some(reply) = reply {
-                                    let _result = reply.send(Err(error));
+                                    let result = if cancelled {
+                                        Err(Preview1WorkerError::Cancelled)
+                                    } else {
+                                        Err(error)
+                                    };
+                                    let _result = reply.send(result);
                                 }
                                 if guest_owned {
                                     remove_worker_input(&worker_inputs, worker);
-                                    actor_operations.push_front(ActorOperation::Dispatch(
-                                        if cancelled {
-                                            CompatEvent::WorkerCancelled(worker)
-                                        } else {
-                                            CompatEvent::WorkerFailed { worker, message }
-                                        },
-                                    ));
+                                    if shutdown_reply.is_none() {
+                                        actor_operations.push_front(ActorOperation::Dispatch(
+                                            if cancelled {
+                                                CompatEvent::WorkerCancelled(worker)
+                                            } else {
+                                                CompatEvent::WorkerFailed { worker, message }
+                                            },
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -2109,9 +2969,11 @@ async fn parent_loop(
     drop(calls);
     drop(actor_store);
     drop(actor_operations);
+    drop(completion_operations);
     drop(notification_operations);
     drop(completion_rx);
     drop(notification_rx);
+    runtime_io.teardown().await;
     coordination.stop();
     stats.workers_active.store(0, Ordering::Release);
     completion_supervisor.shutdown().await;
@@ -2125,7 +2987,7 @@ fn start_dispatch_operation(
     mut actor_store: Store<Preview1Store>,
     actor_instance: Instance,
     event: CompatEvent,
-    mailbox_permit: Option<OwnedSemaphorePermit>,
+    mailbox_permit: Option<(OwnedSemaphorePermit, GenerationBytePermit)>,
     actor_deadline_ticks: u64,
     actor_wall_timeout: Duration,
 ) -> GuestCall {
@@ -2192,6 +3054,7 @@ fn start_actor_operation(
     actor_wall_timeout: Duration,
     worker_yield_ticks: u64,
     existing_reservations: Vec<WorkerReservation>,
+    limits: WasmResourceLimits,
 ) -> GuestCall {
     match operation {
         ActorOperation::Dispatch(event) => start_dispatch_operation(
@@ -2202,11 +3065,15 @@ fn start_actor_operation(
             actor_deadline_ticks,
             actor_wall_timeout,
         ),
-        ActorOperation::Mailbox { event, permit } => start_dispatch_operation(
+        ActorOperation::Mailbox {
+            event,
+            permit,
+            byte_permit,
+        } => start_dispatch_operation(
             actor_store,
             actor_instance,
             event,
-            Some(permit),
+            Some((permit, byte_permit)),
             actor_deadline_ticks,
             actor_wall_timeout,
         ),
@@ -2260,6 +3127,7 @@ fn start_actor_operation(
                     stack_bytes,
                     worker_yield_ticks,
                     &existing_reservations,
+                    limits,
                 ),
             )
             .await
@@ -2269,6 +3137,7 @@ fn start_actor_operation(
                 )
             })
             .and_then(std::convert::identity);
+            wait_at_preparation_test_gate().await;
             CallDone::WorkerPrepared {
                 actor_store,
                 worker,
@@ -2399,6 +3268,7 @@ async fn prepare_worker(
     stack_bytes: u32,
     worker_yield_ticks: u64,
     existing_reservations: &[WorkerReservation],
+    limits: WasmResourceLimits,
 ) -> Result<PreparedWorker, Preview1WorkerError> {
     // Read the immutable TLS metadata from the actor instance so the actor can
     // reserve memory before the secondary instance's start function runs.
@@ -2445,6 +3315,8 @@ async fn prepare_worker(
         worker_completion_io,
         worker_coordination,
         worker_filesystem_watches,
+        worker_runtime_io,
+        worker_runtime_children,
         worker_commands,
         worker_next_id,
         worker_input_capacity,
@@ -2457,6 +3329,8 @@ async fn prepare_worker(
             actor_host.completion_io.clone(),
             actor_host.coordination.clone(),
             actor_host.filesystem_watches.clone(),
+            actor_host.runtime_io.clone(),
+            Arc::clone(&actor_host.runtime_children),
             actor_host.commands.clone(),
             Arc::clone(&actor_host.next_worker),
             actor_host.worker_input_capacity,
@@ -2473,6 +3347,8 @@ async fn prepare_worker(
             completion_io: worker_completion_io,
             coordination: worker_coordination,
             filesystem_watches: worker_filesystem_watches,
+            runtime_io: worker_runtime_io,
+            runtime_children: worker_runtime_children,
             commands: worker_commands,
             next_worker: worker_next_id,
             worker_input_capacity,
@@ -2480,7 +3356,15 @@ async fn prepare_worker(
             worker_inputs,
             stats: worker_stats,
         };
-        let mut store = Store::new(engine, Preview1Store { wasi, host });
+        let mut store = Store::new(
+            engine,
+            Preview1Store {
+                wasi,
+                host,
+                limits: limits.store_limits(),
+            },
+        );
+        store.limiter(|data| &mut data.limits);
         store.set_epoch_deadline(worker_yield_ticks);
         store.epoch_deadline_async_yield_and_update(worker_yield_ticks);
         let instance = instantiate(engine, module, memory, &mut store).await?;
@@ -2618,6 +3502,18 @@ async fn instantiate(
 }
 
 const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1WorkerError> {
+    if config.limits.mailbox_sender_bytes == 0
+        || config.limits.mailbox_body_bytes == 0
+        || config.limits.worker_payload_bytes == 0
+        || config.limits.worker_result_bytes == 0
+        || config.limits.generation_host_bytes == 0
+        || config.limits.generation_memory_bytes == 0
+        || config.limits.store_table_elements == 0
+    {
+        return Err(Preview1WorkerError::InvalidConfig(
+            "resource byte and table limits must be non-zero",
+        ));
+    }
     if config.max_workers == 0 {
         return Err(Preview1WorkerError::InvalidConfig(
             "max_workers must be non-zero",
@@ -2626,6 +3522,11 @@ const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1Wor
     if config.max_pending_actor_operations == 0 {
         return Err(Preview1WorkerError::InvalidConfig(
             "max_pending_actor_operations must be non-zero",
+        ));
+    }
+    if config.max_pending_completions == 0 {
+        return Err(Preview1WorkerError::InvalidConfig(
+            "max_pending_completions must be non-zero",
         ));
     }
     if config.command_capacity == 0 {
@@ -2837,6 +3738,32 @@ fn cancel_all_workers(active_workers: &mut HashMap<Preview1WorkerId, ActiveWorke
     }
 }
 
+fn prepare_actor_operations_for_shutdown(
+    actor_operations: &mut VecDeque<ActorOperation>,
+    preparing_workers: &mut HashSet<Preview1WorkerId>,
+    worker_inputs: &WorkerInputRegistry,
+    worker_slots: &mut usize,
+) {
+    let mut retained = VecDeque::with_capacity(actor_operations.len());
+    for operation in std::mem::take(actor_operations) {
+        match operation {
+            ActorOperation::PrepareWorker { worker, reply, .. } => {
+                preparing_workers.remove(&worker);
+                *worker_slots = worker_slots.saturating_sub(1);
+                remove_worker_input(worker_inputs, worker);
+                if let Some(reply) = reply {
+                    let _result = reply.send(Err(Preview1WorkerError::Cancelled));
+                }
+            }
+            operation @ ActorOperation::ReleaseWorker { .. } => retained.push_back(operation),
+            ActorOperation::Dispatch(_)
+            | ActorOperation::Mailbox { .. }
+            | ActorOperation::Call { .. } => {}
+        }
+    }
+    *actor_operations = retained;
+}
+
 struct EpochTicker {
     stop: std_mpsc::Sender<()>,
     thread: Option<thread::JoinHandle<()>>,
@@ -2877,12 +3804,62 @@ mod tests {
 
     use super::*;
 
+    fn completion(sequence: u64) -> ActorCompletion {
+        ActorCompletion {
+            operation: OperationId::new(1, sequence),
+            kind: ActorCompletionKind::Write {
+                bytes_written: sequence,
+            },
+        }
+    }
+
+    fn write_worker_lifecycle_module() -> Result<NamedTempFile> {
+        write_module(
+            r#"(module
+                (import "env" "memory" (memory 4 4 shared))
+                (global $stack_pointer (export "__stack_pointer") (mut i32)
+                    i32.const 131072)
+                (func (export "manifold_worker_reserve_v1")
+                    (param i32 i32 i32) (result i64)
+                    i64.const 562949953552384)
+                (func (export "manifold_worker_release_v1")
+                    (param i64 i32 i32 i32) (result i32)
+                    i32.const 0)
+                (func (export "manifold_actor_dispatch_v1")
+                    (param i32) (result i32)
+                    i32.const 0)
+                (func (export "manifold_worker_run_v1")
+                    (param i32) (result i32)
+                    i32.const 99)
+                (func (export "manifold_preview1_compat_v1") (result i32)
+                    i32.const 0x4d503101)
+            )"#,
+        )
+    }
+
+    fn worker_lifecycle_config() -> Preview1WorkerConfig {
+        Preview1WorkerConfig {
+            worker_stack_bytes: 64 * 1024,
+            ..Preview1WorkerConfig::default()
+        }
+    }
+
+    struct ReleaseHoldGuard;
+
+    impl Drop for ReleaseHoldGuard {
+        fn drop(&mut self) {
+            HOLD_WORKER_RELEASE_TEST.store(false, Ordering::Release);
+            WORKER_RELEASE_TEST_WAKEUP.notify_one();
+        }
+    }
+
     #[test]
     fn preview_scheduler_does_not_starve_mailbox_behind_system_events() -> Result<()> {
         let slots = Arc::new(Semaphore::new(1));
         let permit = slots
             .try_acquire_owned()
             .context("acquire mailbox test permit")?;
+        let byte_permit = GenerationByteBudget::new(1).try_reserve(1)?;
         let mut operations = VecDeque::from([
             ActorOperation::Dispatch(CompatEvent::WorkerStarted(Preview1WorkerId(1))),
             ActorOperation::Mailbox {
@@ -2891,6 +3868,7 @@ mod tests {
                     payload: Vec::new(),
                 },
                 permit,
+                byte_permit,
             },
             ActorOperation::Dispatch(CompatEvent::WorkerStarted(Preview1WorkerId(2))),
         ]);
@@ -2907,12 +3885,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_completion_lane_backpressures_its_supervisor_receiver() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut lane = CompletionDispatchLane::new(1);
+
+        sender.send(completion(1)).await?;
+        lane.push(receiver.recv().await.context("first completion")?);
+        ensure!(!lane.can_receive());
+        ensure!(lane.operations.len() == 1);
+
+        sender.send(completion(2)).await?;
+        let blocked_sender = sender.clone();
+        let mut blocked_send =
+            tokio::spawn(async move { blocked_sender.send(completion(3)).await });
+        ensure!(
+            timeout(Duration::from_millis(25), &mut blocked_send)
+                .await
+                .is_err(),
+            "the completion producer advanced while the reserved lane and receiver were full"
+        );
+        ensure!(lane.operations.len() == 1);
+
+        drop(lane.pop().context("release first completion")?);
+        ensure!(lane.can_receive());
+        lane.push(receiver.recv().await.context("second completion")?);
+        timeout(Duration::from_secs(1), &mut blocked_send)
+            .await
+            .context("completion producer did not resume after lane ownership was released")???;
+        ensure!(lane.operations.len() == 1);
+
+        drop(lane.pop().context("release second completion")?);
+        lane.push(receiver.recv().await.context("third completion")?);
+        ensure!(lane.operations.len() == 1);
+        drop(lane);
+        Ok(())
+    }
+
+    #[test]
+    fn completion_only_work_is_not_misrouted_to_the_empty_notification_lane() {
+        assert!(!should_dispatch_notification(true, (true, true, false)));
+        assert!(should_dispatch_notification(false, (false, true, true)));
+    }
+
+    #[tokio::test]
+    async fn full_completion_lane_does_not_gate_control_commands() -> Result<()> {
+        let (_completion_sender, mut completion_receiver) = mpsc::channel::<ActorCompletion>(1);
+        let (command_sender, mut command_receiver) = mpsc::channel(1);
+        let mut lane = CompletionDispatchLane::new(1);
+        lane.push(completion(1));
+        command_sender.send(()).await?;
+
+        tokio::select! {
+            completion = completion_receiver.recv(), if lane.can_receive() => {
+                anyhow::bail!("full completion lane unexpectedly received {completion:?}");
+            }
+            command = command_receiver.recv() => {
+                ensure!(command.is_some(), "control channel closed unexpectedly");
+            }
+        }
+        drop(lane);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cancels_late_worker_preparation_before_start_and_releases_it() -> Result<()> {
+        let _test_lock = WORKER_LIFECYCLE_TEST_LOCK.lock().await;
+        let guest = write_worker_lifecycle_module()?;
+        let mut runtime = Preview1WorkerRuntime::load(
+            guest.path(),
+            Preview1ActorCapabilities::default(),
+            worker_lifecycle_config(),
+        )
+        .await?;
+
+        let (preparation_entered, entered) = oneshot::channel();
+        let (release_preparation, preparation_release) = oneshot::channel();
+        *PREPARATION_TEST_GATE
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock preparation test gate: {error}"))? =
+            Some(PreparationTestGate {
+                entered: preparation_entered,
+                release: preparation_release,
+            });
+        let (shutdown_started, started) = oneshot::channel();
+        *SHUTDOWN_STARTED_TEST_OBSERVER
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock shutdown test observer: {error}"))? =
+            Some(shutdown_started);
+        let commands = runtime.commands.clone();
+
+        let spawn_result = {
+            let spawn = runtime.spawn_worker(COMPAT_WORKER_EXPORT, 7);
+            tokio::pin!(spawn);
+            tokio::select! {
+                result = &mut spawn => {
+                    drop(result);
+                    anyhow::bail!("worker preparation completed before the deterministic gate");
+                }
+                entered = entered => entered.context("preparation gate sender dropped")?,
+            }
+
+            let (shutdown_reply, shutdown_done) = oneshot::channel();
+            commands
+                .send(Command::Shutdown {
+                    reply: shutdown_reply,
+                })
+                .await
+                .context("send shutdown while preparation is pending")?;
+            timeout(Duration::from_secs(1), started)
+                .await
+                .context("shutdown did not begin while preparation was pending")?
+                .context("shutdown-start observer dropped")?;
+            release_preparation
+                .send(())
+                .map_err(|()| anyhow::anyhow!("preparation gate receiver dropped"))?;
+
+            let spawn_result = timeout(Duration::from_secs(1), &mut spawn)
+                .await
+                .context("late preparation did not report cancellation")?;
+            timeout(Duration::from_secs(1), shutdown_done)
+                .await
+                .context("shutdown did not wait for reservation release")?
+                .context("shutdown reply sender dropped")?;
+            spawn_result
+        };
+
+        ensure!(
+            matches!(spawn_result, Err(Preview1WorkerError::Cancelled)),
+            "late preparation was not cancelled"
+        );
+        runtime.await_parent().await?;
+        let stats = runtime.stats();
+        drop(runtime);
+        ensure!(stats.workers_active == 0);
+        ensure!(stats.workers_cancelled == 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_preserves_an_already_queued_worker_release() -> Result<()> {
+        let _test_lock = WORKER_LIFECYCLE_TEST_LOCK.lock().await;
+        let guest = write_worker_lifecycle_module()?;
+        let mut runtime = Preview1WorkerRuntime::load(
+            guest.path(),
+            Preview1ActorCapabilities::default(),
+            worker_lifecycle_config(),
+        )
+        .await?;
+        HOLD_WORKER_RELEASE_TEST.store(true, Ordering::Release);
+        let _release_hold = ReleaseHoldGuard;
+        let (release_queued, queued) = oneshot::channel();
+        *WORKER_RELEASE_QUEUED_TEST_OBSERVER
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock release test observer: {error}"))? =
+            Some(release_queued);
+
+        let worker = runtime.spawn_worker(COMPAT_WORKER_EXPORT, 7).await?;
+        timeout(Duration::from_secs(1), queued)
+            .await
+            .context("worker release was not queued")?
+            .context("worker-release observer dropped")?;
+        ensure!(worker.join().await? == 99);
+
+        let (shutdown_started, started) = oneshot::channel();
+        *SHUTDOWN_STARTED_TEST_OBSERVER
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock shutdown test observer: {error}"))? =
+            Some(shutdown_started);
+        let (shutdown_reply, shutdown_done) = oneshot::channel();
+        runtime
+            .commands
+            .send(Command::Shutdown {
+                reply: shutdown_reply,
+            })
+            .await
+            .context("send shutdown with a queued worker release")?;
+        timeout(Duration::from_secs(1), started)
+            .await
+            .context("shutdown did not begin with a queued release")?
+            .context("shutdown-start observer dropped")?;
+        HOLD_WORKER_RELEASE_TEST.store(false, Ordering::Release);
+        WORKER_RELEASE_TEST_WAKEUP.notify_one();
+        timeout(Duration::from_secs(1), shutdown_done)
+            .await
+            .context("shutdown discarded or failed to run the queued release")?
+            .context("shutdown reply sender dropped")?;
+        runtime.await_parent().await?;
+        let stats = runtime.stats();
+        drop(runtime);
+        ensure!(stats.workers_active == 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn accepted_mailbox_message_holds_admission_until_dispatch_ownership_ends() -> Result<()>
     {
         let (commands, mut receiver) = mpsc::channel(2);
         let (coordination, _notification_rx) =
             CoordinationHub::new(1, CoordinationConfig::default())
                 .map_err(|error| anyhow::anyhow!(error))?;
+        let runtime_io = RuntimeIoHub::new(1, RuntimeIoConfig::default(), coordination.clone())
+            .map_err(|error| anyhow::anyhow!(error))?;
         let runtime = Preview1WorkerRuntime {
             commands,
             mailbox_slots: Arc::new(Semaphore::new(1)),
@@ -2922,8 +4095,13 @@ mod tests {
             stats: Arc::new(Preview1CompatStatsInner::default()),
             filesystem_watches: FilesystemWatchHub::new(None, coordination.clone(), 1, 1)
                 .map_err(|error| anyhow::anyhow!(error))?,
+            runtime_io,
             coordination,
             terminal_error: Arc::new(Mutex::new(None)),
+            limits: WasmResourceLimits::default(),
+            byte_budget: GenerationByteBudget::new(
+                WasmResourceLimits::default().generation_host_bytes,
+            ),
         };
 
         runtime.try_send_message("test".to_string(), b"one".to_vec())?;
@@ -2964,6 +4142,7 @@ mod tests {
             guest.path(),
             Preview1ActorCapabilities::default(),
             Preview1WorkerConfig::default(),
+            NativeFilesystemWatcherService::new(),
             move |io| {
                 let _result = observed_tx.send(io.clone());
             },
@@ -3009,6 +4188,7 @@ mod tests {
             guest.path(),
             Preview1ActorCapabilities::default(),
             Preview1WorkerConfig::default(),
+            NativeFilesystemWatcherService::new(),
             move |io| {
                 let _result = observed_tx.send(io.clone());
             },

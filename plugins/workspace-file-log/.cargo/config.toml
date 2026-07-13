@@ -8,4 +8,8 @@ rustflags = [
   "-C", "link-arg=--export-if-defined=__tls_size",
   "-C", "link-arg=--export-if-defined=__tls_align",
   "-C", "link-arg=--export-if-defined=__wasm_init_tls",
+  # Preview 1 shared memory must declare a generation maximum. This plugin's
+  # 512 MiB ceiling is intentionally far above its real watcher workload while
+  # remaining compatible with the daemon's aggregate guest-memory boundary.
+  "-C", "link-arg=--max-memory=536870912",
 ]

@@ -8,6 +8,27 @@ Experimental backend work that is not part of the supported workflow should live
 
 Run `./tools/dev-nested-manifold.sh --keep-running` to start a stable Manifold instance, spawn a development Manifold instance inside it, launch a real client inside the dev instance, and sample both `status-json` streams. See [Test Nested Behavior](../docs/workflows/test-nested.md).
 
+Run `./tools/test-nested-command-ownership.sh` to prove that the built-in
+offscreen nested supervisor waits for its exact controller while a real Weston
+terminal maps and an unrelated hosted child exits. The proof exits normally
+without `--keep-running` and preserves a composed screenshot and transcript.
+
+Run `./tools/test-geometry-conversions-nested.sh` to load the real geometry
+layout policy plugin, render its accepted two-pane layout, and target
+Weston eventdemo with pointer motion, click, wheel-v120, and fractional scroll
+input. The offscreen proof preserves the composed screenshot, accepted layout
+rectangles, before/after compositor metrics, and client-observed local events.
+
+Run `./tools/test-safe-boundaries-nested.sh` to verify the audited renderer,
+debug-buffer, and DBus wire boundaries. The offscreen proof loads the real
+geometry policy plugin, visibly splits a terminal and animated Weston SHM
+client, forwards a substantive desktop notification through the isolated realm
+bus, and preserves the returned host notification ID, debug manifest, and
+composed EGL screenshot. Smithay consumes transient buffer assignments before a
+later debug request, so the manifest may honestly record `no_current_buffer`;
+SHM offset, stride, pixel, alpha, short-buffer, zero-size, and overflow behavior
+is covered by focused unit fixtures.
+
 Run `./tools/audit-v1-capabilities.sh` from the repo root for the concise v1 acceptance audit. It runs formatting, offline checking, unit tests, headless compositor checks, supported host-backed smoke tests when a host display is available, and the dmabuf capability checks. Set `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1` on a DRM-capable backend to make capability skips fail the audit.
 
 Run `./tools/smoke-v1-full.sh` from the repo root for the full supported v1 proof suite: formatting, offline build/test, dmabuf validator/classifier fixtures, headless Wayland globals, headless native-client mapping, headless input forwarding, headless control-error handling, headless JSON status, headless status parity, headless client lifecycle checks, startup attach fallback, native nesting, detach/reattach, host input forwarding, dmabuf diagnostics, explicit-sync diagnostics, and latency/cadence.

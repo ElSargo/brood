@@ -3,7 +3,15 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::mpsc;
 
-use crate::api::read_range;
+use crate::{
+    api::read_range,
+    resource_limits::{GenerationByteBudget, GenerationBytePermit},
+};
+
+/// Legacy byte-only mailbox ceiling. Hosted actor backends additionally bound
+/// sender metadata through [`crate::WasmResourceLimits`].
+pub const MAX_MAILBOX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MAILBOX_GENERATION_BYTES: usize = 256 * 1024 * 1024;
 
 const FIRST_ACTOR_ID: u64 = 1;
 
@@ -21,16 +29,32 @@ pub struct MailboxRegistry {
     mailboxes: BTreeMap<ActorId, MailboxSender>,
     names: BTreeMap<String, ActorId>,
     next_actor_id: u64,
+    byte_budget: GenerationByteBudget,
+}
+
+/// A mailbox generation which has an identity and bounded channel but is not
+/// yet reachable through the public actor namespace.
+#[derive(Debug)]
+pub struct PreparedMailboxRegistration {
+    name: String,
+    actor_id: ActorId,
+    sender: MailboxSender,
 }
 
 #[derive(Clone, Debug)]
 struct MailboxSender {
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<MailboxMessage>,
+}
+
+#[derive(Debug)]
+struct MailboxMessage {
+    payload: Vec<u8>,
+    _byte_permit: GenerationBytePermit,
 }
 
 #[derive(Debug)]
 pub struct Mailbox {
-    inner: mpsc::Receiver<Vec<u8>>,
+    inner: mpsc::Receiver<MailboxMessage>,
     actor_id: ActorId,
 }
 
@@ -41,43 +65,103 @@ impl Default for MailboxRegistry {
 }
 
 impl MailboxRegistry {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             mailboxes: BTreeMap::new(),
             names: BTreeMap::new(),
             next_actor_id: FIRST_ACTOR_ID,
+            byte_budget: GenerationByteBudget::new(MAX_MAILBOX_GENERATION_BYTES),
         }
     }
 
     pub fn register_actor(&mut self, name: impl Into<String>, capacity: usize) -> Result<Mailbox> {
-        ensure!(capacity > 0, "mailbox capacity must be non-zero");
+        let (registration, mailbox) = self.prepare_actor(name, capacity)?;
+        self.activate_prepared(vec![registration], &[])?;
+        Ok(mailbox)
+    }
 
+    /// Allocate and instantiate a mailbox without publishing its name. This
+    /// lets a host finish loading a candidate actor before replacing a live
+    /// generation.
+    pub fn prepare_actor(
+        &mut self,
+        name: impl Into<String>,
+        capacity: usize,
+    ) -> Result<(PreparedMailboxRegistration, Mailbox)> {
+        ensure!(capacity > 0, "mailbox capacity must be non-zero");
         let name = name.into();
         ensure!(!name.is_empty(), "actor name must not be empty");
-        ensure!(
-            !self.names.contains_key(&name),
-            "actor name {name:?} is already registered"
-        );
-
         let actor_id = self.allocate_actor_id()?;
         let (sender, receiver) = mpsc::channel(capacity);
+        Ok((
+            PreparedMailboxRegistration {
+                name,
+                actor_id,
+                sender: MailboxSender { sender },
+            },
+            Mailbox {
+                inner: receiver,
+                actor_id,
+            },
+        ))
+    }
 
-        ensure!(
-            self.names.insert(name, actor_id).is_none(),
-            "actor name was registered concurrently"
-        );
-        ensure!(
+    /// Publish a prepared actor set as one registry transition. Names in
+    /// `replace_names` belong to the retiring generation; every other live
+    /// name remains protected from replacement.
+    pub fn activate_prepared(
+        &mut self,
+        registrations: Vec<PreparedMailboxRegistration>,
+        replace_names: &[String],
+    ) -> Result<()> {
+        self.validate_prepared(&registrations, replace_names)?;
+        let replace_names = replace_names
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        for name in replace_names {
+            if let Some(actor_id) = self.names.remove(name) {
+                self.mailboxes.remove(&actor_id);
+            }
+        }
+        for registration in registrations {
+            self.names.insert(registration.name, registration.actor_id);
             self.mailboxes
-                .insert(actor_id, MailboxSender { sender })
-                .is_none(),
-            "actor id {} was registered concurrently",
-            actor_id.raw()
-        );
+                .insert(registration.actor_id, registration.sender);
+        }
+        Ok(())
+    }
 
-        Ok(Mailbox {
-            inner: receiver,
-            actor_id,
-        })
+    pub fn validate_prepared(
+        &self,
+        registrations: &[PreparedMailboxRegistration],
+        replace_names: &[String],
+    ) -> Result<()> {
+        let mut candidate_names = std::collections::BTreeSet::new();
+        let replace_names = replace_names
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        for registration in registrations {
+            ensure!(
+                candidate_names.insert(registration.name.as_str()),
+                "duplicate prepared actor name {:?}",
+                registration.name
+            );
+            ensure!(
+                !self.names.contains_key(&registration.name)
+                    || replace_names.contains(registration.name.as_str()),
+                "actor name {:?} is already registered",
+                registration.name
+            );
+            ensure!(
+                !self.mailboxes.contains_key(&registration.actor_id),
+                "prepared actor id {} is already registered",
+                registration.actor_id.raw()
+            );
+        }
+
+        Ok(())
     }
 
     pub fn actor_id_for_name(&self, name: &str) -> Option<ActorId> {
@@ -94,6 +178,15 @@ impl MailboxRegistry {
         self.mailboxes.remove(&actor_id).is_some()
     }
 
+    /// Remove `name` only when it still identifies the supplied generation.
+    /// A retiring task can therefore never unregister a same-name replacement.
+    pub fn unregister_actor_generation(&mut self, name: &str, actor_id: ActorId) -> bool {
+        if self.actor_id_for_name(name) != Some(actor_id) {
+            return false;
+        }
+        self.unregister_actor(name)
+    }
+
     pub fn contains_actor(&self, actor_id: ActorId) -> bool {
         self.mailboxes.contains_key(&actor_id)
     }
@@ -106,15 +199,31 @@ impl MailboxRegistry {
     }
 
     pub fn try_post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
+        ensure!(
+            payload.len() <= MAX_MAILBOX_MESSAGE_BYTES,
+            "mailbox message exceeds {MAX_MAILBOX_MESSAGE_BYTES} byte limit"
+        );
+        let byte_permit = self.byte_budget.try_reserve(payload.len())?;
         self.mailbox_sender(recipient)?
-            .try_send(payload)
+            .try_send(MailboxMessage {
+                payload,
+                _byte_permit: byte_permit,
+            })
             .map_err(|err| anyhow::anyhow!("post message to actor {}: {err}", recipient.raw()))
     }
 
     pub async fn post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
+        ensure!(
+            payload.len() <= MAX_MAILBOX_MESSAGE_BYTES,
+            "mailbox message exceeds {MAX_MAILBOX_MESSAGE_BYTES} byte limit"
+        );
+        let byte_permit = self.byte_budget.try_reserve(payload.len())?;
         let sender = self.mailbox_sender(recipient)?.clone();
         sender
-            .send(payload)
+            .send(MailboxMessage {
+                payload,
+                _byte_permit: byte_permit,
+            })
             .await
             .map_err(|err| anyhow::anyhow!("post message to actor {}: {err}", recipient.raw()))
     }
@@ -129,7 +238,7 @@ impl MailboxRegistry {
         self.try_post_message(recipient, bytes.to_vec())
     }
 
-    fn mailbox_sender(&self, recipient: ActorId) -> Result<&mpsc::Sender<Vec<u8>>> {
+    fn mailbox_sender(&self, recipient: ActorId) -> Result<&mpsc::Sender<MailboxMessage>> {
         self.mailboxes
             .get(&recipient)
             .map(|mailbox| &mailbox.sender)
@@ -161,16 +270,52 @@ impl Mailbox {
         let Some(message) = self.inner.recv().await else {
             bail!("actor {} mailbox is closed", self.actor_id.raw());
         };
-        Ok(message)
+        Ok(message.payload)
     }
 
     pub fn try_read_message(&mut self) -> Result<Option<Vec<u8>>> {
         match self.inner.try_recv() {
-            Ok(message) => Ok(Some(message)),
+            Ok(message) => Ok(Some(message.payload)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 bail!("actor {} mailbox is closed", self.actor_id.raw())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_replacement_is_atomic_and_generation_checked() -> Result<()> {
+        let mut registry = MailboxRegistry::new();
+        let old_mailbox = registry.register_actor("layout", 4)?;
+        let old_id = old_mailbox.actor_id();
+        let (prepared, mut replacement_mailbox) = registry.prepare_actor("layout", 4)?;
+        let replacement_id = replacement_mailbox.actor_id();
+
+        registry.try_post_named_message("layout", b"old".to_vec())?;
+        registry.activate_prepared(vec![prepared], &["layout".to_string()])?;
+        registry.try_post_named_message("layout", b"new".to_vec())?;
+
+        ensure!(registry.actor_id_for_name("layout") == Some(replacement_id));
+        ensure!(replacement_mailbox.try_read_message()? == Some(b"new".to_vec()));
+        ensure!(!registry.unregister_actor_generation("layout", old_id));
+        ensure!(registry.actor_id_for_name("layout") == Some(replacement_id));
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_prepared_set_leaves_live_registry_unchanged() -> Result<()> {
+        let mut registry = MailboxRegistry::new();
+        let live = registry.register_actor("unrelated", 4)?;
+        let (prepared, _candidate) = registry.prepare_actor("unrelated", 4)?;
+
+        ensure!(registry.activate_prepared(vec![prepared], &[]).is_err());
+        ensure!(registry.actor_id_for_name("unrelated") == Some(live.actor_id()));
+        registry.try_post_named_message("unrelated", b"still-live".to_vec())?;
+        Ok(())
     }
 }

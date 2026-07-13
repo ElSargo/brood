@@ -1,16 +1,14 @@
 #![allow(
-    clippy::exit,
     clippy::expect_used,
-    clippy::indexing_slicing,
     clippy::let_underscore_must_use,
     clippy::needless_pass_by_ref_mut,
     clippy::needless_pass_by_value,
     clippy::option_if_let_else,
     clippy::too_many_arguments,
     clippy::unnecessary_wraps,
-    reason = "tracked in issues.md: control.rs preserves token-oriented command plumbing while DBus waits cross the compositor actor boundary"
+    reason = "tracked in issues.md: DBus waits still cross the compositor actor boundary"
 )]
-// TODO(lint-structure): separate DBus proxy ABI, CLI parsing, and process entrypoint policy.
+// TODO(lint-structure): separate the DBus proxy ABI from compositor state dispatch.
 
 use std::{
     collections::BTreeMap,
@@ -43,17 +41,18 @@ use tracing::{info, warn};
 use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy};
 
 use crate::{
-    CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, MANIFOLD_SESSION_ENV,
-    MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs, ShowArgs, ShowTarget,
-    SwitchArgs, browser,
+    CommandOutcome, CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs,
+    MANIFOLD_SESSION_ENV, MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, PlugArgs,
+    ShowArgs, ShowTarget, SwitchArgs, browser,
     command::{SurfaceCommand, WorkspaceCommand},
     config,
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
     session_runner,
     state::{
-        FocusDirection, MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL,
-        PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
+        AgentNotification, FocusDirection, HostedChildStatus, HostedChildToken,
+        MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL, PresentationStatus,
+        SurfaceSessionId, SurfaceSessionSummary,
     },
 };
 
@@ -1251,7 +1250,7 @@ pub fn plug(args: PlugArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn enter(args: EnterArgs) -> Result<()> {
+pub fn enter(args: EnterArgs) -> Result<CommandOutcome> {
     let already_entered = entered_session_marker().is_some();
     if already_entered && !args.new {
         bail!(
@@ -1349,8 +1348,12 @@ pub fn enter(args: EnterArgs) -> Result<()> {
         command.status().context("run entered command")?
     };
 
+    entered_command_outcome(status)
+}
+
+fn entered_command_outcome(status: std::process::ExitStatus) -> Result<CommandOutcome> {
     match status.code() {
-        Some(code) => std::process::exit(code),
+        Some(code) => Ok(CommandOutcome::Exit(code)),
         None => bail!("entered command terminated by signal"),
     }
 }
@@ -2531,18 +2534,19 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             );
         }
         DbusStateRequest::CreateSurfaceSession { name, response } => {
-            let id = if let Some(name) = normalize_session_name(&name) {
+            let result = if let Some(name) = normalize_session_name(&name) {
                 state
                     .create_and_attach_named_surface_session(Some(name))
-                    .raw()
+                    .map(SurfaceSessionId::raw)
             } else {
-                WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
-                state.active_surface_session().raw()
+                state
+                    .create_and_attach_surface_session()
+                    .map(SurfaceSessionId::raw)
             };
-            send_response(response, Ok(id));
+            send_response(response, result);
         }
         DbusStateRequest::RenameSurfaceSession { id, name, response } => {
-            let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), name);
+            let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), &name);
             send_response(response, Ok(changed));
         }
         DbusStateRequest::CloseSurfaceSession { id, response } => {
@@ -2571,7 +2575,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.register_extension(role, metadata, sender_name),
+            state.register_extension(&role, metadata, sender_name),
         ),
         DbusStateRequest::UnregisterExtension {
             extension_id,
@@ -2645,7 +2649,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.register_status_publisher(role, metadata, sender_name),
+            state.register_status_publisher(&role, metadata, sender_name),
         ),
         DbusStateRequest::PublishStatus {
             publisher,
@@ -2656,7 +2660,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.publish_status(publisher, channel, status_state, label, metadata),
+            state.publish_status(&publisher, &channel, &status_state, &label, metadata),
         ),
         DbusStateRequest::ClearStatus {
             publisher,
@@ -2674,7 +2678,10 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             metadata,
             sender_name,
             response,
-        } => send_response(response, state.register_agent(kind, metadata, sender_name)),
+        } => send_response(
+            response,
+            state.register_agent(&kind, &metadata, sender_name),
+        ),
         DbusStateRequest::UpdateAgent {
             agent_id,
             status,
@@ -2683,7 +2690,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.update_agent(&agent_id, status, metadata, sender_name),
+            state.update_agent(&agent_id, &status, metadata, sender_name),
         ),
         DbusStateRequest::NotifyAgent {
             agent_id,
@@ -2696,15 +2703,15 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.notify_agent(
-                &agent_id,
+            state.notify_agent(AgentNotification {
+                agent_id,
                 title,
                 subtitle,
                 body,
                 level,
                 metadata,
-                sender_name,
-            ),
+                sender: sender_name,
+            }),
         ),
         DbusStateRequest::ClearAgentAttention { agent_id, response } => {
             send_response(response, Ok(state.clear_agent_attention(&agent_id)));
@@ -2719,7 +2726,10 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             kind,
             metadata,
             response,
-        } => send_response(response, state.unregister_agent_by_identity(kind, metadata)),
+        } => send_response(
+            response,
+            state.unregister_agent_by_identity(&kind, &metadata),
+        ),
         DbusStateRequest::RegisterWindow {
             extension_id,
             window_identity,
@@ -2728,7 +2738,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.register_extension_window(extension_id, window_identity, role, sender_name),
+            state.register_extension_window(extension_id, window_identity, &role, sender_name),
         ),
         DbusStateRequest::ReplaceRole {
             window_id,
@@ -2738,7 +2748,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.replace_window_role(&window_id, role, options, sender_name),
+            state.replace_window_role(&window_id, &role, &options, sender_name),
         ),
         DbusStateRequest::RequestPlacement {
             window_id,
@@ -2747,7 +2757,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.request_window_placement(&window_id, placement, sender_name),
+            state.request_window_placement(&window_id, &placement, sender_name),
         ),
         DbusStateRequest::RequestPresentationMembership {
             window_id,
@@ -2767,7 +2777,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             response,
         } => send_response(
             response,
-            state.request_shortcut_grant(extension_id, shortcut, scope, label, sender_name),
+            state.request_shortcut_grant(&extension_id, &shortcut, scope, label, sender_name),
         ),
         DbusStateRequest::RequestFocus {
             window_id,
@@ -3092,8 +3102,8 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             if args.is_empty() {
                 bail!("spawn requires a command");
             }
-            state.spawn_hosted_app_argv(args)?;
-            format!("OK spawned {}\n", args.join(" "))
+            let token = state.spawn_hosted_app_argv(args)?;
+            format!("OK spawned {} pane_id={}\n", args.join(" "), token.raw())
         }
         "spawn-in-session" => {
             let Some((session, argv)) = args.split_first() else {
@@ -3103,13 +3113,45 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 bail!("spawn-in-session requires a command");
             }
             let session = parse_u64(session, "session id")?;
-            state.spawn_hosted_app_argv_in_session(argv, SurfaceSessionId::from_raw(session))?;
-            format!("OK spawned {}\n", argv.join(" "))
+            let token = state
+                .spawn_hosted_app_argv_in_session(argv, SurfaceSessionId::from_raw(session))?;
+            format!("OK spawned {} pane_id={}\n", argv.join(" "), token.raw())
+        }
+        "hosted-child-status" => {
+            let [pane_id] = args else {
+                bail!("hosted-child-status requires exactly one pane id");
+            };
+            let token = HostedChildToken::from_raw(parse_u64(pane_id, "pane id")?);
+            let visible = state.hosted_child_visible(token);
+            let status = match state.hosted_child_status(token) {
+                HostedChildStatus::Launching => {
+                    serde_json::json!({"pane_id": token.raw(), "state": "launching", "visible": visible})
+                }
+                HostedChildStatus::Running => {
+                    serde_json::json!({"pane_id": token.raw(), "state": "running", "visible": visible})
+                }
+                HostedChildStatus::Exited { success, detail } => serde_json::json!({
+                    "pane_id": token.raw(),
+                    "state": "exited",
+                    "visible": visible,
+                    "success": success,
+                    "detail": detail,
+                }),
+                HostedChildStatus::Unknown => {
+                    serde_json::json!({"pane_id": token.raw(), "state": "unknown", "visible": visible})
+                }
+            };
+            format!("{status}\n")
         }
         "plug" => {
-            let (kind, instance_id, path) = parse_plug_args(args)?;
-            let loaded_kind = plug_wasm_module(state, &path, kind, instance_id.as_deref())?;
-            format_plug_success(loaded_kind, instance_id.as_deref(), &path)
+            let command = PlugCommand::parse(args)?;
+            let loaded_kind = plug_wasm_module(
+                state,
+                &command.path,
+                command.kind,
+                command.instance_id.as_deref(),
+            )?;
+            format_plug_success(loaded_kind, command.instance_id.as_deref(), &command.path)
         }
         "focus" => {
             let direction = match args {
@@ -3252,7 +3294,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 let session = state.create_and_attach_named_surface_session_in_directory(
                     joined_name(name),
                     directory.clone(),
-                );
+                )?;
                 let changed = state.remember_directory_surface_session(
                     directory.clone(),
                     session,
@@ -3286,7 +3328,7 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             [subcommand, name @ ..] if subcommand == "new" => {
                 let name = joined_name(name);
                 if let Some(name) = name {
-                    state.create_and_attach_named_surface_session(Some(name));
+                    state.create_and_attach_named_surface_session(Some(name))?;
                 } else {
                     WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
                 }
@@ -3322,14 +3364,13 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             _ => bail!("usage: harness signal <name>"),
         },
         "nested-inner" => {
-            let destination = state
-                .nested_inner_dbus_destination
-                .clone()
+            let (destination, address) = state
+                .nested_test_target()
                 .context("nested inner DBus destination not configured")?;
             if args.is_empty() {
                 bail!("usage: nested-inner <command...>");
             }
-            let target = ControlTarget::new(destination, state.nested_inner_dbus_address.clone());
+            let target = ControlTarget::new(destination.to_string(), address.map(str::to_string));
             request_dbus_command(&target, args, false)?
         }
         "debug" => match args {
@@ -3393,58 +3434,68 @@ impl WasmPlugKind {
     }
 }
 
-fn parse_plug_args(args: &[String]) -> Result<(WasmPlugKind, Option<String>, PathBuf)> {
-    let mut kind = WasmPlugKind::Auto;
-    let mut instance_id = None;
-    let mut path = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--kind" | "-k" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    bail!("plug --kind requires a value");
-                };
-                kind = WasmPlugKind::parse(value)?;
-            }
-            arg if arg.starts_with("--kind=") => {
-                let value = arg.trim_start_matches("--kind=");
-                kind = WasmPlugKind::parse(value)?;
-            }
-            "--id" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    bail!("plug --id requires a value");
-                };
-                ensure!(!value.is_empty(), "plug --id must not be empty");
-                ensure!(
-                    instance_id.is_none(),
-                    "plug --id may only be specified once"
-                );
-                instance_id = Some(value.clone());
-            }
-            arg if arg.starts_with("--id=") => {
-                let value = arg.trim_start_matches("--id=");
-                ensure!(!value.is_empty(), "plug --id must not be empty");
-                ensure!(
-                    instance_id.is_none(),
-                    "plug --id may only be specified once"
-                );
-                instance_id = Some(value.to_string());
-            }
-            arg if arg.starts_with('-') => {
-                bail!("unknown plug option {arg}");
-            }
-            arg => {
-                ensure!(path.is_none(), "plug accepts exactly one WASM module path");
-                path = Some(PathBuf::from(arg));
+#[derive(Debug, PartialEq, Eq)]
+struct PlugCommand {
+    kind: WasmPlugKind,
+    instance_id: Option<String>,
+    path: PathBuf,
+}
+
+impl PlugCommand {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut kind = WasmPlugKind::Auto;
+        let mut instance_id = None;
+        let mut path = None;
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--kind" | "-k" => {
+                    let Some(value) = args.next() else {
+                        bail!("plug --kind requires a value");
+                    };
+                    kind = WasmPlugKind::parse(value)?;
+                }
+                arg if arg.starts_with("--kind=") => {
+                    let value = arg.trim_start_matches("--kind=");
+                    kind = WasmPlugKind::parse(value)?;
+                }
+                "--id" => {
+                    let Some(value) = args.next() else {
+                        bail!("plug --id requires a value");
+                    };
+                    ensure!(!value.is_empty(), "plug --id must not be empty");
+                    ensure!(
+                        instance_id.is_none(),
+                        "plug --id may only be specified once"
+                    );
+                    instance_id = Some(value.clone());
+                }
+                arg if arg.starts_with("--id=") => {
+                    let value = arg.trim_start_matches("--id=");
+                    ensure!(!value.is_empty(), "plug --id must not be empty");
+                    ensure!(
+                        instance_id.is_none(),
+                        "plug --id may only be specified once"
+                    );
+                    instance_id = Some(value.to_string());
+                }
+                arg if arg.starts_with('-') => {
+                    bail!("unknown plug option {arg}");
+                }
+                arg => {
+                    ensure!(path.is_none(), "plug accepts exactly one WASM module path");
+                    path = Some(PathBuf::from(arg));
+                }
             }
         }
-        index += 1;
-    }
 
-    let path = path.context("usage: plug [--kind auto|plugin|key-policy] [--id ID] <path>")?;
-    Ok((kind, instance_id, path))
+        let path = path.context("usage: plug [--kind auto|plugin|key-policy] [--id ID] <path>")?;
+        Ok(Self {
+            kind,
+            instance_id,
+            path,
+        })
+    }
 }
 
 fn format_plug_success(kind: &str, instance_id: Option<&str>, path: &Path) -> String {
@@ -3547,6 +3598,11 @@ struct StatusSnapshot {
     preview1_compat_pollables: usize,
     preview1_compat_wait_registrations: usize,
     preview1_compat_pending_notification_events: usize,
+    preview1_compat_filesystem_watches: usize,
+    preview1_compat_max_filesystem_watches: usize,
+    preview1_compat_max_filesystem_watch_events: usize,
+    preview1_compat_filesystem_watch_overflows: u64,
+    preview1_compat_filesystem_watch_rescans: u64,
     preview1_compat_workers_started: u64,
     preview1_compat_workers_active: usize,
     preview1_compat_worker_reads_started: u64,
@@ -3554,6 +3610,16 @@ struct StatusSnapshot {
     preview1_compat_workers_failed: u64,
     preview1_compat_workers_cancelled: u64,
     preview1_compat_last_worker_value: u64,
+    filesystem_watcher_registrations: usize,
+    filesystem_watcher_subscriptions: usize,
+    filesystem_watcher_setup_tasks: usize,
+    filesystem_watcher_overflows: u64,
+    filesystem_watcher_rescans: u64,
+    hosted_filesystem_watches: usize,
+    hosted_filesystem_watch_capacity: usize,
+    hosted_filesystem_watch_event_capacity: usize,
+    hosted_filesystem_watch_overflows: u64,
+    hosted_filesystem_watch_rescans: u64,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -3701,6 +3767,8 @@ impl StatusSnapshot {
             |rect| format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h),
         );
         let preview1_compat_stats = state.preview1_compat_stats();
+        let filesystem_watcher_stats = state.filesystem_watcher_stats();
+        let hosted_filesystem_watch_stats = state.hosted_filesystem_watch_stats();
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
@@ -3777,6 +3845,16 @@ impl StatusSnapshot {
                 .map_or(0, |stats| stats.wait_registrations),
             preview1_compat_pending_notification_events: preview1_compat_stats
                 .map_or(0, |stats| stats.pending_notification_events),
+            preview1_compat_filesystem_watches: preview1_compat_stats
+                .map_or(0, |stats| stats.filesystem_watches),
+            preview1_compat_max_filesystem_watches: preview1_compat_stats
+                .map_or(0, |stats| stats.max_filesystem_watches),
+            preview1_compat_max_filesystem_watch_events: preview1_compat_stats
+                .map_or(0, |stats| stats.max_filesystem_watch_events),
+            preview1_compat_filesystem_watch_overflows: preview1_compat_stats
+                .map_or(0, |stats| stats.filesystem_watch_overflows),
+            preview1_compat_filesystem_watch_rescans: preview1_compat_stats
+                .map_or(0, |stats| stats.filesystem_watch_rescans),
             preview1_compat_workers_started: preview1_compat_stats
                 .map_or(0, |stats| stats.workers_started),
             preview1_compat_workers_active: preview1_compat_stats
@@ -3791,6 +3869,16 @@ impl StatusSnapshot {
                 .map_or(0, |stats| stats.workers_cancelled),
             preview1_compat_last_worker_value: preview1_compat_stats
                 .map_or(0, |stats| stats.last_worker_value),
+            filesystem_watcher_registrations: filesystem_watcher_stats.registrations,
+            filesystem_watcher_subscriptions: filesystem_watcher_stats.subscriptions,
+            filesystem_watcher_setup_tasks: filesystem_watcher_stats.setup_tasks,
+            filesystem_watcher_overflows: filesystem_watcher_stats.overflows,
+            filesystem_watcher_rescans: filesystem_watcher_stats.rescans,
+            hosted_filesystem_watches: hosted_filesystem_watch_stats.watches,
+            hosted_filesystem_watch_capacity: hosted_filesystem_watch_stats.max_watches,
+            hosted_filesystem_watch_event_capacity: hosted_filesystem_watch_stats.max_events,
+            hosted_filesystem_watch_overflows: hosted_filesystem_watch_stats.overflows,
+            hosted_filesystem_watch_rescans: hosted_filesystem_watch_stats.rescans,
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),
@@ -3928,36 +4016,35 @@ impl StatusSnapshot {
 }
 
 fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
-    let Some((kind, rest)) = args.split_first() else {
-        bail!("inject requires a kind: motion, button, key, or axis");
-    };
+    let command = InjectCommand::parse(args)?;
     let time = monotonic_time_msec(state);
 
-    match kind.as_str() {
-        "motion" if rest.len() == 2 => {
-            let x = parse_f64(&rest[0], "x")?;
-            let y = parse_f64(&rest[1], "y")?;
+    match command {
+        InjectCommand::Motion { x, y } => {
             state.forward_pointer_motion(Point::from((x, y)), time);
         }
-        "center-motion" if rest.is_empty() => {
+        InjectCommand::CenterMotion => {
             let Some(pos) = state.first_window_center() else {
                 bail!("no mapped window to target");
             };
             state.forward_pointer_motion(pos, time);
         }
-        "button" if rest.len() == 2 => {
-            let button = parse_u32(&rest[0], "button")?;
-            let button_state = parse_button_state(&rest[1])?;
-            state.forward_pointer_button(button, button_state, time);
+        InjectCommand::Button {
+            code,
+            state: button_state,
+        } => {
+            state.forward_pointer_button(code, button_state, time);
         }
-        "key" if rest.len() == 2 => {
-            let key = parse_u32(&rest[0], "key")?;
-            let key_state = parse_key_state(&rest[1])?;
-            state.forward_keyboard_key(key.into(), key_state, time);
+        InjectCommand::Key {
+            code,
+            state: key_state,
+        } => {
+            state.forward_keyboard_key(code.into(), key_state, time);
         }
-        "axis" if rest.len() == 2 => {
-            let horizontal = parse_f64(&rest[0], "horizontal")?;
-            let vertical = parse_f64(&rest[1], "vertical")?;
+        InjectCommand::Axis {
+            horizontal,
+            vertical,
+        } => {
             let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
             if horizontal != 0.0 {
                 frame = frame.value(Axis::Horizontal, horizontal);
@@ -3967,9 +4054,10 @@ fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
             }
             state.forward_pointer_axis(frame);
         }
-        "wheel" if rest.len() == 2 => {
-            let horizontal = parse_i32(&rest[0], "horizontal_v120")?;
-            let vertical = parse_i32(&rest[1], "vertical_v120")?;
+        InjectCommand::Wheel {
+            horizontal,
+            vertical,
+        } => {
             let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
             if horizontal != 0 {
                 frame = frame
@@ -3983,15 +4071,54 @@ fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
             }
             state.forward_pointer_axis(frame);
         }
-        _ => bail!(
-            "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical> | wheel <horizontal_v120> <vertical_v120>"
-        ),
     }
     if let Err(err) = state.display_handle.flush_clients() {
         tracing::warn!(?err, "flush clients after injected input failed");
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum InjectCommand {
+    Motion { x: f64, y: f64 },
+    CenterMotion,
+    Button { code: u32, state: ButtonState },
+    Key { code: u32, state: KeyState },
+    Axis { horizontal: f64, vertical: f64 },
+    Wheel { horizontal: i32, vertical: i32 },
+}
+
+impl InjectCommand {
+    fn parse(args: &[String]) -> Result<Self> {
+        match args {
+            [kind, x, y] if kind == "motion" => Ok(Self::Motion {
+                x: parse_f64(x, "x")?,
+                y: parse_f64(y, "y")?,
+            }),
+            [kind] if kind == "center-motion" => Ok(Self::CenterMotion),
+            [kind, code, state] if kind == "button" => Ok(Self::Button {
+                code: parse_u32(code, "button")?,
+                state: parse_button_state(state)?,
+            }),
+            [kind, code, state] if kind == "key" => Ok(Self::Key {
+                code: parse_u32(code, "key")?,
+                state: parse_key_state(state)?,
+            }),
+            [kind, horizontal, vertical] if kind == "axis" => Ok(Self::Axis {
+                horizontal: parse_f64(horizontal, "horizontal")?,
+                vertical: parse_f64(vertical, "vertical")?,
+            }),
+            [kind, horizontal, vertical] if kind == "wheel" => Ok(Self::Wheel {
+                horizontal: parse_i32(horizontal, "horizontal_v120")?,
+                vertical: parse_i32(vertical, "vertical_v120")?,
+            }),
+            [] => bail!("inject requires a kind: motion, button, key, or axis"),
+            _ => bail!(
+                "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical> | wheel <horizontal_v120> <vertical_v120>"
+            ),
+        }
+    }
 }
 
 fn monotonic_time_msec(state: &Manifold) -> u32 {
@@ -4276,11 +4403,11 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 )]
 mod tests {
     use super::{
-        ControlTarget, MissingDirectorySurfaceSessionAction, SessionSwitchOutcome, WasmPlugKind,
-        choose_cli_surface_session, control_command_for_session, format_plug_success,
-        format_session_picker_row, missing_directory_surface_session_action, parse_plug_args,
-        parse_skim_session_output, resolve_initial_query, session_marker_value,
-        surface_session_dir_new_command,
+        ControlTarget, InjectCommand, MissingDirectorySurfaceSessionAction, PlugCommand,
+        SessionSwitchOutcome, WasmPlugKind, choose_cli_surface_session,
+        control_command_for_session, format_plug_success, format_session_picker_row,
+        missing_directory_surface_session_action, parse_skim_session_output, resolve_initial_query,
+        session_marker_value, surface_session_dir_new_command,
     };
     use crate::state::SurfaceSessionSummary;
     use std::path::Path;
@@ -4293,6 +4420,28 @@ mod tests {
             windows: 0,
             working_directory: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entered_command_returns_its_exit_code_without_exiting_control_logic() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let outcome =
+            super::entered_command_outcome(std::process::ExitStatus::from_raw(37 << 8)).unwrap();
+
+        assert_eq!(outcome, crate::CommandOutcome::Exit(37));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entered_command_reports_signal_termination_as_an_error() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let err =
+            super::entered_command_outcome(std::process::ExitStatus::from_raw(9)).unwrap_err();
+
+        assert_eq!(err.to_string(), "entered command terminated by signal");
     }
 
     #[test]
@@ -4332,16 +4481,16 @@ mod tests {
 
     #[test]
     fn plug_args_default_to_auto_kind() {
-        let (kind, instance_id, path) = parse_plug_args(&["module.wasm".to_string()]).unwrap();
+        let command = PlugCommand::parse(&["module.wasm".to_string()]).unwrap();
 
-        assert_eq!(kind, WasmPlugKind::Auto);
-        assert_eq!(instance_id, None);
-        assert_eq!(path, std::path::PathBuf::from("module.wasm"));
+        assert_eq!(command.kind, WasmPlugKind::Auto);
+        assert_eq!(command.instance_id, None);
+        assert_eq!(command.path, std::path::PathBuf::from("module.wasm"));
     }
 
     #[test]
     fn plug_args_accept_kind_option() {
-        let (kind, instance_id, path) = parse_plug_args(&[
+        let command = PlugCommand::parse(&[
             "--kind".to_string(),
             "plugin".to_string(),
             "--id=rube-17".to_string(),
@@ -4349,35 +4498,70 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(kind, WasmPlugKind::Plugin);
-        assert_eq!(instance_id.as_deref(), Some("rube-17"));
-        assert_eq!(path, std::path::PathBuf::from("workspace.wasm"));
+        assert_eq!(command.kind, WasmPlugKind::Plugin);
+        assert_eq!(command.instance_id.as_deref(), Some("rube-17"));
+        assert_eq!(command.path, std::path::PathBuf::from("workspace.wasm"));
     }
 
     #[test]
     fn plug_args_accept_separate_instance_id_option() {
-        let (_, instance_id, path) = parse_plug_args(&[
+        let command = PlugCommand::parse(&[
             "--id".to_string(),
             "rube-42".to_string(),
             "worker.wasm".to_string(),
         ])
         .unwrap();
 
-        assert_eq!(instance_id.as_deref(), Some("rube-42"));
-        assert_eq!(path, std::path::PathBuf::from("worker.wasm"));
+        assert_eq!(command.instance_id.as_deref(), Some("rube-42"));
+        assert_eq!(command.path, std::path::PathBuf::from("worker.wasm"));
     }
 
     #[test]
     fn plug_args_reject_duplicate_or_empty_instance_ids() {
-        assert!(parse_plug_args(&["--id=".to_string(), "worker.wasm".to_string()]).is_err());
+        assert!(PlugCommand::parse(&["--id=".to_string(), "worker.wasm".to_string()]).is_err());
         assert!(
-            parse_plug_args(&[
+            PlugCommand::parse(&[
                 "--id=a".to_string(),
                 "--id=b".to_string(),
                 "worker.wasm".to_string()
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn plug_parser_rejects_missing_extra_and_ambiguous_forms() {
+        assert!(PlugCommand::parse(&[]).is_err());
+        assert!(
+            PlugCommand::parse(&["first.wasm".to_string(), "second.wasm".to_string()]).is_err()
+        );
+        assert!(
+            PlugCommand::parse(&[
+                "--id=first".to_string(),
+                "--id".to_string(),
+                "second".to_string(),
+                "worker.wasm".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inject_parser_builds_typed_commands_and_rejects_wrong_arity() {
+        let motion =
+            InjectCommand::parse(&["motion".to_string(), "12.5".to_string(), "-4".to_string()])
+                .unwrap();
+        assert!(matches!(motion, InjectCommand::Motion { x: 12.5, y: -4.0 }));
+
+        let missing = InjectCommand::parse(&["motion".to_string(), "12.5".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(missing.starts_with("usage: inject motion"));
+
+        let extra = InjectCommand::parse(&["center-motion".to_string(), "unexpected".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(extra.starts_with("usage: inject motion"));
     }
 
     #[test]

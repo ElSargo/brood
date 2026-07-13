@@ -27,6 +27,7 @@ calloop-wayland-source.workspace = true
 clap.workspace = true
 image.workspace = true
 manifold-wasm = { path = "../manifold-wasm" }
+num-traits.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smithay.workspace = true
@@ -41,6 +42,9 @@ wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
 zbus.workspace = true
+
+[dev-dependencies]
+wat = "1.241.2"
 
 [lints.rust]
 warnings = { level = "deny", priority = -1 }

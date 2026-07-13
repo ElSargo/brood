@@ -43,6 +43,98 @@ interface host {
         cancelled,
     }
 
+    enum filesystem-watch-error {
+        actor-stopped,
+        limit-reached,
+        invalid-handle,
+        not-permitted,
+        not-ready,
+        backend-unavailable,
+    }
+
+    enum runtime-io-error {
+        actor-stopped,
+        limit-reached,
+        not-permitted,
+        invalid-argument,
+        host-failure,
+        would-block,
+        closed,
+        invalid-handle,
+    }
+
+    variant stream-read-result {
+        data(list<u8>),
+        would-block,
+        eof,
+    }
+
+    record process-io {
+        child: u64,
+        stdin: u64,
+        stdout: u64,
+        stderr: u64,
+        resolved-command: string,
+    }
+
+    record pty-io {
+        child: u64,
+        terminal: u64,
+        resolved-command: string,
+    }
+
+    enum child-state { running, exited, signalled }
+    enum timer-state { pending, expired }
+
+    subprocess-spawn: func(command: string, arguments: list<string>) -> result<process-io, runtime-io-error>;
+    pty-spawn: func(command: string, arguments: list<string>, rows: u16, cols: u16) -> result<pty-io, runtime-io-error>;
+    worker-loopback-connect: async func(address: string) -> result<u64, runtime-io-error>;
+    stream-notification: func(handle: u64) -> result<notification-id, runtime-io-error>;
+    stream-read: func(handle: u64, max-bytes: u32) -> result<stream-read-result, runtime-io-error>;
+    stream-write: func(handle: u64, bytes: list<u8>) -> result<u32, runtime-io-error>;
+    stream-close-write: func(handle: u64) -> result<_, runtime-io-error>;
+    stream-drop: async func(handle: u64) -> result<_, runtime-io-error>;
+    child-notification: func(child: u64) -> result<notification-id, runtime-io-error>;
+    child-status: func(child: u64) -> result<tuple<child-state, option<s32>>, runtime-io-error>;
+    child-drop: async func(child: u64) -> result<_, runtime-io-error>;
+    timer-create: func(delay-ms: u64) -> result<u64, runtime-io-error>;
+    timer-notification: func(timer: u64) -> result<notification-id, runtime-io-error>;
+    timer-status: func(timer: u64) -> result<timer-state, runtime-io-error>;
+    timer-drop: async func(timer: u64) -> result<_, runtime-io-error>;
+
+    enum filesystem-event-kind {
+        created,
+        modified,
+        removed,
+        changed,
+        rescan,
+    }
+
+    record filesystem-event {
+        kind: filesystem-event-kind,
+        /// Relative path in the host platform's lossless native encoding.
+        /// Unix uses raw path bytes; Windows uses little-endian UTF-16 units.
+        path: list<u8>,
+    }
+
+    record filesystem-watch-batch {
+        generation: u64,
+        events: list<filesystem-event>,
+    }
+
+    /// A capability-rooted, actor-generation-owned filesystem subscription.
+    /// Readiness is projected into the ordinary notification/pollable model;
+    /// this resource deliberately defines no separate blocking wait.
+    resource filesystem-watch {
+        notification: func() -> result<notification-id, filesystem-watch-error>;
+        read: func() -> result<filesystem-watch-batch, filesystem-watch-error>;
+    }
+
+    filesystem-watch-create: func(
+        path: string,
+        recursive: bool,
+    ) -> result<filesystem-watch, filesystem-watch-error>;
+
     record ready-pollable {
         index: u32,
         pollable: pollable-id,
@@ -175,6 +267,25 @@ interface actor {
         token: u64,
     }
 
+    record lifecycle-entry { key: string, value: string }
+    enum start-reason { initial, replacement, session-rebind }
+    enum stop-reason { replacement, session-rebind, shutdown }
+    record start-context {
+        instance-id: string,
+        generation: u64,
+        reason: start-reason,
+        session-id: option<u64>,
+        workspace-root: string,
+        data: list<lifecycle-entry>,
+    }
+    record stop-context {
+        instance-id: string,
+        generation: u64,
+        reason: stop-reason,
+        next-generation: option<u64>,
+    }
+    variant lifecycle-event { start(start-context), stop(stop-context) }
+
     variant worker-event {
         /// The worker was admitted and its guest call was scheduled. This does
         /// not assert that it has reached a particular I/O operation.
@@ -191,6 +302,7 @@ interface actor {
         completion(completion),
         worker(worker-event),
         notification(notification-event),
+        lifecycle(lifecycle-event),
     }
 
     variant command {
@@ -198,6 +310,9 @@ interface actor {
         /// Request cooperative cancellation. The worker must reach a host call
         /// or yield point and return before the terminal cancelled event.
         cancel-worker(worker-id),
+        /// Completes the one pending start or stop hook. Hooks may span
+        /// dispatcher turns while worker/completion results arrive.
+        lifecycle-complete(result<_, string>),
         stop,
     }
 

@@ -45,9 +45,34 @@ Configured hosted actors may request `filesystem:workspace-read` or
 `filesystem:workspace-write` in `capabilities`. The daemon preopens the active
 session's working directory at guest `.` with the requested access. Without one
 of those grants, the hosted actor keeps the narrow package-directory,
-read-only default. `startup-message` queues one mailbox message after a module
-has loaded; long-lived services use it to let the actor spawn their workers
-without adding a separate host lifecycle ABI.
+read-only default.
+
+Runtime I/O authority is also explicit. `subprocess:<name>` admits one
+PATH-resolved command name, `pty` admits real pseudoterminal attachment for an
+otherwise-allowed command, and `network:loopback` admits outbound connections
+to loopback peers. These grants survive replacement and workspace rebind with
+the configured instance ID; they do not imply arbitrary process, terminal, or
+network authority.
+
+Hosted plugin watch budgets are declared in `[module.<id>.resources]`.
+`filesystem-watches` bounds live logical watch handles and
+`filesystem-watch-events` bounds queued events per handle before the queue is
+replaced by a reconciliation marker. Both values must be nonzero and may only
+narrow the daemon defaults (16 watches and 4096 events). The same typed limits
+apply to Component and Preview 1 generations and survive replacement and
+workspace-session rebind under the configured actor ID.
+
+Hosted plugins use `[module.<id>.lifecycle]` as the target lifecycle source of
+truth. `data` is a string-keyed map delivered as typed, ordered start-context
+entries; `start-timeout-ms` and `stop-timeout-ms` bound explicit guest
+completion of each hook. The context also supplies instance ID, generation,
+start reason, surface-session ID, and guest capability root. The root is always
+guest-relative and never reveals the host path. Timeouts must be non-zero.
+
+`startup-message` remains a legacy bootstrap convenience for plugins without a
+lifecycle table. Combining it with `lifecycle` is rejected rather than running
+two competing startup mechanisms. Exact parser spelling and defaults remain in
+[`config.rs`](../../crates/manifoldd/src/config.rs).
 
 For legacy core-module artifacts, the config table key remains only a module
 label. Those artifacts keep their declared actor/provider names and singular

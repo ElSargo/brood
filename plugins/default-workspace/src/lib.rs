@@ -201,6 +201,9 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32
     pack_actor_outbox(output.as_ptr() as i32, len)
 }
 
+#[no_mangle]
+pub extern "C" fn manifold_actor_workspace_subscribe_layout_state() {}
+
 fn messages_for_global_key<'a>(
     key_code: i32,
     state: &[u8],

@@ -13,6 +13,7 @@ use crate::{
     },
     api_link::EPOCH_RUN_EXPORT,
     mailbox::Mailbox,
+    resource_limits::{GenerationStoreLimits, WasmResourceLimits},
 };
 
 pub const ACTOR_EMPTY_OUTBOX: i64 = EPOCH_RUN_CONTINUE;
@@ -50,6 +51,7 @@ pub struct WasmActorConfig {
     pub inbox_arena_bytes: usize,
     pub inbox_arena_align: usize,
     pub epoch_ticks: u64,
+    pub limits: WasmResourceLimits,
 }
 
 pub struct WasmActor {
@@ -66,6 +68,7 @@ pub(crate) struct WasmActorStore {
     pub(crate) inbox_arena: Option<GuestArena>,
     pub(crate) last_message: Option<GuestAllocation>,
     current_epoch: u64,
+    limits: GenerationStoreLimits,
 }
 
 impl Default for WasmActorConfig {
@@ -74,6 +77,7 @@ impl Default for WasmActorConfig {
             inbox_arena_bytes: DEFAULT_MAILBOX_ARENA_BYTES,
             inbox_arena_align: DEFAULT_GUEST_ARENA_ALIGN,
             epoch_ticks: DEFAULT_EPOCH_TICKS,
+            limits: WasmResourceLimits::default(),
         }
     }
 }
@@ -102,6 +106,7 @@ impl WasmActor {
         run_export: &str,
     ) -> Result<Self> {
         ensure!(config.epoch_ticks > 0, "epoch ticks must be non-zero");
+        config.limits.validate()?;
 
         let engine = async_epoch_engine()?;
         let module = load_module_async(engine.clone(), path).await?;
@@ -116,10 +121,12 @@ impl WasmActor {
         run_export: &str,
     ) -> Result<Self> {
         ensure!(config.epoch_ticks > 0, "epoch ticks must be non-zero");
+        config.limits.validate()?;
 
         let linker = new_actor_linker(&engine)?;
 
-        let mut store = Store::new(&engine, WasmActorStore::new(mailbox));
+        let mut store = Store::new(&engine, WasmActorStore::new(mailbox, config.limits));
+        store.limiter(|data| &mut data.limits);
         store.set_epoch_deadline(config.epoch_ticks);
         store.epoch_deadline_async_yield_and_update(config.epoch_ticks);
 
@@ -268,12 +275,13 @@ impl WasmActor {
 }
 
 impl WasmActorStore {
-    const fn new(mailbox: Mailbox) -> Self {
+    fn new(mailbox: Mailbox, limits: WasmResourceLimits) -> Self {
         Self {
             mailbox,
             inbox_arena: None,
             last_message: None,
             current_epoch: 0,
+            limits: limits.store_limits(),
         }
     }
 }
