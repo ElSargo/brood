@@ -163,13 +163,13 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                 }
                 let workspace_filesystem = workspace_filesystem_capability(&module.capabilities);
                 state
-                    .replace_configured_wasm_plugin(&id, &module_path, workspace_filesystem)
+                    .replace_configured_wasm_plugin(
+                        &id,
+                        &module_path,
+                        workspace_filesystem,
+                        module.startup_message,
+                    )
                     .with_context(|| format!("load config module {id}"))?;
-                if let Some(message) = module.startup_message {
-                    state
-                        .send_plugin_actor_message(&id, "host".to_string(), message)
-                        .with_context(|| format!("send startup message to config module {id}"))?;
-                }
                 info!(
                     module = %id,
                     path = %module_path.display(),

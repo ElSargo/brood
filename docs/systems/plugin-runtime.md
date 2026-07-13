@@ -201,6 +201,15 @@ and operations, removes waits, closes actor-scoped resources, joins host work,
 and only then releases the address space. Session-scoped resources remain owned
 by the session service and may be reattached by a replacement actor.
 
+A configured workspace filesystem grant belongs to one actor generation and
+the active surface session that selected its capability root. Activating a
+different session is an explicit generation-rebind barrier: the host first
+stops and joins the old generation, then changes the active session, creates a
+new generation rooted at that session's working directory, republishes it under
+the stable configured actor ID, and delivers its startup message. A failed
+restart leaves the actor unavailable; it must never preserve access to the
+previous session's workspace as a fallback.
+
 Worker preparation is part of that ownership boundary. Once stopping begins, a
 preparation which returns late must drop its prepared Store, release its guest
 stack and TLS reservation, and report cancellation; it must never begin guest

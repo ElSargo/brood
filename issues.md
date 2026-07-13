@@ -6,10 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- A configured workspace filesystem grant captures the active session working
-  directory when the plugin loads. It is not retargeted when another surface
-  session becomes active. Session-scoped plugin instantiation or an explicit
-  rebind lifecycle is still needed.
 - `startup-message` is an untyped bootstrap convenience, not a complete plugin
   lifecycle interface. Manifest-level start/stop hooks and structured startup
   data remain to be designed.
@@ -92,6 +88,16 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Configured workspace grants follow active surface-session lifecycle through
+  an explicit stable-ID generation rebind. Every runtime activation path stops
+  and joins workspace-granted actor generations before changing the active
+  session, then starts new generations rooted at the target session cwd and
+  redelivers startup; a failed restart leaves the actor unavailable instead of
+  retaining old-workspace authority. The real workspace plugin proof activates
+  two live sessions with distinct directories and observes generations 1, 2,
+  and 3. Each directory receives only its own initial and active-time mutation
+  records, while hashes prove the inactive log remains unchanged and the live
+  control API confirms the expected session ID and working directory.
 - The Preview 1 workspace plugin is a stateful watch consumer, not merely an
   event logger. It maintains a sorted, atomically replaced workspace index;
   ordinary create/remove batches update membership, while any batch containing

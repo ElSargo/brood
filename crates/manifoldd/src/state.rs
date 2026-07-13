@@ -446,6 +446,13 @@ struct HostedPluginFilesystem {
     writable: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfiguredWorkspacePlugin {
+    path: PathBuf,
+    writable: bool,
+    startup_message: Option<String>,
+}
+
 impl HostedIoActor {
     fn try_send_message(&self, sender: String, body: Vec<u8>) -> Result<()> {
         match self {
@@ -650,6 +657,7 @@ pub struct Manifold {
     wasm_actor_names: Vec<String>,
     wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
     wasm_io_actors: BTreeMap<String, HostedIoActor>,
+    configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
     filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
@@ -821,6 +829,7 @@ impl Manifold {
             wasm_actor_names: Vec::new(),
             wasm_actor_tasks: Vec::new(),
             wasm_io_actors: BTreeMap::new(),
+            configured_workspace_plugins: BTreeMap::new(),
             filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
@@ -2710,12 +2719,14 @@ impl Manifold {
         if self.active_surface_session == session {
             return false;
         }
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         true
     }
 
@@ -2925,7 +2936,10 @@ impl Manifold {
         if !self.surface_sessions.contains(&session) {
             return false;
         }
-        if self.active_surface_session != session {
+        let closing_active = self.active_surface_session == session;
+        if closing_active {
+            self.stop_configured_workspace_plugins_for_rebind();
+        } else {
             self.save_active_native_session_layout();
         }
 
@@ -2938,6 +2952,9 @@ impl Manifold {
         self.restore_native_session_layout(self.active_surface_session);
         self.refresh_resolved_layout_from_native_policy();
         self.reconfigure_focus_stack();
+        if closing_active {
+            self.start_configured_workspace_plugins_after_rebind();
+        }
         if !surfaces.is_empty()
             && let Err(err) = self.display_handle.flush_clients()
         {
@@ -3076,6 +3093,7 @@ impl Manifold {
         if !self.surface_sessions.contains(&session) || self.active_surface_session == session {
             return false;
         }
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
@@ -3083,6 +3101,7 @@ impl Manifold {
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         true
     }
 
@@ -3092,6 +3111,7 @@ impl Manifold {
             .iter()
             .position(|session| *session == self.active_surface_session)
         else {
+            self.stop_configured_workspace_plugins_for_rebind();
             self.active_surface_session = self
                 .surface_sessions
                 .first()
@@ -3099,11 +3119,13 @@ impl Manifold {
                 .unwrap_or(SurfaceSessionId(1));
             self.restore_native_session_layout(self.active_surface_session);
             self.reconfigure_focus_stack();
+            self.start_configured_workspace_plugins_after_rebind();
             return true;
         };
         if self.surface_sessions.len() <= 1 {
             return false;
         }
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
         self.active_surface_session =
             self.surface_sessions[(active_index + 1) % self.surface_sessions.len()];
@@ -3112,6 +3134,7 @@ impl Manifold {
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         true
     }
 
@@ -3141,6 +3164,7 @@ impl Manifold {
         ));
         self.surface_session_working_directories
             .insert(session, directory);
+        self.stop_configured_workspace_plugins_for_rebind();
         self.save_active_native_session_layout();
         self.active_surface_session = session;
         self.restore_native_session_layout(session);
@@ -3148,6 +3172,7 @@ impl Manifold {
         self.prune_empty_unfocused_surface_sessions();
         self.refresh_resolved_layout_from_policy();
         self.reconfigure_focus_stack();
+        self.start_configured_workspace_plugins_after_rebind();
         session
     }
 
@@ -4034,6 +4059,7 @@ impl Manifold {
         module_id: &str,
         path: &Path,
         workspace_filesystem_writable: Option<bool>,
+        startup_message: Option<String>,
     ) -> Result<()> {
         ensure!(
             !module_id.trim().is_empty(),
@@ -4056,7 +4082,81 @@ impl Manifold {
         } else {
             None
         };
-        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path, filesystem)
+        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path, filesystem)?;
+        if let Some(writable) = workspace_filesystem_writable
+            && self.wasm_io_actors.contains_key(module_id)
+        {
+            self.configured_workspace_plugins.insert(
+                module_id.to_string(),
+                ConfiguredWorkspacePlugin {
+                    path: path.to_path_buf(),
+                    writable,
+                    startup_message: startup_message.clone(),
+                },
+            );
+        } else {
+            self.configured_workspace_plugins.remove(module_id);
+        }
+        if let Some(message) = startup_message {
+            self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
+        }
+        Ok(())
+    }
+
+    fn stop_configured_workspace_plugins_for_rebind(&mut self) {
+        let actor_names = self
+            .configured_workspace_plugins
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for actor_name in actor_names {
+            if let Err(error) = self.stop_hosted_io_actor(&actor_name) {
+                self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                self.plugin_actor_last_status =
+                    Some(format!("{actor_name}:workspace_rebind_stop_failed"));
+                warn!(actor = %actor_name, error = %error, "failed to stop workspace plugin before session activation");
+            }
+        }
+    }
+
+    fn start_configured_workspace_plugins_after_rebind(&mut self) {
+        let Some(host_path) = self
+            .surface_session_working_directories
+            .get(&self.active_surface_session)
+            .cloned()
+        else {
+            return;
+        };
+        let plugins = self
+            .configured_workspace_plugins
+            .iter()
+            .map(|(id, plugin)| (id.clone(), plugin.clone()))
+            .collect::<Vec<_>>();
+        for (actor_name, plugin) in plugins {
+            let filesystem = HostedPluginFilesystem {
+                host_path: host_path.clone(),
+                writable: plugin.writable,
+            };
+            let result = self
+                .replace_wasm_plugin_with_instance_id(
+                    Some(&actor_name),
+                    true,
+                    &plugin.path,
+                    Some(filesystem),
+                )
+                .and_then(|()| {
+                    if let Some(message) = plugin.startup_message {
+                        self.send_plugin_actor_message(&actor_name, "host".to_string(), message)?;
+                    }
+                    Ok(())
+                });
+            if let Err(error) = result {
+                self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                self.plugin_actor_last_status =
+                    Some(format!("{actor_name}:workspace_rebind_start_failed"));
+                warn!(actor = %actor_name, path = %plugin.path.display(), error = %error, "failed to start workspace plugin for active session");
+            }
+        }
     }
 
     fn replace_wasm_plugin_with_instance_id(
