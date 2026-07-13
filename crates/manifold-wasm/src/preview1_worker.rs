@@ -60,6 +60,9 @@ use crate::coordination::{
 use crate::filesystem_watch::{
     FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId, NativeFilesystemWatcherService,
 };
+use crate::lifecycle::{
+    PluginLifecycleEvent, PluginStartReason, PluginStopReason, wait_for_lifecycle_reply,
+};
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
@@ -109,6 +112,8 @@ const EVENT_WORKER_FINISHED: u32 = 7;
 const EVENT_WORKER_FAILED: u32 = 8;
 const EVENT_WORKER_CANCELLED: u32 = 9;
 const EVENT_NOTIFICATION: u32 = 10;
+const EVENT_LIFECYCLE_START: u32 = 11;
+const EVENT_LIFECYCLE_STOP: u32 = 12;
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 const STACK_ALIGNMENT: u32 = 16;
@@ -227,6 +232,7 @@ enum CompatEvent {
     },
     WorkerCancelled(Preview1WorkerId),
     Notification(ActorNotification),
+    Lifecycle(PluginLifecycleEvent),
 }
 
 impl CompatEvent {
@@ -254,12 +260,16 @@ impl CompatEvent {
             Self::WorkerFailed { .. } => EVENT_WORKER_FAILED,
             Self::WorkerCancelled(_) => EVENT_WORKER_CANCELLED,
             Self::Notification(_) => EVENT_NOTIFICATION,
+            Self::Lifecycle(PluginLifecycleEvent::Start(_)) => EVENT_LIFECYCLE_START,
+            Self::Lifecycle(PluginLifecycleEvent::Stop(_)) => EVENT_LIFECYCLE_STOP,
         }
     }
 
     const fn sender(&self) -> &[u8] {
         match self {
             Self::Mailbox { sender, .. } => sender.as_bytes(),
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => context.instance_id.as_bytes(),
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => context.instance_id.as_bytes(),
             _ => &[],
         }
     }
@@ -276,6 +286,9 @@ impl CompatEvent {
                 ..
             })
             | Self::WorkerFailed { message, .. } => message.as_bytes(),
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => {
+                context.workspace_root.as_bytes()
+            }
             _ => &[],
         }
     }
@@ -288,6 +301,8 @@ impl CompatEvent {
             | Self::WorkerFinished { worker, .. }
             | Self::WorkerFailed { worker, .. } => worker.raw(),
             Self::Notification(notification) => notification.notification.raw(),
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => context.generation,
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => context.generation,
             Self::Mailbox { .. } => 0,
         }
     }
@@ -300,14 +315,37 @@ impl CompatEvent {
             }) => *bytes_written,
             Self::WorkerFinished { value, .. } => *value as u64,
             Self::Notification(notification) => notification.generation,
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => match context.reason {
+                PluginStartReason::Initial => 1,
+                PluginStartReason::Replacement => 2,
+                PluginStartReason::SessionRebind => 3,
+            },
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => match context.reason {
+                PluginStopReason::Replacement => 1,
+                PluginStopReason::SessionRebind => 2,
+                PluginStopReason::Shutdown => 3,
+            },
             _ => 0,
         }
     }
 
-    const fn token(&self) -> u64 {
+    fn token(&self) -> u64 {
         match self {
             Self::Notification(notification) => notification.token,
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => {
+                context.session_id.unwrap_or(0)
+            }
+            Self::Lifecycle(PluginLifecycleEvent::Stop(context)) => {
+                context.next_generation.unwrap_or(0)
+            }
             _ => 0,
+        }
+    }
+
+    fn lifecycle_data(&self) -> &[crate::lifecycle::PluginLifecycleEntry] {
+        match self {
+            Self::Lifecycle(PluginLifecycleEvent::Start(context)) => &context.data,
+            _ => &[],
         }
     }
 }
@@ -430,6 +468,79 @@ impl host_abi::manifold_preview1::ManifoldPreview1 for Preview1Host {
         let event = self.actor_event()?;
         copy_to_guest(memory, sender, sender_len, event.sender())?;
         copy_to_guest(memory, payload, payload_len, event.payload())
+    }
+
+    fn event_lifecycle_data_count(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+    ) -> Result<u32, host_abi::types::Errno> {
+        u32::try_from(self.actor_event()?.lifecycle_data().len())
+            .map_err(|_overflow| host_abi::types::Errno::Limit)
+    }
+
+    fn event_lifecycle_key_len(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        index: u32,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.actor_event()?
+            .lifecycle_data()
+            .get(index as usize)
+            .ok_or(host_abi::types::Errno::Invalid)
+            .and_then(|entry| {
+                u32::try_from(entry.key.len()).map_err(|_overflow| host_abi::types::Errno::Limit)
+            })
+    }
+
+    fn event_lifecycle_value_len(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        index: u32,
+    ) -> Result<u32, host_abi::types::Errno> {
+        self.actor_event()?
+            .lifecycle_data()
+            .get(index as usize)
+            .ok_or(host_abi::types::Errno::Invalid)
+            .and_then(|entry| {
+                u32::try_from(entry.value.len()).map_err(|_overflow| host_abi::types::Errno::Limit)
+            })
+    }
+
+    fn event_lifecycle_data_read(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        index: u32,
+        key: wiggle::GuestPtr<u8>,
+        key_len: u32,
+        value: wiggle::GuestPtr<u8>,
+        value_len: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        let entry = self
+            .actor_event()?
+            .lifecycle_data()
+            .get(index as usize)
+            .ok_or(host_abi::types::Errno::Invalid)?;
+        copy_to_guest(memory, key, key_len, entry.key.as_bytes())?;
+        copy_to_guest(memory, value, value_len, entry.value.as_bytes())
+    }
+
+    fn lifecycle_complete(
+        &mut self,
+        memory: &mut wiggle::GuestMemory<'_>,
+        status: u32,
+        message: wiggle::GuestPtr<u8>,
+        message_len: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.ensure_actor()?;
+        let message = read_guest_string(memory, message, message_len)?;
+        let result = match status {
+            0 => Ok(()),
+            1 => Err(message),
+            _ => return Err(host_abi::types::Errno::Invalid),
+        };
+        self.commands
+            .try_send(Command::GuestLifecycleComplete(result))
+            .map_err(map_command_error)
     }
 
     fn completion_submit_read(
@@ -1620,6 +1731,26 @@ impl Preview1CompatActor {
         self.runtime.stats()
     }
 
+    pub const fn generation(&self) -> u64 {
+        self.runtime.generation
+    }
+
+    pub async fn lifecycle(
+        &self,
+        event: PluginLifecycleEvent,
+        timeout: Duration,
+    ) -> Result<(), Preview1WorkerError> {
+        let (reply, response) = oneshot::channel();
+        self.runtime
+            .commands
+            .send(Command::Lifecycle { event, reply })
+            .await
+            .map_err(|_closed| Preview1WorkerError::RuntimeStopped)?;
+        wait_for_lifecycle_reply(response, timeout)
+            .await
+            .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?
+    }
+
     /// Consume a terminal dispatcher error for daemon status reporting.
     pub fn try_take_failure(&self) -> Option<String> {
         self.runtime.try_take_terminal_error()
@@ -1672,6 +1803,11 @@ enum Command {
         input_pump: Option<(DuplexStream, mpsc::Receiver<Vec<u8>>)>,
     },
     GuestCancelWorker(Preview1WorkerId),
+    Lifecycle {
+        event: PluginLifecycleEvent,
+        reply: oneshot::Sender<Result<(), Preview1WorkerError>>,
+    },
+    GuestLifecycleComplete(std::result::Result<(), String>),
     CancelWorker {
         worker: Preview1WorkerId,
         reply: oneshot::Sender<Result<(), Preview1WorkerError>>,
@@ -1949,6 +2085,7 @@ async fn parent_loop(
     let mut worker_slots = 0_usize;
     let mut completion_open = true;
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
+    let mut pending_lifecycle: Option<oneshot::Sender<Result<(), Preview1WorkerError>>> = None;
 
     let loop_result = loop {
         if shutdown_reply.is_some()
@@ -2082,6 +2219,26 @@ async fn parent_loop(
                     continue;
                 }
                 match command {
+                    Command::Lifecycle { event, reply } => {
+                        if pending_lifecycle.is_some() {
+                            let _result = reply.send(Err(Preview1WorkerError::Guest(
+                                "lifecycle hook already pending".to_string(),
+                            )));
+                        } else {
+                            pending_lifecycle = Some(reply);
+                            actor_operations.push_front(ActorOperation::Dispatch(
+                                CompatEvent::Lifecycle(event),
+                            ));
+                        }
+                    }
+                    Command::GuestLifecycleComplete(result) => {
+                        let Some(reply) = pending_lifecycle.take() else {
+                            break Err(Preview1WorkerError::Guest(
+                                "guest completed lifecycle with no pending hook".to_string(),
+                            ));
+                        };
+                        let _result = reply.send(result.map_err(Preview1WorkerError::Guest));
+                    }
                     Command::Mailbox { sender, payload, permit, byte_permit } => {
                         // Admission was reserved before the public enqueue
                         // returned success. Retain it through dispatch so an

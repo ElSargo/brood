@@ -2,9 +2,10 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use tracing::{info, warn};
 
 use crate::state::Manifold;
@@ -99,6 +100,22 @@ struct ModuleConfig {
     capabilities: Vec<String>,
     #[serde(default, rename = "startup-message")]
     startup_message: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<ModuleLifecycleConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ModuleLifecycleConfig {
+    #[serde(default = "default_lifecycle_timeout_ms", rename = "start-timeout-ms")]
+    start_timeout_ms: u64,
+    #[serde(default = "default_lifecycle_timeout_ms", rename = "stop-timeout-ms")]
+    stop_timeout_ms: u64,
+    #[serde(default)]
+    data: BTreeMap<String, String>,
+}
+
+const fn default_lifecycle_timeout_ms() -> u64 {
+    1_000
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -149,6 +166,20 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
 
         match module.kind.as_str() {
             "wasm-plugin" | "plugin" => {
+                ensure!(
+                    module.startup_message.is_none() || module.lifecycle.is_none(),
+                    "module {id} cannot combine legacy startup-message with lifecycle"
+                );
+                if let Some(lifecycle) = &module.lifecycle {
+                    ensure!(
+                        lifecycle.start_timeout_ms > 0 && lifecycle.stop_timeout_ms > 0,
+                        "module {id} lifecycle timeouts must be non-zero"
+                    );
+                    ensure!(
+                        lifecycle.data.keys().all(|key| !key.trim().is_empty()),
+                        "module {id} lifecycle data keys must not be empty"
+                    );
+                }
                 let module_path = resolve_path(
                     config_path.parent().unwrap_or_else(|| Path::new(".")),
                     &module.path,
@@ -168,6 +199,13 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                         &module_path,
                         workspace_filesystem,
                         module.startup_message,
+                        module
+                            .lifecycle
+                            .map(|lifecycle| crate::state::ConfiguredPluginLifecycle {
+                                start_timeout: Duration::from_millis(lifecycle.start_timeout_ms),
+                                stop_timeout: Duration::from_millis(lifecycle.stop_timeout_ms),
+                                data: lifecycle.data,
+                            }),
                     )
                     .with_context(|| format!("load config module {id}"))?;
                 info!(

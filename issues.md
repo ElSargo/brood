@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- `startup-message` is an untyped bootstrap convenience, not a complete plugin
-  lifecycle interface. Manifest-level start/stop hooks and structured startup
-  data remain to be designed.
 - Watch and event-queue limits currently use runtime defaults. They are bounded,
   but plugin manifests cannot yet request narrower budgets and status output
   does not expose live watch counts or overflow totals.
@@ -88,6 +85,18 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Configured hosted actors have a typed, explicitly acknowledged lifecycle on
+  both Component and Preview 1 backends. Manifest lifecycle tables provide
+  sorted structured start data and separate nonzero start/stop bounds; legacy
+  `startup-message` cannot be mixed with the target interface. Replacement
+  constructs an unreachable candidate, completes the old stop hook, hard-joins
+  old resources regardless of hook outcome, completes candidate start while it
+  is still unreachable, and only then publishes it. Rebind and final shutdown
+  use typed reasons and the same hard-teardown fallback. The real workspace
+  plugin delegates each hook artifact append to ordinary WASI work and only
+  acknowledges a zero-result worker. Its visible logs prove generations 1, 2,
+  and 3 in ordered initial/rebind/shutdown transitions, include session, guest
+  root, instance, and manifest data, and remain byte-stable after daemon exit.
 - Configured workspace grants follow active surface-session lifecycle through
   an explicit stable-ID generation rebind. Every runtime activation path stops
   and joins workspace-granted actor generations before changing the active

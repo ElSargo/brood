@@ -5,23 +5,31 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     ptr,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
 };
 
 const EVENT_MAILBOX: u32 = 1;
 const EVENT_COMPLETION_READ: u32 = 2;
 const EVENT_COMPLETION_WRITE: u32 = 3;
 const EVENT_COMPLETION_FAILED: u32 = 5;
+const EVENT_WORKER_FINISHED: u32 = 7;
+const EVENT_LIFECYCLE_START: u32 = 11;
+const EVENT_LIFECYCLE_STOP: u32 = 12;
 const STACK_ALIGNMENT: usize = 16;
 const LOG_DIRECTORY: &str = ".manifold";
 const LOG_PATH: &str = ".manifold/workspace-file-log.log";
 const MIRROR_LOG_PATH: &str = ".manifold/workspace-file-log.mirror.log";
 const INDEX_PATH: &str = ".manifold/workspace-file-index.tsv";
 const PAUSE_ACK_PATH: &str = ".manifold/workspace-file-log.paused";
+const LIFECYCLE_LOG_PATH: &str = ".manifold/workspace-file-lifecycle.log";
 const SNAPSHOT_PATH: &str = ".manifold/workspace-file-log.snapshot";
 const SNAPSHOT_MAX_BYTES: u32 = 1024 * 1024;
 const WORKER_ARGUMENT: u32 = 1;
 const MIRROR_WORKER_ARGUMENT: u32 = 2;
+const LIFECYCLE_WORKER_ARGUMENT: u32 = 3;
 
 static WATCH_STARTED: AtomicU32 = AtomicU32::new(0);
 static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -34,6 +42,8 @@ static SNAPSHOT_READ_OPERATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_WRITE_OPERATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
 static PRIMARY_PAUSED: AtomicU32 = AtomicU32::new(0);
+static LIFECYCLE_WORKER: AtomicU64 = AtomicU64::new(0);
+static LIFECYCLE_RECORD: Mutex<Option<String>> = Mutex::new(None);
 
 #[link(wasm_import_module = "manifold_preview1")]
 unsafe extern "C" {
@@ -47,6 +57,8 @@ unsafe extern "C" {
     safe fn host_event_operation(value: *mut u64) -> u32;
     #[link_name = "event_value"]
     safe fn host_event_value(value: *mut u64) -> u32;
+    #[link_name = "event_token"]
+    safe fn host_event_token(value: *mut u64) -> u32;
     #[link_name = "event_read"]
     unsafe fn host_event_read(
         sender: *mut u8,
@@ -54,6 +66,22 @@ unsafe extern "C" {
         payload: *mut u8,
         payload_len: u32,
     ) -> u32;
+    #[link_name = "event_lifecycle_data_count"]
+    safe fn host_event_lifecycle_data_count(value: *mut u32) -> u32;
+    #[link_name = "event_lifecycle_key_len"]
+    safe fn host_event_lifecycle_key_len(index: u32, value: *mut u32) -> u32;
+    #[link_name = "event_lifecycle_value_len"]
+    safe fn host_event_lifecycle_value_len(index: u32, value: *mut u32) -> u32;
+    #[link_name = "event_lifecycle_data_read"]
+    unsafe fn host_event_lifecycle_data_read(
+        index: u32,
+        key: *mut u8,
+        key_len: u32,
+        value: *mut u8,
+        value_len: u32,
+    ) -> u32;
+    #[link_name = "lifecycle_complete"]
+    unsafe fn host_lifecycle_complete(status: u32, message: *const u8, message_len: u32) -> u32;
     #[link_name = "completion_submit_read"]
     unsafe fn host_completion_submit_read(
         path: *const u8,
@@ -132,9 +160,122 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
         EVENT_COMPLETION_READ => dispatch_snapshot_read(),
         EVENT_COMPLETION_WRITE => dispatch_snapshot_write(),
         EVENT_COMPLETION_FAILED => ERROR_CODE.store(7, Ordering::Release),
+        EVENT_LIFECYCLE_START => dispatch_lifecycle("start"),
+        EVENT_LIFECYCLE_STOP => dispatch_lifecycle("stop"),
+        EVENT_WORKER_FINISHED
+            if host_u64(host_event_operation) == Some(LIFECYCLE_WORKER.load(Ordering::Acquire)) =>
+        {
+            let worker_result = host_u64(host_event_value).unwrap_or(u64::MAX);
+            let status = if let Some(message) = lifecycle_worker_error(worker_result) {
+                unsafe { host_lifecycle_complete(1, message.as_ptr(), message.len() as u32) }
+            } else {
+                unsafe { host_lifecycle_complete(0, ptr::null(), 0) }
+            };
+            if status != 0 {
+                ERROR_CODE.store(21, Ordering::Release);
+            }
+        }
         _ => {}
     }
     0
+}
+
+fn lifecycle_worker_error(worker_result: u64) -> Option<String> {
+    (worker_result != 0).then(|| format!("lifecycle artifact worker returned {worker_result}"))
+}
+
+fn dispatch_lifecycle(kind: &str) {
+    if kind == "start" && !start_watches() {
+        complete_lifecycle_error(b"watch setup failed");
+        return;
+    }
+    let Some((instance, workspace)) = read_event_with_sender() else {
+        complete_lifecycle_error(b"lifecycle context unavailable");
+        return;
+    };
+    let generation = host_u64(host_event_operation).unwrap_or(0);
+    let reason = match (kind, host_u64(host_event_value).unwrap_or(0)) {
+        ("start", 1) => "initial",
+        ("start", 2) => "replacement",
+        ("start", 3) => "session-rebind",
+        ("stop", 1) => "replacement",
+        ("stop", 2) => "session-rebind",
+        ("stop", 3) => "shutdown",
+        _ => "unknown",
+    };
+    let related = host_u64(host_event_token).unwrap_or(0);
+    let mut data = Vec::new();
+    let count = host_u32(host_event_lifecycle_data_count).unwrap_or(0);
+    for index in 0..count {
+        let mut key_len = 0;
+        let mut value_len = 0;
+        if host_event_lifecycle_key_len(index, &raw mut key_len) != 0
+            || host_event_lifecycle_value_len(index, &raw mut value_len) != 0
+        {
+            continue;
+        }
+        let mut key = vec![0; key_len as usize];
+        let mut value = vec![0; value_len as usize];
+        let status = unsafe {
+            host_event_lifecycle_data_read(
+                index,
+                key.as_mut_ptr(),
+                key_len,
+                value.as_mut_ptr(),
+                value_len,
+            )
+        };
+        if status == 0 {
+            data.push(format!(
+                "{}={}",
+                String::from_utf8_lossy(&key),
+                String::from_utf8_lossy(&value)
+            ));
+        }
+    }
+    data.sort();
+    let record = format!(
+        "{kind}\tgeneration={generation}\treason={reason}\trelated={related}\tinstance={}\tworkspace={}\tdata={}\n",
+        String::from_utf8_lossy(&instance),
+        String::from_utf8_lossy(&workspace),
+        data.join(",")
+    );
+    if let Ok(mut slot) = LIFECYCLE_RECORD.lock() {
+        *slot = Some(record);
+    }
+    let mut worker = 0;
+    if host_worker_spawn(LIFECYCLE_WORKER_ARGUMENT, &raw mut worker) == 0 {
+        LIFECYCLE_WORKER.store(worker, Ordering::Release);
+    } else {
+        complete_lifecycle_error(b"lifecycle worker failed");
+    }
+}
+
+fn complete_lifecycle_error(message: &[u8]) {
+    let _ = unsafe { host_lifecycle_complete(1, message.as_ptr(), message.len() as u32) };
+}
+
+fn start_watches() -> bool {
+    if WATCH_STARTED
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return true;
+    }
+    let Some((watch, notification)) = create_recursive_watch() else {
+        return false;
+    };
+    let Some((mirror_watch, mirror_notification)) = create_recursive_watch() else {
+        return false;
+    };
+    WATCH.store(watch, Ordering::Release);
+    NOTIFICATION.store(notification, Ordering::Release);
+    MIRROR_WATCH.store(mirror_watch, Ordering::Release);
+    MIRROR_NOTIFICATION.store(mirror_notification, Ordering::Release);
+    let mut worker = 0;
+    let mut mirror_worker = 0;
+    host_worker_spawn(WORKER_ARGUMENT, &raw mut worker) == 0
+        && host_worker_spawn(MIRROR_WORKER_ARGUMENT, &raw mut mirror_worker) == 0
 }
 
 fn dispatch_mailbox() {
@@ -259,6 +400,19 @@ fn dispatch_snapshot_write() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
+    if argument == LIFECYCLE_WORKER_ARGUMENT {
+        return match LIFECYCLE_RECORD
+            .lock()
+            .ok()
+            .and_then(|mut record| record.take())
+        {
+            Some(record) => fs::create_dir_all(LOG_DIRECTORY)
+                .and_then(|()| open_log(LIFECYCLE_LOG_PATH))
+                .and_then(|mut log| log.write_all(record.as_bytes()))
+                .map_or(23, |()| 0),
+            None => 24,
+        };
+    }
     let resources = match argument {
         WORKER_ARGUMENT => (
             WATCH.load(Ordering::Acquire),
@@ -622,4 +776,22 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
     value
         .checked_add(alignment.checked_sub(1)?)
         .map(|value| value & !(alignment - 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lifecycle_worker_error;
+
+    #[test]
+    fn lifecycle_completion_requires_a_successful_artifact_worker() {
+        assert_eq!(lifecycle_worker_error(0), None);
+        assert_eq!(
+            lifecycle_worker_error(23).as_deref(),
+            Some("lifecycle artifact worker returned 23")
+        );
+        assert_eq!(
+            lifecycle_worker_error(24).as_deref(),
+            Some("lifecycle artifact worker returned 24")
+        );
+    }
 }

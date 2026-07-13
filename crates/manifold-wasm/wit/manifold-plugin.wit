@@ -217,6 +217,25 @@ interface actor {
         token: u64,
     }
 
+    record lifecycle-entry { key: string, value: string }
+    enum start-reason { initial, replacement, session-rebind }
+    enum stop-reason { replacement, session-rebind, shutdown }
+    record start-context {
+        instance-id: string,
+        generation: u64,
+        reason: start-reason,
+        session-id: option<u64>,
+        workspace-root: string,
+        data: list<lifecycle-entry>,
+    }
+    record stop-context {
+        instance-id: string,
+        generation: u64,
+        reason: stop-reason,
+        next-generation: option<u64>,
+    }
+    variant lifecycle-event { start(start-context), stop(stop-context) }
+
     variant worker-event {
         /// The worker was admitted and its guest call was scheduled. This does
         /// not assert that it has reached a particular I/O operation.
@@ -233,6 +252,7 @@ interface actor {
         completion(completion),
         worker(worker-event),
         notification(notification-event),
+        lifecycle(lifecycle-event),
     }
 
     variant command {
@@ -240,6 +260,9 @@ interface actor {
         /// Request cooperative cancellation. The worker must reach a host call
         /// or yield point and return before the terminal cancelled event.
         cancel-worker(worker-id),
+        /// Completes the one pending start or stop hook. Hooks may span
+        /// dispatcher turns while worker/completion results arrive.
+        lifecycle-complete(result<_, string>),
         stop,
     }
 

@@ -451,6 +451,14 @@ struct ConfiguredWorkspacePlugin {
     path: PathBuf,
     writable: bool,
     startup_message: Option<String>,
+    lifecycle: Option<ConfiguredPluginLifecycle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredPluginLifecycle {
+    pub start_timeout: Duration,
+    pub stop_timeout: Duration,
+    pub data: BTreeMap<String, String>,
 }
 
 impl HostedIoActor {
@@ -467,6 +475,34 @@ impl HostedIoActor {
         match self {
             Self::Component(_) => "wasm-component",
             Self::Preview1(_) => "wasm-preview1-compat",
+        }
+    }
+
+    const fn generation(&self) -> u64 {
+        match self {
+            Self::Component(actor) => actor.generation(),
+            Self::Preview1(actor) => actor.generation(),
+        }
+    }
+
+    async fn lifecycle(
+        &self,
+        event: manifold_wasm::PluginLifecycleEvent,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Component(actor) => actor.lifecycle(event, timeout).await,
+            Self::Preview1(actor) => actor
+                .lifecycle(event, timeout)
+                .await
+                .map_err(anyhow::Error::from),
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Component(actor) => actor.shutdown().await,
+            Self::Preview1(actor) => actor.shutdown().await.map_err(anyhow::Error::from),
         }
     }
 }
@@ -658,6 +694,7 @@ pub struct Manifold {
     wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
     wasm_io_actors: BTreeMap<String, HostedIoActor>,
     configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
+    configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
     filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
@@ -830,6 +867,7 @@ impl Manifold {
             wasm_actor_tasks: Vec::new(),
             wasm_io_actors: BTreeMap::new(),
             configured_workspace_plugins: BTreeMap::new(),
+            configured_plugin_lifecycles: BTreeMap::new(),
             filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
@@ -4043,7 +4081,7 @@ impl Manifold {
     }
 
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
-        self.replace_wasm_plugin_with_instance_id(None, false, path, None)
+        self.replace_wasm_plugin_with_instance_id(None, false, path, None, None)
     }
 
     pub(crate) fn replace_wasm_plugin_as(&mut self, instance_id: &str, path: &Path) -> Result<()> {
@@ -4051,7 +4089,14 @@ impl Manifold {
             !instance_id.trim().is_empty(),
             "WASM plugin instance id must not be empty"
         );
-        self.replace_wasm_plugin_with_instance_id(Some(instance_id), false, path, None)
+        let lifecycle = self.configured_plugin_lifecycles.get(instance_id).cloned();
+        self.replace_wasm_plugin_with_instance_id(
+            Some(instance_id),
+            false,
+            path,
+            None,
+            lifecycle.map(|config| (config, manifold_wasm::PluginStartReason::Replacement)),
+        )
     }
 
     pub(crate) fn replace_configured_wasm_plugin(
@@ -4060,11 +4105,13 @@ impl Manifold {
         path: &Path,
         workspace_filesystem_writable: Option<bool>,
         startup_message: Option<String>,
+        lifecycle: Option<ConfiguredPluginLifecycle>,
     ) -> Result<()> {
         ensure!(
             !module_id.trim().is_empty(),
             "configured WASM module id must not be empty"
         );
+        let replacing = self.wasm_io_actors.contains_key(module_id);
         // Component and Preview 1 artifacts use the config table key as their
         // hosted actor id. Legacy core artifacts predate that namespace: the
         // key remains a config label while their declared names retain the
@@ -4082,7 +4129,18 @@ impl Manifold {
         } else {
             None
         };
-        self.replace_wasm_plugin_with_instance_id(Some(module_id), true, path, filesystem)?;
+        let start_reason = if replacing {
+            manifold_wasm::PluginStartReason::Replacement
+        } else {
+            manifold_wasm::PluginStartReason::Initial
+        };
+        self.replace_wasm_plugin_with_instance_id(
+            Some(module_id),
+            true,
+            path,
+            filesystem,
+            lifecycle.clone().map(|config| (config, start_reason)),
+        )?;
         if let Some(writable) = workspace_filesystem_writable
             && self.wasm_io_actors.contains_key(module_id)
         {
@@ -4092,10 +4150,19 @@ impl Manifold {
                     path: path.to_path_buf(),
                     writable,
                     startup_message: startup_message.clone(),
+                    lifecycle: lifecycle.clone(),
                 },
             );
         } else {
             self.configured_workspace_plugins.remove(module_id);
+        }
+        if self.wasm_io_actors.contains_key(module_id) {
+            if let Some(lifecycle) = lifecycle {
+                self.configured_plugin_lifecycles
+                    .insert(module_id.to_string(), lifecycle);
+            } else {
+                self.configured_plugin_lifecycles.remove(module_id);
+            }
         }
         if let Some(message) = startup_message {
             self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
@@ -4110,7 +4177,14 @@ impl Manifold {
             .cloned()
             .collect::<Vec<_>>();
         for actor_name in actor_names {
-            if let Err(error) = self.stop_hosted_io_actor(&actor_name) {
+            let lifecycle_result = self.stop_hosted_io_actor_lifecycle(
+                &actor_name,
+                manifold_wasm::PluginStopReason::SessionRebind,
+                None,
+            );
+            let hard_result = self.stop_hosted_io_actor(&actor_name);
+            let result = lifecycle_result.and(hard_result);
+            if let Err(error) = result {
                 self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                 self.plugin_actor_last_status =
                     Some(format!("{actor_name}:workspace_rebind_stop_failed"));
@@ -4143,6 +4217,10 @@ impl Manifold {
                     true,
                     &plugin.path,
                     Some(filesystem),
+                    plugin
+                        .lifecycle
+                        .clone()
+                        .map(|config| (config, manifold_wasm::PluginStartReason::SessionRebind)),
                 )
                 .and_then(|()| {
                     if let Some(message) = plugin.startup_message {
@@ -4159,12 +4237,77 @@ impl Manifold {
         }
     }
 
+    fn start_candidate_lifecycle(
+        &self,
+        actor_name: &str,
+        actor: &HostedIoActor,
+        lifecycle: &ConfiguredPluginLifecycle,
+        reason: manifold_wasm::PluginStartReason,
+    ) -> Result<()> {
+        let runtime = self
+            .async_runtime
+            .clone()
+            .context("async runtime is not initialized")?;
+        let context = manifold_wasm::PluginStartContext {
+            instance_id: actor_name.to_string(),
+            generation: actor.generation(),
+            reason,
+            session_id: Some(self.active_surface_session.raw()),
+            workspace_root: ".".to_string(),
+            data: lifecycle
+                .data
+                .iter()
+                .map(|(key, value)| manifold_wasm::PluginLifecycleEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        };
+        runtime
+            .block_on(actor.lifecycle(
+                manifold_wasm::PluginLifecycleEvent::Start(context),
+                lifecycle.start_timeout,
+            ))
+            .context("plugin start lifecycle failed")
+    }
+
+    fn stop_hosted_io_actor_lifecycle(
+        &mut self,
+        actor_name: &str,
+        reason: manifold_wasm::PluginStopReason,
+        next_generation: Option<u64>,
+    ) -> Result<()> {
+        let Some(lifecycle) = self.configured_plugin_lifecycles.get(actor_name).cloned() else {
+            return Ok(());
+        };
+        let Some(actor) = self.wasm_io_actors.get(actor_name) else {
+            return Ok(());
+        };
+        let runtime = self
+            .async_runtime
+            .clone()
+            .context("async runtime is not initialized")?;
+        let context = manifold_wasm::PluginStopContext {
+            instance_id: actor_name.to_string(),
+            generation: actor.generation(),
+            reason,
+            next_generation,
+        };
+        runtime
+            .block_on(actor.lifecycle(
+                manifold_wasm::PluginLifecycleEvent::Stop(context),
+                lifecycle.stop_timeout,
+            ))
+            .context("plugin stop lifecycle failed")
+    }
+
     fn replace_wasm_plugin_with_instance_id(
         &mut self,
         instance_id: Option<&str>,
         allow_legacy_config_label: bool,
         path: &Path,
         filesystem: Option<HostedPluginFilesystem>,
+        lifecycle: Option<(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
     ) -> Result<()> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.wasm_threads(true).shared_memory(true);
@@ -4176,7 +4319,7 @@ impl Manifold {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref())
+                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref())
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
@@ -4188,7 +4331,12 @@ impl Manifold {
         if manifold_wasm::declares_preview1_compat(&module) {
             let instance_id =
                 instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
-            return self.replace_wasm_preview1_actor(&instance_id, path, filesystem.as_ref());
+            return self.replace_wasm_preview1_actor(
+                &instance_id,
+                path,
+                filesystem.as_ref(),
+                lifecycle.as_ref(),
+            );
         }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
         ensure!(
@@ -4222,6 +4370,7 @@ impl Manifold {
         actor_name: &str,
         path: &Path,
         filesystem: Option<&HostedPluginFilesystem>,
+        lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4251,11 +4400,25 @@ impl Manifold {
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
-        // Once the candidate is known-good, fully join the old generation
-        // before making the replacement reachable under the stable id.
+        let mut candidate = HostedIoActor::Component(actor);
+        let next_generation = candidate.generation();
+        if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+            actor_name,
+            manifold_wasm::PluginStopReason::Replacement,
+            Some(next_generation),
+        ) {
+            warn!(actor = %actor_name, error = %error, "old plugin stop hook failed; continuing hard replacement teardown");
+        }
         self.stop_hosted_io_actor(actor_name)?;
+        if let Some((config, reason)) = lifecycle
+            && let Err(error) =
+                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason)
+        {
+            let _ = runtime.block_on(candidate.shutdown());
+            return Err(error);
+        }
         self.wasm_io_actors
-            .insert(actor_name.to_string(), HostedIoActor::Component(actor));
+            .insert(actor_name.to_string(), candidate);
         self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
         info!(actor = %actor_name, path = %path.display(), "started component plugin actor");
         Ok(())
@@ -4266,6 +4429,7 @@ impl Manifold {
         actor_name: &str,
         path: &Path,
         filesystem: Option<&HostedPluginFilesystem>,
+        lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4293,11 +4457,25 @@ impl Manifold {
                 self.filesystem_watcher_service.clone(),
             ),
         )?;
-        // All work owned by the old generation is joined before the candidate
-        // is published under the stable id.
+        let mut candidate = HostedIoActor::Preview1(actor);
+        let next_generation = candidate.generation();
+        if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+            actor_name,
+            manifold_wasm::PluginStopReason::Replacement,
+            Some(next_generation),
+        ) {
+            warn!(actor = %actor_name, error = %error, "old plugin stop hook failed; continuing hard replacement teardown");
+        }
         self.stop_hosted_io_actor(actor_name)?;
+        if let Some((config, reason)) = lifecycle
+            && let Err(error) =
+                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason)
+        {
+            let _ = runtime.block_on(candidate.shutdown());
+            return Err(error);
+        }
         self.wasm_io_actors
-            .insert(actor_name.to_string(), HostedIoActor::Preview1(actor));
+            .insert(actor_name.to_string(), candidate);
         self.plugin_actor_last_status = Some(format!("{actor_name}:preview1_started"));
         info!(actor = %actor_name, path = %path.display(), "started Preview 1 compatibility plugin actor");
         Ok(())
@@ -4381,6 +4559,13 @@ impl Manifold {
         let actor_names = self.wasm_io_actors.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
         for actor_name in actor_names {
+            if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+                &actor_name,
+                manifold_wasm::PluginStopReason::Shutdown,
+                None,
+            ) {
+                warn!(actor = %actor_name, error = %error, "plugin graceful shutdown hook failed; continuing hard teardown");
+            }
             if let Err(error) = self.stop_hosted_io_actor(&actor_name) {
                 warn!(actor = %actor_name, error = %error, "failed to join hosted I/O actor during shutdown");
                 if first_error.is_none() {

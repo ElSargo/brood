@@ -201,12 +201,28 @@ and operations, removes waits, closes actor-scoped resources, joins host work,
 and only then releases the address space. Session-scoped resources remain owned
 by the session service and may be reattached by a replacement actor.
 
+Configured hosted actors receive typed `start` and `stop` lifecycle contexts on
+the reserved system lane. Dispatch return is not acknowledgement: a hook may
+span worker or completion turns and ends only when the guest explicitly
+reports lifecycle completion. Start and stop have separate manifest bounds.
+Failure or timeout is terminal for that hook, after which the host performs
+hard generation teardown and joins every owned resource.
+
+Replacement constructs an unreachable candidate first. The old generation's
+stop hook receives the candidate generation, then the host hard-joins the old
+generation. The candidate start hook runs while it is still unreachable; only
+successful completion publishes it under the stable ID. A failed start is
+hard-joined and leaves the ID unavailable. Session rebind uses the same stop
+and start hooks around the authority change, while final daemon teardown uses
+the `shutdown` stop reason. No old-generation work may mutate state after the
+next generation is reachable or after final shutdown returns.
+
 A configured workspace filesystem grant belongs to one actor generation and
 the active surface session that selected its capability root. Activating a
 different session is an explicit generation-rebind barrier: the host first
 stops and joins the old generation, then changes the active session, creates a
 new generation rooted at that session's working directory, republishes it under
-the stable configured actor ID, and delivers its startup message. A failed
+the stable configured actor ID, and completes its structured start hook. A failed
 restart leaves the actor unavailable; it must never preserve access to the
 previous session's workspace as a fallback.
 

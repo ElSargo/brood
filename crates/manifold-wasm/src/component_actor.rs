@@ -40,6 +40,8 @@ use crate::filesystem_watch::{
     FilesystemWatchBatchEvent, FilesystemWatchError, FilesystemWatchEventKind, FilesystemWatchHub,
     FilesystemWatchId, NativeFilesystemWatcherService,
 };
+use crate::lifecycle::wait_for_lifecycle_reply;
+use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
@@ -66,7 +68,7 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use tokio::{
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time::Duration,
 };
@@ -1019,6 +1021,10 @@ enum RuntimeCommand {
         byte_permit: GenerationBytePermit,
     },
     CancelWorker(WorkerId),
+    Lifecycle {
+        event: PluginLifecycleEvent,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -1214,6 +1220,19 @@ impl ComponentActor {
 
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Deliver one typed lifecycle hook and wait for explicit guest completion.
+    pub async fn lifecycle(&self, event: PluginLifecycleEvent, timeout: Duration) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::Lifecycle { event, reply })
+            .await
+            .context("send component lifecycle event")?;
+        wait_for_lifecycle_reply(response, timeout)
+            .await
+            .context("wait for component lifecycle hook")?
+            .map_err(anyhow::Error::msg)
     }
 
     pub const fn completion_io(&self) -> &CompletionIo {
@@ -1564,6 +1583,7 @@ async fn run_component_event_loop(
     let mut dispatcher_busy = false;
     let mut active_workers = HashSet::new();
     let mut cancelled_workers = HashSet::new();
+    let mut pending_lifecycle: Option<oneshot::Sender<std::result::Result<(), String>>> = None;
     let mut dispatch_lane = 0_usize;
 
     loop {
@@ -1644,6 +1664,15 @@ async fn run_component_event_loop(
                         &mut cancelled_workers,
                     )?;
                 }
+                Some(RuntimeCommand::Lifecycle { event, reply }) => {
+                    ensure!(pending_lifecycle.is_none(), "component lifecycle hook already pending");
+                    enqueue_dispatch(
+                        &mut system_queue,
+                        component_system_capacity(config),
+                        component_lifecycle_to_guest(event),
+                    )?;
+                    pending_lifecycle = Some(reply);
+                }
                 Some(RuntimeCommand::Shutdown) | None => break,
             },
             completion = io_completions.recv(), if completion_queue.len() < config.max_outstanding_io => {
@@ -1717,6 +1746,12 @@ async fn run_component_event_loop(
                                                 &active_workers,
                                                 &mut cancelled_workers,
                                             )?;
+                                        }
+                                        abi::Command::LifecycleComplete(result) => {
+                                            let reply = pending_lifecycle.take().context(
+                                                "component guest completed lifecycle with no pending hook",
+                                            )?;
+                                            let _ = reply.send(result);
                                         }
                                         abi::Command::Stop => return Ok(()),
                                     }
@@ -1858,6 +1893,48 @@ async fn run_component_event_loop(
         }
     }
     Ok(())
+}
+
+fn component_lifecycle_to_guest(event: PluginLifecycleEvent) -> GuestEvent {
+    use bindings::exports::manifold::plugin::actor as abi;
+    let event = match event {
+        PluginLifecycleEvent::Start(context) => {
+            let reason = match context.reason {
+                PluginStartReason::Initial => abi::StartReason::Initial,
+                PluginStartReason::Replacement => abi::StartReason::Replacement,
+                PluginStartReason::SessionRebind => abi::StartReason::SessionRebind,
+            };
+            abi::LifecycleEvent::Start(abi::StartContext {
+                instance_id: context.instance_id,
+                generation: context.generation,
+                reason,
+                session_id: context.session_id,
+                workspace_root: context.workspace_root,
+                data: context
+                    .data
+                    .into_iter()
+                    .map(|entry| abi::LifecycleEntry {
+                        key: entry.key,
+                        value: entry.value,
+                    })
+                    .collect(),
+            })
+        }
+        PluginLifecycleEvent::Stop(context) => {
+            let reason = match context.reason {
+                PluginStopReason::Replacement => abi::StopReason::Replacement,
+                PluginStopReason::SessionRebind => abi::StopReason::SessionRebind,
+                PluginStopReason::Shutdown => abi::StopReason::Shutdown,
+            };
+            abi::LifecycleEvent::Stop(abi::StopContext {
+                instance_id: context.instance_id,
+                generation: context.generation,
+                reason,
+                next_generation: context.next_generation,
+            })
+        }
+    };
+    abi::Event::Lifecycle(event)
 }
 
 fn pop_component_dispatch(

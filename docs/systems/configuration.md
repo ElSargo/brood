@@ -45,9 +45,19 @@ Configured hosted actors may request `filesystem:workspace-read` or
 `filesystem:workspace-write` in `capabilities`. The daemon preopens the active
 session's working directory at guest `.` with the requested access. Without one
 of those grants, the hosted actor keeps the narrow package-directory,
-read-only default. `startup-message` queues one mailbox message after a module
-has loaded; long-lived services use it to let the actor spawn their workers
-without adding a separate host lifecycle ABI.
+read-only default.
+
+Hosted plugins use `[module.<id>.lifecycle]` as the target lifecycle source of
+truth. `data` is a string-keyed map delivered as typed, ordered start-context
+entries; `start-timeout-ms` and `stop-timeout-ms` bound explicit guest
+completion of each hook. The context also supplies instance ID, generation,
+start reason, surface-session ID, and guest capability root. The root is always
+guest-relative and never reveals the host path. Timeouts must be non-zero.
+
+`startup-message` remains a legacy bootstrap convenience for plugins without a
+lifecycle table. Combining it with `lifecycle` is rejected rather than running
+two competing startup mechanisms. Exact parser spelling and defaults remain in
+[`config.rs`](../../crates/manifoldd/src/config.rs).
 
 For legacy core-module artifacts, the config table key remains only a module
 label. Those artifacts keep their declared actor/provider names and singular

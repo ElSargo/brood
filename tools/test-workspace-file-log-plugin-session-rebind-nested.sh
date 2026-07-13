@@ -57,6 +57,7 @@ status = json.loads(sys.argv[3])
 sessions = json.loads(sys.argv[4])
 assert status["active_surface_session"] == expected_id, status
 assert status["plugin_actor_failures"] == 0, status
+assert status["preview1_compat_last_worker_value"] == 0, status
 actors = {actor[0]: actor for actor in status["plugin_actors"]}
 assert actors["workspace-file-log"][1] == "wasm-preview1-compat", actors
 assert sessions["active"] == expected_id, sessions
@@ -71,8 +72,15 @@ run_controller() {
   local second="$2"
   local first_log="$first/.manifold/workspace-file-log.log"
   local second_log="$second/.manifold/workspace-file-log.log"
+  local first_lifecycle="$first/.manifold/workspace-file-lifecycle.log"
+  local second_lifecycle="$second/.manifold/workspace-file-lifecycle.log"
 
   wait_for_record "$first_log" initial first-only.txt
+  for _ in $(seq 1 200); do
+    [[ -f "$first_lifecycle" ]] && grep -q $'^start\t.*reason=initial.*instance=workspace-file-log.*workspace=\..*data=mode=watch,profile=observable$' "$first_lifecycle" && break
+    sleep 0.05
+  done
+  grep -q $'^start\t.*reason=initial.*instance=workspace-file-log.*workspace=\..*data=mode=watch,profile=observable$' "$first_lifecycle"
   local first_session first_generation
   read -r first_session first_generation < <(
     ctl status-json | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["active_surface_session"], s["preview1_compat_generation"])'
@@ -86,6 +94,8 @@ run_controller() {
   assert_session "$second_session" "$second"
   local second_generation
   second_generation="$(wait_for_generation_after "$first_generation")"
+  grep -q $'^stop\t.*reason=session-rebind' "$first_lifecycle"
+  grep -q $'^start\t.*reason=session-rebind' "$second_lifecycle"
 
   # Keep the second session live after switching away so the test exercises
   # repeated activation of two real sessions rather than recreation.
@@ -103,6 +113,8 @@ run_controller() {
   ctl surface-session switch "$first_session" >/dev/null
   assert_session "$first_session" "$first"
   wait_for_generation_after "$second_generation" >/dev/null
+  grep -q $'^stop\t.*reason=session-rebind' "$second_lifecycle"
+  [[ "$(grep -c $'^start\t' "$first_lifecycle")" == 2 ]]
   printf 'first active again\n' > "$first/first-active-again.txt"
   wait_for_record "$first_log" created first-active-again.txt
   [[ "$(sha256sum "$second_log")" == "$second_hash" ]]
@@ -139,7 +151,10 @@ printf '%s\n' \
   'kind = "plugin"' \
   "path = \"$PLUGIN\"" \
   'capabilities = ["filesystem:workspace-write"]' \
-  'startup-message = "start"' > "$CONFIG"
+  '[module.workspace-file-log.lifecycle]' \
+  'start-timeout-ms = 2000' \
+  'stop-timeout-ms = 2000' \
+  'data = { mode = "watch", profile = "observable" }' > "$CONFIG"
 
 TEST_LOG="$OUT/test.log"
 (
@@ -155,5 +170,18 @@ TEST_LOG="$OUT/test.log"
 grep -qx 'topology=outer-supervisor' "$TEST_LOG"
 grep -qx 'outer_presentation=offscreen' "$TEST_LOG"
 grep -q 'workspace_file_log_session_rebind=ok' "$OUT/nested/inner.log"
+
+FIRST_LIFECYCLE="$FIRST/.manifold/workspace-file-lifecycle.log"
+SECOND_LIFECYCLE="$SECOND/.manifold/workspace-file-lifecycle.log"
+grep -q $'^stop\t.*reason=shutdown' "$FIRST_LIFECYCLE"
+[[ "$(grep -c $'^start\t' "$FIRST_LIFECYCLE")" == 2 ]]
+[[ "$(grep -c $'^stop\t' "$FIRST_LIFECYCLE")" == 2 ]]
+[[ "$(grep -c $'^start\t' "$SECOND_LIFECYCLE")" == 1 ]]
+[[ "$(grep -c $'^stop\t' "$SECOND_LIFECYCLE")" == 1 ]]
+FIRST_HASH="$(sha256sum "$FIRST_LIFECYCLE")"
+SECOND_HASH="$(sha256sum "$SECOND_LIFECYCLE")"
+sleep 0.2
+[[ "$(sha256sum "$FIRST_LIFECYCLE")" == "$FIRST_HASH" ]]
+[[ "$(sha256sum "$SECOND_LIFECYCLE")" == "$SECOND_HASH" ]]
 
 echo "workspace_file_log_session_rebind_nested=ok out=$OUT"

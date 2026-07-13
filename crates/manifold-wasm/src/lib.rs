@@ -15,6 +15,7 @@ mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
 pub mod layout_policy;
+mod lifecycle;
 pub mod mailbox;
 pub mod module;
 mod module_link;
@@ -64,6 +65,10 @@ pub use global_key_policy_link::{
 pub use layout_policy::{
     InputBehavior, LayoutItemId, LayoutItemKind, LayoutSize, LocalPoint, LocalTransform,
     ResolvedLayout, ResolvedLayoutItem,
+};
+pub use lifecycle::{
+    PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext, PluginStartReason,
+    PluginStopContext, PluginStopReason,
 };
 pub use mailbox::{
     ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxRegistry,

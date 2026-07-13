@@ -93,3 +93,12 @@ The active workspace gains its own log, mirror, and index plus records for
 mutations made while it is active; byte hashes prove the inactive workspace's
 log remains unchanged. The preserved directories printed by the test make the
 absence of cross-workspace files and log records directly inspectable.
+
+The same workload is the typed lifecycle proof. Each start or stop hook captures
+the structured host context, delegates an append to a worker with ordinary WASI
+filesystem access, and reports lifecycle completion only after that worker
+finishes. `.manifold/workspace-file-lifecycle.log` records generation, reason,
+related session or generation, instance ID, guest root, and sorted manifest
+data. After the nested daemon exits the active workspace ends with
+`reason=shutdown`; stable hashes after exit prove the joined generation cannot
+append afterward.
