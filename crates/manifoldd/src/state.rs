@@ -2483,38 +2483,79 @@ impl Manifold {
             service_request(self, request);
         }
 
-        if !self.test_harness.is_complete()
-            && let Some(completion) = harness.try_take_completion()
-        {
-            match completion.kind {
-                TestHarnessOutcomeKind::Passed => {
-                    info!(detail = %completion.detail, "test harness passed");
-                    self.loop_signal.stop();
+        if !self.test_harness.is_complete() {
+            match harness.try_take_completion() {
+                Ok(Some(completion)) => self.record_test_harness_completion(completion),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(?err, "test harness lifecycle transition rejected");
+                    self.record_test_harness_completion(TestHarnessCompletion {
+                        kind: TestHarnessOutcomeKind::Failed,
+                        exit_code: 1,
+                        detail: err.to_string(),
+                    });
                 }
-                TestHarnessOutcomeKind::Failed => {
-                    warn!(
-                        exit_code = completion.exit_code,
-                        detail = %completion.detail,
-                        "test harness failed"
-                    );
-                    self.loop_signal.stop();
-                }
-                TestHarnessOutcomeKind::Paused => {
-                    warn!(
-                        exit_code = completion.exit_code,
-                        detail = %completion.detail,
-                        "test harness paused for interactive inspection"
-                    );
-                }
-            }
-            if let Err(err) = self.test_harness.record_completion(completion) {
-                warn!(err, "test harness completion transition rejected");
             }
         }
 
         if let Err(err) = self.test_harness.restore_runtime(harness) {
             warn!(err, "test harness runtime ownership transition rejected");
         }
+    }
+
+    fn record_test_harness_completion(&mut self, completion: TestHarnessCompletion) {
+        match completion.kind {
+            TestHarnessOutcomeKind::Passed => {
+                info!(detail = %completion.detail, "test harness passed");
+                self.loop_signal.stop();
+            }
+            TestHarnessOutcomeKind::Failed => {
+                warn!(
+                    exit_code = completion.exit_code,
+                    detail = %completion.detail,
+                    "test harness failed"
+                );
+                self.loop_signal.stop();
+            }
+            TestHarnessOutcomeKind::Paused => {
+                warn!(
+                    exit_code = completion.exit_code,
+                    detail = %completion.detail,
+                    "test harness paused for interactive inspection"
+                );
+            }
+        }
+        if let Err(err) = self.test_harness.record_completion(completion) {
+            warn!(err, "test harness completion transition rejected");
+        }
+    }
+
+    pub(crate) fn shutdown_test_harness(&mut self) -> Result<()> {
+        let Some(mut harness) = self.test_harness.take_runtime() else {
+            return Ok(());
+        };
+        if !self.test_harness.is_complete()
+            && let Some(completion) = harness.try_take_completion()?
+        {
+            self.record_test_harness_completion(completion);
+        }
+        let cleanup = harness.cleanup();
+        if !self.test_harness.is_complete()
+            && let Some(completion) = harness.try_take_completion()?
+        {
+            self.record_test_harness_completion(completion);
+        }
+        let cleanup_succeeded = cleanup.is_success();
+        self.test_harness
+            .record_cleanup(cleanup.clone())
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            cleanup_succeeded,
+            "test harness cleanup failed: {cleanup:?}"
+        );
+        self.test_harness
+            .restore_runtime(harness)
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn signal_test_harness(&self, name: String) -> Result<()> {
@@ -2546,6 +2587,12 @@ impl Manifold {
 
     pub(crate) const fn test_harness_completion(&self) -> Option<&TestHarnessCompletion> {
         self.test_harness.completion()
+    }
+
+    pub(crate) const fn test_harness_cleanup(
+        &self,
+    ) -> Option<&crate::wasm_test::TestHarnessCleanupResult> {
+        self.test_harness.cleanup()
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {

@@ -2120,6 +2120,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasmtime",
+ "wat",
  "wayland-client",
  "wayland-egl",
  "wayland-protocols",

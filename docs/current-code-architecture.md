@@ -647,7 +647,10 @@ when validation fails.
 
 ### 15.3 Test harness ABI
 
-`wasm_test.rs` starts a harness in a blocking task. The guest exports `run() -> i32`; exit code `0` means passed, `2` means paused, anything else means failed.
+`wasm_test.rs` starts each harness as an explicitly owned child thread with a
+checked identity, a typed `Starting -> Running -> Exited` event stream, and one
+join result. The guest exports `run() -> i32`; exit code `0` means passed, `2`
+means paused, and anything else means failed.
 
 Imports include:
 
@@ -657,7 +660,15 @@ Imports include:
 - `control_json`,
 - `status_json`.
 
-Harness requests are sent over std mpsc to the calloop thread. `Manifold::service_test_harness()` drains requests, serves control/status calls, and reacts to completion by stopping the loop for pass/fail or keeping it paused for inspection.
+Harness requests are sent over std mpsc to the calloop thread.
+`Manifold::service_test_harness()` drains requests, serves control/status calls,
+and reacts to completion by stopping the loop for pass/fail or keeping it paused
+for inspection. Runtime shutdown wakes signal, sleep, and host-response waits,
+uses Wasmtime epoch interruption for guest execution, and joins the exact child
+before the Tokio runtime is dropped. Normal completion and cancellation both
+record their cleanup result; a panic or a lifecycle channel that closes without
+an exit event becomes an explicit failure rather than an indefinite pending
+state.
 
 ### 15.4 Component actor prototype
 

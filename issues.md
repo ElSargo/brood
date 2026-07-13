@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## WASM invocation and harness lifecycle
 
-- `crates/manifoldd/src/wasm_test.rs`: harness process lifecycle is procedural
-  and relies on best-effort child cleanup. The target design should model child
-  handles, lifecycle events, and cleanup results explicitly.
 - Target-shape WASM plugin actor loading is wired enough for interactive testing,
   but reload/lifecycle ownership is still provisional. Actor tasks currently run
   indefinitely without cancellation handles, reloading a module with the same
@@ -17,6 +14,22 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Core-WASM test harnesses now run as owned, checked child threads with typed
+  `Starting -> Running -> Exited` events and explicit joined, already-joined,
+  and panicked cleanup results. Signal, sleep, and host-response waits observe
+  cancellation; Wasmtime epoch interruption stops executing guest code; gates
+  before instantiation and `run()` close early-cancellation races; and a lost
+  lifecycle channel becomes a failed completion. Ordered daemon shutdown
+  records the cleanup outcome before the Tokio runtime is dropped, while the
+  destructor remains a hard-join fallback. The real
+  `wasm-harness-lifecycle-proof` plugin and
+  `tools/test-wasm-harness-lifecycle-nested.sh` provide two visible three-pane
+  workloads with an animated EGL client, terminal, and nested presentation.
+  One receives a real named signal, performs a final host request, returns pass,
+  and joins without cancellation. The other stays blocked in the signal import
+  while the controller captures it, then supervisor shutdown wakes, interrupts,
+  and joins the exact child without inventing a guest completion. Native module
+  compilation is joined rather than forcibly preempted mid-compilation.
 - The named `wasm_key.rs` premise was stale after the prototype moved into the
   policy-provider runtime, but the remaining invocation boundary is now fully
   typed: `GlobalKeyPolicyInput` groups code, press/release state, modifiers, and

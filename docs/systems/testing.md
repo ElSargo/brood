@@ -29,6 +29,18 @@ completion transcript.
 
 Use product runtime commands such as `manifold run` for runtime/manual use, not automated behavior validation.
 
+The core-WASM harness controller owns one checked child identity, lifecycle
+event stream, cancellation path, and join result. The focused real proof is
+`tools/test-wasm-harness-lifecycle-nested.sh`: its harness plugin starts an
+animated outer EGL client and interactive terminal beside the nested
+presentation, while the built-in offscreen test topology captures all three
+panes. One run
+delivers a named signal and records a passing guest completion plus an ordinary
+join; a second run leaves the guest blocked in the signal import and proves
+that supervisor shutdown wakes, interrupts, and joins that exact child without
+fabricating a guest result. The composed screenshots and daemon lifecycle
+transcripts are the acceptance evidence, not the guest's integer return alone.
+
 ## Built-In Nested Tests
 
 `manifold test` defaults to `manifold test nested`.

@@ -9,7 +9,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::{
     session_bus::{SessionBusHandle, SessionBusRealm},
     state::SurfaceSessionId,
-    wasm_test::{TestHarnessCompletion, TestHarnessRuntime},
+    wasm_test::{TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessRuntime},
 };
 
 /// Owns the routing facts for surface sessions.
@@ -445,6 +445,7 @@ impl FocusService {
 pub struct TestHarnessService {
     runtime: Option<TestHarnessRuntime>,
     completion: Option<TestHarnessCompletion>,
+    cleanup: Option<TestHarnessCleanupResult>,
     nested_destination: Option<String>,
     nested_address: Option<String>,
 }
@@ -497,6 +498,21 @@ impl TestHarnessService {
 
     pub(crate) const fn is_complete(&self) -> bool {
         self.completion.is_some()
+    }
+
+    pub(crate) fn record_cleanup(
+        &mut self,
+        cleanup: TestHarnessCleanupResult,
+    ) -> Result<(), &'static str> {
+        if self.cleanup.is_some() {
+            return Err("test harness cleanup was already recorded");
+        }
+        self.cleanup = Some(cleanup);
+        Ok(())
+    }
+
+    pub(crate) const fn cleanup(&self) -> Option<&TestHarnessCleanupResult> {
+        self.cleanup.as_ref()
     }
 
     pub(crate) fn configure_nested_target(

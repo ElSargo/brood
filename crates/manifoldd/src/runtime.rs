@@ -84,9 +84,11 @@ fn serve_session_on_calloop_thread(
 
     // Shutdown is unconditional: a calloop error must not strand plugin Stores,
     // workers, completion tasks, or legacy actor tasks.
+    let harness_shutdown = state.shutdown_test_harness();
     let hosted_shutdown = state.stop_all_hosted_io_actors();
     let legacy_shutdown = state.stop_legacy_wasm_plugin_actors();
     event_loop_result?;
+    harness_shutdown?;
     hosted_shutdown?;
     legacy_shutdown?;
     report_harness_completion(&state)
@@ -117,7 +119,7 @@ fn configure_session(
         info!(provider, path = %path.display(), "loaded CLI WASM key policy");
     }
     if let Some(path) = args.test_harness.as_deref() {
-        state.install_test_harness(TestHarnessRuntime::start_on_runtime(path, &runtime))?;
+        state.install_test_harness(TestHarnessRuntime::start(path)?)?;
         info!(path = %path.display(), "loaded CLI test harness");
     }
     state.configure_nested_test_target(
@@ -201,6 +203,9 @@ fn service_runtime_tick(state: &mut Manifold) {
 }
 
 fn report_harness_completion(state: &Manifold) -> Result<()> {
+    if let Some(cleanup) = state.test_harness_cleanup() {
+        println!("TEST_HARNESS_CLEANUP {cleanup:?}");
+    }
     let Some(completion) = state.test_harness_completion() else {
         return Ok(());
     };
