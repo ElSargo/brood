@@ -23,6 +23,21 @@ wait_for_log() {
   return 1
 }
 
+wait_for_line() {
+  local log="$1"
+  local line="$2"
+  for _ in $(seq 1 200); do
+    if [[ -f "$log" ]] && grep -Fqx "$line" "$log"; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "ERR timed out waiting for $line in $log" >&2
+  [[ -f "$log" ]] && tail -50 "$log" >&2
+  ctl status-json >&2 || true
+  return 1
+}
+
 run_controller() {
   local workspace="$1"
   local log="$workspace/.manifold/workspace-file-log.log"
@@ -46,6 +61,18 @@ run_controller() {
   printf 'created\n' > "$workspace/new-file.txt"
   printf 'changed\n' >> "$workspace/alpha.txt"
   rm "$workspace/src/removed.txt"
+  python3 - "$workspace" <<'PY'
+import os
+import sys
+
+root = os.fsencode(sys.argv[1])
+# These names both lossy-render as `preview1-collision-�.txt`; the Preview 1
+# batch and real guest logs must keep their native byte identities distinct.
+for name in (b"preview1-collision-\xff.txt", b"preview1-collision-\xfe.txt"):
+    descriptor = os.open(os.path.join(root, name), os.O_WRONLY | os.O_CREAT, 0o600)
+    os.write(descriptor, b"distinct native path\n")
+    os.close(descriptor)
+PY
 
   wait_for_log "$log" "created"
   wait_for_log "$log" "modified"
@@ -53,12 +80,16 @@ run_controller() {
   grep -q $'^created\tnew-file.txt$' "$log"
   grep -q $'^modified\talpha.txt$' "$log"
   grep -q $'^removed\tsrc/removed.txt$' "$log"
+  wait_for_line "$log" $'created\tpreview1-collision-%FF.txt'
+  wait_for_line "$log" $'created\tpreview1-collision-%FE.txt'
   wait_for_log "$mirror_log" "created"
   wait_for_log "$mirror_log" "modified"
   wait_for_log "$mirror_log" "removed"
   grep -q $'^created\tnew-file.txt$' "$mirror_log"
   grep -q $'^modified\talpha.txt$' "$mirror_log"
   grep -q $'^removed\tsrc/removed.txt$' "$mirror_log"
+  wait_for_line "$mirror_log" $'created\tpreview1-collision-%FF.txt'
+  wait_for_line "$mirror_log" $'created\tpreview1-collision-%FE.txt'
 
   # Two independent guest handles and workers visibly maintain the primary
   # and mirror logs, while daemon status shows one shared native registration.
@@ -163,6 +194,8 @@ lines = set(snapshot.splitlines())
 assert b"created\tnew-file.txt" in lines, lines
 assert b"modified\talpha.txt" in lines, lines
 assert b"removed\tsrc/removed.txt" in lines, lines
+assert b"created\tpreview1-collision-%FF.txt" in lines, lines
+assert b"created\tpreview1-collision-%FE.txt" in lines, lines
 assert b"created\tafter-watch-churn.txt" in lines, lines
 PY
   actors="$(ctl actors list)"

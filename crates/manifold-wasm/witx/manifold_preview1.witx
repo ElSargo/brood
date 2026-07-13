@@ -62,7 +62,9 @@
 
   ;; Watches are rooted in the actor's filesystem capability. The watch owns
   ;; one notification which workers can project into the normal pollable set.
-  ;; Event batches are UTF-8 lines: kind, tab, capability-relative path.
+  ;; Event batches are UTF-8 lines: kind, tab, capability-relative path. Path
+  ;; bytes outside printable ASCII, plus literal `%`, use uppercase `%HH`
+  ;; escapes, so native names and line delimiters remain reversible.
   (@interface func (export "filesystem_watch_create")
     (param $path (@witx pointer u8))
     (param $path_len u32)

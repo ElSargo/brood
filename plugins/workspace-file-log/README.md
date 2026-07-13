@@ -11,6 +11,8 @@ for `initial` records, then sleeps in the watch notification's host pollable.
 Native watch batches record `created`, `modified`, or `removed`; no periodic
 rescan is used. `.git`, `.direnv`, `.manifold`, and `target` are excluded so
 repository metadata, the log itself, and build output do not feed the watcher.
+The line-oriented Preview 1 batch keeps ordinary ASCII paths readable and
+represents all other native path bytes with reversible `%HH` escapes.
 
 The built module declares a 512 MiB shared-memory maximum. That is a
 fault-containment ceiling rather than an expected working set and proves that a
@@ -48,7 +50,10 @@ records are the watch proof. The controller also checks the live daemon's one
 native registration and two logical subscriptions, then sends `snapshot` and
 checks that `.manifold/workspace-file-log.snapshot` is a nonempty byte-for-byte
 prefix of the append-only log containing the observed create, modify, and remove
-records. Those filesystem artifacts are the proof, rather than a
+records. It creates two invalid-UTF-8 names that lossy conversion would conflate;
+distinct `preview1-collision-%FF.txt` and `preview1-collision-%FE.txt` records in
+both logs make lossless compatibility encoding observable. Those filesystem
+artifacts are the proof, rather than a
 plugin-generated success value.
 
 This plugin is also the user-observable completion-write proof: the snapshot is

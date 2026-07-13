@@ -62,7 +62,9 @@ interface host {
 
     record filesystem-event {
         kind: filesystem-event-kind,
-        path: string,
+        /// Relative path in the host platform's lossless native encoding.
+        /// Unix uses raw path bytes; Windows uses little-endian UTF-16 units.
+        path: list<u8>,
     }
 
     record filesystem-watch-batch {

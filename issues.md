@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Preview 1 watch batches currently encode paths as lossy UTF-8 text. The
-  resource is capability safe, but a typed SDK/Component surface must preserve
-  arbitrary platform path bytes without collisions.
 - Native watcher backends may coalesce, duplicate, or classify rename events
   differently. Overflow is safely reported as `rescan`, but consumers that
   maintain state must implement reconciliation; the example logger records the
@@ -99,6 +96,15 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Filesystem-watch events preserve native path identity end to end: raw
+  `OsStr` bytes on Unix and little-endian UTF-16 units on Windows. Component
+  events expose opaque byte lists, while the line-oriented Preview 1 ABI uses
+  reversible uppercase `%HH` escaping for non-graphic bytes, `%`, tabs, and
+  newlines. Unit coverage includes delimiter bytes and two invalid-UTF-8 names
+  that lossy conversion would conflate. The real Component plugin renders those
+  names distinctly as `collision-\xFF.txt` and `collision-\xFE.txt`; the real
+  Preview 1 plugin records `preview1-collision-%FF.txt` and `%FE.txt` distinctly
+  in both watcher logs and the completion-created snapshot.
 - Component plugins own capability-rooted filesystem watches through a typed
   WIT resource with typed event batches. The guest wrapper projects readiness
   into the ordinary notification/pollable wait path, while the host reuses the

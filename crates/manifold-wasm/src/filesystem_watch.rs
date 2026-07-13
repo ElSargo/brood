@@ -42,7 +42,10 @@ pub enum FilesystemWatchEventKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FilesystemWatchBatchEvent {
     pub kind: FilesystemWatchEventKind,
-    pub path: String,
+    /// The relative path in the host platform's lossless native encoding.
+    /// Unix stores raw `OsStr` bytes; Windows stores little-endian UTF-16 code
+    /// units so even unpaired surrogates retain their identity.
+    pub path: Vec<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -192,18 +195,18 @@ struct WatchEvent {
 }
 
 impl WatchEvent {
-    const fn encoded_len(&self) -> usize {
+    fn encoded_len(&self) -> usize {
         event_label_text(self.event.kind)
             .len()
             .saturating_add(1)
-            .saturating_add(self.event.path.len())
+            .saturating_add(preview1_encoded_path_len(&self.event.path))
             .saturating_add(1)
     }
 
     fn encode_into(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(event_label_text(self.event.kind).as_bytes());
         bytes.push(b'\t');
-        bytes.extend_from_slice(self.event.path.as_bytes());
+        encode_preview1_path(&self.event.path, bytes);
         bytes.push(b'\n');
     }
 }
@@ -854,7 +857,7 @@ fn push_bounded_event(
         push_overflow(events, generation);
         return;
     }
-    let path = path.to_string_lossy().into_owned();
+    let path = platform_path_bytes(path);
     events.push_back(WatchEvent {
         generation,
         event: FilesystemWatchBatchEvent { kind, path },
@@ -867,9 +870,60 @@ fn push_overflow(events: &mut VecDeque<WatchEvent>, generation: u64) {
         generation,
         event: FilesystemWatchBatchEvent {
             kind: FilesystemWatchEventKind::Rescan,
-            path: ".".to_string(),
+            path: b".".to_vec(),
         },
     });
+}
+
+/// Encode an opaque path into the legacy line-oriented Preview 1 batch. ASCII
+/// graphic bytes remain readable except `%`, which is the escape introducer;
+/// every other byte is represented as `%HH`. This makes tabs, newlines,
+/// invalid UTF-8 and literal percent sequences unambiguous and reversible.
+fn encode_preview1_path(path: &[u8], output: &mut Vec<u8>) {
+    for &byte in path {
+        if (0x20..=0x7e).contains(&byte) && byte != b'%' {
+            output.push(byte);
+        } else {
+            output.push(b'%');
+            output.push(hex_digit(byte >> 4));
+            output.push(hex_digit(byte & 0x0f));
+        }
+    }
+}
+
+const fn hex_digit(nibble: u8) -> u8 {
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'A' + nibble - 10
+    }
+}
+
+fn preview1_encoded_path_len(path: &[u8]) -> usize {
+    path.iter().fold(0_usize, |length, &byte| {
+        length.saturating_add(if (0x20..=0x7e).contains(&byte) && byte != b'%' {
+            1
+        } else {
+            3
+        })
+    })
+}
+
+#[cfg(unix)]
+fn platform_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn platform_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }
 
 const fn event_kind(kind: EventKind) -> Option<FilesystemWatchEventKind> {
@@ -1207,7 +1261,7 @@ mod tests {
             small_batch
                 == vec![super::FilesystemWatchBatchEvent {
                     kind: super::FilesystemWatchEventKind::Rescan,
-                    path: ".".to_string(),
+                    path: b".".to_vec(),
                 }]
         );
         let large_bytes = large.pending_bytes(large_watch)?;
@@ -1219,6 +1273,60 @@ mod tests {
         large.stop();
         small_coordination.stop();
         large_coordination.stop();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_path_bytes_and_preview1_delimiters_are_lossless() -> Result<()> {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+
+        let first = PathBuf::from(OsString::from_vec(
+            b"collision-\xff\tline\npercent%.txt".to_vec(),
+        ));
+        let second = PathBuf::from(OsString::from_vec(
+            b"collision-\xfe\tline\npercent%.txt".to_vec(),
+        ));
+        let mut events = std::collections::VecDeque::new();
+        super::push_bounded_event(
+            &mut events,
+            4,
+            1,
+            super::FilesystemWatchEventKind::Created,
+            &first,
+        );
+        super::push_bounded_event(
+            &mut events,
+            4,
+            2,
+            super::FilesystemWatchEventKind::Created,
+            &second,
+        );
+
+        let paths = events
+            .iter()
+            .map(|event| event.event.path.as_slice())
+            .collect::<Vec<_>>();
+        ensure!(
+            paths
+                == vec![
+                    first.as_os_str().as_encoded_bytes(),
+                    second.as_os_str().as_encoded_bytes()
+                ]
+        );
+        let [first_path, second_path] = paths.as_slice() else {
+            return Err(anyhow!("expected exactly two native path events"));
+        };
+        ensure!(first_path != second_path);
+
+        let first_event = events.pop_front().context("first queued event")?;
+        let mut encoded = Vec::new();
+        first_event.encode_into(&mut encoded);
+        ensure!(
+            encoded == b"created\tcollision-%FF%09line%0Apercent%25.txt\n",
+            "unexpected Preview 1 path encoding: {encoded:?}"
+        );
+        ensure!(first_event.encoded_len() == encoded.len());
         Ok(())
     }
 

@@ -36,7 +36,7 @@ impl Guest for ComponentWorkspaceWatch {
             let batch = watch.next().await?;
             let mut changed = false;
             for event in batch.events {
-                if event.path == REPORT {
+                if event.path == REPORT.as_bytes() {
                     continue;
                 }
                 changed = true;
@@ -44,7 +44,7 @@ impl Guest for ComponentWorkspaceWatch {
                     "| {} | {} | `{}` |\n",
                     batch.generation,
                     event_kind(event.kind),
-                    event.path.replace('`', "\\`")
+                    display_path(&event.path)
                 ));
             }
             if changed {
@@ -100,6 +100,23 @@ const fn event_kind(kind: host::FilesystemEventKind) -> &'static str {
         host::FilesystemEventKind::Changed => "changed",
         host::FilesystemEventKind::Rescan => "rescan",
     }
+}
+
+/// Render opaque native path bytes without conflating invalid UTF-8 with the
+/// replacement character. Backslash is escaped too, so every `\xNN` sequence
+/// in the report denotes exactly one original byte.
+fn display_path(path: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut display = String::with_capacity(path.len());
+    for &byte in path {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'/') {
+            display.push(char::from(byte));
+        } else {
+            write!(&mut display, "\\x{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    display
 }
 
 export!(ComponentWorkspaceWatch);

@@ -721,6 +721,9 @@ the actor and worker Stores. Workers therefore select watch readiness through
 the existing bounded `wait-any` path, then drain relative-path event batches;
 recursive backend setup runs as host-owned work and publishes an initial rescan
 marker once registration finishes. Overflow uses the same explicit marker.
+Paths remain lossless native bytes in the shared queue and Component ABI;
+Preview 1 compatibility batches use reversible `%HH` escaping for non-graphic
+bytes and the escape introducer.
 Watchers and their native threads are dropped before the actor generation's
 coordination hub stops.
 

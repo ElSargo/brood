@@ -32,9 +32,23 @@ run_controller() {
   printf 'created\n' >"$workspace/created.txt"
   printf 'modified\n' >>"$workspace/seed.txt"
   rm "$workspace/remove-me.txt"
+  python3 - "$workspace" <<'PY'
+import os
+import sys
+
+root = os.fsencode(sys.argv[1])
+# Both names become `collision-�.txt` under lossy UTF-8 conversion. The guest
+# must receive distinct native bytes and render a reversible representation.
+for name in (b"collision-\xff.txt", b"collision-\xfe.txt"):
+    descriptor = os.open(os.path.join(root, name), os.O_WRONLY | os.O_CREAT, 0o600)
+    os.write(descriptor, b"distinct native path\n")
+    os.close(descriptor)
+PY
   wait_for_report "$report" '| created | `created.txt` |'
   wait_for_report "$report" '| modified | `seed.txt` |'
   wait_for_report "$report" '| removed | `remove-me.txt` |'
+  wait_for_report "$report" '| created | `collision-\xFF.txt` |'
+  wait_for_report "$report" '| created | `collision-\xFE.txt` |'
 
   # The artifact is the proof: a human-readable history produced by the real
   # Component guest from real workspace mutations, not a success sentinel.

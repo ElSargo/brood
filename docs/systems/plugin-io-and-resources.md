@@ -170,6 +170,13 @@ normal notification pollable. Preview 1 compatibility guests use the matching
 handle operations and encoded batches. Neither backend owns a separate native
 watcher or watcher-specific wait mechanism.
 
+Event paths retain their native platform identity rather than passing through
+lossy Unicode conversion. The Component record carries an opaque byte list:
+raw `OsStr` bytes on Unix and little-endian UTF-16 code units on Windows.
+Preview 1's line-oriented compatibility batch keeps printable ASCII readable
+and encodes every other byte, including `%`, tab, and newline, as uppercase
+`%HH`. This representation is reversible and cannot merge distinct filenames.
+
 Overflow and any interval without complete coverage produce an explicit
 `rescan` marker. Consumers maintaining state reconcile through the filesystem;
 the event stream is not a journal.

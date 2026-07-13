@@ -225,7 +225,9 @@ workspace scan and live filesystem watch. Creating, editing, and removing
 files produces corresponding records in
 `.manifold/workspace-file-log.log`; the visible file history demonstrates that
 normal actor mailbox, worker, shared-memory, and filesystem behavior remains
-usable inside the ceilings.
+usable inside the ceilings. The nested workload also creates two invalid-UTF-8
+names which lossy conversion would conflate; both real guest logs retain them
+as distinct reversible `%FF` and `%FE` paths.
 
 `plugins/component-workspace-watch` proves the same capability-rooted watch
 model through the Component backend. Its typed WIT resource is an
@@ -234,7 +236,10 @@ service. The guest SDK wrapper projects its notification into the ordinary
 worker pollable set, and the plugin maintains a live Markdown history at
 `.manifold/component-workspace-watch.md`. The nested proof replaces the actor
 generation and observes the old subscription reach zero before the replacement
-is published.
+is published. It also creates two invalid-UTF-8 Unix filenames which would
+collapse to the same replacement-character text under lossy conversion; the
+artifact shows their distinct native bytes as reversible `\xFF` and `\xFE`
+paths.
 
 Host-owned resource teardown retires a watch and its notification as one
 ownership transition. An actor event already admitted to the reserved lane may
