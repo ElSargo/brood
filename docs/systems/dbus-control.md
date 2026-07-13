@@ -46,6 +46,18 @@ Presentation focusing can use activation-token-aware compositor calls where avai
 
 The session-local DBus bus/proxy model is still a staged direction. Current code contains session-bus support and notification forwarding pieces, but internet-safe or hostile-code isolation is not a current claim.
 
+The wire boundary is independent from that future routing design. Socket input
+must pass through a fixed-header type that validates the endian marker,
+eight-byte body alignment, exact frame length, checked arithmetic, and a bounded
+allocation before zbus sees the bytes. Rebuilding a forwarded message accepts
+only a body and signature obtained from the same successfully parsed zbus
+message. The two zbus unsafe constructors remain private to these audited
+helpers; routing code operates on typed `Message` values.
+
+This encapsulation does not decide bus ownership, name policy, or cross-session
+routing. Those remain session-bus service responsibilities rather than wire
+parser concerns.
+
 ## Related Pages
 
 - [[../reference/dbus-interfaces]]

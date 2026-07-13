@@ -2,17 +2,15 @@
     clippy::allow_attributes_without_reason,
     clippy::branches_sharing_code,
     clippy::cast_possible_truncation,
-    clippy::indexing_slicing,
     clippy::let_underscore_must_use,
     clippy::needless_pass_by_ref_mut,
     clippy::needless_pass_by_value,
     clippy::option_if_let_else,
     clippy::type_complexity,
-    clippy::undocumented_unsafe_blocks,
     clippy::unreachable,
-    reason = "tracked in issues.md: session bus forwarding still parses raw DBus messages and owns routing state inline"
+    reason = "tracked in issues.md: session bus routing ownership and transition typing remain separate design work"
 )]
-// TODO(lint-structure): replace the ad hoc DBus byte router with typed message/session abstractions.
+// TODO(lint-structure): replace the ad hoc DBus router ownership with typed session abstractions.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -49,6 +47,8 @@ const NOTIFICATIONS_DESTINATION: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_UNIQUE_NAME: &str = ":1.999999";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const NOTIFICATIONS_INTERFACE: &str = "org.freedesktop.Notifications";
+const DBUS_PRIMARY_HEADER_LEN: usize = 16;
+const MAX_DBUS_FRAME_LEN: usize = 128 * 1024 * 1024;
 const INTROSPECTABLE_INTERFACE: &str = "org.freedesktop.DBus.Introspectable";
 const NOTIFICATIONS_INTROSPECTION_XML: &str = r#"<node>
   <interface name="org.freedesktop.Notifications">
@@ -402,7 +402,7 @@ fn authenticate(reader: &mut BufReader<UnixStream>, guid: &str) -> Result<()> {
         .get_mut()
         .read_exact(&mut initial)
         .context("read DBus auth nul")?;
-    if initial[0] != 0 {
+    if initial != [0] {
         return Err(anyhow!("unsupported DBus auth prelude"));
     }
 
@@ -471,27 +471,82 @@ fn read_messages(
     }
 }
 
-fn read_message_bytes(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>> {
-    let mut primary = [0; 16];
+fn read_message_bytes(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let mut primary = [0; DBUS_PRIMARY_HEADER_LEN];
     reader
         .read_exact(&mut primary)
         .context("read DBus primary header")?;
-    let little = match primary[0] {
-        b'l' => true,
-        b'B' => false,
-        other => return Err(anyhow!("unsupported DBus endian marker {other}")),
-    };
-    let body_len = read_u32(&primary[4..8], little) as usize;
-    let fields_len = read_u32(&primary[12..16], little) as usize;
-    let header_len = 16 + fields_len;
-    let padding = padding_for_8_bytes(header_len);
-    let rest_len = fields_len + padding + body_len;
+    let header = DbusFrameHeader::decode(primary)?;
+    let rest_len = header.remaining_len()?;
     let mut bytes = primary.to_vec();
-    bytes.resize(16 + rest_len, 0);
+    bytes.resize(header.total_len()?, 0);
     reader
-        .read_exact(&mut bytes[16..])
+        .read_exact(
+            bytes
+                .get_mut(DBUS_PRIMARY_HEADER_LEN..)
+                .ok_or_else(|| anyhow!("invalid DBus frame storage"))?,
+        )
         .context("read DBus message body")?;
+    debug_assert_eq!(rest_len, bytes.len() - DBUS_PRIMARY_HEADER_LEN);
     Ok(bytes)
+}
+
+/// Checked shape of a D-Bus wire frame before any allocation or zbus parsing.
+///
+/// D-Bus fixes the primary header at 16 bytes and aligns the body to eight
+/// bytes after its variable header fields. This type owns the endian decision
+/// and all length arithmetic so socket input cannot trigger unchecked slicing,
+/// integer wrapping, or an unbounded allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DbusFrameHeader {
+    endian: Endian,
+    body_len: usize,
+    fields_len: usize,
+}
+
+impl DbusFrameHeader {
+    fn decode(primary: [u8; DBUS_PRIMARY_HEADER_LEN]) -> Result<Self> {
+        let endian = match primary.first().copied() {
+            Some(b'l') => Endian::Little,
+            Some(b'B') => Endian::Big,
+            Some(other) => return Err(anyhow!("unsupported DBus endian marker {other}")),
+            None => unreachable!("fixed-size primary header is non-empty"),
+        };
+        let body_len = usize::try_from(read_u32(
+            primary
+                .get(4..8)
+                .ok_or_else(|| anyhow!("missing DBus body length"))?,
+            endian,
+        )?)?;
+        let fields_len = usize::try_from(read_u32(
+            primary
+                .get(12..16)
+                .ok_or_else(|| anyhow!("missing DBus fields length"))?,
+            endian,
+        )?)?;
+        Ok(Self {
+            endian,
+            body_len,
+            fields_len,
+        })
+    }
+
+    fn remaining_len(self) -> Result<usize> {
+        let fields_end = DBUS_PRIMARY_HEADER_LEN
+            .checked_add(self.fields_len)
+            .ok_or_else(|| anyhow!("DBus fields length overflow"))?;
+        self.fields_len
+            .checked_add(padding_for_8_bytes(fields_end))
+            .and_then(|header| header.checked_add(self.body_len))
+            .filter(|len| *len <= MAX_DBUS_FRAME_LEN - DBUS_PRIMARY_HEADER_LEN)
+            .ok_or_else(|| anyhow!("DBus frame exceeds {MAX_DBUS_FRAME_LEN} bytes"))
+    }
+
+    fn total_len(self) -> Result<usize> {
+        DBUS_PRIMARY_HEADER_LEN
+            .checked_add(self.remaining_len()?)
+            .ok_or_else(|| anyhow!("DBus frame length overflow"))
+    }
 }
 
 fn route_message(
@@ -1131,32 +1186,57 @@ fn build_raw_like(builder: zbus::message::Builder<'_>, message: &Message) -> Res
     let body = message.body();
     let signature = body.signature().to_owned();
     let body_bytes = body.data().to_vec();
-    // The message body has already been parsed from a D-Bus frame. Rebuilding it with the
-    // same signature only changes routing headers that a bus is expected to own.
-    let rebuilt = unsafe { builder.build_raw_body(&body_bytes, signature, Vec::new())? };
+    let rebuilt = build_validated_raw_body(builder, &body_bytes, signature)?;
     Ok(rebuilt.data().to_vec())
 }
 
+/// Rebuild a body which zbus has already validated, changing only bus-owned headers.
+fn build_validated_raw_body(
+    builder: zbus::message::Builder<'_>,
+    body_bytes: &[u8],
+    signature: zbus::zvariant::Signature,
+) -> Result<Message> {
+    // SAFETY: `body_bytes` and `signature` come from the same successfully
+    // parsed zbus `Message::body`. They therefore agree on layout, alignment,
+    // endianness, and lifetimes; no FDs are present because this broker rejects
+    // Unix-FD negotiation.
+    Ok(unsafe { builder.build_raw_body(body_bytes, signature, Vec::new())? })
+}
+
 fn parse_message(bytes: Vec<u8>) -> Result<Message> {
-    let endian = match bytes.first().copied() {
-        Some(b'l') => Endian::Little,
-        Some(b'B') => Endian::Big,
-        Some(other) => return Err(anyhow!("unsupported DBus endian marker {other}")),
-        None => return Err(anyhow!("empty DBus message")),
-    };
+    let primary: [u8; DBUS_PRIMARY_HEADER_LEN] = bytes
+        .get(..DBUS_PRIMARY_HEADER_LEN)
+        .ok_or_else(|| anyhow!("short DBus primary header"))?
+        .try_into()
+        .map_err(|_short_header| anyhow!("short DBus primary header"))?;
+    let header = DbusFrameHeader::decode(primary)?;
+    if bytes.len() != header.total_len()? {
+        return Err(anyhow!(
+            "DBus frame length mismatch: expected {}, received {}",
+            header.total_len()?,
+            bytes.len()
+        ));
+    }
+    parse_validated_message(bytes, header.endian)
+}
+
+/// Hand a length-checked, aligned-at-zero D-Bus frame to zbus.
+fn parse_validated_message(bytes: Vec<u8>, endian: Endian) -> Result<Message> {
     let data = Data::new(bytes, SerializedContext::new_dbus(endian, 0));
-    // zbus validates headers while constructing Message; the unsafety is limited to accepting
-    // bytes from a local client socket, as a D-Bus broker must do.
+    // SAFETY: `DbusFrameHeader` validated the fixed header, endian marker,
+    // eight-byte body alignment, and exact complete frame length. zbus owns the
+    // byte allocation and performs the remaining header/signature validation.
     Ok(unsafe { Message::from_bytes(data)? })
 }
 
-fn read_u32(bytes: &[u8], little: bool) -> u32 {
-    let array = [bytes[0], bytes[1], bytes[2], bytes[3]];
-    if little {
-        u32::from_le_bytes(array)
-    } else {
-        u32::from_be_bytes(array)
-    }
+fn read_u32(bytes: &[u8], endian: Endian) -> Result<u32> {
+    let array: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_wrong_length| anyhow!("DBus u32 field must contain exactly four bytes"))?;
+    Ok(match endian {
+        Endian::Little => u32::from_le_bytes(array),
+        Endian::Big => u32::from_be_bytes(array),
+    })
 }
 
 const fn padding_for_8_bytes(len: usize) -> usize {
@@ -1195,13 +1275,17 @@ impl SessionBusRealm {
 #[cfg(test)]
 #[allow(
     clippy::default_trait_access,
+    clippy::expect_used,
     clippy::unwrap_used,
-    reason = "unit tests rely on inferred DBus bitflag defaults from zbus"
+    reason = "unit tests rely on concise fixed-size frame fixtures and inferred zbus defaults"
 )]
 mod tests {
     use super::{
-        NOTIFICATIONS_DESTINATION, NOTIFICATIONS_UNIQUE_NAME, SessionBusHandle, SessionBusRealm,
+        DBUS_PRIMARY_HEADER_LEN, DbusFrameHeader, MAX_DBUS_FRAME_LEN, NOTIFICATIONS_DESTINATION,
+        NOTIFICATIONS_UNIQUE_NAME, SessionBusHandle, SessionBusRealm, parse_message,
+        read_message_bytes,
     };
+    use std::io::Cursor;
     use zbus::{
         blocking::{connection::Builder as ConnectionBuilder, fdo::DBusProxy},
         fdo::RequestNameReply,
@@ -1276,5 +1360,52 @@ mod tests {
             proxy.get_name_owner(notifications).unwrap().as_str(),
             NOTIFICATIONS_UNIQUE_NAME
         );
+    }
+
+    fn primary_header(endian: u8, body_len: u32, fields_len: u32) -> [u8; 16] {
+        let mut primary = [0; DBUS_PRIMARY_HEADER_LEN];
+        *primary.first_mut().expect("primary header endian byte") = endian;
+        let (body, fields) = if endian == b'B' {
+            (body_len.to_be_bytes(), fields_len.to_be_bytes())
+        } else {
+            (body_len.to_le_bytes(), fields_len.to_le_bytes())
+        };
+        primary
+            .get_mut(4..8)
+            .expect("primary body length")
+            .copy_from_slice(&body);
+        primary
+            .get_mut(12..16)
+            .expect("primary fields length")
+            .copy_from_slice(&fields);
+        primary
+    }
+
+    #[test]
+    fn wire_header_checks_endian_alignment_and_exact_length() {
+        let little = DbusFrameHeader::decode(primary_header(b'l', 4, 1)).unwrap();
+        assert_eq!(little.remaining_len().unwrap(), 12);
+        assert_eq!(little.total_len().unwrap(), 28);
+
+        let big = DbusFrameHeader::decode(primary_header(b'B', 9, 8)).unwrap();
+        assert_eq!(big.remaining_len().unwrap(), 17);
+        assert_eq!(big.total_len().unwrap(), 33);
+        assert!(DbusFrameHeader::decode(primary_header(b'x', 0, 0)).is_err());
+    }
+
+    #[test]
+    fn wire_reader_rejects_short_and_oversized_frames_before_allocation() {
+        assert!(read_message_bytes(&mut Cursor::new([b'l'; 8])).is_err());
+        let oversized = primary_header(b'l', MAX_DBUS_FRAME_LEN as u32, 0);
+        assert!(read_message_bytes(&mut Cursor::new(oversized)).is_err());
+        let overflowing = primary_header(b'l', u32::MAX, u32::MAX);
+        assert!(read_message_bytes(&mut Cursor::new(overflowing)).is_err());
+    }
+
+    #[test]
+    fn zbus_boundary_rejects_short_and_length_mismatched_storage() {
+        assert!(parse_message(Vec::new()).is_err());
+        assert!(parse_message(vec![b'l'; DBUS_PRIMARY_HEADER_LEN - 1]).is_err());
+        assert!(parse_message(primary_header(b'l', 1, 0).to_vec()).is_err());
     }
 }

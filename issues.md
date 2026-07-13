@@ -4,15 +4,6 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Unsafe and raw buffers
-
-- `crates/manifoldd/src/winit_presenter.rs`,
-  `crates/manifoldd/src/debug_dump.rs`, `crates/manifoldd/src/session_bus.rs`,
-  and `crates/manifoldd/src/state.rs`: unsafe blocks and raw buffer indexing sit
-  at FFI, renderer, and DBus-message boundaries. The target design should wrap
-  those boundaries in audited safe helpers with documented invariants rather
-  than scattering safety comments around inline raw access.
-
 ## Session bus routing
 
 - `crates/manifoldd/src/session_bus.rs`: the in-process DBus router operates on
@@ -37,6 +28,25 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Unsafe renderer, SHM, DBus-wire, and calloop access now sits behind narrow
+  audited helpers with typed owners and documented lifetime, alignment, and
+  validity invariants. Winit/EGL/GBM/Wayland handles cannot escape the presenter
+  adapter; Smithay display dispatch is one state-layer helper; SHM capture
+  validates dimensions, offset, stride, mapped span, complete pixels, and alpha
+  policy before slice-only conversion; and DBus frames validate endian,
+  alignment, exact length, checked arithmetic, and a 128 MiB ceiling before the
+  two private zbus raw constructors. Broad unsafe/index allowances are gone,
+  with malformed, short, zero-size/stride, overflow, padded-row, and alpha
+  fixtures covering non-observable seams. The real geometry plugin proves the
+  visible path in `tools/test-safe-boundaries-nested.sh`: it splits a terminal
+  and animated SHM client, the offscreen Winit/EGL frame is captured, the debug
+  manifest records both surfaces, and a substantive “Audited boundaries
+  crossed” notification traverses the isolated realm bus to the host desktop
+  service and returns its real notification ID. The manifest honestly records
+  `no_current_buffer` because Smithay consumes transient `BufferAssignment`
+  state before a later debug request; that SHM mapping boundary is therefore
+  accepted through deterministic fixtures rather than a fabricated plugin
+  result.
 - The launch-context issue's preview premise was stale: repository history
   confirms launch records have always been lossless transport data and no
   environment-preview bound or truncation function exists. The real

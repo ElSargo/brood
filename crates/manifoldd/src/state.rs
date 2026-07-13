@@ -5,7 +5,6 @@
     clippy::cast_sign_loss,
     clippy::expect_used,
     clippy::filter_map_next,
-    clippy::indexing_slicing,
     clippy::iter_on_single_items,
     clippy::let_underscore_must_use,
     clippy::match_same_arms,
@@ -14,12 +13,11 @@
     clippy::question_mark,
     clippy::significant_drop_tightening,
     clippy::struct_field_names,
-    clippy::undocumented_unsafe_blocks,
     clippy::unnecessary_debug_formatting,
     clippy::unused_self,
     clippy::unwrap_used,
     clippy::useless_let_if_seq,
-    reason = "remaining suppressions cover checked geometry conversions, protocol-owned Smithay resources, and audited compositor/raw-memory boundaries tracked by their dedicated issues"
+    reason = "remaining suppressions cover checked geometry conversions, protocol-owned Smithay resources, and experimental state policies tracked by dedicated issues"
 )]
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1718,14 +1716,7 @@ impl Manifold {
             .insert_source(
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
-                    // Smithay's display source is stored in calloop's Generic wrapper
-                    // and must not be dropped while this callback is active.
-                    unsafe {
-                        if let Err(err) = display.get_mut().dispatch_clients(state) {
-                            state.stats.wayland_dispatch_errors += 1;
-                            warn!(?err, "dispatch Wayland clients failed");
-                        }
-                    }
+                    dispatch_wayland_clients(display, state);
                     if let Err(err) = state.display_handle.flush_clients() {
                         warn!(?err, "flush clients after dispatch failed");
                     }
@@ -5211,7 +5202,10 @@ impl Manifold {
             FocusDirection::Next => (active_index + 1) % window_count,
             FocusDirection::Previous => (active_index + window_count - 1) % window_count,
         };
-        self.focus_window(&windows[next_index]);
+        let Some(next_window) = windows.get(next_index) else {
+            return false;
+        };
+        self.focus_window(next_window);
         true
     }
 
@@ -5999,13 +5993,40 @@ impl Manifold {
     }
 }
 
+/// Dispatch the Wayland display retained inside its registered calloop source.
+///
+/// This is the only state-layer escape hatch for `Generic::get_mut`. Dispatch
+/// may mutate Smithay protocol state, but it neither replaces the display nor
+/// changes the file descriptor calloop registered for it.
+fn dispatch_wayland_clients(
+    display: &mut calloop::generic::NoIoDrop<Display<Manifold>>,
+    state: &mut Manifold,
+) {
+    // SAFETY: the callback runs while calloop exclusively owns this source;
+    // `dispatch_clients` preserves the display and its registered poll fd.
+    if let Err(err) = unsafe { display.get_mut().dispatch_clients(state) } {
+        state.stats.wayland_dispatch_errors += 1;
+        warn!(?err, "dispatch Wayland clients failed");
+    }
+}
+
 fn default_surface_session_name(session: SurfaceSessionId) -> String {
     let n = session.raw().saturating_sub(1) as usize;
-    let adjective = SESSION_NAME_ADJECTIVES[n % SESSION_NAME_ADJECTIVES.len()];
-    let noun = SESSION_NAME_NOUNS[(n / SESSION_NAME_ADJECTIVES.len()) % SESSION_NAME_NOUNS.len()];
-    let action = SESSION_NAME_ACTIONS[(n
-        / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
-        % SESSION_NAME_ACTIONS.len()];
+    let adjective = SESSION_NAME_ADJECTIVES
+        .get(n % SESSION_NAME_ADJECTIVES.len())
+        .copied()
+        .unwrap_or("quiet");
+    let noun = SESSION_NAME_NOUNS
+        .get((n / SESSION_NAME_ADJECTIVES.len()) % SESSION_NAME_NOUNS.len())
+        .copied()
+        .unwrap_or("workspace");
+    let action = SESSION_NAME_ACTIONS
+        .get(
+            (n / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
+                % SESSION_NAME_ACTIONS.len(),
+        )
+        .copied()
+        .unwrap_or("working");
     format!("{adjective}-{noun}-{action}")
 }
 
@@ -6052,7 +6073,7 @@ fn first_available_pane_from(
         } else {
             (start_index as isize + (offset + 1) * step).rem_euclid(len)
         } as usize;
-        let pane = panes[index];
+        let pane = panes.get(index).copied()?;
         if !excluded.contains(&pane) {
             return Some(pane);
         }
@@ -6227,8 +6248,9 @@ fn process_env_var(pid: u32, key: &str) -> Option<String> {
     let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
     environ.split(|byte| *byte == 0).find_map(|entry| {
         let (entry_key, entry_value) = entry.split_at_checked(key.len())?;
-        if entry_key == key.as_bytes() && entry_value.first() == Some(&b'=') {
-            Some(String::from_utf8_lossy(&entry_value[1..]).into_owned())
+        if entry_key == key.as_bytes() {
+            let value = entry_value.strip_prefix(b"=")?;
+            Some(String::from_utf8_lossy(value).into_owned())
         } else {
             None
         }
@@ -6500,7 +6522,6 @@ struct WindowRefreshOutcome {
 #[allow(
     clippy::expect_used,
     clippy::unwrap_used,
-    clippy::indexing_slicing,
     reason = "unit tests use direct fixture setup and focused state assertions"
 )]
 mod tests {
@@ -6845,7 +6866,8 @@ mod tests {
         assert!(unknown.is_err());
         let unchanged = state.agent_summaries();
         assert_eq!(unchanged.len(), 1);
-        assert_eq!(unchanged[0].unread_notifications, 0);
+        let unchanged_agent = unchanged.first().expect("one unchanged agent");
+        assert_eq!(unchanged_agent.unread_notifications, 0);
 
         state
             .notify_agent(AgentNotification {
@@ -6859,9 +6881,10 @@ mod tests {
             })
             .expect("notify registered agent");
         let notified = state.agent_summaries();
-        assert_eq!(notified[0].status, "waiting");
-        assert_eq!(notified[0].unread_notifications, 1);
-        assert!(notified[0].attention);
+        let notified_agent = notified.first().expect("one notified agent");
+        assert_eq!(notified_agent.status, "waiting");
+        assert_eq!(notified_agent.unread_notifications, 1);
+        assert!(notified_agent.attention);
 
         assert!(state.unregister_agent(&agent_id));
         assert!(state.agent_summaries().is_empty());

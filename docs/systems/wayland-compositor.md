@@ -46,6 +46,33 @@ The preferred Linux path is DMA-BUF/EGL-compatible surface sharing so client sur
 
 The MVP runtime can attach a Winit/GLES presentation window or an offscreen presentation target. Offscreen presentation exists for nested tests and behavior validation.
 
+Raw display, window, surface, and event-loop handles are confined to the
+audited adapter in `winit_presenter.rs`. Its safe-facing functions retain the
+typed Winit window, EGL context, GBM device, or calloop source that owns each
+handle. EGL construction, foreign Wayland activation, and event pumping cannot
+return a raw handle or extend it beyond that owner's lifetime. Smithay display
+dispatch has the same shape in `state.rs`: one helper documents that dispatch
+preserves the registered display and poll descriptor.
+
+These helpers are renderer implementation boundaries, not plugin APIs. A
+plugin can affect visible layout and rendering through the workspace model, but
+it never receives a Winit, EGL, Wayland, or calloop handle.
+
+## Debug Buffer Capture
+
+SHM debug capture first validates signed dimensions, offset, stride, visible
+row length, total mapped span, and pointer-arithmetic limits. Conversion then
+walks complete rows and four-byte pixels through slices. ARGB and XRGB alpha
+policy is explicit, and malformed or unsupported mappings produce no image.
+
+Smithay moves a committed buffer into renderer surface state and consumes the
+transient compositor `BufferAssignment`. A later DBus debug-dump request cannot
+reliably recover that assignment, even while an animated SHM client is
+committing. The manifest reports `no_current_buffer` honestly in that case.
+The raw-mapping helper is therefore verified with deterministic padded-row,
+alpha, short-mapping, zero-dimension/stride, and overflow fixtures. Composed
+frame capture remains the stable post-commit graphical artifact.
+
 ## Geometry Boundaries
 
 Normalized plugin layout, signed logical layout pixels, unsigned host-window

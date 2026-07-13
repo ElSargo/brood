@@ -41,6 +41,16 @@ Nested tests render surface-local fiducial markers in hosted surfaces before fin
 
 The sandboxed graphical E2E path is `checks.software-e2e`. It forces Mesa software rendering, starts its own DBus session bus, runs an offscreen outer presentation, runs a normal inner presentation inside it, spawns real Weston clients, applies a split layout, and exports inner and outer debug dumps. This check is intended to cover real composition and capture without depending on a host GPU or host-visible presentation window.
 
+`tools/test-safe-boundaries-nested.sh` is the focused boundary proof. A real
+geometry policy plugin visibly splits a terminal and animated Weston SHM
+client. The managed terminal sends a substantive desktop notification through
+its isolated realm bus and records the host notification ID returned through
+the same wire path. A debug bundle records both live surfaces and the composed
+offscreen Winit/EGL frame. The proof deliberately does not claim that a later
+DBus request can read Smithay's already-consumed transient buffer assignment;
+the SHM mapping and pixel boundary instead has deterministic malformed,
+stride, zero-size, overflow, and alpha unit coverage.
+
 The sandboxed plugin I/O path is `checks.wasm-io`, also available as the
 `wasm-io-check` package. It builds the Component and Preview 1 guests plus their
 host workloads, then proves completion I/O, guest-owned shared-memory
