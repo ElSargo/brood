@@ -469,6 +469,7 @@ impl RuntimeIoHub {
             return Err(RuntimeIoError::InvalidArgument);
         }
         let resolved = self.resolve_command(command)?;
+        let cwd = env::current_dir().map_err(|_error| RuntimeIoError::HostFailure)?;
         self.reserve_child()?;
         let child_state = match self.create_child(resolved.clone()) {
             Ok(state) => state,
@@ -498,6 +499,9 @@ impl RuntimeIoHub {
             }
         };
         let mut builder = CommandBuilder::new(&resolved);
+        // `portable-pty` otherwise falls back to `$HOME`, unlike
+        // `std::process::Command`, which inherits the caller's cwd.
+        builder.cwd(cwd);
         for argument in arguments {
             builder.arg(argument);
         }
@@ -1702,11 +1706,13 @@ mod tests {
     #[tokio::test]
     async fn pty_is_a_terminal_and_blocked_resources_teardown() -> Result<()> {
         let hub = test_hub(&["sh"])?;
+        let cwd = env::current_dir()?.canonicalize()?;
+        let cwd_marker = format!("PTY-CWD={}", cwd.display()).into_bytes();
         let pty = hub.spawn_pty(
             "sh",
             &[
                 "-c".into(),
-                "test -t 0 && test -t 1 || exit 42; printf PTY-OK; sleep 60".into(),
+                "test -t 0 && test -t 1 || exit 42; printf PTY-CWD=; pwd -P; printf PTY-OK; sleep 60".into(),
             ],
             24,
             80,
@@ -1732,6 +1738,11 @@ mod tests {
             output
                 .windows(b"PTY-OK".len())
                 .any(|window| window == b"PTY-OK")
+        );
+        ensure!(
+            output
+                .windows(cwd_marker.len())
+                .any(|window| window == cwd_marker)
         );
         timeout(Duration::from_secs(2), hub.teardown())
             .await

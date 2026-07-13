@@ -158,11 +158,13 @@ the data themselves.
 Process authority is an explicit manifest allowlist of PATH-resolved command
 names (`subprocess:<name>`). The runtime reports the resolved executable used
 for a child so observable proofs and diagnostics do not hide environment
-selection. `pty` separately permits spawning a child attached to a real host
-pseudoterminal. `network:loopback` permits outbound connections only to a
-loopback peer; accepting listeners, DNS, ambient sockets, and arbitrary remote
-addresses are not part of this surface. PTY children still require their
-command allowlist entry.
+selection. Pipe and PTY children start from the same actor/session working
+directory; terminal setup must pass that directory explicitly rather than
+infer it from `HOME`. `pty` separately permits spawning a child attached to a
+real host pseudoterminal. `network:loopback` permits outbound connections only
+to a loopback peer; accepting listeners, DNS, ambient sockets, and arbitrary
+remote addresses are not part of this surface. PTY children still require
+their command allowlist entry.
 
 Children, streams, PTYs, connected sockets, timers, pump tasks, and their
 notifications belong to one actor generation. Generation stop first rejects

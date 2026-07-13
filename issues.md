@@ -168,9 +168,10 @@ warnings without pretending these areas are already structurally clean.
 - Subprocess pipes, real PTYs, loopback sockets, and timers now share one
   bounded byte-stream and notification/pollable lifecycle owned by the actor
   generation. Component and Preview 1 guests use the same capability grants,
-  PATH-selected process resolution, exit status, backpressure, async drop, and
-  structured teardown semantics; admission races, cancellation, stale handles,
-  resource churn, and blocked host work have deterministic coverage. The real
+  PATH-selected process resolution, caller working directory, exit status,
+  backpressure, async drop, and structured teardown semantics; admission races,
+  cancellation, stale handles, resource churn, and blocked host work have
+  deterministic coverage. The real
   Component `component-runtime-io` plugin and the Preview 1
   `workspace-file-log` worker write separate visible transcripts through
   `tools/test-runtime-io-plugins-nested.sh`: both feed an allowlisted `tr`
