@@ -2,9 +2,10 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-13
 code-links:
   - crates/manifoldd/src/control.rs
+  - crates/manifoldd/src/browser.rs
   - crates/manifoldd/src/session_bus.rs
 ---
 
@@ -28,6 +29,14 @@ Exact method signatures are defined in `crates/manifoldd/src/control.rs`.
 `manifold ctl` sends command argv to a DBus control endpoint. It can also send a raw JSON argv array with `--json`.
 
 Common control requests include status, status-json, spawn, spawn-in-session, focus, plug, harness signal, nested-inner proxying, and quit.
+
+Raw argv and JSON requests cross one fallible parsing boundary before they can
+mutate compositor state. Command-specific parsers produce typed commands,
+validate exact arity, and reject ambiguous option forms; execution code does
+not interpret positional token indexes. `tools/test-typed-control-parser-nested.sh`
+exercises both encodings in the offscreen nested harness and records the exact
+rejections alongside a real Component actor loaded through the typed `plug`
+command.
 
 ## Host Activation
 

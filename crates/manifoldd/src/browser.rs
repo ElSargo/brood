@@ -1,9 +1,3 @@
-#![allow(
-    clippy::indexing_slicing,
-    reason = "tracked in issues.md: browser command parsing still relies on positional tokens"
-)]
-// TODO(lint-structure): replace browser command token parsing with a typed parser.
-
 use std::{
     collections::BTreeMap,
     env,
@@ -17,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::state::Manifold;
 
@@ -41,6 +35,106 @@ pub struct BrowserLaunchOptions {
     pub extra_args: Vec<String>,
     pub app_mode: bool,
     pub platform: BrowserPlatform,
+}
+
+#[derive(Debug)]
+enum BrowserControlCommand {
+    Open(BrowserLaunchOptions),
+    OpenConfig(PathBuf),
+    List,
+    ListJson,
+    Inspect(u64),
+    InspectJson(u64),
+    Tabs(u64),
+    New {
+        browser_id: u64,
+        url: String,
+    },
+    Activate {
+        browser_id: u64,
+        target_id: String,
+    },
+    CloseTarget {
+        browser_id: u64,
+        target_id: String,
+    },
+    Devtools {
+        browser_id: u64,
+        method: String,
+        path: String,
+        body: String,
+    },
+    Close(u64),
+    CloseAll,
+}
+
+impl BrowserControlCommand {
+    fn parse(args: &[String]) -> Result<Self> {
+        let Some((subcommand, rest)) = args.split_first() else {
+            bail!("browser requires a subcommand: open, list, close");
+        };
+
+        match (subcommand.as_str(), rest) {
+            ("open" | "spawn", options) => Ok(Self::Open(parse_open_options(options)?)),
+            ("open-config", [path]) => Ok(Self::OpenConfig(PathBuf::from(path))),
+            ("open-config", _) => bail!("usage: browser open-config <json-file>"),
+            ("list" | "status", []) => Ok(Self::List),
+            ("list-json", []) => Ok(Self::ListJson),
+            ("inspect", [id]) => Ok(Self::Inspect(parse_browser_id(id)?)),
+            ("inspect-json", [id]) => Ok(Self::InspectJson(parse_browser_id(id)?)),
+            ("tabs", [id]) => Ok(Self::Tabs(parse_browser_id(id)?)),
+            ("new", [id]) => Ok(Self::New {
+                browser_id: parse_browser_id(id)?,
+                url: DEFAULT_URL.to_string(),
+            }),
+            ("new", [id, url]) => Ok(Self::New {
+                browser_id: parse_browser_id(id)?,
+                url: url.clone(),
+            }),
+            ("activate", [id, target_id]) => Ok(Self::Activate {
+                browser_id: parse_browser_id(id)?,
+                target_id: target_id.clone(),
+            }),
+            ("close-target", [id, target_id]) => Ok(Self::CloseTarget {
+                browser_id: parse_browser_id(id)?,
+                target_id: target_id.clone(),
+            }),
+            ("devtools", [id]) => Ok(Self::Devtools {
+                browser_id: parse_browser_id(id)?,
+                method: "GET".to_string(),
+                path: "/json/version".to_string(),
+                body: String::new(),
+            }),
+            ("devtools", [id, method]) => Ok(Self::Devtools {
+                browser_id: parse_browser_id(id)?,
+                method: method.clone(),
+                path: "/json/version".to_string(),
+                body: String::new(),
+            }),
+            ("devtools", [id, method, path]) => Ok(Self::Devtools {
+                browser_id: parse_browser_id(id)?,
+                method: method.clone(),
+                path: path.clone(),
+                body: String::new(),
+            }),
+            ("devtools", [id, method, path, body]) => Ok(Self::Devtools {
+                browser_id: parse_browser_id(id)?,
+                method: method.clone(),
+                path: path.clone(),
+                body: body.clone(),
+            }),
+            ("close", [id]) => Ok(Self::Close(parse_browser_id(id)?)),
+            ("close-all", []) => Ok(Self::CloseAll),
+            (
+                "list" | "status" | "list-json" | "inspect" | "inspect-json" | "tabs" | "new"
+                | "activate" | "close-target" | "devtools" | "close" | "close-all",
+                _,
+            ) => {
+                bail!("invalid arguments for browser {subcommand}")
+            }
+            _ => bail!("unknown browser subcommand: {subcommand}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,80 +366,73 @@ impl Drop for BrowserManager {
 }
 
 pub fn handle_control(args: &[String], state: &mut Manifold) -> Result<String> {
-    let Some((subcommand, rest)) = args.split_first() else {
-        bail!("browser requires a subcommand: open, list, close");
-    };
-
-    match subcommand.as_str() {
-        "open" | "spawn" => {
-            let options = parse_open_options(rest)?;
+    match BrowserControlCommand::parse(args)? {
+        BrowserControlCommand::Open(options) => {
             let summary = state.spawn_browser_pane(options)?;
             Ok(format_browser_opened(summary))
         }
-        "open-config" => {
-            let Some(path) = rest.first() else {
-                bail!("browser open-config requires a JSON file path");
-            };
-            let options = read_launch_config(path)?;
+        BrowserControlCommand::OpenConfig(path) => {
+            let options = read_launch_config(&path)?;
             let summary = state.spawn_browser_pane(options)?;
             Ok(format_browser_opened(summary))
         }
-        "list" | "status" => Ok(format_browser_list(state.browsers.list())),
-        "list-json" => Ok(format_browser_list_json(state.browsers.list())?),
-        "inspect" => {
-            let browser = browser_from_args(rest, state)?;
+        BrowserControlCommand::List => Ok(format_browser_list(state.browsers.list())),
+        BrowserControlCommand::ListJson => Ok(format_browser_list_json(state.browsers.list())?),
+        BrowserControlCommand::Inspect(id) => {
+            let browser = state.browsers.get(id)?;
             Ok(format_browser_inspect(browser))
         }
-        "inspect-json" => {
-            let browser = browser_from_args(rest, state)?;
+        BrowserControlCommand::InspectJson(id) => {
+            let browser = state.browsers.get(id)?;
             Ok(format_browser_inspect_json(browser)?)
         }
-        "tabs" => {
-            let browser = browser_from_args(rest, state)?;
+        BrowserControlCommand::Tabs(id) => {
+            let browser = state.browsers.get(id)?;
             let response = devtools_request(browser.devtools_port, "GET", "/json/list", "")?;
             Ok(format_devtools_response(&response))
         }
-        "new" => {
-            let browser = browser_from_args(rest, state)?;
-            let url = rest.get(1).map_or(DEFAULT_URL, String::as_str);
-            let path = format!("/json/new?{}", percent_encode(url));
+        BrowserControlCommand::New { browser_id, url } => {
+            let browser = state.browsers.get(browser_id)?;
+            let path = format!("/json/new?{}", percent_encode(&url));
             let response = devtools_request(browser.devtools_port, "PUT", &path, "")?;
             Ok(format_devtools_response(&response))
         }
-        "activate" => {
-            let browser = browser_from_args(rest, state)?;
-            let target_id = take_value(rest, 1, "browser activate target id")?;
-            let path = format!("/json/activate/{}", percent_encode_path_segment(target_id));
+        BrowserControlCommand::Activate {
+            browser_id,
+            target_id,
+        } => {
+            let browser = state.browsers.get(browser_id)?;
+            let path = format!("/json/activate/{}", percent_encode_path_segment(&target_id));
             let response = devtools_request(browser.devtools_port, "GET", &path, "")?;
             Ok(format_devtools_response(&response))
         }
-        "close-target" => {
-            let browser = browser_from_args(rest, state)?;
-            let target_id = take_value(rest, 1, "browser close-target target id")?;
-            let path = format!("/json/close/{}", percent_encode_path_segment(target_id));
+        BrowserControlCommand::CloseTarget {
+            browser_id,
+            target_id,
+        } => {
+            let browser = state.browsers.get(browser_id)?;
+            let path = format!("/json/close/{}", percent_encode_path_segment(&target_id));
             let response = devtools_request(browser.devtools_port, "GET", &path, "")?;
             Ok(format_devtools_response(&response))
         }
-        "devtools" => {
-            let browser = browser_from_args(rest, state)?;
-            let method = rest.get(1).map_or("GET", String::as_str);
-            let path = rest.get(2).map_or("/json/version", String::as_str);
-            let body = rest.get(3).map_or("", String::as_str);
-            let response = devtools_request(browser.devtools_port, method, path, body)?;
+        BrowserControlCommand::Devtools {
+            browser_id,
+            method,
+            path,
+            body,
+        } => {
+            let browser = state.browsers.get(browser_id)?;
+            let response = devtools_request(browser.devtools_port, &method, &path, &body)?;
             Ok(format_devtools_response(&response))
         }
-        "close" => {
-            let Some(id) = rest.first() else {
-                bail!("browser close requires an id");
-            };
-            let id = id.parse::<u64>().context("browser id must be a number")?;
+        BrowserControlCommand::Close(id) => {
             let summary = state.browsers.close(id)?;
             Ok(format!(
                 "OK browser closed id={} pid={}\n",
                 summary.id, summary.pid
             ))
         }
-        "close-all" => {
+        BrowserControlCommand::CloseAll => {
             let summaries = state.browsers.close_all();
             let mut output = format!("OK browsers_closed={}\n", summaries.len());
             for summary in summaries {
@@ -354,7 +441,6 @@ pub fn handle_control(args: &[String], state: &mut Manifold) -> Result<String> {
             }
             Ok(output)
         }
-        _ => bail!("unknown browser subcommand: {subcommand}"),
     }
 }
 
@@ -374,68 +460,61 @@ fn terminate_instance_lossy(mut instance: BrowserInstance) -> BrowserInstanceSum
     instance.summary
 }
 
-fn read_launch_config(path: &str) -> Result<BrowserLaunchOptions> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("read browser config {path}"))?;
-    serde_json::from_str(&contents).with_context(|| format!("parse browser config {path}"))
+fn read_launch_config(path: &Path) -> Result<BrowserLaunchOptions> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read browser config {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("parse browser config {}", path.display()))
 }
 
-fn browser_from_args<'a>(
-    args: &[String],
-    state: &'a mut Manifold,
-) -> Result<&'a BrowserInstanceSummary> {
-    let Some(id) = args.first() else {
-        bail!("browser command requires a browser id");
-    };
-    let id = id.parse::<u64>().context("browser id must be a number")?;
-    state.browsers.get(id)
+fn parse_browser_id(value: &str) -> Result<u64> {
+    value.parse().context("browser id must be a number")
 }
 
 fn parse_open_options(args: &[String]) -> Result<BrowserLaunchOptions> {
     let mut options = BrowserLaunchOptions::default();
-    let mut positional_url = None;
-    let mut index = 0;
+    let mut url = None;
+    let mut args = args.iter();
 
-    while index < args.len() {
-        match args[index].as_str() {
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--url" => {
-                index += 1;
-                options.url = take_value(args, index, "--url")?.to_string();
+                let value = next_option_value(&mut args, "--url")?;
+                ensure!(
+                    url.replace(value.to_string()).is_none(),
+                    "browser open URL may only be specified once"
+                );
             }
             "--chromium" | "--browser" => {
-                index += 1;
-                options.chromium = Some(PathBuf::from(take_value(args, index, "--chromium")?));
+                options.chromium = Some(PathBuf::from(next_option_value(&mut args, "--chromium")?));
             }
             "--profile-dir" => {
-                index += 1;
-                options.profile_dir =
-                    Some(PathBuf::from(take_value(args, index, "--profile-dir")?));
+                options.profile_dir = Some(PathBuf::from(next_option_value(
+                    &mut args,
+                    "--profile-dir",
+                )?));
             }
             "--extension" => {
-                index += 1;
                 options
                     .extensions
-                    .push(PathBuf::from(take_value(args, index, "--extension")?));
+                    .push(PathBuf::from(next_option_value(&mut args, "--extension")?));
             }
             "--env" => {
-                index += 1;
-                let assignment = take_value(args, index, "--env")?;
+                let assignment = next_option_value(&mut args, "--env")?;
                 let Some((key, value)) = assignment.split_once('=') else {
                     bail!("--env requires KEY=VALUE");
                 };
                 options.env.insert(key.to_string(), value.to_string());
             }
             "--unset-env" => {
-                index += 1;
                 options
                     .unset_env
-                    .push(take_value(args, index, "--unset-env")?.to_string());
+                    .push(next_option_value(&mut args, "--unset-env")?.to_string());
             }
             "--arg" => {
-                index += 1;
                 options
                     .extra_args
-                    .push(take_value(args, index, "--arg")?.to_string());
+                    .push(next_option_value(&mut args, "--arg")?.to_string());
             }
             "--ui" => {
                 options.app_mode = false;
@@ -444,20 +523,19 @@ fn parse_open_options(args: &[String]) -> Result<BrowserLaunchOptions> {
                 options.app_mode = true;
             }
             "--platform" => {
-                index += 1;
-                options.platform = parse_platform(take_value(args, index, "--platform")?)?;
+                options.platform = parse_platform(next_option_value(&mut args, "--platform")?)?;
             }
             value if value.starts_with("--") => bail!("unknown browser open option: {value}"),
             value => {
-                if positional_url.replace(value.to_string()).is_some() {
-                    bail!("browser open accepts at most one positional URL");
-                }
+                ensure!(
+                    url.replace(value.to_string()).is_none(),
+                    "browser open URL may only be specified once"
+                );
             }
         }
-        index += 1;
     }
 
-    if let Some(url) = positional_url {
+    if let Some(url) = url {
         options.url = url;
     }
     Ok(options)
@@ -472,8 +550,11 @@ fn parse_platform(value: &str) -> Result<BrowserPlatform> {
     }
 }
 
-fn take_value<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str> {
-    args.get(index)
+fn next_option_value<'a>(
+    args: &mut impl Iterator<Item = &'a String>,
+    option: &str,
+) -> Result<&'a str> {
+    args.next()
         .map(String::as_str)
         .with_context(|| format!("{option} requires a value"))
 }
@@ -723,5 +804,101 @@ impl From<&BrowserInstanceSummary> for BrowserInstanceView {
             platform: summary.platform,
             argv: summary.argv.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "parser tests use direct assertions where panic output is useful"
+)]
+mod tests {
+    use super::{BrowserControlCommand, BrowserPlatform};
+
+    fn tokens(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn browser_parser_builds_typed_open_and_devtools_commands() {
+        let open = BrowserControlCommand::parse(&tokens(&[
+            "open",
+            "https://example.test/",
+            "--platform",
+            "wayland",
+            "--env",
+            "MODE=proof",
+        ]))
+        .unwrap();
+        assert!(matches!(&open, BrowserControlCommand::Open(_)));
+        if let BrowserControlCommand::Open(options) = open {
+            assert_eq!(options.url, "https://example.test/");
+            assert!(matches!(options.platform, BrowserPlatform::Wayland));
+            assert_eq!(options.env.get("MODE").map(String::as_str), Some("proof"));
+        }
+
+        let devtools = BrowserControlCommand::parse(&tokens(&[
+            "devtools",
+            "7",
+            "POST",
+            "/json/proof",
+            "payload",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            devtools,
+            BrowserControlCommand::Devtools {
+                browser_id: 7,
+                ref method,
+                ref path,
+                ref body,
+            } if method == "POST" && path == "/json/proof" && body == "payload"
+        ));
+    }
+
+    #[test]
+    fn browser_parser_rejects_missing_and_extra_arguments() {
+        let missing = BrowserControlCommand::parse(&tokens(&["close"]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(missing, "invalid arguments for browser close");
+
+        let extra = BrowserControlCommand::parse(&tokens(&["list-json", "unexpected"]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(extra, "invalid arguments for browser list-json");
+
+        let devtools_extra = BrowserControlCommand::parse(&tokens(&[
+            "devtools",
+            "7",
+            "GET",
+            "/json/list",
+            "body",
+            "unexpected",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(devtools_extra, "invalid arguments for browser devtools");
+    }
+
+    #[test]
+    fn browser_parser_rejects_ambiguous_url_forms() {
+        let duplicate_positionals =
+            BrowserControlCommand::parse(&tokens(&["open", "https://one", "https://two"]))
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            duplicate_positionals,
+            "browser open URL may only be specified once"
+        );
+
+        let option_and_positional =
+            BrowserControlCommand::parse(&tokens(&["open", "--url", "https://one", "https://two"]))
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            option_and_positional,
+            "browser open URL may only be specified once"
+        );
     }
 }

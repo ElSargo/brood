@@ -1,15 +1,14 @@
 #![allow(
     clippy::expect_used,
-    clippy::indexing_slicing,
     clippy::let_underscore_must_use,
     clippy::needless_pass_by_ref_mut,
     clippy::needless_pass_by_value,
     clippy::option_if_let_else,
     clippy::too_many_arguments,
     clippy::unnecessary_wraps,
-    reason = "tracked in issues.md: control.rs preserves token-oriented command plumbing while DBus waits cross the compositor actor boundary"
+    reason = "tracked in issues.md: DBus waits still cross the compositor actor boundary"
 )]
-// TODO(lint-structure): separate the DBus proxy ABI from CLI command parsing.
+// TODO(lint-structure): separate the DBus proxy ABI from compositor state dispatch.
 
 use std::{
     collections::BTreeMap,
@@ -3110,9 +3109,14 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             format!("OK spawned {}\n", argv.join(" "))
         }
         "plug" => {
-            let (kind, instance_id, path) = parse_plug_args(args)?;
-            let loaded_kind = plug_wasm_module(state, &path, kind, instance_id.as_deref())?;
-            format_plug_success(loaded_kind, instance_id.as_deref(), &path)
+            let command = PlugCommand::parse(args)?;
+            let loaded_kind = plug_wasm_module(
+                state,
+                &command.path,
+                command.kind,
+                command.instance_id.as_deref(),
+            )?;
+            format_plug_success(loaded_kind, command.instance_id.as_deref(), &command.path)
         }
         "focus" => {
             let direction = match args {
@@ -3396,58 +3400,68 @@ impl WasmPlugKind {
     }
 }
 
-fn parse_plug_args(args: &[String]) -> Result<(WasmPlugKind, Option<String>, PathBuf)> {
-    let mut kind = WasmPlugKind::Auto;
-    let mut instance_id = None;
-    let mut path = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--kind" | "-k" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    bail!("plug --kind requires a value");
-                };
-                kind = WasmPlugKind::parse(value)?;
-            }
-            arg if arg.starts_with("--kind=") => {
-                let value = arg.trim_start_matches("--kind=");
-                kind = WasmPlugKind::parse(value)?;
-            }
-            "--id" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    bail!("plug --id requires a value");
-                };
-                ensure!(!value.is_empty(), "plug --id must not be empty");
-                ensure!(
-                    instance_id.is_none(),
-                    "plug --id may only be specified once"
-                );
-                instance_id = Some(value.clone());
-            }
-            arg if arg.starts_with("--id=") => {
-                let value = arg.trim_start_matches("--id=");
-                ensure!(!value.is_empty(), "plug --id must not be empty");
-                ensure!(
-                    instance_id.is_none(),
-                    "plug --id may only be specified once"
-                );
-                instance_id = Some(value.to_string());
-            }
-            arg if arg.starts_with('-') => {
-                bail!("unknown plug option {arg}");
-            }
-            arg => {
-                ensure!(path.is_none(), "plug accepts exactly one WASM module path");
-                path = Some(PathBuf::from(arg));
+#[derive(Debug, PartialEq, Eq)]
+struct PlugCommand {
+    kind: WasmPlugKind,
+    instance_id: Option<String>,
+    path: PathBuf,
+}
+
+impl PlugCommand {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut kind = WasmPlugKind::Auto;
+        let mut instance_id = None;
+        let mut path = None;
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--kind" | "-k" => {
+                    let Some(value) = args.next() else {
+                        bail!("plug --kind requires a value");
+                    };
+                    kind = WasmPlugKind::parse(value)?;
+                }
+                arg if arg.starts_with("--kind=") => {
+                    let value = arg.trim_start_matches("--kind=");
+                    kind = WasmPlugKind::parse(value)?;
+                }
+                "--id" => {
+                    let Some(value) = args.next() else {
+                        bail!("plug --id requires a value");
+                    };
+                    ensure!(!value.is_empty(), "plug --id must not be empty");
+                    ensure!(
+                        instance_id.is_none(),
+                        "plug --id may only be specified once"
+                    );
+                    instance_id = Some(value.clone());
+                }
+                arg if arg.starts_with("--id=") => {
+                    let value = arg.trim_start_matches("--id=");
+                    ensure!(!value.is_empty(), "plug --id must not be empty");
+                    ensure!(
+                        instance_id.is_none(),
+                        "plug --id may only be specified once"
+                    );
+                    instance_id = Some(value.to_string());
+                }
+                arg if arg.starts_with('-') => {
+                    bail!("unknown plug option {arg}");
+                }
+                arg => {
+                    ensure!(path.is_none(), "plug accepts exactly one WASM module path");
+                    path = Some(PathBuf::from(arg));
+                }
             }
         }
-        index += 1;
-    }
 
-    let path = path.context("usage: plug [--kind auto|plugin|key-policy] [--id ID] <path>")?;
-    Ok((kind, instance_id, path))
+        let path = path.context("usage: plug [--kind auto|plugin|key-policy] [--id ID] <path>")?;
+        Ok(Self {
+            kind,
+            instance_id,
+            path,
+        })
+    }
 }
 
 fn format_plug_success(kind: &str, instance_id: Option<&str>, path: &Path) -> String {
@@ -3968,36 +3982,35 @@ impl StatusSnapshot {
 }
 
 fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
-    let Some((kind, rest)) = args.split_first() else {
-        bail!("inject requires a kind: motion, button, key, or axis");
-    };
+    let command = InjectCommand::parse(args)?;
     let time = monotonic_time_msec(state);
 
-    match kind.as_str() {
-        "motion" if rest.len() == 2 => {
-            let x = parse_f64(&rest[0], "x")?;
-            let y = parse_f64(&rest[1], "y")?;
+    match command {
+        InjectCommand::Motion { x, y } => {
             state.forward_pointer_motion(Point::from((x, y)), time);
         }
-        "center-motion" if rest.is_empty() => {
+        InjectCommand::CenterMotion => {
             let Some(pos) = state.first_window_center() else {
                 bail!("no mapped window to target");
             };
             state.forward_pointer_motion(pos, time);
         }
-        "button" if rest.len() == 2 => {
-            let button = parse_u32(&rest[0], "button")?;
-            let button_state = parse_button_state(&rest[1])?;
-            state.forward_pointer_button(button, button_state, time);
+        InjectCommand::Button {
+            code,
+            state: button_state,
+        } => {
+            state.forward_pointer_button(code, button_state, time);
         }
-        "key" if rest.len() == 2 => {
-            let key = parse_u32(&rest[0], "key")?;
-            let key_state = parse_key_state(&rest[1])?;
-            state.forward_keyboard_key(key.into(), key_state, time);
+        InjectCommand::Key {
+            code,
+            state: key_state,
+        } => {
+            state.forward_keyboard_key(code.into(), key_state, time);
         }
-        "axis" if rest.len() == 2 => {
-            let horizontal = parse_f64(&rest[0], "horizontal")?;
-            let vertical = parse_f64(&rest[1], "vertical")?;
+        InjectCommand::Axis {
+            horizontal,
+            vertical,
+        } => {
             let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
             if horizontal != 0.0 {
                 frame = frame.value(Axis::Horizontal, horizontal);
@@ -4007,9 +4020,10 @@ fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
             }
             state.forward_pointer_axis(frame);
         }
-        "wheel" if rest.len() == 2 => {
-            let horizontal = parse_i32(&rest[0], "horizontal_v120")?;
-            let vertical = parse_i32(&rest[1], "vertical_v120")?;
+        InjectCommand::Wheel {
+            horizontal,
+            vertical,
+        } => {
             let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
             if horizontal != 0 {
                 frame = frame
@@ -4023,15 +4037,54 @@ fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
             }
             state.forward_pointer_axis(frame);
         }
-        _ => bail!(
-            "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical> | wheel <horizontal_v120> <vertical_v120>"
-        ),
     }
     if let Err(err) = state.display_handle.flush_clients() {
         tracing::warn!(?err, "flush clients after injected input failed");
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+enum InjectCommand {
+    Motion { x: f64, y: f64 },
+    CenterMotion,
+    Button { code: u32, state: ButtonState },
+    Key { code: u32, state: KeyState },
+    Axis { horizontal: f64, vertical: f64 },
+    Wheel { horizontal: i32, vertical: i32 },
+}
+
+impl InjectCommand {
+    fn parse(args: &[String]) -> Result<Self> {
+        match args {
+            [kind, x, y] if kind == "motion" => Ok(Self::Motion {
+                x: parse_f64(x, "x")?,
+                y: parse_f64(y, "y")?,
+            }),
+            [kind] if kind == "center-motion" => Ok(Self::CenterMotion),
+            [kind, code, state] if kind == "button" => Ok(Self::Button {
+                code: parse_u32(code, "button")?,
+                state: parse_button_state(state)?,
+            }),
+            [kind, code, state] if kind == "key" => Ok(Self::Key {
+                code: parse_u32(code, "key")?,
+                state: parse_key_state(state)?,
+            }),
+            [kind, horizontal, vertical] if kind == "axis" => Ok(Self::Axis {
+                horizontal: parse_f64(horizontal, "horizontal")?,
+                vertical: parse_f64(vertical, "vertical")?,
+            }),
+            [kind, horizontal, vertical] if kind == "wheel" => Ok(Self::Wheel {
+                horizontal: parse_i32(horizontal, "horizontal_v120")?,
+                vertical: parse_i32(vertical, "vertical_v120")?,
+            }),
+            [] => bail!("inject requires a kind: motion, button, key, or axis"),
+            _ => bail!(
+                "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical> | wheel <horizontal_v120> <vertical_v120>"
+            ),
+        }
+    }
 }
 
 fn monotonic_time_msec(state: &Manifold) -> u32 {
@@ -4316,11 +4369,11 @@ fn ensure_ok_response(response: &str) -> Result<()> {
 )]
 mod tests {
     use super::{
-        ControlTarget, MissingDirectorySurfaceSessionAction, SessionSwitchOutcome, WasmPlugKind,
-        choose_cli_surface_session, control_command_for_session, format_plug_success,
-        format_session_picker_row, missing_directory_surface_session_action, parse_plug_args,
-        parse_skim_session_output, resolve_initial_query, session_marker_value,
-        surface_session_dir_new_command,
+        ControlTarget, InjectCommand, MissingDirectorySurfaceSessionAction, PlugCommand,
+        SessionSwitchOutcome, WasmPlugKind, choose_cli_surface_session,
+        control_command_for_session, format_plug_success, format_session_picker_row,
+        missing_directory_surface_session_action, parse_skim_session_output, resolve_initial_query,
+        session_marker_value, surface_session_dir_new_command,
     };
     use crate::state::SurfaceSessionSummary;
     use std::path::Path;
@@ -4394,16 +4447,16 @@ mod tests {
 
     #[test]
     fn plug_args_default_to_auto_kind() {
-        let (kind, instance_id, path) = parse_plug_args(&["module.wasm".to_string()]).unwrap();
+        let command = PlugCommand::parse(&["module.wasm".to_string()]).unwrap();
 
-        assert_eq!(kind, WasmPlugKind::Auto);
-        assert_eq!(instance_id, None);
-        assert_eq!(path, std::path::PathBuf::from("module.wasm"));
+        assert_eq!(command.kind, WasmPlugKind::Auto);
+        assert_eq!(command.instance_id, None);
+        assert_eq!(command.path, std::path::PathBuf::from("module.wasm"));
     }
 
     #[test]
     fn plug_args_accept_kind_option() {
-        let (kind, instance_id, path) = parse_plug_args(&[
+        let command = PlugCommand::parse(&[
             "--kind".to_string(),
             "plugin".to_string(),
             "--id=rube-17".to_string(),
@@ -4411,35 +4464,70 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(kind, WasmPlugKind::Plugin);
-        assert_eq!(instance_id.as_deref(), Some("rube-17"));
-        assert_eq!(path, std::path::PathBuf::from("workspace.wasm"));
+        assert_eq!(command.kind, WasmPlugKind::Plugin);
+        assert_eq!(command.instance_id.as_deref(), Some("rube-17"));
+        assert_eq!(command.path, std::path::PathBuf::from("workspace.wasm"));
     }
 
     #[test]
     fn plug_args_accept_separate_instance_id_option() {
-        let (_, instance_id, path) = parse_plug_args(&[
+        let command = PlugCommand::parse(&[
             "--id".to_string(),
             "rube-42".to_string(),
             "worker.wasm".to_string(),
         ])
         .unwrap();
 
-        assert_eq!(instance_id.as_deref(), Some("rube-42"));
-        assert_eq!(path, std::path::PathBuf::from("worker.wasm"));
+        assert_eq!(command.instance_id.as_deref(), Some("rube-42"));
+        assert_eq!(command.path, std::path::PathBuf::from("worker.wasm"));
     }
 
     #[test]
     fn plug_args_reject_duplicate_or_empty_instance_ids() {
-        assert!(parse_plug_args(&["--id=".to_string(), "worker.wasm".to_string()]).is_err());
+        assert!(PlugCommand::parse(&["--id=".to_string(), "worker.wasm".to_string()]).is_err());
         assert!(
-            parse_plug_args(&[
+            PlugCommand::parse(&[
                 "--id=a".to_string(),
                 "--id=b".to_string(),
                 "worker.wasm".to_string()
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn plug_parser_rejects_missing_extra_and_ambiguous_forms() {
+        assert!(PlugCommand::parse(&[]).is_err());
+        assert!(
+            PlugCommand::parse(&["first.wasm".to_string(), "second.wasm".to_string()]).is_err()
+        );
+        assert!(
+            PlugCommand::parse(&[
+                "--id=first".to_string(),
+                "--id".to_string(),
+                "second".to_string(),
+                "worker.wasm".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inject_parser_builds_typed_commands_and_rejects_wrong_arity() {
+        let motion =
+            InjectCommand::parse(&["motion".to_string(), "12.5".to_string(), "-4".to_string()])
+                .unwrap();
+        assert!(matches!(motion, InjectCommand::Motion { x: 12.5, y: -4.0 }));
+
+        let missing = InjectCommand::parse(&["motion".to_string(), "12.5".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(missing.starts_with("usage: inject motion"));
+
+        let extra = InjectCommand::parse(&["center-motion".to_string(), "unexpected".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(extra.starts_with("usage: inject motion"));
     }
 
     #[test]

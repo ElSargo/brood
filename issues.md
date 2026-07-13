@@ -4,13 +4,6 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Control and DBus API shape
-
-- `crates/manifoldd/src/control.rs`, `crates/manifoldd/src/browser.rs`: command
-  handlers still parse token slices positionally, which drives
-  `indexing_slicing` warnings. The target design should move these paths to
-  typed parsers or typed command structs.
-
 ## Central runtime state
 
 - `crates/manifoldd/src/state.rs`: the `Manifold` state object owns session
@@ -69,6 +62,15 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Raw argv and JSON control requests now cross typed `BrowserControlCommand`,
+  `PlugCommand`, and `InjectCommand` parsing boundaries before compositor
+  mutation. Exact arity and ambiguous browser URL forms are rejected without
+  token indexing, and the obsolete `indexing_slicing` allowances are gone. The
+  real `wasm-component-actor` example proves the plugin-facing route through
+  `tools/test-typed-control-parser-nested.sh`: a typed `plug --kind/--id/path`
+  command visibly registers the requested Component actor and its mailbox
+  counter advances, while the same artifact records JSON browser output, exact
+  invalid browser/inject diagnostics, and an unchanged input-event count.
 - The Nix development runner returns a typed `ActivatedChildExit` from its
   activation helper and leaves OS termination to the binary entrypoint. Numeric
   child codes are preserved and Unix signals follow the conventional
