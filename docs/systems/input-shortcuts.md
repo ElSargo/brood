@@ -83,6 +83,14 @@ KeyPolicyResult {
 
 The provider may read its latest published state and return a message batch, but it does not mutate host state or wait for actor work. The host applies accepted directives and enqueues messages only after the call returns.
 
+The host constructs one typed invocation context before crossing into the WASM
+runtime. Its key query groups the code, press/release state, modifier bitset,
+and input mode; the same invocation carries an optional immutable publication
+lease. The core-module adapter alone lowers the two bounded guest buffers to
+the raw pointer/length scalars required by the current Wasmtime function ABI.
+Input routing and policy logic do not pass those event fields as parallel
+arguments.
+
 The checked-in default-workspace plugin uses this boundary today: its
 `WasmGlobalKeyPolicy` returns a bounded decision envelope and actor-message
 batch after reading the latest immutable publication frame. The native host

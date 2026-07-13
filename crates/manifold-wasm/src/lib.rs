@@ -57,10 +57,10 @@ pub use filesystem_watch::{
 pub use global_key_policy::{
     ABI_INPUT_MODE_NORMAL, ABI_INPUT_MODE_PASSTHROUGH, ABI_KEY_PRESSED, ABI_KEY_RELEASED,
     ABI_MOD_ALT, ABI_MOD_CTRL, ABI_MOD_SHIFT, DEFAULT_GLOBAL_KEY_POLICY_ARENA_BYTES,
-    GlobalKeyActorMessage, GlobalKeyDecision, GlobalKeyPolicyInput,
-    GlobalKeyPolicyInvocationBuffers, GlobalKeyPolicyOutcome, HOST_ACTOR_NAME, HostMessage,
-    MAX_GLOBAL_KEY_POLICY_ARENA_BYTES, MAX_GLOBAL_KEY_POLICY_QUERY_BYTES,
-    MAX_GLOBAL_KEY_POLICY_RESULT_BYTES, WasmGlobalKeyPolicy, host_message,
+    GlobalKeyActorMessage, GlobalKeyDecision, GlobalKeyPolicyInput, GlobalKeyPolicyInvocation,
+    GlobalKeyPolicyOutcome, HOST_ACTOR_NAME, HostMessage, MAX_GLOBAL_KEY_POLICY_ARENA_BYTES,
+    MAX_GLOBAL_KEY_POLICY_QUERY_BYTES, MAX_GLOBAL_KEY_POLICY_RESULT_BYTES, WasmGlobalKeyPolicy,
+    host_message,
 };
 pub use global_key_policy_link::{
     GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GLOBAL_KEY_POLICY_RESULT_OK,

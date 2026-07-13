@@ -29,6 +29,11 @@ pub const MAX_GLOBAL_KEY_POLICY_RESULT_BYTES: usize = 64 * 1024;
 pub const HOST_ACTOR_NAME: &str = "host";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The complete key event offered to a synchronous policy provider.
+///
+/// Host input code constructs this value before entering the WASM runtime. The
+/// adapter serializes it as one bounded query envelope, so adding event context
+/// does not grow a parallel list of scalar arguments through the host.
 pub struct GlobalKeyPolicyInput {
     pub key_code: i32,
     pub key_state: i32,
@@ -93,9 +98,16 @@ pub struct WasmGlobalKeyPolicy {
     entry: WasmGlobalKeyPolicyEntry,
 }
 
-#[repr(C)]
+/// One host-side policy invocation, including the immutable actor publication
+/// visible at the same decision point.
+#[derive(Debug, Clone)]
+pub struct GlobalKeyPolicyInvocation<'a> {
+    input: GlobalKeyPolicyInput,
+    publication: Option<&'a PublicationFrameLease>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GlobalKeyPolicyInvocationBuffers {
+struct GlobalKeyPolicyGuestBuffers {
     pub query: GuestAllocation,
     pub state: GuestAllocation,
 }
@@ -112,6 +124,23 @@ impl GlobalKeyPolicyInput {
             modifiers,
             input_mode,
         }
+    }
+}
+
+impl<'a> GlobalKeyPolicyInvocation<'a> {
+    pub const fn new(
+        input: GlobalKeyPolicyInput,
+        publication: Option<&'a PublicationFrameLease>,
+    ) -> Self {
+        Self { input, publication }
+    }
+
+    pub const fn input(&self) -> &GlobalKeyPolicyInput {
+        &self.input
+    }
+
+    pub const fn publication(&self) -> Option<&PublicationFrameLease> {
+        self.publication
     }
 }
 
@@ -182,22 +211,24 @@ impl WasmGlobalKeyPolicy {
 
     pub fn handle_key(
         &mut self,
-        input: GlobalKeyPolicyInput,
-        publication: Option<&PublicationFrameLease>,
+        invocation: GlobalKeyPolicyInvocation<'_>,
     ) -> Result<GlobalKeyPolicyOutcome> {
-        let query = serde_json::to_vec(&input).context("encode global key policy query")?;
-        let state = publication.map_or(&[][..], PublicationFrameLease::bytes);
+        let query = serde_json::to_vec(invocation.input())
+            .context("encode global key policy invocation context")?;
+        let state = invocation
+            .publication()
+            .map_or(&[][..], PublicationFrameLease::bytes);
         let buffers = self.prepare_invocation_buffers(&query, state)?;
 
         let response_ptr = self.entry.call(&mut self.store, &buffers)?;
         read_policy_outcome(self.allocator.memory().data(&self.store), response_ptr)
     }
 
-    pub fn prepare_invocation_buffers(
+    fn prepare_invocation_buffers(
         &mut self,
         query: &[u8],
         state: &[u8],
-    ) -> Result<GlobalKeyPolicyInvocationBuffers> {
+    ) -> Result<GlobalKeyPolicyGuestBuffers> {
         ensure!(
             query.len() <= MAX_GLOBAL_KEY_POLICY_QUERY_BYTES,
             "global key policy query has {} bytes but limit is {MAX_GLOBAL_KEY_POLICY_QUERY_BYTES}",
@@ -224,7 +255,7 @@ impl WasmGlobalKeyPolicy {
             state,
             crate::DEFAULT_GUEST_ARENA_ALIGN,
         )?;
-        Ok(GlobalKeyPolicyInvocationBuffers { query, state })
+        Ok(GlobalKeyPolicyGuestBuffers { query, state })
     }
 
     fn ensure_arena_capacity(&mut self, required_capacity: usize) -> Result<()> {
@@ -258,10 +289,10 @@ impl WasmGlobalKeyPolicyEntry {
         Self { func }
     }
 
-    pub fn call<T: 'static>(
+    fn call<T: 'static>(
         &self,
         mut store: impl wasmtime::AsContextMut<Data = T>,
-        buffers: &GlobalKeyPolicyInvocationBuffers,
+        buffers: &GlobalKeyPolicyGuestBuffers,
     ) -> Result<i32> {
         self.func
             .call(

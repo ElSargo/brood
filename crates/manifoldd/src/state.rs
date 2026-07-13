@@ -1287,10 +1287,12 @@ impl Manifold {
             input_mode,
         );
         let publication = self.latest_wasm_policy_state_publication();
-        let outcome = self
-            .wasm_global_key_policy
-            .as_mut()
-            .map(|policy| policy.handle_key(input, publication.as_ref()))?;
+        let outcome = self.wasm_global_key_policy.as_mut().map(|policy| {
+            policy.handle_key(manifold_wasm::GlobalKeyPolicyInvocation::new(
+                input,
+                publication.as_ref(),
+            ))
+        })?;
         match outcome {
             Ok(outcome) => Some(self.apply_wasm_global_key_policy_outcome(outcome)),
             Err(err) => {

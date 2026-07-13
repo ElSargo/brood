@@ -2,10 +2,10 @@ use anyhow::{Context, Result, ensure};
 use wasmtime::{Engine, Module};
 
 use crate::{
-    ActorEpochOutcome, ActorOutbox, GlobalKeyDecision, GlobalKeyPolicyInput, Registry, WasmActor,
-    WasmActorConfig, WasmGlobalKeyPolicy, WasmModuleInventory, actor::pack_actor_outbox_slice,
-    api::async_epoch_engine, global_key_policy::enqueue_policy_messages,
-    policy_provider::PolicyProviderDeclaration,
+    ActorEpochOutcome, ActorOutbox, GlobalKeyDecision, GlobalKeyPolicyInput,
+    GlobalKeyPolicyInvocation, Registry, WasmActor, WasmActorConfig, WasmGlobalKeyPolicy,
+    WasmModuleInventory, actor::pack_actor_outbox_slice, api::async_epoch_engine,
+    global_key_policy::enqueue_policy_messages, policy_provider::PolicyProviderDeclaration,
 };
 
 #[test]
@@ -87,7 +87,7 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
                 &policy_module,
                 consume_decl,
             )?;
-            let outcome = consume_policy.handle_key(
+            let outcome = consume_policy.handle_key(GlobalKeyPolicyInvocation::new(
                 GlobalKeyPolicyInput::new(
                     32,
                     crate::ABI_KEY_PRESSED,
@@ -95,7 +95,7 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
                     crate::ABI_INPUT_MODE_NORMAL,
                 ),
                 Some(&b_state),
-            )?;
+            ))?;
             ensure!(
                 outcome.decision == GlobalKeyDecision::Consume,
                 "consume policy should consume"
@@ -112,7 +112,7 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
                 &policy_module,
                 abstain_decl,
             )?;
-            let outcome = abstain_policy.handle_key(
+            let outcome = abstain_policy.handle_key(GlobalKeyPolicyInvocation::new(
                 GlobalKeyPolicyInput::new(
                     32,
                     crate::ABI_KEY_PRESSED,
@@ -120,7 +120,7 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
                     crate::ABI_INPUT_MODE_NORMAL,
                 ),
                 Some(&b_state),
-            )?;
+            ))?;
             ensure!(
                 outcome.decision == GlobalKeyDecision::Abstain,
                 "abstain policy should abstain"
@@ -132,6 +132,30 @@ fn actors_messages_publications_and_policy_providers_work_end_to_end() -> Result
 
             Ok(())
         })
+}
+
+#[test]
+fn key_policy_invocation_groups_the_complete_event_context() -> Result<()> {
+    let invocation = GlobalKeyPolicyInvocation::new(
+        GlobalKeyPolicyInput::new(
+            32,
+            crate::ABI_KEY_RELEASED,
+            crate::ABI_MOD_CTRL | crate::ABI_MOD_SHIFT,
+            crate::ABI_INPUT_MODE_PASSTHROUGH,
+        ),
+        None,
+    );
+
+    ensure!(
+        serde_json::to_string(invocation.input())?
+            == r#"{"key_code":32,"key_state":0,"modifiers":5,"input_mode":0}"#,
+        "typed key invocation should serialize one complete event envelope"
+    );
+    ensure!(
+        invocation.publication().is_none(),
+        "invocation should preserve the absence of published state"
+    );
+    Ok(())
 }
 
 fn policy_provider<'a>(

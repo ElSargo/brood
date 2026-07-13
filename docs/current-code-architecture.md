@@ -625,11 +625,14 @@ exports in a self-contained core module. `WasmActor` runs one bounded actor
 epoch at a time against a registered mailbox and dispatches its outbox through
 the host registry.
 
-`crates/manifold-wasm/src/global_key_policy.rs` invokes the selected synchronous
-key provider with a serialized key query and an optional immutable publication
-frame. The provider returns a bounded decision envelope and message batch; the
-daemon applies the decision and enqueues messages to named actors. The checked-in
-default-workspace plugin combines this key provider with a workspace actor.
+`crates/manifold-wasm/src/global_key_policy.rs` constructs one typed invocation
+context for the selected synchronous key provider. The context groups the
+complete key-event query with an optional immutable publication lease; only the
+core-module link adapter lowers its bounded guest buffers to Wasmtime's raw
+pointer/length scalars. The provider returns a bounded decision envelope and
+message batch; the daemon applies the decision and enqueues messages to named
+actors. The checked-in default-workspace plugin combines this key provider with
+a workspace actor.
 See the source files that define module export discovery and policy response
 decoding for the exact ABI.
 

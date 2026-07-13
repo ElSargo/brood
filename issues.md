@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## WASM invocation and harness lifecycle
 
-- `crates/manifoldd/src/wasm_key.rs`: key-handler calls pass event context as
-  parallel scalar arguments. The target design should group those fields into a
-  typed invocation context.
 - `crates/manifoldd/src/wasm_test.rs`: harness process lifecycle is procedural
   and relies on best-effort child cleanup. The target design should model child
   handles, lifecycle events, and cleanup results explicitly.
@@ -20,6 +17,19 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- The named `wasm_key.rs` premise was stale after the prototype moved into the
+  policy-provider runtime, but the remaining invocation boundary is now fully
+  typed: `GlobalKeyPolicyInput` groups code, press/release state, modifiers, and
+  input mode, while `GlobalKeyPolicyInvocation` couples that event envelope to
+  its immutable publication lease. Input routing passes one context, guest
+  allocation details are private, and only the core-WASM link adapter lowers
+  bounded buffers to the four pointer/length scalars required by the stable
+  guest ABI. `tools/test-typed-key-policy-nested.sh` proves this with the real
+  `default-workspace` plugin and real key injection: bare `B` plus `Ctrl+O`
+  leaves one visible terminal and emits no plugin message, while `Ctrl+B` plus
+  `Ctrl+O` applies one host message and visibly opens exactly one second Foot
+  terminal. The captured two-pane frame, matching compositor state, press and
+  release event counts, and zero plugin failures make the result observable.
 - Session-local DBus routing now separates the audited bounded-wire layer from
   a typed `BusRouter`. Connection allocation, unique and well-known ownership,
   replacement flags, release, disconnect cleanup, route decisions, delivery
