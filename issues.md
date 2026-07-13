@@ -6,13 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Filesystem watch churn is not fully bounded. Each watch creation retains a
-  setup-thread handle until the entire hub stops, including after that watch is
-  dropped, so repeated create/drop cycles grow `setup_threads`. In addition,
-  `drop_watch` removes the watch before dropping its notification; if a queued
-  actor event makes `drop_notification` fail, the notification remains live
-  after its owning watch is gone. Reap keyed setup tasks and make watch plus
-  notification teardown atomic or safely deferred.
 - Native watches currently create one `notify` backend per logical watch
   resource. Replace that with a daemon-wide watcher service which deduplicates
   native path registrations and routes events into bounded, actor-generation
@@ -115,6 +108,14 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Filesystem-watch setup tasks are keyed and reaped, while unfinished orphan
+  setup still counts against the watch ceiling until it exits. Logical drop
+  never waits for recursive registration. Host teardown retires a watch's
+  notification before removing the watch, invalidates pollables, adjusts an
+  admitted actor-event count exactly once, and lets any stale queued ID drain as
+  a no-op. Unit tests cover 32 create/drop cycles and queued-event retirement;
+  the real workspace plugin repeats 32 guest teardown probes, returns to one
+  primary notification, and then visibly records `after-watch-churn.txt`.
 - Completion-I/O cancellation and replacement own blocking writes through their
   terminal boundary. Cancellation can prevent queued work from starting but
   does not roll back an already-started filesystem effect; once a write has

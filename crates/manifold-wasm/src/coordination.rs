@@ -325,6 +325,39 @@ impl CoordinationHub {
         Ok(())
     }
 
+    /// Retire a host-owned notification, invalidating an admitted actor event.
+    ///
+    /// Guest-requested drops preserve already-admitted events, but a host
+    /// resource teardown must not leave its notification live after the
+    /// resource is gone. The notification ID may already be in the reserved
+    /// lane; removing its table entry makes that queued ID a safe no-op.
+    pub(super) fn retire_notification(
+        &self,
+        notification: NotificationId,
+    ) -> Result<(), NotificationError> {
+        self.ensure_alive()?;
+        let mut state = self.lock_state()?;
+        let entry = state
+            .notifications
+            .remove(&notification)
+            .ok_or(NotificationError::InvalidHandle)?;
+        if entry.actor_event_queued {
+            self.inner
+                .pending_actor_events
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        state.pollables.retain(|_id, pollable| {
+            if pollable.notification == notification {
+                pollable.invalidated.send_replace(true);
+                false
+            } else {
+                true
+            }
+        });
+        drop(state);
+        Ok(())
+    }
+
     /// Announce that guest shared state was published through `generation`.
     /// Out-of-order announcements are accepted and return the greatest value.
     pub fn signal(

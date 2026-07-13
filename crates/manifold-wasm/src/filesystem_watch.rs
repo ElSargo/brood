@@ -61,7 +61,7 @@ struct FilesystemWatchInner {
     max_watches: usize,
     max_events: usize,
     watches: Mutex<HashMap<FilesystemWatchId, FilesystemWatchEntry>>,
-    setup_threads: Mutex<Vec<JoinHandle<()>>>,
+    setup_threads: Mutex<HashMap<FilesystemWatchId, JoinHandle<()>>>,
 }
 
 struct FilesystemWatchEntry {
@@ -69,6 +69,7 @@ struct FilesystemWatchEntry {
     // reachable while that host-owned setup is pending, then owns the live
     // watcher after setup completes.
     watcher: Option<RecommendedWatcher>,
+    setup_complete: bool,
     notification: NotificationId,
     queue: Arc<Mutex<WatchQueue>>,
 }
@@ -107,7 +108,7 @@ impl FilesystemWatchHub {
                 max_watches,
                 max_events,
                 watches: Mutex::new(HashMap::new()),
-                setup_threads: Mutex::new(Vec::new()),
+                setup_threads: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -117,6 +118,7 @@ impl FilesystemWatchHub {
         guest_path: &Path,
         recursive: bool,
     ) -> Result<(FilesystemWatchId, NotificationId), FilesystemWatchError> {
+        self.reap_finished_setup_threads()?;
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err(FilesystemWatchError::Stopped);
         }
@@ -137,7 +139,16 @@ impl FilesystemWatchHub {
             .watches
             .lock()
             .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
-        if watches.len() >= self.inner.max_watches {
+        let mut setup_threads = self
+            .inner
+            .setup_threads
+            .lock()
+            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
+        let orphaned_setups = setup_threads
+            .keys()
+            .filter(|watch| !watches.contains_key(watch))
+            .count();
+        if watches.len().saturating_add(orphaned_setups) >= self.inner.max_watches {
             return Err(FilesystemWatchError::Limit);
         }
         let raw = self
@@ -167,12 +178,19 @@ impl FilesystemWatchHub {
                 max_events,
                 result,
             );
-        })
-        .map_err(|error| FilesystemWatchError::Backend(error.to_string()))?;
+        });
+        let watcher = match watcher {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let _drop_result = self.inner.coordination.retire_notification(notification);
+                return Err(FilesystemWatchError::Backend(error.to_string()));
+            }
+        };
         watches.insert(
             id,
             FilesystemWatchEntry {
                 watcher: None,
+                setup_complete: false,
                 notification,
                 queue,
             },
@@ -185,18 +203,13 @@ impl FilesystemWatchHub {
         // real build tree. Registration is therefore host-owned background
         // work. Its first notification is always a rescan marker because
         // changes can race the registration walk.
-        let mut setup_threads = self
-            .inner
-            .setup_threads
-            .lock()
-            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
         if !self.inner.alive.load(Ordering::Acquire) {
             let _removed = self
                 .inner
                 .watches
                 .lock()
                 .map(|mut watches| watches.remove(&id));
-            let _drop_result = self.inner.coordination.drop_notification(notification);
+            let _drop_result = self.inner.coordination.retire_notification(notification);
             return Err(FilesystemWatchError::Stopped);
         }
         let inner = Arc::clone(&self.inner);
@@ -212,10 +225,10 @@ impl FilesystemWatchHub {
                 if let Ok(mut watches) = self.inner.watches.lock() {
                     watches.remove(&id);
                 }
-                let _drop_result = self.inner.coordination.drop_notification(notification);
+                let _drop_result = self.inner.coordination.retire_notification(notification);
                 FilesystemWatchError::Backend(error.to_string())
             })?;
-        setup_threads.push(setup);
+        setup_threads.insert(id, setup);
         drop(setup_threads);
         Ok((id, notification))
     }
@@ -269,18 +282,37 @@ impl FilesystemWatchHub {
     }
 
     pub(super) fn drop_watch(&self, watch: FilesystemWatchId) -> Result<(), FilesystemWatchError> {
-        let entry = self
+        let mut watches = self
             .inner
             .watches
             .lock()
-            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?
-            .remove(&watch)
-            .ok_or(FilesystemWatchError::Invalid)?;
-        drop(entry.watcher);
+            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
+        let entry = watches.get(&watch).ok_or(FilesystemWatchError::Invalid)?;
         self.inner
             .coordination
-            .drop_notification(entry.notification)
-            .map_err(map_notification_error)
+            .retire_notification(entry.notification)
+            .map_err(map_notification_error)?;
+        let setup_complete = entry.setup_complete;
+        let entry = watches
+            .remove(&watch)
+            .ok_or(FilesystemWatchError::Invalid)?;
+        drop(watches);
+        drop(entry.watcher);
+
+        if setup_complete {
+            let setup = self
+                .inner
+                .setup_threads
+                .lock()
+                .map_err(|_poisoned| FilesystemWatchError::Unavailable)?
+                .remove(&watch);
+            if let Some(setup) = setup {
+                let _join_result = setup.join();
+            }
+        } else {
+            self.reap_finished_setup_threads()?;
+        }
+        Ok(())
     }
 
     pub(super) fn stop(&self) {
@@ -296,13 +328,13 @@ impl FilesystemWatchHub {
                 let _drop_result = self
                     .inner
                     .coordination
-                    .drop_notification(entry.notification);
+                    .retire_notification(entry.notification);
             }
         }
         if let Ok(mut setup_threads) = self.inner.setup_threads.lock() {
-            let threads = setup_threads.drain(..).collect::<Vec<_>>();
+            let threads = setup_threads.drain().collect::<Vec<_>>();
             drop(setup_threads);
-            for thread in threads {
+            for (_watch, thread) in threads {
                 let _join_result = thread.join();
             }
         }
@@ -323,6 +355,33 @@ impl FilesystemWatchHub {
             .get(&watch)
             .map(function)
             .ok_or(FilesystemWatchError::Invalid)
+    }
+
+    fn reap_finished_setup_threads(&self) -> Result<(), FilesystemWatchError> {
+        let mut setup_threads = self
+            .inner
+            .setup_threads
+            .lock()
+            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
+        let finished = setup_threads
+            .extract_if(|_watch, thread| thread.is_finished())
+            .map(|(_watch, thread)| thread)
+            .collect::<Vec<_>>();
+        drop(setup_threads);
+        for thread in finished {
+            let _join_result = thread.join();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn setup_thread_count(&self) -> Result<usize, FilesystemWatchError> {
+        self.reap_finished_setup_threads()?;
+        self.inner
+            .setup_threads
+            .lock()
+            .map_err(|_poisoned| FilesystemWatchError::Unavailable)
+            .map(|threads| threads.len())
     }
 }
 
@@ -346,6 +405,7 @@ fn finish_watch_setup(
     if result.is_ok() {
         entry.watcher = Some(watcher);
     }
+    entry.setup_complete = true;
     let queue = Arc::clone(&entry.queue);
     let notification = entry.notification;
     drop(watches);
@@ -467,13 +527,33 @@ const fn map_notification_error(error: NotificationError) -> FilesystemWatchErro
 mod tests {
     use std::{fs, path::Path, time::Duration};
 
-    use anyhow::{Result, ensure};
+    use anyhow::{Context, Result, ensure};
 
     use super::{FilesystemWatchError, FilesystemWatchHub};
     use crate::{
         completion_io::FilesystemGrant,
-        coordination::{CoordinationConfig, CoordinationHub, WaitMode},
+        coordination::{ActorWatchResult, CoordinationConfig, CoordinationHub, WaitMode},
     };
+
+    async fn await_setup(
+        watches: &FilesystemWatchHub,
+        coordination: &CoordinationHub,
+        watch: super::FilesystemWatchId,
+        notification: crate::coordination::NotificationId,
+    ) -> Result<u64> {
+        let pollable = coordination.notification_pollable(notification, 0)?;
+        let ready = tokio::time::timeout(
+            Duration::from_secs(5),
+            coordination.wait_any(&[pollable], None, WaitMode::Biased),
+        )
+        .await??;
+        ensure!(ready.pollable == pollable);
+        let bytes = watches.pending_bytes(watch)?;
+        let (generation, events) = watches.read(watch, bytes)?;
+        ensure!(String::from_utf8(events)?.contains("rescan\t."));
+        coordination.drop_pollable(pollable)?;
+        Ok(generation)
+    }
 
     #[tokio::test]
     async fn native_watch_wakes_worker_pollable_and_returns_relative_path() -> Result<()> {
@@ -557,6 +637,88 @@ mod tests {
             watches.create(Path::new("../outside"), true),
             Err(FilesystemWatchError::Invalid)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_create_drop_reaps_setup_threads_and_notifications() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (coordination, _actor_events) = CoordinationHub::new(
+            1,
+            CoordinationConfig {
+                max_notifications: 2,
+                max_pollables: 2,
+                max_wait_set: 2,
+            },
+        )?;
+        let watches = FilesystemWatchHub::new(
+            Some(&FilesystemGrant {
+                host_path: root.path().to_path_buf(),
+                guest_path: ".".to_string(),
+                writable: true,
+            }),
+            coordination.clone(),
+            2,
+            8,
+        )?;
+
+        for _cycle in 0..32 {
+            let (watch, notification) = watches.create(Path::new("."), false)?;
+            let _generation = await_setup(&watches, &coordination, watch, notification).await?;
+            watches.drop_watch(watch)?;
+            ensure!(watches.setup_thread_count()? == 0);
+            ensure!(coordination.stats().notifications == 0);
+        }
+
+        watches.stop();
+        coordination.stop();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_watch_retires_notification_with_queued_actor_event() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (coordination, mut actor_events) = CoordinationHub::new(
+            1,
+            CoordinationConfig {
+                max_notifications: 2,
+                max_pollables: 2,
+                max_wait_set: 2,
+            },
+        )?;
+        let watches = FilesystemWatchHub::new(
+            Some(&FilesystemGrant {
+                host_path: root.path().to_path_buf(),
+                guest_path: ".".to_string(),
+                writable: true,
+            }),
+            coordination.clone(),
+            1,
+            8,
+        )?;
+        let (watch, notification) = watches.create(Path::new("."), false)?;
+        let setup_generation = await_setup(&watches, &coordination, watch, notification).await?;
+        ensure!(
+            coordination.watch_actor(notification, 0, 91)?
+                == ActorWatchResult::Queued {
+                    generation: setup_generation,
+                }
+        );
+        ensure!(coordination.stats().pending_actor_events == 1);
+
+        watches.drop_watch(watch)?;
+        ensure!(coordination.stats().notifications == 0);
+        ensure!(coordination.stats().pending_actor_events == 0);
+        let queued = actor_events
+            .recv()
+            .await
+            .context("queued notification ID")?;
+        ensure!(queued == notification);
+        ensure!(coordination.take_actor_event(queued)? == None);
+        ensure!(coordination.stats().pending_actor_events == 0);
+
+        watches.stop();
+        coordination.stop();
         Ok(())
     }
 }

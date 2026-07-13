@@ -227,6 +227,14 @@ files produces corresponding records in
 normal actor mailbox, worker, shared-memory, and filesystem behavior remains
 usable inside the ceilings.
 
+Host-owned resource teardown retires a watch and its notification as one
+ownership transition. An actor event already admitted to the reserved lane may
+still carry the retired ID, but it drains as a stale no-op and no longer counts
+as pending. Recursive setup tasks are keyed by watch, reaped after completion,
+and remain inside the watch ceiling if logical teardown races setup. The
+workspace logger's teardown probe repeats real guest watch creation and drop,
+then records a later file mutation through the still-live primary watcher.
+
 Current implementation details and runnable tests live in [[extension-host]],
 [[plugin-io-interaction-graph]], and [[../reference/wasm-fast-lanes]].
 

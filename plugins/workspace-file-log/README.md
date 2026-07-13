@@ -22,6 +22,13 @@ write to `.manifold/workspace-file-log.snapshot`. The actor verifies the write
 completion while its long-lived watcher worker remains active. This deliberately
 uses actor completion I/O rather than the worker's ordinary WASI filesystem.
 
+The `probe-watch-teardown` action creates and immediately drops an additional
+non-recursive host watch. The nested proof repeats that action while the primary
+recursive watcher remains active, verifies that only the primary notification
+resource remains, then creates `after-watch-churn.txt`. Its corresponding log
+record demonstrates that bounded teardown churn did not strand resources or
+damage the user-facing watcher.
+
 An explicit `rescan` record means the recursive native registration window
 closed or the bounded host event queue overflowed. A stateful consumer must
 reconcile its state through the granted filesystem when that marker appears.

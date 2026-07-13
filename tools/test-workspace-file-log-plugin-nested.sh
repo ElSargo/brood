@@ -51,6 +51,52 @@ run_controller() {
   grep -q $'^modified\talpha.txt$' "$log"
   grep -q $'^removed\tsrc/removed.txt$' "$log"
 
+  # Exercise real guest create/drop calls repeatedly while the primary watcher
+  # remains live. Once all actor mailbox turns are observed, the runtime must
+  # still own exactly the primary watch notification and no deferred actor
+  # events. A subsequent file event proves the surviving watcher remains useful.
+  status="$(ctl status-json)"
+  mailbox_before="$(python3 - "$status" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1])["preview1_compat_mailbox_dispatched"])
+PY
+)"
+  for _ in $(seq 1 32); do
+    ctl actors send workspace-file-log probe-watch-teardown >/dev/null
+  done
+  mailbox_after=$((mailbox_before + 32))
+  for _ in $(seq 1 200); do
+    status="$(ctl status-json)"
+    if python3 - "$status" "$mailbox_after" <<'PY'
+import json
+import sys
+status = json.loads(sys.argv[1])
+expected = int(sys.argv[2])
+raise SystemExit(status["preview1_compat_mailbox_dispatched"] < expected)
+PY
+    then
+      break
+    fi
+    sleep 0.05
+  done
+  python3 - "$status" "$mailbox_after" <<'PY'
+import json
+import sys
+status = json.loads(sys.argv[1])
+expected = int(sys.argv[2])
+assert status["preview1_compat_mailbox_dispatched"] >= expected, status
+assert status["preview1_compat_notifications"] == 1, status
+assert status["preview1_compat_pending_notification_events"] == 0, status
+PY
+  printf 'watch still live after churn\n' > "$workspace/after-watch-churn.txt"
+  wait_for_log "$log" "created"
+  for _ in $(seq 1 200); do
+    grep -q $'^created\tafter-watch-churn.txt$' "$log" && break
+    sleep 0.05
+  done
+  grep -q $'^created\tafter-watch-churn.txt$' "$log"
+
   # The worker remains active while a second mailbox turn asks the actor to
   # completion-read its live log and completion-write those bytes as a visible
   # snapshot. The snapshot is host completion I/O, not ordinary worker WASI.
@@ -80,6 +126,7 @@ lines = set(snapshot.splitlines())
 assert b"created\tnew-file.txt" in lines, lines
 assert b"modified\talpha.txt" in lines, lines
 assert b"removed\tsrc/removed.txt" in lines, lines
+assert b"created\tafter-watch-churn.txt" in lines, lines
 PY
   actors="$(ctl actors list)"
   [[ "$actors" == *"id=workspace-file-log kind=wasm-preview1-compat"* ]]
@@ -90,7 +137,7 @@ import sys
 
 status = json.loads(sys.argv[1])
 assert status["preview1_compat_workers_active"] >= 1, status
-assert status["preview1_compat_mailbox_dispatched"] >= 2, status
+assert status["preview1_compat_mailbox_dispatched"] >= 34, status
 assert status["preview1_compat_completion_delivered"] >= 2, status
 assert status["plugin_actor_failures"] == 0, status
 PY

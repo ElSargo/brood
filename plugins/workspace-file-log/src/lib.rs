@@ -91,6 +91,8 @@ unsafe extern "C" {
         events_len: u32,
         generation: *mut u64,
     ) -> u32;
+    #[link_name = "filesystem_watch_drop"]
+    safe fn host_filesystem_watch_drop(watch: u64) -> u32;
     #[link_name = "notification_pollable"]
     safe fn host_notification_pollable(
         notification: u64,
@@ -121,7 +123,12 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
         return 0;
     };
     match kind {
-        EVENT_MAILBOX => dispatch_mailbox(),
+        EVENT_MAILBOX => {
+            dispatch_mailbox();
+            if ERROR_CODE.load(Ordering::Acquire) == 9 {
+                return 9;
+            }
+        }
         EVENT_COMPLETION_READ => dispatch_snapshot_read(),
         EVENT_COMPLETION_WRITE => dispatch_snapshot_write(),
         EVENT_COMPLETION_FAILED => ERROR_CODE.store(7, Ordering::Release),
@@ -176,6 +183,15 @@ fn dispatch_mailbox() {
             SNAPSHOT_READ_OPERATION.store(operation, Ordering::Release);
         } else {
             ERROR_CODE.store(4, Ordering::Release);
+        }
+    } else if payload == b"probe-watch-teardown" {
+        let path = b".";
+        let mut watch = 0_u64;
+        let create_status = unsafe {
+            host_filesystem_watch_create(path.as_ptr(), path.len() as u32, 0, &raw mut watch)
+        };
+        if create_status != 0 || watch == 0 || host_filesystem_watch_drop(watch) != 0 {
+            ERROR_CODE.store(9, Ordering::Release);
         }
     }
 }
