@@ -19,6 +19,8 @@ runner <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inne
 ```
 
 The runner activates its environment, exports whatever variables the project needs, runs the supplied inner binary, and exits with that binary's status.
+Numeric exit codes are preserved exactly. On Unix, signal termination is
+reported to the invoking shell using the conventional `128 + signal` status.
 
 Current built-in runner:
 

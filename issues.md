@@ -6,10 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Control and DBus API shape
 
-- `crates/manifoldd/src/bin/manifold-runner-nix-develop.rs`: the runner must
-  preserve the activated child process exit status. A proper fix should move the
-  binary entrypoint to an explicit exit-status return model instead of calling
-  `process::exit` from helper code.
 - `crates/manifoldd/src/control.rs`, `crates/manifoldd/src/browser.rs`: command
   handlers still parse token slices positionally, which drives
   `indexing_slicing` warnings. The target design should move these paths to
@@ -73,6 +69,14 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- The Nix development runner returns a typed `ActivatedChildExit` from its
+  activation helper and leaves OS termination to the binary entrypoint. Numeric
+  child codes are preserved and Unix signals follow the conventional
+  `128 + signal` shell status. A plugin is not applicable beneath the plugin
+  execution layer, so the real proof runs the actual runner through its cached
+  `nix print-dev-env` activation: the inner workload visibly records its
+  Nix-store Cargo path, project/working/cache context, and a deliberate
+  `configuration-rejected` result before the invoking shell observes status 37.
 - Session command execution returns a typed `CommandOutcome` instead of
   terminating from `control.rs`; only the `manifold` binary entrypoint maps an
   explicit child code to its process exit status, while signal termination
