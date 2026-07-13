@@ -6,10 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Native watcher backends may coalesce, duplicate, or classify rename events
-  differently. Overflow is safely reported as `rescan`, but consumers that
-  maintain state must implement reconciliation; the example logger records the
-  marker rather than rebuilding an indexed model.
 - A configured workspace filesystem grant captures the active session working
   directory when the plugin loads. It is not retargeted when another surface
   session becomes active. Session-scoped plugin instantiation or an explicit
@@ -96,6 +92,17 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- The Preview 1 workspace plugin is a stateful watch consumer, not merely an
+  event logger. It maintains a sorted, atomically replaced workspace index;
+  ordinary create/remove batches update membership, while any batch containing
+  `rescan` or a backend-generic `changed` event is discarded and rebuilt by a
+  recursive WASI scan before reconciliation is reported complete. Its nested
+  proof pauses the primary consumer with its watch live, routes 4,200 files
+  through the independently draining mirror to exceed the 4,096-event bound,
+  then resumes to an overflow rescan. The primary log contains no incremental
+  overflow rows, and the resulting 4,204-path index exactly matches an
+  independent walk of the final workspace, including additions, deletion, and
+  documented exclusions.
 - Filesystem-watch events preserve native path identity end to end: raw
   `OsStr` bytes on Unix and little-endian UTF-16 units on Windows. Component
   events expose opaque byte lists, while the line-oriented Preview 1 ABI uses

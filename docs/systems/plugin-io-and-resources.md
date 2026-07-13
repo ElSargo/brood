@@ -179,7 +179,10 @@ and encodes every other byte, including `%`, tab, and newline, as uppercase
 
 Overflow and any interval without complete coverage produce an explicit
 `rescan` marker. Consumers maintaining state reconcile through the filesystem;
-the event stream is not a journal.
+the event stream is not a journal. Backend-generic `changed` events are also
+ambiguous for a stateful consumer: discard that entire batch and rebuild, just
+as for `rescan`. A reconciliation scan is published atomically as the new model
+before the consumer reports that reconciliation completed.
 
 Recursive native registration runs as host-owned background work so a large
 existing tree cannot consume an actor dispatch deadline. Registration

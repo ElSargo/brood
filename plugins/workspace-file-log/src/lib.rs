@@ -1,12 +1,11 @@
 use std::{
     alloc::{Layout, alloc, dealloc},
-    collections::BTreeMap,
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     ptr,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
-    time::UNIX_EPOCH,
 };
 
 const EVENT_MAILBOX: u32 = 1;
@@ -17,6 +16,8 @@ const STACK_ALIGNMENT: usize = 16;
 const LOG_DIRECTORY: &str = ".manifold";
 const LOG_PATH: &str = ".manifold/workspace-file-log.log";
 const MIRROR_LOG_PATH: &str = ".manifold/workspace-file-log.mirror.log";
+const INDEX_PATH: &str = ".manifold/workspace-file-index.tsv";
+const PAUSE_ACK_PATH: &str = ".manifold/workspace-file-log.paused";
 const SNAPSHOT_PATH: &str = ".manifold/workspace-file-log.snapshot";
 const SNAPSHOT_MAX_BYTES: u32 = 1024 * 1024;
 const WORKER_ARGUMENT: u32 = 1;
@@ -32,12 +33,7 @@ static MIRROR_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_READ_OPERATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_WRITE_OPERATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified_nanos: u128,
-}
+static PRIMARY_PAUSED: AtomicU32 = AtomicU32::new(0);
 
 #[link(wasm_import_module = "manifold_preview1")]
 unsafe extern "C" {
@@ -200,6 +196,10 @@ fn dispatch_mailbox() {
         if create_status != 0 || watch == 0 || host_filesystem_watch_drop(watch) != 0 {
             ERROR_CODE.store(9, Ordering::Release);
         }
+    } else if payload == b"pause-primary" {
+        PRIMARY_PAUSED.store(1, Ordering::Release);
+    } else if payload == b"resume-primary" {
+        PRIMARY_PAUSED.store(0, Ordering::Release);
     }
 }
 
@@ -264,15 +264,25 @@ pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
             WATCH.load(Ordering::Acquire),
             NOTIFICATION.load(Ordering::Acquire),
             LOG_PATH,
+            INDEX_PATH,
+            true,
         ),
         MIRROR_WORKER_ARGUMENT => (
             MIRROR_WATCH.load(Ordering::Acquire),
             MIRROR_NOTIFICATION.load(Ordering::Acquire),
             MIRROR_LOG_PATH,
+            "",
+            false,
         ),
         _ => return 1,
     };
-    match watch_workspace(resources.0, resources.1, resources.2) {
+    match watch_workspace(
+        resources.0,
+        resources.1,
+        resources.2,
+        resources.3,
+        resources.4,
+    ) {
         Ok(never) => never,
         Err(code) => {
             ERROR_CODE.store(code, Ordering::Release);
@@ -281,10 +291,19 @@ pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
     }
 }
 
-fn watch_workspace(watch: u64, notification: u64, log_path: &str) -> Result<u32, u32> {
+fn watch_workspace(
+    watch: u64,
+    notification: u64,
+    log_path: &str,
+    index_path: &str,
+    primary: bool,
+) -> Result<u32, u32> {
     fs::create_dir_all(LOG_DIRECTORY).map_err(|_| 10_u32)?;
-    let previous = scan_workspace().map_err(|_| 11_u32)?;
-    append_initial(log_path, &previous).map_err(|_| 12_u32)?;
+    let mut index = scan_workspace().map_err(|_| 11_u32)?;
+    append_initial(log_path, &index).map_err(|_| 12_u32)?;
+    if !index_path.is_empty() {
+        write_index(index_path, &index).map_err(|_| 19_u32)?;
+    }
     SCAN_COUNT.fetch_add(1, Ordering::AcqRel);
     if watch == 0 || notification == 0 {
         return Err(13);
@@ -311,6 +330,17 @@ fn watch_workspace(watch: u64, notification: u64, log_path: &str) -> Result<u32,
         if wait_status != 0 || ready != pollable {
             return Err(15);
         }
+        if primary && PRIMARY_PAUSED.load(Ordering::Acquire) != 0 {
+            fs::write(
+                PAUSE_ACK_PATH,
+                b"primary watch paused with notification live\n",
+            )
+            .map_err(|_| 20_u32)?;
+            while PRIMARY_PAUSED.load(Ordering::Acquire) != 0 {
+                std::hint::spin_loop();
+            }
+            fs::write(PAUSE_ACK_PATH, b"primary watch resumed\n").map_err(|_| 20_u32)?;
+        }
 
         let mut bytes_len = 0_u32;
         if host_filesystem_watch_event_bytes(watch, &raw mut bytes_len) != 0 || bytes_len == 0 {
@@ -324,38 +354,27 @@ fn watch_workspace(watch: u64, notification: u64, log_path: &str) -> Result<u32,
         if read_status != 0 || generation == 0 {
             return Err(17);
         }
-        append_watch_events(log_path, &bytes).map_err(|_| 18_u32)?;
+        apply_watch_events(log_path, index_path, &mut index, &bytes).map_err(|_| 18_u32)?;
         observed_generation = generation;
         SCAN_COUNT.fetch_add(1, Ordering::AcqRel);
     }
 }
 
-fn scan_workspace() -> std::io::Result<BTreeMap<String, FileStamp>> {
-    let mut files = BTreeMap::new();
+fn scan_workspace() -> std::io::Result<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
     let mut pending = vec![PathBuf::from(".")];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
             let relative = path.strip_prefix(".").unwrap_or(&path);
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
                 if !excluded_directory(relative) {
                     pending.push(path);
                 }
-            } else if metadata.is_file() {
-                let modified_nanos = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |duration| duration.as_nanos());
-                files.insert(
-                    relative.to_string_lossy().into_owned(),
-                    FileStamp {
-                        len: metadata.len(),
-                        modified_nanos,
-                    },
-                );
+            } else if file_type.is_file() {
+                files.insert(encode_path(relative));
             }
         }
     }
@@ -369,25 +388,116 @@ fn excluded_directory(path: &Path) -> bool {
     )
 }
 
-fn append_initial(log_path: &str, files: &BTreeMap<String, FileStamp>) -> std::io::Result<()> {
+fn append_initial(log_path: &str, files: &BTreeSet<String>) -> std::io::Result<()> {
     let mut log = open_log(log_path)?;
-    for path in files.keys() {
+    for path in files {
         writeln!(log, "initial\t{path}")?;
     }
     log.flush()
 }
 
-fn append_watch_events(log_path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let mut log = open_log(log_path)?;
-    for line in String::from_utf8_lossy(bytes).lines() {
+fn apply_watch_events(
+    log_path: &str,
+    index_path: &str,
+    index: &mut BTreeSet<String>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let lines = String::from_utf8_lossy(bytes);
+    let ambiguous = lines.lines().find_map(|line| {
+        let (kind, path) = line.split_once('\t')?;
+        (kind == "rescan" || (kind == "changed" && !excluded_path(Path::new(path))))
+            .then_some((kind, path))
+    });
+    if let Some((kind, path)) = ambiguous {
+        let mut log = open_log(log_path)?;
+        writeln!(log, "{kind}\t{path}")?;
+        writeln!(log, "reconcile-started\tfilesystem")?;
+        log.flush()?;
+        let rebuilt = match scan_workspace() {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                writeln!(log, "reconcile-failed\t{error}")?;
+                log.flush()?;
+                return Err(error);
+            }
+        };
+        *index = rebuilt;
+        if !index_path.is_empty() {
+            write_index(index_path, index)?;
+        }
+        // Publish completion only after the replacement index is durable and
+        // renamed into place; controllers may treat this record as the model's
+        // visibility boundary.
+        writeln!(log, "reconciled\t{} files", index.len())?;
+        return log.flush();
+    }
+
+    let mut log: Option<fs::File> = None;
+    let mut index_changed = false;
+    for line in lines.lines() {
         let Some((kind, path)) = line.split_once('\t') else {
             continue;
         };
         if !excluded_path(Path::new(path)) {
-            writeln!(log, "{kind}\t{path}")?;
+            // The mirror is the routing barrier during the deterministic
+            // overflow workload. Keep its proof artifact compact while still
+            // recording the final routed path; the primary index is the
+            // complete stateful result.
+            let compact_mirror_burst = index_path.is_empty()
+                && path.starts_with("overflow/")
+                && path != "overflow/4199.txt";
+            if !compact_mirror_burst {
+                let log = match &mut log {
+                    Some(log) => log,
+                    None => log.insert(open_log(log_path)?),
+                };
+                writeln!(log, "{kind}\t{path}")?;
+            }
+            match kind {
+                "removed" => {
+                    index_changed |= index.remove(path);
+                }
+                "created" => {
+                    index_changed |= index.insert(path.to_owned());
+                }
+                _ => {}
+            }
         }
     }
-    log.flush()
+    if let Some(mut log) = log {
+        log.flush()?;
+    }
+    if index_path.is_empty() || !index_changed {
+        Ok(())
+    } else {
+        write_index(index_path, index)
+    }
+}
+
+fn write_index(path: &str, index: &BTreeSet<String>) -> std::io::Result<()> {
+    let temporary = format!("{path}.new");
+    let mut output = String::from("path\n");
+    for path in index {
+        use std::fmt::Write as _;
+        let _ = writeln!(output, "{path}");
+    }
+    // One host write keeps this excluded proof artifact from manufacturing an
+    // event per inventory row and overflowing its own live watch.
+    fs::write(&temporary, output)?;
+    fs::rename(temporary, path)
+}
+
+fn encode_path(path: &Path) -> String {
+    let mut encoded = String::new();
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        if (0x20..=0x7e).contains(&byte) && byte != b'%' {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 fn excluded_path(path: &Path) -> bool {

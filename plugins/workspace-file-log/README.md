@@ -3,7 +3,9 @@
 This Preview 1 compatibility plugin creates two logical watches of the workspace
 mounted at `.`. Independent workers append the same observable changes to
 `.manifold/workspace-file-log.log` and
-`.manifold/workspace-file-log.mirror.log`.
+`.manifold/workspace-file-log.mirror.log`. The primary worker also maintains the
+human-readable, sorted workspace model
+`.manifold/workspace-file-index.tsv`.
 
 The actor handles its `start` mailbox message by creating a capability-rooted
 host watches and spawning one worker for each. Each worker performs one ordinary WASI scan
@@ -13,6 +15,13 @@ rescan is used. `.git`, `.direnv`, `.manifold`, and `target` are excluded so
 repository metadata, the log itself, and build output do not feed the watcher.
 The line-oriented Preview 1 batch keeps ordinary ASCII paths readable and
 represents all other native path bytes with reversible `%HH` escapes.
+
+Normal batches update the index incrementally. A batch containing `rescan` or
+a backend-generic `changed` event is ambiguous: the worker discards the whole
+batch, recursively scans the granted workspace with ordinary WASI directory
+iteration, writes a complete replacement index, and only then appends a
+`reconciled` record. Index rewrites happen only when relevant state changes, so
+the plugin's own excluded artifacts cannot create a watch feedback loop.
 
 The built module declares a 512 MiB shared-memory maximum. That is a
 fault-containment ceiling rather than an expected working set and proves that a
@@ -39,8 +48,8 @@ record demonstrates that bounded teardown churn did not strand resources or
 damage the user-facing watcher.
 
 An explicit `rescan` record means the recursive native registration window
-closed or the bounded host event queue overflowed. A stateful consumer must
-reconcile its state through the granted filesystem when that marker appears.
+closed or the bounded host event queue overflowed. The index demonstrates the
+required reconciliation rather than merely logging that marker.
 
 Run `tools/test-workspace-file-log-plugin-nested.sh` from the repository root.
 The test uses Manifold's offscreen nested test topology and leaves the observed
@@ -52,9 +61,21 @@ checks that `.manifold/workspace-file-log.snapshot` is a nonempty byte-for-byte
 prefix of the append-only log containing the observed create, modify, and remove
 records. It creates two invalid-UTF-8 names that lossy conversion would conflate;
 distinct `preview1-collision-%FF.txt` and `preview1-collision-%FE.txt` records in
-both logs make lossless compatibility encoding observable. Those filesystem
-artifacts are the proof, rather than a
-plugin-generated success value.
+both logs and in the incremental index make lossless compatibility encoding
+observable. Rust's Preview 1 directory iterator cannot enumerate those invalid
+UTF-8 host names, so the proof removes them through two distinct watch events
+before exercising full reconciliation; this limitation does not permit lossy
+or colliding index keys.
+
+The controller pauses the primary worker after a file notification while
+leaving its notification and watch alive, then creates 4,200 files. The mirror
+worker records the final routed path, proving the burst passed the primary
+queue's existing bound before the primary resumes. The primary log contains a
+new `rescan` and no incremental `overflow/` records. Its replacement index is
+then compared exactly with an independent walk of the real final workspace,
+including the first and last overflow files, a newly created file, a removed
+file, and all documented exclusions. These filesystem artifacts are the proof,
+rather than a plugin-generated success value.
 
 This plugin is also the user-observable completion-write proof: the snapshot is
 created through the same host completion engine whose cancellation and

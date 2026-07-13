@@ -90,6 +90,24 @@ PY
   grep -q $'^removed\tsrc/removed.txt$' "$mirror_log"
   wait_for_line "$mirror_log" $'created\tpreview1-collision-%FF.txt'
   wait_for_line "$mirror_log" $'created\tpreview1-collision-%FE.txt'
+  wait_for_line "$workspace/.manifold/workspace-file-index.tsv" 'preview1-collision-%FF.txt'
+  wait_for_line "$workspace/.manifold/workspace-file-index.tsv" 'preview1-collision-%FE.txt'
+
+  # The compatibility batch and incremental index must keep these native-byte
+  # identities separate. Remove them distinctly before the later full WASI
+  # reconciliation: Rust's Preview 1 directory iterator cannot enumerate an
+  # invalid UTF-8 host name, while the watch ABI can still represent it.
+  python3 - "$workspace" <<'PY'
+import os
+import sys
+root = os.fsencode(sys.argv[1])
+for name in (b"preview1-collision-\xff.txt", b"preview1-collision-\xfe.txt"):
+    os.unlink(os.path.join(root, name))
+PY
+  wait_for_line "$log" $'removed\tpreview1-collision-%FF.txt'
+  wait_for_line "$log" $'removed\tpreview1-collision-%FE.txt'
+  wait_for_line "$mirror_log" $'removed\tpreview1-collision-%FF.txt'
+  wait_for_line "$mirror_log" $'removed\tpreview1-collision-%FE.txt'
 
   # Two independent guest handles and workers visibly maintain the primary
   # and mirror logs, while daemon status shows one shared native registration.
@@ -165,6 +183,147 @@ PY
   done
   grep -q $'^created\tafter-watch-churn.txt$' "$mirror_log"
 
+  # Pause only the primary consumer after its next notification wakes it. The
+  # pause acknowledgement is written by that real worker while its watch and
+  # notification remain live; the mirror continues draining its independent
+  # logical subscription.
+  status="$(ctl status-json)"
+  mailbox_before="$(python3 - "$status" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1])["preview1_compat_mailbox_dispatched"])
+PY
+)"
+  rescan_before="$(grep -c $'^rescan\t' "$log")"
+  reconciled_before="$(grep -c $'^reconciled\t' "$log")"
+  ctl actors send workspace-file-log pause-primary >/dev/null
+  for _ in $(seq 1 200); do
+    status="$(ctl status-json)"
+    if python3 - "$status" "$mailbox_before" <<'PY'
+import json
+import sys
+status = json.loads(sys.argv[1])
+raise SystemExit(status["preview1_compat_mailbox_dispatched"] <= int(sys.argv[2]))
+PY
+    then
+      break
+    fi
+    sleep 0.05
+  done
+  printf 'wake paused worker\n' > "$workspace/pause-trigger.txt"
+  pause_ack="$workspace/.manifold/workspace-file-log.paused"
+  for _ in $(seq 1 200); do
+    [[ -f "$pause_ack" ]] && grep -q '^primary watch paused' "$pause_ack" && break
+    sleep 0.05
+  done
+  grep -q '^primary watch paused with notification live$' "$pause_ack"
+
+  # More than the runtime's existing bounded queue depth is routed while the
+  # primary is paused. Waiting for the live mirror to record the final path
+  # proves the native service has routed the whole burst; this is not a sleep-
+  # based guess that overflow probably happened.
+  python3 - "$workspace" <<'PY'
+from pathlib import Path
+import os
+import sys
+
+root = Path(sys.argv[1])
+overflow = root / "overflow"
+overflow.mkdir()
+for number in range(4200):
+    descriptor = os.open(overflow / f"{number:04}.txt", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.close(descriptor)
+(root / "alpha.txt").write_text("final alpha contents\n")
+(root / "final-after-overflow.txt").write_text("must come from reconciliation\n")
+(root / "new-file.txt").unlink()
+PY
+  wait_for_line "$mirror_log" $'created\toverflow/4199.txt'
+
+  ctl actors send workspace-file-log resume-primary >/dev/null
+  for _ in $(seq 1 400); do
+    rescans="$(grep -c $'^rescan\t' "$log")"
+    reconciled="$(grep -c $'^reconciled\t' "$log")"
+    if (( rescans > rescan_before )) \
+      && (( reconciled > reconciled_before )) \
+      && grep -q '^primary watch resumed$' "$pause_ack" \
+      && [[ -s "$workspace/.manifold/workspace-file-index.tsv" ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  rescans="$(grep -c $'^rescan\t' "$log")"
+  reconciled="$(grep -c $'^reconciled\t' "$log")"
+  (( rescans > rescan_before ))
+  (( reconciled > reconciled_before ))
+  grep -q '^primary watch resumed$' "$pause_ack"
+
+  # A native backend may still be routing earlier callbacks while the first
+  # rebuild runs. Let every resulting rescan reach its own published model so
+  # the retained artifact ends at a quiescent reconciliation boundary.
+  for _ in $(seq 1 400); do
+    rescans="$(grep -c $'^rescan\t' "$log")"
+    reconciled="$(grep -c $'^reconciled\t' "$log")"
+    if (( rescans == reconciled && reconciled > reconciled_before )); then
+      sleep 0.2
+      stable_rescans="$(grep -c $'^rescan\t' "$log")"
+      stable_reconciled="$(grep -c $'^reconciled\t' "$log")"
+      if (( stable_rescans == rescans && stable_reconciled == reconciled )); then
+        break
+      fi
+    fi
+    sleep 0.05
+  done
+  rescans="$(grep -c $'^rescan\t' "$log")"
+  reconciled="$(grep -c $'^reconciled\t' "$log")"
+  (( rescans == reconciled && reconciled > reconciled_before ))
+
+  # Overflow replaced the ambiguous incremental queue. These paths must come
+  # from the filesystem rebuild, not survive as ordinary primary log events.
+  ! grep -q $'^created\toverflow/' "$log"
+  ! grep -q $'^created\tfinal-after-overflow.txt$' "$log"
+
+  python3 - "$workspace" "$workspace/.manifold/workspace-file-index.tsv" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+root = os.fsencode(sys.argv[1])
+index_path = Path(sys.argv[2])
+excluded = {b".git", b".direnv", b".manifold", b"target"}
+
+def encode(path):
+    output = []
+    for byte in path:
+        if 0x20 <= byte <= 0x7e and byte != ord("%"):
+            output.append(chr(byte))
+        else:
+            output.append(f"%{byte:02X}")
+    return "".join(output)
+
+expected = set()
+for directory, directories, files in os.walk(root):
+    directories[:] = [name for name in directories if name not in excluded]
+    for name in files:
+        absolute = os.path.join(directory, name)
+        relative = os.path.relpath(absolute, root)
+        expected.add(encode(relative))
+
+lines = index_path.read_text(encoding="ascii").splitlines()
+assert lines[0] == "path", lines[:1]
+actual = set(lines[1:])
+assert actual == expected, {
+    "missing": sorted(expected - actual)[:20],
+    "unexpected": sorted(actual - expected)[:20],
+}
+assert "alpha.txt" in actual
+assert "final-after-overflow.txt" in actual
+assert "new-file.txt" not in actual
+assert "overflow/0000.txt" in actual
+assert "overflow/4199.txt" in actual
+assert "preview1-collision-%FF.txt" not in actual
+assert "preview1-collision-%FE.txt" not in actual
+PY
+
   # The worker remains active while a second mailbox turn asks the actor to
   # completion-read its live log and completion-write those bytes as a visible
   # snapshot. The snapshot is host completion I/O, not ordinary worker WASI.
@@ -207,7 +366,7 @@ import sys
 
 status = json.loads(sys.argv[1])
 assert status["preview1_compat_workers_active"] >= 2, status
-assert status["preview1_compat_mailbox_dispatched"] >= 34, status
+assert status["preview1_compat_mailbox_dispatched"] >= 36, status
 assert status["preview1_compat_completion_delivered"] >= 2, status
 assert status["plugin_actor_failures"] == 0, status
 PY
