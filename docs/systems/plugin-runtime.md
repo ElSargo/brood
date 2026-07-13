@@ -154,6 +154,24 @@ Publications are host-owned immutable latest-state frames written by actors and
 read by policy providers. They are not queues and never contain pointers into
 mutable actor memory.
 
+## Resource Ceilings
+
+Every actor generation has two complementary forms of backpressure. Item
+counts bound queue scheduling, while byte budgets bound retained host and guest
+memory. The host rejects a mailbox body, sender identity, worker payload, or
+worker result before admitting it when that value exceeds its individual
+ceiling. An ownership permit then follows each admitted value through the
+generation's queues and is released only when dispatch consumes or drops it.
+This prevents a queue containing a bounded number of unusually large values
+from bypassing fault containment.
+
+Wasmtime stores have linear-memory and table limits. A Component or core-Wasm
+generation cannot grow beyond its store limit. Preview 1 workers share their
+actor's imported memory, so the module must declare a maximum and that maximum
+must fit the generation memory ceiling; every worker store separately retains
+the table limit. The defaults are deliberately generous daemon safety limits,
+not quotas that ordinary coding plugins should approach.
+
 ## Host Responsibilities
 
 The host owns scheduling and final product invariants:
@@ -186,6 +204,14 @@ The Component and Preview 1 runtimes are implementation proofs of this target.
 The Component path demonstrates completion I/O and cooperative workers; the
 Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
 memory. Their export names and Store layout are not the durable plugin ABI.
+
+`plugins/workspace-file-log` is the user-observable Preview 1 proof. Its module
+declares a bounded shared-memory maximum, then performs a real recursive
+workspace scan and live filesystem watch. Creating, editing, and removing
+files produces corresponding records in
+`.manifold/workspace-file-log.log`; the visible file history demonstrates that
+normal actor mailbox, worker, shared-memory, and filesystem behavior remains
+usable inside the ceilings.
 
 Current implementation details and runnable tests live in [[extension-host]],
 [[plugin-io-interaction-graph]], and [[../reference/wasm-fast-lanes]].

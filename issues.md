@@ -6,14 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Wasm stores and actor message paths are not yet bounded by bytes. Mailbox
-  bodies, sender strings, worker payloads, worker results, and aggregate guest
-  memory can therefore exhaust daemon memory even though queue item counts are
-  bounded. Address this before stabilizing the runtime by adding Wasmtime
-  memory/table limits plus per-message, per-result, and per-generation byte
-  budgets. These limits should be deliberately very generous: they are
-  fault-containment ceilings for runaway plugins, not constraints that normal
-  coding workloads should approach.
 - The Preview 1 parent drains completion results into `actor_operations`
   without applying `max_pending_actor_operations` or a separate completion-lane
   bound. A completion handler which submits more operations can grow this queue
@@ -139,3 +131,16 @@ warnings without pretending these areas are already structurally clean.
   indefinitely without cancellation handles, reloading a module with the same
   actor names can fail registry registration, and pane-mapped events are
   broadcast to all WASM actors rather than subscription-routed.
+
+## Resolved
+
+- Wasm stores and actor message paths are byte-bounded. Shared, deliberately
+  generous limits cover mailbox senders and bodies, Component worker payloads
+  and results, generation-owned host queues, aggregate linear memory, and store
+  tables. Byte permits follow retained values until dispatch or observation,
+  and Preview 1 modules must declare shared-memory maxima within the generation
+  ceiling. The target contract is documented in
+  `docs/systems/plugin-runtime.md`. The observable proof is
+  `plugins/workspace-file-log`: its nested test performs a real workspace scan
+  and records file creation, modification, and removal under the bounded
+  runtime; see `tools/test-workspace-file-log-plugin-nested.sh`.

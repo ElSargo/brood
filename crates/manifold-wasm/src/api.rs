@@ -50,7 +50,7 @@ pub struct GuestAllocation {
 }
 
 impl Registry {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             mailboxes: MailboxRegistry::new(),
             publications: PublicationRegistry::new(),

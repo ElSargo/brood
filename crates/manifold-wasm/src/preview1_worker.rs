@@ -58,6 +58,9 @@ use crate::coordination::{
     NotificationId, PollError, PollableId, WaitMode,
 };
 use crate::filesystem_watch::{FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId};
+use crate::resource_limits::{
+    GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
+};
 
 #[allow(
     clippy::derive_partial_eq_without_eq,
@@ -167,6 +170,8 @@ pub struct Preview1WorkerConfig {
     pub worker_yield_ticks: u64,
     /// Wall-clock bound around every actor export call.
     pub actor_wall_timeout: Duration,
+    /// Host and guest byte ceilings for one actor generation.
+    pub limits: WasmResourceLimits,
 }
 
 impl Default for Preview1WorkerConfig {
@@ -190,6 +195,7 @@ impl Default for Preview1WorkerConfig {
             actor_deadline_ticks: 50,
             worker_yield_ticks: 1,
             actor_wall_timeout: Duration::from_millis(100),
+            limits: WasmResourceLimits::default(),
         }
     }
 }
@@ -300,6 +306,7 @@ impl CompatEvent {
 struct Preview1Store {
     wasi: WasiP1Ctx,
     host: Preview1Host,
+    limits: GenerationStoreLimits,
 }
 
 struct Preview1Host {
@@ -1089,6 +1096,8 @@ pub struct Preview1WorkerRuntime {
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
     terminal_error: Arc<Mutex<Option<String>>>,
+    limits: WasmResourceLimits,
+    byte_budget: GenerationByteBudget,
 }
 
 impl Preview1WorkerRuntime {
@@ -1143,6 +1152,25 @@ impl Preview1WorkerRuntime {
                 "env::memory must be shared".to_string(),
             ));
         }
+        let maximum_pages = memory_type.maximum().ok_or_else(|| {
+            Preview1WorkerError::InvalidModule(
+                "env::memory must declare a maximum for generation memory containment".to_string(),
+            )
+        })?;
+        let maximum_bytes = usize::try_from(maximum_pages)
+            .ok()
+            .and_then(|pages| pages.checked_mul(64 * 1024))
+            .ok_or_else(|| {
+                Preview1WorkerError::InvalidModule(
+                    "env::memory maximum overflows host byte accounting".to_string(),
+                )
+            })?;
+        if maximum_bytes > config.limits.generation_memory_bytes {
+            return Err(Preview1WorkerError::InvalidModule(format!(
+                "env::memory maximum {maximum_bytes} exceeds {} byte generation limit",
+                config.limits.generation_memory_bytes
+            )));
+        }
         let memory = SharedMemory::new(&engine, memory_type)
             .map_err(|error| Preview1WorkerError::InvalidModule(error.to_string()))?;
 
@@ -1193,6 +1221,7 @@ impl Preview1WorkerRuntime {
         let (commands, receiver) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
         let mailbox_capacity = config.mailbox_backlog;
+        let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
         let stats = Arc::new(Preview1CompatStatsInner::default());
         let next_worker = Arc::new(AtomicU64::new(1));
         let worker_inputs = Arc::new(Mutex::new(HashMap::new()));
@@ -1218,8 +1247,10 @@ impl Preview1WorkerRuntime {
                         worker_inputs: Arc::clone(&worker_inputs),
                         stats: Arc::clone(&stats),
                     },
+                    limits: config.limits.store_limits(),
                 },
             );
+            actor_store.limiter(|data| &mut data.limits);
             configure_actor_deadline(&mut actor_store, config.actor_deadline_ticks);
             let actor_instance = instantiate(&engine, &module, &memory, &mut actor_store).await?;
             validate_actor_exports(&mut actor_store, actor_instance).await?;
@@ -1276,6 +1307,8 @@ impl Preview1WorkerRuntime {
             coordination,
             filesystem_watches,
             terminal_error,
+            limits: config.limits,
+            byte_budget,
         })
     }
 
@@ -1285,6 +1318,21 @@ impl Preview1WorkerRuntime {
         sender: String,
         payload: Vec<u8>,
     ) -> Result<(), Preview1WorkerError> {
+        if sender.len() > self.limits.mailbox_sender_bytes {
+            increment_saturating(&self.stats.mailbox_dropped);
+            return Err(Preview1WorkerError::AtCapacity("mailbox sender bytes"));
+        }
+        if payload.len() > self.limits.mailbox_body_bytes {
+            increment_saturating(&self.stats.mailbox_dropped);
+            return Err(Preview1WorkerError::AtCapacity("mailbox body bytes"));
+        }
+        let byte_permit = self
+            .byte_budget
+            .try_reserve(sender.len().saturating_add(payload.len()))
+            .map_err(|_error| {
+                increment_saturating(&self.stats.mailbox_dropped);
+                Preview1WorkerError::AtCapacity("generation host bytes")
+            })?;
         let permit = Arc::clone(&self.mailbox_slots)
             .try_acquire_owned()
             .map_err(|_no_permit| {
@@ -1295,6 +1343,7 @@ impl Preview1WorkerRuntime {
             sender,
             payload,
             permit,
+            byte_permit,
         }) {
             increment_saturating(&self.stats.mailbox_dropped);
             return Err(match error {
@@ -1545,6 +1594,7 @@ enum Command {
         sender: String,
         payload: Vec<u8>,
         permit: OwnedSemaphorePermit,
+        byte_permit: GenerationBytePermit,
     },
     ActorCall {
         export: String,
@@ -1578,6 +1628,7 @@ enum ActorOperation {
     Mailbox {
         event: CompatEvent,
         permit: OwnedSemaphorePermit,
+        byte_permit: GenerationBytePermit,
     },
     Call {
         export: String,
@@ -1768,6 +1819,7 @@ async fn parent_loop(
                 config.actor_wall_timeout,
                 config.worker_yield_ticks,
                 reservations.values().copied().collect(),
+                config.limits,
             ));
         }
 
@@ -1800,13 +1852,14 @@ async fn parent_loop(
                     continue;
                 }
                 match command {
-                    Command::Mailbox { sender, payload, permit } => {
+                    Command::Mailbox { sender, payload, permit, byte_permit } => {
                         // Admission was reserved before the public enqueue
                         // returned success. Retain it through dispatch so an
                         // accepted mailbox message cannot be silently dropped.
                         actor_operations.push_back(ActorOperation::Mailbox {
                             event: CompatEvent::Mailbox { sender, payload },
                             permit,
+                            byte_permit,
                         });
                     }
                     Command::ActorCall { export, argument, reply } => {
@@ -2125,7 +2178,7 @@ fn start_dispatch_operation(
     mut actor_store: Store<Preview1Store>,
     actor_instance: Instance,
     event: CompatEvent,
-    mailbox_permit: Option<OwnedSemaphorePermit>,
+    mailbox_permit: Option<(OwnedSemaphorePermit, GenerationBytePermit)>,
     actor_deadline_ticks: u64,
     actor_wall_timeout: Duration,
 ) -> GuestCall {
@@ -2192,6 +2245,7 @@ fn start_actor_operation(
     actor_wall_timeout: Duration,
     worker_yield_ticks: u64,
     existing_reservations: Vec<WorkerReservation>,
+    limits: WasmResourceLimits,
 ) -> GuestCall {
     match operation {
         ActorOperation::Dispatch(event) => start_dispatch_operation(
@@ -2202,11 +2256,15 @@ fn start_actor_operation(
             actor_deadline_ticks,
             actor_wall_timeout,
         ),
-        ActorOperation::Mailbox { event, permit } => start_dispatch_operation(
+        ActorOperation::Mailbox {
+            event,
+            permit,
+            byte_permit,
+        } => start_dispatch_operation(
             actor_store,
             actor_instance,
             event,
-            Some(permit),
+            Some((permit, byte_permit)),
             actor_deadline_ticks,
             actor_wall_timeout,
         ),
@@ -2260,6 +2318,7 @@ fn start_actor_operation(
                     stack_bytes,
                     worker_yield_ticks,
                     &existing_reservations,
+                    limits,
                 ),
             )
             .await
@@ -2399,6 +2458,7 @@ async fn prepare_worker(
     stack_bytes: u32,
     worker_yield_ticks: u64,
     existing_reservations: &[WorkerReservation],
+    limits: WasmResourceLimits,
 ) -> Result<PreparedWorker, Preview1WorkerError> {
     // Read the immutable TLS metadata from the actor instance so the actor can
     // reserve memory before the secondary instance's start function runs.
@@ -2480,7 +2540,15 @@ async fn prepare_worker(
             worker_inputs,
             stats: worker_stats,
         };
-        let mut store = Store::new(engine, Preview1Store { wasi, host });
+        let mut store = Store::new(
+            engine,
+            Preview1Store {
+                wasi,
+                host,
+                limits: limits.store_limits(),
+            },
+        );
+        store.limiter(|data| &mut data.limits);
         store.set_epoch_deadline(worker_yield_ticks);
         store.epoch_deadline_async_yield_and_update(worker_yield_ticks);
         let instance = instantiate(engine, module, memory, &mut store).await?;
@@ -2618,6 +2686,18 @@ async fn instantiate(
 }
 
 const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1WorkerError> {
+    if config.limits.mailbox_sender_bytes == 0
+        || config.limits.mailbox_body_bytes == 0
+        || config.limits.worker_payload_bytes == 0
+        || config.limits.worker_result_bytes == 0
+        || config.limits.generation_host_bytes == 0
+        || config.limits.generation_memory_bytes == 0
+        || config.limits.store_table_elements == 0
+    {
+        return Err(Preview1WorkerError::InvalidConfig(
+            "resource byte and table limits must be non-zero",
+        ));
+    }
     if config.max_workers == 0 {
         return Err(Preview1WorkerError::InvalidConfig(
             "max_workers must be non-zero",
@@ -2883,6 +2963,7 @@ mod tests {
         let permit = slots
             .try_acquire_owned()
             .context("acquire mailbox test permit")?;
+        let byte_permit = GenerationByteBudget::new(1).try_reserve(1)?;
         let mut operations = VecDeque::from([
             ActorOperation::Dispatch(CompatEvent::WorkerStarted(Preview1WorkerId(1))),
             ActorOperation::Mailbox {
@@ -2891,6 +2972,7 @@ mod tests {
                     payload: Vec::new(),
                 },
                 permit,
+                byte_permit,
             },
             ActorOperation::Dispatch(CompatEvent::WorkerStarted(Preview1WorkerId(2))),
         ]);
@@ -2924,6 +3006,10 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!(error))?,
             coordination,
             terminal_error: Arc::new(Mutex::new(None)),
+            limits: WasmResourceLimits::default(),
+            byte_budget: GenerationByteBudget::new(
+                WasmResourceLimits::default().generation_host_bytes,
+            ),
         };
 
         runtime.try_send_message("test".to_string(), b"one".to_vec())?;

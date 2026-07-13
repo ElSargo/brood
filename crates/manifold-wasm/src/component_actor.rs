@@ -36,6 +36,9 @@ use crate::coordination::{
     ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError, NotificationId,
     PollError, PollableId, WaitMode,
 };
+use crate::resource_limits::{
+    GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
+};
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -144,6 +147,8 @@ pub struct ComponentActorConfig {
     pub epoch_tick_interval: Duration,
     /// Engine epochs between executor yields from guest code.
     pub epoch_yield_ticks: u64,
+    /// Host and guest byte ceilings for one actor generation.
+    pub limits: WasmResourceLimits,
 }
 
 impl Default for ComponentActorConfig {
@@ -161,6 +166,7 @@ impl Default for ComponentActorConfig {
             dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
+            limits: WasmResourceLimits::default(),
         }
     }
 }
@@ -233,6 +239,7 @@ struct ActorStore {
     blocking_io: BlockingIoTracker,
     event_observer: mpsc::Sender<ComponentActorEvent>,
     dispatcher: Option<DispatcherCallState>,
+    limits: GenerationStoreLimits,
 }
 
 #[derive(Clone, Copy)]
@@ -890,10 +897,12 @@ enum RuntimeCommand {
         sender: String,
         body: Vec<u8>,
         permit: OwnedSemaphorePermit,
+        byte_permit: GenerationBytePermit,
     },
     SpawnWorker {
         worker: WorkerId,
         payload: Vec<u8>,
+        byte_permit: GenerationBytePermit,
     },
     CancelWorker(WorkerId),
     Shutdown,
@@ -919,6 +928,9 @@ pub struct ComponentActor {
     runtime_task: Option<JoinHandle<Result<()>>>,
     io_task: Option<JoinHandle<()>>,
     epoch_ticker: Option<EpochTicker>,
+    limits: WasmResourceLimits,
+    byte_budget: GenerationByteBudget,
+    observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
 }
 
 impl ComponentActor {
@@ -951,6 +963,7 @@ impl ComponentActor {
             "epoch tick interval must be non-zero"
         );
         ensure!(config.epoch_yield_ticks > 0, "epoch yield must be non-zero");
+        config.limits.validate()?;
 
         let generation = NEXT_ACTOR_GENERATION
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -982,6 +995,8 @@ impl ComponentActor {
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
         let mailbox_capacity = config.mailbox_backlog;
+        let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
+        let observer_result_bytes = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel(config.command_capacity);
         let mut store = Store::new(
             &engine,
@@ -993,8 +1008,10 @@ impl ComponentActor {
                 blocking_io: BlockingIoTracker::default(),
                 event_observer: event_tx.clone(),
                 dispatcher: None,
+                limits: config.limits.store_limits(),
             },
         );
+        store.limiter(|data| &mut data.limits);
         store.set_epoch_deadline(config.epoch_yield_ticks);
         store.epoch_deadline_async_yield_and_update(config.epoch_yield_ticks);
         let epoch_yield_ticks = config.epoch_yield_ticks;
@@ -1022,6 +1039,9 @@ impl ComponentActor {
 
         let (completion_tx, completion_rx) = mpsc::channel(config.max_outstanding_io);
         let runtime_io = completion_io.clone();
+        let runtime_byte_budget = byte_budget.clone();
+        let runtime_observer_result_bytes = Arc::clone(&observer_result_bytes);
+        let limits = config.limits;
         let runtime_task = tokio::spawn(async move {
             let result = run_component_actor(
                 &mut store,
@@ -1032,6 +1052,8 @@ impl ComponentActor {
                 completion_tx,
                 event_tx,
                 config,
+                runtime_byte_budget,
+                runtime_observer_result_bytes,
             )
             .await;
             runtime_io.stop();
@@ -1053,6 +1075,9 @@ impl ComponentActor {
             runtime_task: Some(runtime_task),
             io_task: Some(io_task),
             epoch_ticker: Some(epoch_ticker),
+            limits,
+            byte_budget,
+            observer_result_bytes,
         })
     }
 
@@ -1078,6 +1103,8 @@ impl ComponentActor {
             &self.mailbox_dropped,
             sender,
             body,
+            self.limits,
+            &self.byte_budget,
         )
     }
 
@@ -1092,6 +1119,8 @@ impl ComponentActor {
 
     /// Start an actor-private worker in the same component instance.
     pub fn try_spawn_worker(&self, payload: Vec<u8>) -> Result<WorkerId> {
+        self.limits.ensure_worker_payload(&payload)?;
+        let byte_permit = self.byte_budget.try_reserve(payload.len())?;
         let raw = self
             .next_worker
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1100,7 +1129,11 @@ impl ComponentActor {
             .map_err(|_exhausted| anyhow::anyhow!("worker id allocator is exhausted"))?;
         let worker = WorkerId(raw);
         self.commands
-            .try_send(RuntimeCommand::SpawnWorker { worker, payload })
+            .try_send(RuntimeCommand::SpawnWorker {
+                worker,
+                payload,
+                byte_permit,
+            })
             .map_err(|error| anyhow::anyhow!("component actor rejected worker spawn: {error}"))?;
         Ok(worker)
     }
@@ -1121,17 +1154,34 @@ impl ComponentActor {
     }
 
     pub async fn recv_event(&mut self) -> Option<ComponentActorEvent> {
-        self.events.recv().await
+        let event = self.events.recv().await?;
+        self.release_observer_result_bytes(&event);
+        Some(event)
     }
 
     /// Drain one observer event without blocking the host actor.
     pub fn try_recv_event(&mut self) -> Option<ComponentActorEvent> {
-        self.events.try_recv().ok()
+        let event = self.events.try_recv().ok()?;
+        self.release_observer_result_bytes(&event);
+        Some(event)
     }
 
     /// Observe the completion lane independently of normal mailbox traffic.
     pub async fn recv_completion(&mut self) -> Option<ActorCompletion> {
         self.completions.recv().await
+    }
+
+    fn release_observer_result_bytes(&self, event: &ComponentActorEvent) {
+        let worker = match event {
+            ComponentActorEvent::WorkerFinished { worker, .. }
+            | ComponentActorEvent::WorkerFailed { worker, .. } => Some(*worker),
+            _ => None,
+        };
+        if let Some(worker) = worker
+            && let Ok(mut retained) = self.observer_result_bytes.lock()
+        {
+            retained.remove(&worker);
+        }
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -1172,7 +1222,14 @@ fn try_enqueue_mailbox(
     mailbox_dropped: &AtomicU64,
     sender: String,
     body: Vec<u8>,
+    limits: WasmResourceLimits,
+    byte_budget: &GenerationByteBudget,
 ) -> Result<()> {
+    if let Err(error) = limits.ensure_mailbox(&sender, &body) {
+        increment_saturating(mailbox_dropped);
+        return Err(error.context("component actor rejected mailbox message"));
+    }
+    let byte_permit = byte_budget.try_reserve(sender.len().saturating_add(body.len()))?;
     let Ok(permit) = Arc::clone(mailbox_slots).try_acquire_owned() else {
         increment_saturating(mailbox_dropped);
         return Err(anyhow::anyhow!("component actor mailbox backlog is full"));
@@ -1181,6 +1238,7 @@ fn try_enqueue_mailbox(
         sender,
         body,
         permit,
+        byte_permit,
     }) {
         Ok(()) => {
             increment_saturating(mailbox_enqueued);
@@ -1289,6 +1347,11 @@ enum GuestCallOutcome {
 
 type GuestCallFuture<'a> = Pin<Box<dyn Future<Output = GuestCallOutcome> + Send + 'a>>;
 
+struct QueuedGuestEvent {
+    event: GuestEvent,
+    _byte_permit: Option<GenerationBytePermit>,
+}
+
 async fn run_component_actor(
     store: &mut Store<ActorStore>,
     plugin: bindings::ManifoldPlugin,
@@ -1298,6 +1361,8 @@ async fn run_component_actor(
     completion_observer: mpsc::Sender<ActorCompletion>,
     event_observer: mpsc::Sender<ComponentActorEvent>,
     config: ComponentActorConfig,
+    byte_budget: GenerationByteBudget,
+    observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
 ) -> Result<()> {
     let guest = plugin.manifold_plugin_actor();
     let stopped_observer = event_observer.clone();
@@ -1313,6 +1378,8 @@ async fn run_component_actor(
                 &completion_observer,
                 &event_observer,
                 &config,
+                &byte_budget,
+                &observer_result_bytes,
             )
             .await
         })
@@ -1347,6 +1414,8 @@ async fn run_component_event_loop(
     completion_observer: &mpsc::Sender<ActorCompletion>,
     event_observer: &mpsc::Sender<ComponentActorEvent>,
     config: &ComponentActorConfig,
+    byte_budget: &GenerationByteBudget,
+    observer_result_bytes: &Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
 ) -> Result<()> {
     use bindings::exports::manifold::plugin::actor as abi;
     use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -1374,7 +1443,7 @@ async fn run_component_event_loop(
                 accessor,
                 event_observer,
             )?;
-            if let Some((event, mailbox_permit)) = event {
+            if let Some((event, mailbox_permit, byte_permit)) = event {
                 dispatcher_busy = true;
                 let deadline = Instant::now()
                     .checked_add(config.dispatcher_deadline)
@@ -1392,6 +1461,7 @@ async fn run_component_event_loop(
                         // Admission remains held until the accepted mailbox
                         // message has reached its terminal dispatch result.
                         let _mailbox_permit = mailbox_permit;
+                        let _byte_permit = byte_permit;
                         let result = dispatch
                             .finish_call_concurrent(accessor, call)
                             .await
@@ -1405,16 +1475,17 @@ async fn run_component_event_loop(
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(RuntimeCommand::Mailbox { sender, body, permit }) => {
+                Some(RuntimeCommand::Mailbox { sender, body, permit, byte_permit }) => {
                     // The sender acquired one of exactly `mailbox_backlog`
                     // permits before the command was accepted, so this queue
                     // cannot overflow or silently discard the message.
                     mailbox_queue.push_back((
                         abi::Event::Mailbox(abi::MailboxMessage { sender, body }),
                         permit,
+                        byte_permit,
                     ));
                 }
-                Some(RuntimeCommand::SpawnWorker { worker, payload }) => {
+                Some(RuntimeCommand::SpawnWorker { worker, payload, byte_permit }) => {
                     let started = start_worker(
                         worker,
                         payload,
@@ -1425,6 +1496,7 @@ async fn run_component_event_loop(
                         &mut active_workers,
                         event_observer,
                         config,
+                        byte_permit,
                     )?;
                     if started {
                         let _ = event_observer.try_send(ComponentActorEvent::WorkerStarted { worker });
@@ -1473,6 +1545,20 @@ async fn run_component_event_loop(
                                     match command {
                                         abi::Command::SpawnWorker(request) => {
                                             let worker = WorkerId(request.worker);
+                                            let byte_permit = match byte_budget.try_reserve(request.payload.len()) {
+                                                Ok(permit) => permit,
+                                                Err(error) => {
+                                                    enqueue_dispatch(
+                                                        &mut system_queue,
+                                                        component_system_capacity(config),
+                                                        abi::Event::Worker(abi::WorkerEvent::Failed(abi::WorkerFailed {
+                                                            worker: worker.raw(),
+                                                            message: error.to_string(),
+                                                        })),
+                                                    )?;
+                                                    continue;
+                                                }
+                                            };
                                             let started = start_worker(
                                                 worker,
                                                 request.payload,
@@ -1483,6 +1569,7 @@ async fn run_component_event_loop(
                                                 &mut active_workers,
                                                 event_observer,
                                                 config,
+                                                byte_permit,
                                             )?;
                                             if started {
                                                 let _ = event_observer.try_send(ComponentActorEvent::WorkerStarted { worker });
@@ -1524,26 +1611,99 @@ async fn run_component_event_loop(
                         }
                         match result {
                             Ok(Ok(output)) => {
-                                enqueue_dispatch(
+                                if let Err(error) = config.limits.ensure_worker_result(&output) {
+                                    let message = error.to_string();
+                                    enqueue_dispatch(
+                                        &mut system_queue,
+                                        component_system_capacity(config),
+                                        abi::Event::Worker(abi::WorkerEvent::Failed(abi::WorkerFailed {
+                                            worker: worker.raw(),
+                                            message: message.clone(),
+                                        })),
+                                    )?;
+                                    let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
+                                    continue;
+                                }
+                                let result_permits = match (
+                                    byte_budget.try_reserve(output.len()),
+                                    byte_budget.try_reserve(output.len()),
+                                ) {
+                                    (Ok(system), Ok(observer)) => (system, observer),
+                                    (Err(error), _) | (_, Err(error)) => {
+                                        let message = error.to_string();
+                                        enqueue_dispatch(
+                                            &mut system_queue,
+                                            component_system_capacity(config),
+                                            abi::Event::Worker(abi::WorkerEvent::Failed(abi::WorkerFailed {
+                                                worker: worker.raw(),
+                                                message: message.clone(),
+                                            })),
+                                        )?;
+                                        let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
+                                        continue;
+                                    }
+                                };
+                                enqueue_retained_dispatch(
                                     &mut system_queue,
                                     component_system_capacity(config),
                                     abi::Event::Worker(abi::WorkerEvent::Finished(abi::WorkerFinished {
                                         worker: worker.raw(),
                                         output: output.clone(),
                                     })),
+                                    result_permits.0,
                                 )?;
-                                let _ = event_observer.try_send(ComponentActorEvent::WorkerFinished { worker, output });
+                                observe_retained_worker_event(
+                                    event_observer,
+                                    observer_result_bytes,
+                                    worker,
+                                    ComponentActorEvent::WorkerFinished { worker, output },
+                                    result_permits.1,
+                                )?;
                             }
                             Ok(Err(message)) => {
-                                enqueue_dispatch(
-                                    &mut system_queue,
-                                    component_system_capacity(config),
-                                    abi::Event::Worker(abi::WorkerEvent::Failed(abi::WorkerFailed {
-                                        worker: worker.raw(),
-                                        message: message.clone(),
-                                    })),
-                                )?;
-                                let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
+                                let message = match config.limits.ensure_worker_result(message.as_bytes()) {
+                                    Ok(()) => message,
+                                    Err(error) => error.to_string(),
+                                };
+                                let result_permits = byte_budget
+                                    .try_reserve(message.len())
+                                    .and_then(|system| {
+                                        byte_budget
+                                            .try_reserve(message.len())
+                                            .map(|observer| (system, observer))
+                                    })
+                                    .ok();
+                                let message = if result_permits.is_some() {
+                                    message
+                                } else {
+                                    "generation host byte budget rejected worker error".to_string()
+                                };
+                                let event = abi::Event::Worker(abi::WorkerEvent::Failed(abi::WorkerFailed {
+                                    worker: worker.raw(),
+                                    message: message.clone(),
+                                }));
+                                if let Some((system_permit, observer_permit)) = result_permits {
+                                    enqueue_retained_dispatch(
+                                        &mut system_queue,
+                                        component_system_capacity(config),
+                                        event,
+                                        system_permit,
+                                    )?;
+                                    observe_retained_worker_event(
+                                        event_observer,
+                                        observer_result_bytes,
+                                        worker,
+                                        ComponentActorEvent::WorkerFailed { worker, message },
+                                        observer_permit,
+                                    )?;
+                                } else {
+                                    enqueue_dispatch(
+                                        &mut system_queue,
+                                        component_system_capacity(config),
+                                        event,
+                                    )?;
+                                    let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
+                                }
                             }
                             Err(error) => {
                                 let message = error.to_string();
@@ -1568,20 +1728,28 @@ async fn run_component_event_loop(
 
 fn pop_component_dispatch(
     next_lane: &mut usize,
-    completion_queue: &mut VecDeque<GuestEvent>,
+    completion_queue: &mut VecDeque<QueuedGuestEvent>,
     notification_queue: &mut VecDeque<NotificationId>,
-    system_queue: &mut VecDeque<GuestEvent>,
-    mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit)>,
+    system_queue: &mut VecDeque<QueuedGuestEvent>,
+    mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit, GenerationBytePermit)>,
     accessor: &wasmtime::component::Accessor<ActorStore>,
     event_observer: &mpsc::Sender<ComponentActorEvent>,
-) -> Result<Option<(GuestEvent, Option<OwnedSemaphorePermit>)>> {
+) -> Result<
+    Option<(
+        GuestEvent,
+        Option<OwnedSemaphorePermit>,
+        Option<GenerationBytePermit>,
+    )>,
+> {
     use bindings::exports::manifold::plugin::actor as abi;
 
     for _lane in 0..4 {
         let lane = *next_lane;
         *next_lane = (*next_lane + 1) % 4;
         let event = match lane {
-            0 => completion_queue.pop_front().map(|event| (event, None)),
+            0 => completion_queue
+                .pop_front()
+                .map(|queued| (queued.event, None, None)),
             1 => {
                 let mut selected = None;
                 while let Some(notification) = notification_queue.pop_front() {
@@ -1603,15 +1771,18 @@ fn pop_component_dispatch(
                             token: event.token,
                         }),
                         None,
+                        None,
                     ));
                     break;
                 }
                 selected
             }
-            2 => system_queue.pop_front().map(|event| (event, None)),
+            2 => system_queue
+                .pop_front()
+                .map(|queued| (queued.event, None, None)),
             _ => mailbox_queue
                 .pop_front()
-                .map(|(event, permit)| (event, Some(permit))),
+                .map(|(event, permit, byte_permit)| (event, Some(permit), Some(byte_permit))),
         };
         if event.is_some() {
             return Ok(event);
@@ -1621,12 +1792,57 @@ fn pop_component_dispatch(
 }
 
 fn enqueue_dispatch(
-    queue: &mut VecDeque<GuestEvent>,
+    queue: &mut VecDeque<QueuedGuestEvent>,
     capacity: usize,
     event: GuestEvent,
 ) -> Result<()> {
     ensure!(queue.len() < capacity, "actor dispatch backlog is full");
-    queue.push_back(event);
+    queue.push_back(QueuedGuestEvent {
+        event,
+        _byte_permit: None,
+    });
+    Ok(())
+}
+
+fn enqueue_retained_dispatch(
+    queue: &mut VecDeque<QueuedGuestEvent>,
+    capacity: usize,
+    event: GuestEvent,
+    byte_permit: GenerationBytePermit,
+) -> Result<()> {
+    ensure!(queue.len() < capacity, "actor dispatch backlog is full");
+    queue.push_back(QueuedGuestEvent {
+        event,
+        _byte_permit: Some(byte_permit),
+    });
+    Ok(())
+}
+
+fn observe_retained_worker_event(
+    observer: &mpsc::Sender<ComponentActorEvent>,
+    retained: &Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
+    worker: WorkerId,
+    event: ComponentActorEvent,
+    byte_permit: GenerationBytePermit,
+) -> Result<()> {
+    {
+        let mut retained = retained
+            .lock()
+            .map_err(|error| anyhow::anyhow!("worker result byte budget is poisoned: {error}"))?;
+        ensure!(
+            retained.insert(worker, byte_permit).is_none(),
+            "worker {} already has a retained observer result",
+            worker.raw()
+        );
+        drop(retained);
+    }
+    if observer.try_send(event).is_err() {
+        let mut retained = retained
+            .lock()
+            .map_err(|error| anyhow::anyhow!("worker result byte budget is poisoned: {error}"))?;
+        retained.remove(&worker);
+        drop(retained);
+    }
     Ok(())
 }
 
@@ -1639,15 +1855,18 @@ fn start_worker<'a>(
         (std::result::Result<Vec<u8>, String>,),
     >,
     calls: &mut futures::stream::FuturesUnordered<GuestCallFuture<'a>>,
-    system_queue: &mut VecDeque<GuestEvent>,
+    system_queue: &mut VecDeque<QueuedGuestEvent>,
     active_workers: &mut HashSet<WorkerId>,
     event_observer: &mpsc::Sender<ComponentActorEvent>,
     config: &ComponentActorConfig,
+    byte_permit: GenerationBytePermit,
 ) -> Result<bool> {
     use bindings::exports::manifold::plugin::actor as abi;
     use futures::FutureExt;
 
-    let admission_failure = if active_workers.contains(&worker) {
+    let admission_failure = if let Err(error) = config.limits.ensure_worker_payload(&payload) {
+        Some(error.to_string())
+    } else if active_workers.contains(&worker) {
         Some(format!(
             "component actor worker {} is already active",
             worker.raw()
@@ -1703,6 +1922,7 @@ fn start_worker<'a>(
     )?;
     calls.push(
         async move {
+            let _byte_permit = byte_permit;
             let result = worker_run
                 .finish_call_concurrent(accessor, call)
                 .await
@@ -1778,6 +1998,7 @@ mod completion_tests {
         let slots = Arc::new(Semaphore::new(1));
         let enqueued = AtomicU64::new(0);
         let dropped = AtomicU64::new(0);
+        let byte_budget = GenerationByteBudget::new(1024);
 
         try_enqueue_mailbox(
             &commands,
@@ -1786,6 +2007,8 @@ mod completion_tests {
             &dropped,
             "first".to_string(),
             b"accepted".to_vec(),
+            WasmResourceLimits::default(),
+            &byte_budget,
         )?;
         ensure!(
             try_enqueue_mailbox(
@@ -1795,6 +2018,8 @@ mod completion_tests {
                 &dropped,
                 "second".to_string(),
                 b"rejected".to_vec(),
+                WasmResourceLimits::default(),
+                &byte_budget,
             )
             .is_err(),
             "full mailbox accepted a second message"
@@ -1813,6 +2038,8 @@ mod completion_tests {
             &dropped,
             "third".to_string(),
             b"accepted-after-dispatch".to_vec(),
+            WasmResourceLimits::default(),
+            &byte_budget,
         )?;
         let third = receiver
             .try_recv()
@@ -1827,12 +2054,66 @@ mod completion_tests {
                 &dropped,
                 "fourth".to_string(),
                 b"closed".to_vec(),
+                WasmResourceLimits::default(),
+                &byte_budget,
             )
             .is_err(),
             "closed runtime command lane accepted a message"
         );
         ensure!(enqueued.load(Ordering::Acquire) == 2);
         ensure!(dropped.load(Ordering::Acquire) == 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mailbox_generation_byte_budget_follows_queued_message_ownership() -> Result<()> {
+        let (commands, mut receiver) = mpsc::channel(3);
+        let slots = Arc::new(Semaphore::new(3));
+        let enqueued = AtomicU64::new(0);
+        let dropped = AtomicU64::new(0);
+        let byte_budget = GenerationByteBudget::new(10);
+        let limits = WasmResourceLimits {
+            mailbox_sender_bytes: 8,
+            mailbox_body_bytes: 8,
+            generation_host_bytes: 10,
+            ..WasmResourceLimits::default()
+        };
+
+        try_enqueue_mailbox(
+            &commands,
+            &slots,
+            &enqueued,
+            &dropped,
+            "s".to_string(),
+            vec![0; 8],
+            limits,
+            &byte_budget,
+        )?;
+        ensure!(
+            try_enqueue_mailbox(
+                &commands,
+                &slots,
+                &enqueued,
+                &dropped,
+                "s".to_string(),
+                vec![0; 2],
+                limits,
+                &byte_budget,
+            )
+            .is_err(),
+            "queued messages exceeded the generation byte budget"
+        );
+        drop(receiver.try_recv()?);
+        try_enqueue_mailbox(
+            &commands,
+            &slots,
+            &enqueued,
+            &dropped,
+            "s".to_string(),
+            vec![0; 2],
+            limits,
+            &byte_budget,
+        )?;
         Ok(())
     }
 

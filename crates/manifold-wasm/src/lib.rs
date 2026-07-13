@@ -21,6 +21,7 @@ mod module_link;
 pub mod policy_provider;
 mod policy_provider_link;
 pub mod preview1_worker;
+mod resource_limits;
 
 pub use actor::{
     ACTOR_EMPTY_OUTBOX, ActorEpochOutcome, ActorOutbox, ActorOutboxMessage, ActorPublication,
@@ -63,7 +64,9 @@ pub use layout_policy::{
     InputBehavior, LayoutItemId, LayoutItemKind, LayoutSize, LocalPoint, LocalTransform,
     ResolvedLayout, ResolvedLayoutItem,
 };
-pub use mailbox::{ActorId, Mailbox, MailboxRegistry};
+pub use mailbox::{
+    ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxRegistry,
+};
 pub use module::{
     DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, WasmActorDeclaration, WasmModuleInventory,
     WasmPluginConfig, WasmPluginModule,
@@ -83,6 +86,7 @@ pub use preview1_worker::{
     Preview1WorkerRuntime, SHARED_MEMORY_IMPORT_MODULE, SHARED_MEMORY_IMPORT_NAME,
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
 };
+pub use resource_limits::WasmResourceLimits;
 
 #[cfg(test)]
 mod tests;

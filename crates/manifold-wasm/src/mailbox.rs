@@ -3,7 +3,15 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail, ensure};
 use tokio::sync::mpsc;
 
-use crate::api::read_range;
+use crate::{
+    api::read_range,
+    resource_limits::{GenerationByteBudget, GenerationBytePermit},
+};
+
+/// Legacy byte-only mailbox ceiling. Hosted actor backends additionally bound
+/// sender metadata through [`crate::WasmResourceLimits`].
+pub const MAX_MAILBOX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MAILBOX_GENERATION_BYTES: usize = 256 * 1024 * 1024;
 
 const FIRST_ACTOR_ID: u64 = 1;
 
@@ -21,16 +29,23 @@ pub struct MailboxRegistry {
     mailboxes: BTreeMap<ActorId, MailboxSender>,
     names: BTreeMap<String, ActorId>,
     next_actor_id: u64,
+    byte_budget: GenerationByteBudget,
 }
 
 #[derive(Clone, Debug)]
 struct MailboxSender {
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<MailboxMessage>,
+}
+
+#[derive(Debug)]
+struct MailboxMessage {
+    payload: Vec<u8>,
+    _byte_permit: GenerationBytePermit,
 }
 
 #[derive(Debug)]
 pub struct Mailbox {
-    inner: mpsc::Receiver<Vec<u8>>,
+    inner: mpsc::Receiver<MailboxMessage>,
     actor_id: ActorId,
 }
 
@@ -41,11 +56,12 @@ impl Default for MailboxRegistry {
 }
 
 impl MailboxRegistry {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             mailboxes: BTreeMap::new(),
             names: BTreeMap::new(),
             next_actor_id: FIRST_ACTOR_ID,
+            byte_budget: GenerationByteBudget::new(MAX_MAILBOX_GENERATION_BYTES),
         }
     }
 
@@ -106,15 +122,31 @@ impl MailboxRegistry {
     }
 
     pub fn try_post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
+        ensure!(
+            payload.len() <= MAX_MAILBOX_MESSAGE_BYTES,
+            "mailbox message exceeds {MAX_MAILBOX_MESSAGE_BYTES} byte limit"
+        );
+        let byte_permit = self.byte_budget.try_reserve(payload.len())?;
         self.mailbox_sender(recipient)?
-            .try_send(payload)
+            .try_send(MailboxMessage {
+                payload,
+                _byte_permit: byte_permit,
+            })
             .map_err(|err| anyhow::anyhow!("post message to actor {}: {err}", recipient.raw()))
     }
 
     pub async fn post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
+        ensure!(
+            payload.len() <= MAX_MAILBOX_MESSAGE_BYTES,
+            "mailbox message exceeds {MAX_MAILBOX_MESSAGE_BYTES} byte limit"
+        );
+        let byte_permit = self.byte_budget.try_reserve(payload.len())?;
         let sender = self.mailbox_sender(recipient)?.clone();
         sender
-            .send(payload)
+            .send(MailboxMessage {
+                payload,
+                _byte_permit: byte_permit,
+            })
             .await
             .map_err(|err| anyhow::anyhow!("post message to actor {}: {err}", recipient.raw()))
     }
@@ -129,7 +161,7 @@ impl MailboxRegistry {
         self.try_post_message(recipient, bytes.to_vec())
     }
 
-    fn mailbox_sender(&self, recipient: ActorId) -> Result<&mpsc::Sender<Vec<u8>>> {
+    fn mailbox_sender(&self, recipient: ActorId) -> Result<&mpsc::Sender<MailboxMessage>> {
         self.mailboxes
             .get(&recipient)
             .map(|mailbox| &mailbox.sender)
@@ -161,12 +193,12 @@ impl Mailbox {
         let Some(message) = self.inner.recv().await else {
             bail!("actor {} mailbox is closed", self.actor_id.raw());
         };
-        Ok(message)
+        Ok(message.payload)
     }
 
     pub fn try_read_message(&mut self) -> Result<Option<Vec<u8>>> {
         match self.inner.try_recv() {
-            Ok(message) => Ok(Some(message)),
+            Ok(message) => Ok(Some(message.payload)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 bail!("actor {} mailbox is closed", self.actor_id.raw())
