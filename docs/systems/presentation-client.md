@@ -983,6 +983,50 @@ Client diagnostics expose:
 A correlated trace uses connection, session, window, subscription, frame, actor,
 and operation identifiers without depending on synchronized wall clocks.
 
+## Current Refactor Baseline
+
+The pre-transition cleanup established boundaries that the presentation split
+must extend rather than replace:
+
+- `runtime.rs` owns session startup, calloop driving, initial presentation
+  attachment, and ordered shutdown; `compositor.rs` is now focused on Smithay
+  protocol wiring, and `nested_test.rs` independently owns test topology and
+  supervised-process policy.
+- `state_services.rs` gives session catalogue, focus identity, extension
+  registry, and test-harness lifecycle explicit fallible owners. `Manifold`
+  still coordinates Smithay and presentation effects, but new presentation
+  protocol state should be another typed service rather than new parallel fields
+  on `Manifold`.
+- `geometry.rs` centralizes checked conversion between normalized layout,
+  logical pixels, host extents, physical input, capture sizes, and Wayland axis
+  values. The split protocol must preserve those policies and move generally
+  useful geometry types into a shared boundary instead of recreating unchecked
+  casts in the client.
+- `winit_presenter.rs`, `debug_dump.rs`, and the Smithay dispatch path now
+  confine raw handles and mappings behind audited typed owners. The WGPU shell
+  and external-frame import adapters must keep the same narrow unsafe-boundary
+  discipline.
+- The current SHM debug path proves that a late DBus request cannot recover a
+  transient `BufferAssignment` after Smithay consumes it. The frame broker must
+  therefore observe or retain committed content at the Wayland commit/renderer
+  boundary; debug capture cannot be repurposed as the frame source.
+- Core-module replacement now prepares an unreachable candidate generation,
+  validates it, stops and joins the old generation, and atomically publishes the
+  replacement. Component and Preview 1 actors have typed start/stop hooks,
+  generation-owned resources, and structured rebind/shutdown.
+- `resource_limits.rs` provides aggregate Wasmtime memory/table limits and
+  generation byte budgets. Completion, mailbox, worker, watch, process, PTY,
+  socket, timer, and stream resources are bounded and generation-owned. The
+  presentation actor host and connection router must reuse these ownership
+  rules rather than introducing a second unbounded runtime.
+- Typed key-policy invocation keeps event context and immutable publications
+  together. Moving the policy host to the client should preserve that typed
+  invocation and only change placement and routing.
+
+These changes reduce the first phase from a general central-state cleanup to a
+specific extraction of presentation authority, mirrors, and frame ownership.
+They do not alter the target backend/client ownership model.
+
 ## Implementation Structure
 
 The target Rust workspace should separate responsibilities into libraries before
@@ -1007,6 +1051,12 @@ boundaries are required:
 - **transport implementations**: in-process copy, local socket/copy, DMA-BUF,
   and later remote transports.
 
+The first backend presentation service may live inside `manifoldd`, but it must
+follow the transition/effect pattern established by `state_services.rs`: validate
+and commit inventory, lease, and subscription transitions in the service, then
+apply Smithay effects from the compositor owner. Startup and shutdown integration
+belongs in `runtime.rs`; automated topology remains in `nested_test.rs`.
+
 `manifoldd` must no longer expose mutable `Manifold` state to presentation code.
 The current GLES presenter may remain as a temporary compatibility implementation
 but is not part of the target client architecture.
@@ -1017,29 +1067,48 @@ but is not part of the target client architecture.
 
 - Create typed IDs, generations, inventory records, lease state, subscription
   state, frame sequences, and errors.
+- Extract shared logical geometry and checked coordinate/extent policies from
+  the current `geometry.rs` boundary without making Smithay or Winit types part
+  of the protocol model.
+- Reuse generation byte-budget and permit ownership patterns from
+  `manifold-wasm::resource_limits` for bounded protocol lanes.
 - Implement state-machine unit tests and malformed-record property tests.
 - Define endpoint-independent traits for backend commands and client events.
+- Define snapshot adapters from `SurfaceSessionService` and backend window
+  records without exposing `WlSurface` or other Smithay identities.
 - Add diagnostics representations before adding a wire codec.
 
 Exit criteria:
 
 - stale leases and entity generations are rejected;
 - snapshot/delta gaps force resynchronization;
-- subscription/frame cleanup is deterministic;
+- subscription/frame cleanup releases every owned permit deterministically;
+- geometry round trips preserve the checked current conversion policy;
 - all queues and payloads have byte and item bounds.
 
 ### Phase 1: in-process separation
 
-- Extract backend session/window inventory from presentation layout state.
+- Add a typed backend presentation service for inventory revisions, lease state,
+  subscriptions, and connection generations beside the existing services in
+  `state_services.rs` or in a dedicated service module.
+- Derive backend session/window inventory from `SurfaceSessionService` and the
+  compositor's window records rather than creating a second session catalogue.
+- Split the current `FocusService` semantics: viewport focus becomes client
+  state, while backend hosted-window focus records only lease-authorized seat
+  effects and stable producer identity.
 - Replace direct presentation mutation of `Manifold` with typed in-process
   channels implementing the protocol model.
 - Move viewport layout, visibility, hit testing, and chrome state into a client
   state object.
+- Integrate attach, detach, and ordered teardown through `runtime.rs`; keep
+  nested test orchestration in `nested_test.rs`.
 - Preserve existing attached and offscreen behavior through the boundary.
 
 Exit criteria:
 
-- the client half has no mutable reference to backend state;
+- inventory, lease, and subscription transitions are atomic and fallible before
+  Smithay effects are applied;
+- the client half has no mutable reference to backend state or Smithay objects;
 - closing the client half leaves hosted applications alive;
 - a new client half reconstructs from an inventory snapshot;
 - behavior tests exercise the same boundary used by later process separation.
@@ -1047,8 +1116,13 @@ Exit criteria:
 ### Phase 2: WGPU client renderer
 
 - Build the portable WGPU scene compositor and platform-shell boundary.
+- Keep raw display/window handles and WGPU surface creation behind a narrow
+  typed adapter modeled on the audited ownership in `winit_presenter.rs`.
 - Render synthetic panes, chrome, overlays, and copied RGBA window textures.
-- Implement offscreen capture through the client renderer.
+- Implement checked offscreen capture through the client renderer using shared
+  extent and alpha/color policies.
+- Keep the current GLES presenter available until the new path has behavioral
+  and capture parity.
 - Prove software rendering in the Nix behavior-test environment.
 
 Exit criteria:
@@ -1061,6 +1135,11 @@ Exit criteria:
 ### Phase 3: Wayland frame broker and copied transport
 
 - Snapshot committed toplevel surface trees independently of final composition.
+- Capture or retain source content at commit/import time before Smithay consumes
+  transient `BufferAssignment`; do not use the late debug-dump path as a broker.
+- Reuse the current explicit-acquire and implicit DMA-BUF readiness decisions
+  when establishing frame availability, while keeping renderer formats and EGL
+  objects out of producer inventory.
 - Implement copied-image subscription, damage, frame leases, and WGPU upload.
 - Stop frame work when no subscription exists.
 - Preserve application state and current inventory with zero clients.
@@ -1068,6 +1147,8 @@ Exit criteria:
 Exit criteria:
 
 - a real hosted Wayland application is streamed as an independent texture;
+- SHM and DMA-BUF commits are observed at a stable owned boundary rather than a
+  recover-later debug seam;
 - detach and reattach restore its current content;
 - slow subscribers do not create an unbounded `wl_buffer` or frame backlog;
 - hide/unsubscribe does not close the application.
@@ -1077,7 +1158,8 @@ Exit criteria:
 - Implement session presentation lease acquisition, generation, revocation, and
   diagnostics.
 - Move final layout and hit testing into the client.
-- Route resize and input through lease-validated protocol commands.
+- Route resize and input through lease-validated protocol commands and shared
+  checked geometry conversions; preserve typed key-policy invocation context.
 - Separate local hide/close from backend application close/terminate.
 
 Exit criteria:
@@ -1089,9 +1171,20 @@ Exit criteria:
 
 ### Phase 5: client WASM runtime
 
-- Add explicit presentation/session actor placement metadata.
+- Add explicit presentation/session actor placement and typed event-subscription
+  metadata for core, Component, and Preview 1 package forms.
+- Extract or reuse the existing generation resource limiter, byte budgets,
+  mailbox accounting, reserved completion lanes, and structured worker teardown
+  in the client host.
+- Apply the proven replacement order: construct an unreachable candidate, fully
+  validate it, stop and join the old generation, run the candidate start hook,
+  and only then publish the candidate.
 - Instantiate presentation actors per viewport.
-- Run key and layout policy locally.
+- Move the existing typed key-policy invocation and immutable-publication lane
+  to the client, and run layout policy locally.
+- Route backend files, processes, PTYs, sockets, timers, streams, and watches
+  through asynchronous remote capabilities with the same generation-owned
+  handle and cancellation semantics as `RuntimeIoHub`.
 - Add client-local persistence and remote actor/capability completion routing.
 - Prove a real interactive client-side WASM pane with no network operation on
   key-to-frame updates.
@@ -1100,15 +1193,22 @@ Exit criteria:
 
 - local actor messages and render updates remain local;
 - backend file access completes asynchronously over the boundary;
+- presentation actors have aggregate memory, table, host-byte, mailbox,
+  completion, worker, and resource limits;
 - reconnect produces explicit completion failures or application-level resume;
-- actor replacement releases endpoint-local graphics and operation resources.
+- actor replacement joins workers and operations and releases endpoint-local
+  graphics before the replacement becomes reachable.
 
 ### Phase 6: local process boundary
 
 - Run the presentation client as a separate native process.
-- Add a versioned local transport with descriptor-passing capability.
+- Add a versioned local transport with descriptor-passing capability behind an
+  audited owner that cannot leak raw descriptors or platform handles.
 - Preserve copied-image fallback as the correctness baseline.
 - Implement authentication appropriate to a same-user local endpoint.
+- Extend `runtime.rs` ordered shutdown so connection operations, backend actor
+  work, frame leases, and the client process are drained or joined in an
+  explicit order.
 
 Exit criteria:
 
@@ -1157,6 +1257,9 @@ Tests should use real workloads in addition to protocol unit tests.
 
 Required coverage includes:
 
+- continued passage of the merged state-service, geometry, safe-boundary,
+  runtime-I/O, typed-key-policy, actor-lifecycle, harness-lifecycle, and exact
+  nested-child ownership proofs while their responsibilities are moved;
 - lease grant, release, disconnect, stale generation, and observer rejection;
 - complete inventory snapshot, delta gap, and reconnect resynchronization;
 - zero-client session survival and reattach;
