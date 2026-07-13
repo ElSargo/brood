@@ -17,8 +17,8 @@ The assumption that programs, agents, and WASM apps inside the same session may 
 _Avoid_: cross-session ambient trust, internet-safe sandbox boundary
 
 **Session process**:
-The authoritative local process that owns durable session state and the wider workspace-level environment around it.
-_Avoid_: server, daemon, display server when not discussing a protocol role
+The authoritative process that owns durable session state and the wider workspace-level environment around it. In the presentation protocol role it is the session backend.
+_Avoid_: presentation client, display server, final renderer
 
 **Pane**:
 A unit of presentation in a Manifold workspace whose state lives behind a layer of indirection rather than in the presentation surface itself.
@@ -69,16 +69,16 @@ A host-owned latest-state publication path. Plugin actors ask the host to append
 _Avoid_: event log, mailbox, shared mutable heap
 
 **WASM app host**:
-The session-process component that loads sandboxed WASM modules, grants capabilities, calls module lifecycle functions, and applies their requested workspace, scene, or plugin-runtime changes.
-_Avoid_: renderer, compositor plugin
+A runtime in either the session backend or presentation client that loads approved WASM modules, grants placement-appropriate capabilities, and manages actor lifecycle. Presentation hosts own local policy and UI actors; backend hosts own session actors and backend capabilities.
+_Avoid_: assuming all WASM runs in the session process, renderer, compositor plugin
 
 **WASM controller**:
 A WASM-backed plugin role that changes workspace behavior through host APIs, such as focus rules, presentation requests, commands, sync policy lanes, or automation.
 _Avoid_: compositor plugin, direct state mutator
 
 **WASM pane app**:
-A WASM module that owns durable app state in the session process and may create any number of panes by producing semantic UI patches or custom render packets.
-_Avoid_: managed app
+A WASM application whose presentation actor may create panes through semantic UI or custom render packets and whose durable model may be client-local, backend-coordinated, or owned by a paired session actor.
+_Avoid_: managed app, assuming graphics cross the backend connection
 
 **Managed app**:
 An external native application whose windows or surfaces Manifold tracks, places, and preserves as part of a session.
@@ -93,20 +93,32 @@ The normal desktop window opened by a presentation endpoint to show a session on
 _Avoid_: remote client, framebuffer viewer
 
 **Presentation surface**:
-The view that presents one session at a time, choosing which of that session's panes are visible and how they are arranged, animated, and interacted with.
-_Avoid_: session, pane owner
+An independent viewport that presents one session at a time, choosing which panes are visible and how they are arranged, animated, and interacted with. It has state separate from the backend and from other viewports.
+_Avoid_: session, pane owner, canonical backend layout
+
+**Presentation client**:
+The native or web endpoint runtime that owns one or more presentation surfaces, client-side WASM actors, platform integration, a WGPU renderer, and demand-driven window subscriptions.
+_Avoid_: Wayland client, session backend, thin framebuffer viewer
+
+**Presentation lease**:
+Generation-bearing authority held by at most one presentation client for one session. It authorizes hosted Wayland window configuration and primary application input while allowing other clients to observe.
+_Avoid_: ownership of the session, permission to mutate another client's layout
+
+**Frame subscription**:
+A bounded request by a presentation client for the current and future committed content of one backend window producer through a negotiated transport.
+_Avoid_: pane ownership, implicit application resize, unbounded frame queue
 
 **Presentation request**:
 A message from a pane producer to a presentation surface describing desired presentation behavior, such as size, grouping, modality, attention, or placement hints.
 _Avoid_: layout command, guaranteed placement
 
 **Native component pane**:
-A plugin pane whose content is described as host-rendered components instead of plugin-drawn pixels.
-_Avoid_: webview requirement, raw framebuffer by default
+A plugin pane whose content is described as presentation-rendered components instead of plugin-drawn pixels.
+_Avoid_: webview requirement, raw framebuffer by default, backend-rendered UI requirement
 
 **Render packet**:
-A bounded, versioned, replayable command buffer submitted by an actor as the latest custom-drawn visual state of one pane. It may reference host-managed graphics resources, while the host owns validation, GPU synchronization, composition, and presentation.
-_Avoid_: native GPU command buffer, graphics swapchain, pointer into retained guest memory
+A bounded, versioned, replayable command buffer submitted by a presentation actor as the latest custom-drawn visual state of one pane. It may reference client-host-managed graphics resources, while the presentation client owns validation, WGPU lowering, GPU synchronization, composition, and presentation.
+_Avoid_: native GPU command buffer, graphics swapchain, network-rendering requirement, pointer into retained guest memory
 
 **Session DBus proxy**:
 A session-scoped DBus bridge for external apps that need normal desktop-style communication inside a Manifold session.
@@ -129,8 +141,8 @@ A session-local durable or inspectable record of actions requested or performed 
 _Avoid_: hidden agent action, untraceable automation
 
 **Presentation endpoint**:
-The component that owns final presentation execution for a session on a backend.
-_Avoid_: frontend, display client when the process boundary is not the point
+The component role that owns final presentation execution. The target endpoint is a presentation client; use the role term when process or network placement is not the point.
+_Avoid_: session backend, Wayland client
 
 **Detach**:
 Closing or removing a presentation window while preserving the session and any managed apps that still have live state.
@@ -155,11 +167,13 @@ _Avoid_: ambient permission, unrestricted access
 ## Relationships
 
 - The current `manifoldd` binary is the MVP **session process** and also owns the MVP **presentation endpoint**.
-- A future `manifold-client` may become a separate **presentation endpoint** without owning authoritative session state.
+- The target `manifold-client` is an independent portable **presentation client** without authoritative session state. The split is first introduced as a typed in-process boundary.
+- A **presentation client** owns viewport state, client-side actors, graphics resources, WGPU composition, and selected **frame subscriptions**.
+- At most one client holds the generation-bearing **presentation lease** for a session; zero clients is a normal detached state.
 - A **workspace** is the product-level umbrella that contains one or more **sessions**.
 - A **session** contains related panes, producer state, environment, cwd, agents, programs, and capabilities isolated from other sessions.
 - The **session trust boundary** is the primary first-phase trust model: things in the same session are assumed to trust each other, while cross-session access requires explicit workspace-level bridging or grants.
-- **WASM pane apps** in the same **session** may communicate with each other through session APIs and capabilities.
+- **WASM pane apps** may run primarily in a presentation client. They coordinate explicitly with session actors or backend storage when state should follow the session; otherwise their state remains client-local.
 - External apps in a **session** may use a **session DBus proxy** for session-local desktop integration without receiving ambient host-wide DBus access.
 - First-phase **session filesystem access** uses the real host/project filesystem with session cwd, environment, and capability grants. A virtual filesystem remains a possible later layer, not a current requirement.
 - The **session environment** is mutable power-user state. Programs inherit it at launch; session-aware tools may observe or change it, while already-running external processes may not automatically reflect every change.
@@ -175,8 +189,8 @@ _Avoid_: ambient permission, unrestricted access
 - A **pane producer** may create, fill, update, or remove one or more **panes**. **Pane clients**, **managed apps**, and **WASM pane apps** are different producer shapes.
 - A **WASM pane app** can create any number of **panes** without being one pane itself.
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
-- **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with correctness fallbacks.
-- The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, Weston, or renderer internals.
+- **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with copied-image correctness fallback. Remote transports preserve per-window streams and client-side composition.
+- The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, WGPU objects, or renderer internals.
 - A **plugin** may contain multiple **plugin actors**, actor-scoped **plugin workers**, and optional **sync policy lanes**.
 - A **plugin actor** is the public address-space and mailbox boundary. It is dormant between events; once invoked its dispatcher must not suspend or block, and instead submits work and handles **completion** messages.
 - A **plugin worker** shares its actor's memory and capabilities, may use blocking-looking WASI, has no public mailbox, and is cancelled with its actor.
@@ -184,12 +198,12 @@ _Avoid_: ambient permission, unrestricted access
 - Use another **plugin actor** for independent isolation, addressing, capabilities, or lifecycle. Use a **plugin worker** for cheap shared-state concurrency.
 - **Mailbox** delivery is the normal path for durable plugin work; **swapchains** are the latest-state path for sync policy decisions.
 - **Sync policy lanes** are only for immediate host pre-commit decisions and must not block on actor queues or mutate host state directly.
-- The host owns final shortcut routing, accepted layout, pane lifecycle, native chrome, focus, hit testing, and rendering.
+- The presentation client owns final local shortcut routing, accepted viewport layout, native chrome, focus, hit testing, and WGPU rendering. The backend owns session and managed-window lifecycle and validates lease-authorized Wayland configuration and input.
 
 ## Flagged Ambiguities
 
 - "hosted app" is too narrow. Use **managed app** for the product concept, and **hosted Wayland app** for the nested Wayland implementation.
-- "managed app" should not be used for WASM-hosted UI. Use **WASM pane app** for sandboxed UI modules whose state lives in the session process.
+- "managed app" should not be used for WASM-hosted UI. Use **WASM pane app** for sandboxed UI modules whose presentation state may live in the client and whose coordinated state may live in a session actor.
 - "pane" should not imply the state owner. A pane is the presentation unit; the state may live in a plugin, WASM module, external process, session model, browser runtime, or other producer behind indirection.
 - "plugin" should not imply one actor, one pane, one worker, or direct compositor authority. A plugin package can expose multiple actors, each with private workers, plus sync policy lanes, pane producers, and UI views behind host-owned boundaries.
 - "worker" should not imply a second actor or an independently addressable service. Workers are private shared-memory execution contexts inside one actor. Cooperative workers do not promise multicore parallelism.
@@ -202,7 +216,7 @@ _Avoid_: ambient permission, unrestricted access
 - "power-user default" should not mean silent failure. Avoid nagging prompts by default, but keep actions observable and failures explainable.
 - "agent" should not imply a separate trust boundary. Treat agents like apps inside the session, with extra action logging for traceability.
 - "agent action log" should not imply cross-session visibility by default. Workspace-level indexing may exist for user inspection, but the log belongs to the session.
-- "client" previously meant a Wayland client, a future detachable display process, and sometimes the current presentation window. Use **Wayland client**, **presentation endpoint**, or **presentation window** instead of bare "client" in durable prose.
+- "client" previously meant a Wayland client, a detachable display process, and sometimes a presentation window. Use **Wayland client**, **presentation client**, **presentation endpoint**, or **presentation window** explicitly in durable prose.
 - "frontend" remains a legacy/control-command spelling in the MVP tools. In docs, use **presentation endpoint** for the component and **presentation window** for the desktop window.
 - "server" and "daemon" are implementation-adjacent. Use **session process** for Manifold's authoritative state owner unless discussing protocol direction or process names.
 - "shared implementation" is premature. Use **shared behavior spec** when we mean common Manifold semantics across backend work, and reserve shared code for a later decision.

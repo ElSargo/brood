@@ -2,23 +2,26 @@
 status: canonical
 type: concept
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-13
 ---
 
 # Presentation Surface
 
-A presentation surface presents one session at a time. It owns pane visibility, placement, dragging, animation, focus routing, hit testing, native chrome, and input forwarding for what is currently visible.
+A presentation surface is one independent viewport onto one session. It owns pane visibility, placement, dragging, animation, local focus routing, hit testing, native chrome, and final input routing for what it currently shows. Two presentation surfaces may arrange the same session differently; the backend does not own one canonical viewport layout.
 
-The current prototype's session process also owns the MVP presentation endpoint. A future architecture may split presentation into a separate process.
+The target presentation surface runs in a portable presentation client with its own client-side actors, local state, WGPU device, and final renderer. It discovers backend windows cheaply and subscribes only to the frame streams it needs. One optional presentation lease holder controls hosted Wayland sizing and primary application input for a session. See [[../systems/presentation-client]].
 
-Presentation state is not pane state. A presentation surface may save layout or visibility preferences into the workspace, but the pane remains owned by its producer or session state.
+The current prototype's session process also owns the MVP Winit/GLES presentation endpoint. The target separates that endpoint behind a typed in-process boundary before moving it into a client process.
 
-Plugins may influence presentation through host-validated requests and layout policy providers. They do not directly own final rendering, hit testing, focus routing, or accepted layout commits.
+Presentation state is not pane state. A presentation surface may save layout or visibility preferences locally or explicitly coordinate them into session storage, but the pane remains owned by its producer or session state.
+
+Plugins may run presentation actors locally, influence presentation through validated requests, and provide layout policy. The presentation client still owns final rendering, hit testing, focus routing, and accepted viewport commits.
 
 Related:
 
 - [[session]]
 - [[pane]]
+- [[../systems/presentation-client]]
 - [[../systems/layout-policy]]
 - [[../systems/input-shortcuts]]
 - [[../systems/plugin-ui]]

@@ -2,26 +2,26 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-05
+last-reviewed: 2026-07-13
 ---
 
 # Message-Based Layout
 
-The target layout model gives plugins flexible policy control while keeping presentation execution native-owned. Layout is not a synchronous policy-provider lane. It is an actor-owned convergence path:
+The target layout model gives plugins flexible policy control while keeping presentation execution client-owned. Layout normally runs in a presentation actor next to the viewport, so pane changes and user layout actions do not cross the backend connection. Layout is not a synchronous policy-provider lane. It is an actor-owned local convergence path:
 
 ```text
-host layout event
-    -> plugin actor mailbox
-    -> actor updates plugin layout state
-    -> actor sends SetResolvedLayout host message
-    -> host validation
-    -> accepted resolved layout
-    -> native render, hit testing, focus, and input delivery
+presentation-client layout event
+    -> presentation actor mailbox
+    -> actor updates client-local layout state
+    -> actor sends SetResolvedLayout to the local client host
+    -> local validation
+    -> accepted viewport layout
+    -> WGPU render, hit testing, focus, and input delivery
 ```
 
 ## Ownership
 
-The host owns:
+The presentation client owns:
 
 - presentation surfaces and native chrome
 - final layout validation and canonicalization
@@ -34,13 +34,13 @@ Plugins own:
 - layout policy state and preferences
 - split/tab/stack/floating/dock models internal to the plugin
 - rules for placement, resizing, focus preference, and visibility
-- actor logic that turns host events into candidate resolved layouts
+- actor logic that turns client events into candidate resolved layouts
 
-The plugin's internal layout tree is not the host ABI. The host accepts only a bounded resolved layout through a host-validated message.
+The plugin's internal layout tree is not the client host ABI. The client accepts only a bounded resolved layout through a locally validated message. Persistence is explicit: layout state remains client-local unless the actor chooses to coordinate it with a session actor or backend storage.
 
 ## Layout Events
 
-The host emits normal actor messages when layout-relevant state changes. Examples include:
+The presentation client emits normal actor messages when layout-relevant state changes. Examples include:
 
 ```text
 PaneMapped
@@ -64,17 +64,17 @@ SetResolvedLayout {
 }
 ```
 
-The host validates that pane items reference real active panes, canonicalizes the result, rejects invalid or oversized layouts, and then commits it as the accepted resolved layout.
+The presentation client validates that pane items reference real panes in the current inventory and viewport, canonicalizes the result, rejects invalid or oversized layouts, and then commits it as the accepted viewport layout.
 
 ## Why Layout Is Not A Provider
 
-The synchronous presenter/consumer provider model remains valuable for global key handling because the host must decide whether to consume or forward a key before it can continue.
+The synchronous provider model remains valuable for global key handling because the presentation client must decide whether to consume or forward a key before it can continue.
 
 Layout is different. It is usually an eventual-convergence problem: the world changes, then the visible layout should update promptly. If layout depends on plugin-owned split trees, session layout state, focus history, or dock state, a provider would still need a host-to-actor-to-publication round trip before it had current state. At that point the synchronous provider adds complexity without eliminating the real latency source.
 
 ## Fallback
 
-Manifold must always have a deterministic native fallback layout. Fallback is used when:
+The presentation client must always have a deterministic native fallback layout. Fallback is used when:
 
 - no layout actor is registered
 - the actor does not produce a layout yet
@@ -85,6 +85,7 @@ Fallback should keep panes visible enough for recovery and expose clear status s
 
 Related:
 
+- [[presentation-client]]
 - [[../concepts/plugin]]
 - [[plugin-runtime]]
 - [[input-shortcuts]]

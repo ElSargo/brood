@@ -7,7 +7,7 @@ last-reviewed: 2026-07-13
 
 # Plugin UI And Pane Rendering
 
-The target pane UI model provides host-rendered native chrome and rich default components without making those components the limit of plugin graphics. Plugins may describe semantic UI or submit custom render packets; the host owns presentation lifecycle, focus, theme integration, accessibility infrastructure, and final rendering. The low-level graphics protocol is specified in [[plugin-graphics]].
+The target pane UI model provides presentation-rendered native chrome and rich default components without making those components the limit of plugin graphics. Plugins may describe semantic UI or submit custom render packets; the presentation client owns viewport lifecycle, local focus, theme integration, accessibility infrastructure, and final rendering. The low-level graphics protocol is specified in [[plugin-graphics]], and actor placement and the backend/client boundary are specified in [[presentation-client]].
 
 ## Ownership
 
@@ -31,7 +31,7 @@ If a plugin actor exits or crashes, the pane identity can remain host-owned. The
 
 ## Native Component Path
 
-The default plugin pane should be a host-rendered component tree or patch stream.
+The default plugin pane should be a presentation-rendered component tree or patch stream.
 
 Candidate component families:
 
@@ -58,7 +58,7 @@ Host -> Actor: PaneResized / PaneFocused / PaneHidden / PaneDestroyed
 Actor -> Host: CommandRequest / ViewPatch / Status
 ```
 
-Semantic pane updates flow through actor mailboxes and host validation. Custom graphics use the bounded render submission path so an actor can batch a pane update in guest memory and cross the WASM boundary once. Neither path runs on the synchronous key/layout path unless a separate policy provider is explicitly involved.
+Semantic pane updates from a presentation actor flow through the local client host and validation. Custom graphics use the bounded render submission path so an actor can batch a pane update in guest memory and cross the WASM boundary once without crossing the presentation network connection. Neither path runs on a synchronous policy lane unless that lane is explicitly declared.
 
 ## Native Chrome
 
@@ -98,6 +98,7 @@ Diagnostics should report rejected UI updates, backend feature adaptation, actor
 
 Related:
 
+- [[presentation-client]]
 - [[../concepts/plugin]]
 - [[plugin-runtime]]
 - [[plugin-graphics]]

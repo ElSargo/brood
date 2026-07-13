@@ -2,7 +2,7 @@
 status: canonical
 type: system-map
 authority: implementation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-13
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
@@ -51,7 +51,7 @@ The current `manifold` runtime owns:
   notification-based coordination
 - async WASM test harness lane
 
-The long-term architecture may split presentation into a separate endpoint process. That split is deferred until the current single-process prototype has proven the behavior contract.
+The target architecture splits presentation into an independent portable client. The client owns viewport state, client-side WASM actors, and WGPU composition; the session process exports window inventory, lease-validated input/configuration, backend capabilities, actor routing, and demand-driven frame streams. The split is introduced first as a typed in-process boundary and later as a local or remote protocol. See [[systems/presentation-client]].
 
 ## Data Flow
 
@@ -79,4 +79,4 @@ chrome, focus, rendering, and bridges across the session boundary. Validation
 keeps host state coherent; it is not presented as containment of malicious
 installed plugin code.
 
-See [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-policy]], [[systems/plugin-ui]], [[systems/plugin-graphics]], and [[systems/extension-host]].
+See [[systems/presentation-client]], [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-policy]], [[systems/plugin-ui]], [[systems/plugin-graphics]], and [[systems/extension-host]].

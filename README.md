@@ -136,6 +136,7 @@ The docs are organized as a wiki-style knowledge base.
 - [Testing](docs/systems/testing.md)
 - [Configuration](docs/systems/configuration.md)
 - [Extension Host](docs/systems/extension-host.md)
+- [Presentation Client Target](docs/systems/presentation-client.md)
 - [Plugin Runtime Target](docs/systems/plugin-runtime.md)
 - [Input And Shortcuts Target](docs/systems/input-shortcuts.md)
 - [Layout Policy Target](docs/systems/layout-policy.md)

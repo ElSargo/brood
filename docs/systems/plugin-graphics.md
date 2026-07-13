@@ -7,16 +7,21 @@ last-reviewed: 2026-07-13
 
 # Plugin Graphics
 
-Manifold provides plugin actors with a low-level, backend-independent graphics
-protocol and a rich SDK above it. Simple interfaces should require little code,
-while custom applications retain access to buffers, textures, arbitrary
-shaders, geometry, render targets, and draw commands.
+Manifold provides presentation actors with a low-level, backend-independent
+graphics protocol and a rich SDK above it. Simple interfaces should require
+little code, while custom applications retain access to buffers, textures,
+arbitrary shaders, geometry, render targets, and draw commands. Render
+submission, validation, resource ownership, and WGPU lowering occur in the
+presentation client, so the interactive actor-to-frame path does not cross the
+backend connection. See [[presentation-client]] for actor placement and client
+lifecycle.
 
-The protocol is GL- or Vulkan-like in what it can express, not in who owns the
-GPU. Actors describe pane-local rendering. The host owns the physical device,
-GPU synchronization, swapchains, final composition, frame pacing, and recovery.
-Smithay, EGL, GL, Vulkan, WGPU, and backend-native objects are never part of the
-plugin ABI.
+The protocol is WebGPU-like in what it can express, not in who owns the GPU.
+Actors describe pane-local rendering. The presentation client owns the physical
+device, GPU synchronization, swapchains, final composition, frame pacing, and
+recovery. WGPU and WGSL are the target client implementation, but WGPU Rust
+objects and backend-native Vulkan, Metal, Direct3D, EGL, or DMA-BUF objects are
+never part of the plugin ABI.
 
 ## API Layers
 
@@ -237,10 +242,10 @@ permitted to mutate them.
 
 Custom shaders are a supported escape from the standard component and canvas
 SDKs, not an accidental backend leak. The portable ABI uses a validated,
-backend-independent shader language and resource model. WGSL is the preferred
-starting point because it has explicit validation and can be translated to the
-active backend; the choice must still be verified against the required Linux
-and WSL graphics stacks.
+backend-independent resource model and WGSL shader source. The required
+baseline is the common Manifold WGPU/WebGPU profile; optional features are
+negotiated through Manifold feature identifiers rather than native backend
+names.
 
 Pipelines declare shader stages, vertex layouts, bindings, blend behavior,
 raster state, and target requirements without exposing a native driver object.
@@ -287,13 +292,13 @@ that cannot be recovered reliably from triangles.
 
 A custom-drawn pane may submit a companion semantic interaction tree containing
 stable element IDs, bounds, roles, actions, and accessibility metadata. The
-host owns final pane hit testing and input routing, while the actor receives
-semantic or low-level pane input according to its selected API. Visual packet
-replacement and semantic-tree replacement use generations so the host does not
-silently combine incompatible states.
+presentation client owns final pane hit testing and input routing, while the
+actor receives semantic or low-level pane input according to its selected API.
+Visual packet replacement and semantic-tree replacement use generations so the
+client does not silently combine incompatible states.
 
 Native pane chrome remains outside actor rendering. A shader or full-pane draw
-cannot overwrite host-owned borders, recovery UI, menus, or overlays unless a
+cannot overwrite client-owned borders, recovery UI, menus, or overlays unless a
 separate presentation capability explicitly allows that composition role.
 
 ## Scheduling And Actor Integration
@@ -364,6 +369,7 @@ require private renderer access.
 
 Related:
 
+- [[presentation-client]]
 - [[plugin-ui]]
 - [[plugin-runtime]]
 - [[plugin-io-and-resources]]

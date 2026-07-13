@@ -2,7 +2,7 @@
 status: target
 type: concept
 authority: product
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-13
 ---
 
 # Plugin
@@ -13,7 +13,11 @@ runtime is a portability, lifecycle, and fault-isolation boundary rather than
 an adversarial sandbox.
 
 A package may contain actors, policy providers, publications, pane producers,
-and action or service registrations.
+and action or service registrations. Actors and policy lanes declare whether
+they run in the session backend or in a presentation client. Presentation
+actors own endpoint-local interaction and UI state; session actors own backend
+or explicitly coordinated session behavior. The runtime does not transparently
+migrate mutable actors between those placements.
 
 ## Execution Roles
 
@@ -33,9 +37,11 @@ independent address, address space, failure domain, or lifecycle.
 
 ## Communication And I/O
 
-Actors communicate through bounded host mailboxes. Actors submit I/O and later
-receive typed completion events. Workers may use the same operations through
-ordinary WASI calls and worker `select!`; only the calling worker waits.
+Actors communicate through bounded host mailboxes. Same-runtime messages remain
+local; explicitly addressed presentation-to-session messages cross the
+presentation connection. Actors submit I/O and later receive typed completion
+events. Workers may use the same operations through ordinary WASI calls and
+worker `select!`; only the calling worker waits.
 
 Workers coordinate through guest-owned shared-memory structures plus host
 notifications. The host schedules wakeups but does not define plugin mutex,
@@ -62,6 +68,7 @@ validation, pane lifecycle, and bridges across the session boundary.
 
 Related:
 
+- [[../systems/presentation-client]]
 - [[../systems/plugin-runtime]]
 - [[../systems/plugin-io-and-resources]]
 - [[session]]

@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-01
+last-reviewed: 2026-07-13
 code-links:
   - crates/manifoldd/src/compositor.rs
   - crates/manifoldd/src/state.rs
@@ -30,9 +30,12 @@ The preferred Linux path is DMA-BUF/EGL-compatible surface sharing so client sur
 
 The MVP runtime can attach a Winit/GLES presentation window or an offscreen presentation target. Offscreen presentation exists for nested tests and behavior validation.
 
+The target design removes final viewport composition from the session process. The compositor publishes revisioned window inventory and committed surface-tree frames to demand-driven presentation-client subscriptions. A session presentation lease authorizes one client to request Wayland window sizes and send primary application input. DMA-BUF remains a negotiated local fast path with copied and remote transports as correctness alternatives. See [[presentation-client]].
+
 ## Related Pages
 
 - [[../concepts/managed-app]]
 - [[../concepts/pane]]
+- [[presentation-client]]
 - [[testing]]
 - [[runtime]]

@@ -2,15 +2,18 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-13
 ---
 
 # Plugin Runtime
 
-Manifold treats an installed plugin as trusted user code running inside a
-session. The runtime provides fault isolation, scheduling, lifecycle, and a
-portable I/O environment; it does not claim that a useful coding plugin is an
-adversarial security sandbox.
+Manifold treats an installed and approved plugin as trusted user code in its
+execution environment. Actors may run in the session backend or in a
+presentation client according to explicit package placement. The runtime
+provides fault isolation, scheduling, lifecycle, and a portable I/O environment;
+it does not claim that a useful coding plugin is an adversarial security sandbox.
+A remote backend cannot authorize code execution on a client merely by sending
+it a WASM artifact; see [[presentation-client]].
 
 The complete model has three execution roles:
 
@@ -53,17 +56,20 @@ one environment are trusted peers. See [[../concepts/session]].
 ## Runtime Shape
 
 ```text
-Host or presentation endpoint
-└── Session environment: local, container, or remote
-    ├── Actor A: address + mailbox + memory + resources
-    │   ├── worker
-    │   └── worker
-    ├── Actor B: independent address space and lifecycle
-    └── Policy provider + immutable publications
+Session backend                         Presentation client
+├── session actor                       ├── presentation actor
+│   ├── worker                          │   ├── worker
+│   └── worker                          │   └── worker
+├── backend policy/service lanes        ├── local key/layout policy
+└── immutable publications              └── local UI and graphics publications
+                 bounded addressed messages
 ```
 
-Only actors and policy providers are registered with the host. Workers are
-private implementation details and are never globally addressable.
+Only actors and policy providers are registered with their local host. Workers
+are private implementation details and are never globally addressable. Same-host
+messages remain local; explicitly addressed cross-placement messages are routed
+over the presentation connection. Actors do not transparently migrate between
+placements.
 
 Capabilities describe the resources and host APIs a plugin expects inside its
 session. They support configuration, audit, portability, and least-accidental
@@ -75,7 +81,7 @@ or from a native subprocess launched by that plugin.
 An actor is the public unit of plugin state, communication, and fault isolation.
 It owns:
 
-- an address space and durable local state;
+- an address space and placement-local state;
 - a globally addressable mailbox with optional named slots;
 - a resource table and publications;
 - workers, outstanding operations, diagnostics, and lifecycle state.
@@ -156,17 +162,20 @@ mutable actor memory.
 
 ## Host Responsibilities
 
-The host owns scheduling and final product invariants:
+Each local actor host owns mailbox, worker, completion, resource scheduling,
+actor lifecycle, ABI validation, limits, cancellation, and stale-generation
+rejection. Product authority then follows placement:
 
-- mailbox, worker, completion, and resource scheduling;
-- actor start, stop, replacement, and diagnostics;
-- final workspace, session, pane, input, layout, and presentation commits;
-- ABI validation, queue limits, cancellation, and stale-generation rejection;
-- bridges between a session environment and the presentation host.
+- the presentation client owns viewport layout, local focus, client input
+  policy, UI validation, graphics, and final presentation;
+- the backend owns session and managed-application lifecycle, backend resources,
+  and lease-authorized hosted Wayland configuration and input;
+- the connection router validates cross-placement addresses, capabilities,
+  generations, and backpressure.
 
-Plugins own behavior and local state. Host validation of commands is a product
-correctness boundary: it keeps compositor and session state coherent even
-though the requesting plugin is trusted.
+Plugins own behavior and placement-local state. Host validation of commands is a
+product correctness boundary even when the requesting installed plugin is
+trusted.
 
 ## Lifecycle And Failure
 
@@ -192,6 +201,7 @@ Current implementation details and runnable tests live in [[extension-host]],
 
 Related:
 
+- [[presentation-client]]
 - [[plugin-io-and-resources]]
 - [[../concepts/plugin]]
 - [[../concepts/session]]

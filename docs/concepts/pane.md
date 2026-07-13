@@ -2,7 +2,7 @@
 status: canonical
 type: concept
 authority: product
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-13
 ---
 
 # Pane
@@ -13,7 +13,7 @@ A pane may be produced by:
 
 - a hosted Wayland app surface
 - a browser or terminal pane client
-- a plugin or WASM pane app using host-rendered components or custom render packets
+- a plugin or WASM pane app using presentation-rendered components or custom render packets
 - a future native producer
 
 Do not use pane to mean process, app, plugin, actor, tab, or native child window. A pane is what the presentation surface arranges and focuses.
@@ -25,6 +25,7 @@ Related:
 - [[plugin]]
 - [[managed-app]]
 - [[presentation-surface]]
+- [[../systems/presentation-client]]
 - [[../systems/plugin-ui]]
 - [[../systems/plugin-graphics]]
 - [[../systems/wayland-compositor]]

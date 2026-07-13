@@ -2,7 +2,7 @@
 status: canonical
 type: overview
 authority: product
-last-reviewed: 2026-07-10
+last-reviewed: 2026-07-13
 ---
 
 # Overview
@@ -13,7 +13,7 @@ The product model is:
 
 - A [[concepts/workspace]] contains one or more [[concepts/session]]s.
 - A session groups panes, programs, agents, environment, cwd, and capabilities.
-- A [[concepts/presentation-surface]] shows one session at a time.
+- A [[concepts/presentation-surface]] is an independent client viewport that shows one session at a time.
 - A [[concepts/pane]] is the unit of presentation.
 - A [[concepts/managed-app]] is an external native app tracked by Manifold.
 - A [[concepts/plugin]] can extend behavior through addressed actors, private actor-scoped workers, completion-based I/O, WASI resources, policy providers, and publications.
@@ -22,7 +22,9 @@ The product model is:
 The current Rust workspace contains `manifoldd`, which builds the user-facing
 `manifold` binary, and `manifold-wasm`, which implements the hosted WASM
 runtimes. The daemon binary currently owns the session process, nested Wayland
-compositor, DBus control endpoint, and MVP presentation endpoint.
+compositor, DBus control endpoint, and MVP presentation endpoint. The target
+architecture extracts a portable presentation client with client-side WASM and
+WGPU rendering; see [[systems/presentation-client]].
 
 See [[architecture]] for the implementation map.
 

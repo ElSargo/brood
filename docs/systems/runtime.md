@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-03
+last-reviewed: 2026-07-13
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
@@ -34,7 +34,7 @@ Current high-level startup order:
 
 ## Presentation Modes
 
-Attached Winit presentation is the product runtime default.
+Attached Winit presentation is the current product runtime default. The target architecture replaces direct attachment with an independent presentation client; see [[presentation-client]].
 
 Headless runtime is for service-managed sessions and long-lived control endpoints. It is not the preferred behavior-test entry point.
 
@@ -46,6 +46,7 @@ Offscreen presentation is used by nested tests so composition can run without cr
 
 ## Related Pages
 
+- [[presentation-client]]
 - [[configuration]]
 - [[testing]]
 - [[plugin-runtime]]

@@ -2,23 +2,23 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-10
+last-reviewed: 2026-07-13
 ---
 
 # Input And Keyboard Shortcuts
 
-The target input model keeps final key routing in the host while allowing privileged plugins to participate in immediate keyboard policy through policy providers.
+The target input model keeps final viewport key routing in the presentation client while allowing privileged presentation plugins to participate in immediate keyboard policy through local policy providers. Keys consumed by local UI or actors do not cross the backend connection; keys forwarded to hosted applications are sent under the current presentation lease.
 
 ## Ownership
 
-The host owns:
+The presentation client owns:
 
 - physical key state and modifier tracking
 - focused surface/widget selection
 - reserved escape and recovery shortcuts
 - keymap conflict resolution
 - action invocation
-- forwarding keys to managed client panes
+- forwarding keys under the session presentation lease to managed client panes
 - suppressing or replaying modifier events as needed
 
 Plugins may contribute:
@@ -35,22 +35,22 @@ Most plugins should register actions, not observe raw keyboard input.
 
 ```text
 plugin registers Action { id, title, scope, default_binding, target_actor }
-user and host keymap resolve conflicts
-host matches key input in the current focus/context
-host sends InvokeAction to the owning actor or executes a host command
+user and client keymap resolve conflicts
+client matches key input in the current focus/context
+client sends InvokeAction to the owning actor or executes a client command
 ```
 
-User configuration and host-reserved bindings override plugin defaults. Conflicts should be visible in diagnostics and configuration UI.
+User configuration and client-reserved bindings override plugin defaults. Conflicts should be visible in diagnostics and configuration UI.
 
 ## Routing Order
 
 The target routing order is:
 
-1. host-reserved safety and recovery keys
+1. client-reserved safety and recovery keys
 2. focused native widget/text-input behavior
-3. granted key policy provider for the active context
-4. host keymap/action dispatch
-5. forwarding to the focused managed client pane
+3. granted local key policy provider for the active context
+4. client keymap/action dispatch
+5. lease-authorized forwarding to the focused managed client pane
 
 The exact order may be specialized for modes, but raw keyboard observation remains a separate capability. Ordinary plugins should not become global keyloggers.
 
@@ -76,17 +76,14 @@ Candidate result shape:
 ```text
 KeyPolicyResult {
   decision: Abstain | Consume | Forward | ForwardWithModifiers,
-  directives: list<host-validated-directive>,
+  directives: list<client-validated-directive>,
   messages: list<mailbox-message>,
 }
 ```
 
-The provider may read its latest published state and return a message batch, but it does not mutate host state or wait for actor work. The host applies accepted directives and enqueues messages only after the call returns.
+The provider may read its latest published state and return a message batch, but it does not mutate client or backend state or wait for actor work. The local client host applies accepted directives and enqueues messages only after the call returns.
 
-The checked-in default-workspace plugin uses this boundary today: its
-`WasmGlobalKeyPolicy` returns a bounded decision envelope and actor-message
-batch after reading the latest immutable publication frame. The native host
-validates and applies the result only after the provider returns.
+The checked-in default-workspace plugin uses this boundary inside the current combined process: its `WasmGlobalKeyPolicy` returns a bounded decision envelope and actor-message batch after reading the latest immutable publication frame. During the split this policy runtime moves to the presentation client without changing its synchronous local property.
 
 ## Actor Follow-Up
 
@@ -102,11 +99,11 @@ key press
   -> search actor opens pane or updates UI asynchronously
 ```
 
-If a key should launch or focus an app immediately, the result should still be a host-validated directive or command request. The host executes the command; the plugin never directly mutates pane focus or process state.
+If a key should focus a local pane immediately, the result remains a client-validated directive. Launching or mutating a backend application uses an asynchronous backend command request; the plugin never directly mutates backend process or session state.
 
 ## Diagnostics
 
-Input diagnostics should separate host keymap behavior from policy provider behavior:
+Input diagnostics should separate client keymap behavior from policy provider and backend forwarding behavior:
 
 - matched binding and scope
 - winning plugin/action
@@ -115,9 +112,11 @@ Input diagnostics should separate host keymap behavior from policy provider beha
 - traps, timeouts, disabled providers
 - consumed, forwarded, and transformed key counts
 - messages emitted from key policy provider results
+- lease-authorized hosted-application forwarding and backend rejection
 
 Related:
 
+- [[presentation-client]]
 - [[../concepts/plugin]]
 - [[plugin-runtime]]
 - [[layout-policy]]
