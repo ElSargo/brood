@@ -4147,6 +4147,7 @@ impl Manifold {
                     guest_path: ".".to_string(),
                     writable,
                 }),
+                filesystem_watcher_service: self.filesystem_watcher_service.clone(),
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;

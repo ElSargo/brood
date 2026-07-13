@@ -30,6 +30,21 @@ impl FilesystemWatchId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesystemWatchEventKind {
+    Created,
+    Modified,
+    Removed,
+    Changed,
+    Rescan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemWatchBatchEvent {
+    pub kind: FilesystemWatchEventKind,
+    pub path: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FilesystemWatchError {
     #[error("actor has stopped")]
@@ -57,6 +72,15 @@ pub struct FilesystemWatchHub {
 #[derive(Clone, Default)]
 pub struct NativeFilesystemWatcherService {
     inner: Arc<NativeWatcherInner>,
+}
+
+impl std::fmt::Debug for NativeFilesystemWatcherService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeFilesystemWatcherService")
+            .field("stats", &self.stats())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -164,7 +188,24 @@ struct WatchQueue {
 
 struct WatchEvent {
     generation: u64,
-    line: String,
+    event: FilesystemWatchBatchEvent,
+}
+
+impl WatchEvent {
+    const fn encoded_len(&self) -> usize {
+        event_label_text(self.event.kind)
+            .len()
+            .saturating_add(1)
+            .saturating_add(self.event.path.len())
+            .saturating_add(1)
+    }
+
+    fn encode_into(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(event_label_text(self.event.kind).as_bytes());
+        bytes.push(b'\t');
+        bytes.extend_from_slice(self.event.path.as_bytes());
+        bytes.push(b'\n');
+    }
 }
 
 impl NativeFilesystemWatcherService {
@@ -520,7 +561,7 @@ impl FilesystemWatchHub {
         self.with_entry(watch, |entry| Arc::clone(&entry.queue))?
             .lock()
             .map_err(|_poisoned| FilesystemWatchError::Unavailable)
-            .map(|queue| queue.events.iter().map(|event| event.line.len()).sum())
+            .map(|queue| queue.events.iter().map(WatchEvent::encoded_len).sum())
     }
 
     pub(super) fn read(
@@ -538,20 +579,40 @@ impl FilesystemWatchHub {
         let mut bytes = Vec::with_capacity(capacity);
         let mut generation = 0;
         while let Some(event) = queue.events.front() {
-            if bytes.len().saturating_add(event.line.len()) > capacity {
+            if bytes.len().saturating_add(event.encoded_len()) > capacity {
                 break;
             }
             let Some(event) = queue.events.pop_front() else {
                 break;
             };
             generation = event.generation;
-            bytes.extend_from_slice(event.line.as_bytes());
+            event.encode_into(&mut bytes);
         }
         if bytes.is_empty() {
             return Err(FilesystemWatchError::Limit);
         }
         drop(queue);
         Ok((generation, bytes))
+    }
+
+    pub(super) fn read_typed(
+        &self,
+        watch: FilesystemWatchId,
+    ) -> Result<(u64, Vec<FilesystemWatchBatchEvent>), FilesystemWatchError> {
+        let queue = self.with_entry(watch, |entry| Arc::clone(&entry.queue))?;
+        let mut queue = queue
+            .lock()
+            .map_err(|_poisoned| FilesystemWatchError::Unavailable)?;
+        if queue.events.is_empty() {
+            return Err(FilesystemWatchError::NotReady);
+        }
+        let generation = queue
+            .events
+            .back()
+            .map_or(queue.generation, |event| event.generation);
+        let events = queue.events.drain(..).map(|event| event.event).collect();
+        drop(queue);
+        Ok((generation, events))
     }
 
     pub(super) fn drop_watch(&self, watch: FilesystemWatchId) -> Result<(), FilesystemWatchError> {
@@ -738,7 +799,7 @@ fn record_subscription_event(subscription: &NativeSubscription, result: &notify:
     };
     match result {
         Ok(event) => {
-            let Some(label) = event_label(event.kind) else {
+            let Some(kind) = event_kind(event.kind) else {
                 return;
             };
             queue.generation = queue.generation.saturating_add(1).max(1);
@@ -761,7 +822,7 @@ fn record_subscription_event(subscription: &NativeSubscription, result: &notify:
                     &mut queue.events,
                     subscription.max_events,
                     generation,
-                    label,
+                    kind,
                     path,
                 );
             }
@@ -786,17 +847,17 @@ fn push_bounded_event(
     events: &mut VecDeque<WatchEvent>,
     max_events: usize,
     generation: u64,
-    label: &str,
+    kind: FilesystemWatchEventKind,
     path: &Path,
 ) {
     if events.len() >= max_events {
         push_overflow(events, generation);
         return;
     }
-    let path = path.to_string_lossy();
+    let path = path.to_string_lossy().into_owned();
     events.push_back(WatchEvent {
         generation,
-        line: format!("{label}\t{path}\n"),
+        event: FilesystemWatchBatchEvent { kind, path },
     });
 }
 
@@ -804,17 +865,30 @@ fn push_overflow(events: &mut VecDeque<WatchEvent>, generation: u64) {
     events.clear();
     events.push_back(WatchEvent {
         generation,
-        line: "rescan\t.\n".to_string(),
+        event: FilesystemWatchBatchEvent {
+            kind: FilesystemWatchEventKind::Rescan,
+            path: ".".to_string(),
+        },
     });
 }
 
-const fn event_label(kind: EventKind) -> Option<&'static str> {
+const fn event_kind(kind: EventKind) -> Option<FilesystemWatchEventKind> {
     match kind {
-        EventKind::Create(_) => Some("created"),
-        EventKind::Modify(_) => Some("modified"),
-        EventKind::Remove(_) => Some("removed"),
+        EventKind::Create(_) => Some(FilesystemWatchEventKind::Created),
+        EventKind::Modify(_) => Some(FilesystemWatchEventKind::Modified),
+        EventKind::Remove(_) => Some(FilesystemWatchEventKind::Removed),
         EventKind::Access(_) => None,
-        EventKind::Other | EventKind::Any => Some("changed"),
+        EventKind::Other | EventKind::Any => Some(FilesystemWatchEventKind::Changed),
+    }
+}
+
+const fn event_label_text(kind: FilesystemWatchEventKind) -> &'static str {
+    match kind {
+        FilesystemWatchEventKind::Created => "created",
+        FilesystemWatchEventKind::Modified => "modified",
+        FilesystemWatchEventKind::Removed => "removed",
+        FilesystemWatchEventKind::Changed => "changed",
+        FilesystemWatchEventKind::Rescan => "rescan",
     }
 }
 
@@ -1128,9 +1202,14 @@ mod tests {
             .add_path(root.path().join("one"))
             .add_path(root.path().join("two"));
         service.emit_for_test(root.path(), RecursiveMode::Recursive, event);
-        let small_bytes = small.pending_bytes(small_watch)?;
-        let (_, small_batch) = small.read(small_watch, small_bytes)?;
-        ensure!(small_batch == b"rescan\t.\n");
+        let (_, small_batch) = small.read_typed(small_watch)?;
+        ensure!(
+            small_batch
+                == vec![super::FilesystemWatchBatchEvent {
+                    kind: super::FilesystemWatchEventKind::Rescan,
+                    path: ".".to_string(),
+                }]
+        );
         let large_bytes = large.pending_bytes(large_watch)?;
         let (_, large_batch) = large.read(large_watch, large_bytes)?;
         let large_batch = String::from_utf8(large_batch)?;

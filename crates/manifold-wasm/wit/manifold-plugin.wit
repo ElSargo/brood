@@ -43,6 +43,46 @@ interface host {
         cancelled,
     }
 
+    enum filesystem-watch-error {
+        actor-stopped,
+        limit-reached,
+        invalid-handle,
+        not-permitted,
+        not-ready,
+        backend-unavailable,
+    }
+
+    enum filesystem-event-kind {
+        created,
+        modified,
+        removed,
+        changed,
+        rescan,
+    }
+
+    record filesystem-event {
+        kind: filesystem-event-kind,
+        path: string,
+    }
+
+    record filesystem-watch-batch {
+        generation: u64,
+        events: list<filesystem-event>,
+    }
+
+    /// A capability-rooted, actor-generation-owned filesystem subscription.
+    /// Readiness is projected into the ordinary notification/pollable model;
+    /// this resource deliberately defines no separate blocking wait.
+    resource filesystem-watch {
+        notification: func() -> result<notification-id, filesystem-watch-error>;
+        read: func() -> result<filesystem-watch-batch, filesystem-watch-error>;
+    }
+
+    filesystem-watch-create: func(
+        path: string,
+        recursive: bool,
+    ) -> result<filesystem-watch, filesystem-watch-error>;
+
     record ready-pollable {
         index: u32,
         pollable: pollable-id,

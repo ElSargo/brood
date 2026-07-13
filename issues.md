@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Native capability-rooted filesystem watches currently exist only in the
-  Preview 1 compatibility ABI. The Component backend still needs an equivalent
-  WIT resource and SDK wrapper before both plugin backends have one I/O model.
 - Preview 1 watch batches currently encode paths as lossy UTF-8 text. The
   resource is capability safe, but a typed SDK/Component surface must preserve
   arbitrary platform path bytes without collisions.
@@ -102,6 +99,16 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Component plugins own capability-rooted filesystem watches through a typed
+  WIT resource with typed event batches. The guest wrapper projects readiness
+  into the ordinary notification/pollable wait path, while the host reuses the
+  daemon-owned native watcher service and retires subscriptions before actor
+  replacement completes. `plugins/component-workspace-watch` is the observable
+  proof: its nested workload creates, edits, and removes real workspace files,
+  and the plugin maintains `.manifold/component-workspace-watch.md` with the
+  corresponding paths and event kinds. The same proof observes one live native
+  registration and logical subscription, then zero of each after generation
+  replacement.
 - Manifold owns one native filesystem-watcher service which deduplicates
   canonical path plus recursion-mode registrations across actor generations.
   Logical subscriptions keep private bounded queues, overflow, notification,

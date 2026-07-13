@@ -164,6 +164,12 @@ notification plus bounded event batches. Events are advisory and may be
 coalesced or duplicated by the platform. Every batch uses relative paths and
 classifies create, modify, remove, rename, or generic change.
 
+Both plugin backends use this model. Component guests own a typed WIT watch
+resource and read typed batches; its SDK wrapper waits through the resource's
+normal notification pollable. Preview 1 compatibility guests use the matching
+handle operations and encoded batches. Neither backend owns a separate native
+watcher or watcher-specific wait mechanism.
+
 Overflow and any interval without complete coverage produce an explicit
 `rescan` marker. Consumers maintaining state reconcile through the filesystem;
 the event stream is not a journal.

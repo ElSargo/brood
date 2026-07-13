@@ -227,6 +227,15 @@ files produces corresponding records in
 normal actor mailbox, worker, shared-memory, and filesystem behavior remains
 usable inside the ceilings.
 
+`plugins/component-workspace-watch` proves the same capability-rooted watch
+model through the Component backend. Its typed WIT resource is an
+actor-generation-owned logical subscription backed by the daemon watcher
+service. The guest SDK wrapper projects its notification into the ordinary
+worker pollable set, and the plugin maintains a live Markdown history at
+`.manifold/component-workspace-watch.md`. The nested proof replaces the actor
+generation and observes the old subscription reach zero before the replacement
+is published.
+
 Host-owned resource teardown retires a watch and its notification as one
 ownership transition. An actor event already admitted to the reserved lane may
 still carry the retired ID, but it drains as a stale no-op and no longer counts

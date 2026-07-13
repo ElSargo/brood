@@ -36,6 +36,10 @@ use crate::coordination::{
     ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError, NotificationId,
     PollError, PollableId, WaitMode,
 };
+use crate::filesystem_watch::{
+    FilesystemWatchBatchEvent, FilesystemWatchError, FilesystemWatchEventKind, FilesystemWatchHub,
+    FilesystemWatchId, NativeFilesystemWatcherService,
+};
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
@@ -68,7 +72,7 @@ use tokio::{
 };
 use wasmtime::{
     AsContextMut, Config, Engine, Store,
-    component::{Component, GuestTaskId, HasSelf, Linker},
+    component::{Component, GuestTaskId, HasSelf, Linker, Resource},
 };
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -133,6 +137,10 @@ pub struct ComponentActorMailboxStats {
 #[derive(Debug, Clone)]
 pub struct ComponentActorConfig {
     pub filesystem: Option<FilesystemGrant>,
+    /// Daemon-owned native watcher registry shared across actor generations.
+    pub filesystem_watcher_service: NativeFilesystemWatcherService,
+    pub max_filesystem_watches: usize,
+    pub max_filesystem_watch_events: usize,
     pub command_capacity: usize,
     pub mailbox_backlog: usize,
     pub max_workers: usize,
@@ -155,6 +163,9 @@ impl Default for ComponentActorConfig {
     fn default() -> Self {
         Self {
             filesystem: None,
+            filesystem_watcher_service: NativeFilesystemWatcherService::new(),
+            max_filesystem_watches: 16,
+            max_filesystem_watch_events: 4096,
             command_capacity: 64,
             mailbox_backlog: 64,
             max_workers: 64,
@@ -234,6 +245,7 @@ fn worker_write_file(
 struct ActorStore {
     completion_io: CompletionIo,
     coordination: CoordinationHub,
+    filesystem_watches: FilesystemWatchHub,
     worker_filesystem: Option<WorkerFilesystem>,
     worker_cancellations: WorkerCancellationRegistry,
     blocking_io: BlockingIoTracker,
@@ -396,6 +408,27 @@ impl WorkerCancellationToken {
 }
 
 impl bindings::manifold::plugin::host::Host for ActorStore {
+    fn filesystem_watch_create(
+        &mut self,
+        path: String,
+        recursive: bool,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            Resource<bindings::manifold::plugin::host::FilesystemWatch>,
+            bindings::manifold::plugin::host::FilesystemWatchError,
+        >,
+    > {
+        Ok(self
+            .filesystem_watches
+            .create(Path::new(&path), recursive)
+            .and_then(|(watch, _notification)| {
+                u32::try_from(watch.raw())
+                    .map(Resource::new_own)
+                    .map_err(|_error| FilesystemWatchError::Limit)
+            })
+            .map_err(map_component_filesystem_watch_error))
+    }
+
     fn submit_read(
         &mut self,
         path: String,
@@ -550,6 +583,54 @@ impl bindings::manifold::plugin::host::Host for ActorStore {
             .try_poll(&pollables)
             .map(|ready| ready.into_iter().map(component_ready_pollable).collect())
             .map_err(map_component_poll_error))
+    }
+}
+
+impl bindings::manifold::plugin::host::HostFilesystemWatch for ActorStore {
+    fn notification(
+        &mut self,
+        watch: Resource<bindings::manifold::plugin::host::FilesystemWatch>,
+    ) -> wasmtime::Result<
+        std::result::Result<u64, bindings::manifold::plugin::host::FilesystemWatchError>,
+    > {
+        Ok(self
+            .filesystem_watches
+            .notification(FilesystemWatchId::from_raw(u64::from(watch.rep())))
+            .map(NotificationId::raw)
+            .map_err(map_component_filesystem_watch_error))
+    }
+
+    fn read(
+        &mut self,
+        watch: Resource<bindings::manifold::plugin::host::FilesystemWatch>,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            bindings::manifold::plugin::host::FilesystemWatchBatch,
+            bindings::manifold::plugin::host::FilesystemWatchError,
+        >,
+    > {
+        Ok(self
+            .filesystem_watches
+            .read_typed(FilesystemWatchId::from_raw(u64::from(watch.rep())))
+            .map(
+                |(generation, events)| bindings::manifold::plugin::host::FilesystemWatchBatch {
+                    generation,
+                    events: events
+                        .into_iter()
+                        .map(component_filesystem_watch_event)
+                        .collect(),
+                },
+            )
+            .map_err(map_component_filesystem_watch_error))
+    }
+
+    fn drop(
+        &mut self,
+        watch: Resource<bindings::manifold::plugin::host::FilesystemWatch>,
+    ) -> wasmtime::Result<()> {
+        self.filesystem_watches
+            .drop_watch(FilesystemWatchId::from_raw(u64::from(watch.rep())))
+            .map_err(|error| wasmtime::Error::msg(error.to_string()))
     }
 }
 
@@ -868,6 +949,39 @@ const fn map_component_notification_error(
     }
 }
 
+fn map_component_filesystem_watch_error(
+    error: FilesystemWatchError,
+) -> bindings::manifold::plugin::host::FilesystemWatchError {
+    use bindings::manifold::plugin::host::FilesystemWatchError as AbiError;
+    match error {
+        FilesystemWatchError::Stopped => AbiError::ActorStopped,
+        FilesystemWatchError::Limit => AbiError::LimitReached,
+        FilesystemWatchError::Invalid => AbiError::InvalidHandle,
+        FilesystemWatchError::NotPermitted => AbiError::NotPermitted,
+        FilesystemWatchError::NotReady => AbiError::NotReady,
+        FilesystemWatchError::Backend(_) | FilesystemWatchError::Unavailable => {
+            AbiError::BackendUnavailable
+        }
+    }
+}
+
+fn component_filesystem_watch_event(
+    event: FilesystemWatchBatchEvent,
+) -> bindings::manifold::plugin::host::FilesystemEvent {
+    use bindings::manifold::plugin::host::FilesystemEventKind as AbiKind;
+    let kind = match event.kind {
+        FilesystemWatchEventKind::Created => AbiKind::Created,
+        FilesystemWatchEventKind::Modified => AbiKind::Modified,
+        FilesystemWatchEventKind::Removed => AbiKind::Removed,
+        FilesystemWatchEventKind::Changed => AbiKind::Changed,
+        FilesystemWatchEventKind::Rescan => AbiKind::Rescan,
+    };
+    bindings::manifold::plugin::host::FilesystemEvent {
+        kind,
+        path: event.path,
+    }
+}
+
 const fn map_component_poll_error(error: PollError) -> bindings::manifold::plugin::host::WaitError {
     use bindings::manifold::plugin::host::WaitError as AbiError;
     match error {
@@ -946,6 +1060,14 @@ impl ComponentActor {
         );
         ensure!(config.max_workers > 0, "worker limit must be non-zero");
         ensure!(
+            config.max_filesystem_watches > 0,
+            "filesystem watch limit must be non-zero"
+        );
+        ensure!(
+            config.max_filesystem_watch_events > 0,
+            "filesystem watch event limit must be non-zero"
+        );
+        ensure!(
             config.max_notifications > 0,
             "notification limit must be non-zero"
         );
@@ -979,6 +1101,14 @@ impl ComponentActor {
             },
         )
         .map_err(|error| anyhow::anyhow!("create component coordination hub: {error}"))?;
+        let filesystem_watches = FilesystemWatchHub::new_with_service(
+            config.filesystem_watcher_service.clone(),
+            config.filesystem.as_ref(),
+            coordination.clone(),
+            config.max_filesystem_watches,
+            config.max_filesystem_watch_events,
+        )
+        .map_err(|error| anyhow::anyhow!("create component filesystem watch hub: {error}"))?;
 
         let engine = component_engine()?;
         let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
@@ -1003,6 +1133,7 @@ impl ComponentActor {
             ActorStore {
                 completion_io: completion_io.clone(),
                 coordination: coordination.clone(),
+                filesystem_watches,
                 worker_filesystem,
                 worker_cancellations: WorkerCancellationRegistry::default(),
                 blocking_io: BlockingIoTracker::default(),
@@ -1384,6 +1515,9 @@ async fn run_component_actor(
             .await
         })
         .await;
+    // Retire watch notifications and native subscriptions before the
+    // generation can report termination or a replacement becomes reachable.
+    store.data().filesystem_watches.stop();
     // Guest-task cancellation can drop an in-flight host future, but any
     // operation already delegated to the blocking pool remains owned by this
     // actor generation. Join those operations before reporting termination.
