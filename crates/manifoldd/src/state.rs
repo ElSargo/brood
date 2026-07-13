@@ -22,7 +22,7 @@
     reason = "remaining suppressions cover checked geometry conversions, protocol-owned Smithay resources, and audited compositor/raw-memory boundaries tracked by their dedicated issues"
 )]
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -145,6 +145,29 @@ struct HostedChild {
     pane_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostedChildToken(u64);
+
+impl HostedChildToken {
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostedChildStatus {
+    Launching,
+    Running,
+    Exited { success: bool, detail: String },
+    Unknown,
+}
+
+const HOSTED_CHILD_COMPLETION_HISTORY: usize = 256;
+
 struct HostedChildStarted {
     pid: u32,
     command: String,
@@ -215,6 +238,27 @@ fn record_hosted_child_exit_error(
         pane_id = ?pane_id,
         "failed to poll hosted Wayland app"
     );
+}
+
+fn remember_hosted_child_completion(
+    completions: &mut VecDeque<(HostedChildToken, bool, String)>,
+    pane_id: Option<u64>,
+    success: bool,
+    detail: String,
+) {
+    let Some(pane_id) = pane_id else {
+        return;
+    };
+    completions.push_back((HostedChildToken(pane_id), success, detail));
+    while completions.len() > HOSTED_CHILD_COMPLETION_HISTORY {
+        completions.pop_front();
+    }
+}
+
+fn hosted_child_exit_detail(status: ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| format!("exit:{code}"))
 }
 
 fn set_fractional_scale_for_surface(surface: &WlSurface, scale: f64) {
@@ -885,6 +929,7 @@ pub struct Manifold {
     hosted_child_exits: u64,
     hosted_child_failures: u64,
     hosted_child_last_status: Option<String>,
+    hosted_child_completions: VecDeque<(HostedChildToken, bool, String)>,
 }
 
 impl Manifold {
@@ -1040,6 +1085,7 @@ impl Manifold {
             hosted_child_exits: 0,
             hosted_child_failures: 0,
             hosted_child_last_status: None,
+            hosted_child_completions: VecDeque::new(),
         }
     }
 
@@ -1761,7 +1807,7 @@ impl Manifold {
         sender
     }
 
-    pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<()> {
+    pub fn spawn_hosted_app(&mut self, command: &OsString) -> Result<HostedChildToken> {
         self.spawn_hosted_app_in_session(command, self.sessions.active())
     }
 
@@ -1769,7 +1815,7 @@ impl Manifold {
         &mut self,
         command: &OsString,
         session: SurfaceSessionId,
-    ) -> Result<()> {
+    ) -> Result<HostedChildToken> {
         ensure!(
             self.sessions.contains(session),
             "unknown surface session {}",
@@ -1796,7 +1842,7 @@ impl Manifold {
         )
     }
 
-    pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<()> {
+    pub fn spawn_hosted_app_argv(&mut self, argv: &[String]) -> Result<HostedChildToken> {
         self.spawn_hosted_app_argv_in_session(argv, self.sessions.active())
     }
 
@@ -1804,7 +1850,7 @@ impl Manifold {
         &mut self,
         argv: &[String],
         session: SurfaceSessionId,
-    ) -> Result<()> {
+    ) -> Result<HostedChildToken> {
         let Some((program, args)) = argv.split_first() else {
             anyhow::bail!("spawn requires a command");
         };
@@ -1837,7 +1883,7 @@ impl Manifold {
         )
     }
 
-    pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<()> {
+    pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<HostedChildToken> {
         let Some((program, args)) = argv.split_first() else {
             anyhow::bail!("spawn requires a command");
         };
@@ -1874,7 +1920,7 @@ impl Manifold {
         session: SurfaceSessionId,
         presentation: bool,
         spawn_context: String,
-    ) -> Result<()> {
+    ) -> Result<HostedChildToken> {
         self.pending_child_panes.push(PendingChildPane {
             pid: None,
             pane_id,
@@ -1883,7 +1929,7 @@ impl Manifold {
         });
         if let Some(runtime) = self.async_runtime.clone() {
             self.spawn_hosted_child_launch_task(&runtime, command_label, command, pane_id, session);
-            return Ok(());
+            return Ok(HostedChildToken(pane_id));
         }
 
         match command.spawn() {
@@ -1898,7 +1944,7 @@ impl Manifold {
                     "spawned hosted Wayland app"
                 );
                 self.track_hosted_child(command_label, pid, Some(child), Some(pane_id));
-                Ok(())
+                Ok(HostedChildToken(pane_id))
             }
             Err(err) => {
                 self.pending_child_panes
@@ -1995,6 +2041,12 @@ impl Manifold {
             .retain(|pending| pending.pane_id != failure.pane_id);
         self.hosted_child_failures += 1;
         self.hosted_child_last_status = Some(format!("{}:spawn_error", failure.command));
+        remember_hosted_child_completion(
+            &mut self.hosted_child_completions,
+            Some(failure.pane_id),
+            false,
+            format!("spawn_error:{}", failure.error),
+        );
         warn!(
             error = %failure.error,
             command = %failure.command,
@@ -2012,6 +2064,8 @@ impl Manifold {
             };
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let success = status.success();
+                    let detail = hosted_child_exit_detail(status);
                     record_hosted_child_exit_status(
                         &mut self.hosted_child_exits,
                         &mut self.hosted_child_failures,
@@ -2020,9 +2074,16 @@ impl Manifold {
                         hosted.pane_id,
                         status,
                     );
+                    remember_hosted_child_completion(
+                        &mut self.hosted_child_completions,
+                        hosted.pane_id,
+                        success,
+                        detail,
+                    );
                 }
                 Ok(None) => active.push(hosted),
                 Err(err) => {
+                    let detail = format!("poll_error:{err}");
                     record_hosted_child_exit_error(
                         &mut self.hosted_child_exits,
                         &mut self.hosted_child_failures,
@@ -2031,6 +2092,12 @@ impl Manifold {
                         hosted.pane_id,
                         &err,
                         "poll_error",
+                    );
+                    remember_hosted_child_completion(
+                        &mut self.hosted_child_completions,
+                        hosted.pane_id,
+                        false,
+                        detail,
                     );
                 }
             }
@@ -2053,25 +2120,79 @@ impl Manifold {
                 "hosted Wayland app exit arrived after child record was gone"
             );
         }
+        self.pending_child_panes
+            .retain(|pending| Some(pending.pane_id) != exit.pane_id);
         match exit.result {
-            Ok(status) => record_hosted_child_exit_status(
-                &mut self.hosted_child_exits,
-                &mut self.hosted_child_failures,
-                &mut self.hosted_child_last_status,
-                &exit.command,
-                exit.pane_id,
-                status,
-            ),
-            Err(err) => record_hosted_child_exit_error(
-                &mut self.hosted_child_exits,
-                &mut self.hosted_child_failures,
-                &mut self.hosted_child_last_status,
-                &exit.command,
-                exit.pane_id,
-                &err,
-                "wait_error",
-            ),
+            Ok(status) => {
+                let success = status.success();
+                let detail = hosted_child_exit_detail(status);
+                record_hosted_child_exit_status(
+                    &mut self.hosted_child_exits,
+                    &mut self.hosted_child_failures,
+                    &mut self.hosted_child_last_status,
+                    &exit.command,
+                    exit.pane_id,
+                    status,
+                );
+                remember_hosted_child_completion(
+                    &mut self.hosted_child_completions,
+                    exit.pane_id,
+                    success,
+                    detail,
+                );
+            }
+            Err(err) => {
+                let detail = format!("wait_error:{err}");
+                record_hosted_child_exit_error(
+                    &mut self.hosted_child_exits,
+                    &mut self.hosted_child_failures,
+                    &mut self.hosted_child_last_status,
+                    &exit.command,
+                    exit.pane_id,
+                    &err,
+                    "wait_error",
+                );
+                remember_hosted_child_completion(
+                    &mut self.hosted_child_completions,
+                    exit.pane_id,
+                    false,
+                    detail,
+                );
+            }
         }
+    }
+
+    pub(crate) fn hosted_child_status(&self, token: HostedChildToken) -> HostedChildStatus {
+        if self
+            .hosted_children
+            .iter()
+            .any(|child| child.pane_id == Some(token.raw()))
+        {
+            return HostedChildStatus::Running;
+        }
+        if let Some((_, success, detail)) = self
+            .hosted_child_completions
+            .iter()
+            .rev()
+            .find(|(completed, _, _)| *completed == token)
+        {
+            return HostedChildStatus::Exited {
+                success: *success,
+                detail: detail.clone(),
+            };
+        }
+        if self
+            .pending_child_panes
+            .iter()
+            .any(|pending| pending.pane_id == token.raw())
+        {
+            return HostedChildStatus::Launching;
+        }
+        HostedChildStatus::Unknown
+    }
+
+    pub(crate) fn hosted_child_visible(&self, token: HostedChildToken) -> bool {
+        self.surface_for_pane(token.raw()).is_some()
     }
 
     pub const fn hosted_child_count(&self) -> usize {
@@ -3692,7 +3813,7 @@ impl Manifold {
             return true;
         }
         match self.spawn_hosted_app_argv(argv) {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(err) => {
                 warn!(
                     ?err,

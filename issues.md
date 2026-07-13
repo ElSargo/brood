@@ -4,13 +4,6 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## Central runtime state
-
-- `crates/manifoldd/src/compositor.rs`: runtime setup and nested-test
-  orchestration are interleaved with compositor wiring. The target design should
-  split test orchestration from compositor startup and give event-loop callbacks
-  narrow typed inputs.
-
 ## Geometry and conversion model
 
 - `crates/manifoldd/src/layout.rs`, `crates/manifoldd/src/input.rs`,
@@ -56,6 +49,19 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Smithay protocol wiring, product runtime startup, and built-in nested-test
+  orchestration now live in separate compositor, runtime, and test modules with
+  typed launch plans, supervised processes, and a narrow runtime-tick callback.
+  Hosted spawns return an exact token with bounded lifecycle history, so the
+  supervisor can wait either for that pane to be presented or, explicitly, for
+  that process to exit; unrelated windows and child exits satisfy neither
+  policy, and a known failure cannot be hidden by visibility. The real proof in
+  `tools/test-nested-command-ownership.sh` maps a substantive Weston terminal,
+  observes a different hosted child exit while its controller remains alive,
+  captures the rendered terminal, then observes the exact controller complete
+  and automatic nested cleanup without `--keep-running` or manual daemon quits.
+  A persistent `weston-simple-egl -f` run independently proves the default
+  visible-client policy remains compatible.
 - `Manifold` now coordinates typed surface-session, focus, registry, and test-
   harness services instead of owning those transition tables as loose fields;
   layout and browser state retain their existing service owners. Session

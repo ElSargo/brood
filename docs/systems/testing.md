@@ -16,6 +16,17 @@ code-links:
 
 The supported behavior-test path is the built-in `manifold test` CLI, run through the Nix development shell for checked-in workflows. It owns nested topology policy and avoids creating a host OS window by default.
 
+Nested command readiness belongs to the exact hosted child returned by the
+spawn transition. By default the supervisor returns after that child's pane is
+mapped and presented, which supports persistent graphical clients. Controller
+workloads can instead select owned process completion and wait for that exact
+child to exit. In either policy an unrelated window or hosted-child exit cannot
+complete the command. The supervisor owns normal inner/outer shutdown, so
+controller proofs do not need `--keep-running` or manual daemon quit calls. The
+real Weston terminal workload in `tools/test-nested-command-ownership.sh`
+exercises this boundary and preserves both its rendered screenshot and
+completion transcript.
+
 Use product runtime commands such as `manifold run` for runtime/manual use, not automated behavior validation.
 
 ## Built-In Nested Tests

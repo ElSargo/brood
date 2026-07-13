@@ -50,8 +50,9 @@ use crate::{
     layout::LayoutAction,
     session_runner,
     state::{
-        AgentNotification, FocusDirection, MANIFOLD_STATUS_PUBLISHER, Manifold,
-        PASSTHROUGH_STATUS_CHANNEL, PresentationStatus, SurfaceSessionId, SurfaceSessionSummary,
+        AgentNotification, FocusDirection, HostedChildStatus, HostedChildToken,
+        MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL, PresentationStatus,
+        SurfaceSessionId, SurfaceSessionSummary,
     },
 };
 
@@ -3101,8 +3102,8 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             if args.is_empty() {
                 bail!("spawn requires a command");
             }
-            state.spawn_hosted_app_argv(args)?;
-            format!("OK spawned {}\n", args.join(" "))
+            let token = state.spawn_hosted_app_argv(args)?;
+            format!("OK spawned {} pane_id={}\n", args.join(" "), token.raw())
         }
         "spawn-in-session" => {
             let Some((session, argv)) = args.split_first() else {
@@ -3112,8 +3113,35 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 bail!("spawn-in-session requires a command");
             }
             let session = parse_u64(session, "session id")?;
-            state.spawn_hosted_app_argv_in_session(argv, SurfaceSessionId::from_raw(session))?;
-            format!("OK spawned {}\n", argv.join(" "))
+            let token = state
+                .spawn_hosted_app_argv_in_session(argv, SurfaceSessionId::from_raw(session))?;
+            format!("OK spawned {} pane_id={}\n", argv.join(" "), token.raw())
+        }
+        "hosted-child-status" => {
+            let [pane_id] = args else {
+                bail!("hosted-child-status requires exactly one pane id");
+            };
+            let token = HostedChildToken::from_raw(parse_u64(pane_id, "pane id")?);
+            let visible = state.hosted_child_visible(token);
+            let status = match state.hosted_child_status(token) {
+                HostedChildStatus::Launching => {
+                    serde_json::json!({"pane_id": token.raw(), "state": "launching", "visible": visible})
+                }
+                HostedChildStatus::Running => {
+                    serde_json::json!({"pane_id": token.raw(), "state": "running", "visible": visible})
+                }
+                HostedChildStatus::Exited { success, detail } => serde_json::json!({
+                    "pane_id": token.raw(),
+                    "state": "exited",
+                    "visible": visible,
+                    "success": success,
+                    "detail": detail,
+                }),
+                HostedChildStatus::Unknown => {
+                    serde_json::json!({"pane_id": token.raw(), "state": "unknown", "visible": visible})
+                }
+            };
+            format!("{status}\n")
         }
         "plug" => {
             let command = PlugCommand::parse(args)?;

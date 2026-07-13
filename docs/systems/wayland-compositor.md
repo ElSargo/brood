@@ -14,6 +14,13 @@ code-links:
 
 Manifold currently hosts nested Wayland clients as managed apps in panes. The implementation uses Smithay for the Linux/Rust nested compositor path.
 
+Smithay protocol handlers are isolated in `compositor.rs`. Session process
+startup, configuration, presentation attachment, event-loop driving, and
+ordered shutdown are owned by `runtime.rs`; the built-in nested test topology
+and artifact lifecycle are owned independently by `nested_test.rs`. This keeps
+test process policy out of Wayland callbacks and gives startup/orchestration
+helpers typed launch plans and supervised-process inputs.
+
 The current compositor path can:
 
 - expose a nested Wayland socket

@@ -8,6 +8,11 @@ Experimental backend work that is not part of the supported workflow should live
 
 Run `./tools/dev-nested-manifold.sh --keep-running` to start a stable Manifold instance, spawn a development Manifold instance inside it, launch a real client inside the dev instance, and sample both `status-json` streams. See [Test Nested Behavior](../docs/workflows/test-nested.md).
 
+Run `./tools/test-nested-command-ownership.sh` to prove that the built-in
+offscreen nested supervisor waits for its exact controller while a real Weston
+terminal maps and an unrelated hosted child exits. The proof exits normally
+without `--keep-running` and preserves a composed screenshot and transcript.
+
 Run `./tools/audit-v1-capabilities.sh` from the repo root for the concise v1 acceptance audit. It runs formatting, offline checking, unit tests, headless compositor checks, supported host-backed smoke tests when a host display is available, and the dmabuf capability checks. Set `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1` on a DRM-capable backend to make capability skips fail the audit.
 
 Run `./tools/smoke-v1-full.sh` from the repo root for the full supported v1 proof suite: formatting, offline build/test, dmabuf validator/classifier fixtures, headless Wayland globals, headless native-client mapping, headless input forwarding, headless control-error handling, headless JSON status, headless status parity, headless client lifecycle checks, startup attach fallback, native nesting, detach/reattach, host input forwarding, dmabuf diagnostics, explicit-sync diagnostics, and latency/cadence.

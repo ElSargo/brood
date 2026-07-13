@@ -36,7 +36,7 @@ impl WorkspaceCommand {
         match self {
             Self::Layout(action) => state.apply_layout_action(action),
             Self::SpawnApp(argv) => match state.spawn_hosted_app_argv(&argv) {
-                Ok(()) => true,
+                Ok(_) => true,
                 Err(err) => {
                     warn!(?err, ?argv, "workspace command failed to spawn app");
                     false

@@ -14,8 +14,10 @@ mod debug_dump;
 mod input;
 pub mod launch_context;
 mod layout;
+mod nested_test;
 mod plugin_runtime;
 mod presentation;
+mod runtime;
 mod session_bus;
 mod session_runner;
 pub(crate) mod state;
@@ -325,6 +327,9 @@ struct NestedTestArgs {
     /// Spawn a hosted Wayland app inside the inner instance after startup.
     #[arg(long = "inner-command", value_name = "CMD")]
     inner_command: Option<String>,
+    /// Wait for the inner command process to exit instead of returning when its pane is visible.
+    #[arg(long = "wait-for-inner-command-exit", requires = "inner_command")]
+    wait_for_inner_command_exit: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -383,14 +388,14 @@ pub fn run_cli() -> Result<CommandOutcome> {
         Command::List(args) => control::list(args)
             .context("list session environments")
             .map(|()| CommandOutcome::Completed),
-        Command::Run(args) => compositor::run(args).map(|()| CommandOutcome::Completed),
+        Command::Run(args) => runtime::run(args).map(|()| CommandOutcome::Completed),
         Command::Plug(args) => control::plug(args)
             .context("plug WASM module")
             .map(|()| CommandOutcome::Completed),
         Command::Switch(args) => control::switch(args)
             .context("switch session")
             .map(|()| CommandOutcome::Completed),
-        Command::Test(args) => compositor::run_test(args).map(|()| CommandOutcome::Completed),
+        Command::Test(args) => nested_test::run(args).map(|()| CommandOutcome::Completed),
         Command::Ctl(args) => control::send(args)
             .context("send control command")
             .map(|()| CommandOutcome::Completed),
@@ -408,7 +413,7 @@ pub fn run_session_cli() -> Result<()> {
         Err(_) => SessionArgs::parse(),
     };
     info!(?args, "starting manifold session server");
-    compositor::serve_session(args)
+    runtime::serve_session(args)
 }
 
 #[cfg(test)]

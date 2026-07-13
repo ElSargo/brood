@@ -352,7 +352,8 @@ pub fn load_startup_apps(
         match app.realm {
             StartupRealm::Session if filter == StartupAppFilter::All => state
                 .spawn_hosted_app_argv(&argv)
-                .with_context(|| format!("spawn config startup app {id}"))?,
+                .with_context(|| format!("spawn config startup app {id}"))
+                .map(|_| ())?,
             StartupRealm::Session => {
                 info!(
                     startup_app = %id,
@@ -362,7 +363,8 @@ pub fn load_startup_apps(
             }
             StartupRealm::Presentation => state
                 .spawn_presentation_app_argv(&argv)
-                .with_context(|| format!("spawn config presentation startup app {id}"))?,
+                .with_context(|| format!("spawn config presentation startup app {id}"))
+                .map(|_| ())?,
         }
         info!(startup_app = %id, realm = ?app.realm, argv = ?argv, "spawned config startup app");
     }
