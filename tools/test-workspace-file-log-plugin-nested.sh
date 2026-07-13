@@ -279,8 +279,12 @@ PY
 
   # Overflow replaced the ambiguous incremental queue. These paths must come
   # from the filesystem rebuild, not survive as ordinary primary log events.
-  ! grep -q $'^created\toverflow/' "$log"
-  ! grep -q $'^created\tfinal-after-overflow.txt$' "$log"
+  if grep -q $'^created\toverflow/' "$log" \
+    || grep -q $'^created\tfinal-after-overflow.txt$' "$log"
+  then
+    echo "ERR ambiguous overflow events survived in the primary log" >&2
+    return 1
+  fi
 
   python3 - "$workspace" "$workspace/.manifold/workspace-file-index.tsv" <<'PY'
 import os
