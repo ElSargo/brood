@@ -66,6 +66,14 @@ Cancellation races are resolved once. If cancellation wins, a successful late
 result is discarded and cannot mutate guest memory. A completion is considered
 delivered only after admission to the reserved completion lane.
 
+Cancellation does not promise to roll back filesystem effects which began
+before the request won. It does promise an ownership boundary: a blocking write
+which has entered the host pool is joined before its `cancelled` completion is
+delivered. Actor shutdown and hot replacement likewise join admitted blocking
+writes before the old generation is considered stopped, so no filesystem
+mutation from that generation can occur after cancellation is observable or a
+replacement generation becomes active.
+
 Large results use owned buffers, immutable blobs, or resource handles rather
 than unbounded mailbox copies. Host pointers never enter guest memory, and the
 host never writes through a buffer after returning its ownership.
@@ -329,6 +337,8 @@ mocked resource units. Required coverage includes:
 - process and PTY input/output, exit, cancellation, and backpressure;
 - filesystem registration, change, overflow, and reconciliation;
 - replacement under load with no stale completion or surviving actor resource;
+- cancellation and replacement barriers around already-started blocking
+  filesystem mutations;
 - bounded stress and soak runs across many actor generations and workers.
 
 The source-linked interaction map is [[plugin-io-interaction-graph]]. Current

@@ -35,3 +35,10 @@ checks that `.manifold/workspace-file-log.snapshot` is a nonempty byte-for-byte
 prefix of the append-only log containing the observed create, modify, and remove
 records. Those filesystem artifacts are the proof, rather than a
 plugin-generated success value.
+
+This plugin is also the user-observable completion-write proof: the snapshot is
+created through the same host completion engine whose cancellation and
+replacement ownership is tested with a deliberately blocked filesystem
+mutation in `completion_io::tests`. The plugin demonstrates the real guest and
+daemon path and leaves inspectable bytes; the deterministic host test supplies
+the timing barrier which an ordinary regular-file write cannot reliably expose.

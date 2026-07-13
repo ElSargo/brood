@@ -6,12 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Completion writes run through `spawn_blocking`, but cancellation and shutdown
-  abort only the async wrapper. A blocking filesystem operation which has
-  already started can continue mutating the filesystem after a cancellation
-  completion or actor replacement. Track and join completion-engine blocking
-  work as Component worker I/O already does, or explicitly weaken and document
-  the cancellation contract for external side effects.
 - Filesystem watch churn is not fully bounded. Each watch creation retains a
   setup-thread handle until the entire hub stops, including after that watch is
   dropped, so repeated create/drop cycles grow `setup_threads`. In addition,
@@ -121,6 +115,14 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Completion-I/O cancellation and replacement own blocking writes through their
+  terminal boundary. Cancellation can prevent queued work from starting but
+  does not roll back an already-started filesystem effect; once a write has
+  started, its blocking task is joined before `cancelled` is delivered. Shutdown
+  likewise drains admitted writes before replacement can activate, so an old
+  generation cannot mutate files afterward. Deterministic blocked-mutation
+  tests prove that ordering, while `workspace-file-log` leaves a real
+  completion-written snapshot as the user-observable guest-to-daemon proof.
 - Preview 1 shutdown treats queued and in-flight worker preparation as owned
   lifecycle state. Stopping cancels queued preparations, waits for late Stores
   to return, drops them before execution, releases every guest stack/TLS
