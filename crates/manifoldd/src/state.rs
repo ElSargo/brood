@@ -452,6 +452,22 @@ struct ConfiguredWorkspacePlugin {
     writable: bool,
     startup_message: Option<String>,
     lifecycle: Option<ConfiguredPluginLifecycle>,
+    resources: ConfiguredPluginResources,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfiguredPluginResources {
+    pub filesystem_watches: usize,
+    pub filesystem_watch_events: usize,
+}
+
+impl Default for ConfiguredPluginResources {
+    fn default() -> Self {
+        Self {
+            filesystem_watches: 16,
+            filesystem_watch_events: 4096,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -482,6 +498,13 @@ impl HostedIoActor {
         match self {
             Self::Component(actor) => actor.generation(),
             Self::Preview1(actor) => actor.generation(),
+        }
+    }
+
+    fn filesystem_watch_stats(&self) -> manifold_wasm::FilesystemWatchStats {
+        match self {
+            Self::Component(actor) => actor.filesystem_watch_stats(),
+            Self::Preview1(actor) => actor.filesystem_watch_stats(),
         }
     }
 
@@ -539,6 +562,21 @@ fn aggregate_preview1_compat_stats(
         aggregate.pending_notification_events = aggregate
             .pending_notification_events
             .saturating_add(next.pending_notification_events);
+        aggregate.filesystem_watches = aggregate
+            .filesystem_watches
+            .saturating_add(next.filesystem_watches);
+        aggregate.max_filesystem_watches = aggregate
+            .max_filesystem_watches
+            .saturating_add(next.max_filesystem_watches);
+        aggregate.max_filesystem_watch_events = aggregate
+            .max_filesystem_watch_events
+            .max(next.max_filesystem_watch_events);
+        aggregate.filesystem_watch_overflows = aggregate
+            .filesystem_watch_overflows
+            .saturating_add(next.filesystem_watch_overflows);
+        aggregate.filesystem_watch_rescans = aggregate
+            .filesystem_watch_rescans
+            .saturating_add(next.filesystem_watch_rescans);
         aggregate.workers_started = aggregate
             .workers_started
             .saturating_add(next.workers_started);
@@ -695,6 +733,7 @@ pub struct Manifold {
     wasm_io_actors: BTreeMap<String, HostedIoActor>,
     configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
     configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
+    configured_plugin_resources: BTreeMap<String, ConfiguredPluginResources>,
     filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
@@ -868,6 +907,7 @@ impl Manifold {
             wasm_io_actors: BTreeMap::new(),
             configured_workspace_plugins: BTreeMap::new(),
             configured_plugin_lifecycles: BTreeMap::new(),
+            configured_plugin_resources: BTreeMap::new(),
             filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
@@ -1047,6 +1087,21 @@ impl Manifold {
 
     pub fn filesystem_watcher_stats(&self) -> manifold_wasm::NativeFilesystemWatcherStats {
         self.filesystem_watcher_service.stats()
+    }
+
+    pub fn hosted_filesystem_watch_stats(&self) -> manifold_wasm::FilesystemWatchStats {
+        self.wasm_io_actors.values().fold(
+            manifold_wasm::FilesystemWatchStats::default(),
+            |mut aggregate, actor| {
+                let next = actor.filesystem_watch_stats();
+                aggregate.watches = aggregate.watches.saturating_add(next.watches);
+                aggregate.max_watches = aggregate.max_watches.saturating_add(next.max_watches);
+                aggregate.max_events = aggregate.max_events.max(next.max_events);
+                aggregate.overflows = aggregate.overflows.saturating_add(next.overflows);
+                aggregate.rescans = aggregate.rescans.saturating_add(next.rescans);
+                aggregate
+            },
+        )
     }
 
     pub fn try_wasm_global_key_policy(
@@ -4081,7 +4136,14 @@ impl Manifold {
     }
 
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
-        self.replace_wasm_plugin_with_instance_id(None, false, path, None, None)
+        self.replace_wasm_plugin_with_instance_id(
+            None,
+            false,
+            path,
+            None,
+            None,
+            ConfiguredPluginResources::default(),
+        )
     }
 
     pub(crate) fn replace_wasm_plugin_as(&mut self, instance_id: &str, path: &Path) -> Result<()> {
@@ -4090,13 +4152,22 @@ impl Manifold {
             "WASM plugin instance id must not be empty"
         );
         let lifecycle = self.configured_plugin_lifecycles.get(instance_id).cloned();
+        let resources = self.configured_resources_for_instance(instance_id);
         self.replace_wasm_plugin_with_instance_id(
             Some(instance_id),
             false,
             path,
             None,
             lifecycle.map(|config| (config, manifold_wasm::PluginStartReason::Replacement)),
+            resources,
         )
+    }
+
+    fn configured_resources_for_instance(&self, instance_id: &str) -> ConfiguredPluginResources {
+        self.configured_plugin_resources
+            .get(instance_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(crate) fn replace_configured_wasm_plugin(
@@ -4106,6 +4177,7 @@ impl Manifold {
         workspace_filesystem_writable: Option<bool>,
         startup_message: Option<String>,
         lifecycle: Option<ConfiguredPluginLifecycle>,
+        resources: ConfiguredPluginResources,
     ) -> Result<()> {
         ensure!(
             !module_id.trim().is_empty(),
@@ -4140,6 +4212,7 @@ impl Manifold {
             path,
             filesystem,
             lifecycle.clone().map(|config| (config, start_reason)),
+            resources,
         )?;
         if let Some(writable) = workspace_filesystem_writable
             && self.wasm_io_actors.contains_key(module_id)
@@ -4151,18 +4224,24 @@ impl Manifold {
                     writable,
                     startup_message: startup_message.clone(),
                     lifecycle: lifecycle.clone(),
+                    resources,
                 },
             );
         } else {
             self.configured_workspace_plugins.remove(module_id);
         }
         if self.wasm_io_actors.contains_key(module_id) {
+            self.configured_plugin_resources
+                .insert(module_id.to_string(), resources);
             if let Some(lifecycle) = lifecycle {
                 self.configured_plugin_lifecycles
                     .insert(module_id.to_string(), lifecycle);
             } else {
                 self.configured_plugin_lifecycles.remove(module_id);
             }
+        } else {
+            self.configured_plugin_resources.remove(module_id);
+            self.configured_plugin_lifecycles.remove(module_id);
         }
         if let Some(message) = startup_message {
             self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
@@ -4221,6 +4300,7 @@ impl Manifold {
                         .lifecycle
                         .clone()
                         .map(|config| (config, manifold_wasm::PluginStartReason::SessionRebind)),
+                    plugin.resources,
                 )
                 .and_then(|()| {
                     if let Some(message) = plugin.startup_message {
@@ -4308,6 +4388,7 @@ impl Manifold {
         path: &Path,
         filesystem: Option<HostedPluginFilesystem>,
         lifecycle: Option<(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
+        resources: ConfiguredPluginResources,
     ) -> Result<()> {
         let mut engine_config = wasmtime::Config::new();
         engine_config.wasm_threads(true).shared_memory(true);
@@ -4319,7 +4400,7 @@ impl Manifold {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref())
+                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources)
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_error}) nor a component actor",
@@ -4336,6 +4417,7 @@ impl Manifold {
                 path,
                 filesystem.as_ref(),
                 lifecycle.as_ref(),
+                resources,
             );
         }
         let inventory = manifold_wasm::WasmModuleInventory::discover(&module)?;
@@ -4371,6 +4453,7 @@ impl Manifold {
         path: &Path,
         filesystem: Option<&HostedPluginFilesystem>,
         lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
+        resources: ConfiguredPluginResources,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4397,6 +4480,8 @@ impl Manifold {
                     writable,
                 }),
                 filesystem_watcher_service: self.filesystem_watcher_service.clone(),
+                max_filesystem_watches: resources.filesystem_watches,
+                max_filesystem_watch_events: resources.filesystem_watch_events,
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
@@ -4430,6 +4515,7 @@ impl Manifold {
         path: &Path,
         filesystem: Option<&HostedPluginFilesystem>,
         lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
+        resources: ConfiguredPluginResources,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4453,7 +4539,11 @@ impl Manifold {
                         writable,
                     }),
                 },
-                manifold_wasm::Preview1WorkerConfig::default(),
+                manifold_wasm::Preview1WorkerConfig {
+                    max_filesystem_watches: resources.filesystem_watches,
+                    max_filesystem_watch_events: resources.filesystem_watch_events,
+                    ..manifold_wasm::Preview1WorkerConfig::default()
+                },
                 self.filesystem_watcher_service.clone(),
             ),
         )?;
@@ -6388,9 +6478,9 @@ struct WindowRefreshOutcome {
 )]
 mod tests {
     use super::{
-        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, aggregate_preview1_compat_stats,
-        ensure_legacy_instance_id_supported, fullscreen_layout_rect,
-        legacy_instance_id_to_validate, wasm_plugin_instance_id,
+        ConfiguredPluginResources, Manifold, PresentationStatus, SESSION_OUTPUT_SIZE,
+        aggregate_preview1_compat_stats, ensure_legacy_instance_id_supported,
+        fullscreen_layout_rect, legacy_instance_id_to_validate, wasm_plugin_instance_id,
         window_surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
@@ -6413,6 +6503,11 @@ mod tests {
             pollables: usize::try_from(scale).unwrap(),
             wait_registrations: usize::try_from(scale).unwrap(),
             pending_notification_events: usize::try_from(scale).unwrap(),
+            filesystem_watches: usize::try_from(scale).unwrap(),
+            max_filesystem_watches: usize::try_from(scale).unwrap(),
+            max_filesystem_watch_events: usize::try_from(scale).unwrap(),
+            filesystem_watch_overflows: scale,
+            filesystem_watch_rescans: scale,
             workers_started: scale,
             workers_active: usize::try_from(scale).unwrap(),
             worker_reads_started: scale,
@@ -6421,6 +6516,28 @@ mod tests {
             workers_cancelled: scale,
             last_worker_value: scale,
         }
+    }
+
+    #[test]
+    fn configured_watch_resources_survive_stable_id_replacement_lookup() {
+        let mut event_loop = EventLoop::try_new().expect("event loop");
+        let display = Display::new().expect("display");
+        let mut state = Manifold::new(&mut event_loop, display);
+        let resources = ConfiguredPluginResources {
+            filesystem_watches: 3,
+            filesystem_watch_events: 64,
+        };
+        state
+            .configured_plugin_resources
+            .insert("watcher".to_string(), resources);
+        assert_eq!(
+            state.configured_resources_for_instance("watcher"),
+            resources
+        );
+        assert_eq!(
+            state.configured_resources_for_instance("unconfigured"),
+            ConfiguredPluginResources::default()
+        );
     }
 
     #[test]

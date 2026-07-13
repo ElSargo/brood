@@ -1100,6 +1100,16 @@ pub struct Preview1CompatStats {
     pub wait_registrations: usize,
     /// Coalesced actor notification IDs waiting in the reserved lane.
     pub pending_notification_events: usize,
+    /// Live logical filesystem watches owned by this generation.
+    pub filesystem_watches: usize,
+    /// Configured logical-watch ceiling.
+    pub max_filesystem_watches: usize,
+    /// Configured per-watch queued-event ceiling.
+    pub max_filesystem_watch_events: usize,
+    /// Capacity/backend overflows collapsed to rescan markers.
+    pub filesystem_watch_overflows: u64,
+    /// All rescan markers, including initial native setup.
+    pub filesystem_watch_rescans: u64,
     /// Workers admitted after Store/export preparation and scheduled to run.
     pub workers_started: u64,
     /// Workers whose guest calls are currently live.
@@ -1505,6 +1515,7 @@ impl Preview1WorkerRuntime {
     /// Snapshot daemon-observable lifecycle counters.
     pub fn stats(&self) -> Preview1CompatStats {
         let coordination = self.coordination.stats();
+        let filesystem_watches = self.filesystem_watches.stats();
         Preview1CompatStats {
             generation: self.generation,
             mailbox_queued: self.stats.mailbox_queued.load(Ordering::Relaxed),
@@ -1517,6 +1528,11 @@ impl Preview1WorkerRuntime {
             pollables: coordination.pollables,
             wait_registrations: coordination.wait_registrations,
             pending_notification_events: coordination.pending_actor_events,
+            filesystem_watches: filesystem_watches.watches,
+            max_filesystem_watches: filesystem_watches.max_watches,
+            max_filesystem_watch_events: filesystem_watches.max_events,
+            filesystem_watch_overflows: filesystem_watches.overflows,
+            filesystem_watch_rescans: filesystem_watches.rescans,
             workers_started: self.stats.workers_started.load(Ordering::Relaxed),
             workers_active: self.stats.workers_active.load(Ordering::Acquire),
             worker_reads_started: self.stats.worker_reads_started.load(Ordering::Relaxed),
@@ -1525,6 +1541,10 @@ impl Preview1WorkerRuntime {
             workers_cancelled: self.stats.workers_cancelled.load(Ordering::Relaxed),
             last_worker_value: self.stats.last_worker_value.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
+        self.filesystem_watches.stats()
     }
 
     fn try_take_terminal_error(&self) -> Option<String> {
@@ -1729,6 +1749,10 @@ impl Preview1CompatActor {
     /// Current lifecycle counters, including the reload generation.
     pub fn stats(&self) -> Preview1CompatStats {
         self.runtime.stats()
+    }
+
+    pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
+        self.runtime.filesystem_watch_stats()
     }
 
     pub const fn generation(&self) -> u64 {

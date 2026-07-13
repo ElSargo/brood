@@ -50,7 +50,9 @@ pub use coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, CoordinationStats,
     NotificationError, NotificationId, PollError, PollableId, ReadyPollable, WaitMode,
 };
-pub use filesystem_watch::{NativeFilesystemWatcherService, NativeFilesystemWatcherStats};
+pub use filesystem_watch::{
+    FilesystemWatchStats, NativeFilesystemWatcherService, NativeFilesystemWatcherStats,
+};
 pub use global_key_policy::{
     ABI_INPUT_MODE_NORMAL, ABI_INPUT_MODE_PASSTHROUGH, ABI_KEY_PRESSED, ABI_KEY_RELEASED,
     ABI_MOD_ALT, ABI_MOD_CTRL, ABI_MOD_SHIFT, DEFAULT_GLOBAL_KEY_POLICY_ARENA_BYTES,

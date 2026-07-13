@@ -119,11 +119,22 @@ status = json.loads(sys.argv[1])
 assert status["filesystem_watcher_registrations"] == 1, status
 assert status["filesystem_watcher_subscriptions"] == 2, status
 assert status["preview1_compat_notifications"] == 2, status
+assert status["preview1_compat_filesystem_watches"] == 2, status
+assert status["preview1_compat_max_filesystem_watches"] == 3, status
+assert status["preview1_compat_max_filesystem_watch_events"] == 64, status
+assert status["hosted_filesystem_watches"] == 2, status
+assert status["hosted_filesystem_watch_capacity"] == 3, status
+assert status["hosted_filesystem_watch_event_capacity"] == 64, status
 proof = {
     "filesystem_watcher_registrations": status["filesystem_watcher_registrations"],
     "filesystem_watcher_subscriptions": status["filesystem_watcher_subscriptions"],
     "preview1_compat_notifications": status["preview1_compat_notifications"],
     "preview1_compat_workers_active": status["preview1_compat_workers_active"],
+    "filesystem_watches": status["preview1_compat_filesystem_watches"],
+    "filesystem_watch_capacity": status["preview1_compat_max_filesystem_watches"],
+    "filesystem_watch_event_capacity": status["preview1_compat_max_filesystem_watch_events"],
+    "filesystem_watch_overflows_before": status["filesystem_watcher_overflows"],
+    "preview1_watch_overflows_before": status["preview1_compat_filesystem_watch_overflows"],
 }
 with open(sys.argv[2], "w", encoding="utf-8") as output:
     json.dump(proof, output, indent=2, sort_keys=True)
@@ -218,26 +229,39 @@ PY
   done
   grep -q '^primary watch paused with notification live$' "$pause_ack"
 
-  # More than the runtime's existing bounded queue depth is routed while the
-  # primary is paused. Waiting for the live mirror to record the final path
-  # proves the native service has routed the whole burst; this is not a sleep-
-  # based guess that overflow probably happened.
-  python3 - "$workspace" <<'PY'
-from pathlib import Path
-import os
-import sys
+  # Route more than the configured 64-event queue while primary is paused.
+  # Pacing keeps the mirror draining; its distinct final-path record proves all
+  # 80 creates were routed while the primary stayed paused past its capacity.
+  mkdir "$workspace/overflow"
+  for number in $(seq -w 0 79); do
+    : > "$workspace/overflow/00${number}.txt"
+    sleep 0.01
+  done
+  wait_for_line "$mirror_log" $'created\toverflow/0079.txt'
+  printf 'final alpha contents\n' > "$workspace/alpha.txt"
+  printf 'must come from reconciliation\n' > "$workspace/final-after-overflow.txt"
+  rm "$workspace/new-file.txt"
 
-root = Path(sys.argv[1])
-overflow = root / "overflow"
-overflow.mkdir()
-for number in range(4200):
-    descriptor = os.open(overflow / f"{number:04}.txt", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    os.close(descriptor)
-(root / "alpha.txt").write_text("final alpha contents\n")
-(root / "final-after-overflow.txt").write_text("must come from reconciliation\n")
-(root / "new-file.txt").unlink()
+  status="$(ctl status-json)"
+  python3 - "$status" "$workspace/.manifold/workspace-file-log.watch-status.json" <<'PY'
+import json
+import sys
+status = json.loads(sys.argv[1])
+with open(sys.argv[2], "r+", encoding="utf-8") as proof_file:
+    proof = json.load(proof_file)
+    assert status["filesystem_watcher_overflows"] > proof["filesystem_watch_overflows_before"], status
+    assert status["preview1_compat_filesystem_watch_overflows"] > proof["preview1_watch_overflows_before"], status
+    assert status["filesystem_watcher_rescans"] > status["filesystem_watcher_overflows"], status
+    assert status["preview1_compat_filesystem_watches"] == 2, status
+    proof["filesystem_watch_overflows_after"] = status["filesystem_watcher_overflows"]
+    proof["filesystem_watch_rescans_after"] = status["filesystem_watcher_rescans"]
+    proof["preview1_watch_overflows_after"] = status["preview1_compat_filesystem_watch_overflows"]
+    proof["preview1_watch_rescans_after"] = status["preview1_compat_filesystem_watch_rescans"]
+    proof_file.seek(0)
+    json.dump(proof, proof_file, indent=2, sort_keys=True)
+    proof_file.write("\n")
+    proof_file.truncate()
 PY
-  wait_for_line "$mirror_log" $'created\toverflow/4199.txt'
 
   ctl actors send workspace-file-log resume-primary >/dev/null
   for _ in $(seq 1 400); do
@@ -323,7 +347,7 @@ assert "alpha.txt" in actual
 assert "final-after-overflow.txt" in actual
 assert "new-file.txt" not in actual
 assert "overflow/0000.txt" in actual
-assert "overflow/4199.txt" in actual
+assert "overflow/0079.txt" in actual
 assert "preview1-collision-%FF.txt" not in actual
 assert "preview1-collision-%FE.txt" not in actual
 PY
@@ -410,6 +434,12 @@ printf '%s\n' \
   "path = \"$PLUGIN\"" \
   'capabilities = ["filesystem:workspace-write"]' \
   'startup-message = "start"' > "$CONFIG"
+cat >> "$CONFIG" <<'EOF'
+
+[module.workspace-file-log.resources]
+filesystem-watches = 3
+filesystem-watch-events = 64
+EOF
 
 TEST_LOG="$OUT/test.log"
 (

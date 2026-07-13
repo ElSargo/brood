@@ -3547,6 +3547,11 @@ struct StatusSnapshot {
     preview1_compat_pollables: usize,
     preview1_compat_wait_registrations: usize,
     preview1_compat_pending_notification_events: usize,
+    preview1_compat_filesystem_watches: usize,
+    preview1_compat_max_filesystem_watches: usize,
+    preview1_compat_max_filesystem_watch_events: usize,
+    preview1_compat_filesystem_watch_overflows: u64,
+    preview1_compat_filesystem_watch_rescans: u64,
     preview1_compat_workers_started: u64,
     preview1_compat_workers_active: usize,
     preview1_compat_worker_reads_started: u64,
@@ -3557,6 +3562,13 @@ struct StatusSnapshot {
     filesystem_watcher_registrations: usize,
     filesystem_watcher_subscriptions: usize,
     filesystem_watcher_setup_tasks: usize,
+    filesystem_watcher_overflows: u64,
+    filesystem_watcher_rescans: u64,
+    hosted_filesystem_watches: usize,
+    hosted_filesystem_watch_capacity: usize,
+    hosted_filesystem_watch_event_capacity: usize,
+    hosted_filesystem_watch_overflows: u64,
+    hosted_filesystem_watch_rescans: u64,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -3705,6 +3717,7 @@ impl StatusSnapshot {
         );
         let preview1_compat_stats = state.preview1_compat_stats();
         let filesystem_watcher_stats = state.filesystem_watcher_stats();
+        let hosted_filesystem_watch_stats = state.hosted_filesystem_watch_stats();
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
@@ -3781,6 +3794,16 @@ impl StatusSnapshot {
                 .map_or(0, |stats| stats.wait_registrations),
             preview1_compat_pending_notification_events: preview1_compat_stats
                 .map_or(0, |stats| stats.pending_notification_events),
+            preview1_compat_filesystem_watches: preview1_compat_stats
+                .map_or(0, |stats| stats.filesystem_watches),
+            preview1_compat_max_filesystem_watches: preview1_compat_stats
+                .map_or(0, |stats| stats.max_filesystem_watches),
+            preview1_compat_max_filesystem_watch_events: preview1_compat_stats
+                .map_or(0, |stats| stats.max_filesystem_watch_events),
+            preview1_compat_filesystem_watch_overflows: preview1_compat_stats
+                .map_or(0, |stats| stats.filesystem_watch_overflows),
+            preview1_compat_filesystem_watch_rescans: preview1_compat_stats
+                .map_or(0, |stats| stats.filesystem_watch_rescans),
             preview1_compat_workers_started: preview1_compat_stats
                 .map_or(0, |stats| stats.workers_started),
             preview1_compat_workers_active: preview1_compat_stats
@@ -3798,6 +3821,13 @@ impl StatusSnapshot {
             filesystem_watcher_registrations: filesystem_watcher_stats.registrations,
             filesystem_watcher_subscriptions: filesystem_watcher_stats.subscriptions,
             filesystem_watcher_setup_tasks: filesystem_watcher_stats.setup_tasks,
+            filesystem_watcher_overflows: filesystem_watcher_stats.overflows,
+            filesystem_watcher_rescans: filesystem_watcher_stats.rescans,
+            hosted_filesystem_watches: hosted_filesystem_watch_stats.watches,
+            hosted_filesystem_watch_capacity: hosted_filesystem_watch_stats.max_watches,
+            hosted_filesystem_watch_event_capacity: hosted_filesystem_watch_stats.max_events,
+            hosted_filesystem_watch_overflows: hosted_filesystem_watch_stats.overflows,
+            hosted_filesystem_watch_rescans: hosted_filesystem_watch_stats.rescans,
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),

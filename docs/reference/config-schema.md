@@ -33,6 +33,12 @@ For a legacy core-module artifact, `<id>` remains a configuration label. The
 artifact keeps its declared actor/provider names and singular replacement
 lane; it does not claim the label as a hosted actor ID.
 
+The optional `[module.<id>.resources]` table accepts
+`filesystem-watches` and `filesystem-watch-events`. Omitted fields retain the
+daemon ceilings; supplied values must be nonzero and no greater than those
+ceilings. Runtime status reports live logical handles, configured capacities,
+and monotonic overflow/rescan counters without exposing capability-root paths.
+
 The parser recognizes the old `fast-key-handler` and `fast-map-hook` names only
 to warn and skip them.
 

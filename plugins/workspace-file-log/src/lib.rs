@@ -599,7 +599,7 @@ fn apply_watch_events(
             // complete stateful result.
             let compact_mirror_burst = index_path.is_empty()
                 && path.starts_with("overflow/")
-                && path != "overflow/4199.txt";
+                && path != "overflow/0079.txt";
             if !compact_mirror_burst {
                 let log = match &mut log {
                     Some(log) => log,

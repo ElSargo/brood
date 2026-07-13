@@ -6,9 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Watch and event-queue limits currently use runtime defaults. They are bounded,
-  but plugin manifests cannot yet request narrower budgets and status output
-  does not expose live watch counts or overflow totals.
 - Subprocesses, pipe streams, PTYs, sockets, and timers remain deliberately
   absent. They should reuse the same generation-owned resource and pollable
   lifecycle rather than grow separate wait mechanisms.
@@ -85,6 +82,18 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Hosted plugin manifests can narrow logical filesystem-watch and per-watch
+  event ceilings through a validated resource table; zero, daemon-ceiling
+  bypass, and policy loss across stable-ID replacement are covered by tests.
+  The same limits apply to Component and Preview 1 generations and survive
+  workspace rebind. Generation stats expose live handles, configured ceilings,
+  overflows, and rescans, while the shared daemon watcher reports monotonic
+  totals; initial setup counts only as rescan and queue/backend collapse counts
+  as both. The real workspace plugin runs with 3 watches/64 events, keeps 2
+  handles live, pauses one consumer through an 80-file paced workload, and
+  records daemon and generation overflow changes from 0 to 1. Its visible
+  85-line index exactly reflects the reconciled workspace and its preserved
+  status JSON records the applied capacities and counters.
 - Configured hosted actors have a typed, explicitly acknowledged lifecycle on
   both Component and Preview 1 backends. Manifest lifecycle tables provide
   sorted structured start data and separate nonzero start/stop bounds; legacy

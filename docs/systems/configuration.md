@@ -47,6 +47,14 @@ session's working directory at guest `.` with the requested access. Without one
 of those grants, the hosted actor keeps the narrow package-directory,
 read-only default.
 
+Hosted plugin watch budgets are declared in `[module.<id>.resources]`.
+`filesystem-watches` bounds live logical watch handles and
+`filesystem-watch-events` bounds queued events per handle before the queue is
+replaced by a reconciliation marker. Both values must be nonzero and may only
+narrow the daemon defaults (16 watches and 4096 events). The same typed limits
+apply to Component and Preview 1 generations and survive replacement and
+workspace-session rebind under the configured actor ID.
+
 Hosted plugins use `[module.<id>.lifecycle]` as the target lifecycle source of
 truth. `data` is a string-keyed map delivered as typed, ordered start-context
 entries; `start-timeout-ms` and `stop-timeout-ms` bound explicit guest

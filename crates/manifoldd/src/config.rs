@@ -102,6 +102,41 @@ struct ModuleConfig {
     startup_message: Option<String>,
     #[serde(default)]
     lifecycle: Option<ModuleLifecycleConfig>,
+    #[serde(default)]
+    resources: ModuleResourceConfig,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ModuleResourceConfig {
+    #[serde(rename = "filesystem-watches")]
+    filesystem_watches: Option<usize>,
+    #[serde(rename = "filesystem-watch-events")]
+    filesystem_watch_events: Option<usize>,
+}
+
+fn configured_plugin_resources(
+    resources: &ModuleResourceConfig,
+) -> Result<crate::state::ConfiguredPluginResources> {
+    let defaults = crate::state::ConfiguredPluginResources::default();
+    let filesystem_watches = resources
+        .filesystem_watches
+        .unwrap_or(defaults.filesystem_watches);
+    let filesystem_watch_events = resources
+        .filesystem_watch_events
+        .unwrap_or(defaults.filesystem_watch_events);
+    ensure!(
+        filesystem_watches > 0 && filesystem_watch_events > 0,
+        "plugin filesystem watch resource limits must be non-zero"
+    );
+    ensure!(
+        filesystem_watches <= defaults.filesystem_watches
+            && filesystem_watch_events <= defaults.filesystem_watch_events,
+        "plugin filesystem watch resource limits cannot exceed daemon ceilings"
+    );
+    Ok(crate::state::ConfiguredPluginResources {
+        filesystem_watches,
+        filesystem_watch_events,
+    })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -206,6 +241,8 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
                                 stop_timeout: Duration::from_millis(lifecycle.stop_timeout_ms),
                                 data: lifecycle.data,
                             }),
+                        configured_plugin_resources(&module.resources)
+                            .with_context(|| format!("validate config module {id} resources"))?,
                     )
                     .with_context(|| format!("load config module {id}"))?;
                 info!(
@@ -480,10 +517,74 @@ mod tests {
     };
 
     use super::{
-        BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, SessionRunnerSource,
-        discover_session_runner, read_config, repo_config_path_from_current_exe, resolve_path,
-        resolve_startup_argv, workspace_filesystem_capability,
+        BUILTIN_RUNNER_DETECTORS, DEFAULT_RUNNER_PRIORITY, ModuleResourceConfig,
+        SessionRunnerSource, configured_plugin_resources, discover_session_runner, read_config,
+        repo_config_path_from_current_exe, resolve_path, resolve_startup_argv,
+        workspace_filesystem_capability,
     };
+
+    #[test]
+    fn plugin_watch_resources_default_and_accept_narrow_nonzero_limits() {
+        assert_eq!(
+            configured_plugin_resources(&ModuleResourceConfig::default())
+                .expect("default resources"),
+            crate::state::ConfiguredPluginResources::default()
+        );
+        let resources = configured_plugin_resources(&ModuleResourceConfig {
+            filesystem_watches: Some(3),
+            filesystem_watch_events: Some(8),
+        })
+        .expect("narrow resources");
+        assert_eq!(resources.filesystem_watches, 3);
+        assert_eq!(resources.filesystem_watch_events, 8);
+    }
+
+    #[test]
+    fn plugin_watch_resources_reject_zero_and_daemon_ceiling_bypass() {
+        assert!(
+            configured_plugin_resources(&ModuleResourceConfig {
+                filesystem_watches: Some(0),
+                filesystem_watch_events: Some(8),
+            })
+            .is_err()
+        );
+        assert!(
+            configured_plugin_resources(&ModuleResourceConfig {
+                filesystem_watches: Some(17),
+                filesystem_watch_events: Some(4097),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parser_reads_plugin_resource_table() {
+        let root = temp_dir("plugin-resources");
+        std::fs::create_dir_all(&root).expect("create resource config dir");
+        let path = root.join("manifold.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [module.watcher]
+            kind = "plugin"
+            path = "watcher.wasm"
+
+            [module.watcher.resources]
+            filesystem-watches = 3
+            filesystem-watch-events = 64
+            "#,
+        )
+        .expect("write resource config");
+        let config = read_config(&path).expect("parse resource config");
+        let resources = &config
+            .module
+            .get("watcher")
+            .expect("watcher module")
+            .resources;
+        assert_eq!(resources.filesystem_watches, Some(3));
+        assert_eq!(resources.filesystem_watch_events, Some(64));
+        std::fs::remove_dir_all(root).expect("remove resource config");
+    }
 
     #[test]
     fn resolves_relative_paths_against_config_dir() {

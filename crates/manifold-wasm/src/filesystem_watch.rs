@@ -91,6 +91,8 @@ pub struct NativeFilesystemWatcherStats {
     pub registrations: usize,
     pub subscriptions: usize,
     pub setup_tasks: usize,
+    pub overflows: u64,
+    pub rescans: u64,
 }
 
 struct NativeWatcherInner {
@@ -99,6 +101,8 @@ struct NativeWatcherInner {
     registrations: Mutex<HashMap<NativeWatchKey, NativeRegistration>>,
     setup_threads: Mutex<Vec<JoinHandle<()>>>,
     pending_setups: Mutex<HashSet<u64>>,
+    overflows: Arc<AtomicU64>,
+    rescans: Arc<AtomicU64>,
 }
 
 impl Default for NativeWatcherInner {
@@ -109,6 +113,8 @@ impl Default for NativeWatcherInner {
             registrations: Mutex::new(HashMap::new()),
             setup_threads: Mutex::new(Vec::new()),
             pending_setups: Mutex::new(HashSet::new()),
+            overflows: Arc::new(AtomicU64::new(0)),
+            rescans: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -155,6 +161,10 @@ struct NativeSubscription {
     notification: NotificationId,
     queue: Arc<Mutex<WatchQueue>>,
     max_events: usize,
+    generation_overflows: Arc<AtomicU64>,
+    generation_rescans: Arc<AtomicU64>,
+    service_overflows: Arc<AtomicU64>,
+    service_rescans: Arc<AtomicU64>,
 }
 
 struct NativeSubscriptionToken {
@@ -175,6 +185,17 @@ struct FilesystemWatchInner {
     service: NativeFilesystemWatcherService,
     watches: Mutex<HashMap<FilesystemWatchId, FilesystemWatchEntry>>,
     orphaned_setups: Mutex<Vec<u64>>,
+    overflows: Arc<AtomicU64>,
+    rescans: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FilesystemWatchStats {
+    pub watches: usize,
+    pub max_watches: usize,
+    pub max_events: usize,
+    pub overflows: u64,
+    pub rescans: u64,
 }
 
 struct FilesystemWatchEntry {
@@ -232,6 +253,8 @@ impl NativeFilesystemWatcherService {
                 .pending_setups
                 .lock()
                 .map_or(0, |setups| setups.len()),
+            overflows: self.inner.overflows.load(Ordering::Acquire),
+            rescans: self.inner.rescans.load(Ordering::Acquire),
         }
     }
 
@@ -459,6 +482,8 @@ impl FilesystemWatchHub {
                 service,
                 watches: Mutex::new(HashMap::new()),
                 orphaned_setups: Mutex::new(Vec::new()),
+                overflows: Arc::new(AtomicU64::new(0)),
+                rescans: Arc::new(AtomicU64::new(0)),
             }),
         })
     }
@@ -526,6 +551,10 @@ impl FilesystemWatchHub {
             notification,
             queue: Arc::clone(&queue),
             max_events: self.inner.max_events,
+            generation_overflows: Arc::clone(&self.inner.overflows),
+            generation_rescans: Arc::clone(&self.inner.rescans),
+            service_overflows: Arc::clone(&self.inner.service.inner.overflows),
+            service_rescans: Arc::clone(&self.inner.service.inner.rescans),
         });
         let subscription = match self
             .inner
@@ -676,6 +705,16 @@ impl FilesystemWatchHub {
         }
     }
 
+    pub fn stats(&self) -> FilesystemWatchStats {
+        FilesystemWatchStats {
+            watches: self.inner.watches.lock().map_or(0, |watches| watches.len()),
+            max_watches: self.inner.max_watches,
+            max_events: self.inner.max_events,
+            overflows: self.inner.overflows.load(Ordering::Acquire),
+            rescans: self.inner.rescans.load(Ordering::Acquire),
+        }
+    }
+
     fn with_entry<T>(
         &self,
         watch: FilesystemWatchId,
@@ -786,6 +825,8 @@ fn signal_rescan(subscription: &NativeSubscription) {
     };
     queue.generation = queue.generation.saturating_add(1).max(1);
     let generation = queue.generation;
+    increment_saturating(&subscription.generation_rescans);
+    increment_saturating(&subscription.service_rescans);
     push_overflow(&mut queue.events, generation);
     drop(queue);
     let _signal_result = subscription
@@ -821,18 +862,13 @@ fn record_subscription_event(subscription: &NativeSubscription, result: &notify:
                 let Ok(path) = path.strip_prefix(&subscription.projection_root) else {
                     continue;
                 };
-                push_bounded_event(
-                    &mut queue.events,
-                    subscription.max_events,
-                    generation,
-                    kind,
-                    path,
-                );
+                push_subscription_event(&mut queue.events, subscription, generation, kind, path);
             }
         }
         Err(_error) => {
             queue.generation = queue.generation.saturating_add(1).max(1);
             let generation = queue.generation;
+            record_overflow(subscription);
             push_overflow(&mut queue.events, generation);
         }
     }
@@ -861,6 +897,32 @@ fn push_bounded_event(
     events.push_back(WatchEvent {
         generation,
         event: FilesystemWatchBatchEvent { kind, path },
+    });
+}
+
+fn push_subscription_event(
+    events: &mut VecDeque<WatchEvent>,
+    subscription: &NativeSubscription,
+    generation: u64,
+    kind: FilesystemWatchEventKind,
+    path: &Path,
+) {
+    if events.len() >= subscription.max_events {
+        record_overflow(subscription);
+    }
+    push_bounded_event(events, subscription.max_events, generation, kind, path);
+}
+
+fn record_overflow(subscription: &NativeSubscription) {
+    increment_saturating(&subscription.generation_overflows);
+    increment_saturating(&subscription.generation_rescans);
+    increment_saturating(&subscription.service_overflows);
+    increment_saturating(&subscription.service_rescans);
+}
+
+fn increment_saturating(counter: &AtomicU64) {
+    let _previous = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(1))
     });
 }
 
@@ -1251,6 +1313,9 @@ mod tests {
         await_setup(&small, &small_coordination, small_watch, small_notification).await?;
         let (large_watch, large_notification) = large.create(Path::new("."), true)?;
         await_setup(&large, &large_coordination, large_watch, large_notification).await?;
+        ensure!(small.stats().overflows == 0 && small.stats().rescans == 1);
+        ensure!(large.stats().overflows == 0 && large.stats().rescans == 1);
+        ensure!(service.stats().overflows == 0 && service.stats().rescans == 2);
 
         let event = Event::new(EventKind::Create(CreateKind::File))
             .add_path(root.path().join("one"))
@@ -1268,6 +1333,9 @@ mod tests {
         let (_, large_batch) = large.read(large_watch, large_bytes)?;
         let large_batch = String::from_utf8(large_batch)?;
         ensure!(large_batch.contains("created\tone") && large_batch.contains("created\ttwo"));
+        ensure!(small.stats().overflows == 1 && small.stats().rescans == 2);
+        ensure!(large.stats().overflows == 0 && large.stats().rescans == 1);
+        ensure!(service.stats().overflows == 1 && service.stats().rescans == 3);
 
         small.stop();
         large.stop();
@@ -1465,6 +1533,10 @@ mod tests {
             notification,
             queue: Arc::clone(&queue),
             max_events: 8,
+            generation_overflows: Arc::new(super::AtomicU64::new(0)),
+            generation_rescans: Arc::new(super::AtomicU64::new(0)),
+            service_overflows: Arc::new(super::AtomicU64::new(0)),
+            service_rescans: Arc::new(super::AtomicU64::new(0)),
         });
         let key = super::NativeWatchKey {
             path: root.path().to_path_buf(),

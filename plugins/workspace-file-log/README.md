@@ -68,9 +68,12 @@ before exercising full reconciliation; this limitation does not permit lossy
 or colliding index keys.
 
 The controller pauses the primary worker after a file notification while
-leaving its notification and watch alive, then creates 4,200 files. The mirror
-worker records the final routed path, proving the burst passed the primary
-queue's existing bound before the primary resumes. The primary log contains a
+leaving its notification and watch alive. Its manifest narrows the generation
+to three logical watches and 64 queued events per watch. The controller
+creates eighty paced files while the mirror drains, then waits for the mirror's
+distinct final-path record. That barrier proves every create was routed while
+only the paused primary retained more than its queue capacity. Status records
+the configured capacities and monotonic overflow increase. The primary log contains a
 new `rescan` and no incremental `overflow/` records. Its replacement index is
 then compared exactly with an independent walk of the real final workspace,
 including the first and last overflow files, a newly created file, a removed

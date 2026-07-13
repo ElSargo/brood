@@ -1037,6 +1037,7 @@ pub struct ComponentActor {
     generation: u64,
     completion_io: CompletionIo,
     coordination: CoordinationHub,
+    filesystem_watches: FilesystemWatchHub,
     commands: mpsc::Sender<RuntimeCommand>,
     mailbox_slots: Arc<Semaphore>,
     mailbox_capacity: usize,
@@ -1134,6 +1135,7 @@ impl ComponentActor {
         let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
         let observer_result_bytes = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel(config.command_capacity);
+        let actor_filesystem_watches = filesystem_watches.clone();
         let mut store = Store::new(
             &engine,
             ActorStore {
@@ -1201,6 +1203,7 @@ impl ComponentActor {
             generation,
             completion_io,
             coordination,
+            filesystem_watches: actor_filesystem_watches,
             commands: command_tx,
             mailbox_slots,
             mailbox_capacity,
@@ -1242,6 +1245,10 @@ impl ComponentActor {
     /// Snapshot live notification, pollable, and worker-wait registrations.
     pub fn coordination_stats(&self) -> crate::coordination::CoordinationStats {
         self.coordination.stats()
+    }
+
+    pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
+        self.filesystem_watches.stats()
     }
 
     /// Nonblocking actor-mailbox delivery.
