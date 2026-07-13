@@ -713,8 +713,10 @@ guest-owned atomic queue; host notifications suspend workers and schedule a
 coalesced actor event. The host-owned stdin duplex is retained only for an
 explicit ordinary-WASI compatibility case.
 
-Capability-rooted filesystem watches use the platform's native watcher through
-`filesystem_watch.rs`. A watch owns one generation notification shared across
+Capability-rooted filesystem watches use the daemon's shared native watcher
+service through `filesystem_watch.rs`. Canonical path and recursion-mode
+registrations are deduplicated while each logical watch owns a private bounded
+queue and one generation notification shared across
 the actor and worker Stores. Workers therefore select watch readiness through
 the existing bounded `wait-any` path, then drain relative-path event batches;
 recursive backend setup runs as host-owned work and publishes an initial rescan

@@ -6,12 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Native watches currently create one `notify` backend per logical watch
-  resource. Replace that with a daemon-wide watcher service which deduplicates
-  native path registrations and routes events into bounded, actor-generation
-  scoped subscription queues. Keep the existing guest watch/notification ABI;
-  capability-relative path projection, overflow, and teardown remain private
-  to each logical handle even when the kernel registration is shared.
 - Native capability-rooted filesystem watches currently exist only in the
   Preview 1 compatibility ABI. The Component backend still needs an equivalent
   WIT resource and SDK wrapper before both plugin backends have one I/O model.
@@ -108,6 +102,14 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Manifold owns one native filesystem-watcher service which deduplicates
+  canonical path plus recursion-mode registrations across actor generations.
+  Logical subscriptions keep private bounded queues, overflow, notification,
+  capability projection, and teardown; stale setup results cannot attach to a
+  recreated registration and backends are never destroyed under the registry
+  mutex. Status exposes native registrations, logical subscriptions, and setup
+  tasks. The real workspace plugin proves the shape with two active workers and
+  identical 198-byte logs backed by one registration and two subscriptions.
 - Filesystem-watch setup tasks are keyed and reaped, while unfinished orphan
   setup still counts against the watch ceiling until it exits. Logical drop
   never waits for recursive registration. Host teardown retires a watch's

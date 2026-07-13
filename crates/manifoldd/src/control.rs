@@ -3554,6 +3554,9 @@ struct StatusSnapshot {
     preview1_compat_workers_failed: u64,
     preview1_compat_workers_cancelled: u64,
     preview1_compat_last_worker_value: u64,
+    filesystem_watcher_registrations: usize,
+    filesystem_watcher_subscriptions: usize,
+    filesystem_watcher_setup_tasks: usize,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -3701,6 +3704,7 @@ impl StatusSnapshot {
             |rect| format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h),
         );
         let preview1_compat_stats = state.preview1_compat_stats();
+        let filesystem_watcher_stats = state.filesystem_watcher_stats();
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
@@ -3791,6 +3795,9 @@ impl StatusSnapshot {
                 .map_or(0, |stats| stats.workers_cancelled),
             preview1_compat_last_worker_value: preview1_compat_stats
                 .map_or(0, |stats| stats.last_worker_value),
+            filesystem_watcher_registrations: filesystem_watcher_stats.registrations,
+            filesystem_watcher_subscriptions: filesystem_watcher_stats.subscriptions,
+            filesystem_watcher_setup_tasks: filesystem_watcher_stats.setup_tasks,
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),

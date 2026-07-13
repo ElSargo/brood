@@ -1,10 +1,12 @@
 # Workspace file log plugin
 
-This Preview 1 compatibility plugin watches the workspace mounted at `.` and
-appends changed file names to `.manifold/workspace-file-log.log`.
+This Preview 1 compatibility plugin creates two logical watches of the workspace
+mounted at `.`. Independent workers append the same observable changes to
+`.manifold/workspace-file-log.log` and
+`.manifold/workspace-file-log.mirror.log`.
 
 The actor handles its `start` mailbox message by creating a capability-rooted
-host watch and spawning a worker. The worker performs one ordinary WASI scan
+host watches and spawning one worker for each. Each worker performs one ordinary WASI scan
 for `initial` records, then sleeps in the watch notification's host pollable.
 Native watch batches record `created`, `modified`, or `removed`; no periodic
 rescan is used. `.git`, `.direnv`, `.manifold`, and `target` are excluded so
@@ -15,7 +17,12 @@ fault-containment ceiling rather than an expected working set and proves that a
 real Preview 1 actor plus its workers can operate under the runtime's aggregate
 generation memory limit.
 
-The worker's native watch events exercise the notification lane. A `snapshot`
+Both workers' native watch events exercise independent notification lanes and
+bounded logical queues. `status-json` exposes two subscriptions backed by one
+native registration, while the two real logs demonstrate that both consumers
+remain useful; the proof also preserves those live counts in
+`.manifold/workspace-file-log.watch-status.json` for inspection after the
+offscreen daemon exits. This is the observable deduplication proof. A `snapshot`
 mailbox message separately makes the actor submit a completion read of the live
 log. Its read-completion handler submits the returned bytes as a completion
 write to `.manifold/workspace-file-log.snapshot`. The actor verifies the write
@@ -36,8 +43,9 @@ reconcile its state through the granted filesystem when that marker appears.
 Run `tools/test-workspace-file-log-plugin-nested.sh` from the repository root.
 The test uses Manifold's offscreen nested test topology and leaves the observed
 workspace under the printed path. Inspect
-`.manifold/workspace-file-log.log`: its `initial`, `created`, `modified`, and
-`removed` records are the watch proof. The controller then sends `snapshot` and
+both workspace file logs: their `initial`, `created`, `modified`, and `removed`
+records are the watch proof. The controller also checks the live daemon's one
+native registration and two logical subscriptions, then sends `snapshot` and
 checks that `.manifold/workspace-file-log.snapshot` is a nonempty byte-for-byte
 prefix of the append-only log containing the observed create, modify, and remove
 records. Those filesystem artifacts are the proof, rather than a

@@ -26,8 +26,10 @@ wait_for_log() {
 run_controller() {
   local workspace="$1"
   local log="$workspace/.manifold/workspace-file-log.log"
+  local mirror_log="$workspace/.manifold/workspace-file-log.mirror.log"
 
   wait_for_log "$log" "initial"
+  wait_for_log "$mirror_log" "initial"
   # The initial assertion is path-specific so it cannot pass on an empty log.
   for _ in $(seq 1 200); do
     [[ -f "$log" ]] && grep -q $'^initial\talpha.txt$' "$log" && break
@@ -39,6 +41,7 @@ run_controller() {
   # proves the full pre-existing directory tree is registered before the
   # mutations below are used as assertions.
   wait_for_log "$log" "rescan"
+  wait_for_log "$mirror_log" "rescan"
 
   printf 'created\n' > "$workspace/new-file.txt"
   printf 'changed\n' >> "$workspace/alpha.txt"
@@ -50,6 +53,33 @@ run_controller() {
   grep -q $'^created\tnew-file.txt$' "$log"
   grep -q $'^modified\talpha.txt$' "$log"
   grep -q $'^removed\tsrc/removed.txt$' "$log"
+  wait_for_log "$mirror_log" "created"
+  wait_for_log "$mirror_log" "modified"
+  wait_for_log "$mirror_log" "removed"
+  grep -q $'^created\tnew-file.txt$' "$mirror_log"
+  grep -q $'^modified\talpha.txt$' "$mirror_log"
+  grep -q $'^removed\tsrc/removed.txt$' "$mirror_log"
+
+  # Two independent guest handles and workers visibly maintain the primary
+  # and mirror logs, while daemon status shows one shared native registration.
+  status="$(ctl status-json)"
+  python3 - "$status" "$workspace/.manifold/workspace-file-log.watch-status.json" <<'PY'
+import json
+import sys
+status = json.loads(sys.argv[1])
+assert status["filesystem_watcher_registrations"] == 1, status
+assert status["filesystem_watcher_subscriptions"] == 2, status
+assert status["preview1_compat_notifications"] == 2, status
+proof = {
+    "filesystem_watcher_registrations": status["filesystem_watcher_registrations"],
+    "filesystem_watcher_subscriptions": status["filesystem_watcher_subscriptions"],
+    "preview1_compat_notifications": status["preview1_compat_notifications"],
+    "preview1_compat_workers_active": status["preview1_compat_workers_active"],
+}
+with open(sys.argv[2], "w", encoding="utf-8") as output:
+    json.dump(proof, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
 
   # Exercise real guest create/drop calls repeatedly while the primary watcher
   # remains live. Once all actor mailbox turns are observed, the runtime must
@@ -86,7 +116,9 @@ import sys
 status = json.loads(sys.argv[1])
 expected = int(sys.argv[2])
 assert status["preview1_compat_mailbox_dispatched"] >= expected, status
-assert status["preview1_compat_notifications"] == 1, status
+assert status["preview1_compat_notifications"] == 2, status
+assert status["filesystem_watcher_registrations"] == 1, status
+assert status["filesystem_watcher_subscriptions"] == 2, status
 assert status["preview1_compat_pending_notification_events"] == 0, status
 PY
   printf 'watch still live after churn\n' > "$workspace/after-watch-churn.txt"
@@ -96,6 +128,11 @@ PY
     sleep 0.05
   done
   grep -q $'^created\tafter-watch-churn.txt$' "$log"
+  for _ in $(seq 1 200); do
+    grep -q $'^created\tafter-watch-churn.txt$' "$mirror_log" && break
+    sleep 0.05
+  done
+  grep -q $'^created\tafter-watch-churn.txt$' "$mirror_log"
 
   # The worker remains active while a second mailbox turn asks the actor to
   # completion-read its live log and completion-write those bytes as a visible
@@ -136,7 +173,7 @@ import json
 import sys
 
 status = json.loads(sys.argv[1])
-assert status["preview1_compat_workers_active"] >= 1, status
+assert status["preview1_compat_workers_active"] >= 2, status
 assert status["preview1_compat_mailbox_dispatched"] >= 34, status
 assert status["preview1_compat_completion_delivered"] >= 2, status
 assert status["plugin_actor_failures"] == 0, status

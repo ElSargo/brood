@@ -650,6 +650,7 @@ pub struct Manifold {
     wasm_actor_names: Vec<String>,
     wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
     wasm_io_actors: BTreeMap<String, HostedIoActor>,
+    filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
     pub(crate) presentation_redraw_deferred: bool,
     pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
@@ -820,6 +821,7 @@ impl Manifold {
             wasm_actor_names: Vec::new(),
             wasm_actor_tasks: Vec::new(),
             wasm_io_actors: BTreeMap::new(),
+            filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
             presentation_redraw_deferred: false,
             presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
@@ -994,6 +996,10 @@ impl Manifold {
                 HostedIoActor::Component(_) => None,
             },
         ))
+    }
+
+    pub fn filesystem_watcher_stats(&self) -> manifold_wasm::NativeFilesystemWatcherStats {
+        self.filesystem_watcher_service.stats()
     }
 
     pub fn try_wasm_global_key_policy(
@@ -4172,17 +4178,20 @@ impl Manifold {
             |grant| grant.host_path.clone(),
         );
         let writable = filesystem.is_some_and(|grant| grant.writable);
-        let actor = runtime.block_on(manifold_wasm::Preview1CompatActor::load(
-            path,
-            manifold_wasm::Preview1ActorCapabilities {
-                filesystem: Some(manifold_wasm::Preview1FilesystemGrant {
-                    host_path,
-                    guest_path: ".".to_string(),
-                    writable,
-                }),
-            },
-            manifold_wasm::Preview1WorkerConfig::default(),
-        ))?;
+        let actor = runtime.block_on(
+            manifold_wasm::Preview1CompatActor::load_with_watcher_service(
+                path,
+                manifold_wasm::Preview1ActorCapabilities {
+                    filesystem: Some(manifold_wasm::Preview1FilesystemGrant {
+                        host_path,
+                        guest_path: ".".to_string(),
+                        writable,
+                    }),
+                },
+                manifold_wasm::Preview1WorkerConfig::default(),
+                self.filesystem_watcher_service.clone(),
+            ),
+        )?;
         // All work owned by the old generation is joined before the candidate
         // is published under the stable id.
         self.stop_hosted_io_actor(actor_name)?;

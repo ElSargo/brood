@@ -172,10 +172,15 @@ Recursive native registration runs as host-owned background work so a large
 existing tree cannot consume an actor dispatch deadline. Registration
 completion produces the first `rescan` marker because changes may race setup.
 
-The target host uses one session/daemon watcher service, deduplicates native
-path registrations, and routes events into private bounded subscription queues.
+The host uses one daemon watcher service, deduplicates canonical native path
+and recursion-mode registrations, and routes events into private bounded
+subscription queues.
 Logical handles retain independent actor-generation ownership, relative-path
 projection, overflow, and teardown even when they share a kernel registration.
+Generation teardown removes its subscriptions without disturbing other actors;
+the final subscriber releases the native registration. Daemon status exposes
+native registration, logical subscription, and in-progress setup counts so
+operators can distinguish sharing from leaked resources.
 
 ### Streams And Blobs
 

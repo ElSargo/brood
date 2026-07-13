@@ -57,7 +57,9 @@ use crate::coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError,
     NotificationId, PollError, PollableId, WaitMode,
 };
-use crate::filesystem_watch::{FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId};
+use crate::filesystem_watch::{
+    FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId, NativeFilesystemWatcherService,
+};
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
@@ -1117,13 +1119,37 @@ impl Preview1WorkerRuntime {
         capabilities: Preview1ActorCapabilities,
         config: Preview1WorkerConfig,
     ) -> Result<Self, Preview1WorkerError> {
-        Self::load_with_completion_observer(path.as_ref(), capabilities, config, |_io| {}).await
+        Self::load_with_watcher_service(
+            path,
+            capabilities,
+            config,
+            NativeFilesystemWatcherService::new(),
+        )
+        .await
+    }
+
+    /// Load using a daemon-owned native watcher service shared by generations.
+    pub async fn load_with_watcher_service(
+        path: impl AsRef<Path>,
+        capabilities: Preview1ActorCapabilities,
+        config: Preview1WorkerConfig,
+        watcher_service: NativeFilesystemWatcherService,
+    ) -> Result<Self, Preview1WorkerError> {
+        Self::load_with_completion_observer(
+            path.as_ref(),
+            capabilities,
+            config,
+            watcher_service,
+            |_io| {},
+        )
+        .await
     }
 
     async fn load_with_completion_observer<F>(
         path: &Path,
         capabilities: Preview1ActorCapabilities,
         config: Preview1WorkerConfig,
+        watcher_service: NativeFilesystemWatcherService,
         observe_completion: F,
     ) -> Result<Self, Preview1WorkerError>
     where
@@ -1212,7 +1238,8 @@ impl Preview1WorkerRuntime {
             max_outstanding: config.max_outstanding_io,
             max_completion_bytes: config.max_completion_bytes,
         };
-        let filesystem_watches = FilesystemWatchHub::new(
+        let filesystem_watches = FilesystemWatchHub::new_with_service(
+            watcher_service,
             completion_config.filesystem.as_ref(),
             coordination.clone(),
             config.max_filesystem_watches,
@@ -1547,6 +1574,30 @@ impl Preview1CompatActor {
             .unwrap_or("preview1-compat")
             .to_string();
         let runtime = Preview1WorkerRuntime::load(path, capabilities, config).await?;
+        Ok(Self { name, runtime })
+    }
+
+    /// Load with the daemon's shared native filesystem watcher service.
+    pub async fn load_with_watcher_service(
+        path: impl AsRef<Path>,
+        capabilities: Preview1ActorCapabilities,
+        config: Preview1WorkerConfig,
+        watcher_service: NativeFilesystemWatcherService,
+    ) -> Result<Self, Preview1WorkerError> {
+        let path = path.as_ref();
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("preview1-compat")
+            .to_string();
+        let runtime = Preview1WorkerRuntime::load_with_watcher_service(
+            path,
+            capabilities,
+            config,
+            watcher_service,
+        )
+        .await?;
         Ok(Self { name, runtime })
     }
 
@@ -3536,6 +3587,7 @@ mod tests {
             guest.path(),
             Preview1ActorCapabilities::default(),
             Preview1WorkerConfig::default(),
+            NativeFilesystemWatcherService::new(),
             move |io| {
                 let _result = observed_tx.send(io.clone());
             },
@@ -3581,6 +3633,7 @@ mod tests {
             guest.path(),
             Preview1ActorCapabilities::default(),
             Preview1WorkerConfig::default(),
+            NativeFilesystemWatcherService::new(),
             move |io| {
                 let _result = observed_tx.send(io.clone());
             },

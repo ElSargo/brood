@@ -16,15 +16,19 @@ const EVENT_COMPLETION_FAILED: u32 = 5;
 const STACK_ALIGNMENT: usize = 16;
 const LOG_DIRECTORY: &str = ".manifold";
 const LOG_PATH: &str = ".manifold/workspace-file-log.log";
+const MIRROR_LOG_PATH: &str = ".manifold/workspace-file-log.mirror.log";
 const SNAPSHOT_PATH: &str = ".manifold/workspace-file-log.snapshot";
 const SNAPSHOT_MAX_BYTES: u32 = 1024 * 1024;
 const WORKER_ARGUMENT: u32 = 1;
+const MIRROR_WORKER_ARGUMENT: u32 = 2;
 
 static WATCH_STARTED: AtomicU32 = AtomicU32::new(0);
 static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
 static ERROR_CODE: AtomicU32 = AtomicU32::new(0);
 static WATCH: AtomicU64 = AtomicU64::new(0);
 static NOTIFICATION: AtomicU64 = AtomicU64::new(0);
+static MIRROR_WATCH: AtomicU64 = AtomicU64::new(0);
+static MIRROR_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_READ_OPERATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_WRITE_OPERATION: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -147,23 +151,26 @@ fn dispatch_mailbox() {
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     {
-        let mut watch = 0_u64;
-        let path = b".";
-        let watch_status = unsafe {
-            host_filesystem_watch_create(path.as_ptr(), path.len() as u32, 1, &raw mut watch)
-        };
-        let mut notification = 0_u64;
-        if watch_status != 0
-            || host_filesystem_watch_notification(watch, &raw mut notification) != 0
-        {
+        let Some((watch, notification)) = create_recursive_watch() else {
             ERROR_CODE.store(2, Ordering::Release);
             WATCH_STARTED.store(0, Ordering::Release);
             return;
-        }
+        };
+        let Some((mirror_watch, mirror_notification)) = create_recursive_watch() else {
+            let _drop_status = host_filesystem_watch_drop(watch);
+            ERROR_CODE.store(2, Ordering::Release);
+            WATCH_STARTED.store(0, Ordering::Release);
+            return;
+        };
         WATCH.store(watch, Ordering::Release);
         NOTIFICATION.store(notification, Ordering::Release);
+        MIRROR_WATCH.store(mirror_watch, Ordering::Release);
+        MIRROR_NOTIFICATION.store(mirror_notification, Ordering::Release);
         let mut worker = 0_u64;
-        if host_worker_spawn(WORKER_ARGUMENT, &raw mut worker) != 0 {
+        let mut mirror_worker = 0_u64;
+        if host_worker_spawn(WORKER_ARGUMENT, &raw mut worker) != 0
+            || host_worker_spawn(MIRROR_WORKER_ARGUMENT, &raw mut mirror_worker) != 0
+        {
             ERROR_CODE.store(3, Ordering::Release);
             WATCH_STARTED.store(0, Ordering::Release);
         }
@@ -194,6 +201,17 @@ fn dispatch_mailbox() {
             ERROR_CODE.store(9, Ordering::Release);
         }
     }
+}
+
+fn create_recursive_watch() -> Option<(u64, u64)> {
+    let mut watch = 0_u64;
+    let path = b".";
+    let status = unsafe {
+        host_filesystem_watch_create(path.as_ptr(), path.len() as u32, 1, &raw mut watch)
+    };
+    let mut notification = 0_u64;
+    (status == 0 && host_filesystem_watch_notification(watch, &raw mut notification) == 0)
+        .then_some((watch, notification))
 }
 
 fn dispatch_snapshot_read() {
@@ -241,10 +259,20 @@ fn dispatch_snapshot_write() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
-    if argument != WORKER_ARGUMENT {
-        return 1;
-    }
-    match watch_workspace() {
+    let resources = match argument {
+        WORKER_ARGUMENT => (
+            WATCH.load(Ordering::Acquire),
+            NOTIFICATION.load(Ordering::Acquire),
+            LOG_PATH,
+        ),
+        MIRROR_WORKER_ARGUMENT => (
+            MIRROR_WATCH.load(Ordering::Acquire),
+            MIRROR_NOTIFICATION.load(Ordering::Acquire),
+            MIRROR_LOG_PATH,
+        ),
+        _ => return 1,
+    };
+    match watch_workspace(resources.0, resources.1, resources.2) {
         Ok(never) => never,
         Err(code) => {
             ERROR_CODE.store(code, Ordering::Release);
@@ -253,13 +281,11 @@ pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
     }
 }
 
-fn watch_workspace() -> Result<u32, u32> {
+fn watch_workspace(watch: u64, notification: u64, log_path: &str) -> Result<u32, u32> {
     fs::create_dir_all(LOG_DIRECTORY).map_err(|_| 10_u32)?;
     let previous = scan_workspace().map_err(|_| 11_u32)?;
-    append_initial(&previous).map_err(|_| 12_u32)?;
+    append_initial(log_path, &previous).map_err(|_| 12_u32)?;
     SCAN_COUNT.fetch_add(1, Ordering::AcqRel);
-    let watch = WATCH.load(Ordering::Acquire);
-    let notification = NOTIFICATION.load(Ordering::Acquire);
     if watch == 0 || notification == 0 {
         return Err(13);
     }
@@ -298,7 +324,7 @@ fn watch_workspace() -> Result<u32, u32> {
         if read_status != 0 || generation == 0 {
             return Err(17);
         }
-        append_watch_events(&bytes).map_err(|_| 18_u32)?;
+        append_watch_events(log_path, &bytes).map_err(|_| 18_u32)?;
         observed_generation = generation;
         SCAN_COUNT.fetch_add(1, Ordering::AcqRel);
     }
@@ -343,16 +369,16 @@ fn excluded_directory(path: &Path) -> bool {
     )
 }
 
-fn append_initial(files: &BTreeMap<String, FileStamp>) -> std::io::Result<()> {
-    let mut log = open_log()?;
+fn append_initial(log_path: &str, files: &BTreeMap<String, FileStamp>) -> std::io::Result<()> {
+    let mut log = open_log(log_path)?;
     for path in files.keys() {
         writeln!(log, "initial\t{path}")?;
     }
     log.flush()
 }
 
-fn append_watch_events(bytes: &[u8]) -> std::io::Result<()> {
-    let mut log = open_log()?;
+fn append_watch_events(log_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let mut log = open_log(log_path)?;
     for line in String::from_utf8_lossy(bytes).lines() {
         let Some((kind, path)) = line.split_once('\t') else {
             continue;
@@ -373,8 +399,8 @@ fn excluded_path(path: &Path) -> bool {
     })
 }
 
-fn open_log() -> std::io::Result<fs::File> {
-    OpenOptions::new().create(true).append(true).open(LOG_PATH)
+fn open_log(path: &str) -> std::io::Result<fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 fn read_event() -> Option<Vec<u8>> {
