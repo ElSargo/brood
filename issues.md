@@ -6,12 +6,6 @@ warnings without pretending these areas are already structurally clean.
 
 ## Plugin I/O follow-ups exposed by the real workspace watcher
 
-- Preview 1 shutdown cancels workers which are already active, but a worker
-  preparation which completes after shutdown begins can still start a new
-  worker. That worker missed the cancellation pass and can delay or hang hot
-  replacement. Once stopping begins, every late preparation result must drop
-  its prepared Store, release its reservation, and report cancellation instead
-  of starting the worker.
 - Completion writes run through `spawn_blocking`, but cancellation and shutdown
   abort only the async wrapper. A blocking filesystem operation which has
   already started can continue mutating the filesystem after a cancellation
@@ -127,6 +121,14 @@ warnings without pretending these areas are already structurally clean.
 
 ## Resolved
 
+- Preview 1 shutdown treats queued and in-flight worker preparation as owned
+  lifecycle state. Stopping cancels queued preparations, waits for late Stores
+  to return, drops them before execution, releases every guest stack/TLS
+  reservation, and reports cancellation to host-owned spawns. Already-queued
+  reservation releases are preserved while other actor work is discarded. The
+  exact races have deterministic gated tests; the real
+  `tools/test-wasm-preview1-worker-nested.sh` workload proves two-generation hot
+  replacement and structured shutdown with worker values 90 and 81.
 - Preview 1 completion dispatch has its own generously sized bounded lane. The
   parent stops receiving from the completion supervisor while that lane is full,
   but continues servicing control and shutdown commands; completion, mailbox,

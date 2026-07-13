@@ -36,6 +36,21 @@ host workloads, then proves completion I/O, guest-owned shared-memory
 coordination, notification coalescing, worker `wait-any`, cancellation teardown,
 ordinary WASI read compatibility, and structured shutdown.
 
+The Preview 1 unit suite deterministically gates a worker after Store and
+reservation preparation, begins shutdown, and then releases the late result. It
+also holds a completed worker's queued reservation release across shutdown.
+Together they assert cancellation and cleanup without relying on scheduler
+timing. `tools/test-wasm-preview1-worker-nested.sh` is the real lifecycle proof:
+it replaces a live generation with suspended workers, observes the generation
+change, then runs workers in the replacement before structured shutdown. Its
+fixed workload produces worker values 90 before replacement and 81 afterward.
+
+`plugins/workspace-file-log` remains a user-observable normal-operation
+regression workload. Its real initial scan, live create/modify/remove history,
+and completion-backed snapshot prove useful worker and I/O behavior through
+filesystem artifacts rather than a plugin success return; it does not itself
+exercise generation replacement.
+
 The cross-runtime Rube Goldberg workload composes those mechanisms across
 dozens of actors and workers. Its `quick` profile executes more than one
 thousand deterministic transitions and is the only profile included in CI:

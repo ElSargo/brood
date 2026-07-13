@@ -1790,6 +1790,44 @@ struct PreparedWorker {
     reservation: WorkerReservation,
 }
 
+#[cfg(test)]
+struct PreparationTestGate {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+static PREPARATION_TEST_GATE: Mutex<Option<PreparationTestGate>> = Mutex::new(None);
+
+#[cfg(test)]
+static SHUTDOWN_STARTED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+static HOLD_WORKER_RELEASE_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static WORKER_RELEASE_QUEUED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
+
+#[cfg(test)]
+static WORKER_LIFECYCLE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+async fn wait_at_preparation_test_gate() {
+    let gate = PREPARATION_TEST_GATE
+        .lock()
+        .ok()
+        .and_then(|mut gate| gate.take());
+    if let Some(gate) = gate {
+        let _result = gate.entered.send(());
+        let _result = gate.release.await;
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_preparation_test_gate() -> std::future::Ready<()> {
+    std::future::ready(())
+}
+
 struct ActiveWorker {
     abort: AbortHandle,
     completion: Option<oneshot::Sender<Result<u32, Preview1WorkerError>>>,
@@ -1849,45 +1887,81 @@ async fn parent_loop(
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
 
     let loop_result = loop {
-        if shutdown_reply.is_some() && active_workers.is_empty() {
+        if shutdown_reply.is_some()
+            && active_workers.is_empty()
+            && preparing_workers.is_empty()
+            && reservations.is_empty()
+        {
             break Ok(());
         }
 
-        let actor_dispatch_available = shutdown_reply.is_none() && actor_store.is_some();
+        let stopping = shutdown_reply.is_some();
+        let release_pending = actor_operations
+            .iter()
+            .any(|operation| matches!(operation, ActorOperation::ReleaseWorker { .. }));
+        #[cfg(test)]
+        let release_held = HOLD_WORKER_RELEASE_TEST.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let release_held = false;
+        #[cfg(test)]
+        if release_pending && release_held {
+            let observer = WORKER_RELEASE_QUEUED_TEST_OBSERVER
+                .lock()
+                .ok()
+                .and_then(|mut observer| observer.take());
+            if let Some(observer) = observer {
+                let _result = observer.send(());
+            }
+        }
+        let actor_dispatch_available = actor_store.is_some()
+            && (!stopping || release_pending)
+            && !(release_pending && release_held);
         let actor_work_pending = !actor_operations.is_empty()
             || !completion_operations.is_empty()
             || !notification_operations.is_empty();
         if actor_dispatch_available && actor_work_pending {
-            let notification_first = prefer_notification && !notification_operations.is_empty();
-            prefer_notification = !prefer_notification;
-            let operation = if should_dispatch_notification(
-                notification_first,
-                (
-                    notification_operations.is_empty(),
-                    actor_operations.is_empty(),
-                    completion_operations.is_empty(),
-                ),
-            ) {
-                let Some(notification) = notification_operations.pop_front() else {
+            let operation = if stopping {
+                let Some(index) = actor_operations.iter().position(|operation| {
+                    matches!(operation, ActorOperation::ReleaseWorker { .. })
+                }) else {
                     continue;
                 };
-                let Some(event) = coordination
-                    .take_actor_event(notification)
-                    .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?
-                else {
-                    continue;
-                };
-                ActorOperation::Dispatch(CompatEvent::Notification(event))
-            } else {
-                let Some(operation) = pop_preview_dispatch_operation(
-                    &mut actor_operations,
-                    &mut completion_operations,
-                    &mut prefer_completion,
-                    &mut prefer_mailbox,
-                ) else {
+                let Some(operation) = actor_operations.remove(index) else {
                     continue;
                 };
                 operation
+            } else {
+                let notification_first = prefer_notification && !notification_operations.is_empty();
+                prefer_notification = !prefer_notification;
+                if should_dispatch_notification(
+                    notification_first,
+                    (
+                        notification_operations.is_empty(),
+                        actor_operations.is_empty(),
+                        completion_operations.is_empty(),
+                    ),
+                ) {
+                    let Some(notification) = notification_operations.pop_front() else {
+                        continue;
+                    };
+                    let Some(event) = coordination
+                        .take_actor_event(notification)
+                        .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?
+                    else {
+                        continue;
+                    };
+                    ActorOperation::Dispatch(CompatEvent::Notification(event))
+                } else {
+                    let Some(operation) = pop_preview_dispatch_operation(
+                        &mut actor_operations,
+                        &mut completion_operations,
+                        &mut prefer_completion,
+                        &mut prefer_mailbox,
+                    ) else {
+                        continue;
+                    };
+                    operation
+                }
             };
             let Some(store) = actor_store.take() else {
                 continue;
@@ -1927,6 +2001,12 @@ async fn parent_loop(
                     cancel_all_workers(&mut active_workers);
                     coordination.stop();
                     completion_io.stop();
+                    prepare_actor_operations_for_shutdown(
+                        &mut actor_operations,
+                        &mut preparing_workers,
+                        &worker_inputs,
+                        &mut worker_slots,
+                    );
                     shutdown_reply = Some(oneshot::channel().0);
                     continue;
                 };
@@ -1975,6 +2055,7 @@ async fn parent_loop(
                                 continue;
                             };
                             worker_slots += 1;
+                            preparing_workers.insert(worker);
                             actor_operations.push_back(ActorOperation::PrepareWorker {
                                 worker,
                                 export,
@@ -2044,10 +2125,24 @@ async fn parent_loop(
                     Command::Shutdown { reply } => {
                         cancel_all_workers(&mut active_workers);
                         coordination.stop();
+                        #[cfg(test)]
+                        let shutdown_observer = SHUTDOWN_STARTED_TEST_OBSERVER
+                            .lock()
+                            .ok()
+                            .and_then(|mut observer| observer.take());
+                        #[cfg(test)]
+                        if let Some(observer) = shutdown_observer {
+                            let _result = observer.send(());
+                        }
+                        prepare_actor_operations_for_shutdown(
+                            &mut actor_operations,
+                            &mut preparing_workers,
+                            &worker_inputs,
+                            &mut worker_slots,
+                        );
                         if let Ok(mut inputs) = worker_inputs.lock() {
                             inputs.clear();
                         }
-                        actor_operations.clear();
                         completion_operations.clear();
                         notification_operations.clear();
                         completion_io.stop();
@@ -2104,7 +2199,8 @@ async fn parent_loop(
                         actor_store = Some(store);
                         preparing_workers.remove(&worker);
                         let guest_owned = reply.is_none();
-                        let cancelled = pending_cancellations.remove(&worker);
+                        let cancelled = shutdown_reply.is_some()
+                            || pending_cancellations.remove(&worker);
                         match result {
                             Ok(prepared) => {
                                 if cancelled {
@@ -2114,13 +2210,21 @@ async fn parent_loop(
                                     // until the prepared worker Store is gone.
                                     drop(prepared);
                                     remove_worker_input(&worker_inputs, worker);
+                                    reservations.insert(worker, reservation);
                                     actor_operations.push_front(ActorOperation::ReleaseWorker {
                                         worker,
                                         reservation,
                                     });
-                                    actor_operations.push_front(ActorOperation::Dispatch(
-                                        CompatEvent::WorkerCancelled(worker),
-                                    ));
+                                    if let Some(reply) = reply {
+                                        let _result = reply.send(Err(Preview1WorkerError::Cancelled));
+                                    }
+                                    if shutdown_reply.is_none() {
+                                        actor_operations.push_front(ActorOperation::Dispatch(
+                                            CompatEvent::WorkerCancelled(worker),
+                                        ));
+                                    } else {
+                                        stats.workers_cancelled.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 } else if overlaps_existing(prepared.reservation, reservations.values().copied()) {
                                     worker_slots = worker_slots.saturating_sub(1);
                                     actor_operations.push_front(ActorOperation::ReleaseWorker {
@@ -2171,17 +2275,24 @@ async fn parent_loop(
                                 worker_slots = worker_slots.saturating_sub(1);
                                 let message = error.to_string();
                                 if let Some(reply) = reply {
-                                    let _result = reply.send(Err(error));
+                                    let result = if cancelled {
+                                        Err(Preview1WorkerError::Cancelled)
+                                    } else {
+                                        Err(error)
+                                    };
+                                    let _result = reply.send(result);
                                 }
                                 if guest_owned {
                                     remove_worker_input(&worker_inputs, worker);
-                                    actor_operations.push_front(ActorOperation::Dispatch(
-                                        if cancelled {
-                                            CompatEvent::WorkerCancelled(worker)
-                                        } else {
-                                            CompatEvent::WorkerFailed { worker, message }
-                                        },
-                                    ));
+                                    if shutdown_reply.is_none() {
+                                        actor_operations.push_front(ActorOperation::Dispatch(
+                                            if cancelled {
+                                                CompatEvent::WorkerCancelled(worker)
+                                            } else {
+                                                CompatEvent::WorkerFailed { worker, message }
+                                            },
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -2415,6 +2526,7 @@ fn start_actor_operation(
                 )
             })
             .and_then(std::convert::identity);
+            wait_at_preparation_test_gate().await;
             CallDone::WorkerPrepared {
                 actor_store,
                 worker,
@@ -3009,6 +3121,32 @@ fn cancel_all_workers(active_workers: &mut HashMap<Preview1WorkerId, ActiveWorke
     }
 }
 
+fn prepare_actor_operations_for_shutdown(
+    actor_operations: &mut VecDeque<ActorOperation>,
+    preparing_workers: &mut HashSet<Preview1WorkerId>,
+    worker_inputs: &WorkerInputRegistry,
+    worker_slots: &mut usize,
+) {
+    let mut retained = VecDeque::with_capacity(actor_operations.len());
+    for operation in std::mem::take(actor_operations) {
+        match operation {
+            ActorOperation::PrepareWorker { worker, reply, .. } => {
+                preparing_workers.remove(&worker);
+                *worker_slots = worker_slots.saturating_sub(1);
+                remove_worker_input(worker_inputs, worker);
+                if let Some(reply) = reply {
+                    let _result = reply.send(Err(Preview1WorkerError::Cancelled));
+                }
+            }
+            operation @ ActorOperation::ReleaseWorker { .. } => retained.push_back(operation),
+            ActorOperation::Dispatch(_)
+            | ActorOperation::Mailbox { .. }
+            | ActorOperation::Call { .. } => {}
+        }
+    }
+    *actor_operations = retained;
+}
+
 struct EpochTicker {
     stop: std_mpsc::Sender<()>,
     thread: Option<thread::JoinHandle<()>>,
@@ -3055,6 +3193,45 @@ mod tests {
             kind: ActorCompletionKind::Write {
                 bytes_written: sequence,
             },
+        }
+    }
+
+    fn write_worker_lifecycle_module() -> Result<NamedTempFile> {
+        write_module(
+            r#"(module
+                (import "env" "memory" (memory 4 4 shared))
+                (global $stack_pointer (export "__stack_pointer") (mut i32)
+                    i32.const 131072)
+                (func (export "manifold_worker_reserve_v1")
+                    (param i32 i32 i32) (result i64)
+                    i64.const 562949953552384)
+                (func (export "manifold_worker_release_v1")
+                    (param i64 i32 i32 i32) (result i32)
+                    i32.const 0)
+                (func (export "manifold_actor_dispatch_v1")
+                    (param i32) (result i32)
+                    i32.const 0)
+                (func (export "manifold_worker_run_v1")
+                    (param i32) (result i32)
+                    i32.const 99)
+                (func (export "manifold_preview1_compat_v1") (result i32)
+                    i32.const 0x4d503101)
+            )"#,
+        )
+    }
+
+    fn worker_lifecycle_config() -> Preview1WorkerConfig {
+        Preview1WorkerConfig {
+            worker_stack_bytes: 64 * 1024,
+            ..Preview1WorkerConfig::default()
+        }
+    }
+
+    struct ReleaseHoldGuard;
+
+    impl Drop for ReleaseHoldGuard {
+        fn drop(&mut self) {
+            HOLD_WORKER_RELEASE_TEST.store(false, Ordering::Release);
         }
     }
 
@@ -3149,6 +3326,135 @@ mod tests {
             }
         }
         drop(lane);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cancels_late_worker_preparation_before_start_and_releases_it() -> Result<()> {
+        let _test_lock = WORKER_LIFECYCLE_TEST_LOCK.lock().await;
+        let guest = write_worker_lifecycle_module()?;
+        let mut runtime = Preview1WorkerRuntime::load(
+            guest.path(),
+            Preview1ActorCapabilities::default(),
+            worker_lifecycle_config(),
+        )
+        .await?;
+
+        let (preparation_entered, entered) = oneshot::channel();
+        let (release_preparation, preparation_release) = oneshot::channel();
+        *PREPARATION_TEST_GATE
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock preparation test gate: {error}"))? =
+            Some(PreparationTestGate {
+                entered: preparation_entered,
+                release: preparation_release,
+            });
+        let (shutdown_started, started) = oneshot::channel();
+        *SHUTDOWN_STARTED_TEST_OBSERVER
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock shutdown test observer: {error}"))? =
+            Some(shutdown_started);
+        let commands = runtime.commands.clone();
+
+        let spawn_result = {
+            let spawn = runtime.spawn_worker(COMPAT_WORKER_EXPORT, 7);
+            tokio::pin!(spawn);
+            tokio::select! {
+                result = &mut spawn => {
+                    drop(result);
+                    anyhow::bail!("worker preparation completed before the deterministic gate");
+                }
+                entered = entered => entered.context("preparation gate sender dropped")?,
+            }
+
+            let (shutdown_reply, shutdown_done) = oneshot::channel();
+            commands
+                .send(Command::Shutdown {
+                    reply: shutdown_reply,
+                })
+                .await
+                .context("send shutdown while preparation is pending")?;
+            timeout(Duration::from_secs(1), started)
+                .await
+                .context("shutdown did not begin while preparation was pending")?
+                .context("shutdown-start observer dropped")?;
+            release_preparation
+                .send(())
+                .map_err(|()| anyhow::anyhow!("preparation gate receiver dropped"))?;
+
+            let spawn_result = timeout(Duration::from_secs(1), &mut spawn)
+                .await
+                .context("late preparation did not report cancellation")?;
+            timeout(Duration::from_secs(1), shutdown_done)
+                .await
+                .context("shutdown did not wait for reservation release")?
+                .context("shutdown reply sender dropped")?;
+            spawn_result
+        };
+
+        ensure!(
+            matches!(spawn_result, Err(Preview1WorkerError::Cancelled)),
+            "late preparation was not cancelled"
+        );
+        runtime.await_parent().await?;
+        let stats = runtime.stats();
+        drop(runtime);
+        ensure!(stats.workers_active == 0);
+        ensure!(stats.workers_cancelled == 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_preserves_an_already_queued_worker_release() -> Result<()> {
+        let _test_lock = WORKER_LIFECYCLE_TEST_LOCK.lock().await;
+        let guest = write_worker_lifecycle_module()?;
+        let mut runtime = Preview1WorkerRuntime::load(
+            guest.path(),
+            Preview1ActorCapabilities::default(),
+            worker_lifecycle_config(),
+        )
+        .await?;
+        HOLD_WORKER_RELEASE_TEST.store(true, Ordering::Release);
+        let _release_hold = ReleaseHoldGuard;
+        let (release_queued, queued) = oneshot::channel();
+        *WORKER_RELEASE_QUEUED_TEST_OBSERVER
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock release test observer: {error}"))? =
+            Some(release_queued);
+
+        let worker = runtime.spawn_worker(COMPAT_WORKER_EXPORT, 7).await?;
+        timeout(Duration::from_secs(1), queued)
+            .await
+            .context("worker release was not queued")?
+            .context("worker-release observer dropped")?;
+        ensure!(worker.join().await? == 99);
+
+        let (shutdown_started, started) = oneshot::channel();
+        *SHUTDOWN_STARTED_TEST_OBSERVER
+            .lock()
+            .map_err(|error| anyhow::anyhow!("lock shutdown test observer: {error}"))? =
+            Some(shutdown_started);
+        let (shutdown_reply, shutdown_done) = oneshot::channel();
+        runtime
+            .commands
+            .send(Command::Shutdown {
+                reply: shutdown_reply,
+            })
+            .await
+            .context("send shutdown with a queued worker release")?;
+        timeout(Duration::from_secs(1), started)
+            .await
+            .context("shutdown did not begin with a queued release")?
+            .context("shutdown-start observer dropped")?;
+        HOLD_WORKER_RELEASE_TEST.store(false, Ordering::Release);
+        timeout(Duration::from_secs(1), shutdown_done)
+            .await
+            .context("shutdown discarded or failed to run the queued release")?
+            .context("shutdown reply sender dropped")?;
+        runtime.await_parent().await?;
+        let stats = runtime.stats();
+        drop(runtime);
+        ensure!(stats.workers_active == 0);
         Ok(())
     }
 

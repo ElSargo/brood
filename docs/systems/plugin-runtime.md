@@ -201,6 +201,12 @@ and operations, removes waits, closes actor-scoped resources, joins host work,
 and only then releases the address space. Session-scoped resources remain owned
 by the session service and may be reattached by a replacement actor.
 
+Worker preparation is part of that ownership boundary. Once stopping begins, a
+preparation which returns late must drop its prepared Store, release its guest
+stack and TLS reservation, and report cancellation; it must never begin guest
+worker execution. Replacement cannot publish the new generation until that
+cleanup has joined.
+
 Diagnostics must expose mailbox pressure, dispatch latency, live and waiting
 workers, outstanding operations, wait registrations, resource counts,
 cancellation, and terminal failures. One actor failure must remain local to
