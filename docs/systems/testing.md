@@ -41,6 +41,15 @@ that supervisor shutdown wakes, interrupts, and joins that exact child without
 fabricating a guest result. The composed screenshots and daemon lifecycle
 transcripts are the acceptance evidence, not the guest's integer return alone.
 
+`tools/test-wasm-actor-lifecycle-nested.sh` is the observable core-actor
+replacement and routing proof. A real subscribed plugin actor changes a live
+terminal and animated EGL client from columns to rows across same-name hot
+reload. Between those generations, an invalid two-actor candidate is rejected;
+a real mailbox probe and a third column screenshot prove that the old actor set
+remains owned and responsive. The module also contains a real unsubscribed poison actor which would
+spawn a third client on an incorrectly broadcast host event; the compositor
+dumps and both screenshots prove that only two panes remain.
+
 ## Built-In Nested Tests
 
 `manifold test` defaults to `manifold test nested`.

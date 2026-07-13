@@ -620,10 +620,14 @@ The systemd scope name embeds the launch id, allowing `launch_context::current_l
 
 ### 15.1 Core-module actors and global key policy
 
-`crates/manifold-wasm/src/module.rs` discovers named actor and policy-provider
-exports in a self-contained core module. `WasmActor` runs one bounded actor
-epoch at a time against a registered mailbox and dispatches its outbox through
-the host registry.
+`crates/manifold-wasm/src/module.rs` discovers named actors, their typed event
+subscriptions, and policy-provider exports in a self-contained core module.
+The daemon stages replacement actors against unreachable prepared mailboxes,
+cancels and joins the published generation, atomically activates the candidate
+mailbox set, and then starts the new generation tasks. Actor identities,
+declarations, cancellation, and joins are owned by that generation together.
+`WasmActor` runs one bounded actor epoch at a time and dispatches its outbox
+through the host registry.
 
 `crates/manifold-wasm/src/global_key_policy.rs` constructs one typed invocation
 context for the selected synchronous key provider. The context groups the
@@ -639,11 +643,12 @@ decoding for the exact ABI.
 ### 15.2 Actor-driven layout policy
 
 Layout is no longer a standalone direct map-hook import lane. When pane
-inventory changes, the daemon emits `pane-mapped` and `layout-state` messages
-to the loaded plugin actors. An actor can post a `set-resolved-layout` command
-to the host actor mailbox. The daemon validates pane identity, geometry, focus,
-and input behavior before accepting the layout, and falls back to native layout
-when validation fails.
+inventory changes, the daemon routes typed `pane-mapped` and `layout-state`
+messages only to actors whose declarations subscribe to that event kind. A
+new generation receives an initial layout snapshot. An actor can post a
+`set-resolved-layout` command to the host actor mailbox. The daemon validates
+pane identity, geometry, focus, and input behavior before accepting the layout,
+and falls back to native layout when no actor subscribes or validation fails.
 
 ### 15.3 Test harness ABI
 

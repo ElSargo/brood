@@ -628,6 +628,96 @@ enum HostedIoActor {
     Preview1(manifold_wasm::Preview1CompatActor),
 }
 
+struct LegacyWasmActorGeneration {
+    declarations: Vec<manifold_wasm::WasmActorDeclaration>,
+    actor_ids: BTreeMap<String, manifold_wasm::ActorId>,
+    cancellation: tokio::sync::watch::Sender<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl LegacyWasmActorGeneration {
+    fn actor_names(&self) -> Vec<String> {
+        self.declarations
+            .iter()
+            .map(|actor| actor.name.clone())
+            .collect()
+    }
+
+    fn subscribers(&self, event: manifold_wasm::WasmActorEventKind) -> Vec<String> {
+        self.declarations
+            .iter()
+            .filter(|actor| actor.subscribes_to(event))
+            .map(|actor| actor.name.clone())
+            .collect()
+    }
+}
+
+async fn cancel_and_join_legacy_generation(generation: LegacyWasmActorGeneration) {
+    let actor_names = generation.actor_names();
+    let _ = generation.cancellation.send(true);
+    for (actor_name, task) in actor_names.into_iter().zip(generation.tasks) {
+        match task.await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(actor = %actor_name, error = %error, "legacy WASM actor join failed");
+            }
+        }
+    }
+}
+
+fn spawn_legacy_actor_task(
+    runtime: &tokio::runtime::Handle,
+    mut actor: manifold_wasm::WasmActor,
+    declaration: manifold_wasm::WasmActorDeclaration,
+    registry: Arc<tokio::sync::Mutex<manifold_wasm::Registry>>,
+    host_events: channel::Sender<PluginHostEvent>,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
+    path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
+        info!(actor = %declaration.name, export = %declaration.export_name, path = %path.display(), "started WASM plugin actor generation");
+        loop {
+            let outcome = tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    if changed.is_err() || *cancellation.borrow() {
+                        info!(actor = %declaration.name, "cancelled WASM plugin actor generation");
+                        return;
+                    }
+                    continue;
+                }
+                outcome = actor.run_one_epoch() => outcome,
+            };
+            match outcome {
+                Ok(manifold_wasm::ActorEpochOutcome::Continue { outbox }) => {
+                    if let Some(outbox) = outbox {
+                        let refresh_layout = !outbox.publications.is_empty();
+                        let dispatch = {
+                            let mut registry = registry.lock().await;
+                            actor.dispatch_outbox(&mut registry, &outbox)
+                        };
+                        if let Err(error) = dispatch {
+                            warn!(actor = %declaration.name, error = %error, "WASM plugin actor outbox dispatch failed");
+                        }
+                        let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
+                        if refresh_layout {
+                            let _ = host_events.send(PluginHostEvent::RefreshWasmLayout);
+                        }
+                    }
+                }
+                Ok(manifold_wasm::ActorEpochOutcome::Stop) => {
+                    info!(actor = %declaration.name, "WASM plugin actor stopped");
+                    return;
+                }
+                Err(error) => {
+                    warn!(actor = %declaration.name, error = %error, "WASM plugin actor epoch failed");
+                    return;
+                }
+            }
+        }
+    })
+}
+
 #[derive(Clone)]
 struct HostedPluginFilesystem {
     host_path: PathBuf,
@@ -903,8 +993,7 @@ pub struct Manifold {
     plugin_actor_last_status: Option<String>,
     wasm_registry: Arc<tokio::sync::Mutex<manifold_wasm::Registry>>,
     wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
-    wasm_actor_names: Vec<String>,
-    wasm_actor_tasks: Vec<tokio::task::JoinHandle<()>>,
+    legacy_wasm_actor_generation: Option<LegacyWasmActorGeneration>,
     wasm_io_actors: BTreeMap<String, HostedIoActor>,
     configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
     configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
@@ -1057,8 +1146,7 @@ impl Manifold {
             plugin_actor_last_status: None,
             wasm_registry: Arc::new(tokio::sync::Mutex::new(wasm_registry)),
             wasm_host_mailbox: Some(wasm_host_mailbox),
-            wasm_actor_names: Vec::new(),
-            wasm_actor_tasks: Vec::new(),
+            legacy_wasm_actor_generation: None,
             wasm_io_actors: BTreeMap::new(),
             configured_workspace_plugins: BTreeMap::new(),
             configured_plugin_lifecycles: BTreeMap::new(),
@@ -1107,6 +1195,21 @@ impl Manifold {
         self.drain_hosted_actor_events();
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             actor.try_send_message(sender, body.into_bytes())?;
+            self.plugin_actor_messages += 1;
+            self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+            return Ok(());
+        }
+        if self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .is_some_and(|generation| {
+                generation
+                    .declarations
+                    .iter()
+                    .any(|actor| actor.name == actor_id)
+            })
+        {
+            self.try_route_wasm_actor_message(actor_id, sender, body.into_bytes())?;
             self.plugin_actor_messages += 1;
             self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
             return Ok(());
@@ -1354,7 +1457,10 @@ impl Manifold {
     }
 
     fn latest_wasm_policy_state_publication(&self) -> Option<manifold_wasm::PublicationFrameLease> {
-        let actor_names = self.wasm_actor_names.clone();
+        let actor_names = self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .map_or_else(Vec::new, LegacyWasmActorGeneration::actor_names);
         self.block_on_wasm_registry(|registry| {
             actor_names.iter().find_map(|actor| {
                 let actor_id = registry.actor_id_for_name(actor)?;
@@ -1393,41 +1499,20 @@ impl Manifold {
             })
             .collect::<Vec<_>>()
             .join(",");
-        self.emit_wasm_actor_event_to_all(&format!(
+        self.emit_wasm_actor_event(
+            manifold_wasm::WasmActorEventKind::LayoutState,
+            &format!(
             r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"pane_app_ids":[{}],"size":{{"w":{},"h":{}}}}}"#,
             panes, focused, pane_app_ids, size.w, size.h
-        ));
+            ),
+        );
     }
 
-    fn emit_wasm_actor_event_to_all(&mut self, payload: &str) {
-        self.drain_hosted_actor_events();
-        let io_actor_deliveries = self
-            .wasm_io_actors
-            .iter()
-            .map(|(actor_name, actor)| {
-                (
-                    actor_name.clone(),
-                    actor.kind(),
-                    actor
-                        .try_send_message("host".to_string(), payload.as_bytes().to_vec())
-                        .map_err(|error| error.to_string()),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (actor_name, actor_kind, delivery) in io_actor_deliveries {
-            match delivery {
-                Ok(()) => {
-                    self.plugin_actor_messages += 1;
-                    self.plugin_actor_last_status = Some(format!("{actor_name}:event_queued"));
-                }
-                Err(err) => {
-                    self.plugin_actor_failures += 1;
-                    self.plugin_actor_last_status = Some(format!("{actor_name}:event_error"));
-                    warn!(actor = %actor_name, kind = actor_kind, error = %err, "failed to enqueue hosted I/O actor event");
-                }
-            }
-        }
-        let actor_names = self.wasm_actor_names.clone();
+    fn emit_wasm_actor_event(&mut self, event: manifold_wasm::WasmActorEventKind, payload: &str) {
+        let actor_names = self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .map_or_else(Vec::new, |generation| generation.subscribers(event));
         for actor in actor_names {
             let result = self.block_on_wasm_registry(|registry| {
                 registry.try_post_named_message(&actor, payload.as_bytes().to_vec())
@@ -1440,7 +1525,7 @@ impl Manifold {
                 Ok(Err(err)) | Err(err) => {
                     self.plugin_actor_failures += 1;
                     self.plugin_actor_last_status = Some(format!("{actor}:event_error"));
-                    warn!(actor = %actor, error = %err, "failed to enqueue WASM actor event");
+                    warn!(actor = %actor, event = event.message_type(), error = %err, "failed to enqueue subscribed WASM actor event");
                 }
             }
         }
@@ -2658,11 +2743,14 @@ impl Manifold {
             self.refresh_resolved_layout_from_policy();
             return self.active_content_surface_for_layout_action();
         }
-        self.emit_wasm_actor_event_to_all(&format!(
-            r#"{{"type":"pane-mapped","pane":{},"session":{}}}"#,
-            registered.pane_id,
-            registered.session.raw()
-        ));
+        self.emit_wasm_actor_event(
+            manifold_wasm::WasmActorEventKind::PaneMapped,
+            &format!(
+                r#"{{"type":"pane-mapped","pane":{},"session":{}}}"#,
+                registered.pane_id,
+                registered.session.raw()
+            ),
+        );
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
             && registered.session == self.sessions.active()
         {
@@ -2958,7 +3046,15 @@ impl Manifold {
     }
 
     fn refresh_resolved_layout_from_policy_with_extra_pane(&mut self, extra_pane: Option<u64>) {
-        if self.wasm_actor_names.is_empty() {
+        let has_layout_subscriber =
+            self.legacy_wasm_actor_generation
+                .as_ref()
+                .is_some_and(|generation| {
+                    !generation
+                        .subscribers(manifold_wasm::WasmActorEventKind::LayoutState)
+                        .is_empty()
+                });
+        if !has_layout_subscriber {
             self.refresh_resolved_layout_from_native_policy();
             return;
         }
@@ -4502,19 +4598,24 @@ impl Manifold {
         ))?;
         self.ensure_legacy_wasm_actor_ids_available(&inventory.actors)?;
 
-        if let Some(provider) = select_policy_provider(
+        let candidate_key_policy = if let Some(provider) = select_policy_provider(
             &inventory.policy_providers,
             manifold_wasm::PolicyProviderKind::Key,
             "workspace",
         )? {
-            self.wasm_global_key_policy = Some(
+            Some((
+                provider.name.clone(),
                 manifold_wasm::WasmGlobalKeyPolicy::load_from_module(engine, &module, provider)?,
-            );
-            info!(provider = %provider.name, path = %path.display(), "loaded WASM plugin key policy");
-        }
+            ))
+        } else {
+            None
+        };
 
-        self.stop_legacy_wasm_plugin_actors()?;
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
+        if let Some((provider_name, policy)) = candidate_key_policy {
+            self.wasm_global_key_policy = Some(policy);
+            info!(provider = %provider_name, path = %path.display(), "loaded WASM plugin key policy");
+        }
         Ok(())
     }
 
@@ -4651,7 +4752,13 @@ impl Manifold {
 
     fn ensure_hosted_io_actor_id_available(&self, actor_name: &str) -> Result<()> {
         ensure!(
-            !self.wasm_actor_names.iter().any(|name| name == actor_name),
+            !self
+                .legacy_wasm_actor_generation
+                .as_ref()
+                .is_some_and(|generation| generation
+                    .declarations
+                    .iter()
+                    .any(|actor| actor.name == actor_name)),
             "hosted I/O actor id {actor_name:?} conflicts with a legacy WASM actor"
         );
         let conflicts_with_builtin = self.plugin_runtime.as_ref().is_some_and(|runtime| {
@@ -4745,28 +4852,21 @@ impl Manifold {
     }
 
     pub(crate) fn stop_legacy_wasm_plugin_actors(&mut self) -> Result<()> {
-        let tasks = self.wasm_actor_tasks.drain(..).collect::<Vec<_>>();
-        for task in &tasks {
-            task.abort();
-        }
-        let old_names = std::mem::take(&mut self.wasm_actor_names);
-        if let Some(runtime) = self.async_runtime.as_ref() {
-            let registry = Arc::clone(&self.wasm_registry);
-            runtime.block_on(async move {
-                for task in tasks {
-                    let _ = task.await;
-                }
-                let mut registry = registry.lock().await;
-                for name in old_names {
-                    registry.unregister_actor(&name);
-                }
-            });
-        } else {
-            ensure!(
-                tasks.is_empty(),
-                "cannot join legacy WASM actors without the async runtime"
-            );
-        }
+        let Some(generation) = self.legacy_wasm_actor_generation.take() else {
+            return Ok(());
+        };
+        let actor_ids = generation.actor_ids.clone();
+        let Some(runtime) = self.async_runtime.as_ref() else {
+            anyhow::bail!("cannot cancel and join legacy WASM actors without the async runtime");
+        };
+        let registry = Arc::clone(&self.wasm_registry);
+        runtime.block_on(async move {
+            cancel_and_join_legacy_generation(generation).await;
+            let mut registry = registry.lock().await;
+            for (name, actor_id) in actor_ids {
+                registry.unregister_actor_generation(&name, actor_id);
+            }
+        });
         Ok(())
     }
 
@@ -4778,67 +4878,83 @@ impl Manifold {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
         };
-        self.wasm_actor_names = actors.iter().map(|actor| actor.name.clone()).collect();
+        let registry = Arc::clone(&self.wasm_registry);
+        let mut candidates = Vec::with_capacity(actors.len());
+        let mut actor_ids = BTreeMap::new();
+        let mut registrations = Vec::with_capacity(actors.len());
         for actor in actors {
-            let path = path.to_path_buf();
-            let actor_name = actor.name.clone();
-            let export_name = actor.export_name.clone();
-            let registry = Arc::clone(&self.wasm_registry);
-            let host_events = self.plugin_host_event_sender.clone();
-            let mailbox = runtime.block_on({
+            let (registration, mailbox) = runtime.block_on({
                 let registry = Arc::clone(&registry);
-                let actor_name = actor_name.clone();
-                async move { registry.lock().await.register_actor(actor_name, 64) }
+                let actor_name = actor.name.clone();
+                async move { registry.lock().await.prepare_actor(actor_name, 64) }
             })?;
-            let task = runtime.spawn(async move {
-                let mut actor = match manifold_wasm::WasmActor::load_named(
-                    &path,
+            let candidate = runtime
+                .block_on(manifold_wasm::WasmActor::load_named(
+                    path,
                     mailbox,
-                    &export_name,
-                )
-                .await
-                {
-                    Ok(actor) => actor,
-                    Err(err) => {
-                        warn!(actor = %actor_name, error = %err, "failed to load WASM plugin actor");
-                        return;
-                    }
-                };
-                info!(actor = %actor_name, export = %export_name, path = %path.display(), "started WASM plugin actor");
-                loop {
-                    let outcome = match actor.run_one_epoch().await {
-                        Ok(outcome) => outcome,
-                        Err(err) => {
-                            warn!(actor = %actor_name, error = %err, "WASM plugin actor epoch failed");
-                            return;
-                        }
-                    };
-                    match outcome {
-                        manifold_wasm::ActorEpochOutcome::Continue { outbox } => {
-                            if let Some(outbox) = outbox {
-                                let dispatch = {
-                                    let mut registry = registry.lock().await;
-                                    actor.dispatch_outbox(&mut registry, &outbox)
-                                };
-                                if let Err(err) = dispatch {
-                                    warn!(actor = %actor_name, error = %err, "WASM plugin actor outbox dispatch failed");
-                                }
-                                let refresh_layout = !outbox.publications.is_empty();
-                                let _ = host_events.send(PluginHostEvent::DrainWasmHostMailbox);
-                                if refresh_layout {
-                                    let _ = host_events.send(PluginHostEvent::RefreshWasmLayout);
-                                }
-                            }
-                        }
-                        manifold_wasm::ActorEpochOutcome::Stop => {
-                            info!(actor = %actor_name, "WASM plugin actor stopped");
-                            return;
-                        }
-                    }
-                }
-            });
-            self.wasm_actor_tasks.push(task);
+                    &actor.export_name,
+                ))
+                .with_context(|| format!("load candidate WASM actor {:?}", actor.name))?;
+            actor_ids.insert(actor.name.clone(), candidate.actor_id());
+            registrations.push(registration);
+            candidates.push((actor.clone(), candidate));
         }
+
+        let old_names = self
+            .legacy_wasm_actor_generation
+            .as_ref()
+            .map_or_else(Vec::new, LegacyWasmActorGeneration::actor_names);
+        runtime.block_on({
+            let registry = Arc::clone(&registry);
+            let registrations = &registrations;
+            let old_names = &old_names;
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .validate_prepared_actors(registrations, old_names)
+            }
+        })?;
+
+        // The retiring generation remains the published owner through its
+        // cancellation and join. It cannot dispatch a host mutation after the
+        // registry switches to the candidate generation.
+        if let Some(old_generation) = self.legacy_wasm_actor_generation.take() {
+            runtime.block_on(cancel_and_join_legacy_generation(old_generation));
+        }
+
+        runtime.block_on({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .activate_prepared_actors(registrations, &old_names)
+            }
+        })?;
+
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        let tasks = candidates
+            .into_iter()
+            .map(|(declaration, actor)| {
+                spawn_legacy_actor_task(
+                    &runtime,
+                    actor,
+                    declaration,
+                    Arc::clone(&registry),
+                    self.plugin_host_event_sender.clone(),
+                    cancellation.subscribe(),
+                    path.to_path_buf(),
+                )
+            })
+            .collect();
+        self.legacy_wasm_actor_generation = Some(LegacyWasmActorGeneration {
+            declarations: actors.to_vec(),
+            actor_ids,
+            cancellation,
+            tasks,
+        });
+        self.refresh_resolved_layout_from_policy();
         Ok(())
     }
 
@@ -6574,11 +6690,17 @@ struct WindowRefreshOutcome {
     reason = "unit tests use direct fixture setup and focused state assertions"
 )]
 mod tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
     use super::{
-        AgentNotification, ConfiguredPluginResources, ExtensionMetadata, Manifold,
-        PresentationStatus, SESSION_OUTPUT_SIZE, aggregate_preview1_compat_stats,
-        ensure_legacy_instance_id_supported, fullscreen_layout_rect,
-        legacy_instance_id_to_validate, wasm_plugin_instance_id,
+        AgentNotification, ConfiguredPluginResources, ExtensionMetadata, LegacyWasmActorGeneration,
+        Manifold, PresentationStatus, SESSION_OUTPUT_SIZE, aggregate_preview1_compat_stats,
+        cancel_and_join_legacy_generation, ensure_legacy_instance_id_supported,
+        fullscreen_layout_rect, legacy_instance_id_to_validate, wasm_plugin_instance_id,
         window_surface_origin_in_compositor_space,
     };
     use crate::layout::LayoutSize;
@@ -6586,8 +6708,78 @@ mod tests {
         reexports::{calloop::EventLoop, wayland_server::Display},
         utils::Point,
     };
-    use std::path::{Path, PathBuf};
 
+    #[test]
+    fn event_routes_include_only_explicit_subscribers() {
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        let generation = LegacyWasmActorGeneration {
+            declarations: vec![
+                manifold_wasm::WasmActorDeclaration {
+                    name: "layout".to_string(),
+                    export_name: "manifold_actor_layout_epoch_run".to_string(),
+                    subscriptions: BTreeSet::from([
+                        manifold_wasm::WasmActorEventKind::PaneMapped,
+                        manifold_wasm::WasmActorEventKind::LayoutState,
+                    ]),
+                },
+                manifold_wasm::WasmActorDeclaration {
+                    name: "poison".to_string(),
+                    export_name: "manifold_actor_poison_epoch_run".to_string(),
+                    subscriptions: BTreeSet::new(),
+                },
+            ],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: Vec::new(),
+        };
+
+        assert_eq!(
+            generation.subscribers(manifold_wasm::WasmActorEventKind::PaneMapped),
+            vec!["layout"]
+        );
+        assert_eq!(
+            generation.subscribers(manifold_wasm::WasmActorEventKind::LayoutState),
+            vec!["layout"]
+        );
+    }
+
+    #[test]
+    fn retiring_generation_is_joined_before_replacement_can_continue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (cancellation, mut receiver) = tokio::sync::watch::channel(false);
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let task_mutations = Arc::clone(&mutations);
+        let task = runtime.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = receiver.changed() => {}
+                _ = gate => {
+                    task_mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        let generation = LegacyWasmActorGeneration {
+            declarations: vec![manifold_wasm::WasmActorDeclaration {
+                name: "layout".to_string(),
+                export_name: "manifold_actor_layout_epoch_run".to_string(),
+                subscriptions: BTreeSet::new(),
+            }],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: vec![task],
+        };
+
+        runtime.block_on(cancel_and_join_legacy_generation(generation));
+        assert!(
+            release.send(()).is_err(),
+            "retiring task must already be gone"
+        );
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
     fn preview1_stats(generation: u64, scale: u64) -> manifold_wasm::Preview1CompatStats {
         manifold_wasm::Preview1CompatStats {
             generation,
@@ -6698,7 +6890,17 @@ mod tests {
         let mut event_loop = EventLoop::try_new().expect("event loop");
         let display = Display::new().expect("display");
         let mut state = Manifold::new(&mut event_loop, display);
-        state.wasm_actor_names.push("taken".to_string());
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        state.legacy_wasm_actor_generation = Some(LegacyWasmActorGeneration {
+            declarations: vec![manifold_wasm::WasmActorDeclaration {
+                name: "taken".to_string(),
+                export_name: "manifold_actor_taken_epoch_run".to_string(),
+                subscriptions: BTreeSet::new(),
+            }],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: Vec::new(),
+        });
 
         assert!(state.ensure_hosted_io_actor_id_available("taken").is_err());
         assert!(state.ensure_hosted_io_actor_id_available("free").is_ok());
@@ -6712,6 +6914,7 @@ mod tests {
         let actor = manifold_wasm::WasmActorDeclaration {
             name: "duplicate".to_string(),
             export_name: "actor_duplicate".to_string(),
+            subscriptions: BTreeSet::new(),
         };
 
         assert!(
@@ -6946,8 +7149,21 @@ mod tests {
         let mut state = Manifold::new(&mut event_loop, display);
 
         assert!(state.latest_wasm_policy_state_publication().is_none());
-        state.wasm_actor_names.push("not-started".to_string());
-        state.emit_wasm_actor_event_to_all(r#"{"type":"ownership-proof"}"#);
+        let (cancellation, _) = tokio::sync::watch::channel(false);
+        state.legacy_wasm_actor_generation = Some(LegacyWasmActorGeneration {
+            declarations: vec![manifold_wasm::WasmActorDeclaration {
+                name: "not-started".to_string(),
+                export_name: "manifold_actor_not-started_epoch_run".to_string(),
+                subscriptions: BTreeSet::from([manifold_wasm::WasmActorEventKind::PaneMapped]),
+            }],
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: Vec::new(),
+        });
+        state.emit_wasm_actor_event(
+            manifold_wasm::WasmActorEventKind::PaneMapped,
+            r#"{"type":"pane-mapped"}"#,
+        );
 
         assert_eq!(state.plugin_actor_failures, 1);
         assert_eq!(

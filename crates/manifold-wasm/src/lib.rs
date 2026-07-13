@@ -75,12 +75,13 @@ pub use lifecycle::{
 };
 pub use mailbox::{
     ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxRegistry,
+    PreparedMailboxRegistration,
 };
 pub use module::{
-    DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, WasmActorDeclaration, WasmModuleInventory,
-    WasmPluginConfig, WasmPluginModule,
+    DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, WasmActorDeclaration, WasmActorEventKind,
+    WasmModuleInventory, WasmPluginConfig, WasmPluginModule,
 };
-pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX};
+pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX, ACTOR_SUBSCRIPTION_INFIX};
 pub use policy_provider::{
     DEFAULT_PUBLICATION_SLOT, POLICY_PROVIDER_RESPONSE_ABSTAIN, POLICY_PROVIDER_RESPONSE_ERROR,
     POLICY_PROVIDER_RESPONSE_OK, PolicyProviderDeclaration, PolicyProviderKind,

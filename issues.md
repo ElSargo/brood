@@ -4,16 +4,26 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
-## WASM invocation and harness lifecycle
-
-- Target-shape WASM plugin actor loading is wired enough for interactive testing,
-  but reload/lifecycle ownership is still provisional. Actor tasks currently run
-  indefinitely without cancellation handles, reloading a module with the same
-  actor names can fail registry registration, and pane-mapped events are
-  broadcast to all WASM actors rather than subscription-routed.
-
 ## Resolved
 
+- Core-module actor generations now own their declarations, mailbox identities,
+  cancellation signal, and join handles. Replacement builds every actor against
+  unpublished mailboxes, validates the complete candidate set, cancels and joins
+  the retiring generation, and atomically publishes the prepared set before new
+  tasks run; invalid candidates leave the old names and actors reachable. Typed
+  `pane-mapped` and `layout-state` marker exports are validated and routed only
+  to declared subscribers, while direct actor messages share the public actor
+  namespace. The real `wasm-actor-lifecycle-proof` plugin and
+  `tools/test-wasm-actor-lifecycle-nested.sh` render a terminal and animated EGL
+  client in columns, reject a deliberately broken second actor while a mailbox
+  probe proves the old generation remains responsive, then hot-reload the same
+  actor names and visibly render the same two clients in rows. Its unsubscribed
+  poison actor would spawn an obvious third pane if broadcast routing returned;
+  all three compositor captures retain exactly two panes, and the daemon log
+  records both actors joined at replacement and final shutdown. Event marker
+  subscriptions currently describe core-module actors; Component and Preview 1
+  actors remain message-driven until their manifests gain an event-declaration
+  surface.
 - Core-WASM test harnesses now run as owned, checked child threads with typed
   `Starting -> Running -> Exited` events and explicit joined, already-joined,
   and panicked cleanup results. Signal, sleep, and host-response waits observe

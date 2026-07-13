@@ -108,13 +108,24 @@ actor/policy exports. A key policy can also be selected explicitly. See the
 parser and replacement routing in `control.rs` and `state.rs` for exact
 selection behavior.
 
-The Component Model and Preview 1 prototypes already apply structured
+All runnable actor lanes apply structured
 replacement. Individual Component worker cancellation is cooperative and emits
 its terminal event only after the guest export returns; replacement terminates
 the owning Store, then joins the runtime and completion supervisor before the
 new generation becomes active. Preview 1 replacement aborts worker calls, drops
 their Stores, and joins its completion supervisor. Guest memory is not migrated
-to the replacement generation.
+to the replacement generation. Core-module sets are built against detached
+prepared mailboxes. The old set remains the published owner until cancellation
+has been observed and every task joined; the registry then activates candidate
+names as one transition before starting their tasks. Candidate actor or policy
+load failures leave the published actors and key policy unchanged.
+
+Core-module actors opt into daemon events with typed marker exports associated
+with their actor declaration. Pane mapping and layout snapshots are routed only
+to matching subscribers, and activation queues a fresh layout snapshot so a
+replacement converges without waiting for another client to map. Malformed,
+unknown-event, and orphan markers reject the module. Exact marker spellings are
+defined in `module_link.rs`.
 
 Target hot reload should cancel affected workers and in-flight I/O before
 restarting actors and policy providers, preserve host-owned pane identity where
@@ -136,6 +147,14 @@ offscreen outer presentation, reaches the actor through the normal control
 surface, leaves an ordinary worker read pending while actor traffic and
 completion I/O continue, feeds the worker, then hot-reloads while another read
 is pending and verifies generation isolation and structured shutdown.
+
+`tools/test-wasm-actor-lifecycle-nested.sh` loads the real
+`wasm-actor-lifecycle-proof` core plugin beside two rendered Wayland clients.
+Its subscribed actor first arranges columns, then a same-name hot replacement
+arranges rows. An invalid middle candidate is rejected while the first actor
+still accepts a real mailbox probe and retains its rendered columns. A second actor has no subscriptions and would visibly spawn an
+unwanted client if routing regressed to broadcast; both screenshots retain
+exactly the intended two panes.
 
 These workloads establish the execution and I/O model. The prototype still
 loads one actor artifact without package-manifest declarations, gives it a
