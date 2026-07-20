@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, OpenOptions},
+    os::fd::OwnedFd,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -25,12 +26,29 @@ pub const PRESENTATION_PROTOCOL_VERSION: u32 = 1;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
+type DbusDmabufFrame = (
+    u64,
+    u32,
+    u32,
+    u32,
+    u64,
+    u32,
+    u32,
+    bool,
+    zbus::zvariant::OwnedFd,
+);
+
 #[proxy(
     interface = "org.manifold.Session.Control",
     default_path = "/org/manifold/Session"
 )]
 trait ManifoldControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
+    fn latest_dmabuf_frame(&self) -> zbus::Result<DbusDmabufFrame>;
+    fn open_presentation_fast_path(
+        &self,
+    ) -> zbus::Result<(u64, zbus::zvariant::OwnedFd, zbus::zvariant::OwnedFd)>;
+    fn dmabuf_resource(&self, resource_id: u64) -> zbus::Result<DbusDmabufFrame>;
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +90,26 @@ impl ControlTarget {
 pub struct Handshake {
     pub protocol_version: u32,
     pub server_pid: u32,
+}
+
+#[derive(Debug)]
+pub struct PresentationFastPath {
+    pub generation: u64,
+    pub input_fd: OwnedFd,
+    pub frame_fd: OwnedFd,
+}
+
+#[derive(Debug)]
+pub struct DmabufFrame {
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub stride: u32,
+    pub offset: u32,
+    pub y_inverted: bool,
+    pub fd: OwnedFd,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +182,73 @@ pub fn request_dbus_command(
             "call Manifold DBus control command on {}",
             target.destination
         )
+    })
+}
+
+fn presentation_proxy<'a>(
+    connection: &'a zbus::blocking::Connection,
+    target: &'a ControlTarget,
+) -> Result<ManifoldControlProxyBlocking<'a>> {
+    ManifoldControlProxyBlocking::builder(connection)
+        .destination(target.destination.as_str())?
+        .path(CONTROL_OBJECT_PATH)?
+        .interface(CONTROL_INTERFACE)?
+        .build()
+        .context("build Manifold presentation proxy")
+}
+
+pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<PresentationFastPath> {
+    let connection = connection(target)?;
+    let (generation, input_fd, frame_fd) = presentation_proxy(&connection, target)?
+        .open_presentation_fast_path()
+        .context("open local presentation fast path")?;
+    Ok(PresentationFastPath {
+        generation,
+        input_fd: input_fd.into(),
+        frame_fd: frame_fd.into(),
+    })
+}
+
+pub fn latest_dmabuf_frame(target: &ControlTarget) -> Result<DmabufFrame> {
+    let connection = connection(target)?;
+    let proxy = ManifoldControlProxyBlocking::builder(&connection)
+        .destination(target.destination.as_str())?
+        .path(CONTROL_OBJECT_PATH)?
+        .interface(CONTROL_INTERFACE)?
+        .build()
+        .context("build Manifold presentation proxy")?;
+    let (sequence, width, height, fourcc, modifier, stride, offset, y_inverted, fd) = proxy
+        .latest_dmabuf_frame()
+        .context("request latest hosted DMA-BUF frame")?;
+    Ok(DmabufFrame {
+        sequence,
+        width,
+        height,
+        fourcc,
+        modifier,
+        stride,
+        offset,
+        y_inverted,
+        fd: fd.into(),
+    })
+}
+
+pub fn dmabuf_resource(target: &ControlTarget, resource_id: u64) -> Result<DmabufFrame> {
+    let connection = connection(target)?;
+    let (sequence, width, height, fourcc, modifier, stride, offset, y_inverted, fd) =
+        presentation_proxy(&connection, target)?
+            .dmabuf_resource(resource_id)
+            .with_context(|| format!("fetch DMA-BUF resource {resource_id}"))?;
+    Ok(DmabufFrame {
+        sequence,
+        width,
+        height,
+        fourcc,
+        modifier,
+        stride,
+        offset,
+        y_inverted,
+        fd: fd.into(),
     })
 }
 

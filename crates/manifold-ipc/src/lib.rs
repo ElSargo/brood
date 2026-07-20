@@ -29,6 +29,19 @@ const ABI_VERSION: u32 = 1;
 pub const CRITICAL_CAPACITY: usize = 64;
 const CRITICAL_CAPACITY_U32: u32 = 64;
 
+/// Pointer moved to an absolute logical position; arguments are x/y `f64` bits.
+pub const INPUT_POINTER_MOTION: u32 = 1;
+/// Pointer button changed; arguments are Linux button code and pressed boolean.
+pub const INPUT_POINTER_BUTTON: u32 = 2;
+/// Keyboard key changed; arguments are xkb keycode and pressed boolean.
+pub const INPUT_KEYBOARD_KEY: u32 = 3;
+/// Pointer wheel changed; arguments are horizontal/vertical `f64` bits.
+pub const INPUT_POINTER_AXIS: u32 = 4;
+/// Presentation extent changed; arguments are width and height.
+pub const INPUT_PRESENTATION_SIZE: u32 = 5;
+/// A registered DMA-BUF resource was committed; argument zero is its resource ID.
+pub const FRAME_DMABUF_COMMIT: u32 = 0x100;
+
 /// One directly usable critical-lane record.
 ///
 /// Operation-specific code gives the arguments meaning. The representation is

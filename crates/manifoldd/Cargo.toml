@@ -34,6 +34,7 @@ calloop-wayland-source.workspace = true
 clap.workspace = true
 image.workspace = true
 manifold-cli.workspace = true
+manifold-ipc.workspace = true
 manifold-wasm = { path = "../manifold-wasm" }
 num-traits.workspace = true
 serde.workspace = true

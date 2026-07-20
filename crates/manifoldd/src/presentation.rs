@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
     backend::SwapBuffersError,
-    backend::allocator::Fourcc,
+    backend::allocator::{Fourcc, Modifier},
     backend::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
@@ -999,7 +999,16 @@ fn send_active_client_frame_callbacks(
 }
 
 fn initialize_dmabuf(state: &mut Manifold, backend: &mut PresenterBackend) {
-    let dmabuf_formats = backend.renderer().dmabuf_formats();
+    let mut dmabuf_formats = backend.renderer().dmabuf_formats();
+    if std::env::var_os("MANIFOLD_DMABUF_HAPPY_PATH").is_some() {
+        dmabuf_formats = dmabuf_formats
+            .iter()
+            .filter(|format| {
+                format.modifier == Modifier::Linear || format.modifier == Modifier::Invalid
+            })
+            .copied()
+            .collect();
+    }
     state.dmabuf.advertised_formats = dmabuf_formats.indexset().len();
     let advertisement = dmabuf_advertisement_for(state.dmabuf.advertised_formats);
     if let DmabufAdvertisement::Disabled { reason } = advertisement {

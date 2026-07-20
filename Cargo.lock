@@ -2247,9 +2247,23 @@ dependencies = [
  "anyhow",
  "clap",
  "manifold-cli",
+ "manifold-dmabuf",
+ "manifold-ipc",
  "pollster",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "manifold-dmabuf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gbm",
+ "pollster",
+ "wgpu",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -2294,6 +2308,7 @@ dependencies = [
  "clap",
  "image",
  "manifold-cli",
+ "manifold-ipc",
  "manifold-wasm",
  "num-traits",
  "serde",

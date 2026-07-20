@@ -16,9 +16,13 @@ use std::{
     ffi::OsString,
     future::Future,
     io::Write,
+    os::fd::AsFd,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -27,16 +31,20 @@ pub use manifold_cli::control::{
     ControlTarget, request_dbus_command, resolve_control_target, session_marker_value,
 };
 use smithay::{
-    backend::input::{Axis, AxisSource, ButtonState, KeyState},
+    backend::{
+        allocator::Buffer,
+        input::{Axis, AxisSource, ButtonState, KeyState},
+    },
     input::pointer::AxisFrame,
     reexports::calloop::{
         EventLoop,
         channel::{self, Event},
+        timer::{TimeoutAction, Timer},
     },
     utils::Point,
 };
 use tracing::{info, warn};
-use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy};
+use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy, zvariant};
 
 use crate::{
     CommandOutcome, CtlArgs, DEFAULT_MANIFOLD_DBUS_NAME, EnterArgs, HideArgs, ListArgs,
@@ -74,6 +82,8 @@ type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 type DbusStatusItem = (String, String, String, String, DbusMetadata);
 type DbusPluginActor = (String, String, u64, u64, u64, u64, String, String);
 type DbusPluginMailbox = (String, u64, u64, u64);
+type DbusDmabufFrame = (u64, u32, u32, u32, u64, u32, u32, bool, zvariant::OwnedFd);
+type DbusFastPath = (u64, zvariant::OwnedFd, zvariant::OwnedFd);
 type DbusAgent = (
     String,
     String,
@@ -100,6 +110,8 @@ type PluginActorListResponse = DbusResponse<Vec<DbusPluginActor>>;
 type PluginMailboxListResponse = DbusResponse<Vec<DbusPluginMailbox>>;
 type AgentListResponse = DbusResponse<Vec<DbusAgent>>;
 type OptionalControlResponse = DbusResponse<Option<String>>;
+type DmabufFrameResponse = DbusResponse<DbusDmabufFrame>;
+type FastPathResponse = DbusResponse<DbusFastPath>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -109,6 +121,16 @@ enum DbusStateRequest {
     },
     CurrentStatus {
         response: ControlResponse,
+    },
+    LatestDmabufFrame {
+        response: DmabufFrameResponse,
+    },
+    OpenPresentationFastPath {
+        response: FastPathResponse,
+    },
+    DmabufResource {
+        resource_id: u64,
+        response: DmabufFrameResponse,
     },
     ListSurfaceSessions {
         response: SessionListResponse,
@@ -344,6 +366,28 @@ impl ControlDbus {
         request_state(&self.sender, |response| DbusStateRequest::ControlCommand {
             command: argv,
             json,
+            response,
+        })
+        .await
+    }
+
+    async fn latest_dmabuf_frame(&self) -> fdo::Result<DbusDmabufFrame> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::LatestDmabufFrame { response }
+        })
+        .await
+    }
+
+    async fn open_presentation_fast_path(&self) -> fdo::Result<DbusFastPath> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::OpenPresentationFastPath { response }
+        })
+        .await
+    }
+
+    async fn dmabuf_resource(&self, resource_id: u64) -> fdo::Result<DbusDmabufFrame> {
+        request_state(&self.sender, |response| DbusStateRequest::DmabufResource {
+            resource_id,
             response,
         })
         .await
@@ -2330,6 +2374,16 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         DbusStateRequest::CurrentStatus { response } => {
             send_response(response, status_json_string(state));
         }
+        DbusStateRequest::LatestDmabufFrame { response } => {
+            send_response(response, latest_dmabuf_frame(state));
+        }
+        DbusStateRequest::OpenPresentationFastPath { response } => {
+            send_response(response, open_presentation_fast_path(state));
+        }
+        DbusStateRequest::DmabufResource {
+            resource_id,
+            response,
+        } => send_response(response, dmabuf_resource(state, resource_id)),
         DbusStateRequest::ListSurfaceSessions { response } => {
             state.refresh_window_state();
             let sessions = dbus_surface_sessions(state.surface_session_summaries());
@@ -2629,6 +2683,174 @@ fn send_response<T>(response: DbusResponse<T>, result: Result<T>) {
         warn!(error = %err, "DBus request failed");
     }
     let _ = response.send(response_result);
+}
+
+static FAST_PATH_GENERATION: AtomicU64 = AtomicU64::new(1);
+const FAST_INPUT_POLL_INTERVAL: Duration = Duration::from_micros(250);
+
+fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
+    let generation = FAST_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let input_file = manifold_ipc::CriticalLaneFile::create(generation)?;
+    let frame_file = manifold_ipc::CriticalLaneFile::create(generation)?;
+    let input_fd = input_file.as_fd().try_clone_to_owned()?;
+    let frame_fd = frame_file.as_fd().try_clone_to_owned()?;
+    let input = manifold_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
+    let frames = manifold_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
+    let mut fast_path = crate::state::PresentationFastPath {
+        generation,
+        input,
+        frames,
+        resources: std::collections::HashMap::new(),
+        buffers: std::collections::HashMap::new(),
+        next_resource_id: 1,
+    };
+    if let Some(dmabuf) = state.dmabuf.latest_client_buffer.as_ref() {
+        let resource_id = fast_path.next_resource_id;
+        fast_path.next_resource_id = resource_id.wrapping_add(1);
+        fast_path.resources.insert(dmabuf.clone(), resource_id);
+        fast_path.buffers.insert(resource_id, dmabuf.clone());
+        if fast_path
+            .frames
+            .try_send(manifold_ipc::CriticalRecord {
+                opcode: manifold_ipc::FRAME_DMABUF_COMMIT,
+                connection_generation: generation,
+                sequence: state.dmabuf.latest_client_buffer_sequence,
+                arguments: [resource_id, 0, 0, 0, 0],
+                ..manifold_ipc::CriticalRecord::default()
+            })
+            .is_err()
+        {
+            // A new lane always has capacity; retain non-blocking semantics.
+        }
+    }
+    state.dmabuf.fast_path = Some(fast_path);
+    state
+        .loop_handle
+        .insert_source(
+            Timer::from_duration(FAST_INPUT_POLL_INTERVAL),
+            |_, (), state| {
+                drain_fast_path_input(state);
+                TimeoutAction::ToDuration(FAST_INPUT_POLL_INTERVAL)
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("install fast-path input poll: {error}"))?;
+    Ok((generation, input_fd.into(), frame_fd.into()))
+}
+
+fn drain_fast_path_input(state: &mut Manifold) {
+    let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
+        return;
+    };
+    while let Some(record) = fast_path.input.try_recv() {
+        if record.connection_generation != fast_path.generation {
+            continue;
+        }
+        let time = monotonic_time_msec(state);
+        match record.opcode {
+            manifold_ipc::INPUT_POINTER_MOTION => state.forward_pointer_motion(
+                Point::from((
+                    f64::from_bits(record.arguments[0]),
+                    f64::from_bits(record.arguments[1]),
+                )),
+                time,
+            ),
+            manifold_ipc::INPUT_POINTER_BUTTON => state.forward_pointer_button(
+                u32::try_from(record.arguments[0]).map_or(u32::MAX, |value| value),
+                if record.arguments[1] == 0 {
+                    ButtonState::Released
+                } else {
+                    ButtonState::Pressed
+                },
+                time,
+            ),
+            manifold_ipc::INPUT_KEYBOARD_KEY => state.forward_keyboard_key(
+                u32::try_from(record.arguments[0])
+                    .map_or(u32::MAX, |value| value)
+                    .into(),
+                if record.arguments[1] == 0 {
+                    KeyState::Released
+                } else {
+                    KeyState::Pressed
+                },
+                time,
+            ),
+            manifold_ipc::INPUT_POINTER_AXIS => {
+                let horizontal = f64::from_bits(record.arguments[0]);
+                let vertical = f64::from_bits(record.arguments[1]);
+                let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+                if horizontal != 0.0 {
+                    frame = frame.value(Axis::Horizontal, horizontal);
+                }
+                if vertical != 0.0 {
+                    frame = frame.value(Axis::Vertical, vertical);
+                }
+                state.forward_pointer_axis(frame);
+            }
+            manifold_ipc::INPUT_PRESENTATION_SIZE => {
+                state.configure_first_window_size(
+                    i32::try_from(record.arguments[0]).map_or(i32::MAX, |value| value),
+                    i32::try_from(record.arguments[1]).map_or(i32::MAX, |value| value),
+                );
+            }
+            _ => {}
+        }
+    }
+    state.dmabuf.fast_path = Some(fast_path);
+    if let Err(error) = state.display_handle.flush_clients() {
+        warn!(?error, "flush clients after fast-path input failed");
+    }
+}
+
+fn latest_dmabuf_frame(state: &Manifold) -> Result<DbusDmabufFrame> {
+    let dmabuf = state
+        .dmabuf
+        .latest_client_buffer
+        .as_ref()
+        .context("no hosted DMA-BUF frame is available")?;
+    dmabuf_frame_tuple(dmabuf, state.dmabuf.latest_client_buffer_sequence)
+}
+
+fn dmabuf_resource(state: &Manifold, resource_id: u64) -> Result<DbusDmabufFrame> {
+    let dmabuf = state
+        .dmabuf
+        .fast_path
+        .as_ref()
+        .and_then(|fast_path| fast_path.buffers.get(&resource_id))
+        .with_context(|| format!("unknown DMA-BUF resource {resource_id}"))?;
+    dmabuf_frame_tuple(dmabuf, resource_id)
+}
+
+fn dmabuf_frame_tuple(
+    dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+    sequence: u64,
+) -> Result<DbusDmabufFrame> {
+    ensure!(
+        dmabuf.num_planes() == 1,
+        "happy-path presentation requires a single-plane DMA-BUF"
+    );
+    let size = dmabuf.size();
+    let width = u32::try_from(size.w).context("DMA-BUF width is invalid")?;
+    let height = u32::try_from(size.h).context("DMA-BUF height is invalid")?;
+    let format = dmabuf.format();
+    let stride = dmabuf.strides().next().context("DMA-BUF has no stride")?;
+    let offset = dmabuf.offsets().next().context("DMA-BUF has no offset")?;
+    let handle = dmabuf
+        .handles()
+        .next()
+        .context("DMA-BUF has no plane descriptor")?
+        .try_clone_to_owned()
+        .context("duplicate DMA-BUF plane descriptor")?;
+    Ok((
+        sequence,
+        width,
+        height,
+        format.code as u32,
+        u64::from(format.modifier),
+        stride,
+        offset,
+        dmabuf.y_inverted(),
+        handle.into(),
+    ))
 }
 
 fn dbus_surface_sessions(sessions: Vec<SurfaceSessionSummary>) -> Vec<DbusSurfaceSession> {
@@ -3225,6 +3447,18 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             }
             _ => bail!("usage: debug dump <dir> [state,composed,surfaces]"),
         },
+        "presentation-size" => {
+            let [width, height] = args else {
+                bail!("usage: presentation-size <width> <height>");
+            };
+            let width = width.parse::<i32>().context("parse presentation width")?;
+            let height = height.parse::<i32>().context("parse presentation height")?;
+            ensure!(
+                state.configure_first_window_size(width, height),
+                "no hosted toplevel is available"
+            );
+            format!("OK presentation-size {}x{}\n", width.max(1), height.max(1))
+        }
         "inject" => {
             handle_inject(args, state)?;
             format!("OK injected {}\n", args.join(" "))

@@ -7,6 +7,8 @@ edition.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 manifold-cli.workspace = true
+manifold-dmabuf = { path = "../../crates/manifold-dmabuf" }
+manifold-ipc.workspace = true
 pollster.workspace = true
 wgpu.workspace = true
 winit.workspace = true

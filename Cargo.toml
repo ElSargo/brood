@@ -2,6 +2,7 @@
 members = [
     "clients/manifold-client",
     "crates/manifold-cli",
+    "crates/manifold-dmabuf",
     "crates/manifold-ipc",
     "crates/manifoldd",
     "crates/manifold-wasm",
@@ -19,9 +20,11 @@ cap-std = "3.4.5"
 cap-fs-ext = "3.4.5"
 clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3.32"
+gbm = "0.18.0"
 image = "0.25.8"
 libc = "0.2.186"
 manifold-cli = { path = "crates/manifold-cli" }
+manifold-ipc = { path = "crates/manifold-ipc" }
 num-traits = "0.2.19"
 notify = "8.2.0"
 pollster = "0.4.0"
@@ -46,6 +49,7 @@ wasmtime = { version = "46.0.1", features = ["component-model-async"] }
 wasmtime-wasi = { version = "46.0.1", default-features = false, features = ["p1"] }
 wiggle = "46.0.1"
 wgpu = "30.0.0"
+wgpu-hal = { version = "30.0.0", features = ["vulkan"] }
 winit = "0.30.13"
 wayland-egl = "0.32.11"
 wayland-client = { version = "0.31.14", features = ["system"] }
