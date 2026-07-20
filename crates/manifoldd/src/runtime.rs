@@ -102,7 +102,10 @@ fn configure_session(
 ) -> Result<()> {
     state.set_async_runtime(runtime.clone());
     state.test_surface_markers = args.test_surface_markers;
-    let config_path = args.resolved_config_path();
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(config::global_config_path);
     if args.no_initial_surface_session {
         state.clear_initial_surface_session();
     }

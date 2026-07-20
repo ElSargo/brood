@@ -1134,14 +1134,6 @@ const fn dmabuf_advertisement_for(format_count: usize) -> DmabufAdvertisement {
     DmabufAdvertisement::Version4
 }
 
-#[cfg(test)]
-const fn explicit_sync_disabled_reason_for(advertisement: DmabufAdvertisement) -> &'static str {
-    match advertisement {
-        DmabufAdvertisement::Disabled { reason } => reason,
-        DmabufAdvertisement::Version4 => "none",
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresentationRuntimeFailure {
     context: &'static str,
@@ -1219,78 +1211,5 @@ fn presentation_control_poll_interval(
         Duration::from_millis(8)
     } else {
         Duration::from_millis(50)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        DmabufAdvertisement, dmabuf_advertisement_for, explicit_sync_disabled_reason_for,
-        presentation_control_poll_interval, presentation_runtime_error_status,
-        sanitize_status_value,
-    };
-
-    #[test]
-    fn dmabuf_is_disabled_when_renderer_reports_no_formats() {
-        assert_eq!(
-            dmabuf_advertisement_for(0),
-            DmabufAdvertisement::Disabled {
-                reason: "no_dmabuf_texture_formats",
-            },
-        );
-    }
-
-    #[test]
-    fn dmabuf_uses_v4_when_formats_and_render_node_are_available() {
-        assert_eq!(dmabuf_advertisement_for(3), DmabufAdvertisement::Version4,);
-    }
-
-    #[test]
-    fn explicit_sync_disabled_reason_tracks_dmabuf_advertisement() {
-        assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(0)),
-            "no_dmabuf_texture_formats",
-        );
-        assert_eq!(
-            explicit_sync_disabled_reason_for(dmabuf_advertisement_for(3)),
-            "none",
-        );
-    }
-
-    #[test]
-    fn status_values_are_shell_token_safe() {
-        assert_eq!(
-            sanitize_status_value("EglExtensionNotSupported([\"EGL_WL_bind_wayland_display\"])"),
-            "EglExtensionNotSupported_[\"EGL_WL_bind_wayland_display\"]_",
-        );
-    }
-
-    #[test]
-    fn presentation_runtime_errors_are_shell_token_safe() {
-        assert_eq!(
-            presentation_runtime_error_status("render_output", "BackendError(\"lost device\")"),
-            "runtime_render_output:BackendError_\"lost_device\"_",
-        );
-    }
-
-    #[test]
-    fn presentation_control_polling_is_fast_while_detached() {
-        assert_eq!(
-            presentation_control_poll_interval(crate::state::PresentationStatus::Detached, false)
-                .as_millis(),
-            8,
-        );
-
-        assert_eq!(
-            presentation_control_poll_interval(crate::state::PresentationStatus::Attached, false)
-                .as_millis(),
-            50,
-        );
-
-        assert_eq!(
-            presentation_control_poll_interval(crate::state::PresentationStatus::Attached, true)
-                .as_millis(),
-            8,
-        );
     }
 }

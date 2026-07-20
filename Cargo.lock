@@ -2230,10 +2230,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "manifold-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "zbus",
+]
+
+[[package]]
 name = "manifold-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "manifold-cli",
  "pollster",
  "wgpu",
  "winit",
@@ -2257,7 +2270,6 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
- "wat",
  "wiggle",
  "wit-component 0.251.0",
 ]
@@ -2271,6 +2283,7 @@ dependencies = [
  "calloop-wayland-source 0.4.1",
  "clap",
  "image",
+ "manifold-cli",
  "manifold-wasm",
  "num-traits",
  "serde",
@@ -2282,7 +2295,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasmtime",
- "wat",
  "wayland-client",
  "wayland-egl",
  "wayland-protocols",

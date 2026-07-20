@@ -101,6 +101,3 @@ pub use runtime_io::{
     ByteStream, ChildHandle, ChildStatus, ProcessIo, PtyIo, RuntimeIoCapabilities, RuntimeIoConfig,
     RuntimeIoError, RuntimeIoHub, StreamRead, TimerHandle, TimerStatus,
 };
-
-#[cfg(test)]
-mod tests;

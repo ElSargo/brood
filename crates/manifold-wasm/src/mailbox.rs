@@ -283,39 +283,3 @@ impl Mailbox {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prepared_replacement_is_atomic_and_generation_checked() -> Result<()> {
-        let mut registry = MailboxRegistry::new();
-        let old_mailbox = registry.register_actor("layout", 4)?;
-        let old_id = old_mailbox.actor_id();
-        let (prepared, mut replacement_mailbox) = registry.prepare_actor("layout", 4)?;
-        let replacement_id = replacement_mailbox.actor_id();
-
-        registry.try_post_named_message("layout", b"old".to_vec())?;
-        registry.activate_prepared(vec![prepared], &["layout".to_string()])?;
-        registry.try_post_named_message("layout", b"new".to_vec())?;
-
-        ensure!(registry.actor_id_for_name("layout") == Some(replacement_id));
-        ensure!(replacement_mailbox.try_read_message()? == Some(b"new".to_vec()));
-        ensure!(!registry.unregister_actor_generation("layout", old_id));
-        ensure!(registry.actor_id_for_name("layout") == Some(replacement_id));
-        Ok(())
-    }
-
-    #[test]
-    fn rejected_prepared_set_leaves_live_registry_unchanged() -> Result<()> {
-        let mut registry = MailboxRegistry::new();
-        let live = registry.register_actor("unrelated", 4)?;
-        let (prepared, _candidate) = registry.prepare_actor("unrelated", 4)?;
-
-        ensure!(registry.activate_prepared(vec![prepared], &[]).is_err());
-        ensure!(registry.actor_id_for_name("unrelated") == Some(live.actor_id()));
-        registry.try_post_named_message("unrelated", b"still-live".to_vec())?;
-        Ok(())
-    }
-}

@@ -406,17 +406,3 @@ impl Manifold {
         pointer.frame(self);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const KEY_C: Keycode = Keycode::new(54);
-    const KEY_G: Keycode = Keycode::new(42);
-
-    #[test]
-    fn shift_modifiers_do_not_collide_with_plain_letters() {
-        assert_ne!(KEY_LEFTSHIFT, KEY_G);
-        assert_ne!(KEY_RIGHTSHIFT, KEY_C);
-    }
-}

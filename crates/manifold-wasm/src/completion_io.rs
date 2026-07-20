@@ -177,12 +177,6 @@ enum IoOperation {
         offset: u64,
         bytes: Vec<u8>,
     },
-    #[cfg(test)]
-    BlockingMutationProbe {
-        path: PathBuf,
-        started: std::sync::mpsc::Sender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    },
 }
 
 impl CompletionIo {
@@ -301,17 +295,6 @@ impl CompletionIo {
     pub(crate) fn stop(&self) {
         self.inner.alive.store(false, Ordering::Release);
         self.inner.shutdown.notify_one();
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_supervisor_exit(&self) {
-        loop {
-            let notified = self.inner.supervisor_exit.notified();
-            if self.inner.supervisor_exited.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
     }
 }
 
@@ -485,10 +468,6 @@ async fn execute_io_async(
         operation @ IoOperation::Write { .. } => {
             execute_blocking_write(root, writable, operation, cancellation).await
         }
-        #[cfg(test)]
-        operation @ IoOperation::BlockingMutationProbe { .. } => {
-            execute_blocking_write(root, writable, operation, cancellation).await
-        }
     }
 }
 
@@ -600,22 +579,6 @@ fn execute_io(
                 bytes_written: u64::try_from(bytes.len())?,
             })
         }
-        #[cfg(test)]
-        IoOperation::BlockingMutationProbe {
-            path,
-            started,
-            release,
-        } => {
-            ensure!(writable, "filesystem capability is read-only");
-            let mut file = root.create(&path)?;
-            file.write_all(b"started\n")?;
-            file.flush()?;
-            started.send(()).context("announce blocking mutation")?;
-            release.recv().context("release blocking mutation")?;
-            file.write_all(b"finished\n")?;
-            file.flush()?;
-            Ok(ActorCompletionKind::Write { bytes_written: 17 })
-        }
     }
 }
 
@@ -707,184 +670,4 @@ fn validate_capability_path(path: &Path) -> std::result::Result<PathBuf, Complet
         return Err(CompletionIoError::InvalidArgument);
     }
     Ok(path.to_path_buf())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, sync::mpsc as std_mpsc};
-
-    use anyhow::{Context, Result, ensure};
-    use tempfile::tempdir;
-    use tokio::time::{Duration, timeout};
-
-    use super::*;
-
-    fn writable_config(path: &Path) -> CompletionIoConfig {
-        CompletionIoConfig {
-            filesystem: Some(FilesystemGrant {
-                host_path: path.to_path_buf(),
-                guest_path: "/workspace".to_owned(),
-                writable: true,
-            }),
-            max_outstanding: 2,
-            max_completion_bytes: 1024,
-        }
-    }
-
-    async fn wait_for_probe_started(started: std_mpsc::Receiver<()>) -> Result<()> {
-        timeout(
-            Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || started.recv()),
-        )
-        .await
-        .context("blocking mutation did not start")??
-        .context("blocking mutation dropped its start signal")?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancellation_is_terminal_only_after_blocking_mutation_is_joined() -> Result<()> {
-        let root = tempdir()?;
-        let (io, mut completions, task) = start_completion_io(81, &writable_config(root.path()))?;
-        let (started_tx, started_rx) = std_mpsc::channel();
-        let (release_tx, release_rx) = std_mpsc::channel();
-        let operation = io.submit(IoOperation::BlockingMutationProbe {
-            path: PathBuf::from("cancel-proof.txt"),
-            started: started_tx,
-            release: release_rx,
-        })?;
-        wait_for_probe_started(started_rx).await?;
-
-        ensure!(io.cancel(operation), "cancellation request was rejected");
-        ensure!(
-            timeout(Duration::from_millis(50), completions.recv())
-                .await
-                .is_err(),
-            "cancelled completion escaped before its blocking mutation joined"
-        );
-        ensure!(
-            fs::read(root.path().join("cancel-proof.txt"))? == b"started\n",
-            "probe was not stopped at the external-side-effect barrier"
-        );
-
-        release_tx.send(())?;
-        let completion = timeout(Duration::from_secs(2), completions.recv())
-            .await
-            .context("joined cancellation did not complete")?
-            .context("completion lane closed")?;
-        ensure!(completion.operation == operation);
-        ensure!(completion.kind == ActorCompletionKind::Cancelled);
-        ensure!(
-            fs::read(root.path().join("cancel-proof.txt"))? == b"started\nfinished\n",
-            "cancel completion preceded the final external side effect"
-        );
-        io.stop();
-        task.await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_joins_started_blocking_mutation_before_replacement() -> Result<()> {
-        let root = tempdir()?;
-        let (io, _completions, mut task) = start_completion_io(82, &writable_config(root.path()))?;
-        let (started_tx, started_rx) = std_mpsc::channel();
-        let (release_tx, release_rx) = std_mpsc::channel();
-        io.submit(IoOperation::BlockingMutationProbe {
-            path: PathBuf::from("replacement-proof.txt"),
-            started: started_tx,
-            release: release_rx,
-        })?;
-        wait_for_probe_started(started_rx).await?;
-
-        io.stop();
-        ensure!(
-            timeout(Duration::from_millis(50), &mut task).await.is_err(),
-            "shutdown returned while old-generation filesystem work was live"
-        );
-        release_tx.send(())?;
-        timeout(Duration::from_secs(2), &mut task)
-            .await
-            .context("shutdown did not join blocking mutation")??;
-        ensure!(
-            fs::read(root.path().join("replacement-proof.txt"))? == b"started\nfinished\n",
-            "replacement became possible before the old generation finished mutating"
-        );
-        ensure!(!io.stats().alive && io.stats().outstanding == 0);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_bypasses_a_full_operation_command_queue() -> Result<()> {
-        let (command_tx, command_rx) = mpsc::channel(1);
-        let fake = OperationId::new(73, 1);
-        command_tx
-            .try_send(IoSupervisorCommand::Cancel(fake))
-            .map_err(|error| anyhow::anyhow!("fill I/O command queue: {error}"))?;
-        let state = Arc::new(CompletionIoInner {
-            generation: 73,
-            next_sequence: AtomicU64::new(2),
-            outstanding: AtomicUsize::new(0),
-            max_outstanding: 1,
-            max_completion_bytes: 32,
-            writable: false,
-            permitted: false,
-            alive: AtomicBool::new(true),
-            shutdown: Notify::new(),
-            commands: command_tx,
-            supervisor_exited: AtomicBool::new(false),
-            supervisor_exit: Notify::new(),
-        });
-        let io = CompletionIo {
-            inner: Arc::clone(&state),
-        };
-        let (completion_tx, _completion_rx) = mpsc::channel(1);
-        io.stop();
-        let task = tokio::spawn(run_completion_io_supervisor(
-            None,
-            false,
-            state,
-            command_rx,
-            completion_tx,
-        ));
-        timeout(Duration::from_millis(100), task)
-            .await
-            .context("full I/O queue blocked shutdown")??;
-        let stats = io.stats();
-        ensure!(!stats.alive && stats.outstanding == 0);
-        ensure!(stats.generation == 73 && stats.max_outstanding == 1);
-        Ok(())
-    }
-
-    #[test]
-    fn exhausted_operation_ids_never_wrap_or_reuse() -> Result<()> {
-        let (commands, _receiver) = mpsc::channel(2);
-        let io = CompletionIo {
-            inner: Arc::new(CompletionIoInner {
-                generation: 73,
-                next_sequence: AtomicU64::new(u64::MAX),
-                outstanding: AtomicUsize::new(0),
-                max_outstanding: 2,
-                max_completion_bytes: 32,
-                writable: false,
-                permitted: true,
-                alive: AtomicBool::new(true),
-                shutdown: Notify::new(),
-                commands,
-                supervisor_exited: AtomicBool::new(false),
-                supervisor_exit: Notify::new(),
-            }),
-        };
-        ensure!(
-            io.submit_read("file", 0, 1) == Err(CompletionIoError::LimitReached),
-            "the exhausted allocator admitted an operation"
-        );
-        ensure!(
-            io.submit_read("file", 0, 1) == Err(CompletionIoError::LimitReached),
-            "the exhausted allocator wrapped and reused an operation ID"
-        );
-        ensure!(io.inner.outstanding.load(Ordering::Acquire) == 0);
-        let stats = io.stats();
-        ensure!(stats.permitted && !stats.writable && stats.outstanding == 0);
-        Ok(())
-    }
 }

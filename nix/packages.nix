@@ -186,9 +186,9 @@ let
   manifolddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
     // {
-      cargoBuildExtraArgs = "-p manifoldd --bins";
-      cargoCheckExtraArgs = "-p manifoldd --all-targets";
-      cargoTestExtraArgs = "-p manifoldd --no-run";
+      cargoBuildExtraArgs = "-p manifoldd -p manifold-client --bins";
+      cargoCheckExtraArgs = "-p manifoldd -p manifold-client --all-targets";
+      cargoTestExtraArgs = "-p manifoldd -p manifold-client --no-run";
     }
   );
 
@@ -196,7 +196,7 @@ let
     craneBaseArgs
     // {
       cargoArtifacts = manifolddArtifacts;
-      cargoBuildExtraArgs = "-p manifoldd --bins";
+      cargoBuildExtraArgs = "-p manifoldd -p manifold-client --bins";
       doCheck = false;
     }
   );

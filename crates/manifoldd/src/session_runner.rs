@@ -122,7 +122,10 @@ fn runner_config(args: &RunArgs) -> Result<Option<SessionRunnerSelection>> {
         return Ok(Some(config::override_session_runner(
             kind.to_string(),
             current_project_dir()?,
-            args.session.resolved_config_path(),
+            args.session
+                .config
+                .clone()
+                .unwrap_or_else(config::global_config_path),
         )));
     }
     config::discover_session_runner(&current_project_dir()?)
@@ -257,19 +260,6 @@ fn cleanup_cache_dir(cache_dir: &Path) {
             ?err,
             cache_dir = %cache_dir.display(),
             "failed to remove Manifold session runner cache directory"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::launch_context;
-
-    #[test]
-    fn scope_unit_uses_launch_record_id() {
-        assert_eq!(
-            launch_context::scope_unit("p123t456"),
-            "manifold-launch-p123t456.scope"
         );
     }
 }

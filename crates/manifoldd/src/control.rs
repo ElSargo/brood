@@ -14,20 +14,18 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    fs::{self, OpenOptions},
     future::Future,
     io::Write,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::mpsc,
-    thread,
     time::Duration,
 };
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use anyhow::{Context, Result, bail, ensure};
+pub use manifold_cli::control::{
+    ControlTarget, request_dbus_command, resolve_control_target, session_marker_value,
+};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState},
     input::pointer::AxisFrame,
@@ -63,7 +61,6 @@ const PLUGIN_OBJECT_PATH: &str = "/org/manifold/Plugin";
 const COMPOSITOR_OBJECT_PATH: &str = "/org/manifold/Compositor";
 const AGENT_OBJECT_PATH: &str = "/org/manifold/Agent";
 const STATUS_OBJECT_PATH: &str = "/org/manifold/Status";
-const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
 const MANAGER_INTERFACE: &str = "org.manifold.Manager";
 const EXTENSION_INTERFACE: &str = "org.manifold.Extension";
 const PLUGIN_INTERFACE: &str = "org.manifold.Plugin";
@@ -90,38 +87,6 @@ type DbusAgent = (
     String,
     DbusMetadata,
 );
-
-#[derive(Clone, Debug)]
-pub struct ControlTarget {
-    pub(crate) destination: String,
-    pub(crate) address: Option<String>,
-}
-
-impl ControlTarget {
-    pub(crate) const fn new(destination: String, address: Option<String>) -> Self {
-        Self {
-            destination,
-            address,
-        }
-    }
-
-    pub(crate) fn session_marker(&self) -> String {
-        self.session_marker_with_session(None)
-    }
-
-    pub(crate) fn session_marker_with_session(&self, surface_session_id: Option<u64>) -> String {
-        let mut marker = format!("dbus-destination={}", self.destination);
-        if let Some(address) = self.address.as_deref() {
-            marker.push_str(" dbus-address=");
-            marker.push_str(address);
-        }
-        if let Some(session_id) = surface_session_id {
-            marker.push_str(" surface-session-id=");
-            marker.push_str(&session_id.to_string());
-        }
-        marker
-    }
-}
 
 type DbusResponse<T> = tokio::sync::oneshot::Sender<std::result::Result<T, String>>;
 type ControlResponse = DbusResponse<String>;
@@ -1588,95 +1553,14 @@ fn ensure_global_control_target_running(
     current_directory: &Path,
     config_path: &Path,
 ) -> Result<()> {
-    if !should_auto_start_global_control_target(target) {
+    if target.destination != DEFAULT_MANIFOLD_DBUS_NAME || target.address.is_some() {
         return Ok(());
     }
-    if status_snapshot(target).is_ok() {
-        return Ok(());
-    }
-
-    let (log_path, mut child) = spawn_global_server(target, current_directory, config_path)?;
-    for _ in 0..1800 {
-        if status_snapshot(target).is_ok() {
-            return Ok(());
-        }
-        if let Some(status) = child
-            .try_wait()
-            .context("check global Manifold server startup process")?
-        {
-            bail!(
-                "global Manifold session server exited before becoming ready with {status}; see {}",
-                log_path.display()
-            );
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    bail!(
-        "global Manifold session server did not become ready for {}; see {}",
-        target.destination,
-        log_path.display()
-    )
-}
-
-fn should_auto_start_global_control_target(target: &ControlTarget) -> bool {
-    target.destination == DEFAULT_MANIFOLD_DBUS_NAME && target.address.is_none()
-}
-
-fn spawn_global_server(
-    target: &ControlTarget,
-    current_directory: &Path,
-    config_path: &Path,
-) -> Result<(PathBuf, std::process::Child)> {
-    let current_exe = env::current_exe().context("resolve current executable")?;
-    let log_dir = global_server_log_dir()?;
-    fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
-    let log_path = log_dir.join("global.log");
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("open {}", log_path.display()))?;
-    let log_err = log.try_clone().context("clone global server log")?;
-
-    let mut command = ProcessCommand::new(&current_exe);
-    command
-        .arg("run")
-        .arg("--headless")
-        .arg("--no-initial-surface-session")
-        .arg("--dbus-destination")
-        .arg(&target.destination)
-        .arg("--config")
-        .arg(config_path)
-        .current_dir(current_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-    detach_session_server(&mut command);
-    let child = command.spawn().with_context(|| {
-        format!(
-            "start global Manifold server {} in {}",
-            current_exe.display(),
-            current_directory.display()
-        )
-    })?;
-    Ok((log_path, child))
-}
-
-fn detach_session_server(command: &mut ProcessCommand) {
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
-}
-
-fn global_server_log_dir() -> Result<PathBuf> {
-    let root = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(env::temp_dir)
-        .join("manifold")
-        .join("session-server");
-    Ok(root)
+    let mut launch = manifold_cli::control::ServerLaunch::discover()?;
+    launch.current_directory = current_directory.to_path_buf();
+    launch.config = Some(config_path.to_path_buf());
+    manifold_cli::control::connect_or_spawn(target, &launch)?;
+    Ok(())
 }
 
 fn create_directory_surface_session(
@@ -1904,39 +1788,6 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn resolve_control_target(
-    destination: Option<String>,
-    address: Option<String>,
-) -> ControlTarget {
-    let marker = env::var(MANIFOLD_SESSION_ENV).ok();
-    let destination = destination
-        .or_else(|| env::var(MANIFOLDD_DBUS_DESTINATION_ENV).ok())
-        .or_else(|| {
-            marker
-                .as_deref()
-                .and_then(|value| session_marker_value(value, "dbus-destination"))
-        })
-        .unwrap_or_else(|| DEFAULT_MANIFOLD_DBUS_NAME.to_string());
-    let address = address
-        .or_else(|| env::var(MANIFOLDD_DBUS_ADDRESS_ENV).ok())
-        .or_else(|| {
-            marker
-                .as_deref()
-                .and_then(|value| session_marker_value(value, "dbus-address"))
-        });
-    ControlTarget::new(destination, address)
-}
-
-fn session_marker_value(marker: &str, key: &str) -> Option<String> {
-    marker.split_whitespace().find_map(|field| {
-        field
-            .strip_prefix(key)
-            .and_then(|value| value.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-    })
-}
-
 #[derive(Debug, serde::Deserialize)]
 struct EnterStatusSnapshot {
     wayland_display: String,
@@ -2022,38 +1873,6 @@ fn start_dbus_service(
         .recv_timeout(CONTROL_REPLY_TIMEOUT)
         .context("DBus control service did not report readiness")?
         .map_err(anyhow::Error::msg)
-}
-
-pub fn request_dbus_command(
-    target: &ControlTarget,
-    command: &[String],
-    json: bool,
-) -> Result<String> {
-    if json {
-        let encoded = command.join(" ");
-        let _: Vec<String> =
-            serde_json::from_str(&encoded).context("validate JSON control argv")?;
-    }
-
-    let connection = match target.address.as_deref() {
-        Some(address) => zbus::blocking::connection::Builder::address(address)
-            .with_context(|| format!("parse DBus address {address}"))?
-            .build()
-            .with_context(|| format!("connect DBus address {address}"))?,
-        None => zbus::blocking::Connection::session().context("connect session DBus")?,
-    };
-    let proxy = ManifoldControlProxyBlocking::builder(&connection)
-        .destination(target.destination.as_str())?
-        .path(CONTROL_OBJECT_PATH)?
-        .interface(CONTROL_INTERFACE)?
-        .build()
-        .context("build Manifold DBus control proxy")?;
-    proxy.command(command.to_vec(), json).with_context(|| {
-        format!(
-            "call Manifold DBus control command on {}",
-            target.destination
-        )
-    })
 }
 
 fn handle_typed_ctl_command(target: &ControlTarget, command: &[String]) -> Result<bool> {
@@ -2927,6 +2746,23 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
     };
 
     let response = match command.as_str() {
+        "handshake" => {
+            let [client_version] = args else {
+                bail!("usage: handshake <protocol-version>");
+            };
+            let client_version = client_version
+                .parse::<u32>()
+                .context("parse client presentation protocol version")?;
+            ensure!(
+                client_version == manifold_cli::control::PRESENTATION_PROTOCOL_VERSION,
+                "unsupported presentation protocol version {client_version}"
+            );
+            let handshake = manifold_cli::control::Handshake {
+                protocol_version: manifold_cli::control::PRESENTATION_PROTOCOL_VERSION,
+                server_pid: std::process::id(),
+            };
+            format!("{}\n", serde_json::to_string(&handshake)?)
+        }
         "attach" if args.is_empty() => {
             state.request_attach();
             "OK attach requested\n".to_string()
@@ -4394,308 +4230,4 @@ fn ensure_ok_response(response: &str) -> Result<()> {
         response.trim()
     );
     Ok(())
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    reason = "unit tests use direct parse assertions where panic output is useful"
-)]
-mod tests {
-    use super::{
-        ControlTarget, InjectCommand, MissingDirectorySurfaceSessionAction, PlugCommand,
-        SessionSwitchOutcome, WasmPlugKind, choose_cli_surface_session,
-        control_command_for_session, format_plug_success, format_session_picker_row,
-        missing_directory_surface_session_action, parse_skim_session_output, resolve_initial_query,
-        session_marker_value, surface_session_dir_new_command,
-    };
-    use crate::state::SurfaceSessionSummary;
-    use std::path::Path;
-
-    fn session(id: u64, name: &str) -> SurfaceSessionSummary {
-        SurfaceSessionSummary {
-            id,
-            name: name.to_string(),
-            active: false,
-            windows: 0,
-            working_directory: None,
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn entered_command_returns_its_exit_code_without_exiting_control_logic() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let outcome =
-            super::entered_command_outcome(std::process::ExitStatus::from_raw(37 << 8)).unwrap();
-
-        assert_eq!(outcome, crate::CommandOutcome::Exit(37));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn entered_command_reports_signal_termination_as_an_error() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let err =
-            super::entered_command_outcome(std::process::ExitStatus::from_raw(9)).unwrap_err();
-
-        assert_eq!(err.to_string(), "entered command terminated by signal");
-    }
-
-    #[test]
-    fn picker_row_starts_with_machine_readable_session_id() {
-        let row = format_session_picker_row(&SurfaceSessionSummary {
-            id: 7,
-            name: "notes".to_string(),
-            active: true,
-            windows: 2,
-            working_directory: None,
-        });
-
-        let output = format!("ignored query\n{row}");
-        let outcome = parse_skim_session_output(&output).unwrap();
-        assert!(matches!(outcome, SessionSwitchOutcome::Existing(7)));
-        assert!(row.contains("* notes"));
-        assert!(row.contains("2 windows"));
-    }
-
-    #[test]
-    fn query_without_selection_creates_named_session() {
-        let outcome = parse_skim_session_output("research notes").unwrap();
-
-        assert!(matches!(
-            outcome,
-            SessionSwitchOutcome::Create(name) if name == "research notes"
-        ));
-    }
-
-    #[test]
-    fn initial_query_selects_single_name_match() {
-        let sessions = vec![session(1, "session 1"), session(2, "research notes")];
-        let outcome = resolve_initial_query(&sessions, Some("research")).unwrap();
-
-        assert!(matches!(outcome, SessionSwitchOutcome::Existing(2)));
-    }
-
-    #[test]
-    fn plug_args_default_to_auto_kind() {
-        let command = PlugCommand::parse(&["module.wasm".to_string()]).unwrap();
-
-        assert_eq!(command.kind, WasmPlugKind::Auto);
-        assert_eq!(command.instance_id, None);
-        assert_eq!(command.path, std::path::PathBuf::from("module.wasm"));
-    }
-
-    #[test]
-    fn plug_args_accept_kind_option() {
-        let command = PlugCommand::parse(&[
-            "--kind".to_string(),
-            "plugin".to_string(),
-            "--id=rube-17".to_string(),
-            "workspace.wasm".to_string(),
-        ])
-        .unwrap();
-
-        assert_eq!(command.kind, WasmPlugKind::Plugin);
-        assert_eq!(command.instance_id.as_deref(), Some("rube-17"));
-        assert_eq!(command.path, std::path::PathBuf::from("workspace.wasm"));
-    }
-
-    #[test]
-    fn plug_args_accept_separate_instance_id_option() {
-        let command = PlugCommand::parse(&[
-            "--id".to_string(),
-            "rube-42".to_string(),
-            "worker.wasm".to_string(),
-        ])
-        .unwrap();
-
-        assert_eq!(command.instance_id.as_deref(), Some("rube-42"));
-        assert_eq!(command.path, std::path::PathBuf::from("worker.wasm"));
-    }
-
-    #[test]
-    fn plug_args_reject_duplicate_or_empty_instance_ids() {
-        assert!(PlugCommand::parse(&["--id=".to_string(), "worker.wasm".to_string()]).is_err());
-        assert!(
-            PlugCommand::parse(&[
-                "--id=a".to_string(),
-                "--id=b".to_string(),
-                "worker.wasm".to_string()
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn plug_parser_rejects_missing_extra_and_ambiguous_forms() {
-        assert!(PlugCommand::parse(&[]).is_err());
-        assert!(
-            PlugCommand::parse(&["first.wasm".to_string(), "second.wasm".to_string()]).is_err()
-        );
-        assert!(
-            PlugCommand::parse(&[
-                "--id=first".to_string(),
-                "--id".to_string(),
-                "second".to_string(),
-                "worker.wasm".to_string(),
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn inject_parser_builds_typed_commands_and_rejects_wrong_arity() {
-        let motion =
-            InjectCommand::parse(&["motion".to_string(), "12.5".to_string(), "-4".to_string()])
-                .unwrap();
-        assert!(matches!(motion, InjectCommand::Motion { x: 12.5, y: -4.0 }));
-
-        let missing = InjectCommand::parse(&["motion".to_string(), "12.5".to_string()])
-            .unwrap_err()
-            .to_string();
-        assert!(missing.starts_with("usage: inject motion"));
-
-        let extra = InjectCommand::parse(&["center-motion".to_string(), "unexpected".to_string()])
-            .unwrap_err()
-            .to_string();
-        assert!(extra.starts_with("usage: inject motion"));
-    }
-
-    #[test]
-    fn plug_success_only_reports_an_explicit_registered_instance_id() {
-        let path = std::path::Path::new("module.wasm");
-        assert_eq!(
-            format_plug_success("plugin", None, path),
-            "OK plug kind=plugin path=module.wasm\n"
-        );
-        assert_eq!(
-            format_plug_success("plugin", Some("worker-7"), path),
-            "OK plug kind=plugin id=worker-7 path=module.wasm\n"
-        );
-    }
-
-    #[test]
-    fn initial_query_creates_when_name_matches_nothing() {
-        let sessions = vec![session(1, "session 1")];
-        let outcome = resolve_initial_query(&sessions, Some("research notes")).unwrap();
-
-        assert!(matches!(
-            outcome,
-            SessionSwitchOutcome::Create(name) if name == "research notes"
-        ));
-    }
-
-    #[test]
-    fn empty_query_without_selection_is_cancelled_selection() {
-        assert!(parse_skim_session_output("").is_err());
-    }
-
-    #[test]
-    fn session_marker_includes_surface_session_id() {
-        let marker = ControlTarget::new("org.manifold.Session".to_string(), None)
-            .session_marker_with_session(Some(42));
-
-        assert_eq!(
-            session_marker_value(&marker, "surface-session-id"),
-            Some("42".to_string())
-        );
-    }
-
-    #[test]
-    fn show_here_missing_directory_creates_even_from_entered_session() {
-        assert_eq!(
-            missing_directory_surface_session_action(Some(42), true, false),
-            MissingDirectorySurfaceSessionAction::Create
-        );
-    }
-
-    #[test]
-    fn entered_fallback_remains_available_for_callers_that_request_it() {
-        assert_eq!(
-            missing_directory_surface_session_action(Some(42), true, true),
-            MissingDirectorySurfaceSessionAction::Entered(42)
-        );
-    }
-
-    #[test]
-    fn entered_fallback_wins_over_directory_default_when_allowed() {
-        assert_eq!(
-            choose_cli_surface_session(Some(7), Some(42), true, true),
-            MissingDirectorySurfaceSessionAction::Entered(42)
-        );
-    }
-
-    #[test]
-    fn show_here_keeps_directory_default_ahead_of_entered_fallback() {
-        assert_eq!(
-            choose_cli_surface_session(Some(7), Some(42), true, false),
-            MissingDirectorySurfaceSessionAction::ExistingDefault(7)
-        );
-    }
-
-    #[test]
-    fn entered_spawn_command_targets_entered_session() {
-        let command = control_command_for_session(
-            vec!["spawn".to_string(), "foot".to_string()],
-            false,
-            Some(42),
-        );
-
-        assert_eq!(
-            command,
-            vec!["spawn-in-session", "42", "foot"]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn json_spawn_command_is_not_rewritten() {
-        let command = control_command_for_session(
-            vec!["spawn".to_string(), "foot".to_string()],
-            true,
-            Some(42),
-        );
-
-        assert_eq!(command, vec!["spawn".to_string(), "foot".to_string()]);
-    }
-
-    #[test]
-    fn dir_new_command_carries_client_directory_and_default_mode() {
-        let command = surface_session_dir_new_command(Path::new("/tmp/project/subdir"), None, true);
-
-        assert_eq!(
-            command,
-            vec![
-                "surface-session",
-                "dir-new",
-                "/tmp/project/subdir",
-                "default"
-            ]
-        );
-    }
-
-    #[test]
-    fn dir_new_command_carries_name_without_setting_default() {
-        let command = surface_session_dir_new_command(
-            Path::new("/tmp/project/subdir"),
-            Some("scratch".to_string()),
-            false,
-        );
-
-        assert_eq!(
-            command,
-            vec![
-                "surface-session",
-                "dir-new",
-                "/tmp/project/subdir",
-                "keep-default",
-                "scratch"
-            ]
-        );
-    }
 }

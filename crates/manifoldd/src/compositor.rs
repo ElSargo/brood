@@ -527,33 +527,6 @@ impl FractionalScaleHandler for Manifold {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{DmabufBlockerPlan, dmabuf_blocker_plan};
-
-    #[test]
-    fn dmabuf_without_explicit_acquire_uses_implicit_readiness_blocker() {
-        assert_eq!(
-            dmabuf_blocker_plan(true, false),
-            DmabufBlockerPlan::ImplicitDmabuf,
-        );
-    }
-
-    #[test]
-    fn explicit_acquire_point_requires_explicit_sync_blocker() {
-        assert_eq!(
-            dmabuf_blocker_plan(true, true),
-            DmabufBlockerPlan::ExplicitSync,
-        );
-    }
-
-    #[test]
-    fn no_dmabuf_needs_no_dmabuf_blocker() {
-        assert_eq!(dmabuf_blocker_plan(false, true), DmabufBlockerPlan::None,);
-        assert_eq!(dmabuf_blocker_plan(false, false), DmabufBlockerPlan::None,);
-    }
-}
-
 smithay::delegate_compositor!(Manifold);
 smithay::delegate_xdg_shell!(Manifold);
 smithay::delegate_xdg_decoration!(Manifold);

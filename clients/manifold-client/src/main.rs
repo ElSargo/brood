@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
+use manifold_cli::{
+    ClientArgs,
+    control::{ServerLaunch, connect_or_spawn, resolve_control_target},
+};
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -10,6 +15,18 @@ use winit::{
 };
 
 fn main() -> Result<()> {
+    let args = ClientArgs::parse();
+    let target = resolve_control_target(args.dbus_name, args.dbus_address);
+    let mut server = ServerLaunch::discover()?;
+    if let Some(executable) = args.server {
+        server.executable = executable;
+    }
+    let handshake = connect_or_spawn(&target, &server)?;
+    eprintln!(
+        "connected to Manifold server pid={} protocol={}",
+        handshake.server_pid, handshake.protocol_version
+    );
+
     let event_loop = EventLoop::new().context("create event loop")?;
     let mut application = Application::default();
 

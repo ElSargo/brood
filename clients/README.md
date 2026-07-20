@@ -2,6 +2,6 @@
 
 Native presentation endpoints will live here.
 
-The first separate endpoint is expected to be a local Linux/WSL-oriented compositor process. It should open a window, forward input and metrics to the session process, import surfaces, cache scene data, and present frames at refresh rate.
+`manifold-client` is the first separate endpoint. It opens a WGPU window and owns connection startup: it connects to the session server, starts one when necessary, and completes the presentation protocol handshake. Surface transport, scene mirroring, input forwarding, and composition follow in later stages.
 
 The presentation endpoint should not own authoritative editor, session, app, or pane state. It owns presentation behavior such as layout, visibility, animation, dragging, and hit testing, and may save preferences back to the workspace.

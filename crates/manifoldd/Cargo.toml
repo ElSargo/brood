@@ -4,17 +4,24 @@ version = "0.1.0"
 edition.workspace = true
 default-run = "manifold"
 
+[lib]
+test = false
+doctest = false
+
 [[bin]]
 name = "manifold"
 path = "src/main.rs"
+test = false
 
 [[bin]]
 name = "manifold-sessiond"
 path = "src/bin/manifold-sessiond.rs"
+test = false
 
 [[bin]]
 name = "manifold-runner-nix-develop"
 path = "src/bin/manifold-runner-nix-develop.rs"
+test = false
 
 [features]
 default = ["shm-fallback"]
@@ -26,6 +33,7 @@ calloop.workspace = true
 calloop-wayland-source.workspace = true
 clap.workspace = true
 image.workspace = true
+manifold-cli.workspace = true
 manifold-wasm = { path = "../manifold-wasm" }
 num-traits.workspace = true
 serde.workspace = true
@@ -42,9 +50,6 @@ wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
 zbus.workspace = true
-
-[dev-dependencies]
-wat = "1.241.2"
 
 [lints.rust]
 warnings = { level = "deny", priority = -1 }

@@ -1,8 +1,8 @@
 # Crates
 
-Future Rust crates will live here.
+Shared Rust crates live here. `manifold-cli` owns command-line types, DBus client access, server discovery, and the initial presentation handshake.
 
-Likely crate areas:
+Additional crate areas:
 
 - session process
 - protocol types

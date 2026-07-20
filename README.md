@@ -15,8 +15,9 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 
 ## Initial Shape
 
-- `manifold`: authoritative local session process and MVP presentation owner.
-- `manifold-client`: deferred presentation endpoint for future isolation or multi-window attach experiments.
+- `manifold`: CLI entrypoint that starts the presentation client.
+- `manifold-client`: WGPU presentation process that connects to the session server.
+- `manifold-sessiond`: authoritative local session server.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
 - plugins/WASM apps: sandboxed built-in or user applications that use addressed actors, private shared-memory workers, completion-based I/O, WASI resources, optional sync policy lanes, host-rendered UI, or low-level pane graphics.
 
@@ -46,37 +47,9 @@ Run the project through the Nix development shell:
 nix develop --command cargo run
 ```
 
-By default this starts `manifold run`, attaches a presentation surface, and
-loads enabled modules and startup apps from the global Manifold config. Manifold
-first checks the XDG config location and then falls back to the checked-in
-`manifold.toml` found from the development binary's repo checkout. The checked-in
-config enables the target-shape default-workspace WASM plugin when its built
-artifact exists and starts the pi agent workspace pane.
-
-Run Rust unit tests through Nix:
-
-```sh
-nix develop --command cargo test
-```
-
-Run Manifold behavior tests through Nix:
-
-```sh
-nix develop --command cargo run -- test
-```
-
-Behavior tests own their presentation policy. Outside Manifold, the default test topology starts an offscreen-attached outer supervisor and a normal subject compositor inside it, so graphical behavior can be exercised without opening a host OS window. Inside a managed Manifold session, `manifold_session` is present, so the test command skips the extra outer supervisor and starts only the subject compositor.
-
-For automated graphical behavior checks, keep using `test`, for example:
-
-```sh
-nix develop --command cargo run -- test nested --inner-command 'weston-simple-egl -f'
-```
-
-The outer supervisor is offscreen-attached unless `--outer-headful` is explicitly
-passed.
-The older helper script `tools/dev-nested-manifold.sh` is for host-visible manual
-development and opens a presentation window on the current desktop.
+By default the CLI starts `manifold-client`. The client connects to the default
+session server, starts `manifold-sessiond` when necessary, performs a protocol
+handshake, and then opens its WGPU presentation window.
 
 Run the session service without attaching it to a desktop presentation:
 
@@ -84,7 +57,7 @@ Run the session service without attaching it to a desktop presentation:
 nix develop --command cargo run -- run --headless
 ```
 
-`run --headless` is for service managers and long-lived runtime processes, such as a future systemd unit. Use `test` rather than `run --headless` for behavior validation.
+`run --headless` remains available for service managers and explicit server development.
 
 The repo includes `flake.nix`, and checked-in development workflows should prefer it for builds and tests. Its default package is the Manifold app; heavier development environments are exposed through explicit `full` outputs.
 
@@ -112,18 +85,13 @@ nix develop --command cargo run -- check
 nix develop --command cargo run -- run --no-default-modules
 nix develop --command cargo run -- run --config ./manifold.toml
 nix develop --command cargo run -- ctl status-json
-nix develop --command cargo run -- test
-nix develop --command cargo run -- test nested
-nix develop --command cargo run -- test nested --force-outer
 ```
 
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
 
-The current prototype uses Smithay with Winit/EGL for presentation, Wasmtime for
-WASM, DBus plus in-process channels for control, and a two-crate Rust workspace.
-CEF integration, durable plugin protocol encoding, and longer-term crate
-boundaries remain open. Remote presentation is a non-goal for the current
-prototype.
+The session server uses Smithay and Wasmtime. The presentation client uses WGPU,
+and shared CLI/DBus types live in `manifold-cli`. Durable presentation transport
+and rendering beyond the initial handshake and window remain open.
 
 ## Docs
 

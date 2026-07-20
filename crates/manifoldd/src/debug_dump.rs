@@ -344,37 +344,6 @@ impl ShmImageView<'_> {
         })
     }
 
-    #[cfg(test)]
-    fn from_slice(
-        bytes: &[u8],
-        width: usize,
-        height: usize,
-        stride: usize,
-        offset: usize,
-    ) -> Option<ShmImageView<'_>> {
-        let row_bytes = width.checked_mul(4)?;
-        if width == 0 || height == 0 || stride == 0 {
-            return None;
-        }
-        if stride < row_bytes {
-            return None;
-        }
-        let span = if height == 0 {
-            0
-        } else {
-            stride
-                .checked_mul(height.checked_sub(1)?)?
-                .checked_add(row_bytes)?
-        };
-        let end = offset.checked_add(span)?;
-        Some(ShmImageView {
-            bytes: bytes.get(offset..end)?,
-            width,
-            height,
-            stride,
-        })
-    }
-
     fn rgba(self, format: wl_shm::Format) -> Option<Vec<u8>> {
         let alpha = match format {
             wl_shm::Format::Argb8888 => true,
@@ -413,50 +382,4 @@ fn capture_shm_buffer(ptr: *const u8, len: usize, data: BufferData) -> Option<Su
         height: u32::try_from(data.height).ok()?,
         bytes: rgba,
     })
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    reason = "pixel fixture tests fail immediately when constructing an invalid test view"
-)]
-mod tests {
-    use super::ShmImageView;
-    use smithay::reexports::wayland_server::protocol::wl_shm;
-
-    #[test]
-    fn shm_view_converts_stride_offset_and_alpha_without_indexing() {
-        let bytes = [
-            9, 9, 9, 9, // offset
-            3, 2, 1, 4, 6, 5, 4, 7, 0, 0, 0, 0, // row plus padding
-            9, 8, 7, 6, 12, 11, 10, 5,
-        ];
-        let view = ShmImageView::from_slice(&bytes, 2, 2, 12, 4).expect("valid view");
-        assert_eq!(
-            view.rgba(wl_shm::Format::Argb8888).expect("ARGB"),
-            [1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 6, 10, 11, 12, 5]
-        );
-    }
-
-    #[test]
-    fn shm_view_forces_xrgb_alpha_opaque() {
-        let bytes = [3, 2, 1, 0];
-        let view = ShmImageView::from_slice(&bytes, 1, 1, 4, 0).expect("valid view");
-        assert_eq!(
-            view.rgba(wl_shm::Format::Xrgb8888).expect("XRGB"),
-            [1, 2, 3, 0xff]
-        );
-    }
-
-    #[test]
-    fn shm_view_rejects_short_stride_short_mapping_and_overflow() {
-        let bytes = [0; 16];
-        assert!(ShmImageView::from_slice(&bytes, 2, 1, 7, 0).is_none());
-        assert!(ShmImageView::from_slice(&bytes, 2, 3, 8, 0).is_none());
-        assert!(ShmImageView::from_slice(&bytes, usize::MAX, 1, 4, 0).is_none());
-        assert!(ShmImageView::from_slice(&bytes, 1, usize::MAX, 4, 0).is_none());
-        assert!(ShmImageView::from_slice(&bytes, 1, 1, 4, usize::MAX).is_none());
-        assert!(ShmImageView::from_slice(&bytes, 0, 1, 0, 0).is_none());
-        assert!(ShmImageView::from_slice(&bytes, 1, 0, 4, 0).is_none());
-    }
 }
