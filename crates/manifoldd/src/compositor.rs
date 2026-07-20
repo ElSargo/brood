@@ -107,42 +107,6 @@ impl CompositorHandler for Manifold {
             });
 
             if let Some(dmabuf) = maybe_dmabuf {
-                let mut root = surface.clone();
-                while let Some(parent) = get_parent(&root) {
-                    root = parent;
-                }
-                let is_mapped_toplevel = state
-                    .space
-                    .elements()
-                    .any(|window| Self::window_toplevel_surface(window).as_ref() == Some(&root));
-                if is_mapped_toplevel {
-                    state.dmabuf.latest_client_buffer = Some(dmabuf.clone());
-                    state.dmabuf.latest_client_buffer_sequence =
-                        state.dmabuf.latest_client_buffer_sequence.wrapping_add(1);
-                    if let Some(fast_path) = state.dmabuf.fast_path.as_mut() {
-                        let weak_dmabuf = dmabuf.weak();
-                        let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
-                            *id
-                        } else {
-                            fast_path.resources.retain(|buffer, _| !buffer.is_gone());
-                            let id = fast_path.next_resource_id;
-                            fast_path.next_resource_id = id.wrapping_add(1);
-                            fast_path.resources.insert(weak_dmabuf, id);
-                            fast_path.buffers.insert(id, dmabuf.clone());
-                            id
-                        };
-                        let record = manifold_ipc::CriticalRecord {
-                            opcode: manifold_ipc::FRAME_DMABUF_COMMIT,
-                            connection_generation: fast_path.generation,
-                            sequence: state.dmabuf.latest_client_buffer_sequence,
-                            arguments: [resource_id, 0, 0, 0, 0],
-                            ..manifold_ipc::CriticalRecord::default()
-                        };
-                        if fast_path.frames.try_send(record).is_err() {
-                            // The bounded lane intentionally drops superseded frames.
-                        }
-                    }
-                }
                 if has_release_point {
                     state.dmabuf.stats.explicit_sync_release_points += 1;
                 }

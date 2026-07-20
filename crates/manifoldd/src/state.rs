@@ -54,7 +54,7 @@ use smithay::{
             protocol::{wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{IsAlive, Logical, Point, SERIAL_COUNTER, Transform},
+    utils::{IsAlive, Logical, Point, SERIAL_COUNTER, Size, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
@@ -2555,10 +2555,32 @@ impl Manifold {
             return false;
         }
 
-        let mode = OutputMode {
-            size: (width.max(1), height.max(1)).into(),
-            refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
+        self.configure_presentation_output(width, height, SESSION_OUTPUT_REFRESH_MILLIHZ);
+        true
+    }
+
+    pub fn configure_presentation_output(&mut self, width: i32, height: i32, refresh_millihz: i32) {
+        let size = Size::from((width.max(1), height.max(1)));
+        let refresh = if refresh_millihz > 0 {
+            refresh_millihz
+        } else {
+            self.session_output
+                .current_mode()
+                .map_or(SESSION_OUTPUT_REFRESH_MILLIHZ, |mode| mode.refresh)
         };
+        let mode = OutputMode { size, refresh };
+        let resize_result = self
+            .presenter
+            .as_ref()
+            .map(|presenter| presenter.runtime.borrow_mut().resize_offscreen(size));
+        if let Some(Err(error)) = resize_result {
+            self.presentation_runtime_failures += 1;
+            self.presentation_last_error = Some(crate::presentation::sanitize_status_value(
+                &format!("runtime_resize_offscreen:{error}"),
+            ));
+            warn!(?error, "failed to resize offscreen presentation target");
+            self.request_detach();
+        }
         self.session_output
             .change_current_state(Some(mode), None, None, None);
         self.session_output.set_preferred(mode);
@@ -2572,7 +2594,6 @@ impl Manifold {
         if let Err(error) = self.display_handle.flush_clients() {
             warn!(?error, "flush after presentation client resize failed");
         }
-        true
     }
 
     pub fn allocate_toplevel_location(&mut self) -> Point<i32, Logical> {
@@ -6977,9 +6998,13 @@ pub struct PresentationFastPath {
     pub generation: u64,
     pub input: manifold_ipc::CriticalConsumer,
     pub frames: manifold_ipc::CriticalProducer,
+    pub frame_notifications: manifold_ipc::EventNotifier,
     pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,
     pub next_resource_id: u64,
+    pub last_presented_sequence: Option<u64>,
+    pub in_flight_sequence: Option<u64>,
+    pub pending_redraw: bool,
 }
 
 #[allow(dead_code)]

@@ -395,6 +395,12 @@ pub fn request_presenter_redraw_after_client_commit(state: &mut Manifold) {
     if state.presentation != PresentationStatus::Attached {
         return;
     }
+    if let Some(fast_path) = state.dmabuf.fast_path.as_mut()
+        && fast_path.in_flight_sequence.is_some()
+    {
+        fast_path.pending_redraw = true;
+        return;
+    }
     if state.presentation_visible_window_count() == 0 {
         return;
     }
@@ -402,6 +408,33 @@ pub fn request_presenter_redraw_after_client_commit(state: &mut Manifold) {
         return;
     };
     if state.presentation_redraw_deferred {
+        return;
+    }
+    let offscreen = presenter
+        .runtime
+        .borrow()
+        .backend
+        .as_ref()
+        .is_some_and(|backend| backend.target_name() == "offscreen");
+    if offscreen && schedule_deferred_client_frame(&presenter, state, false) {
+        return;
+    }
+    if let Some(backend) = presenter.runtime.borrow().backend.as_ref() {
+        backend.request_redraw();
+    }
+}
+
+pub fn request_external_client_redraw(state: &mut Manifold) {
+    let Some(presenter) = state.presenter.clone() else {
+        return;
+    };
+    let offscreen = presenter
+        .runtime
+        .borrow()
+        .backend
+        .as_ref()
+        .is_some_and(|backend| backend.target_name() == "offscreen");
+    if offscreen && schedule_deferred_client_frame(&presenter, state, false) {
         return;
     }
     if let Some(backend) = presenter.runtime.borrow().backend.as_ref() {
@@ -532,11 +565,11 @@ fn render_presenter_frame_with_capture(
     let output_scale = Scale::from(output.current_scale().fractional_scale());
     let chrome_elements = layout_chrome_elements(state, output_scale);
 
-    {
+    let render_sync = {
         let (renderer, mut framebuffer) = backend
             .bind()
             .map_err(|err| PresentationRuntimeFailure::new("bind_winit_backend", err))?;
-        smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
+        let result = smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
             &output,
             renderer,
             &mut framebuffer,
@@ -572,7 +605,11 @@ fn render_presenter_frame_with_capture(
             )
             .map_err(|err| PresentationRuntimeFailure::new("save_buffer", err))?;
         }
-    }
+        result.sync
+    };
+    render_sync
+        .wait()
+        .map_err(|err| PresentationRuntimeFailure::new("wait_composed_frame", err))?;
     let submitted = match backend.submit(Some(&[damage])) {
         Ok(()) => true,
         Err(err) => {
@@ -593,15 +630,72 @@ fn render_presenter_frame_with_capture(
     };
     state.stats.record_frame(frame_started.elapsed());
 
+    let external_client_active = state.dmabuf.fast_path.is_some();
+    if submitted && external_client_active {
+        let composed = backend.composed_dmabuf().ok_or_else(|| {
+            PresentationRuntimeFailure::new(
+                "publish_composed_frame",
+                "offscreen presenter has no exportable DMA-BUF",
+            )
+        })?;
+        publish_composed_frame(state, composed)?;
+    }
     if !submitted {
         state.presentation_skip_post_submit_frame_callbacks = false;
     } else if state.presentation_skip_post_submit_frame_callbacks {
         state.presentation_skip_post_submit_frame_callbacks = false;
-    } else {
+    } else if !external_client_active {
         send_active_client_frame_callbacks(presenter, state);
     }
 
-    backend.request_redraw();
+    if !external_client_active {
+        backend.request_redraw();
+    }
+    Ok(())
+}
+
+fn publish_composed_frame(
+    state: &mut Manifold,
+    dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+) -> std::result::Result<(), PresentationRuntimeFailure> {
+    state.dmabuf.latest_client_buffer = Some(dmabuf.clone());
+    state.dmabuf.latest_client_buffer_sequence =
+        state.dmabuf.latest_client_buffer_sequence.wrapping_add(1);
+    let sequence = state.dmabuf.latest_client_buffer_sequence;
+    let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
+        return Ok(());
+    };
+    if fast_path.in_flight_sequence.is_some() {
+        fast_path.pending_redraw = true;
+        return Ok(());
+    }
+    let weak_dmabuf = dmabuf.weak();
+    let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
+        *id
+    } else {
+        fast_path.resources.retain(|buffer, _| !buffer.is_gone());
+        let id = fast_path.next_resource_id;
+        fast_path.next_resource_id = id.wrapping_add(1);
+        fast_path.resources.insert(weak_dmabuf, id);
+        fast_path.buffers.insert(id, dmabuf);
+        id
+    };
+    let record = manifold_ipc::CriticalRecord {
+        opcode: manifold_ipc::FRAME_DMABUF_COMMIT,
+        connection_generation: fast_path.generation,
+        sequence,
+        arguments: [resource_id, 0, 0, 0, 0],
+        ..manifold_ipc::CriticalRecord::default()
+    };
+    fast_path
+        .frames
+        .try_send(record)
+        .map_err(|error| PresentationRuntimeFailure::new("publish_composed_frame", error))?;
+    fast_path
+        .frame_notifications
+        .notify()
+        .map_err(|error| PresentationRuntimeFailure::new("notify_composed_frame", error))?;
+    fast_path.in_flight_sequence = Some(sequence);
     Ok(())
 }
 
@@ -957,6 +1051,15 @@ fn send_active_client_frame_callbacks(
     state: &mut Manifold,
 ) -> u64 {
     let output = presenter.output.clone();
+    send_client_frame_callbacks(&output, state)
+}
+
+pub fn send_external_client_frame_callbacks(state: &mut Manifold) -> u64 {
+    let output = state.session_output.clone();
+    send_client_frame_callbacks(&output, state)
+}
+
+fn send_client_frame_callbacks(output: &Output, state: &mut Manifold) -> u64 {
     let mut client_frame_callbacks = 0;
     let active_window = state.active_presentation_window();
     let active_surface = active_window
@@ -978,14 +1081,14 @@ fn send_active_client_frame_callbacks(
     );
     windows.iter().for_each(|window| {
         window.send_frame(
-            &output,
+            output,
             state.start_time.elapsed(),
             Some(Duration::ZERO),
             |_, _| Some(output.clone()),
         );
         client_frame_callbacks += 1;
         if let Some(feedback) = state.dmabuf.default_feedback.as_ref() {
-            window.send_dmabuf_feedback(&output, |_, _| Some(output.clone()), |_, _| feedback);
+            window.send_dmabuf_feedback(output, |_, _| Some(output.clone()), |_, _| feedback);
         }
     });
     state

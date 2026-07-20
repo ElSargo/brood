@@ -37,9 +37,9 @@ use smithay::{
     },
     input::pointer::AxisFrame,
     reexports::calloop::{
-        EventLoop,
+        EventLoop, Interest, Mode, PostAction,
         channel::{self, Event},
-        timer::{TimeoutAction, Timer},
+        generic::Generic,
     },
     utils::Point,
 };
@@ -54,7 +54,7 @@ use crate::{
     config,
     debug_dump::{self, DumpOptions},
     layout::LayoutAction,
-    session_runner,
+    presentation, session_runner,
     state::{
         AgentNotification, FocusDirection, HostedChildStatus, HostedChildToken,
         MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL, PresentationStatus,
@@ -83,7 +83,13 @@ type DbusStatusItem = (String, String, String, String, DbusMetadata);
 type DbusPluginActor = (String, String, u64, u64, u64, u64, String, String);
 type DbusPluginMailbox = (String, u64, u64, u64);
 type DbusDmabufFrame = (u64, u32, u32, u32, u64, u32, u32, bool, zvariant::OwnedFd);
-type DbusFastPath = (u64, zvariant::OwnedFd, zvariant::OwnedFd);
+type DbusFastPath = (
+    u64,
+    zvariant::OwnedFd,
+    zvariant::OwnedFd,
+    zvariant::OwnedFd,
+    zvariant::OwnedFd,
+);
 type DbusAgent = (
     String,
     String,
@@ -2686,23 +2692,30 @@ fn send_response<T>(response: DbusResponse<T>, result: Result<T>) {
 }
 
 static FAST_PATH_GENERATION: AtomicU64 = AtomicU64::new(1);
-const FAST_INPUT_POLL_INTERVAL: Duration = Duration::from_micros(250);
 
 fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     let generation = FAST_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
     let input_file = manifold_ipc::CriticalLaneFile::create(generation)?;
     let frame_file = manifold_ipc::CriticalLaneFile::create(generation)?;
+    let input_notifications = manifold_ipc::EventNotifier::create()?;
+    let frame_notifications = manifold_ipc::EventNotifier::create()?;
     let input_fd = input_file.as_fd().try_clone_to_owned()?;
+    let input_notify_fd = input_notifications.as_fd().try_clone_to_owned()?;
     let frame_fd = frame_file.as_fd().try_clone_to_owned()?;
+    let frame_notify_fd = frame_notifications.as_fd().try_clone_to_owned()?;
     let input = manifold_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
     let frames = manifold_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
     let mut fast_path = crate::state::PresentationFastPath {
         generation,
         input,
         frames,
+        frame_notifications,
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
         next_resource_id: 1,
+        last_presented_sequence: None,
+        in_flight_sequence: None,
+        pending_redraw: false,
     };
     if let Some(dmabuf) = state.dmabuf.latest_client_buffer.as_ref() {
         let resource_id = fast_path.next_resource_id;
@@ -2718,29 +2731,42 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
                 arguments: [resource_id, 0, 0, 0, 0],
                 ..manifold_ipc::CriticalRecord::default()
             })
-            .is_err()
+            .is_ok()
         {
-            // A new lane always has capacity; retain non-blocking semantics.
+            fast_path.frame_notifications.notify()?;
+            fast_path.in_flight_sequence = Some(state.dmabuf.latest_client_buffer_sequence);
         }
     }
     state.dmabuf.fast_path = Some(fast_path);
+    presentation::request_external_client_redraw(state);
     state
         .loop_handle
         .insert_source(
-            Timer::from_duration(FAST_INPUT_POLL_INTERVAL),
-            |_, (), state| {
+            Generic::new(input_notifications, Interest::READ, Mode::Level),
+            |_, notifications, state| {
+                if let Err(error) = notifications.drain() {
+                    warn!(?error, "drain fast-path input notification failed");
+                }
                 drain_fast_path_input(state);
-                TimeoutAction::ToDuration(FAST_INPUT_POLL_INTERVAL)
+                Ok(PostAction::Continue)
             },
         )
-        .map_err(|error| anyhow::anyhow!("install fast-path input poll: {error}"))?;
-    Ok((generation, input_fd.into(), frame_fd.into()))
+        .map_err(|error| anyhow::anyhow!("install fast-path input notification: {error}"))?;
+    Ok((
+        generation,
+        input_fd.into(),
+        input_notify_fd.into(),
+        frame_fd.into(),
+        frame_notify_fd.into(),
+    ))
 }
 
 fn drain_fast_path_input(state: &mut Manifold) {
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
     };
+    let mut request_redraw = false;
+    let mut disconnected = false;
     while let Some(record) = fast_path.input.try_recv() {
         if record.connection_generation != fast_path.generation {
             continue;
@@ -2787,15 +2813,46 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 state.forward_pointer_axis(frame);
             }
             manifold_ipc::INPUT_PRESENTATION_SIZE => {
-                state.configure_first_window_size(
+                state.configure_presentation_output(
                     i32::try_from(record.arguments[0]).map_or(i32::MAX, |value| value),
                     i32::try_from(record.arguments[1]).map_or(i32::MAX, |value| value),
+                    i32::try_from(record.arguments[2]).map_or(i32::MAX, |value| value),
                 );
+            }
+            manifold_ipc::INPUT_FRAME_PRESENTED => {
+                let sequence = record.arguments[0];
+                let accepted = fast_path.in_flight_sequence == Some(sequence);
+                if accepted {
+                    fast_path.last_presented_sequence = Some(sequence);
+                    fast_path.in_flight_sequence = None;
+                }
+                let redraw_pending = accepted && fast_path.pending_redraw;
+                if redraw_pending {
+                    fast_path.pending_redraw = false;
+                }
+                drop(record);
+                if accepted {
+                    presentation::send_external_client_frame_callbacks(state);
+                }
+                if redraw_pending {
+                    request_redraw = true;
+                }
+            }
+            manifold_ipc::INPUT_CLIENT_DISCONNECT => {
+                disconnected = true;
+                break;
             }
             _ => {}
         }
     }
-    state.dmabuf.fast_path = Some(fast_path);
+    if disconnected {
+        presentation::send_external_client_frame_callbacks(state);
+    } else {
+        state.dmabuf.fast_path = Some(fast_path);
+    }
+    if request_redraw || disconnected {
+        presentation::request_external_client_redraw(state);
+    }
     if let Err(error) = state.display_handle.flush_clients() {
         warn!(?error, "flush clients after fast-path input failed");
     }
@@ -2832,6 +2889,11 @@ fn dmabuf_frame_tuple(
     let width = u32::try_from(size.w).context("DMA-BUF width is invalid")?;
     let height = u32::try_from(size.h).context("DMA-BUF height is invalid")?;
     let format = dmabuf.format();
+    let modifier = if format.modifier == smithay::backend::allocator::Modifier::Invalid {
+        smithay::backend::allocator::Modifier::Linear
+    } else {
+        format.modifier
+    };
     let stride = dmabuf.strides().next().context("DMA-BUF has no stride")?;
     let offset = dmabuf.offsets().next().context("DMA-BUF has no offset")?;
     let handle = dmabuf
@@ -2845,7 +2907,7 @@ fn dmabuf_frame_tuple(
         width,
         height,
         format.code as u32,
-        u64::from(format.modifier),
+        u64::from(modifier),
         stride,
         offset,
         dmabuf.y_inverted(),

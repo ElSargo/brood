@@ -22,7 +22,7 @@ use crate::{
 
 pub const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 pub const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 1;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 2;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -47,7 +47,13 @@ trait ManifoldControl {
     fn latest_dmabuf_frame(&self) -> zbus::Result<DbusDmabufFrame>;
     fn open_presentation_fast_path(
         &self,
-    ) -> zbus::Result<(u64, zbus::zvariant::OwnedFd, zbus::zvariant::OwnedFd)>;
+    ) -> zbus::Result<(
+        u64,
+        zbus::zvariant::OwnedFd,
+        zbus::zvariant::OwnedFd,
+        zbus::zvariant::OwnedFd,
+        zbus::zvariant::OwnedFd,
+    )>;
     fn dmabuf_resource(&self, resource_id: u64) -> zbus::Result<DbusDmabufFrame>;
 }
 
@@ -96,7 +102,9 @@ pub struct Handshake {
 pub struct PresentationFastPath {
     pub generation: u64,
     pub input_fd: OwnedFd,
+    pub input_notify_fd: OwnedFd,
     pub frame_fd: OwnedFd,
+    pub frame_notify_fd: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -199,13 +207,16 @@ fn presentation_proxy<'a>(
 
 pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<PresentationFastPath> {
     let connection = connection(target)?;
-    let (generation, input_fd, frame_fd) = presentation_proxy(&connection, target)?
-        .open_presentation_fast_path()
-        .context("open local presentation fast path")?;
+    let (generation, input_fd, input_notify_fd, frame_fd, frame_notify_fd) =
+        presentation_proxy(&connection, target)?
+            .open_presentation_fast_path()
+            .context("open local presentation fast path")?;
     Ok(PresentationFastPath {
         generation,
         input_fd: input_fd.into(),
+        input_notify_fd: input_notify_fd.into(),
         frame_fd: frame_fd.into(),
+        frame_notify_fd: frame_notify_fd.into(),
     })
 }
 

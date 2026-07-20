@@ -27,7 +27,11 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::{
     backend::{
         SwapBuffersError,
-        allocator::{Fourcc, gbm::GbmDevice},
+        allocator::{
+            Allocator, Fourcc, Modifier,
+            dmabuf::{Dmabuf, DmabufAllocator},
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+        },
         drm::DrmDeviceFd,
         egl::{
             EGLContext, EGLDevice, EGLSurface,
@@ -429,6 +433,24 @@ impl PresenterRuntime {
         self.ensure_windowless_target();
     }
 
+    pub fn resize_offscreen(
+        &mut self,
+        size: Size<i32, Physical>,
+    ) -> Result<(), PresenterBackendError> {
+        if self.target != PresenterTarget::Offscreen || size == self.offscreen_size {
+            return Ok(());
+        }
+        self.offscreen_size = size;
+        if let Some(backend) = self.backend.as_mut() {
+            backend.create_offscreen_target(size)?;
+            self.pending_events.push(PresenterEvent::Resized {
+                size,
+                scale_factor: 1.0,
+            });
+        }
+        Ok(())
+    }
+
     fn ensure_windowless_target(&mut self) {
         if !self.want_window
             || self
@@ -491,10 +513,13 @@ enum PresenterTarget {
     Offscreen,
 }
 
+type OffscreenAllocator = DmabufAllocator<GbmAllocator<DrmDeviceFd>>;
+
 #[derive(Debug)]
 pub struct PresenterBackend {
     renderer: GlesRenderer,
     _display: EGLDisplay,
+    offscreen_allocator: Option<OffscreenAllocator>,
     target: Option<PresenterRenderTarget>,
     damage_tracking: bool,
     bind_size: Option<Size<i32, Physical>>,
@@ -518,8 +543,14 @@ struct PresenterFrontend {
 
 #[derive(Debug)]
 struct PresenterOffscreenTarget {
-    renderbuffer: GlesRenderbuffer,
+    buffer: PresenterOffscreenBuffer,
     size: Size<i32, Physical>,
+}
+
+#[derive(Debug)]
+enum PresenterOffscreenBuffer {
+    Dmabuf(Dmabuf),
+    Renderbuffer(GlesRenderbuffer),
 }
 
 #[derive(Debug)]
@@ -562,6 +593,7 @@ impl PresenterBackend {
         Ok(Self {
             renderer,
             _display: display,
+            offscreen_allocator: None,
             target: Some(PresenterRenderTarget::Window(PresenterFrontend {
                 egl_surface,
                 window,
@@ -582,7 +614,7 @@ impl PresenterBackend {
     ) -> Result<Self, PresenterBackendError> {
         let span_for_guard = span.clone();
         let _guard = span_for_guard.enter();
-        let display = offscreen_egl_display()?;
+        let (display, mut offscreen_allocator) = offscreen_egl_display()?;
         let context = if env::var_os("MANIFOLD_ALLOW_SOFTWARE_EGL_CONFIG").is_some() {
             EGLContext::new(&display)?
         } else {
@@ -590,14 +622,15 @@ impl PresenterBackend {
         };
         let _ = context.unbind();
         let mut renderer = audited_ffi::renderer(context)?;
-        let renderbuffer = create_offscreen_renderbuffer(&mut renderer, size)?;
+        let buffer = create_offscreen_buffer(&mut renderer, offscreen_allocator.as_mut(), size)?;
         drop(_guard);
 
         Ok(Self {
             renderer,
             _display: display,
+            offscreen_allocator,
             target: Some(PresenterRenderTarget::Offscreen(PresenterOffscreenTarget {
-                renderbuffer,
+                buffer,
                 size,
             })),
             damage_tracking: false,
@@ -653,9 +686,10 @@ impl PresenterBackend {
         &mut self,
         size: Size<i32, Physical>,
     ) -> Result<(), PresenterBackendError> {
-        let renderbuffer = create_offscreen_renderbuffer(&mut self.renderer, size)?;
+        let buffer =
+            create_offscreen_buffer(&mut self.renderer, self.offscreen_allocator.as_mut(), size)?;
         self.target = Some(PresenterRenderTarget::Offscreen(PresenterOffscreenTarget {
-            renderbuffer,
+            buffer,
             size,
         }));
         self.bind_size = None;
@@ -825,6 +859,16 @@ impl PresenterBackend {
         &mut self.renderer
     }
 
+    pub fn composed_dmabuf(&self) -> Option<Dmabuf> {
+        let PresenterRenderTarget::Offscreen(target) = self.target.as_ref()? else {
+            return None;
+        };
+        let PresenterOffscreenBuffer::Dmabuf(dmabuf) = &target.buffer else {
+            return None;
+        };
+        Some(dmabuf.clone())
+    }
+
     pub fn reset_target_after_context_loss(&mut self) {
         if let Err(err) = self.renderer.egl_context().unbind() {
             warn!(
@@ -865,7 +909,12 @@ impl PresenterBackend {
             }
             PresenterRenderTarget::Offscreen(target) => {
                 self.bind_size = Some(target.size);
-                let fb = self.renderer.bind(&mut target.renderbuffer)?;
+                let fb = match &mut target.buffer {
+                    PresenterOffscreenBuffer::Dmabuf(dmabuf) => self.renderer.bind(dmabuf)?,
+                    PresenterOffscreenBuffer::Renderbuffer(renderbuffer) => {
+                        self.renderer.bind(renderbuffer)?
+                    }
+                };
                 Ok((&mut self.renderer, fb))
             }
         }
@@ -935,25 +984,40 @@ fn activate_wayland_window_with_token(
     audited_ffi::activate_wayland_window(window, activation_token)
 }
 
-fn create_offscreen_renderbuffer(
+fn create_offscreen_buffer(
     renderer: &mut GlesRenderer,
+    allocator: Option<&mut OffscreenAllocator>,
     size: Size<i32, Physical>,
-) -> Result<GlesRenderbuffer, GlesError> {
+) -> Result<PresenterOffscreenBuffer, PresenterBackendError> {
+    if let Some(allocator) = allocator {
+        let width = u32::try_from(size.w.max(1))
+            .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
+        let height = u32::try_from(size.h.max(1))
+            .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
+        let dmabuf = allocator
+            .create_buffer(width, height, Fourcc::Argb8888, &[Modifier::Linear])
+            .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
+        return Ok(PresenterOffscreenBuffer::Dmabuf(dmabuf));
+    }
     let buffer_size: Size<i32, BufferCoords> = (size.w, size.h).into();
-    renderer.create_buffer(Fourcc::Abgr8888, buffer_size)
+    renderer
+        .create_buffer(Fourcc::Abgr8888, buffer_size)
+        .map(PresenterOffscreenBuffer::Renderbuffer)
+        .map_err(Into::into)
 }
 
-fn offscreen_egl_display() -> Result<EGLDisplay, PresenterBackendError> {
+fn offscreen_egl_display() -> Result<(EGLDisplay, Option<OffscreenAllocator>), PresenterBackendError>
+{
     let mut failures = Vec::new();
     for path in render_node_candidates() {
         match gbm_egl_display_from_path(&path) {
-            Ok(display) => return Ok(display),
+            Ok(pair) => return Ok((pair.0, Some(DmabufAllocator(pair.1)))),
             Err(err) => failures.push(format!("{}:{err}", path.display())),
         }
     }
 
     match audited_ffi::surfaceless_display() {
-        Ok(display) => Ok(display),
+        Ok(display) => Ok((display, None)),
         Err(err) => {
             if failures.is_empty() {
                 Err(err.into())
@@ -967,12 +1031,18 @@ fn offscreen_egl_display() -> Result<EGLDisplay, PresenterBackendError> {
     }
 }
 
-fn gbm_egl_display_from_path(path: &PathBuf) -> Result<EGLDisplay, PresenterBackendError> {
+fn gbm_egl_display_from_path(
+    path: &PathBuf,
+) -> Result<(EGLDisplay, GbmAllocator<DrmDeviceFd>), PresenterBackendError> {
     let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
     let owned_fd: OwnedFd = file.into();
     let drm_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
     let gbm = GbmDevice::new(drm_fd)?;
-    Ok(audited_ffi::gbm_display(gbm)?)
+    let allocator = GbmAllocator::new(
+        gbm.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::LINEAR,
+    );
+    Ok((audited_ffi::gbm_display(gbm)?, allocator))
 }
 
 fn render_node_candidates() -> Vec<PathBuf> {

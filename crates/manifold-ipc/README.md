@@ -9,9 +9,11 @@ consumer acquires the slot and borrows `&CriticalRecord` directly from shared
 memory. Dropping the borrow releases the slot. The consumer performs no byte
 parsing, allocation, or payload copy.
 
-The active minimum-latency path spins. Event-loop integration will add a bounded
-active spin followed by an armed notification so an idle connection does not
-consume a core without adding notification syscalls to an already-active path.
+Each lane has a coalescing eventfd readiness notification. Producers publish
+records before signaling; consumers wake once and drain every available record.
+This keeps idle endpoints asleep, removes timer-poll latency, and prevents the
+frame receiver from consuming a core. The ring remains the source of truth, so
+notifications may be safely coalesced.
 
 Run the release benchmark through the checked-in environment:
 

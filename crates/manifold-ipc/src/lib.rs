@@ -37,10 +37,127 @@ pub const INPUT_POINTER_BUTTON: u32 = 2;
 pub const INPUT_KEYBOARD_KEY: u32 = 3;
 /// Pointer wheel changed; arguments are horizontal/vertical `f64` bits.
 pub const INPUT_POINTER_AXIS: u32 = 4;
-/// Presentation extent changed; arguments are width and height.
+/// Presentation configuration changed; arguments are width, height, and refresh mHz.
 pub const INPUT_PRESENTATION_SIZE: u32 = 5;
+/// A frame reached the presentation queue; argument zero is its frame sequence.
+pub const INPUT_FRAME_PRESENTED: u32 = 6;
+/// The presentation client is closing cleanly and relinquishes its fast path.
+pub const INPUT_CLIENT_DISCONNECT: u32 = 7;
 /// A registered DMA-BUF resource was committed; argument zero is its resource ID.
 pub const FRAME_DMABUF_COMMIT: u32 = 0x100;
+
+/// Non-blocking eventfd used to wake a critical-lane consumer.
+///
+/// The shared-memory lane remains the source of truth. The eventfd is only a
+/// coalescing readiness notification, so one wake can cover any number of
+/// records published before the consumer drains the lane.
+#[derive(Debug)]
+pub struct EventNotifier {
+    fd: OwnedFd,
+}
+
+impl EventNotifier {
+    /// Create an initially idle notification descriptor.
+    pub fn create() -> Result<Self, CriticalLaneError> {
+        // SAFETY: `eventfd` takes a plain initial counter and valid flag bits.
+        let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: a successful `eventfd` returns a new owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        Ok(Self { fd })
+    }
+
+    /// Attach to a notification descriptor received from another process.
+    #[must_use]
+    pub const fn from_owned_fd(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
+    /// Duplicate this notification endpoint for descriptor transfer.
+    pub fn try_clone(&self) -> Result<Self, CriticalLaneError> {
+        Ok(Self {
+            fd: self.fd.try_clone()?,
+        })
+    }
+
+    /// Mark the associated lane readable.
+    pub fn notify(&self) -> Result<(), CriticalLaneError> {
+        let value = 1_u64.to_ne_bytes();
+        // SAFETY: `value` is an initialized eight-byte eventfd counter and the
+        // descriptor remains live for the duration of the syscall.
+        let written = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+            )
+        };
+        if usize::try_from(written).ok() == Some(value.len()) {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            // A saturated eventfd is already readable, which is sufficient.
+            return Ok(());
+        }
+        Err(error.into())
+    }
+
+    /// Clear accumulated wakeups without blocking.
+    pub fn drain(&self) -> Result<u64, CriticalLaneError> {
+        let mut value = [0_u8; size_of::<u64>()];
+        // SAFETY: `value` is writable eight-byte storage and the descriptor
+        // remains live for the duration of the syscall.
+        let read = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                value.as_mut_ptr().cast::<libc::c_void>(),
+                value.len(),
+            )
+        };
+        if usize::try_from(read).ok() == Some(value.len()) {
+            return Ok(u64::from_ne_bytes(value));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(0);
+        }
+        Err(error.into())
+    }
+
+    /// Sleep until at least one wakeup is pending, then clear it.
+    pub fn wait(&self) -> Result<u64, CriticalLaneError> {
+        loop {
+            let drained = self.drain()?;
+            if drained > 0 {
+                return Ok(drained);
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `descriptor` is one valid pollfd and remains writable for
+            // the duration of the blocking syscall.
+            let ready = unsafe { libc::poll(&raw mut descriptor, 1, -1) };
+            if ready > 0 {
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+impl AsFd for EventNotifier {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
 
 /// One directly usable critical-lane record.
 ///
@@ -525,6 +642,29 @@ mod tests {
             CriticalConsumer::map(file.as_fd(), 9),
             Err(CriticalLaneError::StaleGeneration)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn event_notifier_coalesces_and_clears_wakeups() -> Result<()> {
+        let notifier = EventNotifier::create()?;
+        notifier.notify()?;
+        notifier.notify()?;
+        ensure!(notifier.drain()? == 2);
+        ensure!(notifier.drain()? == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn event_notifier_wakes_a_blocked_consumer() -> Result<()> {
+        let notifier = EventNotifier::create()?;
+        let waiter = notifier.try_clone()?;
+        let thread = std::thread::spawn(move || waiter.wait());
+        notifier.notify()?;
+        let wakeups = thread
+            .join()
+            .map_err(|_panic| std::io::Error::other("notification waiter panicked"))??;
+        ensure!(wakeups == 1);
         Ok(())
     }
 }
