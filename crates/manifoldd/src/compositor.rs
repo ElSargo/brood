@@ -120,12 +120,14 @@ impl CompositorHandler for Manifold {
                     state.dmabuf.latest_client_buffer_sequence =
                         state.dmabuf.latest_client_buffer_sequence.wrapping_add(1);
                     if let Some(fast_path) = state.dmabuf.fast_path.as_mut() {
-                        let resource_id = if let Some(id) = fast_path.resources.get(&dmabuf) {
+                        let weak_dmabuf = dmabuf.weak();
+                        let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
                             *id
                         } else {
+                            fast_path.resources.retain(|buffer, _| !buffer.is_gone());
                             let id = fast_path.next_resource_id;
                             fast_path.next_resource_id = id.wrapping_add(1);
-                            fast_path.resources.insert(dmabuf.clone(), id);
+                            fast_path.resources.insert(weak_dmabuf, id);
                             fast_path.buffers.insert(id, dmabuf.clone());
                             id
                         };

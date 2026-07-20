@@ -541,6 +541,13 @@ impl Renderer {
 
     fn select_frame(&mut self, resource_id: u64, resource: Option<DmabufFrame>) -> Result<()> {
         if let Some(frame) = resource {
+            if self
+                .content_extent()
+                .is_some_and(|extent| extent != (frame.width, frame.height))
+            {
+                self.current_frame = None;
+                self.imported_frames.clear();
+            }
             let imported = ImportedFrame::new(&self.device, self.config.format, frame)?;
             self.imported_frames.insert(resource_id, imported);
         }

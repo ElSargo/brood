@@ -2707,7 +2707,7 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     if let Some(dmabuf) = state.dmabuf.latest_client_buffer.as_ref() {
         let resource_id = fast_path.next_resource_id;
         fast_path.next_resource_id = resource_id.wrapping_add(1);
-        fast_path.resources.insert(dmabuf.clone(), resource_id);
+        fast_path.resources.insert(dmabuf.weak(), resource_id);
         fast_path.buffers.insert(resource_id, dmabuf.clone());
         if fast_path
             .frames
@@ -2810,14 +2810,14 @@ fn latest_dmabuf_frame(state: &Manifold) -> Result<DbusDmabufFrame> {
     dmabuf_frame_tuple(dmabuf, state.dmabuf.latest_client_buffer_sequence)
 }
 
-fn dmabuf_resource(state: &Manifold, resource_id: u64) -> Result<DbusDmabufFrame> {
+fn dmabuf_resource(state: &mut Manifold, resource_id: u64) -> Result<DbusDmabufFrame> {
     let dmabuf = state
         .dmabuf
         .fast_path
-        .as_ref()
-        .and_then(|fast_path| fast_path.buffers.get(&resource_id))
+        .as_mut()
+        .and_then(|fast_path| fast_path.buffers.remove(&resource_id))
         .with_context(|| format!("unknown DMA-BUF resource {resource_id}"))?;
-    dmabuf_frame_tuple(dmabuf, resource_id)
+    dmabuf_frame_tuple(&dmabuf, resource_id)
 }
 
 fn dmabuf_frame_tuple(

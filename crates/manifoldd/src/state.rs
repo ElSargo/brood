@@ -35,7 +35,7 @@ use anyhow::{Context, Result, ensure};
 use smithay::wayland::shm::ShmState;
 use smithay::{
     backend::{
-        allocator::dmabuf::Dmabuf,
+        allocator::dmabuf::{Dmabuf, WeakDmabuf},
         input::{KeyState, Keycode},
     },
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
@@ -2551,18 +2551,24 @@ impl Manifold {
     }
 
     pub fn configure_first_window_size(&mut self, width: i32, height: i32) -> bool {
-        let Some(window) = self.space.elements().next().cloned() else {
+        if self.space.elements().next().is_none() {
             return false;
+        }
+
+        let mode = OutputMode {
+            size: (width.max(1), height.max(1)).into(),
+            refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
         };
-        let Some(toplevel) = window.toplevel() else {
-            return false;
-        };
-        let size = (width.max(1), height.max(1));
-        toplevel.with_pending_state(|state| {
-            state.size = Some(size.into());
-            state.bounds = Some(size.into());
-        });
-        toplevel.send_configure();
+        self.session_output
+            .change_current_state(Some(mode), None, None, None);
+        self.session_output.set_preferred(mode);
+        self.refresh_fractional_scales();
+        self.reconfigure_focus_stack();
+        if let Some(importer) = self.dmabuf.importer.as_ref()
+            && let Some(backend) = importer.borrow().backend.as_ref()
+        {
+            backend.request_redraw();
+        }
         if let Err(error) = self.display_handle.flush_clients() {
             warn!(?error, "flush after presentation client resize failed");
         }
@@ -6971,7 +6977,7 @@ pub struct PresentationFastPath {
     pub generation: u64,
     pub input: manifold_ipc::CriticalConsumer,
     pub frames: manifold_ipc::CriticalProducer,
-    pub resources: HashMap<Dmabuf, u64>,
+    pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,
     pub next_resource_id: u64,
 }
