@@ -2253,6 +2253,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "manifold-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "manifold-wasm"
 version = "0.1.0"
 dependencies = [
