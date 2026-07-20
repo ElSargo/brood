@@ -4,6 +4,7 @@ members = [
     "crates/manifold-cli",
     "crates/manifold-dmabuf",
     "crates/manifold-ipc",
+    "crates/manifold-layout",
     "crates/manifoldd",
     "crates/manifold-wasm",
 ]
@@ -25,6 +26,7 @@ image = "0.25.8"
 libc = "0.2.186"
 manifold-cli = { path = "crates/manifold-cli" }
 manifold-ipc = { path = "crates/manifold-ipc" }
+manifold-layout = { path = "crates/manifold-layout" }
 num-traits = "0.2.19"
 notify = "8.2.0"
 pollster = "0.4.0"

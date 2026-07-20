@@ -1,6 +1,8 @@
 use tracing::warn;
 
-use crate::{layout::LayoutAction, state::Manifold};
+use manifold_layout::LayoutAction;
+
+use crate::state::Manifold;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkspaceCommand {
@@ -12,7 +14,7 @@ pub enum WorkspaceCommand {
         argv: Vec<String>,
     },
     SetResolvedLayout {
-        layout: crate::layout::ResolvedLayout,
+        layout: manifold_layout::ResolvedLayout,
         focus: Option<u64>,
     },
     Surface(SurfaceCommand),

@@ -33,38 +33,6 @@ pub fn capture_extent(axis: &'static str, value: i32) -> Result<u32, GeometryCon
     Ok(value)
 }
 
-/// Round normalized layout math to the nearest signed pixel and saturate overflow.
-///
-/// `NaN` has no meaningful direction and maps to the origin. Infinities and finite values outside
-/// the signed layout domain saturate toward their sign.
-pub fn rounded_layout_coordinate(value: f64) -> i32 {
-    if value.is_nan() {
-        return 0;
-    }
-    value.round().to_i32().unwrap_or_else(|| {
-        if value.is_sign_negative() {
-            i32::MIN
-        } else {
-            i32::MAX
-        }
-    })
-}
-
-/// Round a normalized extent to pixels.
-///
-/// Positive presentation bounds retain a one-pixel minimum. Empty bounds stay empty. Invalid or
-/// negative calculated extents collapse to zero, and positive overflow saturates at `i32::MAX`.
-pub fn rounded_layout_extent(value: f64, bounds: i32) -> i32 {
-    if bounds <= 0 || value.is_nan() || value <= 0.0 {
-        return 0;
-    }
-    value
-        .round()
-        .to_i32()
-        .unwrap_or(i32::MAX)
-        .clamp(1, i32::MAX)
-}
-
 /// Convert a physical pointer coordinate to logical space and clamp it to the presentation.
 ///
 /// A zero-sized presentation collapses to the origin. `NaN` and negative infinity map to the

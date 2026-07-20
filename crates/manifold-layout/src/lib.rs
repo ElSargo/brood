@@ -1,10 +1,40 @@
+//! Portable viewport layout primitives.
+//!
+//! This crate deliberately knows nothing about compositor surfaces, rendering,
+//! transports, or plugin runtimes. Presentation hosts supply pane inventory and
+//! execute the accepted layout.
+
 use std::{collections::BTreeSet, fmt, str::FromStr};
 
-use crate::geometry::{rounded_layout_coordinate, rounded_layout_extent};
+use num_traits::ToPrimitive;
 
 const MAX_RESOLVED_LAYOUT_ITEMS: usize = 512;
 const NORMALIZED_MIN: f64 = -1.0;
 const NORMALIZED_MAX: f64 = 1.0;
+
+fn rounded_layout_coordinate(value: f64) -> i32 {
+    if value.is_nan() {
+        return 0;
+    }
+    value.round().to_i32().unwrap_or_else(|| {
+        if value.is_sign_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    })
+}
+
+fn rounded_layout_extent(value: f64, bounds: i32) -> i32 {
+    if bounds <= 0 || value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    value
+        .round()
+        .to_i32()
+        .unwrap_or(i32::MAX)
+        .clamp(1, i32::MAX)
+}
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct ResolvedLayout {
@@ -12,6 +42,7 @@ pub struct ResolvedLayout {
 }
 
 impl ResolvedLayout {
+    #[must_use]
     pub const fn empty() -> Self {
         Self { items: Vec::new() }
     }
@@ -84,6 +115,7 @@ impl ResolvedLayout {
         Ok(self)
     }
 
+    #[must_use]
     pub fn hit_stack(&self, point: LocalPoint) -> Vec<HitResult> {
         let mut hits = self
             .items
@@ -111,6 +143,7 @@ impl ResolvedLayout {
             .collect()
     }
 
+    #[must_use]
     pub fn pane_item(&self, pane: u64) -> Option<&ResolvedLayoutItem> {
         self.items
             .iter()
@@ -118,6 +151,7 @@ impl ResolvedLayout {
             .find(|item| item.kind == LayoutItemKind::Pane { pane })
     }
 
+    #[must_use]
     pub fn placeholder_count(&self) -> usize {
         self.items
             .iter()
@@ -125,6 +159,7 @@ impl ResolvedLayout {
             .count()
     }
 
+    #[must_use]
     pub fn pane_count(&self) -> usize {
         self.items
             .iter()
@@ -147,6 +182,7 @@ pub struct ResolvedLayoutItem {
 }
 
 impl ResolvedLayoutItem {
+    #[must_use]
     pub fn pixel_rect(self, size: LayoutSize) -> LayoutRect {
         self.transform.pixel_rect(size)
     }
@@ -178,6 +214,7 @@ pub struct LocalPoint {
 }
 
 impl LocalPoint {
+    #[must_use]
     pub fn from_pixel_in_rect(x: f64, y: f64, rect: LayoutRect) -> Self {
         Self {
             u: ((x - f64::from(rect.x)) / f64::from(rect.w.max(1))).mul_add(2.0, -1.0),
@@ -197,6 +234,7 @@ pub struct LocalTransform {
 }
 
 impl LocalTransform {
+    #[must_use]
     pub fn from_pixel_rect(rect: LayoutRect, bounds: LayoutSize) -> Self {
         let bounds_w = f64::from(bounds.w.max(1));
         let bounds_h = f64::from(bounds.h.max(1));
@@ -256,6 +294,7 @@ impl LocalTransform {
         })
     }
 
+    #[must_use]
     pub fn pixel_rect(self, size: LayoutSize) -> LayoutRect {
         let bounds_w = size.w.max(0);
         let bounds_h = size.h.max(0);
@@ -316,6 +355,7 @@ impl LayoutAction {
         dead_code,
         reason = "legacy ABI tests still document numeric layout action mapping"
     )]
+    #[must_use]
     pub const fn from_abi(value: i32) -> Option<Self> {
         Some(match value {
             1 => Self::FocusNext,
@@ -341,6 +381,7 @@ impl LayoutAction {
         })
     }
 
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::FocusNext => "focus-next",
@@ -462,6 +503,7 @@ impl LayoutState {
             .then_some(new_leaf_id)
     }
 
+    #[must_use]
     pub const fn active_leaf(&self) -> LayoutLeafId {
         self.active_leaf
     }
@@ -513,10 +555,12 @@ impl LayoutState {
         Some((leaf, next_active_leaf))
     }
 
+    #[must_use]
     pub fn active_rect(&self, size: LayoutSize) -> Option<LayoutRect> {
         self.leaf_rect(self.active_leaf, size)
     }
 
+    #[must_use]
     pub fn leaf_rect(&self, leaf: LayoutLeafId, size: LayoutSize) -> Option<LayoutRect> {
         self.resolve(size)
             .into_iter()
@@ -524,10 +568,12 @@ impl LayoutState {
             .map(|region| region.rect)
     }
 
+    #[must_use]
     pub fn active_kind(&self) -> Option<LayoutLeafKind> {
         self.root.leaf_kind(self.active_leaf)
     }
 
+    #[must_use]
     pub fn resolve(&self, size: LayoutSize) -> Vec<LayoutRegion> {
         let mut regions = Vec::new();
         self.root.resolve(
@@ -543,6 +589,7 @@ impl LayoutState {
         regions
     }
 
+    #[must_use]
     pub fn leaf_ids(&self) -> Vec<LayoutLeafId> {
         let mut leaves = Vec::new();
         self.root.collect_leaf_ids(&mut leaves);
@@ -577,6 +624,7 @@ pub struct LayoutRect {
 }
 
 impl LayoutRect {
+    #[must_use]
     pub fn contains_f64(self, x: f64, y: f64) -> bool {
         let max_x = f64::from(self.x) + f64::from(self.w.max(0));
         let max_y = f64::from(self.y) + f64::from(self.h.max(0));
@@ -596,6 +644,7 @@ pub struct LayoutRegion {
 pub struct LayoutLeafId(u64);
 
 impl LayoutLeafId {
+    #[must_use]
     pub const fn raw(self) -> u64 {
         self.0
     }
@@ -748,6 +797,157 @@ const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRe
                     ..rect
                 },
             )
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "layout tests assert exact API results and tree positions"
+)]
+mod tests {
+    use super::{
+        InputBehavior, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize,
+        LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+    };
+
+    #[test]
+    fn split_tree_resolves_and_collapses_without_host_state() {
+        let mut layout = LayoutState::default();
+        let first_leaf = layout.active_leaf();
+        let second_leaf = layout
+            .split_active(LayoutAxis::Horizontal)
+            .expect("split creates a second leaf");
+        assert!(layout.set_active_leaf(second_leaf));
+
+        let split = layout.resolve(LayoutSize { w: 1281, h: 800 });
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            split[0].rect,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 640,
+                h: 800
+            }
+        );
+        assert_eq!(
+            split[1].rect,
+            LayoutRect {
+                x: 640,
+                y: 0,
+                w: 641,
+                h: 800,
+            }
+        );
+
+        assert_eq!(layout.remove_active_leaf(), Some((second_leaf, first_leaf)));
+        assert_eq!(
+            layout.resolve(LayoutSize { w: 1281, h: 800 })[0].rect,
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 1281,
+                h: 800,
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_layout_validation_is_inventory_driven() {
+        let valid = ResolvedLayout {
+            items: vec![pane_item(7, 0.0, -1.0, -1.0, 2.0, 2.0)],
+        };
+        assert!(valid.clone().validate_for_panes(&[7]).is_ok());
+        assert!(valid.validate_for_panes(&[8]).is_err());
+
+        let duplicate = ResolvedLayout {
+            items: vec![
+                pane_item(7, 0.0, -1.0, -1.0, 1.0, 2.0),
+                pane_item(7, 1.0, 0.0, -1.0, 1.0, 2.0),
+            ],
+        };
+        assert!(duplicate.validate_for_panes(&[7]).is_err());
+    }
+
+    #[test]
+    fn hit_testing_uses_layout_z_order_and_local_coordinates() {
+        let layout = ResolvedLayout {
+            items: vec![
+                pane_item(7, 0.0, -1.0, -1.0, 2.0, 2.0),
+                ResolvedLayoutItem {
+                    id: LayoutItemId(99),
+                    kind: LayoutItemKind::Handle,
+                    z: 5.0,
+                    transform: LocalTransform {
+                        offset: LocalPoint { u: -0.2, v: -1.0 },
+                        size: LocalPoint { u: 0.4, v: 2.0 },
+                    },
+                    input: InputBehavior::Drag,
+                },
+            ],
+        }
+        .validate_for_panes(&[7])
+        .expect("layout is valid");
+
+        let hits = layout.hit_stack(LocalPoint { u: 0.0, v: 0.0 });
+        assert_eq!(hits[0].kind, LayoutItemKind::Handle);
+        assert_eq!(hits[0].local_point, LocalPoint { u: 0.0, v: 0.0 });
+        assert_eq!(hits[1].kind, LayoutItemKind::Pane { pane: 7 });
+    }
+
+    #[test]
+    fn normalized_projection_preserves_fractional_and_empty_bounds() {
+        let transform = LocalTransform {
+            offset: LocalPoint { u: -0.5, v: -0.5 },
+            size: LocalPoint { u: 0.5, v: 0.5 },
+        };
+
+        assert_eq!(
+            transform.pixel_rect(LayoutSize { w: 5, h: 7 }),
+            LayoutRect {
+                x: 1,
+                y: 2,
+                w: 1,
+                h: 2,
+            }
+        );
+        assert_eq!(
+            transform.pixel_rect(LayoutSize { w: 0, h: -4 }),
+            LayoutRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            }
+        );
+    }
+
+    fn pane_item(
+        pane: u64,
+        z: f64,
+        offset_u: f64,
+        offset_v: f64,
+        size_u: f64,
+        size_v: f64,
+    ) -> ResolvedLayoutItem {
+        ResolvedLayoutItem {
+            id: LayoutItemId(pane),
+            kind: LayoutItemKind::Pane { pane },
+            z,
+            transform: LocalTransform {
+                offset: LocalPoint {
+                    u: offset_u,
+                    v: offset_v,
+                },
+                size: LocalPoint {
+                    u: size_u,
+                    v: size_v,
+                },
+            },
+            input: InputBehavior::Pane,
         }
     }
 }

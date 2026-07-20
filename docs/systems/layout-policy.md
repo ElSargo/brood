@@ -36,6 +36,19 @@ Plugins own:
 - rules for placement, resizing, focus preference, and visibility
 - actor logic that turns client events into candidate resolved layouts
 
+## Portable Host Boundary
+
+The client host consumes layout through the compositor-independent
+`manifold-layout` crate. That crate owns resolved-layout validation,
+normalized coordinate projection, hit testing, and the deterministic native
+fallback. It must not depend on Smithay, Winit, WGPU, a transport, or a plugin
+runtime.
+
+The current daemon and future presentation client should call this same API
+while ownership moves between processes. Pane inventory, focus, rendering,
+input delivery, actor execution, and persistence remain host responsibilities;
+they are inputs to or consumers of layout, not part of the portable mechanism.
+
 The plugin's internal layout tree is not the client host ABI. The client accepts only a bounded resolved layout through a locally validated message. Persistence is explicit: layout state remains client-local unless the actor chooses to coordinate it with a session actor or backend storage.
 
 ## Layout Events

@@ -30,6 +30,7 @@ use anyhow::{Context, Result, bail, ensure};
 pub use manifold_cli::control::{
     ControlTarget, request_dbus_command, resolve_control_target, session_marker_value,
 };
+use manifold_layout::LayoutAction;
 use smithay::{
     backend::{
         allocator::Buffer,
@@ -53,7 +54,6 @@ use crate::{
     command::{SurfaceCommand, WorkspaceCommand},
     config,
     debug_dump::{self, DumpOptions},
-    layout::LayoutAction,
     presentation, session_runner,
     state::{
         AgentNotification, FocusDirection, HostedChildStatus, HostedChildToken,

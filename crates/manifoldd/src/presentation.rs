@@ -16,6 +16,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use manifold_layout::{LayoutItemKind, LayoutRect};
 #[cfg(feature = "shm-fallback")]
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
@@ -54,7 +55,6 @@ use tracing::{info, warn};
 
 use crate::{
     geometry::capture_extent,
-    layout::{LayoutItemKind, LayoutRect},
     state::{Manifold, PresentationStatus, SESSION_OUTPUT_REFRESH_MILLIHZ},
     winit_presenter::{
         PresenterBackend, PresenterEvent, PresenterEventSource, PresenterRuntime,

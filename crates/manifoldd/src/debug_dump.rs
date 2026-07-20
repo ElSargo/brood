@@ -20,8 +20,8 @@ use smithay::{
     },
 };
 
-use crate::layout::LayoutItemKind;
 use crate::{control, presentation, state::Manifold};
+use manifold_layout::LayoutItemKind;
 
 #[derive(Clone, Copy)]
 pub struct DumpOptions {

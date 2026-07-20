@@ -73,17 +73,18 @@ use smithay::{
 };
 use tracing::{info, warn};
 
+use manifold_layout::{
+    HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutLeafId,
+    LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint, LocalTransform,
+    ResolvedLayout, ResolvedLayoutItem,
+};
+
 use crate::{
     MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_PANE_ID_ENV, MANIFOLD_SESSION_ENV,
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     clipboard::HostClipboardBridge,
     command::{InputCommand, SurfaceCommand, WorkspaceCommand},
-    layout::{
-        HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind,
-        LayoutLeafId, LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint,
-        LocalTransform, ResolvedLayout, ResolvedLayoutItem,
-    },
     plugin_runtime::{
         PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary, PluginRuntime,
     },

@@ -2278,6 +2278,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "manifold-layout"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "serde",
+]
+
+[[package]]
 name = "manifold-wasm"
 version = "0.1.0"
 dependencies = [
@@ -2310,6 +2318,7 @@ dependencies = [
  "image",
  "manifold-cli",
  "manifold-ipc",
+ "manifold-layout",
  "manifold-wasm",
  "num-traits",
  "serde",
