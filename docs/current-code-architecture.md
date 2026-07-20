@@ -1,19 +1,22 @@
 # Current Code Architecture, Data Flow, and Control Flow
 
 This document describes the architecture that exists in the code today. It is
-based on direct inspection of `crates/manifoldd`, `crates/manifold-wasm`, the
-Rust sidecar binaries, and the checked-in GTK session switcher application. It
-intentionally describes current behavior rather than a target design.
+based on direct inspection of `crates/manifoldd`, `crates/manifold-wasm`,
+`clients/manifold-client`, the Rust sidecar binaries, and the checked-in GTK
+session switcher application. It intentionally describes current behavior
+rather than a target design.
 
 ## 1. High-level shape
 
-Manifold currently consists of two Rust workspace packages, `manifoldd` and
-`manifold-wasm`, plus support applications, plugins, examples, and scripts. The
-main runtime is a nested Wayland compositor with an optional presentation
-frontend. It hosts Wayland clients on an internal Wayland socket, exposes
-control APIs over DBus, can attach or detach a visible/offscreen presentation
-target, and keeps most mutable compositor state inside one central `Manifold`
-state object.
+Manifold currently consists of the `manifoldd` session service,
+`manifold-client` presentation endpoint, shared runtime/protocol/layout crates,
+plus support applications, plugins, examples, and scripts. The main service is
+a nested Wayland compositor with an optional presentation frontend. It hosts
+Wayland clients on an internal Wayland socket, exposes control APIs over DBus,
+can attach or detach a visible/offscreen presentation target, and keeps most
+mutable compositor state inside one central `Manifold` state object. The
+separate client owns its Winit/WGPU viewport, final layout and hit testing, and
+a client-local `manifold-wasm` actor runtime.
 
 At runtime, the core process combines these roles:
 
@@ -43,8 +46,9 @@ The most important architectural fact is that **`Manifold` is the actor-like sta
 | Control plane | `control.rs` | DBus service/proxies, CLI control helpers, token command interpreter, status snapshots, inject/debug commands. |
 | Config and runner | `config.rs`, `session_runner.rs`, `launch_context.rs`, `src/bin/*runner*`, `src/bin/manifold-sessiond.rs` | Config loading, startup modules/apps, project session runner discovery, systemd scope launch records, sidecar activation. |
 | DBus isolation | `session_bus.rs` | In-process DBus bus per session, DBus auth/message router, name registry, host notification proxy. |
-| WASM core plugins and host integration | `crates/manifold-wasm/src/module.rs`, `crates/manifold-wasm/src/actor.rs`, `crates/manifold-wasm/src/global_key_policy.rs`, `crates/manifold-wasm/src/policy_provider.rs`, `state.rs`, `wasm_test.rs` | Core-module actor/policy discovery and execution, daemon artifact routing/lifecycle, and the async test harness. |
+| WASM core plugins and host integration | `crates/manifold-wasm/src/module.rs`, `crates/manifold-wasm/src/actor.rs`, `crates/manifold-wasm/src/hosted_actor.rs`, `crates/manifold-wasm/src/legacy_runtime.rs`, `crates/manifold-wasm/src/global_key_policy.rs`, `crates/manifold-wasm/src/policy_provider.rs`, `crates/manifold-wasm/src/test_harness.rs`, `state.rs`, `wasm_test.rs` | Runtime-owned artifact classification, hosted actor abstraction, core-module generation execution, policy execution, and test-harness engine, plus daemon capability policy and typed request adaptation. |
 | WASM actor/worker runtime | `crates/manifold-wasm/src/component_actor.rs`, `crates/manifold-wasm/src/preview1_worker.rs`, `crates/manifold-wasm/src/completion_io.rs`, `crates/manifold-wasm/src/coordination.rs` | Component Model actors, the Preview 1 POSIX compatibility actor/worker runtime, completion I/O, and shared notification/pollable coordination. |
+| Presentation client actor host | `clients/manifold-client/src/actor_runtime.rs`, `clients/manifold-client/src/main.rs` | Client-owned Tokio/WASM runtime, presentation actor loading and teardown, runtime failure observation, and Winit-loop ownership. |
 | Plugins | `plugin_runtime.rs` | Built-in actor, host-mailbox, and publication scaffold used by the DBus plugin surface. |
 | Browser | `browser.rs` | Chromium process manager and DevTools HTTP helper under control commands. |
 | Diagnostics | `debug_dump.rs` | Status/composed/surface capture bundle. |
@@ -652,7 +656,7 @@ and falls back to native layout when no actor subscribes or validation fails.
 
 ### 15.3 Test harness ABI
 
-`wasm_test.rs` starts each harness as an explicitly owned child thread with a
+`crates/manifold-wasm/src/test_harness.rs` starts each harness as an explicitly owned child thread with a
 checked identity, a typed `Starting -> Running -> Exited` event stream, and one
 join result. The guest exports `run() -> i32`; exit code `0` means passed, `2`
 means paused, and anything else means failed.

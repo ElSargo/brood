@@ -3,6 +3,7 @@ use std::{
     os::fd::AsFd,
     sync::Arc,
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -20,61 +21,88 @@ use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId},
 };
 
+mod actor_runtime;
+
+use actor_runtime::PresentationWasmRuntime;
+
 fn main() -> Result<()> {
     let args = ClientArgs::parse();
-    let target = resolve_control_target(args.dbus_name, args.dbus_address);
-    let mut server = ServerLaunch::discover()?;
-    if let Some(executable) = args.server {
-        server.executable = executable;
+    if args.check_wasm_actors {
+        let mut runtime = PresentationWasmRuntime::start(&args.wasm_actors)?;
+        runtime
+            .shutdown()
+            .context("stop checked presentation WASM runtime")?;
+        drop(runtime);
+        eprintln!("presentation WASM actor check passed");
+        return Ok(());
     }
-    let handshake = connect_or_spawn(&target, &server)?;
-    eprintln!(
-        "connected to Manifold server pid={} protocol={}",
-        handshake.server_pid, handshake.protocol_version
-    );
-
-    let fast_path_enabled = std::env::var_os("MANIFOLD_DMABUF_HAPPY_PATH").is_some();
     let event_loop = EventLoop::<ClientEvent>::with_user_event()
         .build()
         .context("create event loop")?;
-    let input_sender = if fast_path_enabled {
-        let fast_path = open_presentation_fast_path(&target)?;
-        let input =
-            manifold_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
-        let frames =
-            manifold_ipc::CriticalConsumer::map(fast_path.frame_fd.as_fd(), fast_path.generation)?;
-        let frame_notifications =
-            manifold_ipc::EventNotifier::from_owned_fd(fast_path.frame_notify_fd);
-        spawn_frame_updates(
-            target,
-            frames,
-            frame_notifications,
-            event_loop.create_proxy(),
-        )?;
-        Some(InputLane {
-            producer: input,
-            notifications: manifold_ipc::EventNotifier::from_owned_fd(fast_path.input_notify_fd),
-            generation: fast_path.generation,
-            sequence: 0,
-        })
+    let (input_sender, fast_path_enabled, backend_connected) = if args.no_server {
+        eprintln!("starting Manifold presentation without a backend");
+        (None, false, false)
     } else {
-        None
+        let target = resolve_control_target(args.dbus_name, args.dbus_address);
+        let mut server = ServerLaunch::discover()?;
+        if let Some(executable) = args.server {
+            server.executable = executable;
+        }
+        let handshake = connect_or_spawn(&target, &server)?;
+        eprintln!(
+            "connected to Manifold server pid={} protocol={}",
+            handshake.server_pid, handshake.protocol_version
+        );
+
+        let fast_path_enabled = std::env::var_os("MANIFOLD_DMABUF_HAPPY_PATH").is_some();
+        let input_sender = if fast_path_enabled {
+            let fast_path = open_presentation_fast_path(&target)?;
+            let input = manifold_ipc::CriticalProducer::map(
+                fast_path.input_fd.as_fd(),
+                fast_path.generation,
+            )?;
+            let frames = manifold_ipc::CriticalConsumer::map(
+                fast_path.frame_fd.as_fd(),
+                fast_path.generation,
+            )?;
+            let frame_notifications =
+                manifold_ipc::EventNotifier::from_owned_fd(fast_path.frame_notify_fd);
+            spawn_frame_updates(
+                target,
+                frames,
+                frame_notifications,
+                event_loop.create_proxy(),
+            )?;
+            Some(InputLane {
+                producer: input,
+                notifications: manifold_ipc::EventNotifier::from_owned_fd(
+                    fast_path.input_notify_fd,
+                ),
+                generation: fast_path.generation,
+                sequence: 0,
+            })
+        } else {
+            None
+        };
+        (input_sender, fast_path_enabled, true)
     };
     let mut application = Application {
+        wasm_runtime: Some(PresentationWasmRuntime::start(&args.wasm_actors)?),
         input_sender,
         fast_path_enabled,
+        backend_connected,
         ..Application::default()
     };
 
-    event_loop
+    let run_result = event_loop
         .run_app(&mut application)
-        .context("run event loop")?;
+        .context("run event loop");
 
     if let Some(sender) = application.input_sender.as_mut() {
         let _ = send_input(
@@ -83,7 +111,16 @@ fn main() -> Result<()> {
             [0, 0, 0, 0, 0],
         );
     }
-    if let Some(error) = application.error {
+    let shutdown_result = application
+        .wasm_runtime
+        .as_mut()
+        .map_or(Ok(()), PresentationWasmRuntime::shutdown)
+        .context("stop presentation WASM runtime");
+    let error = application.error.take();
+    drop(application);
+    run_result?;
+    shutdown_result?;
+    if let Some(error) = error {
         return Err(error);
     }
 
@@ -244,10 +281,12 @@ struct Application {
     error: Option<anyhow::Error>,
     input_sender: Option<InputLane>,
     fast_path_enabled: bool,
+    backend_connected: bool,
     pending_frame: Option<ClientEvent>,
     last_presented_sequence: Option<u64>,
     modifiers: ModifiersState,
     cursor_position: Option<(f64, f64)>,
+    wasm_runtime: Option<PresentationWasmRuntime>,
 }
 
 impl Application {
@@ -272,6 +311,17 @@ impl Application {
         };
         renderer.select_scene(sequence, width, height, windows)
     }
+
+    fn drain_wasm_events(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if let Some(runtime) = self.wasm_runtime.as_mut()
+            && let Err(error) = runtime.drain_events()
+        {
+            self.error = Some(error);
+            event_loop.exit();
+            return false;
+        }
+        true
+    }
 }
 
 impl ApplicationHandler<ClientEvent> for Application {
@@ -280,8 +330,13 @@ impl ApplicationHandler<ClientEvent> for Application {
             return;
         }
 
+        let title = if self.backend_connected {
+            "Manifold"
+        } else {
+            "Manifold - No backend"
+        };
         let result = event_loop
-            .create_window(Window::default_attributes().with_title("Manifold"))
+            .create_window(Window::default_attributes().with_title(title))
             .context("create presentation window")
             .and_then(|window| Renderer::new(Arc::new(window), self.fast_path_enabled));
 
@@ -309,9 +364,27 @@ impl ApplicationHandler<ClientEvent> for Application {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ClientEvent) {
+        if !self.drain_wasm_events(event_loop) {
+            return;
+        }
         if let Err(error) = self.accept_frame(event) {
             self.error = Some(error);
             event_loop.exit();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.drain_wasm_events(event_loop) {
+            return;
+        }
+        if self
+            .wasm_runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_empty())
+        {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(50),
+            ));
         }
     }
 

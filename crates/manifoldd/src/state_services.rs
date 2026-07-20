@@ -4,12 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use manifold_wasm::{TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessRuntime};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::{
     session_bus::{SessionBusHandle, SessionBusRealm},
     state::SurfaceSessionId,
-    wasm_test::{TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessRuntime},
 };
 
 /// Owns the routing facts for surface sessions.

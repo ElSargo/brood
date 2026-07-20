@@ -253,6 +253,12 @@ pub enum CommandOutcome {
 #[derive(Debug, Parser)]
 #[command(about = "Manifold presentation client", version)]
 pub struct ClientArgs {
+    /// Start the presentation client without connecting to or starting a session server.
+    #[arg(
+        long = "no-server",
+        conflicts_with_all = ["dbus_name", "dbus_address", "server"]
+    )]
+    pub no_server: bool,
     /// `DBus` destination name for the session server.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub dbus_name: Option<String>,
@@ -262,6 +268,51 @@ pub struct ClientArgs {
     /// Override the session server executable used for auto-start.
     #[arg(long = "server", value_name = "PATH")]
     pub server: Option<PathBuf>,
+    /// Start a presentation-scoped WASM actor as ID from PATH.
+    #[arg(long = "wasm-actor", value_name = "ID=PATH")]
+    pub wasm_actors: Vec<String>,
+    /// Validate configured presentation actors without opening a presentation.
+    #[arg(long = "check-wasm-actors", hide = true, requires = "wasm_actors")]
+    pub check_wasm_actors: bool,
+}
+
+#[cfg(test)]
+mod client_args_tests {
+    use super::*;
+
+    #[test]
+    fn no_server_selects_standalone_client_startup() {
+        let parsed = ClientArgs::try_parse_from(["manifold-client", "--no-server"]);
+        assert!(parsed.is_ok());
+        if let Ok(args) = parsed {
+            assert!(args.no_server);
+            assert!(args.dbus_name.is_none());
+            assert!(args.dbus_address.is_none());
+            assert!(args.server.is_none());
+        }
+    }
+
+    #[test]
+    fn no_server_rejects_connection_options() {
+        assert!(
+            ClientArgs::try_parse_from([
+                "manifold-client",
+                "--no-server",
+                "--dbus-destination",
+                "org.manifold.Test",
+            ])
+            .is_err()
+        );
+        assert!(
+            ClientArgs::try_parse_from([
+                "manifold-client",
+                "--no-server",
+                "--server",
+                "/tmp/manifoldd",
+            ])
+            .is_err()
+        );
+    }
 }
 
 #[derive(Debug, Parser)]

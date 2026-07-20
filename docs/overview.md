@@ -20,9 +20,12 @@ The product model is:
 - A [[concepts/wasm-controller]] is one plugin role for changing workspace behavior through host APIs.
 
 The current Rust workspace contains `manifoldd`, which builds the user-facing
-`manifold` binary, and `manifold-wasm`, which implements the hosted WASM
-runtimes. The daemon binary currently owns the session process, nested Wayland
-compositor, DBus control endpoint, and MVP presentation endpoint. The target
+`manifold` binary, and `manifold-wasm`, which owns Wasmtime configuration,
+plugin artifact loading, the hosted actor/worker runtimes, and the nested
+behavior-test harness engine. The daemon adapts typed runtime requests and
+outcomes to session state without depending on Wasmtime. It owns the session
+process, nested Wayland compositor, DBus control endpoint, and MVP presentation
+endpoint. The target
 architecture extracts a portable presentation client with client-side WASM
 actors and WGPU rendering. Local clients bootstrap through DBus and then use
 shared-memory protocol lanes plus DMA-BUF or copied per-window surfaces; remote

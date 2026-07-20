@@ -14,7 +14,9 @@ pub mod coordination;
 mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
+mod hosted_actor;
 pub mod layout_policy;
+mod legacy_runtime;
 mod lifecycle;
 pub mod mailbox;
 pub mod module;
@@ -24,6 +26,7 @@ mod policy_provider_link;
 pub mod preview1_worker;
 mod resource_limits;
 pub mod runtime_io;
+mod test_harness;
 
 pub use actor::{
     ACTOR_EMPTY_OUTBOX, ActorEpochOutcome, ActorOutbox, ActorOutboxMessage, ActorPublication,
@@ -65,10 +68,12 @@ pub use global_key_policy::{
 pub use global_key_policy_link::{
     GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GLOBAL_KEY_POLICY_RESULT_OK,
 };
+pub use hosted_actor::{HostedWasmActor, aggregate_preview1_compat_stats};
 pub use layout_policy::{
     InputBehavior, LayoutItemId, LayoutItemKind, LayoutSize, LocalPoint, LocalTransform,
     ResolvedLayout, ResolvedLayoutItem,
 };
+pub use legacy_runtime::{LegacyWasmActorGeneration, LegacyWasmRuntimeEvent};
 pub use lifecycle::{
     PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext, PluginStartReason,
     PluginStopContext, PluginStopReason,
@@ -78,8 +83,9 @@ pub use mailbox::{
     PreparedMailboxRegistration,
 };
 pub use module::{
-    DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, WasmActorDeclaration, WasmActorEventKind,
-    WasmModuleInventory, WasmPluginConfig, WasmPluginModule,
+    DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, LegacyWasmPluginArtifact,
+    WasmActorDeclaration, WasmActorEventKind, WasmModuleInventory, WasmPluginArtifact,
+    WasmPluginConfig, WasmPluginModule,
 };
 pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX, ACTOR_SUBSCRIPTION_INFIX};
 pub use policy_provider::{
@@ -100,4 +106,8 @@ pub use resource_limits::WasmResourceLimits;
 pub use runtime_io::{
     ByteStream, ChildHandle, ChildStatus, ProcessIo, PtyIo, RuntimeIoCapabilities, RuntimeIoConfig,
     RuntimeIoError, RuntimeIoHub, StreamRead, TimerHandle, TimerStatus,
+};
+pub use test_harness::{
+    TestHarnessChildId, TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessOutcomeKind,
+    TestHarnessRequest, TestHarnessRuntime, TestHarnessSignal,
 };

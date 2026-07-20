@@ -133,6 +133,9 @@ The first implementation does not provide:
   to service unrelated session work.
 - The client never waits synchronously on network or backend I/O while handling
   immediate input or rendering.
+- A client may start without a backend connection. Its local viewport,
+  renderer, and presentation actors remain valid while backend inventory,
+  operations, and input forwarding are unavailable.
 - Frame and render-update queues are bounded and may supersede intermediate
   latest-state updates.
 - Reliable control state and supersedable frame state use distinct flow-control

@@ -11,6 +11,7 @@ code-links:
   - crates/manifold-wasm/src/global_key_policy.rs
   - crates/manifold-wasm/src/global_key_policy_link.rs
   - crates/manifold-wasm/src/policy_provider.rs
+  - crates/manifold-wasm/src/test_harness.rs
   - crates/manifoldd/src/wasm_test.rs
   - crates/manifoldd/src/control.rs
   - crates/manifoldd/src/state.rs

@@ -6,15 +6,13 @@
 use std::{env, path::PathBuf, thread};
 
 use anyhow::{Context, Result, anyhow, bail};
+use manifold_wasm::{TestHarnessOutcomeKind, TestHarnessRuntime};
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
 use tracing::{info, warn};
 
 use crate::{
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, RunArgs, SessionArgs,
-    browser::BrowserLaunchOptions,
-    config, control, presentation, session_runner,
-    state::Manifold,
-    wasm_test::{TestHarnessOutcomeKind, TestHarnessRuntime},
+    browser::BrowserLaunchOptions, config, control, presentation, session_runner, state::Manifold,
 };
 
 pub fn run(args: RunArgs) -> Result<()> {

@@ -6,8 +6,10 @@ use wasmtime::{Engine, Module};
 use crate::{
     actor::{ActorEpochOutcome, WasmActor, WasmActorConfig},
     api::{Registry, async_epoch_engine, load_module_async},
+    global_key_policy::WasmGlobalKeyPolicy,
     module_link::{discover_module_inventory, parse_actor_export},
-    policy_provider::{PolicyProviderDeclaration, WasmPolicyProvider},
+    policy_provider::{PolicyProviderDeclaration, PolicyProviderKind, WasmPolicyProvider},
+    preview1_worker::declares_preview1_compat,
 };
 
 pub const DEFAULT_ACTOR_NAME: &str = "default";
@@ -50,6 +52,21 @@ pub struct WasmPluginModule {
     inventory: WasmModuleInventory,
     actors: Vec<WasmActor>,
     policy_providers: Vec<WasmPolicyProvider>,
+}
+
+pub struct LegacyWasmPluginArtifact {
+    pub inventory: WasmModuleInventory,
+    pub key_policy: Option<(String, WasmGlobalKeyPolicy)>,
+}
+
+/// A plugin artifact classified and prepared by the WASM runtime crate.
+///
+/// Keeping the Wasmtime `Engine` and `Module` inspection here means hosts do
+/// not need to depend on Wasmtime or duplicate artifact-format detection.
+pub enum WasmPluginArtifact {
+    Component { core_module_error: String },
+    Preview1,
+    Legacy(Box<LegacyWasmPluginArtifact>),
 }
 
 impl Default for WasmPluginConfig {
@@ -187,4 +204,72 @@ impl WasmPluginModule {
     pub fn policy_providers(&self) -> &[WasmPolicyProvider] {
         &self.policy_providers
     }
+}
+
+impl WasmPluginArtifact {
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut engine_config = wasmtime::Config::new();
+        engine_config.wasm_threads(true).shared_memory(true);
+        let engine = Engine::new(&engine_config)
+            .map_err(|error| anyhow::anyhow!("create WASM plugin inspection engine: {error}"))?;
+        let module = match Module::from_file(&engine, path) {
+            Ok(module) => module,
+            Err(error) => {
+                return Ok(Self::Component {
+                    core_module_error: error.to_string(),
+                });
+            }
+        };
+        if declares_preview1_compat(&module) {
+            return Ok(Self::Preview1);
+        }
+
+        let inventory = WasmModuleInventory::discover(&module)?;
+        ensure!(
+            !inventory.is_empty(),
+            "WASM plugin does not declare any actors or policy providers"
+        );
+        let key_policy = select_policy_provider(
+            &inventory.policy_providers,
+            PolicyProviderKind::Key,
+            "workspace",
+        )?
+        .map(|provider| {
+            Ok::<_, anyhow::Error>((
+                provider.name.clone(),
+                WasmGlobalKeyPolicy::load_from_module(engine, &module, provider)?,
+            ))
+        })
+        .transpose()?;
+        Ok(Self::Legacy(Box::new(LegacyWasmPluginArtifact {
+            inventory,
+            key_policy,
+        })))
+    }
+}
+
+fn select_policy_provider<'a>(
+    providers: &'a [PolicyProviderDeclaration],
+    kind: PolicyProviderKind,
+    preferred_name: &str,
+) -> Result<Option<&'a PolicyProviderDeclaration>> {
+    let matching = providers
+        .iter()
+        .filter(|provider| provider.kind == kind)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    if let Some(provider) = matching
+        .iter()
+        .copied()
+        .find(|provider| provider.name == preferred_name)
+    {
+        return Ok(Some(provider));
+    }
+    ensure!(
+        matching.len() == 1,
+        "WASM plugin declares multiple {kind:?} providers but none named {preferred_name:?}"
+    );
+    Ok(matching.first().copied())
 }

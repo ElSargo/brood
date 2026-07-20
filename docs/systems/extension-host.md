@@ -6,12 +6,15 @@ last-reviewed: 2026-07-11
 code-links:
   - crates/manifold-wasm/src/module.rs
   - crates/manifold-wasm/src/actor.rs
+  - crates/manifold-wasm/src/hosted_actor.rs
+  - crates/manifold-wasm/src/legacy_runtime.rs
   - crates/manifold-wasm/src/global_key_policy.rs
   - crates/manifold-wasm/src/policy_provider.rs
   - crates/manifold-wasm/src/component_actor.rs
   - crates/manifold-wasm/src/preview1_worker.rs
   - crates/manifold-wasm/src/completion_io.rs
   - crates/manifold-wasm/src/coordination.rs
+  - crates/manifold-wasm/src/test_harness.rs
   - crates/manifoldd/src/wasm_test.rs
   - crates/manifoldd/src/control.rs
   - crates/manifoldd/src/state.rs
@@ -24,8 +27,8 @@ The current extension story has four implementation layers:
 - DBus extension/status/agent/plugin surfaces for external tools and debugging.
 - A built-in lightweight plugin actor named `debug-toggle` plus a native host
   mailbox/publication scaffold.
-- Core-WASM actors and synchronous key policy providers, plus the async test
-  harness.
+- Core-WASM actors and synchronous key policy providers, plus the runtime-owned
+  behavior-test harness engine and its thin daemon request adapter.
 - Runnable Component Model and Preview 1 compatibility actor/worker prototypes.
 
 The target design is broader: plugins use actors as host-visible isolation and

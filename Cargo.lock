@@ -2251,7 +2251,9 @@ dependencies = [
  "manifold-dmabuf",
  "manifold-ipc",
  "manifold-layout",
+ "manifold-wasm",
  "pollster",
+ "tokio",
  "wgpu",
  "winit",
 ]
@@ -2330,7 +2332,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "wasmtime",
  "wayland-client",
  "wayland-egl",
  "wayland-protocols",
