@@ -5,7 +5,7 @@ security-boundary: mixed
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-20
 ---
 
 # Presentation Client Architecture
@@ -26,8 +26,10 @@ does not optimize for simultaneous collaborative control.
 This boundary exists to provide all of the following without separate product
 models:
 
-- local presentation with DMA-BUF or another low-copy transport where possible;
-- remote presentation using encoded or damage-based frame transport;
+- local presentation using a DBus bootstrap, shared-memory steady-state
+  protocol lanes, and DMA-BUF surface transport where supported;
+- remote presentation using an authenticated network carrier and encoded or
+  damage-based per-window surface transport;
 - one Rust presentation implementation for Linux, macOS, Windows, and the web;
 - client-side WASM applications, key policy, layout policy, component UI, and
   graphics that do not cross the network on their interactive path;
@@ -152,17 +154,27 @@ Session backend
   lease and input authority
   presentation protocol endpoint
              |
-             | control state, actor messages, capability operations,
-             | window metadata, and subscribed frame streams
+             | local:  DBus bootstrap -> shared-memory protocol lanes
+             |         + DMA-BUF or copied per-window surfaces
+             |
+             | remote: authenticated network carrier
+             |         + encoded or damage-based per-window surfaces
              |
 Presentation client
   connection/session mirrors
-  viewport and presentation scene
+  viewport, layout, focus, hit testing, and presentation scene
   presentation WASM actors and policy lanes
+  local actor mailboxes and client persistence
   local component, text, and graphics services
   WGPU compositor
   native or web platform shell
 ```
+
+Presentation actors execute in the client in both local and remote deployments.
+Their local messages, policy decisions, UI updates, animations, and render
+submissions do not cross the presentation connection. Only addressed session
+actor messages and asynchronous backend capability operations cross to
+`manifoldd`.
 
 A local deployment may initially host both halves in one process. It must still
 use the same typed boundary and ownership rules. Direct references from client
@@ -267,7 +279,19 @@ connecting
   -> draining or disconnected
 ```
 
-The handshake establishes:
+The local handshake uses DBus for discovery, activation, authentication, and
+exchange of connection-generation resources. It establishes size-sealed
+shared-memory regions and event notifications for the steady-state protocol. DBus remains a
+cold descriptor broker for resources such as DMA-BUF pools; it is not on the
+per-input or per-frame message path. A dedicated Unix-socket message transport
+is not part of the target local profile.
+
+A remote handshake uses an authenticated encrypted network carrier. QUIC is the
+preferred starting point because it supplies secure multiplexed streams,
+datagrams, congestion control, and connection liveness; the carrier remains
+replaceable behind the protocol lane abstraction.
+
+Every handshake establishes:
 
 - protocol major and minor versions;
 - backend and endpoint identity;
@@ -505,7 +529,15 @@ conversion, encoding, and transport work. It may suppress Wayland frame
 callbacks according to compositor policy so invisible applications do not
 render continuously.
 
-## Frame Transport Architecture
+## Transport Architecture
+
+The connection carrier and surface transport are negotiated separately.
+Ordinary protocol records use semantic reliable, critical, latest-state, and
+bulk lanes. Surface subscriptions select a frame transport appropriate to the
+endpoints and producer. A local connection therefore uses shared memory for
+ordinary traffic while concurrently referencing DMA-BUF or copied-image frame
+resources; a remote connection maps the same protocol semantics onto a network
+carrier and selects an encoded or damage-based frame transport.
 
 A frame is a producer snapshot; a frame transport is how that snapshot reaches
 one client. Transport negotiation selects a concrete family rather than filling
@@ -535,10 +567,22 @@ without relying on external-memory support.
 
 ### Local DMA-BUF transport
 
-The Linux fast path may pass DMA-BUF plane descriptors, format, modifier,
-extent, color metadata, and explicit acquire synchronization over a local
-connection capable of descriptor transfer. The client imports the image through
-a Linux-specific WGPU integration adapter.
+The Linux fast path registers reusable DMA-BUF pools through the DBus descriptor
+broker. Registration transfers plane descriptors, format, modifier, extent,
+color metadata, and synchronization capabilities and returns a
+generation-scoped resource ID. Only after registration is acknowledged may
+shared-memory frame records reference that resource ID. Per-frame descriptor
+transfer is not the hot path.
+
+Frame offers and releases travel through the shared-memory lanes. Reusable DRM
+synchronization objects or equivalent timelines are registered as resources;
+frame records carry timeline points rather than transferring a new fence FD per
+frame. Where an upstream producer supplies a one-shot fence, the backend imports
+it into the registered synchronization timeline before publishing the frame.
+Acquire and release synchronization must be explicit where supported, and
+resource IDs, frame sequences, and connection generations prevent stale
+mappings from being used after reconnect or pool replacement. The client imports
+the image through a Linux-specific WGPU integration adapter.
 
 WGPU remains the only renderer even if the importer uses WGPU HAL or platform
 APIs. If direct import, modifier support, or synchronization is unavailable,
@@ -552,7 +596,14 @@ must be visible in diagnostics and bounded by retained-frame budgets.
 
 ### Remote transports
 
-Remote implementations may add:
+Remote implementations preserve per-window subscriptions and client-side
+composition. The initial network carrier should be evaluated as QUIC: reliable
+streams carry control and reconstructible bulk state, while datagrams may carry
+bounded supersedable records. Raw UDP is not a protocol baseline because doing
+so would require Manifold to recreate authentication, encryption, congestion,
+retransmission, multiplexing, and path handling.
+
+Remote frame transports may add:
 
 - lossless damage tiles;
 - compressed still frames;
@@ -831,8 +882,29 @@ after the client renderer and actor-placement boundary are proven.
 
 ## Control And Data Lanes
 
-The logical protocol separates traffic classes even if an initial in-process or
-socket implementation multiplexes them.
+The logical protocol separates traffic classes independently of the carrier.
+The target mappings are:
+
+| Semantic traffic | Local carrier | Remote carrier |
+| --- | --- | --- |
+| Critical reliable | Reserved shared-memory ring | Reserved reliable stream capacity |
+| Reliable ordered | Shared-memory ring | Reliable multiplexed stream |
+| Latest state | Coalescing shared-memory slots/ring | Datagrams or replaceable stream state |
+| Bulk | Registered memfd-backed resource | Independently flow-controlled stream |
+| Surface frame | DMA-BUF or copied-image resource | Encoded or damage-based per-window transport |
+| Wake and liveness | Event notification, DBus owner, optional pidfd | Carrier connection state |
+
+The local carrier uses independent bounded single-producer/single-consumer
+regions in each direction. Monotonic sequence positions, acquire/release
+atomics, cache-line-separated ownership, validated record lengths, and
+connection generations define the shared ABI. Event notifications are batched
+and normally emitted only when a lane changes from empty to non-empty. No
+cross-process mutex is part of the baseline.
+
+Reliable exhaustion applies explicit backpressure. Latest-state exhaustion
+coalesces or supersedes records. Reserved critical capacity ensures that lease
+revocation, key/button releases, terminal results, and teardown cannot be
+starved by frame or motion traffic.
 
 ### Reliable ordered control
 
@@ -1048,8 +1120,12 @@ boundaries are required:
 - **WGPU renderer**: scene lowering, component and plugin graphics, managed-frame
   textures, composition, and recovery;
 - **platform shell**: native Winit and web adapters;
-- **transport implementations**: in-process copy, local socket/copy, DMA-BUF,
-  and later remote transports.
+- **local connection carrier**: DBus bootstrap and descriptor brokering plus
+  bounded bidirectional shared-memory lanes and event notifications;
+- **remote connection carrier**: authenticated encrypted streams and
+  supersedable delivery, initially targeting QUIC semantics;
+- **surface transports**: copied image, local DMA-BUF, and remote encoded or
+  damage-based per-window streams.
 
 The first backend presentation service may live inside `manifoldd`, but it must
 follow the transition/effect pattern established by `state_services.rs`: validate
@@ -1199,27 +1275,49 @@ Exit criteria:
 - actor replacement joins workers and operations and releases endpoint-local
   graphics before the replacement becomes reachable.
 
-### Phase 6: local process boundary
+### Phase 6: local shared-memory process boundary
 
 - Run the presentation client as a separate native process.
-- Add a versioned local transport with descriptor-passing capability behind an
-  audited owner that cannot leak raw descriptors or platform handles.
+- Extend the DBus handshake to authenticate the endpoint and establish a fresh
+  connection generation.
+- Exchange size-sealed memfd regions and event-notification descriptors for one
+  bounded single-producer/single-consumer direction per endpoint.
+- Implement reserved critical, reliable ordered, latest-state, and registered
+  bulk-resource lanes with explicit item and byte budgets.
+- Keep DBus as the cold descriptor broker; do not add a dedicated local socket
+  message transport.
+- Add owner-loss and optional pidfd liveness handling, malformed-region
+  validation, and generation-scoped cleanup.
 - Preserve copied-image fallback as the correctness baseline.
-- Implement authentication appropriate to a same-user local endpoint.
 - Extend `runtime.rs` ordered shutdown so connection operations, backend actor
-  work, frame leases, and the client process are drained or joined in an
-  explicit order.
+  work, frame leases, client actors, and the client process are drained or
+  joined in an explicit order.
 
 Exit criteria:
 
+- input, inventory, actor routing, subscription, frame-offer, and release traffic
+  use shared memory after bootstrap;
+- critical records remain deliverable while latest-state and frame lanes are
+  saturated;
 - either process can crash and restart without corrupting the other;
+- stale mappings and resource IDs are rejected after reconnect;
 - no hidden shared pointer or renderer object crosses the boundary;
 - teardown releases all connection-owned frame and operation resources.
 
 ### Phase 7: DMA-BUF fast path
 
 - Spike and select the WGPU external-image import strategy.
-- Negotiate formats, modifiers, planes, and synchronization.
+- Add generation-scoped reusable DMA-BUF pool registration through the DBus
+  descriptor broker.
+- Negotiate DRM device identity, formats, modifiers, planes, color metadata,
+  and acquire/release synchronization.
+- Register reusable synchronization timelines and carry per-frame acquire and
+  release points through shared memory, including backend import of one-shot
+  producer fences where necessary.
+- Publish frame offers and releases by resource ID through shared memory without
+  per-frame DBus calls.
+- Compare direct hosted-client buffer retention with copies into backend-owned
+  exportable pools and expose the selected path in diagnostics.
 - Implement fallback on incompatible adapter or format.
 - Measure copies, GPU residency, frame latency, and retained buffers.
 
@@ -1232,8 +1330,14 @@ Exit criteria:
 
 ### Phase 8: remote and web clients
 
-- Add authenticated remote control transport.
-- Add at least one bounded remote frame transport with recovery semantics.
+- Implement an authenticated encrypted remote carrier, initially targeting QUIC
+  streams for reliable/bulk lanes and datagrams for eligible latest-state
+  records.
+- Preserve reliable delivery for key/button/focus transitions, settled resize,
+  lease changes, actor messages, and terminal operation results.
+- Add at least one bounded per-window remote frame transport with recovery
+  semantics; evaluate encoded video and lossless damage transport against real
+  browser, terminal, editor, and media workloads.
 - Compile the shared client core and renderer for web WASM/WebGPU.
 - Add platform adapters for browser input, storage, and networking.
 
@@ -1268,8 +1372,12 @@ Required coverage includes:
 - surface trees with subsurfaces, damage, scaling, and popups;
 - interactive resize through real xdg configure/ack/commit;
 - keyboard, pointer, click, and scroll routed from the real client;
+- DBus bootstrap followed by shared-memory-only steady-state protocol traffic;
+- shared-memory lane saturation, coalescing, reserved critical delivery, peer
+  crash, and stale-generation cleanup;
 - copied transport on software WGPU;
-- DMA-BUF direct path and forced fallback where available;
+- DMA-BUF pool registration, shared-memory frame references, direct path, and
+  forced fallback where available;
 - client and backend process crash/restart;
 - local presentation actor key-to-frame latency without network messages;
 - asynchronous backend file operation from a presentation actor;
@@ -1287,8 +1395,8 @@ automated acceptance path.
 
 The following do not block the initial in-process, copied-frame architecture:
 
-- exact network and local wire codec;
-- QUIC, WebTransport, WebSocket, or other remote carrier choice;
+- exact record codec within the fixed local shared-memory carrier;
+- final QUIC, WebTransport, or other authenticated remote carrier selection;
 - final package signing and remote plugin installation UX;
 - exact DMA-BUF-to-WGPU integration mechanism;
 - video codec and congestion-control policy;

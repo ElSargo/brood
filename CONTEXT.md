@@ -189,7 +189,9 @@ _Avoid_: ambient permission, unrestricted access
 - A **pane producer** may create, fill, update, or remove one or more **panes**. **Pane clients**, **managed apps**, and **WASM pane apps** are different producer shapes.
 - A **WASM pane app** can create any number of **panes** without being one pane itself.
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
-- **Local presentation indirection** uses DMA-BUF-compatible surface sharing where available, with copied-image correctness fallback. Remote transports preserve per-window streams and client-side composition.
+- A local **presentation client** uses DBus only to bootstrap and broker descriptors, bounded shared-memory lanes for ordinary steady-state protocol traffic, and DMA-BUF-compatible per-window surface sharing where available, with copied-image correctness fallback.
+- A remote **presentation client** maps the same semantic protocol lanes onto an authenticated network carrier and uses encoded or damage-based per-window surface transports. Remote presentation preserves client-side composition.
+- **Presentation actors** run in the client. Their local mailboxes, policy, layout, UI, graphics, and render updates remain endpoint-local; only addressed session-actor messages and asynchronous backend operations cross the presentation connection.
 - The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, WGPU objects, or renderer internals.
 - A **plugin** may contain multiple **plugin actors**, actor-scoped **plugin workers**, and optional **sync policy lanes**.
 - A **plugin actor** is the public address-space and mailbox boundary. It is dormant between events; once invoked its dispatcher must not suspend or block, and instead submits work and handles **completion** messages.

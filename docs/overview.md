@@ -2,7 +2,7 @@
 status: canonical
 type: overview
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-20
 ---
 
 # Overview
@@ -23,8 +23,12 @@ The current Rust workspace contains `manifoldd`, which builds the user-facing
 `manifold` binary, and `manifold-wasm`, which implements the hosted WASM
 runtimes. The daemon binary currently owns the session process, nested Wayland
 compositor, DBus control endpoint, and MVP presentation endpoint. The target
-architecture extracts a portable presentation client with client-side WASM and
-WGPU rendering; see [[systems/presentation-client]].
+architecture extracts a portable presentation client with client-side WASM
+actors and WGPU rendering. Local clients bootstrap through DBus and then use
+shared-memory protocol lanes plus DMA-BUF or copied per-window surfaces; remote
+clients retain the same client-owned actors and viewport over an authenticated
+network carrier and remote surface transports. See
+[[systems/presentation-client]].
 
 See [[architecture]] for the implementation map.
 

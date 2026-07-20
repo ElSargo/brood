@@ -2,7 +2,7 @@
 status: canonical
 type: system-map
 authority: implementation
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-20
 code-links:
   - crates/manifoldd/src/lib.rs
   - crates/manifoldd/src/compositor.rs
@@ -51,7 +51,7 @@ The current `manifold` runtime owns:
   notification-based coordination
 - async WASM test harness lane
 
-The target architecture splits presentation into an independent portable client. The client owns viewport state, client-side WASM actors, and WGPU composition; the session process exports window inventory, lease-validated input/configuration, backend capabilities, actor routing, and demand-driven frame streams. The split is introduced first as a typed in-process boundary and later as a local or remote protocol. See [[systems/presentation-client]].
+The target architecture splits presentation into an independent portable client. The client owns viewport state, client-side WASM actors, local actor mailboxes and policy, and WGPU composition; the session process exports window inventory, lease-validated input/configuration, backend capabilities, cross-runtime actor routing, and demand-driven frame streams. The split is introduced first as a typed in-process boundary. The local process profile uses DBus to bootstrap bounded shared-memory protocol lanes and DMA-BUF or copied per-window surfaces. Remote profiles map the same semantic lanes onto an authenticated network carrier and encoded or damage-based per-window surfaces. See [[systems/presentation-client]] and [[decisions/0007-presentation-transports-and-client-actors]].
 
 ## Data Flow
 
