@@ -525,22 +525,31 @@ impl ImportedFrame {
         resource_id: u64,
         frame: DmabufFrame,
     ) -> Result<Self> {
-        const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
-        const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
-        ensure_supported_fourcc(frame.fourcc, DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888)?;
+        if frame.color_space != manifold_ipc::FrameColorSpace::Srgb {
+            return Err(anyhow!(
+                "unsupported happy-path DMA-BUF color space {:?}",
+                frame.color_space
+            ));
+        }
+        let (format, view_format) = dmabuf_texture_formats(frame.fourcc)?;
         let texture = import_single_plane(
             device,
             frame.fd,
             SinglePlaneDmabuf {
                 width: frame.width,
                 height: frame.height,
-                format: wgpu::TextureFormat::Bgra8Unorm,
+                format,
+                view_format: Some(view_format),
                 modifier: frame.modifier,
                 stride: u64::from(frame.stride),
                 offset: u64::from(frame.offset),
             },
         )?;
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("hosted DMA-BUF sRGB view"),
+            format: Some(view_format),
+            ..Default::default()
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("hosted DMA-BUF bind group"),
             layout: bind_group_layout,
@@ -556,11 +565,13 @@ impl ImportedFrame {
             ],
         });
         eprintln!(
-            "imported window DMA-BUF window_id={} resource_id={} size={}x{} stride={} modifier={} y_inverted={}",
+            "imported window DMA-BUF window_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={} modifier={} y_inverted={}",
             window_id,
             resource_id,
             frame.width,
             frame.height,
+            format,
+            frame.color_space,
             frame.stride,
             frame.modifier,
             frame.y_inverted
@@ -622,8 +633,29 @@ fn create_frame_pipeline(
                 }
                 @group(0) @binding(0) var image: texture_2d<f32>;
                 @group(0) @binding(1) var image_sampler: sampler;
-                @fragment fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
+
+                fn linear_to_srgb_channel(linear: f32) -> f32 {
+                    return select(
+                        12.92 * linear,
+                        1.055 * pow(max(linear, 0.0), 1.0 / 2.4) - 0.055,
+                        linear > 0.0031308);
+                }
+                fn linear_to_srgb(linear: vec3<f32>) -> vec3<f32> {
+                    return vec3<f32>(
+                        linear_to_srgb_channel(linear.r),
+                        linear_to_srgb_channel(linear.g),
+                        linear_to_srgb_channel(linear.b));
+                }
+                @fragment fn fragment_linear_target(
+                    input: VertexOutput
+                ) -> @location(0) vec4<f32> {
                     return textureSample(image, image_sampler, input.uv);
+                }
+                @fragment fn fragment_encoded_target(
+                    input: VertexOutput
+                ) -> @location(0) vec4<f32> {
+                    let linear = textureSample(image, image_sampler, input.uv);
+                    return vec4<f32>(linear_to_srgb(linear.rgb), linear.a);
                 }"
             .into(),
         ),
@@ -644,7 +676,11 @@ fn create_frame_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fragment"),
+            entry_point: Some(if target_format.is_srgb() {
+                "fragment_linear_target"
+            } else {
+                "fragment_encoded_target"
+            }),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
                 blend: None,
@@ -661,12 +697,43 @@ fn create_frame_pipeline(
     (bind_group_layout, sampler, pipeline)
 }
 
-fn ensure_supported_fourcc(fourcc: u32, argb: u32, xrgb: u32) -> Result<()> {
-    if fourcc == argb || fourcc == xrgb {
-        Ok(())
-    } else {
-        Err(anyhow!("unsupported happy-path DMA-BUF fourcc {fourcc:#x}"))
+fn dmabuf_texture_formats(fourcc: u32) -> Result<(wgpu::TextureFormat, wgpu::TextureFormat)> {
+    const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+    const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+    const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+    const DRM_FORMAT_XBGR8888: u32 = 0x3432_4258;
+    match fourcc {
+        DRM_FORMAT_ARGB8888 | DRM_FORMAT_XRGB8888 => Ok((
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        )),
+        DRM_FORMAT_ABGR8888 | DRM_FORMAT_XBGR8888 => Ok((
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        )),
+        _ => Err(anyhow!("unsupported happy-path DMA-BUF fourcc {fourcc:#x}")),
     }
+}
+
+fn srgb_surface_format(
+    supported: &[wgpu::SurfaceFormatCapabilities],
+) -> Option<wgpu::TextureFormat> {
+    let mut encoded_fallback = None;
+    for capability in supported {
+        if !capability
+            .color_spaces
+            .contains(wgpu::SurfaceColorSpaces::SRGB)
+        {
+            continue;
+        }
+        if capability.format.is_srgb() {
+            return Some(capability.format);
+        }
+        if encoded_fallback.is_none() {
+            encoded_fallback = Some(capability.format);
+        }
+    }
+    encoded_fallback
 }
 
 impl Renderer {
@@ -713,11 +780,18 @@ impl Renderer {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| anyhow!("wgpu surface has no supported configuration"))?;
         let capabilities = surface.get_capabilities(&adapter);
+        config.format = srgb_surface_format(&capabilities.format_capabilities)
+            .ok_or_else(|| anyhow!("wgpu surface cannot present standard sRGB"))?;
+        config.color_space = wgpu::SurfaceColorSpace::Srgb;
         config.present_mode = low_latency_present_mode(&capabilities.present_modes);
         config.desired_maximum_frame_latency = 1;
         let (frame_bind_group_layout, frame_sampler, frame_pipeline) =
             create_frame_pipeline(&device, config.format);
         surface.configure(&device, &config);
+        eprintln!(
+            "configured presentation surface format={:?} color_space={:?}",
+            config.format, config.color_space
+        );
         Ok(Self {
             window,
             surface,
@@ -958,6 +1032,54 @@ mod tests {
         assert_eq!(
             low_latency_present_mode(&[wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate,]),
             wgpu::PresentMode::Immediate
+        );
+    }
+
+    #[test]
+    fn srgb_surface_prefers_a_hardware_encoding_format() {
+        let supported = [
+            wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                color_spaces: wgpu::SurfaceColorSpaces::SRGB,
+            },
+            wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                color_spaces: wgpu::SurfaceColorSpaces::SRGB,
+            },
+        ];
+        assert_eq!(
+            srgb_surface_format(&supported),
+            Some(wgpu::TextureFormat::Bgra8UnormSrgb)
+        );
+    }
+
+    #[test]
+    fn encoded_srgb_surface_is_a_valid_fallback() {
+        let supported = [wgpu::SurfaceFormatCapabilities {
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            color_spaces: wgpu::SurfaceColorSpaces::SRGB,
+        }];
+        assert_eq!(
+            srgb_surface_format(&supported),
+            Some(wgpu::TextureFormat::Rgba8Unorm)
+        );
+    }
+
+    #[test]
+    fn dma_fourcc_preserves_channel_order_while_adding_an_srgb_view() {
+        assert_eq!(
+            dmabuf_texture_formats(0x3432_5241).ok(),
+            Some((
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Bgra8UnormSrgb
+            ))
+        );
+        assert_eq!(
+            dmabuf_texture_formats(0x3432_4241).ok(),
+            Some((
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            ))
         );
     }
 

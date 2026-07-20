@@ -557,6 +557,24 @@ Every transport must define:
 - corruption and unsupported-format fallback;
 - diagnostics and timing.
 
+### Color ownership
+
+The backend preserves each managed-window snapshot's pixel encoding and carries
+its color-space, alpha, and format metadata with the frame resource. It does not
+convert buffers for the display attached to a presentation client, because the
+backend may be headless, remote, or observed by clients on different displays.
+
+The presentation client imports or decodes the source encoding into its linear
+composition space. After combining managed windows, client UI, and overlays, it
+converts to the color space selected for the current operating-system surface.
+The platform shell reevaluates that surface when the window moves between
+displays. The operating system remains responsible for the final transform from
+the declared surface color space through the current monitor profile.
+
+An untagged SDR Wayland producer is interpreted as sRGB. Wide-gamut and HDR
+producers require explicit frame metadata; neither endpoint infers those
+properties from a DRM fourcc or an eight- or ten-bit channel layout.
+
 ### Required initial transport: copied image
 
 The first end-to-end transport uses a bounded copied image representation, with

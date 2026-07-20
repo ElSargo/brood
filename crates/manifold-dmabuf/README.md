@@ -17,5 +17,6 @@ nix develop --command cargo run --release -p manifold-dmabuf \
 
 The proof allocates an ARGB8888 GBM buffer on the render node, writes a known
 pixel pattern, exports its DMA-BUF descriptor, imports it into the selected
-Vulkan WGPU device without a CPU image copy, performs a GPU texture-to-buffer
-copy, and verifies the resulting bytes.
+Vulkan WGPU device without a CPU image copy, creates the compatible sRGB view
+used by the presentation client, performs a GPU texture-to-buffer copy, and
+verifies the resulting bytes.

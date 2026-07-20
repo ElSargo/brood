@@ -53,6 +53,7 @@ async fn run(args: Args) -> Result<()> {
         width: WIDTH,
         height: HEIGHT,
         format: wgpu::TextureFormat::Bgra8Unorm,
+        view_format: Some(wgpu::TextureFormat::Bgra8UnormSrgb),
         modifier: u64::from(buffer.modifier()),
         stride: u64::from(buffer.stride_for_plane(0)),
         offset: u64::from(buffer.offset(0)),
@@ -87,6 +88,11 @@ async fn run(args: Args) -> Result<()> {
         .context("create Vulkan WGPU device with DMA-BUF import")?;
 
     let texture = import_single_plane(&device, dma_fd, metadata)?;
+    let _srgb_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("DMA-BUF import spike sRGB view"),
+        format: metadata.view_format,
+        ..Default::default()
+    });
     let readback_size = u64::from(BYTES_PER_ROW) * u64::from(HEIGHT);
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("DMA-BUF import readback"),

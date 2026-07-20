@@ -82,7 +82,18 @@ type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 type DbusStatusItem = (String, String, String, String, DbusMetadata);
 type DbusPluginActor = (String, String, u64, u64, u64, u64, String, String);
 type DbusPluginMailbox = (String, u64, u64, u64);
-type DbusDmabufFrame = (u64, u32, u32, u32, u64, u32, u32, bool, zvariant::OwnedFd);
+type DbusDmabufFrame = (
+    u64,
+    u32,
+    u32,
+    u32,
+    u32,
+    u64,
+    u32,
+    u32,
+    bool,
+    zvariant::OwnedFd,
+);
 type DbusFastPath = (
     u64,
     zvariant::OwnedFd,
@@ -2888,6 +2899,7 @@ fn dmabuf_frame_tuple(
         width,
         height,
         format.code as u32,
+        manifold_ipc::FrameColorSpace::Srgb.into(),
         u64::from(modifier),
         stride,
         offset,
