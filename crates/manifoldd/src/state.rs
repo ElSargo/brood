@@ -3690,6 +3690,11 @@ impl Manifold {
         self.layout_rect_for_toplevel_surface(&surface)
     }
 
+    pub(crate) fn window_pane_id(&self, window: &Window) -> Option<u64> {
+        let surface = Self::window_toplevel_surface(window)?;
+        self.pane_for_toplevel_surface(&surface)
+    }
+
     pub(crate) fn window_test_marker_id(&self, window: &Window, fallback_index: usize) -> u64 {
         let Some(surface) = Self::window_toplevel_surface(window) else {
             return fallback_marker_id(fallback_index);
@@ -7001,6 +7006,7 @@ pub struct PresentationFastPath {
     pub frame_notifications: manifold_ipc::EventNotifier,
     pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,
+    pub window_buffers: HashMap<u64, Dmabuf>,
     pub next_resource_id: u64,
     pub last_presented_sequence: Option<u64>,
     pub in_flight_sequence: Option<u64>,

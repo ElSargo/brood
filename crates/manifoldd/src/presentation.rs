@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
     backend::SwapBuffersError,
-    backend::allocator::{Fourcc, Modifier},
+    backend::allocator::{Buffer as AllocatorBuffer, Fourcc, Modifier, dmabuf::Dmabuf},
     backend::{
         drm::{DrmDeviceFd, DrmNode},
         egl::EGLDevice,
@@ -35,13 +35,16 @@ use smithay::{
         },
     },
     desktop::{Space, Window, space::SpaceElement},
-    output::{Mode, Output, Scale as OutputScale},
+    output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
     reexports::calloop::{
         LoopHandle,
         timer::{TimeoutAction, Timer},
     },
     utils::DeviceFd,
-    utils::{Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
+    utils::{
+        Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size,
+        Transform,
+    },
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -539,6 +542,17 @@ fn render_presenter_frame_with_capture(
     let Some(backend) = runtime.backend.as_mut() else {
         return Ok(());
     };
+    if capture_path.is_none() && state.dmabuf.fast_path.is_some() {
+        if let Some(fast_path) = state.dmabuf.fast_path.as_mut()
+            && fast_path.in_flight_sequence.is_some()
+        {
+            fast_path.pending_redraw = true;
+            return Ok(());
+        }
+        render_external_client_scene(backend, state)?;
+        state.stats.record_frame(frame_started.elapsed());
+        return Ok(());
+    }
     let output = presenter.output.clone();
     let mut damage_tracker = presenter.damage_tracker.borrow_mut();
     let size = backend.window_size();
@@ -631,15 +645,6 @@ fn render_presenter_frame_with_capture(
     state.stats.record_frame(frame_started.elapsed());
 
     let external_client_active = state.dmabuf.fast_path.is_some();
-    if submitted && external_client_active {
-        let composed = backend.composed_dmabuf().ok_or_else(|| {
-            PresentationRuntimeFailure::new(
-                "publish_composed_frame",
-                "offscreen presenter has no exportable DMA-BUF",
-            )
-        })?;
-        publish_composed_frame(state, composed)?;
-    }
     if !submitted {
         state.presentation_skip_post_submit_frame_callbacks = false;
     } else if state.presentation_skip_post_submit_frame_callbacks {
@@ -654,11 +659,137 @@ fn render_presenter_frame_with_capture(
     Ok(())
 }
 
-fn publish_composed_frame(
+#[derive(Clone)]
+struct ExternalWindowFrame {
+    window_id: u64,
+    rect: LayoutRect,
+    active: bool,
+    element: MarkedWindow,
+}
+
+fn render_external_client_scene(
+    backend: &mut PresenterBackend,
     state: &mut Manifold,
-    dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
 ) -> std::result::Result<(), PresentationRuntimeFailure> {
-    state.dmabuf.latest_client_buffer = Some(dmabuf.clone());
+    let active_window = state.active_presentation_window();
+    let mut windows = state
+        .space
+        .elements()
+        .filter(|window| state.window_visible_in_presentation(window))
+        .enumerate()
+        .filter_map(|(index, window)| {
+            let rect = state.window_layout_rect(window)?;
+            (rect.w > 0 && rect.h > 0).then(|| ExternalWindowFrame {
+                window_id: state
+                    .window_pane_id(window)
+                    .unwrap_or_else(|| state.window_test_marker_id(window, index)),
+                rect,
+                active: active_window.as_ref() == Some(window),
+                element: marked_window(state, window, index),
+            })
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|window| window.active);
+
+    if windows.len().saturating_add(2) > manifold_ipc::CRITICAL_CAPACITY {
+        return Err(PresentationRuntimeFailure::new(
+            "publish_window_scene",
+            format!(
+                "scene has {} windows but the transport batch holds at most {}",
+                windows.len(),
+                manifold_ipc::CRITICAL_CAPACITY.saturating_sub(2)
+            ),
+        ));
+    }
+
+    let mut rendered = Vec::with_capacity(windows.len());
+    for window in windows {
+        let size: Size<i32, Physical> = (window.rect.w.max(1), window.rect.h.max(1)).into();
+        let existing = state
+            .dmabuf
+            .fast_path
+            .as_mut()
+            .and_then(|fast_path| fast_path.window_buffers.remove(&window.window_id));
+        let mut dmabuf = match existing {
+            Some(buffer) if buffer.size() == (size.w, size.h).into() => buffer,
+            _ => backend.create_exportable_dmabuf(size).map_err(|error| {
+                PresentationRuntimeFailure::new("allocate_window_dmabuf", error)
+            })?,
+        };
+        render_window_dmabuf(backend, state, &window, &mut dmabuf)?;
+        let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
+            return Err(PresentationRuntimeFailure::new(
+                "store_window_dmabuf",
+                "fast path closed while rendering",
+            ));
+        };
+        fast_path
+            .window_buffers
+            .insert(window.window_id, dmabuf.clone());
+        rendered.push((window, dmabuf));
+    }
+    publish_window_scene(state, backend.window_size(), rendered)
+}
+
+fn render_window_dmabuf(
+    backend: &mut PresenterBackend,
+    state: &Manifold,
+    window: &ExternalWindowFrame,
+    dmabuf: &mut Dmabuf,
+) -> std::result::Result<(), PresentationRuntimeFailure> {
+    let size: Size<i32, Physical> = (window.rect.w.max(1), window.rect.h.max(1)).into();
+    let output = Output::new(
+        format!("manifold-window-{}", window.window_id),
+        PhysicalProperties {
+            size: (0, 0).into(),
+            subpixel: Subpixel::Unknown,
+            make: "Manifold".into(),
+            model: "Client window frame".into(),
+        },
+    );
+    let mode = Mode {
+        size,
+        refresh: SESSION_OUTPUT_REFRESH_MILLIHZ,
+    };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        Some(state.session_output.current_scale()),
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
+    let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    let mut window_space = Space::default();
+    window_space.map_output(&output, (0, 0));
+    window_space.map_element(window.element.clone(), (0, 0), true);
+
+    let sync = {
+        let (renderer, mut framebuffer) = backend
+            .bind_dmabuf(dmabuf)
+            .map_err(|error| PresentationRuntimeFailure::new("bind_window_dmabuf", error))?;
+        smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
+            &output,
+            renderer,
+            &mut framebuffer,
+            1.0,
+            0,
+            [&window_space],
+            &[],
+            &mut damage_tracker,
+            [0.02, 0.02, 0.025, 1.0],
+        )
+        .map_err(|error| PresentationRuntimeFailure::new("render_window_dmabuf", error))?
+        .sync
+    };
+    sync.wait()
+        .map_err(|error| PresentationRuntimeFailure::new("wait_window_dmabuf", error))
+}
+
+fn publish_window_scene(
+    state: &mut Manifold,
+    scene_size: Size<i32, Physical>,
+    windows: Vec<(ExternalWindowFrame, Dmabuf)>,
+) -> std::result::Result<(), PresentationRuntimeFailure> {
     state.dmabuf.latest_client_buffer_sequence =
         state.dmabuf.latest_client_buffer_sequence.wrapping_add(1);
     let sequence = state.dmabuf.latest_client_buffer_sequence;
@@ -669,34 +800,72 @@ fn publish_composed_frame(
         fast_path.pending_redraw = true;
         return Ok(());
     }
-    let weak_dmabuf = dmabuf.weak();
-    let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
-        *id
-    } else {
-        fast_path.resources.retain(|buffer, _| !buffer.is_gone());
-        let id = fast_path.next_resource_id;
-        fast_path.next_resource_id = id.wrapping_add(1);
-        fast_path.resources.insert(weak_dmabuf, id);
-        fast_path.buffers.insert(id, dmabuf);
-        id
-    };
-    let record = manifold_ipc::CriticalRecord {
-        opcode: manifold_ipc::FRAME_DMABUF_COMMIT,
+    let begin = manifold_ipc::CriticalRecord {
+        opcode: manifold_ipc::FRAME_SCENE_BEGIN,
         connection_generation: fast_path.generation,
         sequence,
-        arguments: [resource_id, 0, 0, 0, 0],
+        arguments: [
+            u64::try_from(windows.len()).unwrap_or(u64::MAX),
+            u64::try_from(scene_size.w.max(1)).unwrap_or(u64::MAX),
+            u64::try_from(scene_size.h.max(1)).unwrap_or(u64::MAX),
+            0,
+            0,
+        ],
         ..manifold_ipc::CriticalRecord::default()
     };
     fast_path
         .frames
-        .try_send(record)
-        .map_err(|error| PresentationRuntimeFailure::new("publish_composed_frame", error))?;
+        .try_send(begin)
+        .map_err(|error| PresentationRuntimeFailure::new("publish_scene_begin", error))?;
+    for (window, dmabuf) in windows {
+        let weak_dmabuf = dmabuf.weak();
+        let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
+            *id
+        } else {
+            fast_path.resources.retain(|buffer, _| !buffer.is_gone());
+            let id = fast_path.next_resource_id;
+            fast_path.next_resource_id = id.wrapping_add(1);
+            fast_path.resources.insert(weak_dmabuf, id);
+            fast_path.buffers.insert(id, dmabuf);
+            id
+        };
+        fast_path
+            .frames
+            .try_send(manifold_ipc::CriticalRecord {
+                opcode: manifold_ipc::FRAME_WINDOW_DMABUF,
+                connection_generation: fast_path.generation,
+                sequence,
+                arguments: [
+                    window.window_id,
+                    resource_id,
+                    pack_i32_pair(window.rect.x, window.rect.y),
+                    pack_i32_pair(window.rect.w, window.rect.h),
+                    u64::from(window.active),
+                ],
+                ..manifold_ipc::CriticalRecord::default()
+            })
+            .map_err(|error| PresentationRuntimeFailure::new("publish_window_frame", error))?;
+    }
+    fast_path
+        .frames
+        .try_send(manifold_ipc::CriticalRecord {
+            opcode: manifold_ipc::FRAME_SCENE_END,
+            connection_generation: fast_path.generation,
+            sequence,
+            ..manifold_ipc::CriticalRecord::default()
+        })
+        .map_err(|error| PresentationRuntimeFailure::new("publish_scene_end", error))?;
     fast_path
         .frame_notifications
         .notify()
-        .map_err(|error| PresentationRuntimeFailure::new("notify_composed_frame", error))?;
+        .map_err(|error| PresentationRuntimeFailure::new("notify_window_scene", error))?;
     fast_path.in_flight_sequence = Some(sequence);
     Ok(())
+}
+
+fn pack_i32_pair(first: i32, second: i32) -> u64 {
+    u64::from(u32::from_ne_bytes(first.to_ne_bytes()))
+        | (u64::from(u32::from_ne_bytes(second.to_ne_bytes())) << 32)
 }
 
 fn layout_chrome_elements(state: &Manifold, scale: Scale<f64>) -> Vec<SolidColorRenderElement> {

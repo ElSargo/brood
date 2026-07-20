@@ -22,7 +22,7 @@ use crate::{
 
 pub const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 pub const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 2;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 3;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 

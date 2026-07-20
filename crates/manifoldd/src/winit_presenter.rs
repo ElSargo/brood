@@ -859,14 +859,30 @@ impl PresenterBackend {
         &mut self.renderer
     }
 
-    pub fn composed_dmabuf(&self) -> Option<Dmabuf> {
-        let PresenterRenderTarget::Offscreen(target) = self.target.as_ref()? else {
-            return None;
-        };
-        let PresenterOffscreenBuffer::Dmabuf(dmabuf) = &target.buffer else {
-            return None;
-        };
-        Some(dmabuf.clone())
+    pub fn create_exportable_dmabuf(
+        &mut self,
+        size: Size<i32, Physical>,
+    ) -> Result<Dmabuf, PresenterBackendError> {
+        let allocator = self.offscreen_allocator.as_mut().ok_or_else(|| {
+            PresenterBackendError::OffscreenRenderer(
+                "offscreen renderer has no DMA-BUF allocator".to_string(),
+            )
+        })?;
+        create_exportable_dmabuf(allocator, size)
+    }
+
+    pub fn bind_dmabuf<'a>(
+        &'a mut self,
+        dmabuf: &'a mut Dmabuf,
+    ) -> Result<
+        (
+            &'a mut GlesRenderer,
+            <GlesRenderer as RendererSuper>::Framebuffer<'a>,
+        ),
+        SwapBuffersError,
+    > {
+        let framebuffer = self.renderer.bind(dmabuf)?;
+        Ok((&mut self.renderer, framebuffer))
     }
 
     pub fn reset_target_after_context_loss(&mut self) {
@@ -990,13 +1006,7 @@ fn create_offscreen_buffer(
     size: Size<i32, Physical>,
 ) -> Result<PresenterOffscreenBuffer, PresenterBackendError> {
     if let Some(allocator) = allocator {
-        let width = u32::try_from(size.w.max(1))
-            .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
-        let height = u32::try_from(size.h.max(1))
-            .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
-        let dmabuf = allocator
-            .create_buffer(width, height, Fourcc::Argb8888, &[Modifier::Linear])
-            .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
+        let dmabuf = create_exportable_dmabuf(allocator, size)?;
         return Ok(PresenterOffscreenBuffer::Dmabuf(dmabuf));
     }
     let buffer_size: Size<i32, BufferCoords> = (size.w, size.h).into();
@@ -1004,6 +1014,19 @@ fn create_offscreen_buffer(
         .create_buffer(Fourcc::Abgr8888, buffer_size)
         .map(PresenterOffscreenBuffer::Renderbuffer)
         .map_err(Into::into)
+}
+
+fn create_exportable_dmabuf(
+    allocator: &mut OffscreenAllocator,
+    size: Size<i32, Physical>,
+) -> Result<Dmabuf, PresenterBackendError> {
+    let width = u32::try_from(size.w.max(1))
+        .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
+    let height = u32::try_from(size.h.max(1))
+        .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))?;
+    allocator
+        .create_buffer(width, height, Fourcc::Argb8888, &[Modifier::Linear])
+        .map_err(|error| PresenterBackendError::OffscreenRenderer(error.to_string()))
 }
 
 fn offscreen_egl_display() -> Result<(EGLDisplay, Option<OffscreenAllocator>), PresenterBackendError>

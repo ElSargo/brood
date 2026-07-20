@@ -90,11 +90,30 @@ fn main() -> Result<()> {
 
 #[derive(Debug)]
 enum ClientEvent {
-    DmabufFrame {
-        resource_id: u64,
+    SceneFrame {
         sequence: u64,
-        resource: Option<DmabufFrame>,
+        width: u32,
+        height: u32,
+        windows: Vec<SceneWindowUpdate>,
     },
+    TransportError(String),
+}
+
+#[derive(Debug)]
+struct SceneWindowUpdate {
+    window_id: u64,
+    resource_id: u64,
+    rect: [i32; 4],
+    active: bool,
+    resource: Option<DmabufFrame>,
+}
+
+struct PendingScene {
+    sequence: u64,
+    expected_windows: usize,
+    width: u32,
+    height: u32,
+    windows: Vec<SceneWindowUpdate>,
 }
 
 fn spawn_frame_updates(
@@ -107,44 +126,107 @@ fn spawn_frame_updates(
         .name("manifold-frame-updates".to_string())
         .spawn(move || {
             let mut resources = HashSet::new();
+            let mut pending_scene: Option<PendingScene> = None;
             loop {
                 if notifications.wait().is_err() {
                     break;
                 }
-                let mut latest = None;
                 while let Some(record) = frames.try_recv() {
-                    if record.opcode == manifold_ipc::FRAME_DMABUF_COMMIT {
-                        latest = Some((record.arguments[0], record.sequence));
-                    }
-                }
-                let Some((resource_id, sequence)) = latest else {
-                    continue;
-                };
-                let resource = if resources.contains(&resource_id) {
-                    None
-                } else {
-                    match dmabuf_resource(&target, resource_id) {
-                        Ok(resource) => {
-                            resources.insert(resource_id);
-                            Some(resource)
+                    match record.opcode {
+                        manifold_ipc::FRAME_SCENE_BEGIN => {
+                            pending_scene = Some(PendingScene {
+                                sequence: record.sequence,
+                                expected_windows: usize::try_from(record.arguments[0])
+                                    .unwrap_or(usize::MAX),
+                                width: u32::try_from(record.arguments[1]).unwrap_or(u32::MAX),
+                                height: u32::try_from(record.arguments[2]).unwrap_or(u32::MAX),
+                                windows: Vec::new(),
+                            });
                         }
-                        Err(_) => continue,
+                        manifold_ipc::FRAME_WINDOW_DMABUF => {
+                            let Some(scene) = pending_scene.as_mut() else {
+                                continue;
+                            };
+                            if scene.sequence != record.sequence {
+                                let _send_result =
+                                    proxy.send_event(ClientEvent::TransportError(format!(
+                                        "window record sequence {} does not match scene {}",
+                                        record.sequence, scene.sequence
+                                    )));
+                                return;
+                            }
+                            let resource_id = record.arguments[1];
+                            let resource = if resources.contains(&resource_id) {
+                                None
+                            } else {
+                                match dmabuf_resource(&target, resource_id) {
+                                    Ok(resource) => {
+                                        resources.insert(resource_id);
+                                        Some(resource)
+                                    }
+                                    Err(error) => {
+                                        let _send_result =
+                                            proxy.send_event(ClientEvent::TransportError(format!(
+                                                "fetch DMA-BUF resource {resource_id}: {error:#}"
+                                            )));
+                                        return;
+                                    }
+                                }
+                            };
+                            let (x, y) = unpack_i32_pair(record.arguments[2]);
+                            let (width, height) = unpack_i32_pair(record.arguments[3]);
+                            scene.windows.push(SceneWindowUpdate {
+                                window_id: record.arguments[0],
+                                resource_id,
+                                rect: [x, y, width, height],
+                                active: record.arguments[4] != 0,
+                                resource,
+                            });
+                        }
+                        manifold_ipc::FRAME_SCENE_END => {
+                            let Some(scene) = pending_scene.take() else {
+                                continue;
+                            };
+                            if scene.sequence != record.sequence
+                                || scene.windows.len() != scene.expected_windows
+                            {
+                                let _send_result =
+                                    proxy.send_event(ClientEvent::TransportError(format!(
+                                        "incomplete scene {}: expected {} windows, received {}",
+                                        scene.sequence,
+                                        scene.expected_windows,
+                                        scene.windows.len()
+                                    )));
+                                return;
+                            }
+                            if proxy
+                                .send_event(ClientEvent::SceneFrame {
+                                    sequence: scene.sequence,
+                                    width: scene.width,
+                                    height: scene.height,
+                                    windows: scene.windows,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        _ => {}
                     }
-                };
-                if proxy
-                    .send_event(ClientEvent::DmabufFrame {
-                        resource_id,
-                        sequence,
-                        resource,
-                    })
-                    .is_err()
-                {
-                    break;
                 }
             }
         })
         .context("spawn DMA-BUF frame update worker")?;
     Ok(())
+}
+
+fn unpack_i32_pair(value: u64) -> (i32, i32) {
+    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
+    let high = u32::try_from(value >> 32).unwrap_or_default();
+    (
+        i32::from_ne_bytes(low.to_ne_bytes()),
+        i32::from_ne_bytes(high.to_ne_bytes()),
+    )
 }
 
 struct InputLane {
@@ -166,20 +248,25 @@ struct Application {
 
 impl Application {
     fn accept_frame(&mut self, event: ClientEvent) -> Result<()> {
-        let ClientEvent::DmabufFrame {
-            resource_id,
-            sequence,
-            resource,
-        } = event;
-        let Some(renderer) = self.renderer.as_mut() else {
-            self.pending_frame = Some(ClientEvent::DmabufFrame {
-                resource_id,
+        let (sequence, width, height, windows) = match event {
+            ClientEvent::SceneFrame {
                 sequence,
-                resource,
+                width,
+                height,
+                windows,
+            } => (sequence, width, height, windows),
+            ClientEvent::TransportError(message) => return Err(anyhow!(message)),
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            self.pending_frame = Some(ClientEvent::SceneFrame {
+                sequence,
+                width,
+                height,
+                windows,
             });
             return Ok(());
         };
-        renderer.select_frame(resource_id, sequence, resource)
+        renderer.select_scene(sequence, width, height, windows)
     }
 }
 
@@ -359,15 +446,21 @@ struct Renderer {
     frame_sampler: wgpu::Sampler,
     frame_pipeline: wgpu::RenderPipeline,
     imported_frames: HashMap<u64, ImportedFrame>,
-    current_frame: Option<u64>,
+    current_windows: Vec<SceneWindow>,
+    scene_extent: Option<(u32, u32)>,
     current_sequence: Option<u64>,
+}
+
+struct SceneWindow {
+    window_id: u64,
+    resource_id: u64,
+    rect: [i32; 4],
+    active: bool,
 }
 
 struct ImportedFrame {
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-    width: u32,
-    height: u32,
 }
 
 fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
@@ -428,6 +521,8 @@ impl ImportedFrame {
         device: &wgpu::Device,
         bind_group_layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
+        window_id: u64,
+        resource_id: u64,
         frame: DmabufFrame,
     ) -> Result<Self> {
         const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
@@ -461,8 +556,9 @@ impl ImportedFrame {
             ],
         });
         eprintln!(
-            "imported hosted DMA-BUF sequence={} size={}x{} stride={} modifier={} y_inverted={}",
-            frame.sequence,
+            "imported window DMA-BUF window_id={} resource_id={} size={}x{} stride={} modifier={} y_inverted={}",
+            window_id,
+            resource_id,
             frame.width,
             frame.height,
             frame.stride,
@@ -472,8 +568,6 @@ impl ImportedFrame {
         Ok(Self {
             _texture: texture,
             bind_group,
-            width: frame.width,
-            height: frame.height,
         })
     }
 }
@@ -634,34 +728,50 @@ impl Renderer {
             frame_sampler,
             frame_pipeline,
             imported_frames: HashMap::new(),
-            current_frame: None,
+            current_windows: Vec::new(),
+            scene_extent: None,
             current_sequence: None,
         })
     }
 
-    fn content_extent(&self) -> Option<(u32, u32)> {
-        self.current_frame
-            .and_then(|id| self.imported_frames.get(&id))
-            .map(|frame| (frame.width, frame.height))
+    const fn content_extent(&self) -> Option<(u32, u32)> {
+        self.scene_extent
     }
 
-    fn select_frame(
+    fn select_scene(
         &mut self,
-        resource_id: u64,
         sequence: u64,
-        resource: Option<DmabufFrame>,
+        width: u32,
+        height: u32,
+        windows: Vec<SceneWindowUpdate>,
     ) -> Result<()> {
-        if let Some(frame) = resource {
-            let imported = ImportedFrame::new(
-                &self.device,
-                &self.frame_bind_group_layout,
-                &self.frame_sampler,
-                frame,
-            )?;
-            self.imported_frames.insert(resource_id, imported);
+        let mut scene_windows = Vec::with_capacity(windows.len());
+        for window in windows {
+            if let Some(frame) = window.resource {
+                let imported = ImportedFrame::new(
+                    &self.device,
+                    &self.frame_bind_group_layout,
+                    &self.frame_sampler,
+                    window.window_id,
+                    window.resource_id,
+                    frame,
+                )?;
+                self.imported_frames.insert(window.resource_id, imported);
+            }
+            scene_windows.push(SceneWindow {
+                window_id: window.window_id,
+                resource_id: window.resource_id,
+                rect: window.rect,
+                active: window.active,
+            });
         }
-        if self.imported_frames.contains_key(&resource_id) {
-            self.current_frame = Some(resource_id);
+        scene_windows.sort_by_key(|window| (window.active, window.window_id));
+        if scene_windows
+            .iter()
+            .all(|window| self.imported_frames.contains_key(&window.resource_id))
+        {
+            self.current_windows = scene_windows;
+            self.scene_extent = Some((width.max(1), height.max(1)));
             self.current_sequence = Some(sequence);
             self.window.request_redraw();
         }
@@ -729,13 +839,38 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(imported) = self
-                .current_frame
-                .and_then(|id| self.imported_frames.get(&id))
-            {
+            if let Some((scene_width, scene_height)) = self.scene_extent {
                 render_pass.set_pipeline(&self.frame_pipeline);
-                render_pass.set_bind_group(0, &imported.bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
+                let scene_width_i32 = i32::try_from(scene_width).unwrap_or(i32::MAX);
+                let scene_height_i32 = i32::try_from(scene_height).unwrap_or(i32::MAX);
+                for window in &self.current_windows {
+                    let Some(imported) = self.imported_frames.get(&window.resource_id) else {
+                        continue;
+                    };
+                    let [x, y, width, height] = window.rect;
+                    let x = x.clamp(0, scene_width_i32);
+                    let y = y.clamp(0, scene_height_i32);
+                    let width = width.max(0).min(scene_width_i32 - x);
+                    let height = height.max(0).min(scene_height_i32 - y);
+                    if width == 0 || height == 0 {
+                        continue;
+                    }
+                    let viewport = scaled_viewport(
+                        [x, y, width, height],
+                        (scene_width, scene_height),
+                        (self.config.width, self.config.height),
+                    );
+                    render_pass.set_viewport(
+                        viewport[0],
+                        viewport[1],
+                        viewport[2],
+                        viewport[3],
+                        0.0,
+                        1.0,
+                    );
+                    render_pass.set_bind_group(0, &imported.bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
+                }
             }
             drop(render_pass);
         }
@@ -757,6 +892,26 @@ impl Renderer {
             reconfigure,
         }
     }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "WGPU viewports require f32 while protocol and surface extents are integer pixels"
+)]
+fn scaled_viewport(
+    rect: [i32; 4],
+    scene_extent: (u32, u32),
+    target_extent: (u32, u32),
+) -> [f32; 4] {
+    let [x, y, width, height] = rect;
+    let scale_x = target_extent.0 as f32 / scene_extent.0 as f32;
+    let scale_y = target_extent.1 as f32 / scene_extent.1 as f32;
+    [
+        x as f32 * scale_x,
+        y as f32 * scale_y,
+        width as f32 * scale_x,
+        height as f32 * scale_y,
+    ]
 }
 
 #[derive(Clone, Copy)]
@@ -803,6 +958,25 @@ mod tests {
         assert_eq!(
             low_latency_present_mode(&[wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate,]),
             wgpu::PresentMode::Immediate
+        );
+    }
+
+    #[test]
+    fn packed_signed_window_coordinates_round_trip() {
+        let packed = u64::from(u32::from_ne_bytes((-17_i32).to_ne_bytes()))
+            | (u64::from(u32::from_ne_bytes(42_i32.to_ne_bytes())) << 32);
+        assert_eq!(unpack_i32_pair(packed), (-17, 42));
+    }
+
+    #[test]
+    fn window_viewport_scales_with_the_client_surface() {
+        let actual = scaled_viewport([500, 0, 500, 750], (1000, 750), (800, 600));
+        let expected = [400.0, 0.0, 400.0, 600.0];
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
         );
     }
 }

@@ -2705,38 +2705,19 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     let frame_notify_fd = frame_notifications.as_fd().try_clone_to_owned()?;
     let input = manifold_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
     let frames = manifold_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
-    let mut fast_path = crate::state::PresentationFastPath {
+    let fast_path = crate::state::PresentationFastPath {
         generation,
         input,
         frames,
         frame_notifications,
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
+        window_buffers: std::collections::HashMap::new(),
         next_resource_id: 1,
         last_presented_sequence: None,
         in_flight_sequence: None,
         pending_redraw: false,
     };
-    if let Some(dmabuf) = state.dmabuf.latest_client_buffer.as_ref() {
-        let resource_id = fast_path.next_resource_id;
-        fast_path.next_resource_id = resource_id.wrapping_add(1);
-        fast_path.resources.insert(dmabuf.weak(), resource_id);
-        fast_path.buffers.insert(resource_id, dmabuf.clone());
-        if fast_path
-            .frames
-            .try_send(manifold_ipc::CriticalRecord {
-                opcode: manifold_ipc::FRAME_DMABUF_COMMIT,
-                connection_generation: generation,
-                sequence: state.dmabuf.latest_client_buffer_sequence,
-                arguments: [resource_id, 0, 0, 0, 0],
-                ..manifold_ipc::CriticalRecord::default()
-            })
-            .is_ok()
-        {
-            fast_path.frame_notifications.notify()?;
-            fast_path.in_flight_sequence = Some(state.dmabuf.latest_client_buffer_sequence);
-        }
-    }
     state.dmabuf.fast_path = Some(fast_path);
     presentation::request_external_client_redraw(state);
     state

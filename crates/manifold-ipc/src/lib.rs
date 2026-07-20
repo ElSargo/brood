@@ -43,8 +43,17 @@ pub const INPUT_PRESENTATION_SIZE: u32 = 5;
 pub const INPUT_FRAME_PRESENTED: u32 = 6;
 /// The presentation client is closing cleanly and relinquishes its fast path.
 pub const INPUT_CLIENT_DISCONNECT: u32 = 7;
-/// A registered DMA-BUF resource was committed; argument zero is its resource ID.
-pub const FRAME_DMABUF_COMMIT: u32 = 0x100;
+/// Begin one atomic client-composed scene.
+///
+/// Arguments are window count, scene width, and scene height.
+pub const FRAME_SCENE_BEGIN: u32 = 0x100;
+/// One separately transported window in the current scene batch.
+///
+/// Arguments are window ID, resource ID, packed x/y, packed width/height,
+/// and whether the window is active.
+pub const FRAME_WINDOW_DMABUF: u32 = 0x101;
+/// End and publish the current atomic scene batch.
+pub const FRAME_SCENE_END: u32 = 0x102;
 
 /// Non-blocking eventfd used to wake a critical-lane consumer.
 ///
