@@ -43,6 +43,8 @@ pub const INPUT_PRESENTATION_SIZE: u32 = 5;
 pub const INPUT_FRAME_PRESENTED: u32 = 6;
 /// The presentation client is closing cleanly and relinquishes its fast path.
 pub const INPUT_CLIENT_DISCONNECT: u32 = 7;
+/// The presentation client selected a hosted window; argument zero is its window ID.
+pub const INPUT_WINDOW_FOCUS: u32 = 8;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.

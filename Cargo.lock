@@ -2250,6 +2250,7 @@ dependencies = [
  "manifold-cli",
  "manifold-dmabuf",
  "manifold-ipc",
+ "manifold-layout",
  "pollster",
  "wgpu",
  "winit",

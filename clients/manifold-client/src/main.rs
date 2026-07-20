@@ -15,11 +15,13 @@ use manifold_cli::{
     },
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
+use manifold_layout::{LayoutAxis, LayoutRect, LayoutSize, LayoutState};
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId},
 };
@@ -244,6 +246,8 @@ struct Application {
     fast_path_enabled: bool,
     pending_frame: Option<ClientEvent>,
     last_presented_sequence: Option<u64>,
+    modifiers: ModifiersState,
+    cursor_position: Option<(f64, f64)>,
 }
 
 impl Application {
@@ -333,6 +337,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = Some((position.x, position.y));
                 if let (Some(sender), Some((content_width, content_height))) =
                     (self.input_sender.as_mut(), renderer.content_extent())
                 {
@@ -341,6 +346,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                         position.x * f64::from(content_width) / f64::from(window_size.width.max(1));
                     let y = position.y * f64::from(content_height)
                         / f64::from(window_size.height.max(1));
+                    let (x, y) = renderer
+                        .backend_position_for_client_point(x, y)
+                        .unwrap_or((x, y));
                     send_input(
                         sender,
                         manifold_ipc::INPUT_POINTER_MOTION,
@@ -349,6 +357,21 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && let Some((x, y)) = self.cursor_position
+                {
+                    let window_size = renderer.window.inner_size();
+                    let scene_x = x * f64::from(renderer.content_extent().map_or(1, |size| size.0))
+                        / f64::from(window_size.width.max(1));
+                    let scene_y = y * f64::from(renderer.content_extent().map_or(1, |size| size.1))
+                        / f64::from(window_size.height.max(1));
+                    if let Some(window_id) = renderer.focus_window_at(scene_x, scene_y)
+                        && let Some(sender) = self.input_sender.as_mut()
+                    {
+                        send_window_focus(sender, window_id);
+                    }
+                }
                 if let (Some(sender), Some(code)) =
                     (self.input_sender.as_mut(), linux_button_code(button))
                 {
@@ -380,11 +403,34 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
                 ..
             } if !is_synthetic && !event.repeat => {
+                // TEMPORARY TESTING HACK: Ctrl-J/Ctrl-K locally cycle the client-owned
+                // focused pane until presentation shortcut policy is hosted in the client.
+                let cycle_offset = if self.modifiers.control_key() {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyJ) => Some(1),
+                        PhysicalKey::Code(KeyCode::KeyK) => Some(-1),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(offset) = cycle_offset {
+                    if event.state == ElementState::Pressed
+                        && let Some(window_id) = renderer.cycle_focus(offset)
+                        && let Some(sender) = self.input_sender.as_mut()
+                    {
+                        send_window_focus(sender, window_id);
+                    }
+                    return;
+                }
                 if let (Some(sender), Some(scancode)) =
                     (self.input_sender.as_mut(), event.physical_key.to_scancode())
                 {
@@ -454,6 +500,7 @@ struct Renderer {
 struct SceneWindow {
     window_id: u64,
     resource_id: u64,
+    source_rect: [i32; 4],
     rect: [i32; 4],
     active: bool,
 }
@@ -503,6 +550,14 @@ fn send_input(lane: &mut InputLane, opcode: u32, arguments: [u64; 5]) -> bool {
         return false;
     }
     true
+}
+
+fn send_window_focus(lane: &mut InputLane, window_id: u64) {
+    let _sent = send_input(
+        lane,
+        manifold_ipc::INPUT_WINDOW_FOCUS,
+        [window_id, 0, 0, 0, 0],
+    );
 }
 
 const fn linux_button_code(button: MouseButton) -> Option<u32> {
@@ -819,6 +874,11 @@ impl Renderer {
         height: u32,
         windows: Vec<SceneWindowUpdate>,
     ) -> Result<()> {
+        let previous_focus = self
+            .current_windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.window_id);
         let mut scene_windows = Vec::with_capacity(windows.len());
         for window in windows {
             if let Some(frame) = window.resource {
@@ -835,11 +895,33 @@ impl Renderer {
             scene_windows.push(SceneWindow {
                 window_id: window.window_id,
                 resource_id: window.resource_id,
+                source_rect: window.rect,
                 rect: window.rect,
                 active: window.active,
             });
         }
-        scene_windows.sort_by_key(|window| (window.active, window.window_id));
+        scene_windows.sort_by_key(|window| window.window_id);
+        let focused_window = previous_focus
+            .filter(|focused| {
+                scene_windows
+                    .iter()
+                    .any(|window| window.window_id == *focused)
+            })
+            .or_else(|| {
+                scene_windows
+                    .iter()
+                    .find(|window| window.active)
+                    .map(|window| window.window_id)
+            })
+            .or_else(|| scene_windows.first().map(|window| window.window_id));
+        map_windows(
+            &mut scene_windows,
+            LayoutSize {
+                w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
+                h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
+            },
+            focused_window,
+        );
         if scene_windows
             .iter()
             .all(|window| self.imported_frames.contains_key(&window.resource_id))
@@ -850,6 +932,51 @@ impl Renderer {
             self.window.request_redraw();
         }
         Ok(())
+    }
+
+    fn cycle_focus(&mut self, offset: isize) -> Option<u64> {
+        let window_count = self.current_windows.len();
+        if window_count < 2 {
+            return None;
+        }
+        let active_index = self
+            .current_windows
+            .iter()
+            .position(|window| window.active)
+            .unwrap_or_default();
+        let next_index = cycled_index(active_index, window_count, offset)?;
+        self.focus_window_index(next_index)
+    }
+
+    fn focus_window_at(&mut self, x: f64, y: f64) -> Option<u64> {
+        let index = self
+            .current_windows
+            .iter()
+            .rposition(|window| rect_contains(window.rect, x, y))?;
+        self.focus_window_index(index)
+    }
+
+    fn focus_window_index(&mut self, index: usize) -> Option<u64> {
+        let window_id = self.current_windows.get(index)?.window_id;
+        for window in &mut self.current_windows {
+            window.active = window.window_id == window_id;
+        }
+        self.window.request_redraw();
+        Some(window_id)
+    }
+
+    fn backend_position_for_client_point(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let window = self
+            .current_windows
+            .iter()
+            .rev()
+            .find(|window| rect_contains(window.rect, x, y))?;
+        Some(project_point_between_rects(
+            x,
+            y,
+            window.rect,
+            window.source_rect,
+        ))
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -966,6 +1093,64 @@ impl Renderer {
             reconfigure,
         }
     }
+}
+
+fn map_windows(windows: &mut [SceneWindow], extent: LayoutSize, focused_window: Option<u64>) {
+    let mut layout = LayoutState::default();
+    for _ in 1..windows.len() {
+        let active_rect = layout.active_rect(extent).unwrap_or(LayoutRect {
+            x: 0,
+            y: 0,
+            w: extent.w,
+            h: extent.h,
+        });
+        let axis = if active_rect.w >= active_rect.h {
+            LayoutAxis::Horizontal
+        } else {
+            LayoutAxis::Vertical
+        };
+        let Some(next_leaf) = layout.split_active(axis) else {
+            break;
+        };
+        layout.set_active_leaf(next_leaf);
+    }
+    for (window, region) in windows.iter_mut().zip(layout.resolve(extent)) {
+        window.rect = [region.rect.x, region.rect.y, region.rect.w, region.rect.h];
+        window.active = focused_window == Some(window.window_id);
+    }
+}
+
+fn cycled_index(current: usize, count: usize, offset: isize) -> Option<usize> {
+    if count == 0 || current >= count {
+        return None;
+    }
+    let step = offset.unsigned_abs() % count;
+    Some(if offset.is_negative() {
+        current
+            .checked_sub(step)
+            .unwrap_or_else(|| count - (step - current))
+    } else {
+        (current + step) % count
+    })
+}
+
+fn rect_contains(rect: [i32; 4], x: f64, y: f64) -> bool {
+    let [left, top, width, height] = rect;
+    x >= f64::from(left)
+        && y >= f64::from(top)
+        && x < f64::from(left.saturating_add(width.max(0)))
+        && y < f64::from(top.saturating_add(height.max(0)))
+}
+
+fn project_point_between_rects(x: f64, y: f64, from: [i32; 4], to: [i32; 4]) -> (f64, f64) {
+    let [from_x, from_y, from_width, from_height] = from;
+    let [to_x, to_y, to_width, to_height] = to;
+    let local_x = (x - f64::from(from_x)) / f64::from(from_width.max(1));
+    let local_y = (y - f64::from(from_y)) / f64::from(from_height.max(1));
+    (
+        local_x.mul_add(f64::from(to_width.max(1)), f64::from(to_x)),
+        local_y.mul_add(f64::from(to_height.max(1)), f64::from(to_y)),
+    )
 }
 
 #[allow(
@@ -1100,5 +1285,42 @@ mod tests {
                 .zip(expected)
                 .all(|(actual, expected)| (actual - expected).abs() < f32::EPSILON)
         );
+    }
+
+    #[test]
+    fn client_maps_three_windows_with_the_native_split_fallback() {
+        let mut windows = [scene_window(11), scene_window(12), scene_window(13)];
+        map_windows(&mut windows, LayoutSize { w: 1200, h: 800 }, Some(12));
+
+        assert_eq!(windows[0].rect, [0, 0, 600, 800]);
+        assert_eq!(windows[1].rect, [600, 0, 600, 400]);
+        assert_eq!(windows[2].rect, [600, 400, 600, 400]);
+        assert!(!windows[0].active);
+        assert!(windows[1].active);
+        assert!(!windows[2].active);
+    }
+
+    #[test]
+    fn focus_cycle_wraps_in_both_directions() {
+        assert_eq!(cycled_index(2, 3, 1), Some(0));
+        assert_eq!(cycled_index(0, 3, -1), Some(2));
+        assert_eq!(cycled_index(0, 0, 1), None);
+    }
+
+    #[test]
+    fn client_pointer_position_projects_into_the_matching_backend_window() {
+        let actual =
+            project_point_between_rects(900.0, 200.0, [600, 0, 600, 400], [0, 400, 600, 400]);
+        assert_eq!(actual, (300.0, 600.0));
+    }
+
+    fn scene_window(window_id: u64) -> SceneWindow {
+        SceneWindow {
+            window_id,
+            resource_id: window_id,
+            source_rect: [0, 0, 1, 1],
+            rect: [0, 0, 1, 1],
+            active: false,
+        }
     }
 }

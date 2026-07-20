@@ -2834,6 +2834,9 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 disconnected = true;
                 break;
             }
+            manifold_ipc::INPUT_WINDOW_FOCUS if state.focus_pane(record.arguments[0]) => {
+                request_redraw = true;
+            }
             _ => {}
         }
     }
