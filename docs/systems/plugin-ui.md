@@ -2,106 +2,155 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-21
 ---
 
 # Plugin UI And Pane Rendering
 
-The target pane UI model provides presentation-rendered native chrome and rich default components without making those components the limit of plugin graphics. Plugins may describe semantic UI or submit custom render packets; the presentation client owns viewport lifecycle, local focus, theme integration, accessibility infrastructure, and final rendering. The low-level graphics protocol is specified in [[plugin-graphics]], and actor placement and the backend/client boundary are specified in [[presentation-client]].
+Plugin UI is actor-owned application state rendered through the canvas packet
+contract in [[plugin-graphics]]. Rich components are SDK functions built from
+that contract. The presentation client does not implement, validate, retain, or
+patch a plugin component tree.
 
 ## Ownership
 
-The host owns:
+The presentation client owns:
 
-- pane shells, tabs, borders, title bars, menus, overlays, and recovery UI
-- layout integration and resize/focus/visibility events
-- input routing between native widgets, plugin actors, policy providers, and managed clients
-- theming, accessibility, text editing primitives, and platform integration
-- validation of plugin-provided UI trees, semantic interaction trees, and render packets
+- pane shells, tabs, borders, title bars, menus, overlays, and recovery UI;
+- pane placement, resize, focus, visibility, scale, and lifecycle events;
+- delivery of pane-local keyboard, pointer, touch, text, and IME input;
+- validation and rendering of canvas draw packets;
+- native text shaping and platform font integration;
+- final clipping, composition, scheduling, and renderer recovery;
+- projection of optional accessibility metadata onto platform APIs.
 
-Plugins own:
+The plugin actor and its SDK own:
 
-- pane-local app state
-- actor logic for UI events, completions, and commands
-- actor-scoped workers for blocking-looking I/O and shared-state concurrent work
-- semantic view models or component trees
-- custom graphics resources, shaders, and pane render packets when needed
+- pane-local application and UI state;
+- components, layout, styling, themes, and widget identity;
+- widget hit testing and event dispatch;
+- text-editing behavior and document state;
+- packet encoding and submission;
+- optional semantic accessibility descriptions.
 
-If a plugin actor exits or crashes, the pane identity can remain host-owned. The host can replace the content with native recovery chrome such as restart, close, and logs actions.
+If an actor exits, the pane identity can remain host-owned. The client replaces
+plugin content with native recovery chrome such as restart, close, and logs
+actions without needing to understand the failed UI's components.
 
-## Native Component Path
+## SDK Components
 
-The default plugin pane should be a presentation-rendered component tree or patch stream.
+Components are library code, not protocol entities. An SDK may expose functions
+such as:
 
-Candidate component families:
+```text
+column
+list
+button
+checkbox
+menu
+text-input
+editor
+virtual-list
+tooltip
+```
 
-- root, row, column, stack, scroll
-- text, icon, image
-- button, checkbox, menu, command bar
-- text input and editor primitives
-- list, tree, table, virtual list
-- divider, spacer, status item
-- pane slot or surface slot
-- overlay, tooltip, context menu
+Those functions may use immediate-mode, retained, reactive, or application-
+specific guest-side internals. Their common output is canvas commands, image and
+text-layout references, plus optionally accessibility metadata. SDK text helpers
+call or cache the host `layout_text` service outside the packet and emit only
+`draw-text-layout` commands. No component kind, property schema, patch stream,
+native toolkit object, or widget event is part of the host ABI.
 
-The component ABI should be Manifold-owned. Backend toolkits such as Iced, GPUI, GTK, or a future renderer may render the accepted tree, but their native types are not the plugin ABI.
+This keeps SDK evolution independent from the runtime. Different SDKs may offer
+different component systems while producing compatible draw packets. Iced,
+GPUI, GTK, browser DOM types, or another toolkit must not become the plugin ABI.
 
 ## Pane Lifecycle
 
-A plugin actor may request or be assigned a pane. The host creates the pane shell and routes lifecycle messages to the responsible actor.
+A presentation actor may request or be assigned a pane. The client creates the
+pane shell and routes lifecycle and pane-local input events to the actor:
 
 ```text
-Host -> Actor: CreatePane { pane_id, kind, constraints, capabilities }
-Actor -> Host: SetViewTree or PatchViewTree { pane_id, ... }
-Actor -> Host: SubmitRenderPacket { pane_handle, guest_range }
-Host -> Actor: PaneResized / PaneFocused / PaneHidden / PaneDestroyed
-Actor -> Host: CommandRequest / ViewPatch / Status
+Client -> Actor: PaneCreated { pane, size, scale, capabilities }
+Client -> Actor: PaneResized / PaneFocused / PaneHidden / PaneDestroyed
+Client -> Actor: Pointer / Key / Text / Ime / Frame
+Actor -> Client: SubmitDrawPacket { pane, bytes }
+Actor -> Client: RequestFrame / CommandRequest / Status
 ```
 
-Semantic pane updates from a presentation actor flow through the local client host and validation. Custom graphics use the bounded render submission path so an actor can batch a pane update in guest memory and cross the WASM boundary once without crossing the presentation network connection. Neither path runs on a synchronous policy lane unless that lane is explicitly declared.
+The actor returns from each dispatch without waiting for I/O, a worker, or GPU
+execution. It may delegate unrelated work and update the pane when a completion
+arrives. Drawing is normal actor output, not a synchronous key or layout policy
+lane.
+
+## Input And Text Editing
+
+The client converts platform events into a stable pane-local event model and
+owns focus between panes and client chrome. Inside the pane, the SDK decides
+which component is hovered, pressed, focused, scrolled, or edited.
+
+The client bridges platform text and IME input but does not own the plugin's
+editor or text-field state. The SDK combines those events with native text
+measurement and hit-testing services from [[plugin-graphics]] to implement
+selection, carets, navigation, and drawing.
 
 ## Native Chrome
 
-Native chrome should be available by default so plugin panes feel coherent across the workspace. The host should provide common UI affordances instead of making every plugin draw its own frame, menus, drag handles, and error surfaces.
+Native pane chrome remains available by default so plugins do not redraw
+workspace borders, tabs, drag handles, recovery controls, or presentation menus.
+The actor may request chrome roles and actions, but the client decides their
+placement, style, focus behavior, and composition.
 
-Plugin-provided layout or UI may request chrome roles and actions, but the host decides final placement, style, and interaction details.
+Client chrome is not implemented through the plugin component SDK and cannot be
+overwritten by a full-pane draw packet without a separate presentation role.
 
-## Low-Level Graphics Path
+## Accessibility
 
-Custom drawing is a supported first-class path, although it is not the shortest path for conventional UI. Actors can create host-managed buffers, textures, samplers, shaders, pipelines, render targets, text layouts, and related resources. They submit a bounded, replayable render packet as the latest visual state of a pane.
+Pixels and canvas commands do not preserve component semantics. An SDK may
+therefore publish a companion accessibility description containing stable IDs,
+roles, bounds, labels, values, states, and actions. The client validates and
+projects that description to the platform accessibility adapter.
 
-The protocol can express textured quads, custom geometry, indexed and instanced drawing, arbitrary validated shaders, and offscreen effects. It deliberately does not expose physical devices, swapchains, GPU queues, barriers, fences, or backend-native objects. The host copies and validates a submitted guest-memory range, then owns lowering, synchronization, composition, and presentation.
+This semantic description is not a component tree or rendering input. It does
+not prescribe SDK layout, styling, state ownership, or widget implementation.
+Visual and semantic updates use explicit revisions so the client does not pair
+incompatible geometry and accessibility metadata.
 
-Canvas, terminal, text-grid, and other domain APIs belong in the SDK above this protocol. Imported client surfaces and external GPU or shared-buffer paths remain separately negotiated capabilities with explicit lifecycle rules. See [[plugin-graphics]] for the complete graphics and text contract.
+## Example
 
-## Relation To Policy Providers
+A session-switcher SDK may implement a list, buttons, query editor, selection,
+and fuzzy matching entirely in guest code. The host provides session events,
+command capabilities, pane input, canvas rendering, and text layout. A button
+click becomes a pane-local pointer event interpreted by the SDK, followed by a
+normal command request and replacement draw packet.
 
-UI actor dispatchers are completion-driven and must not block. They may delegate
-I/O or long-running work to workers and handle the resulting completion
-messages. Actors can publish latest state when a policy provider needs that
-state for keyboard or layout decisions, but the view tree itself should not
-become a policy-path backlog.
+The client never receives a `Button` node or preserves a host widget instance.
 
-For example, a session switcher actor can own picker query state and render a native component tree. A host shortcut or key policy provider can open the picker immediately by sending a message or host directive, while the actor performs filtering and UI updates through normal mailbox delivery.
+## Advanced Drawing
+
+The base UI path uses canvas packets. Future applications that need custom
+geometry, user shaders, or GPU-style resources may use the separate
+[[plugin-advanced-graphics]] protocol. Advanced graphics is an escape hatch, not
+the substrate that every SDK component must encode against.
 
 ## Validation And Diagnostics
 
-The host should validate:
+The client validates packet bounds, resource ownership, pane authority, input
+revisions, and optional semantic metadata. Diagnostics report rejected or
+superseded UI updates, actor latency, frame/update counters, text failures,
+resource use, and recovery state.
 
-- stable IDs for stateful widgets
-- bounded node, property, string, and action counts
-- capability use for commands, files, process launch, clipboard, and cross-plugin messages
-- unsupported component features by backend
-- patch application order and generation
-
-Diagnostics should report rejected UI updates, backend feature adaptation, actor latency, frame/update counters, and recovery state. Render-packet, shader, resource, and presentation diagnostics are specified in [[plugin-graphics]].
+SDK component correctness is tested at the SDK and workload level rather than by
+adding component rules to the runtime. Real behavior tests should drive pointer,
+keyboard, text, resize, focus, and scroll input through a nested presentation
+client and verify both rendered output and client/actor metrics.
 
 Related:
 
-- [[presentation-client]]
-- [[../concepts/plugin]]
-- [[plugin-runtime]]
 - [[plugin-graphics]]
+- [[plugin-advanced-graphics]]
+- [[presentation-client]]
+- [[plugin-runtime]]
 - [[input-shortcuts]]
 - [[layout-policy]]
 - [[../concepts/pane]]

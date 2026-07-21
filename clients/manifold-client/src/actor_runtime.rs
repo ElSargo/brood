@@ -6,10 +6,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use manifold_wasm::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, FilesystemGrant, HostedWasmActor,
-    NativeFilesystemWatcherService, Preview1ActorCapabilities, Preview1CompatActor,
-    Preview1FilesystemGrant, Preview1WorkerConfig, RuntimeIoCapabilities, RuntimeIoConfig,
-    WasmPluginArtifact,
+    NativeFilesystemWatcherService, PresentationEvent, Preview1ActorCapabilities,
+    Preview1CompatActor, Preview1FilesystemGrant, Preview1WorkerConfig, RuntimeIoCapabilities,
+    RuntimeIoConfig, WasmPluginArtifact,
 };
+
+use crate::plugin_graphics::PluginGraphicsBridge;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PresentationActorSpec {
@@ -19,12 +21,17 @@ struct PresentationActorSpec {
 
 pub struct PresentationWasmRuntime {
     executor: tokio::runtime::Runtime,
-    actors: BTreeMap<String, HostedWasmActor>,
+    actors: BTreeMap<String, PresentationActor>,
     filesystem_watcher_service: NativeFilesystemWatcherService,
 }
 
+struct PresentationActor {
+    pane: u64,
+    actor: HostedWasmActor,
+}
+
 impl PresentationWasmRuntime {
-    pub fn start(actor_specs: &[String]) -> Result<Self> {
+    pub fn start(actor_specs: &[String], graphics: Option<&PluginGraphicsBridge>) -> Result<Self> {
         let specs = actor_specs
             .iter()
             .map(|spec| PresentationActorSpec::parse(spec))
@@ -39,8 +46,9 @@ impl PresentationWasmRuntime {
             actors: BTreeMap::new(),
             filesystem_watcher_service: NativeFilesystemWatcherService::new(),
         };
-        for spec in specs {
-            runtime.load_actor(spec)?;
+        for (index, spec) in specs.into_iter().enumerate() {
+            let pane = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            runtime.load_actor(spec, pane, graphics)?;
         }
         Ok(runtime)
     }
@@ -49,14 +57,25 @@ impl PresentationWasmRuntime {
         clippy::significant_drop_tightening,
         reason = "the loaded actor is intentionally transferred into the long-lived client runtime"
     )]
-    fn load_actor(&mut self, spec: PresentationActorSpec) -> Result<()> {
+    fn load_actor(
+        &mut self,
+        spec: PresentationActorSpec,
+        pane: u64,
+        graphics: Option<&PluginGraphicsBridge>,
+    ) -> Result<()> {
         ensure!(
             !self.actors.contains_key(&spec.id),
             "duplicate presentation actor id {:?}",
             spec.id
         );
         let watcher = self.filesystem_watcher_service.clone();
-        let actor = self.executor.block_on(load_actor(&spec, watcher))?;
+        let presentation = graphics.map(|graphics| graphics.actor_host(pane));
+        let actor = self
+            .executor
+            .block_on(load_actor(&spec, watcher, presentation.clone()))?;
+        if let Some(presentation) = presentation {
+            presentation.bind_generation(actor.generation());
+        }
         eprintln!(
             "started presentation WASM actor id={} kind={} generation={} path={}",
             spec.id,
@@ -64,13 +83,14 @@ impl PresentationWasmRuntime {
             actor.generation(),
             spec.path.display()
         );
-        self.actors.insert(spec.id, actor);
+        self.actors
+            .insert(spec.id, PresentationActor { pane, actor });
         Ok(())
     }
 
     pub fn drain_events(&mut self) -> Result<()> {
-        for (actor_id, actor) in &mut self.actors {
-            match actor {
+        for (actor_id, hosted) in &mut self.actors {
+            match &mut hosted.actor {
                 HostedWasmActor::Component(actor) => {
                     while let Some(event) = actor.try_recv_event() {
                         match event {
@@ -108,6 +128,25 @@ impl PresentationWasmRuntime {
         self.actors.is_empty()
     }
 
+    pub fn pane_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.actors.values().map(|actor| actor.pane)
+    }
+
+    pub fn send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
+        let pane = presentation_event_pane(&event);
+        let actor = self
+            .actors
+            .values()
+            .find(|actor| actor.pane == pane)
+            .with_context(|| format!("presentation pane {pane} has no actor"))?;
+        match &actor.actor {
+            HostedWasmActor::Component(actor) => actor.try_send_presentation_event(event),
+            HostedWasmActor::Preview1(_) => {
+                anyhow::bail!("Preview 1 compatibility actors cannot own presentation panes")
+            }
+        }
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         let actor_ids = self.actors.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
@@ -115,7 +154,7 @@ impl PresentationWasmRuntime {
             let Some(mut actor) = self.actors.remove(&actor_id) else {
                 continue;
             };
-            if let Err(error) = self.executor.block_on(actor.shutdown())
+            if let Err(error) = self.executor.block_on(actor.actor.shutdown())
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -148,6 +187,7 @@ impl PresentationActorSpec {
 async fn load_actor(
     spec: &PresentationActorSpec,
     watcher: NativeFilesystemWatcherService,
+    presentation: Option<std::sync::Arc<crate::plugin_graphics::ActorPresentationHost>>,
 ) -> Result<HostedWasmActor> {
     let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
     let artifact = WasmPluginArtifact::load(&spec.path)?;
@@ -166,6 +206,8 @@ async fn load_actor(
                         capabilities: RuntimeIoCapabilities::default(),
                         ..RuntimeIoConfig::default()
                     },
+                    presentation: presentation
+                        .map(|presentation| presentation as std::sync::Arc<dyn manifold_wasm::PresentationHost>),
                     ..ComponentActorConfig::default()
                 },
             )
@@ -203,6 +245,19 @@ async fn load_actor(
     };
 
     Ok(actor)
+}
+
+const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
+    match event {
+        PresentationEvent::PaneCreated { pane, .. }
+        | PresentationEvent::PaneResized { pane, .. }
+        | PresentationEvent::PaneFocused { pane, .. }
+        | PresentationEvent::PointerMoved { pane, .. }
+        | PresentationEvent::PointerButton { pane, .. }
+        | PresentationEvent::PointerScroll { pane, .. }
+        | PresentationEvent::Key { pane, .. }
+        | PresentationEvent::Text { pane, .. } => *pane,
+    }
 }
 
 #[cfg(test)]

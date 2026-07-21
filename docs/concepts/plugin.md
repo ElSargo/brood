@@ -2,7 +2,7 @@
 status: target
 type: concept
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-21
 ---
 
 # Plugin
@@ -75,4 +75,5 @@ Related:
 - [[../decisions/0006-plugin-actors-and-workers]]
 - [[../systems/plugin-ui]]
 - [[../systems/plugin-graphics]]
+- [[../systems/plugin-advanced-graphics]]
 - [[wasm-controller]]

@@ -42,6 +42,9 @@ use crate::filesystem_watch::{
 };
 use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
+use crate::presentation::{
+    PresentationError, PresentationEvent, PresentationHost, TextLayoutOptions,
+};
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
@@ -157,6 +160,8 @@ pub struct ComponentActorConfig {
     pub max_wait_set: usize,
     /// Generation-owned process, PTY, socket, stream, and timer policy.
     pub runtime_io: RuntimeIoConfig,
+    /// Presentation-local canvas, resource, and native text capability.
+    pub presentation: Option<Arc<dyn PresentationHost>>,
     pub dispatcher_deadline: Duration,
     /// Wall-clock cadence for guest interruption checks. Epoch yields keep the
     /// executor responsive; cross-call worker fairness uses `worker-yield`.
@@ -183,6 +188,7 @@ impl Default for ComponentActorConfig {
             max_pollables: 256,
             max_wait_set: 64,
             runtime_io: RuntimeIoConfig::default(),
+            presentation: None,
             dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
@@ -256,6 +262,8 @@ struct ActorStore {
     coordination: CoordinationHub,
     filesystem_watches: FilesystemWatchHub,
     runtime_io: RuntimeIoHub,
+    actor_generation: u64,
+    presentation: Option<Arc<dyn PresentationHost>>,
     worker_filesystem: Option<WorkerFilesystem>,
     worker_cancellations: WorkerCancellationRegistry,
     blocking_io: BlockingIoTracker,
@@ -418,6 +426,96 @@ impl WorkerCancellationToken {
 }
 
 impl bindings::manifold::plugin::host::Host for ActorStore {
+    fn graphics_submit_draw_packet(
+        &mut self,
+        pane: u64,
+        packet: Vec<u8>,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::manifold::plugin::host::GraphicsError>>
+    {
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.submit_draw_packet(self.actor_generation, pane, packet)
+            })
+            .map_err(map_component_presentation_error))
+    }
+
+    fn graphics_create_image_rgba8(
+        &mut self,
+        pane: u64,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::manifold::plugin::host::GraphicsError>>
+    {
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.create_image_rgba8(self.actor_generation, pane, width, height, pixels)
+            })
+            .map_err(map_component_presentation_error))
+    }
+
+    fn graphics_layout_text(
+        &mut self,
+        pane: u64,
+        text: String,
+        options: bindings::manifold::plugin::host::TextLayoutOptions,
+    ) -> wasmtime::Result<
+        std::result::Result<
+            bindings::manifold::plugin::host::TextLayoutResult,
+            bindings::manifold::plugin::host::GraphicsError,
+        >,
+    > {
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.layout_text(
+                    self.actor_generation,
+                    pane,
+                    text,
+                    TextLayoutOptions {
+                        font_size: options.font_size,
+                        max_width: options.max_width,
+                        line_height: options.line_height,
+                        color: [options.red, options.green, options.blue, options.alpha],
+                    },
+                )
+            })
+            .map(
+                |layout| bindings::manifold::plugin::host::TextLayoutResult {
+                    handle: layout.handle,
+                    width: layout.width,
+                    height: layout.height,
+                    first_baseline: layout.first_baseline,
+                    line_count: layout.line_count,
+                },
+            )
+            .map_err(map_component_presentation_error))
+    }
+
+    fn graphics_drop_resource(
+        &mut self,
+        pane: u64,
+        resource: u64,
+    ) -> wasmtime::Result<std::result::Result<(), bindings::manifold::plugin::host::GraphicsError>>
+    {
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.drop_resource(self.actor_generation, pane, resource)
+            })
+            .map_err(map_component_presentation_error))
+    }
+
     fn subprocess_spawn(
         &mut self,
         command: String,
@@ -1308,6 +1406,22 @@ const fn map_component_runtime_io_error(
     }
 }
 
+const fn map_component_presentation_error(
+    error: PresentationError,
+) -> bindings::manifold::plugin::host::GraphicsError {
+    use bindings::manifold::plugin::host::GraphicsError as AbiError;
+    match error {
+        PresentationError::Unavailable => AbiError::Unavailable,
+        PresentationError::InvalidPane => AbiError::InvalidPane,
+        PresentationError::InvalidArgument => AbiError::InvalidArgument,
+        PresentationError::LimitReached => AbiError::LimitReached,
+        PresentationError::InvalidPacket => AbiError::InvalidPacket,
+        PresentationError::InvalidResource => AbiError::InvalidResource,
+        PresentationError::ResourceInUse => AbiError::ResourceInUse,
+        PresentationError::HostFailure => AbiError::HostFailure,
+    }
+}
+
 fn component_ready_pollable(
     ready: crate::coordination::ReadyPollable,
 ) -> bindings::manifold::plugin::host::ReadyPollable {
@@ -1336,6 +1450,7 @@ enum RuntimeCommand {
         event: PluginLifecycleEvent,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    Presentation(PresentationEvent),
     Shutdown,
 }
 
@@ -1458,6 +1573,8 @@ impl ComponentActor {
                 coordination: coordination.clone(),
                 filesystem_watches,
                 runtime_io: runtime_io.clone(),
+                actor_generation: generation,
+                presentation: config.presentation.clone(),
                 worker_filesystem,
                 worker_cancellations: WorkerCancellationRegistry::default(),
                 blocking_io: BlockingIoTracker::default(),
@@ -1580,6 +1697,15 @@ impl ComponentActor {
             self.limits,
             &self.byte_budget,
         )
+    }
+
+    /// Deliver one typed pane lifecycle or input event without blocking.
+    pub fn try_send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
+        self.commands
+            .try_send(RuntimeCommand::Presentation(event))
+            .map_err(|error| {
+                anyhow::anyhow!("component actor rejected presentation event: {error}")
+            })
     }
 
     /// Snapshot cumulative mailbox delivery counters.
@@ -1904,6 +2030,7 @@ async fn run_component_event_loop(
     let mut completion_queue = VecDeque::new();
     let mut notification_queue = VecDeque::new();
     let mut system_queue = VecDeque::new();
+    let mut presentation_queue = VecDeque::new();
     let mut mailbox_queue = VecDeque::new();
     let mut dispatcher_busy = false;
     let mut active_workers = HashSet::new();
@@ -1918,6 +2045,7 @@ async fn run_component_event_loop(
                 &mut completion_queue,
                 &mut notification_queue,
                 &mut system_queue,
+                &mut presentation_queue,
                 &mut mailbox_queue,
                 accessor,
                 event_observer,
@@ -1997,6 +2125,13 @@ async fn run_component_event_loop(
                         component_lifecycle_to_guest(event),
                     )?;
                     pending_lifecycle = Some(reply);
+                }
+                Some(RuntimeCommand::Presentation(event)) => {
+                    enqueue_presentation_dispatch(
+                        &mut presentation_queue,
+                        config.command_capacity,
+                        event,
+                    );
                 }
                 Some(RuntimeCommand::Shutdown) | None => break,
             },
@@ -2262,11 +2397,93 @@ fn component_lifecycle_to_guest(event: PluginLifecycleEvent) -> GuestEvent {
     abi::Event::Lifecycle(event)
 }
 
+fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
+    use bindings::exports::manifold::plugin::actor as abi;
+    let event = match event {
+        PresentationEvent::PaneCreated {
+            pane,
+            width,
+            height,
+            scale,
+        } => abi::PresentationEvent::PaneCreated(abi::PaneCreated {
+            pane,
+            width,
+            height,
+            scale,
+        }),
+        PresentationEvent::PaneResized {
+            pane,
+            width,
+            height,
+            scale,
+        } => abi::PresentationEvent::PaneResized(abi::PaneResized {
+            pane,
+            width,
+            height,
+            scale,
+        }),
+        PresentationEvent::PaneFocused { pane, focused } => {
+            abi::PresentationEvent::PaneFocused(abi::PaneFocused { pane, focused })
+        }
+        PresentationEvent::PointerMoved { pane, x, y } => {
+            abi::PresentationEvent::PointerMoved(abi::PointerMoved { pane, x, y })
+        }
+        PresentationEvent::PointerButton {
+            pane,
+            x,
+            y,
+            button,
+            pressed,
+            modifiers,
+        } => abi::PresentationEvent::PointerButton(abi::PointerButton {
+            pane,
+            x,
+            y,
+            button,
+            pressed,
+            modifiers,
+        }),
+        PresentationEvent::PointerScroll {
+            pane,
+            x,
+            y,
+            horizontal,
+            vertical,
+            modifiers,
+        } => abi::PresentationEvent::PointerScroll(abi::PointerScroll {
+            pane,
+            x,
+            y,
+            horizontal,
+            vertical,
+            modifiers,
+        }),
+        PresentationEvent::Key {
+            pane,
+            physical_key,
+            pressed,
+            repeat,
+            modifiers,
+        } => abi::PresentationEvent::Key(abi::KeyEvent {
+            pane,
+            physical_key,
+            pressed,
+            repeat,
+            modifiers,
+        }),
+        PresentationEvent::Text { pane, text } => {
+            abi::PresentationEvent::Text(abi::TextEvent { pane, text })
+        }
+    };
+    abi::Event::Presentation(event)
+}
+
 fn pop_component_dispatch(
     next_lane: &mut usize,
     completion_queue: &mut VecDeque<QueuedGuestEvent>,
     notification_queue: &mut VecDeque<NotificationId>,
     system_queue: &mut VecDeque<QueuedGuestEvent>,
+    presentation_queue: &mut VecDeque<PresentationEvent>,
     mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit, GenerationBytePermit)>,
     accessor: &wasmtime::component::Accessor<ActorStore>,
     event_observer: &mpsc::Sender<ComponentActorEvent>,
@@ -2279,9 +2496,9 @@ fn pop_component_dispatch(
 > {
     use bindings::exports::manifold::plugin::actor as abi;
 
-    for _lane in 0..4 {
+    for _lane in 0..5 {
         let lane = *next_lane;
-        *next_lane = (*next_lane + 1) % 4;
+        *next_lane = (*next_lane + 1) % 5;
         let event = match lane {
             0 => completion_queue
                 .pop_front()
@@ -2316,6 +2533,10 @@ fn pop_component_dispatch(
             2 => system_queue
                 .pop_front()
                 .map(|queued| (queued.event, None, None)),
+            3 => presentation_queue
+                .pop_front()
+                .map(component_presentation_to_guest)
+                .map(|event| (event, None, None)),
             _ => mailbox_queue
                 .pop_front()
                 .map(|(event, permit, byte_permit)| (event, Some(permit), Some(byte_permit))),
@@ -2325,6 +2546,37 @@ fn pop_component_dispatch(
         }
     }
     Ok(None)
+}
+
+fn enqueue_presentation_dispatch(
+    queue: &mut VecDeque<PresentationEvent>,
+    capacity: usize,
+    event: PresentationEvent,
+) {
+    if let PresentationEvent::PointerMoved { pane, .. } = &event {
+        if let Some(queued) = queue.back_mut()
+            && matches!(queued, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
+        {
+            *queued = event;
+            return;
+        }
+        if queue.len() < capacity {
+            queue.push_back(event);
+        }
+        return;
+    }
+
+    if queue.len() >= capacity {
+        if let Some(index) = queue
+            .iter()
+            .position(|queued| matches!(queued, PresentationEvent::PointerMoved { .. }))
+        {
+            queue.remove(index);
+        } else {
+            queue.pop_front();
+        }
+    }
+    queue.push_back(event);
 }
 
 fn enqueue_dispatch(

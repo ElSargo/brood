@@ -11,7 +11,7 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 - managed apps and session state survive presentation window close/reopen
 - editor, browser, terminal, agent, git, and app panes share one pane model
 - browser and Wayland app surfaces are composited as first-class panes
-- built-in apps can be sandboxed plugins, often WASM-backed, that describe native component panes or submit custom render packets
+- built-in apps can be WASM-backed plugins whose SDK components emit bounded canvas draw packets
 
 ## Initial Shape
 
@@ -19,7 +19,7 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 - `manifold-client`: WGPU presentation process that connects to the session server.
 - `manifold-sessiond`: authoritative local session server.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
-- plugins/WASM apps: sandboxed built-in or user applications that use addressed actors, private shared-memory workers, completion-based I/O, WASI resources, optional sync policy lanes, host-rendered UI, or low-level pane graphics.
+- plugins/WASM apps: built-in or user applications that use addressed actors, private shared-memory workers, completion-based I/O, WASI resources, optional sync policy lanes, canvas draw packets, native text services, and a future advanced-graphics escape hatch.
 
 ## Current Status
 
@@ -110,6 +110,7 @@ The docs are organized as a wiki-style knowledge base.
 - [Layout Policy Target](docs/systems/layout-policy.md)
 - [Plugin UI Target](docs/systems/plugin-ui.md)
 - [Plugin Graphics Target](docs/systems/plugin-graphics.md)
+- [Future Advanced Plugin Graphics](docs/systems/plugin-advanced-graphics.md)
 - [CLI Reference Pointers](docs/reference/cli.md)
 - [Decision Records](docs/decisions/README.md)
 

@@ -1,17 +1,21 @@
-# Session Switcher UI Backend Notes
+# Session Switcher UI Implementation Notes
 
-Backend branches for [Session Switcher UI Experiment](../session-switcher-ui.md)
-should add one note in this directory before handoff.
+Implementations of the [Session Switcher UI Experiment](../session-switcher-ui.md)
+should add a short note in this directory before handoff.
 
-Use `<backend>.md` as the filename, such as `iced.md` or `gpui.md`.
+Name the note after the SDK or implementation spike being evaluated. Each note
+should cover:
 
-Each note should cover:
+- what was implemented and how to run it;
+- what real input and rendering behavior was verified;
+- what failed or remained incomplete;
+- the canvas commands and native text facilities used;
+- component, layout, styling, and hit-testing code which remained guest-side;
+- places where the SDK was awkward or unexpectedly verbose;
+- any missing canvas, text, input, accessibility, or lifecycle facility;
+- recommended changes to the boundaries in [Plugin UI](../../systems/plugin-ui.md)
+  and [Plugin Graphics](../../systems/plugin-graphics.md).
 
-- what was implemented
-- how to run it
-- what was verified
-- what failed or was left incomplete
-- backend quirks
-- places the Manifold UI IR model did not fit cleanly
-- places the backend wanted to own lifecycle, focus, input, layout, or rendering
-- recommended changes to the shared IR or host/plugin boundary described in [Plugin UI](../../systems/plugin-ui.md)
+Be explicit if an implementation appears to require host component knowledge.
+The note should first identify the concrete missing primitive rather than
+proposing a component ABI.

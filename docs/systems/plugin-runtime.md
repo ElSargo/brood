@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-21
 ---
 
 # Plugin Runtime
@@ -341,3 +341,4 @@ Related:
 - [[layout-policy]]
 - [[plugin-ui]]
 - [[plugin-graphics]]
+- [[plugin-advanced-graphics]]

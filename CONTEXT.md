@@ -77,7 +77,7 @@ A WASM-backed plugin role that changes workspace behavior through host APIs, suc
 _Avoid_: compositor plugin, direct state mutator
 
 **WASM pane app**:
-A WASM application whose presentation actor may create panes through semantic UI or custom render packets and whose durable model may be client-local, backend-coordinated, or owned by a paired session actor.
+A WASM application whose presentation actor may create panes and submit canvas draw packets while its durable model remains client-local, backend-coordinated, or owned by a paired session actor.
 _Avoid_: managed app, assuming graphics cross the backend connection
 
 **Managed app**:
@@ -112,13 +112,9 @@ _Avoid_: pane ownership, implicit application resize, unbounded frame queue
 A message from a pane producer to a presentation surface describing desired presentation behavior, such as size, grouping, modality, attention, or placement hints.
 _Avoid_: layout command, guaranteed placement
 
-**Native component pane**:
-A plugin pane whose content is described as presentation-rendered components instead of plugin-drawn pixels.
-_Avoid_: webview requirement, raw framebuffer by default, backend-rendered UI requirement
-
-**Render packet**:
-A bounded, versioned, replayable command buffer submitted by a presentation actor as the latest custom-drawn visual state of one pane. It may reference client-host-managed graphics resources, while the presentation client owns validation, WGPU lowering, GPU synchronization, composition, and presentation.
-_Avoid_: native GPU command buffer, graphics swapchain, network-rendering requirement, pointer into retained guest memory
+**Draw packet**:
+A bounded, versioned, replayable canvas display list submitted by a presentation actor as the latest visual state of one pane. It contains paths, images, text, transforms, clips, layers, and compositing commands while the presentation client owns validation, WGPU lowering, composition, and presentation.
+_Avoid_: component tree, native GPU command buffer, graphics swapchain, network-rendering requirement, pointer into retained guest memory
 
 **Session DBus proxy**:
 A session-scoped DBus bridge for external apps that need normal desktop-style communication inside a Manifold session.
@@ -191,7 +187,7 @@ _Avoid_: ambient permission, unrestricted access
 - An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
 - A local **presentation client** uses DBus only to bootstrap and broker descriptors, bounded shared-memory lanes for ordinary steady-state protocol traffic, and DMA-BUF-compatible per-window surface sharing where available, with copied-image correctness fallback.
 - A remote **presentation client** maps the same semantic protocol lanes onto an authenticated network carrier and uses encoded or damage-based per-window surface transports. Remote presentation preserves client-side composition.
-- **Presentation actors** run in the client. Their local mailboxes, policy, layout, UI, graphics, and render updates remain endpoint-local; only addressed session-actor messages and asynchronous backend operations cross the presentation connection.
+- **Presentation actors** run in the client. Their local mailboxes, policy, layout, SDK UI state, draw packets, and render updates remain endpoint-local; only addressed session-actor messages and asynchronous backend operations cross the presentation connection.
 - The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, WGPU objects, or renderer internals.
 - A **plugin** may contain multiple **plugin actors**, actor-scoped **plugin workers**, and optional **sync policy lanes**.
 - A **plugin actor** is the public address-space and mailbox boundary. It is dormant between events; once invoked its dispatcher must not suspend or block, and instead submits work and handles **completion** messages.
@@ -201,6 +197,7 @@ _Avoid_: ambient permission, unrestricted access
 - **Mailbox** delivery is the normal path for durable plugin work; **swapchains** are the latest-state path for sync policy decisions.
 - **Sync policy lanes** are only for immediate host pre-commit decisions and must not block on actor queues or mutate host state directly.
 - The presentation client owns final local shortcut routing, accepted viewport layout, native chrome, focus, hit testing, and WGPU rendering. The backend owns session and managed-window lifecycle and validates lease-authorized Wayland configuration and input.
+- Plugin components are guest SDK functions which produce canvas draw commands. They are not host objects and have no runtime component ABI.
 
 ## Flagged Ambiguities
 

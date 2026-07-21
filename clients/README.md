@@ -19,4 +19,13 @@ executor is dropped. Package placement metadata, local input/layout event
 routing, policy lanes, and cross-runtime messaging remain later layers over
 this ownership boundary.
 
+Component presentation actors can submit bounded canvas packets for their pane.
+The client retains the latest accepted packet, lowers it to a CPU canvas, uploads
+the result into its existing WGPU composition pass, and routes pane-local resize,
+focus, pointer, scroll, key, and text events back to the actor. Native text
+layout is a separate client host function; packets only place immutable layout
+handles. The executable workload is in `examples/wasm-plugin-graphics`, and
+`ClientArgs` in `crates/manifold-cli/src/cli.rs` remains the source of truth for
+the client invocation.
+
 `Ctrl-J` and `Ctrl-K` temporarily cycle the focused window in the client. This is explicitly a testing hack while the presentation shortcut-policy path is moved into the client; it is not the target user-facing keybinding design.

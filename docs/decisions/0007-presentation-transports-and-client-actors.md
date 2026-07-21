@@ -13,9 +13,9 @@ handshake. A proposed dedicated Unix-socket protocol would add another local
 message carrier alongside DBus, shared memory, and DMA-BUF resources.
 
 The presentation client also hosts presentation-scoped actors. Input policy,
-layout, component UI, graphics, animation, and actor-to-actor messages should
-remain endpoint-local. Only managed-window input, session actor messages, and
-backend capability operations need to cross the presentation connection.
+layout, SDK UI state, canvas drawing, animation, and actor-to-actor messages
+should remain endpoint-local. Only managed-window input, session actor messages,
+and backend capability operations need to cross the presentation connection.
 
 ## Decision
 
@@ -45,10 +45,10 @@ damage-based transports rather than DMA-BUF. The final remote carrier and frame
 codecs remain subject to workload testing.
 
 Presentation actors run in the client for both local and remote connections.
-Their local mailboxes, policy decisions, viewport state, component UI, graphics,
-and render updates do not traverse shared memory or the network. Session actors
-remain in `manifoldd`; cross-runtime messages and backend capability operations
-are asynchronous protocol traffic.
+Their local mailboxes, policy decisions, viewport state, SDK component state,
+draw packets, and render updates do not traverse shared memory or the network.
+Session actors remain in `manifoldd`; cross-runtime messages and backend
+capability operations are asynchronous protocol traffic.
 
 ## Consequences
 

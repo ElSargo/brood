@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-21
 ---
 
 # Plugin I/O And Resources
@@ -11,8 +11,9 @@ This page specifies the I/O, coordination, external-resource, and shutdown
 contract for [[plugin-runtime]]. It describes the target design, not prototype
 export names or a complete POSIX emulation.
 
-Graphics and pane rendering belong to [[plugin-ui]] and [[plugin-graphics]]. Exact current ABI details
-belong to [[extension-host]] and the code-linked
+UI and base canvas rendering belong to [[plugin-ui]] and [[plugin-graphics]].
+Future GPU-style facilities are separated in [[plugin-advanced-graphics]]. Exact
+current ABI details belong to [[extension-host]] and the code-linked
 [[plugin-io-interaction-graph]].
 
 ## Invariants
@@ -370,6 +371,9 @@ inside this target specification.
 Related:
 
 - [[plugin-runtime]]
+- [[plugin-ui]]
+- [[plugin-graphics]]
+- [[plugin-advanced-graphics]]
 - [[extension-host]]
 - [[../concepts/plugin]]
 - [[../concepts/session]]

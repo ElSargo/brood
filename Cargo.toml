@@ -3,6 +3,7 @@ members = [
     "clients/manifold-client",
     "crates/manifold-cli",
     "crates/manifold-dmabuf",
+    "crates/manifold-graphics",
     "crates/manifold-ipc",
     "crates/manifold-layout",
     "crates/manifoldd",
@@ -25,6 +26,7 @@ gbm = "0.18.0"
 image = "0.25.8"
 libc = "0.2.186"
 manifold-cli = { path = "crates/manifold-cli" }
+manifold-graphics = { path = "crates/manifold-graphics" }
 manifold-ipc = { path = "crates/manifold-ipc" }
 manifold-layout = { path = "crates/manifold-layout" }
 num-traits = "0.2.19"

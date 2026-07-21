@@ -1,3 +1,10 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "bounded window, text, and raster coordinates intentionally narrow to the f32 and integer formats used by WGPU and tiny-skia"
+)]
+
 use std::{
     collections::{HashMap, HashSet},
     os::fd::AsFd,
@@ -28,13 +35,16 @@ use winit::{
 };
 
 mod actor_runtime;
+mod plugin_graphics;
 
 use actor_runtime::PresentationWasmRuntime;
+use manifold_wasm::PresentationEvent;
+use plugin_graphics::PluginGraphicsBridge;
 
 fn main() -> Result<()> {
     let args = ClientArgs::parse();
     if args.check_wasm_actors {
-        let mut runtime = PresentationWasmRuntime::start(&args.wasm_actors)?;
+        let mut runtime = PresentationWasmRuntime::start(&args.wasm_actors, None)?;
         runtime
             .shutdown()
             .context("stop checked presentation WASM runtime")?;
@@ -45,6 +55,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<ClientEvent>::with_user_event()
         .build()
         .context("create event loop")?;
+    let plugin_graphics = PluginGraphicsBridge::new(event_loop.create_proxy());
     let (input_sender, fast_path_enabled, backend_connected) = if args.no_server {
         eprintln!("starting Manifold presentation without a backend");
         (None, false, false)
@@ -93,7 +104,11 @@ fn main() -> Result<()> {
         (input_sender, fast_path_enabled, true)
     };
     let mut application = Application {
-        wasm_runtime: Some(PresentationWasmRuntime::start(&args.wasm_actors)?),
+        wasm_runtime: Some(PresentationWasmRuntime::start(
+            &args.wasm_actors,
+            Some(&plugin_graphics),
+        )?),
+        plugin_graphics: Some(plugin_graphics),
         input_sender,
         fast_path_enabled,
         backend_connected,
@@ -136,6 +151,10 @@ enum ClientEvent {
         windows: Vec<SceneWindowUpdate>,
     },
     TransportError(String),
+    PluginGraphicsChanged {
+        pane: u64,
+        sequence: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -286,7 +305,9 @@ struct Application {
     last_presented_sequence: Option<u64>,
     modifiers: ModifiersState,
     cursor_position: Option<(f64, f64)>,
+    pending_plugin_pointer_motion: Option<(f32, f32)>,
     wasm_runtime: Option<PresentationWasmRuntime>,
+    plugin_graphics: Option<PluginGraphicsBridge>,
 }
 
 impl Application {
@@ -299,6 +320,11 @@ impl Application {
                 windows,
             } => (sequence, width, height, windows),
             ClientEvent::TransportError(message) => return Err(anyhow!(message)),
+            ClientEvent::PluginGraphicsChanged { .. } => {
+                return Err(anyhow!(
+                    "plugin graphics event reached scene transport path"
+                ));
+            }
         };
         let Some(renderer) = self.renderer.as_mut() else {
             self.pending_frame = Some(ClientEvent::SceneFrame {
@@ -322,6 +348,11 @@ impl Application {
         }
         true
     }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        self.error = Some(error);
+        event_loop.exit();
+    }
 }
 
 impl ApplicationHandler<ClientEvent> for Application {
@@ -338,7 +369,13 @@ impl ApplicationHandler<ClientEvent> for Application {
         let result = event_loop
             .create_window(Window::default_attributes().with_title(title))
             .context("create presentation window")
-            .and_then(|window| Renderer::new(Arc::new(window), self.fast_path_enabled));
+            .and_then(|window| {
+                let graphics = self
+                    .plugin_graphics
+                    .clone()
+                    .context("plugin graphics bridge is unavailable")?;
+                Renderer::new(Arc::new(window), self.fast_path_enabled, graphics)
+            });
 
         match result {
             Ok(renderer) => {
@@ -355,6 +392,32 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.error = Some(error);
                     event_loop.exit();
                 }
+                if let Some(renderer) = self.renderer.as_ref() {
+                    let (width, height, scale) = renderer.logical_extent();
+                    if let Err(error) =
+                        send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                            PresentationEvent::PaneCreated {
+                                pane,
+                                width,
+                                height,
+                                scale,
+                            }
+                        })
+                    {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                    if let Err(error) =
+                        send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                            PresentationEvent::PaneFocused {
+                                pane,
+                                focused: true,
+                            }
+                        })
+                    {
+                        self.fail(event_loop, error);
+                    }
+                }
             }
             Err(error) => {
                 self.error = Some(error);
@@ -367,9 +430,19 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
-        if let Err(error) = self.accept_frame(event) {
-            self.error = Some(error);
-            event_loop.exit();
+        match event {
+            ClientEvent::PluginGraphicsChanged { pane, sequence } => {
+                if let Some(renderer) = self.renderer.as_mut()
+                    && let Err(error) = renderer.refresh_plugin_graphics(pane, sequence)
+                {
+                    self.fail(event_loop, error);
+                }
+            }
+            event => {
+                if let Err(error) = self.accept_frame(event) {
+                    self.fail(event_loop, error);
+                }
+            }
         }
     }
 
@@ -377,6 +450,12 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
+        // A full actor lane keeps the latest position for the next Winit turn.
+        // Motion is state, so intermediate samples are disposable.
+        let _motion_result = flush_presentation_pointer_motion(
+            self.wasm_runtime.as_ref(),
+            &mut self.pending_plugin_pointer_motion,
+        );
         if self
             .wasm_runtime
             .as_ref()
@@ -404,13 +483,32 @@ impl ApplicationHandler<ClientEvent> for Application {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                renderer.resize(size.width, size.height);
+                if let Err(error) = renderer.resize(size.width, size.height) {
+                    self.fail(event_loop, error);
+                    return;
+                }
+                let (width, height, scale) = renderer.logical_extent();
+                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                    PresentationEvent::PaneResized {
+                        pane,
+                        width,
+                        height,
+                        scale,
+                    }
+                }) {
+                    self.fail(event_loop, error);
+                    return;
+                }
                 if let Some(sender) = self.input_sender.as_mut() {
                     send_presentation_configuration(sender, renderer);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
+                let scale = renderer.window.scale_factor() as f32;
+                let x = position.x as f32 / scale;
+                let y = position.y as f32 / scale;
+                self.pending_plugin_pointer_motion = Some((x, y));
                 if let (Some(sender), Some((content_width, content_height))) =
                     (self.input_sender.as_mut(), renderer.content_extent())
                 {
@@ -430,6 +528,25 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let (x, y) = self.cursor_position.unwrap_or_default();
+                let scale = renderer.window.scale_factor() as f32;
+                let x = x as f32 / scale;
+                let y = y as f32 / scale;
+                let button_code = linux_button_code(button).unwrap_or_default();
+                let pressed = state == ElementState::Pressed;
+                let modifiers = modifier_bits(self.modifiers);
+                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                    PresentationEvent::PointerButton {
+                        pane,
+                        x,
+                        y,
+                        button: button_code,
+                        pressed,
+                        modifiers,
+                    }
+                }) {
+                    eprintln!("dropped plugin pointer button: {error:#}");
+                }
                 if state == ElementState::Pressed
                     && button == MouseButton::Left
                     && let Some((x, y)) = self.cursor_position
@@ -462,13 +579,30 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let (horizontal, vertical) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (f64::from(x) * 15.0, f64::from(y) * 15.0),
+                    MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
+                };
+                let (x, y) = self.cursor_position.unwrap_or_default();
+                let scale = renderer.window.scale_factor() as f32;
+                let logical_horizontal = horizontal as f32 / scale;
+                let logical_vertical = vertical as f32 / scale;
+                let x = x as f32 / scale;
+                let y = y as f32 / scale;
+                let modifiers = modifier_bits(self.modifiers);
+                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                    PresentationEvent::PointerScroll {
+                        pane,
+                        x,
+                        y,
+                        horizontal: logical_horizontal,
+                        vertical: logical_vertical,
+                        modifiers,
+                    }
+                }) {
+                    eprintln!("dropped plugin pointer scroll: {error:#}");
+                }
                 if let Some(sender) = self.input_sender.as_mut() {
-                    let (horizontal, vertical) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => {
-                            (f64::from(x) * 15.0, f64::from(y) * 15.0)
-                        }
-                        MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
-                    };
                     send_input(
                         sender,
                         manifold_ipc::INPUT_POINTER_AXIS,
@@ -479,11 +613,52 @@ impl ApplicationHandler<ClientEvent> for Application {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
+            WindowEvent::Focused(focused) => {
+                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                    PresentationEvent::PaneFocused { pane, focused }
+                }) {
+                    eprintln!("dropped plugin focus event: {error:#}");
+                }
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
                 ..
-            } if !is_synthetic && !event.repeat => {
+            } if !is_synthetic => {
+                let modifiers = modifier_bits(self.modifiers);
+                if let Some(physical_key) = event.physical_key.to_scancode()
+                    && let Err(error) =
+                        send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                            PresentationEvent::Key {
+                                pane,
+                                physical_key,
+                                pressed: event.state == ElementState::Pressed,
+                                repeat: event.repeat,
+                                modifiers,
+                            }
+                        })
+                {
+                    eprintln!("dropped plugin key event: {error:#}");
+                }
+                if event.state == ElementState::Pressed
+                    && let Some(text) = event.text.as_ref()
+                    && !text.is_empty()
+                {
+                    let text = text.to_string();
+                    if let Err(error) =
+                        send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                            PresentationEvent::Text {
+                                pane,
+                                text: text.clone(),
+                            }
+                        })
+                    {
+                        eprintln!("dropped plugin text event: {error:#}");
+                    }
+                }
+                if event.repeat {
+                    return;
+                }
                 // TEMPORARY TESTING HACK: Ctrl-J/Ctrl-K locally cycle the client-owned
                 // focused pane until presentation shortcut policy is hosted in the client.
                 let cycle_offset = if self.modifiers.control_key() {
@@ -568,6 +743,8 @@ struct Renderer {
     current_windows: Vec<SceneWindow>,
     scene_extent: Option<(u32, u32)>,
     current_sequence: Option<u64>,
+    plugin_graphics: PluginGraphicsBridge,
+    plugin_pane: Option<PluginPaneTexture>,
 }
 
 struct SceneWindow {
@@ -579,6 +756,15 @@ struct SceneWindow {
 }
 
 struct ImportedFrame {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+struct PluginPaneTexture {
+    pane: u64,
+    sequence: u64,
+    width: u32,
+    height: u32,
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
@@ -633,6 +819,36 @@ fn send_window_focus(lane: &mut InputLane, window_id: u64) {
     );
 }
 
+fn send_presentation_events(
+    runtime: Option<&PresentationWasmRuntime>,
+    mut create: impl FnMut(u64) -> PresentationEvent,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let panes = runtime.pane_ids().collect::<Vec<_>>();
+    for pane in panes {
+        runtime.send_presentation_event(create(pane))?;
+    }
+    Ok(())
+}
+
+fn flush_presentation_pointer_motion(
+    runtime: Option<&PresentationWasmRuntime>,
+    pending: &mut Option<(f32, f32)>,
+) -> Result<()> {
+    let Some((x, y)) = *pending else {
+        return Ok(());
+    };
+    send_presentation_events(runtime, |pane| PresentationEvent::PointerMoved {
+        pane,
+        x,
+        y,
+    })?;
+    pending.take();
+    Ok(())
+}
+
 const fn linux_button_code(button: MouseButton) -> Option<u32> {
     match button {
         MouseButton::Left => Some(0x110),
@@ -642,6 +858,13 @@ const fn linux_button_code(button: MouseButton) -> Option<u32> {
         MouseButton::Forward => Some(0x115),
         MouseButton::Other(_) => None,
     }
+}
+
+fn modifier_bits(modifiers: ModifiersState) -> u32 {
+    u32::from(modifiers.shift_key())
+        | (u32::from(modifiers.control_key()) << 1)
+        | (u32::from(modifiers.alt_key()) << 2)
+        | (u32::from(modifiers.super_key()) << 3)
 }
 
 impl ImportedFrame {
@@ -865,11 +1088,19 @@ fn srgb_surface_format(
 }
 
 impl Renderer {
-    fn new(window: Arc<Window>, fast_path_enabled: bool) -> Result<Self> {
-        pollster::block_on(Self::new_async(window, fast_path_enabled))
+    fn new(
+        window: Arc<Window>,
+        fast_path_enabled: bool,
+        plugin_graphics: PluginGraphicsBridge,
+    ) -> Result<Self> {
+        pollster::block_on(Self::new_async(window, fast_path_enabled, plugin_graphics))
     }
 
-    async fn new_async(window: Arc<Window>, fast_path_enabled: bool) -> Result<Self> {
+    async fn new_async(
+        window: Arc<Window>,
+        fast_path_enabled: bool,
+        plugin_graphics: PluginGraphicsBridge,
+    ) -> Result<Self> {
         let instance = if fast_path_enabled {
             let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
             descriptor.backends = wgpu::Backends::VULKAN;
@@ -933,7 +1164,18 @@ impl Renderer {
             current_windows: Vec::new(),
             scene_extent: None,
             current_sequence: None,
+            plugin_graphics,
+            plugin_pane: None,
         })
+    }
+
+    fn logical_extent(&self) -> (f32, f32, f32) {
+        let scale = self.window.scale_factor() as f32;
+        (
+            self.config.width as f32 / scale,
+            self.config.height as f32 / scale,
+            scale,
+        )
     }
 
     const fn content_extent(&self) -> Option<(u32, u32)> {
@@ -1052,15 +1294,119 @@ impl Renderer {
         ))
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
+    fn refresh_plugin_graphics(&mut self, pane: u64, expected_sequence: u64) -> Result<()> {
+        let Some(snapshot) = self.plugin_graphics.snapshot(pane)? else {
+            return Ok(());
+        };
+        if snapshot.sequence < expected_sequence {
+            return Ok(());
+        }
+        if self.plugin_pane.as_ref().is_some_and(|current| {
+            current.pane == snapshot.pane
+                && current.sequence >= snapshot.sequence
+                && current.width == self.config.width
+                && current.height == self.config.height
+        }) {
+            return Ok(());
+        }
+        let scale = self.window.scale_factor() as f32;
+        let mut pixels = plugin_graphics::rasterize(
+            &snapshot,
+            self.config.width.max(1),
+            self.config.height.max(1),
+            scale,
+        )?;
+        flip_rgba_rows(
+            &mut pixels,
+            self.config.width.max(1),
+            self.config.height.max(1),
+        );
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("plugin canvas pane"),
+            size: wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.config.width.max(1).saturating_mul(4)),
+                rows_per_image: Some(self.config.height.max(1)),
+            },
+            wgpu::Extent3d {
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("plugin canvas pane bind group"),
+            layout: &self.frame_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.frame_sampler),
+                },
+            ],
+        });
+        eprintln!(
+            "accepted plugin draw packet pane={} sequence={} commands={} raster={}x{} scale={:.2}",
+            snapshot.pane,
+            snapshot.sequence,
+            snapshot.packet.commands.len(),
+            self.config.width,
+            self.config.height,
+            scale,
+        );
+        self.plugin_pane = Some(PluginPaneTexture {
+            pane: snapshot.pane,
+            sequence: snapshot.sequence,
+            width: self.config.width,
+            height: self.config.height,
+            _texture: texture,
+            bind_group,
+        });
+        self.window.request_redraw();
+        Ok(())
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         if width == 0 || height == 0 {
-            return;
+            return Ok(());
         }
 
         self.config.width = width;
         self.config.height = height;
         self.reconfigure();
+        if let Some((pane, sequence)) = self
+            .plugin_pane
+            .as_ref()
+            .map(|plugin| (plugin.pane, plugin.sequence))
+        {
+            self.refresh_plugin_graphics(pane, sequence)?;
+        }
         self.window.request_redraw();
+        Ok(())
     }
 
     fn reconfigure(&self) {
@@ -1113,8 +1459,20 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            render_pass.set_pipeline(&self.frame_pipeline);
+            if let Some(plugin) = self.plugin_pane.as_ref() {
+                render_pass.set_viewport(
+                    0.0,
+                    0.0,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_bind_group(0, &plugin.bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
             if let Some((scene_width, scene_height)) = self.scene_extent {
-                render_pass.set_pipeline(&self.frame_pipeline);
                 let scene_width_i32 = i32::try_from(scene_width).unwrap_or(i32::MAX);
                 let scene_height_i32 = i32::try_from(scene_height).unwrap_or(i32::MAX);
                 for window in &self.current_windows {
@@ -1165,6 +1523,26 @@ impl Renderer {
             sequence: self.current_sequence,
             reconfigure,
         }
+    }
+}
+
+fn flip_rgba_rows(pixels: &mut [u8], width: u32, height: u32) {
+    let row_bytes = usize::try_from(width)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    let height = usize::try_from(height).unwrap_or_default();
+    for row in 0..height / 2 {
+        let opposite = height - row - 1;
+        let first = row.saturating_mul(row_bytes);
+        let second = opposite.saturating_mul(row_bytes);
+        let (before_second, second_and_after) = pixels.split_at_mut(second);
+        let Some(first_row) = before_second.get_mut(first..first.saturating_add(row_bytes)) else {
+            return;
+        };
+        let Some(second_row) = second_and_after.get_mut(..row_bytes) else {
+            return;
+        };
+        first_row.swap_with_slice(second_row);
     }
 }
 

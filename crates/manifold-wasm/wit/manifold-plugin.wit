@@ -63,6 +63,58 @@ interface host {
         invalid-handle,
     }
 
+    enum graphics-error {
+        unavailable,
+        invalid-pane,
+        invalid-argument,
+        limit-reached,
+        invalid-packet,
+        invalid-resource,
+        resource-in-use,
+        host-failure,
+    }
+
+    record text-layout-options {
+        font-size: f32,
+        max-width: f32,
+        line-height: f32,
+        red: f32,
+        green: f32,
+        blue: f32,
+        alpha: f32,
+    }
+
+    record text-layout-result {
+        handle: u64,
+        width: f32,
+        height: f32,
+        first-baseline: f32,
+        line-count: u32,
+    }
+
+    graphics-submit-draw-packet: func(
+        pane: u64,
+        packet: list<u8>,
+    ) -> result<u64, graphics-error>;
+
+    graphics-create-image-rgba8: func(
+        pane: u64,
+        width: u32,
+        height: u32,
+        pixels: list<u8>,
+    ) -> result<u64, graphics-error>;
+
+    graphics-layout-text: func(
+        pane: u64,
+        text: string,
+        options: text-layout-options,
+    ) -> result<text-layout-result, graphics-error>;
+
+    graphics-drop-resource: func(
+        pane: u64,
+        handle: u64,
+    ) -> result<_, graphics-error>;
+
     variant stream-read-result {
         data(list<u8>),
         would-block,
@@ -297,12 +349,65 @@ interface actor {
         cancelled(worker-id),
     }
 
+    record pane-created {
+        pane: u64,
+        width: f32,
+        height: f32,
+        scale: f32,
+    }
+
+    record pane-resized {
+        pane: u64,
+        width: f32,
+        height: f32,
+        scale: f32,
+    }
+
+    record pane-focused { pane: u64, focused: bool }
+    record pointer-moved { pane: u64, x: f32, y: f32 }
+    record pointer-button {
+        pane: u64,
+        x: f32,
+        y: f32,
+        button: u32,
+        pressed: bool,
+        modifiers: u32,
+    }
+    record pointer-scroll {
+        pane: u64,
+        x: f32,
+        y: f32,
+        horizontal: f32,
+        vertical: f32,
+        modifiers: u32,
+    }
+    record key-event {
+        pane: u64,
+        physical-key: u32,
+        pressed: bool,
+        repeat: bool,
+        modifiers: u32,
+    }
+    record text-event { pane: u64, text: string }
+
+    variant presentation-event {
+        pane-created(pane-created),
+        pane-resized(pane-resized),
+        pane-focused(pane-focused),
+        pointer-moved(pointer-moved),
+        pointer-button(pointer-button),
+        pointer-scroll(pointer-scroll),
+        key(key-event),
+        text(text-event),
+    }
+
     variant event {
         mailbox(mailbox-message),
         completion(completion),
         worker(worker-event),
         notification(notification-event),
         lifecycle(lifecycle-event),
+        presentation(presentation-event),
     }
 
     variant command {

@@ -23,6 +23,7 @@ pub mod module;
 mod module_link;
 pub mod policy_provider;
 mod policy_provider_link;
+pub mod presentation;
 pub mod preview1_worker;
 mod resource_limits;
 pub mod runtime_io;
@@ -95,6 +96,9 @@ pub use policy_provider::{
     WasmPolicyProvider,
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
+pub use presentation::{
+    PresentationError, PresentationEvent, PresentationHost, TextLayoutOptions, TextLayoutResult,
+};
 pub use preview1_worker::{
     COMPAT_DISPATCH_EXPORT, COMPAT_MARKER_EXPORT, COMPAT_MARKER_MAGIC, COMPAT_WORKER_EXPORT,
     Preview1ActorCapabilities, Preview1CompatActor, Preview1CompatStats, Preview1FilesystemGrant,

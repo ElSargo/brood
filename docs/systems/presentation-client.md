@@ -5,7 +5,7 @@ security-boundary: mixed
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-20
+last-reviewed: 2026-07-21
 ---
 
 # Presentation Client Architecture
@@ -31,8 +31,8 @@ models:
 - remote presentation using an authenticated network carrier and encoded or
   damage-based per-window surface transport;
 - one Rust presentation implementation for Linux, macOS, Windows, and the web;
-- client-side WASM applications, key policy, layout policy, component UI, and
-  graphics that do not cross the network on their interactive path;
+- client-side WASM applications, key policy, layout policy, SDK UI state, and
+  canvas drawing that do not cross the network on their interactive path;
 - durable backend applications and actors that survive presentation detach;
 - explicit, asynchronous access from client actors to backend files, processes,
   services, and session actors.
@@ -111,7 +111,7 @@ The first implementation does not provide:
 
 **Presentation actor**
 : A plugin actor instantiated in the presentation client for one viewport. It
-  may own endpoint-local application, policy, component, or graphics state.
+  may own endpoint-local application, policy, SDK component, or graphics state.
 
 **Session actor**
 : A plugin actor instantiated in the backend. It may own durable or shared
@@ -142,8 +142,9 @@ The first implementation does not provide:
   rules.
 - A frame transport owns complete acquire, reuse, cancellation, disconnect, and
   release semantics.
-- WGPU and WGSL are implementation choices of the presentation runtime, not
-  host object types carried in the cross-process or plugin ABI.
+- WGPU, and WGSL for future advanced graphics, are implementation choices of the
+  presentation runtime rather than object types carried in the cross-process or
+  plugin ABI.
 
 ## System Topology
 
@@ -168,7 +169,7 @@ Presentation client
   viewport, layout, focus, hit testing, and presentation scene
   presentation WASM actors and policy lanes
   local actor mailboxes and client persistence
-  local component, text, and graphics services
+  local canvas and native text services
   WGPU compositor
   native or web platform shell
 ```
@@ -201,7 +202,7 @@ optimization to preserve.
 | Session/backend actor state | authoritative | messages/snapshots only |
 | Backend files and processes | authoritative capability service | asynchronous requester |
 | GPU device and swapchain | no | authoritative WGPU owner |
-| Client render packets/resources | no by default | authoritative |
+| Client draw packets/canvas resources | no by default | authoritative |
 | Hosted-window frame production | authoritative | subscribed consumer |
 | Frame decoding/import | transport producer/converter as needed | transport consumer |
 | Accessibility/IME/clipboard UI | mediates session operations as needed | platform-facing owner |
@@ -236,11 +237,12 @@ client and backend heaps.
 
 ### Graphics state
 
-WGPU devices, pipelines, bind groups, textures, component caches, and accepted
-client render packets are endpoint-local. They are rebuilt after client restart
-or unrecoverable device loss. An application that requires durable reconstruction
-stores its model or source assets in client persistence, a session actor, or a
-backend capability rather than treating GPU state as durable.
+WGPU state, canvas resources, native text-layout caches, accepted draw packets,
+and any future advanced-graphics resources are endpoint-local. They are rebuilt
+after client restart or unrecoverable device loss. An application that requires
+durable reconstruction stores its model or source assets in client persistence,
+a session actor, or a backend capability rather than treating renderer state as
+durable.
 
 ## Identity And Generation Model
 
@@ -721,7 +723,7 @@ It may:
 
 - handle local semantic input events;
 - maintain transient or client-persisted state;
-- create local component or custom-graphics panes;
+- create local panes and submit canvas draw packets;
 - register local actions and key policy;
 - propose or compute viewport layout;
 - message local presentation actors without network traffic;
@@ -739,10 +741,10 @@ The following paths remain entirely within the client when their participants
 are local:
 
 ```text
-key or pointer -> local policy -> local actor -> component/render update
+key or pointer -> local policy -> local actor -> SDK state/draw update
 window inventory event -> local layout actor -> local viewport commit
 local actor -> local actor mailbox
-render packet -> local validation -> local WGPU lowering
+draw packet -> local validation -> local WGPU lowering
 ```
 
 Network completions and remote actor messages enter bounded reserved actor lanes.
@@ -830,8 +832,8 @@ renderer.
 The renderer composites:
 
 - imported or uploaded managed-window textures;
-- presentation-rendered component trees;
-- plugin render packets and canvas scenes;
+- plugin canvas draw packets;
+- optional future advanced-graphics layers;
 - text and image resources;
 - client chrome, menus, cursors, overlays, and recovery surfaces.
 
@@ -840,15 +842,15 @@ become resources in the WGPU composition graph.
 
 ### Portable baseline
 
-Manifold defines a required graphics baseline from the common supported WGPU and
-WebGPU behavior. It includes explicit limits and formats rather than inferring
-features from backend names. Optional features use Manifold feature identifiers
-and require fallback content or a clear unavailable state.
+The required plugin graphics baseline is the backend-independent canvas contract
+in [[plugin-graphics]]. It defines paths, images, native text layouts,
+transforms, clips, layers, compositing, coordinate rules, and explicit limits.
+The client lowers that contract to WGPU without exposing its device, queue,
+command encoder, swapchain, pipelines, or native backend objects.
 
-WGSL is the shader source language for custom plugin pipelines. Source is
-validated and pipelines are compiled asynchronously relative to actor dispatch.
-A plugin cannot obtain WGPU device, queue, command encoder, swapchain, or native
-backend objects.
+User geometry, WGSL shaders, pipelines, and GPU-style resources are a separate
+future protocol direction in [[plugin-advanced-graphics]]. They are not canvas
+features and are not required by SDK components.
 
 ### Platform shell
 
@@ -870,36 +872,45 @@ construction, transport state machines, and rendering policy.
 
 The client renderer reports device loss to the viewport and presentation actor
 runtime. Managed-window subscriptions provide a new current frame as needed.
-Component scenes and plugin graphics are reconstructed from accepted CPU-side
-state or by actor resubmission. Recovery is bounded; unrecoverable panes display
-client-native recovery content without affecting backend session liveness.
+Canvas scenes are reconstructed from accepted CPU-side packets and resources or
+by actor resubmission. Future advanced graphics must define equivalent recovery
+rules before becoming supported. Recovery is bounded; unrecoverable panes
+display client-native recovery content without affecting backend session
+liveness.
 
 ## Plugin UI And Graphics
 
-Component trees and custom graphics are presentation-local outputs. A
-presentation actor submits them directly to the local client host. The backend
-is not on the input-to-frame path and does not normally retain their GPU
-resources or render packets.
+Plugin UI state and SDK components remain inside the presentation actor. The SDK
+submits canvas draw packets directly to the local client host. The backend is not
+on the input-to-frame path and does not retain component state, canvas resources,
+or draw packets.
 
 The presentation client owns:
 
-- component rendering and theme realization;
+- canvas packet validation and WGPU lowering;
 - text shaping and endpoint font integration;
-- accessibility projection;
-- graphics packet validation and WGPU lowering;
+- optional accessibility projection from separate semantic metadata;
 - resource budgets and GPU synchronization;
 - final pane clipping and composition;
 - frame pacing, damage, and device recovery.
 
-The actor owns its application model, component description, semantic tree,
-shader source, and graphics resource requests. If it wants these to survive
-client replacement, it persists reconstructible state locally or coordinates
-with the backend.
+The actor and SDK own the application model, components, layout, styling, widget
+identity, pane-local hit testing, packet construction, and optional accessibility
+description. If this state must survive client replacement, the actor persists a
+reconstructible model locally or coordinates with the backend.
 
-The render-packet ABI remains Manifold-owned rather than exposing WGPU Rust
-objects. Its portable baseline should map directly and predictably to WGPU/WGSL.
-See [[plugin-ui]] and [[plugin-graphics]]; those protocols must be finalized only
-after the client renderer and actor-placement boundary are proven.
+The draw-packet ABI remains Manifold-owned and canvas-like. Components are SDK
+functions rather than host protocol objects. See [[plugin-ui]] and
+[[plugin-graphics]]; the base packet and text contracts are finalized only after
+the client renderer and actor-placement boundary are proven. The advanced
+protocol in [[plugin-advanced-graphics]] follows separately.
+
+Text layout, measurement, and text-position queries are local client host calls
+which produce ready immutable layout handles. Draw packets only position those
+handles. Likewise, packet acceptance is the final per-packet validation state:
+an accepted packet becomes the active replayable scene and cannot later receive
+an individual lowering rejection. Renderer-wide failures use the client recovery
+path instead.
 
 ## Control And Data Lanes
 
@@ -976,7 +987,7 @@ Both endpoints advertise generous but finite limits. At minimum, account for:
 - copied frame and encoded-frame bytes;
 - decoder and imported-texture memory estimates;
 - client WASM memories, tables, workers, and CPU fuel/time;
-- graphics packets, resources, pipelines, and compile queues.
+- canvas packets, images, paths, text layouts, and future advanced resources.
 
 Exhaustion returns typed backpressure or limit failures. It does not silently
 fall back to unbounded queues. Frame paths prefer dropping superseded work;
@@ -1044,10 +1055,12 @@ The client validates:
 - inventory and transport encoding;
 - external image dimensions, formats, and resource counts;
 - plugin package approval and content identity;
-- render packets, shaders, and local actor resource use.
+- draw packets, canvas resources, optional advanced shaders, and local actor
+  resource use.
 
-Neither side treats a DMA-BUF descriptor, encoded frame, WASM module, shader, or
-length field as trusted merely because the peer is local.
+Neither side treats a DMA-BUF descriptor, encoded frame, WASM module, draw
+packet, optional advanced shader, or length field as trusted merely because the
+peer is local.
 
 ## Diagnostics
 
@@ -1070,7 +1083,7 @@ Client diagnostics expose:
 - import, upload, decode, WGPU render, and presentation timing;
 - frame age, dropped/superseded sequences, and texture memory;
 - local actor latency, mailbox pressure, and policy timing;
-- component/render-packet revisions and failures;
+- SDK view/draw-packet revisions and failures;
 - adapter capabilities, optional-feature fallback, and device recovery.
 
 A correlated trace uses connection, session, window, subscription, frame, actor,
@@ -1138,8 +1151,8 @@ boundaries are required:
   presentation requests;
 - **client WASM host**: presentation actors, policy lanes, persistence, and
   local/remote routing;
-- **WGPU renderer**: scene lowering, component and plugin graphics, managed-frame
-  textures, composition, and recovery;
+- **WGPU renderer**: scene lowering, plugin canvas and future advanced graphics,
+  managed-frame textures, composition, and recovery;
 - **platform shell**: native Winit and web adapters;
 - **local connection carrier**: DBus bootstrap and descriptor brokering plus
   bounded bidirectional shared-memory lanes and event notifications;
@@ -1369,11 +1382,13 @@ Exit criteria:
 - disconnection and congestion do not stall backend applications or actors;
 - web capability fallback is explicit and diagnosable.
 
-### Phase 9: freeze plugin UI and graphics baselines
+### Phase 9: freeze plugin UI and base canvas graphics
 
 - Implement materially different client-side WASM workloads.
-- Finalize component, semantic-tree, render-packet, text, and graphics-resource
-  contracts against the proven WGPU client.
+- Finalize canvas draw-packet, native text, image/path resource, pane-input, and
+  optional accessibility-metadata contracts against the proven WGPU client.
+- Keep components inside SDKs and keep the future advanced protocol outside the
+  base ABI.
 - Freeze packet encodings only after parser fuzzing and cross-platform replay.
 
 ## Verification Strategy
@@ -1443,6 +1458,7 @@ lifecycle rules above.
 - [[plugin-io-and-resources]]
 - [[plugin-ui]]
 - [[plugin-graphics]]
+- [[plugin-advanced-graphics]]
 - [[input-shortcuts]]
 - [[layout-policy]]
 - [[testing]]
