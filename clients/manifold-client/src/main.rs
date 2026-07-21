@@ -115,6 +115,7 @@ fn main() -> Result<()> {
         input_sender,
         fast_path_enabled,
         backend_connected,
+        window_focused: true,
         event_proxy: Some(event_proxy),
         ..Application::default()
     };
@@ -312,6 +313,7 @@ struct Application {
     pending_frame: Option<ClientEvent>,
     last_presented_sequence: Option<u64>,
     modifiers: ModifiersState,
+    window_focused: bool,
     cursor_position: Option<(f64, f64)>,
     pending_plugin_pointer_motion: Option<(f32, f32)>,
     wasm_runtime: Option<PresentationWasmRuntime>,
@@ -518,10 +520,21 @@ impl ApplicationHandler<ClientEvent> for Application {
         }
         match event {
             ClientEvent::PluginGraphicsChanged { pane, sequence } => {
-                if let Some(renderer) = self.renderer.as_mut()
-                    && let Err(error) = renderer.refresh_plugin_graphics(pane, sequence)
-                {
-                    self.fail(event_loop, error);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    match renderer.refresh_plugin_graphics(pane, sequence) {
+                        Ok(Some(change)) => {
+                            if let Err(error) = dispatch_focus_change(
+                                self.wasm_runtime.as_ref(),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            ) {
+                                self.fail(event_loop, error);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => self.fail(event_loop, error),
+                    }
                 }
             }
             ClientEvent::RendererFailed {
@@ -599,66 +612,73 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
-                let scale = renderer.window.scale_factor() as f32;
-                let x = position.x as f32 / scale;
-                let y = position.y as f32 / scale;
-                self.pending_plugin_pointer_motion = Some((x, y));
-                if let (Some(sender), Some((content_width, content_height))) =
-                    (self.input_sender.as_mut(), renderer.content_extent())
-                {
-                    let window_size = renderer.window.inner_size();
-                    let x =
-                        position.x * f64::from(content_width) / f64::from(window_size.width.max(1));
-                    let y = position.y * f64::from(content_height)
-                        / f64::from(window_size.height.max(1));
-                    let (x, y) = renderer
-                        .backend_position_for_client_point(x, y)
-                        .unwrap_or((x, y));
-                    send_input(
-                        sender,
-                        manifold_ipc::INPUT_POINTER_MOTION,
-                        [x.to_bits(), y.to_bits(), 0, 0, 0],
-                    );
+                if renderer.focused_plugin_pane().is_some() {
+                    self.pending_plugin_pointer_motion =
+                        renderer.plugin_position_for_window_point(position.x, position.y);
+                } else if renderer.focused_managed_window().is_some() {
+                    self.pending_plugin_pointer_motion = None;
+                    if let (Some(sender), Some((x, y))) = (
+                        self.input_sender.as_mut(),
+                        renderer.backend_position_for_window_point(position.x, position.y),
+                    ) {
+                        send_input(
+                            sender,
+                            manifold_ipc::INPUT_POINTER_MOTION,
+                            [x.to_bits(), y.to_bits(), 0, 0, 0],
+                        );
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let (x, y) = self.cursor_position.unwrap_or_default();
-                let scale = renderer.window.scale_factor() as f32;
-                let x = x as f32 / scale;
-                let y = y as f32 / scale;
-                let button_code = linux_button_code(button).unwrap_or_default();
-                let pressed = state == ElementState::Pressed;
-                let modifiers = modifier_bits(self.modifiers);
-                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
-                    PresentationEvent::PointerButton {
-                        pane,
-                        x,
-                        y,
-                        button: button_code,
-                        pressed,
-                        modifiers,
-                    }
-                }) {
-                    eprintln!("dropped plugin pointer button: {error:#}");
-                }
                 if state == ElementState::Pressed
                     && button == MouseButton::Left
                     && let Some((x, y)) = self.cursor_position
+                    && let Some(change) = renderer.focus_pane_at_window_point(x, y)
+                    && let Err(error) = dispatch_focus_change(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        change,
+                        self.window_focused,
+                    )
                 {
-                    let window_size = renderer.window.inner_size();
-                    let scene_x = x * f64::from(renderer.content_extent().map_or(1, |size| size.0))
-                        / f64::from(window_size.width.max(1));
-                    let scene_y = y * f64::from(renderer.content_extent().map_or(1, |size| size.1))
-                        / f64::from(window_size.height.max(1));
-                    if let Some(window_id) = renderer.focus_window_at(scene_x, scene_y)
-                        && let Some(sender) = self.input_sender.as_mut()
-                    {
-                        send_window_focus(sender, window_id);
-                    }
+                    eprintln!("dropped pane focus event: {error:#}");
                 }
-                if let (Some(sender), Some(code)) =
-                    (self.input_sender.as_mut(), linux_button_code(button))
+
+                let button_code = linux_button_code(button).unwrap_or_default();
+                let pressed = state == ElementState::Pressed;
+                let modifiers = modifier_bits(self.modifiers);
+                if let Some(pane) = renderer.focused_plugin_pane()
+                    && let Some((x, y)) = self
+                        .cursor_position
+                        .and_then(|(x, y)| renderer.plugin_position_for_window_point(x, y))
                 {
+                    if let Err(error) = send_presentation_event(
+                        self.wasm_runtime.as_ref(),
+                        PresentationEvent::PointerButton {
+                            pane,
+                            x,
+                            y,
+                            button: button_code,
+                            pressed,
+                            modifiers,
+                        },
+                    ) {
+                        eprintln!("dropped plugin pointer button: {error:#}");
+                    }
+                } else if renderer.focused_managed_window().is_some()
+                    && let (Some(sender), Some(code)) =
+                        (self.input_sender.as_mut(), linux_button_code(button))
+                {
+                    if let Some((x, y)) = self
+                        .cursor_position
+                        .and_then(|(x, y)| renderer.backend_position_for_window_point(x, y))
+                    {
+                        send_input(
+                            sender,
+                            manifold_ipc::INPUT_POINTER_MOTION,
+                            [x.to_bits(), y.to_bits(), 0, 0, 0],
+                        );
+                    }
                     send_input(
                         sender,
                         manifold_ipc::INPUT_POINTER_BUTTON,
@@ -677,26 +697,28 @@ impl ApplicationHandler<ClientEvent> for Application {
                     MouseScrollDelta::LineDelta(x, y) => (f64::from(x) * 15.0, f64::from(y) * 15.0),
                     MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
                 };
-                let (x, y) = self.cursor_position.unwrap_or_default();
-                let scale = renderer.window.scale_factor() as f32;
-                let logical_horizontal = horizontal as f32 / scale;
-                let logical_vertical = vertical as f32 / scale;
-                let x = x as f32 / scale;
-                let y = y as f32 / scale;
-                let modifiers = modifier_bits(self.modifiers);
-                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
-                    PresentationEvent::PointerScroll {
-                        pane,
-                        x,
-                        y,
-                        horizontal: logical_horizontal,
-                        vertical: logical_vertical,
-                        modifiers,
+                if let Some(pane) = renderer.focused_plugin_pane()
+                    && let Some((x, y)) = self
+                        .cursor_position
+                        .and_then(|(x, y)| renderer.plugin_position_for_window_point(x, y))
+                {
+                    let scale = renderer.window.scale_factor() as f32;
+                    if let Err(error) = send_presentation_event(
+                        self.wasm_runtime.as_ref(),
+                        PresentationEvent::PointerScroll {
+                            pane,
+                            x,
+                            y,
+                            horizontal: horizontal as f32 / scale,
+                            vertical: vertical as f32 / scale,
+                            modifiers: modifier_bits(self.modifiers),
+                        },
+                    ) {
+                        eprintln!("dropped plugin pointer scroll: {error:#}");
                     }
-                }) {
-                    eprintln!("dropped plugin pointer scroll: {error:#}");
-                }
-                if let Some(sender) = self.input_sender.as_mut() {
+                } else if renderer.focused_managed_window().is_some()
+                    && let Some(sender) = self.input_sender.as_mut()
+                {
                     send_input(
                         sender,
                         manifold_ipc::INPUT_POINTER_AXIS,
@@ -708,10 +730,14 @@ impl ApplicationHandler<ClientEvent> for Application {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::Focused(focused) => {
-                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
-                    PresentationEvent::PaneFocused { pane, focused }
-                }) {
-                    eprintln!("dropped plugin focus event: {error:#}");
+                self.window_focused = focused;
+                if let Some(pane) = renderer.focused_plugin_pane()
+                    && let Err(error) = send_presentation_event(
+                        self.wasm_runtime.as_ref(),
+                        PresentationEvent::PaneFocused { pane, focused },
+                    )
+                {
+                    eprintln!("dropped plugin outer-window focus event: {error:#}");
                 }
             }
             WindowEvent::KeyboardInput {
@@ -719,62 +745,56 @@ impl ApplicationHandler<ClientEvent> for Application {
                 is_synthetic,
                 ..
             } if !is_synthetic => {
+                // TEMPORARY MVP BINDING: F6 toggles between the one local plugin pane
+                // and the backend-managed pane without carrying modifiers across them.
+                if is_plugin_managed_focus_toggle(event.physical_key) {
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && let Some(change) = renderer.toggle_plugin_managed_focus()
+                        && let Err(error) = dispatch_focus_change(
+                            self.wasm_runtime.as_ref(),
+                            self.input_sender.as_mut(),
+                            change,
+                            self.window_focused,
+                        )
+                    {
+                        eprintln!("dropped pane focus event: {error:#}");
+                    }
+                    return;
+                }
+
                 let modifiers = modifier_bits(self.modifiers);
-                if let Some(physical_key) = event.physical_key.to_scancode()
-                    && let Err(error) =
-                        send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                if let Some(pane) = renderer.focused_plugin_pane() {
+                    if let Some(physical_key) = event.physical_key.to_scancode()
+                        && let Err(error) = send_presentation_event(
+                            self.wasm_runtime.as_ref(),
                             PresentationEvent::Key {
                                 pane,
                                 physical_key,
                                 pressed: event.state == ElementState::Pressed,
                                 repeat: event.repeat,
                                 modifiers,
-                            }
-                        })
-                {
-                    eprintln!("dropped plugin key event: {error:#}");
-                }
-                if event.state == ElementState::Pressed
-                    && let Some(text) = event.text.as_ref()
-                    && !text.is_empty()
-                {
-                    let text = text.to_string();
-                    if let Err(error) =
-                        send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
+                            },
+                        )
+                    {
+                        eprintln!("dropped plugin key event: {error:#}");
+                    }
+                    if event.state == ElementState::Pressed
+                        && let Some(text) = event.text.as_ref()
+                        && !text.is_empty()
+                        && let Err(error) = send_presentation_event(
+                            self.wasm_runtime.as_ref(),
                             PresentationEvent::Text {
                                 pane,
-                                text: text.clone(),
-                            }
-                        })
+                                text: text.to_string(),
+                            },
+                        )
                     {
                         eprintln!("dropped plugin text event: {error:#}");
                     }
-                }
-                if event.repeat {
-                    return;
-                }
-                // TEMPORARY TESTING HACK: Ctrl-J/Ctrl-K locally cycle the client-owned
-                // focused pane until presentation shortcut policy is hosted in the client.
-                let cycle_offset = if self.modifiers.control_key() {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyJ) => Some(1),
-                        PhysicalKey::Code(KeyCode::KeyK) => Some(-1),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                if let Some(offset) = cycle_offset {
-                    if event.state == ElementState::Pressed
-                        && let Some(window_id) = renderer.cycle_focus(offset)
-                        && let Some(sender) = self.input_sender.as_mut()
-                    {
-                        send_window_focus(sender, window_id);
-                    }
-                    return;
-                }
-                if let (Some(sender), Some(scancode)) =
-                    (self.input_sender.as_mut(), event.physical_key.to_scancode())
+                } else if renderer.focused_managed_window().is_some()
+                    && let (Some(sender), Some(scancode)) =
+                        (self.input_sender.as_mut(), event.physical_key.to_scancode())
                 {
                     send_input(
                         sender,
@@ -844,6 +864,19 @@ struct Renderer {
     current_sequence: Option<u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_pane: Option<PluginPaneTexture>,
+    focused_pane: Option<FocusedPane>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusedPane {
+    Plugin(u64),
+    Managed(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FocusChange {
+    plugin: Option<(u64, bool)>,
+    managed_window: Option<u64>,
 }
 
 struct SceneWindow {
@@ -861,6 +894,7 @@ struct ImportedFrame {
 
 struct PluginPaneTexture {
     scene: GpuCanvasScene,
+    rect: [i32; 4],
 }
 
 fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
@@ -923,6 +957,44 @@ fn send_presentation_events(
     let panes = runtime.pane_ids().collect::<Vec<_>>();
     for pane in panes {
         runtime.send_presentation_event(create(pane))?;
+    }
+    Ok(())
+}
+
+fn send_presentation_event(
+    runtime: Option<&PresentationWasmRuntime>,
+    event: PresentationEvent,
+) -> Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    runtime.send_presentation_event(event)
+}
+
+fn dispatch_focus_change(
+    runtime: Option<&PresentationWasmRuntime>,
+    input_sender: Option<&mut InputLane>,
+    change: FocusChange,
+    window_focused: bool,
+) -> Result<()> {
+    if let Some((pane, focused)) = change.plugin {
+        send_presentation_event(
+            runtime,
+            PresentationEvent::PaneFocused {
+                pane,
+                focused: focused && window_focused,
+            },
+        )?;
+        eprintln!(
+            "focused {} plugin pane={pane}",
+            if focused { "local" } else { "away from" }
+        );
+    }
+    if let Some(window_id) = change.managed_window {
+        if let Some(sender) = input_sender {
+            send_window_focus(sender, window_id);
+        }
+        eprintln!("focused backend-managed window={window_id}");
     }
     Ok(())
 }
@@ -1298,6 +1370,7 @@ impl Renderer {
             current_sequence: None,
             plugin_graphics,
             plugin_pane: None,
+            focused_pane: None,
         })
     }
 
@@ -1310,10 +1383,6 @@ impl Renderer {
         )
     }
 
-    const fn content_extent(&self) -> Option<(u32, u32)> {
-        self.scene_extent
-    }
-
     fn select_scene(
         &mut self,
         sequence: u64,
@@ -1321,12 +1390,8 @@ impl Renderer {
         height: u32,
         windows: Vec<SceneWindowUpdate>,
     ) -> Result<()> {
-        let previous_focus = self
-            .current_windows
-            .iter()
-            .find(|window| window.active)
-            .map(|window| window.window_id);
         let mut scene_windows = Vec::with_capacity(windows.len());
+        let mut backend_focus = None;
         for window in windows {
             if let Some(frame) = window.resource {
                 let imported = ImportedFrame::new(
@@ -1339,6 +1404,9 @@ impl Renderer {
                 )?;
                 self.imported_frames.insert(window.resource_id, imported);
             }
+            if window.active {
+                backend_focus = Some(window.window_id);
+            }
             scene_windows.push(SceneWindow {
                 window_id: window.window_id,
                 resource_id: window.resource_id,
@@ -1348,27 +1416,6 @@ impl Renderer {
             });
         }
         scene_windows.sort_by_key(|window| window.window_id);
-        let focused_window = previous_focus
-            .filter(|focused| {
-                scene_windows
-                    .iter()
-                    .any(|window| window.window_id == *focused)
-            })
-            .or_else(|| {
-                scene_windows
-                    .iter()
-                    .find(|window| window.active)
-                    .map(|window| window.window_id)
-            })
-            .or_else(|| scene_windows.first().map(|window| window.window_id));
-        map_windows(
-            &mut scene_windows,
-            LayoutSize {
-                w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
-                h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
-            },
-            focused_window,
-        );
         if scene_windows
             .iter()
             .all(|window| self.imported_frames.contains_key(&window.resource_id))
@@ -1376,48 +1423,123 @@ impl Renderer {
             self.current_windows = scene_windows;
             self.scene_extent = Some((width.max(1), height.max(1)));
             self.current_sequence = Some(sequence);
+            self.focused_pane = match self.focused_pane {
+                Some(FocusedPane::Plugin(pane))
+                    if self
+                        .plugin_pane
+                        .as_ref()
+                        .is_some_and(|plugin| plugin.scene.pane == pane) =>
+                {
+                    Some(FocusedPane::Plugin(pane))
+                }
+                Some(FocusedPane::Managed(window_id))
+                    if self
+                        .current_windows
+                        .iter()
+                        .any(|window| window.window_id == window_id) =>
+                {
+                    Some(FocusedPane::Managed(window_id))
+                }
+                _ => backend_focus
+                    .or_else(|| self.current_windows.first().map(|window| window.window_id))
+                    .map(FocusedPane::Managed)
+                    .or_else(|| {
+                        self.plugin_pane
+                            .as_ref()
+                            .map(|plugin| FocusedPane::Plugin(plugin.scene.pane))
+                    }),
+            };
+            self.relayout_panes();
             self.window.request_redraw();
         }
         Ok(())
     }
 
-    fn cycle_focus(&mut self, offset: isize) -> Option<u64> {
-        let window_count = self.current_windows.len();
-        if window_count < 2 {
+    const fn focused_plugin_pane(&self) -> Option<u64> {
+        match self.focused_pane {
+            Some(FocusedPane::Plugin(pane)) => Some(pane),
+            _ => None,
+        }
+    }
+
+    const fn focused_managed_window(&self) -> Option<u64> {
+        match self.focused_pane {
+            Some(FocusedPane::Managed(window_id)) => Some(window_id),
+            _ => None,
+        }
+    }
+
+    fn toggle_plugin_managed_focus(&mut self) -> Option<FocusChange> {
+        let plugin = self.plugin_pane.as_ref()?.scene.pane;
+        let managed = match self.focused_pane {
+            Some(FocusedPane::Managed(window_id))
+                if self
+                    .current_windows
+                    .iter()
+                    .any(|window| window.window_id == window_id) =>
+            {
+                window_id
+            }
+            _ => self.current_windows.first()?.window_id,
+        };
+        let target = toggled_plugin_managed_focus(self.focused_pane, plugin, managed);
+        self.set_focus(target)
+    }
+
+    fn focus_pane_at_window_point(&mut self, x: f64, y: f64) -> Option<FocusChange> {
+        let (x, y) = self.scene_position_for_window_point(x, y);
+        let target = self
+            .current_windows
+            .iter()
+            .rfind(|window| rect_contains(window.rect, x, y))
+            .map(|window| FocusedPane::Managed(window.window_id))
+            .or_else(|| {
+                self.plugin_pane.as_ref().and_then(|plugin| {
+                    rect_contains(plugin.rect, x, y)
+                        .then_some(FocusedPane::Plugin(plugin.scene.pane))
+                })
+            })?;
+        self.set_focus(target)
+    }
+
+    fn set_focus(&mut self, target: FocusedPane) -> Option<FocusChange> {
+        let previous = self.focused_pane;
+        if previous == Some(target) {
             return None;
         }
-        let active_index = self
-            .current_windows
-            .iter()
-            .position(|window| window.active)
-            .unwrap_or_default();
-        let next_index = cycled_index(active_index, window_count, offset)?;
-        self.focus_window_index(next_index)
-    }
-
-    fn focus_window_at(&mut self, x: f64, y: f64) -> Option<u64> {
-        let index = self
-            .current_windows
-            .iter()
-            .rposition(|window| rect_contains(window.rect, x, y))?;
-        self.focus_window_index(index)
-    }
-
-    fn focus_window_index(&mut self, index: usize) -> Option<u64> {
-        let window_id = self.current_windows.get(index)?.window_id;
+        self.focused_pane = Some(target);
         for window in &mut self.current_windows {
-            window.active = window.window_id == window_id;
+            window.active = matches!(target, FocusedPane::Managed(id) if id == window.window_id);
         }
         self.window.request_redraw();
-        Some(window_id)
+        Some(FocusChange {
+            plugin: match (previous, target) {
+                (Some(FocusedPane::Plugin(pane)), FocusedPane::Managed(_)) => Some((pane, false)),
+                (_, FocusedPane::Plugin(pane)) => Some((pane, true)),
+                _ => None,
+            },
+            managed_window: match target {
+                FocusedPane::Managed(window_id) => Some(window_id),
+                FocusedPane::Plugin(_) => None,
+            },
+        })
     }
 
-    fn backend_position_for_client_point(&self, x: f64, y: f64) -> Option<(f64, f64)> {
-        let window = self
-            .current_windows
-            .iter()
-            .rev()
-            .find(|window| rect_contains(window.rect, x, y))?;
+    fn scene_position_for_window_point(&self, x: f64, y: f64) -> (f64, f64) {
+        let (content_width, content_height) = self.composition_extent();
+        let window_size = self.window.inner_size();
+        (
+            x * f64::from(content_width) / f64::from(window_size.width.max(1)),
+            y * f64::from(content_height) / f64::from(window_size.height.max(1)),
+        )
+    }
+
+    fn backend_position_for_window_point(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (x, y) = self.scene_position_for_window_point(x, y);
+        let window = self.current_windows.iter().rev().find(|window| {
+            self.focused_managed_window() == Some(window.window_id)
+                && rect_contains(window.rect, x, y)
+        })?;
         Some(project_point_between_rects(
             x,
             y,
@@ -1426,12 +1548,60 @@ impl Renderer {
         ))
     }
 
-    fn refresh_plugin_graphics(&mut self, pane: u64, expected_sequence: u64) -> Result<()> {
+    fn plugin_position_for_window_point(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        let plugin = self.plugin_pane.as_ref()?;
+        if self.focused_plugin_pane() != Some(plugin.scene.pane) {
+            return None;
+        }
+        let (x, y) = self.scene_position_for_window_point(x, y);
+        if !rect_contains(plugin.rect, x, y) {
+            return None;
+        }
+        let (composition_width, composition_height) = self.composition_extent();
+        let (x, y) = project_point_between_rects(
+            x,
+            y,
+            plugin.rect,
+            [
+                0,
+                0,
+                i32::try_from(composition_width).unwrap_or(i32::MAX),
+                i32::try_from(composition_height).unwrap_or(i32::MAX),
+            ],
+        );
+        let scale = self.window.scale_factor() as f32;
+        Some((x as f32 / scale, y as f32 / scale))
+    }
+
+    fn composition_extent(&self) -> (u32, u32) {
+        self.scene_extent
+            .unwrap_or_else(|| (self.config.width.max(1), self.config.height.max(1)))
+    }
+
+    fn relayout_panes(&mut self) {
+        let (width, height) = self.composition_extent();
+        let plugin_rect = self.plugin_pane.as_mut().map(|plugin| &mut plugin.rect);
+        map_panes(
+            plugin_rect,
+            &mut self.current_windows,
+            LayoutSize {
+                w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
+                h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
+            },
+            self.focused_pane,
+        );
+    }
+
+    fn refresh_plugin_graphics(
+        &mut self,
+        pane: u64,
+        expected_sequence: u64,
+    ) -> Result<Option<FocusChange>> {
         let Some(snapshot) = self.plugin_graphics.snapshot(pane)? else {
-            return Ok(());
+            return Ok(None);
         };
         if snapshot.sequence < expected_sequence {
-            return Ok(());
+            return Ok(None);
         }
         if self.plugin_pane.as_ref().is_some_and(|current| {
             current.scene.pane == snapshot.pane
@@ -1439,7 +1609,7 @@ impl Renderer {
                 && current.scene.width == self.config.width
                 && current.scene.height == self.config.height
         }) {
-            return Ok(());
+            return Ok(None);
         }
         let scale = self.window.scale_factor() as f32;
         let scene = self.plugin_canvas.compile(
@@ -1460,9 +1630,22 @@ impl Renderer {
                 scale,
             );
         }
-        self.plugin_pane = Some(PluginPaneTexture { scene });
+        let first_plugin_scene = self.plugin_pane.is_none();
+        self.plugin_pane = Some(PluginPaneTexture {
+            scene,
+            rect: [
+                0,
+                0,
+                i32::try_from(self.config.width).unwrap_or(i32::MAX),
+                i32::try_from(self.config.height).unwrap_or(i32::MAX),
+            ],
+        });
+        self.relayout_panes();
+        let focus_change = first_plugin_scene
+            .then(|| self.set_focus(FocusedPane::Plugin(pane)))
+            .flatten();
         self.window.request_redraw();
-        Ok(())
+        Ok(focus_change)
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -1473,12 +1656,13 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.reconfigure();
+        self.relayout_panes();
         if let Some((pane, sequence)) = self
             .plugin_pane
             .as_ref()
             .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
         {
-            self.refresh_plugin_graphics(pane, sequence)?;
+            let _focus_change = self.refresh_plugin_graphics(pane, sequence)?;
         }
         self.window.request_redraw();
         Ok(())
@@ -1545,11 +1729,16 @@ impl Renderer {
             });
             render_pass.set_pipeline(&self.frame_pipeline);
             if let Some(plugin) = self.plugin_pane.as_ref() {
+                let viewport = scaled_viewport(
+                    plugin.rect,
+                    self.composition_extent(),
+                    (self.config.width, self.config.height),
+                );
                 render_pass.set_viewport(
-                    0.0,
-                    0.0,
-                    self.config.width as f32,
-                    self.config.height as f32,
+                    viewport[0],
+                    viewport[1],
+                    viewport[2],
+                    viewport[3],
                     0.0,
                     1.0,
                 );
@@ -1611,9 +1800,18 @@ impl Renderer {
     }
 }
 
-fn map_windows(windows: &mut [SceneWindow], extent: LayoutSize, focused_window: Option<u64>) {
+fn map_panes(
+    plugin_rect: Option<&mut [i32; 4]>,
+    windows: &mut [SceneWindow],
+    extent: LayoutSize,
+    focused_pane: Option<FocusedPane>,
+) {
+    let pane_count = windows.len() + usize::from(plugin_rect.is_some());
+    if pane_count == 0 {
+        return;
+    }
     let mut layout = LayoutState::default();
-    for _ in 1..windows.len() {
+    for _ in 1..pane_count {
         let active_rect = layout.active_rect(extent).unwrap_or(LayoutRect {
             x: 0,
             y: 0,
@@ -1630,24 +1828,31 @@ fn map_windows(windows: &mut [SceneWindow], extent: LayoutSize, focused_window: 
         };
         layout.set_active_leaf(next_leaf);
     }
-    for (window, region) in windows.iter_mut().zip(layout.resolve(extent)) {
+    let mut regions = layout.resolve(extent).into_iter();
+    if let Some(plugin_rect) = plugin_rect
+        && let Some(region) = regions.next()
+    {
+        *plugin_rect = [region.rect.x, region.rect.y, region.rect.w, region.rect.h];
+    }
+    for (window, region) in windows.iter_mut().zip(regions) {
         window.rect = [region.rect.x, region.rect.y, region.rect.w, region.rect.h];
-        window.active = focused_window == Some(window.window_id);
+        window.active = focused_pane == Some(FocusedPane::Managed(window.window_id));
     }
 }
 
-fn cycled_index(current: usize, count: usize, offset: isize) -> Option<usize> {
-    if count == 0 || current >= count {
-        return None;
+const fn toggled_plugin_managed_focus(
+    current: Option<FocusedPane>,
+    plugin: u64,
+    managed: u64,
+) -> FocusedPane {
+    match current {
+        Some(FocusedPane::Plugin(_)) => FocusedPane::Managed(managed),
+        _ => FocusedPane::Plugin(plugin),
     }
-    let step = offset.unsigned_abs() % count;
-    Some(if offset.is_negative() {
-        current
-            .checked_sub(step)
-            .unwrap_or_else(|| count - (step - current))
-    } else {
-        (current + step) % count
-    })
+}
+
+const fn is_plugin_managed_focus_toggle(key: PhysicalKey) -> bool {
+    matches!(key, PhysicalKey::Code(KeyCode::F6))
 }
 
 fn rect_contains(rect: [i32; 4], x: f64, y: f64) -> bool {
@@ -1806,7 +2011,12 @@ mod tests {
     #[test]
     fn client_maps_three_windows_with_the_native_split_fallback() {
         let mut windows = [scene_window(11), scene_window(12), scene_window(13)];
-        map_windows(&mut windows, LayoutSize { w: 1200, h: 800 }, Some(12));
+        map_panes(
+            None,
+            &mut windows,
+            LayoutSize { w: 1200, h: 800 },
+            Some(FocusedPane::Managed(12)),
+        );
 
         assert_eq!(windows[0].rect, [0, 0, 600, 800]);
         assert_eq!(windows[1].rect, [600, 0, 600, 400]);
@@ -1817,10 +2027,37 @@ mod tests {
     }
 
     #[test]
-    fn focus_cycle_wraps_in_both_directions() {
-        assert_eq!(cycled_index(2, 3, 1), Some(0));
-        assert_eq!(cycled_index(0, 3, -1), Some(2));
-        assert_eq!(cycled_index(0, 0, 1), None);
+    fn client_maps_a_plugin_and_managed_window_side_by_side() {
+        let mut plugin_rect = [0, 0, 1, 1];
+        let mut windows = [scene_window(42)];
+        map_panes(
+            Some(&mut plugin_rect),
+            &mut windows,
+            LayoutSize { w: 1200, h: 800 },
+            Some(FocusedPane::Plugin(7)),
+        );
+
+        assert_eq!(plugin_rect, [0, 0, 600, 800]);
+        assert_eq!(windows[0].rect, [600, 0, 600, 800]);
+        assert!(!windows[0].active);
+    }
+
+    #[test]
+    fn focus_toggle_distinguishes_local_and_backend_ids() {
+        assert!(is_plugin_managed_focus_toggle(PhysicalKey::Code(
+            KeyCode::F6
+        )));
+        assert!(!is_plugin_managed_focus_toggle(PhysicalKey::Code(
+            KeyCode::F5
+        )));
+        assert_eq!(
+            toggled_plugin_managed_focus(Some(FocusedPane::Plugin(1)), 1, 1),
+            FocusedPane::Managed(1)
+        );
+        assert_eq!(
+            toggled_plugin_managed_focus(Some(FocusedPane::Managed(1)), 1, 1),
+            FocusedPane::Plugin(1)
+        );
     }
 
     #[test]

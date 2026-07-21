@@ -8,7 +8,7 @@ The local development path exports each managed window separately. The server co
 
 The presentation endpoint should not own authoritative editor, session, app, or pane state. It owns presentation behavior such as layout, visibility, animation, dragging, and hit testing, and may save preferences back to the workspace.
 
-The current client maps all received windows with the deterministic native split layout and keeps focus locally. The focused window drives hosted-application keyboard input, and pointer coordinates are projected from the client-owned pane bounds back into the matching backend surface.
+The client maps local plugin panes and received managed windows together with the deterministic native split layout. One client-owned focus target drives input: plugin events stay local when the plugin pane is focused, while managed-window input is forwarded to the backend under the presentation connection.
 
 The client also owns a `manifold-wasm` presentation runtime and its Tokio
 executor. Presentation-scoped Component and Preview 1 actors can be loaded with
@@ -28,4 +28,4 @@ handles. The executable workload is in `examples/wasm-plugin-graphics`, and
 `ClientArgs` in `crates/manifold-cli/src/cli.rs` remains the source of truth for
 the client invocation.
 
-`Ctrl-J` and `Ctrl-K` temporarily cycle the focused window in the client. This is explicitly a testing hack while the presentation shortcut-policy path is moved into the client; it is not the target user-facing keybinding design.
+`F6` temporarily toggles focus between the local plugin pane and the first backend-managed window. This is explicitly an MVP testing binding while presentation shortcut policy is hosted in the client; it is not the target user-facing keybinding design.
