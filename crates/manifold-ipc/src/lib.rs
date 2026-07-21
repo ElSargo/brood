@@ -62,6 +62,11 @@ pub const INPUT_WINDOW_POINTER_BUTTON: u32 = 11;
 pub const INPUT_WINDOW_POINTER_AXIS: u32 = 12;
 /// Leave the currently hovered managed pane; arguments are unused.
 pub const INPUT_WINDOW_POINTER_LEAVE: u32 = 13;
+/// Send discrete wheel motion over one managed pane.
+///
+/// Arguments are window ID, horizontal/vertical signed v120 values, and
+/// pane-local x/y `f64` bits.
+pub const INPUT_WINDOW_POINTER_WHEEL: u32 = 14;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.
@@ -74,6 +79,19 @@ pub const FRAME_SCENE_BEGIN: u32 = 0x100;
 pub const FRAME_WINDOW_DMABUF: u32 = 0x101;
 /// End and publish the current atomic scene batch.
 pub const FRAME_SCENE_END: u32 = 0x102;
+
+/// Preserve one signed 32-bit protocol value in a record argument.
+#[must_use]
+pub fn encode_i32_argument(value: i32) -> u64 {
+    u64::from(u32::from_ne_bytes(value.to_ne_bytes()))
+}
+
+/// Recover one signed 32-bit protocol value from a record argument.
+#[must_use]
+pub fn decode_i32_argument(value: u64) -> i32 {
+    let value = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
+    i32::from_ne_bytes(value.to_ne_bytes())
+}
 
 /// Color space carried by one managed-window frame resource.
 ///
@@ -736,5 +754,12 @@ mod tests {
         ensure!(FrameColorSpace::try_from(1) == Ok(FrameColorSpace::Srgb));
         ensure!(FrameColorSpace::try_from(99) == Err(UnsupportedFrameColorSpace(99)));
         Ok(())
+    }
+
+    #[test]
+    fn signed_record_arguments_round_trip() {
+        for value in [i32::MIN, -120, -1, 0, 1, 120, i32::MAX] {
+            assert_eq!(decode_i32_argument(encode_i32_argument(value)), value);
+        }
     }
 }

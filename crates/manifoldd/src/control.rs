@@ -2822,13 +2822,22 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 );
                 let horizontal = f64::from_bits(record.arguments[1]);
                 let vertical = f64::from_bits(record.arguments[2]);
-                let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
-                if horizontal != 0.0 {
-                    frame = frame.value(Axis::Horizontal, horizontal);
-                }
-                if vertical != 0.0 {
-                    frame = frame.value(Axis::Vertical, vertical);
-                }
+                let frame = crate::input::managed_continuous_axis_frame(time, horizontal, vertical);
+                state.forward_pointer_axis_to_pane(pane, frame);
+            }
+            manifold_ipc::INPUT_WINDOW_POINTER_WHEEL => {
+                let pane = record.arguments[0];
+                state.forward_pointer_motion_to_pane(
+                    pane,
+                    Point::from((
+                        f64::from_bits(record.arguments[3]),
+                        f64::from_bits(record.arguments[4]),
+                    )),
+                    time,
+                );
+                let horizontal = manifold_ipc::decode_i32_argument(record.arguments[1]);
+                let vertical = manifold_ipc::decode_i32_argument(record.arguments[2]);
+                let frame = crate::input::managed_wheel_axis_frame(time, horizontal, vertical);
                 state.forward_pointer_axis_to_pane(pane, frame);
             }
             manifold_ipc::INPUT_WINDOW_POINTER_LEAVE => {

@@ -27,6 +27,32 @@ const KEY_RIGHTSHIFT: Keycode = Keycode::new(62);
 const KEY_LEFTALT: Keycode = Keycode::new(64);
 const KEY_RIGHTALT: Keycode = Keycode::new(108);
 
+pub fn managed_continuous_axis_frame(time: u32, horizontal: f64, vertical: f64) -> AxisFrame {
+    let mut frame = AxisFrame::new(time).source(AxisSource::Continuous);
+    if let Some(horizontal) = finite_axis_value(horizontal).filter(|value| *value != 0.0) {
+        frame = frame.value(Axis::Horizontal, horizontal);
+    }
+    if let Some(vertical) = finite_axis_value(vertical).filter(|value| *value != 0.0) {
+        frame = frame.value(Axis::Vertical, vertical);
+    }
+    frame
+}
+
+pub fn managed_wheel_axis_frame(time: u32, horizontal_v120: i32, vertical_v120: i32) -> AxisFrame {
+    let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+    if horizontal_v120 != 0 {
+        frame = frame
+            .value(Axis::Horizontal, f64::from(horizontal_v120) * 15.0 / 120.0)
+            .v120(Axis::Horizontal, horizontal_v120);
+    }
+    if vertical_v120 != 0 {
+        frame = frame
+            .value(Axis::Vertical, f64::from(vertical_v120) * 15.0 / 120.0)
+            .v120(Axis::Vertical, vertical_v120);
+    }
+    frame
+}
+
 impl Manifold {
     #[allow(
         dead_code,
@@ -493,6 +519,13 @@ impl Manifold {
             },
         );
         pointer.frame(self);
+        tracing::info!(
+            pane,
+            button_code,
+            ?state,
+            grabbed = pointer.is_grabbed(),
+            "forwarded presentation pointer button"
+        );
     }
 
     fn record_consumed_pointer_button(&mut self) {
@@ -524,10 +557,36 @@ impl Manifold {
         self.stats.pointer_axis_events += 1;
         if has_target {
             self.stats.pointer_target_hits += 1;
+            tracing::info!(
+                pane,
+                grabbed = pointer.is_grabbed(),
+                "forwarded presentation pointer axis"
+            );
             pointer.axis(self, frame);
             pointer.frame(self);
         } else {
             self.stats.pointer_target_misses += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_wheel_frame_preserves_v120_and_legacy_axis_values() {
+        let frame = managed_wheel_axis_frame(7, -120, 60);
+        assert_eq!(frame.source, Some(AxisSource::Wheel));
+        assert_eq!(frame.v120, Some((-120, 60)));
+        assert_eq!(frame.axis, (-15.0, 7.5));
+    }
+
+    #[test]
+    fn managed_continuous_frame_rejects_non_finite_values() {
+        let frame = managed_continuous_axis_frame(9, f64::NAN, -2.5);
+        assert_eq!(frame.source, Some(AxisSource::Continuous));
+        assert_eq!(frame.v120, None);
+        assert_eq!(frame.axis, (0.0, -2.5));
     }
 }

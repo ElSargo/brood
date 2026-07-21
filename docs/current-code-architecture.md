@@ -381,7 +381,21 @@ target is sent through the input lane as the pane ID plus coordinates projected
 into that pane's source rectangle; button and axis records also carry their
 position so they remain correct if disposable motion samples are superseded.
 The daemon resolves the named pane's nested Wayland surface and does not consult
-its compatibility-presenter placement.
+its compatibility-presenter placement. The client holds an implicit grab on the
+pressed pane across focus, layout, and inventory revisions and resynchronizes
+hover after the final release. Wheel records preserve signed v120 detents;
+continuous pixel deltas retain their source and logical scale.
+When the bounded input ring is full, ordered records remain in a client-local
+retry queue and keep the Winit loop polling until the daemon accepts them.
+Adjacent deferred motion samples may collapse to the latest position, but
+button, key, focus, scroll, leave, and configuration transitions keep their
+relative order. This prevents a drag burst from dropping its terminal release
+and leaving the Wayland seat grabbed to the original pane.
+
+When a scene revision adds an active managed pane or removes the focused pane,
+the client computes the new local focus before emitting the backend focus
+record. For retained managed focus, it repairs any backend focus mismatch
+instead of allowing key-policy focus and Wayland seat focus to diverge.
 
 For the built-in compatibility presenter, pointer motion:
 

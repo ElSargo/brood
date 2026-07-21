@@ -676,6 +676,12 @@ That record preserves the client's hit-test result. The backend resolves nested
 surfaces inside the named hosted pane, but it never interprets the coordinates
 through a backend-owned presentation layout.
 
+Button presses establish a client-side implicit grab on the hit pane. Motion,
+additional buttons, scrolling, and the matching releases stay with that pane
+until all buttons are released or the viewport loses focus; a layout or pane
+inventory revision cannot retarget half of a click. Discrete wheel input
+preserves signed v120 detents separately from continuous pixel scrolling.
+
 A hosted-window input record includes:
 
 - session and window identity;
@@ -692,6 +698,11 @@ scroll may be coalesced; key transitions, button transitions, focus transitions,
 and protocol-significant events remain ordered. On reconnect, lease change, or
 input-stream gap, the backend resets pressed-state assumptions before accepting
 a new synchronized input state.
+
+Temporary exhaustion of the local shared-memory ring must not turn an ordered
+transition into a dropped event. The client keeps such records in an ordered,
+bounded retry path while superseding adjacent motion state; terminal releases
+retain reserved progress so a drag cannot strand the backend's implicit grab.
 
 The backend maps accepted input into its Wayland seat. The initial product may
 use one logical primary seat because zero or one controlling client is the target.

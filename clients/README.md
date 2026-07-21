@@ -27,7 +27,17 @@ policy forwards reach the focused plugin or managed window.
 Pointer routing uses the same client-owned layout: plugin events stay in the
 local actor runtime, while hosted-window records carry the selected pane ID and
 pane-local coordinates. The server resolves only that pane's Wayland surface
-tree and never repeats hit testing against a server-side placement.
+tree and never repeats hit testing against a server-side placement. The client
+retains the pressed pane as an implicit pointer-grab target until every button
+is released, even if focus or layout changes meanwhile. Discrete wheel input
+keeps its signed v120 values, while pixel scrolling remains continuous input.
+If the bounded shared-memory lane is temporarily full, the client retains
+ordered input transitions locally and retries them without blocking the window
+loop; only adjacent pointer-motion samples are superseded. In particular, a
+button release cannot be discarded behind a burst of drag motion.
+Pane inventory changes reconcile client focus with newly active and fallback
+managed panes so the local key and pointer targets cannot diverge from the
+Wayland seat.
 
 The client also owns a `manifold-wasm` presentation runtime and its Tokio
 executor. Presentation-scoped Component and Preview 1 actors can be loaded with

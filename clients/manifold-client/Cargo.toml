@@ -15,6 +15,7 @@ manifold-ipc.workspace = true
 manifold-layout.workspace = true
 manifold-wasm = { path = "../../crates/manifold-wasm" }
 lyon_tessellation.workspace = true
+num-traits.workspace = true
 pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true

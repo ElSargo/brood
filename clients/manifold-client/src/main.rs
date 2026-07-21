@@ -6,7 +6,7 @@
 )]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     os::fd::AsFd,
     sync::{Arc, mpsc},
     thread,
@@ -27,6 +27,7 @@ use manifold_layout::{
     InputBehavior, LayoutAction, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize, LocalPoint,
     LocalTransform, ResolvedLayout, ResolvedLayoutItem,
 };
+use num_traits::ToPrimitive;
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -191,6 +192,9 @@ fn main() -> Result<()> {
                 ),
                 generation: fast_path.generation,
                 sequence: 0,
+                deferred: VecDeque::new(),
+                deferred_high_water: 0,
+                coalesced_motion: 0,
             })
         } else {
             None
@@ -413,6 +417,54 @@ struct InputLane {
     notifications: manifold_ipc::EventNotifier,
     generation: u64,
     sequence: u64,
+    deferred: VecDeque<manifold_ipc::CriticalRecord>,
+    deferred_high_water: usize,
+    coalesced_motion: u64,
+}
+
+impl InputLane {
+    fn flush_deferred(&mut self) {
+        let had_deferred = !self.deferred.is_empty();
+        let mut published = false;
+        while let Some(record) = self.deferred.front().copied() {
+            if self.producer.try_send(record).is_err() {
+                break;
+            }
+            self.deferred.pop_front();
+            published = true;
+        }
+        if published && let Err(error) = self.notifications.notify() {
+            eprintln!("failed to notify presentation input consumer: {error}");
+        }
+        if had_deferred && self.deferred.is_empty() {
+            eprintln!(
+                "drained deferred presentation input records high_water={} coalesced_motion={}",
+                self.deferred_high_water, self.coalesced_motion
+            );
+            self.deferred_high_water = 0;
+            self.coalesced_motion = 0;
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    fn defer(&mut self, record: manifold_ipc::CriticalRecord) {
+        if record.opcode == manifold_ipc::INPUT_WINDOW_POINTER_MOTION
+            && let Some(previous) = self.deferred.back_mut()
+            && previous.opcode == manifold_ipc::INPUT_WINDOW_POINTER_MOTION
+        {
+            *previous = record;
+            self.coalesced_motion = self.coalesced_motion.saturating_add(1);
+            return;
+        }
+        if self.deferred.is_empty() {
+            eprintln!("presentation input lane backpressured; deferring input records");
+        }
+        self.deferred.push_back(record);
+        self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
+    }
 }
 
 struct BackendCommandLane {
@@ -491,6 +543,7 @@ struct Application {
     cursor_position: Option<(f64, f64)>,
     pending_plugin_pointer_motion: Option<(u64, f32, f32)>,
     managed_pointer_target: Option<u64>,
+    pointer_grab: Option<PointerGrab>,
     wasm_runtime: Option<PresentationWasmRuntime>,
     layout_policy: Option<ClientLayoutPolicy>,
     key_policy: Option<ClientKeyPolicy>,
@@ -785,13 +838,22 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
+        let input_backpressured = self.input_sender.as_mut().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        });
         // A full actor lane keeps the latest position for the next Winit turn.
         // Motion is state, so intermediate samples are disposable.
         let _motion_result = flush_presentation_pointer_motion(
             self.wasm_runtime.as_ref(),
             &mut self.pending_plugin_pointer_motion,
         );
-        if self
+        if input_backpressured {
+            // The shared-memory consumer already has a wakeup for the records
+            // which filled its ring. Poll until it frees a slot so input state
+            // transitions cannot remain deferred indefinitely.
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else if self
             .wasm_runtime
             .as_ref()
             .is_some_and(|runtime| !runtime.is_empty())
@@ -799,6 +861,8 @@ impl ApplicationHandler<ClientEvent> for Application {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(50),
             ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -855,34 +919,14 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
-                match renderer.pointer_target_for_window_point(position.x, position.y) {
-                    Some(PanePointerTarget::Plugin { pane, x, y }) => {
-                        self.pending_plugin_pointer_motion = Some((pane, x, y));
-                        send_managed_pointer_leave(
-                            self.input_sender.as_mut(),
-                            &mut self.managed_pointer_target,
-                        );
-                    }
-                    Some(PanePointerTarget::Managed { pane, x, y }) => {
-                        self.pending_plugin_pointer_motion = None;
-                        if let Some(sender) = self.input_sender.as_mut()
-                            && send_input(
-                                sender,
-                                manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
-                                [pane, x.to_bits(), y.to_bits(), 0, 0],
-                            )
-                        {
-                            self.managed_pointer_target = Some(pane);
-                        }
-                    }
-                    None => {
-                        self.pending_plugin_pointer_motion = None;
-                        send_managed_pointer_leave(
-                            self.input_sender.as_mut(),
-                            &mut self.managed_pointer_target,
-                        );
-                    }
-                }
+                route_pointer_motion(
+                    renderer,
+                    self.cursor_position,
+                    &mut self.pointer_grab,
+                    self.input_sender.as_mut(),
+                    &mut self.pending_plugin_pointer_motion,
+                    &mut self.managed_pointer_target,
+                );
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_position = None;
@@ -893,94 +937,117 @@ impl ApplicationHandler<ClientEvent> for Application {
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let pointer_target = self
-                    .cursor_position
-                    .and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y));
-                if state == ElementState::Pressed
-                    && button == MouseButton::Left
-                    && let Some(target) = pointer_target
+                let Some(button_code) = linux_button_code(button) else {
+                    return;
+                };
+                let pressed = state == ElementState::Pressed;
+                if !pressed
+                    && self
+                        .pointer_grab
+                        .as_ref()
+                        .is_none_or(|grab| !grab.buttons.contains(&button_code))
                 {
-                    let pane = match target {
-                        PanePointerTarget::Plugin { pane, .. }
-                        | PanePointerTarget::Managed { pane, .. } => pane,
-                    };
-                    if let Some(change) = renderer.focus_pane(pane)
-                        && let Err(error) = dispatch_focus_change(
-                            self.wasm_runtime.as_ref(),
-                            self.input_sender.as_mut(),
-                            change,
-                            self.window_focused,
-                        )
-                    {
+                    return;
+                }
+                let Some(target) = pointer_target_for_cursor(
+                    renderer,
+                    self.cursor_position,
+                    self.pointer_grab.as_ref(),
+                ) else {
+                    return;
+                };
+                eprintln!(
+                    "presentation pointer button target={target:?} pressed={pressed} client_grab_active={}",
+                    self.pointer_grab.is_some()
+                );
+                if let Some(grab) = self.pointer_grab.as_mut() {
+                    grab.target = target;
+                    if pressed {
+                        grab.press(button_code);
+                    }
+                } else if pressed {
+                    self.pointer_grab = Some(PointerGrab::new(target, button_code));
+                }
+
+                if pressed && let Some(change) = renderer.focus_pane(target.pane()) {
+                    if let Err(error) = dispatch_focus_change(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        change,
+                        self.window_focused,
+                    ) {
                         eprintln!("dropped pane focus event: {error:#}");
                     }
                     flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
                 }
 
-                let Some(target) = pointer_target else {
-                    return;
-                };
-                let Some(button_code) = linux_button_code(button) else {
-                    return;
-                };
-                let pressed = state == ElementState::Pressed;
-                match target {
-                    PanePointerTarget::Plugin { pane, x, y } => {
-                        if let Err(error) = send_presentation_event(
-                            self.wasm_runtime.as_ref(),
-                            PresentationEvent::PointerButton {
-                                pane,
-                                x,
-                                y,
-                                button: button_code,
-                                pressed,
-                                modifiers: modifier_bits(self.modifiers),
-                            },
-                        ) {
-                            eprintln!("dropped plugin pointer button: {error:#}");
-                        }
-                    }
-                    PanePointerTarget::Managed { pane, x, y } => {
-                        if let Some(sender) = self.input_sender.as_mut()
-                            && send_input(
-                                sender,
-                                manifold_ipc::INPUT_WINDOW_POINTER_BUTTON,
-                                [
-                                    pane,
-                                    u64::from(button_code),
-                                    u64::from(pressed),
-                                    x.to_bits(),
-                                    y.to_bits(),
-                                ],
-                            )
-                        {
-                            self.managed_pointer_target = Some(pane);
-                        }
-                    }
+                send_pointer_button_to_target(
+                    self.wasm_runtime.as_ref(),
+                    self.input_sender.as_mut(),
+                    &mut self.pending_plugin_pointer_motion,
+                    &mut self.managed_pointer_target,
+                    target,
+                    PointerButtonState {
+                        button: button_code,
+                        pressed,
+                        modifiers: modifier_bits(self.modifiers),
+                    },
+                );
+
+                let grab_ended = !pressed
+                    && self
+                        .pointer_grab
+                        .as_mut()
+                        .is_some_and(|grab| grab.release(button_code));
+                if grab_ended {
+                    eprintln!("presentation pointer grab ended target={target:?}");
+                    self.pointer_grab = None;
+                    route_pointer_motion(
+                        renderer,
+                        self.cursor_position,
+                        &mut self.pointer_grab,
+                        self.input_sender.as_mut(),
+                        &mut self.pending_plugin_pointer_motion,
+                        &mut self.managed_pointer_target,
+                    );
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (horizontal, vertical) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (f64::from(x) * 15.0, f64::from(y) * 15.0),
-                    MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
-                };
-                let Some(target) = self
-                    .cursor_position
-                    .and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y))
-                else {
+                let Some(target) = pointer_target_for_cursor(
+                    renderer,
+                    self.cursor_position,
+                    self.pointer_grab.as_ref(),
+                ) else {
                     return;
                 };
+                eprintln!(
+                    "presentation pointer scroll target={target:?} client_grab_active={}",
+                    self.pointer_grab.is_some()
+                );
+                if let Some(grab) = self.pointer_grab.as_mut() {
+                    grab.target = target;
+                }
                 match target {
                     PanePointerTarget::Plugin { pane, x, y } => {
                         let scale = renderer.window.scale_factor() as f32;
+                        let (horizontal, vertical) = match delta {
+                            MouseScrollDelta::LineDelta(x, y) => (x * 15.0, y * 15.0),
+                            MouseScrollDelta::PixelDelta(position) => {
+                                (position.x as f32, position.y as f32)
+                            }
+                        };
+                        send_managed_pointer_leave(
+                            self.input_sender.as_mut(),
+                            &mut self.managed_pointer_target,
+                        );
                         if let Err(error) = send_presentation_event(
                             self.wasm_runtime.as_ref(),
                             PresentationEvent::PointerScroll {
                                 pane,
                                 x,
                                 y,
-                                horizontal: horizontal as f32 / scale,
-                                vertical: vertical as f32 / scale,
+                                horizontal: horizontal / scale,
+                                vertical: vertical / scale,
                                 modifiers: modifier_bits(self.modifiers),
                             },
                         ) {
@@ -988,20 +1055,38 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                     }
                     PanePointerTarget::Managed { pane, x, y } => {
-                        if let Some(sender) = self.input_sender.as_mut()
-                            && send_input(
-                                sender,
-                                manifold_ipc::INPUT_WINDOW_POINTER_AXIS,
-                                [
-                                    pane,
-                                    horizontal.to_bits(),
-                                    vertical.to_bits(),
-                                    x.to_bits(),
-                                    y.to_bits(),
-                                ],
-                            )
-                        {
-                            self.managed_pointer_target = Some(pane);
+                        self.pending_plugin_pointer_motion = None;
+                        if let Some(sender) = self.input_sender.as_mut() {
+                            let sent = match delta {
+                                MouseScrollDelta::LineDelta(horizontal, vertical) => send_input(
+                                    sender,
+                                    manifold_ipc::INPUT_WINDOW_POINTER_WHEEL,
+                                    [
+                                        pane,
+                                        manifold_ipc::encode_i32_argument(wheel_v120(horizontal)),
+                                        manifold_ipc::encode_i32_argument(wheel_v120(vertical)),
+                                        x.to_bits(),
+                                        y.to_bits(),
+                                    ],
+                                ),
+                                MouseScrollDelta::PixelDelta(position) => {
+                                    let scale = renderer.window.scale_factor().max(f64::EPSILON);
+                                    send_input(
+                                        sender,
+                                        manifold_ipc::INPUT_WINDOW_POINTER_AXIS,
+                                        [
+                                            pane,
+                                            (-position.x / scale).to_bits(),
+                                            (-position.y / scale).to_bits(),
+                                            x.to_bits(),
+                                            y.to_bits(),
+                                        ],
+                                    )
+                                }
+                            };
+                            if sent {
+                                self.managed_pointer_target = Some(pane);
+                            }
                         }
                     }
                 }
@@ -1012,6 +1097,14 @@ impl ApplicationHandler<ClientEvent> for Application {
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    cancel_pointer_grab(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        &mut self.pending_plugin_pointer_motion,
+                        &mut self.managed_pointer_target,
+                        &mut self.pointer_grab,
+                        modifier_bits(self.modifiers),
+                    );
                     self.cursor_position = None;
                     self.pending_plugin_pointer_motion = None;
                     send_managed_pointer_leave(
@@ -1233,6 +1326,47 @@ enum PanePointerTarget {
     Managed { pane: u64, x: f64, y: f64 },
 }
 
+impl PanePointerTarget {
+    const fn pane(self) -> u64 {
+        match self {
+            Self::Plugin { pane, .. } | Self::Managed { pane, .. } => pane,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PointerGrab {
+    target: PanePointerTarget,
+    buttons: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointerButtonState {
+    button: u32,
+    pressed: bool,
+    modifiers: u32,
+}
+
+impl PointerGrab {
+    fn new(target: PanePointerTarget, button: u32) -> Self {
+        Self {
+            target,
+            buttons: vec![button],
+        }
+    }
+
+    fn press(&mut self, button: u32) {
+        if !self.buttons.contains(&button) {
+            self.buttons.push(button);
+        }
+    }
+
+    fn release(&mut self, button: u32) -> bool {
+        self.buttons.retain(|pressed| *pressed != button);
+        self.buttons.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FocusChange {
     plugin: Option<(u64, bool)>,
@@ -1297,23 +1431,25 @@ fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer
 }
 
 fn send_input(lane: &mut InputLane, opcode: u32, arguments: [u64; 5]) -> bool {
+    lane.flush_deferred();
     lane.sequence = lane.sequence.wrapping_add(1);
-    if lane
-        .producer
-        .try_send(manifold_ipc::CriticalRecord {
-            opcode,
-            connection_generation: lane.generation,
-            sequence: lane.sequence,
-            arguments,
-            ..manifold_ipc::CriticalRecord::default()
-        })
-        .is_err()
-    {
-        // Input remains non-blocking if the bounded consumer falls behind.
-        return false;
+    let record = manifold_ipc::CriticalRecord {
+        opcode,
+        connection_generation: lane.generation,
+        sequence: lane.sequence,
+        arguments,
+        ..manifold_ipc::CriticalRecord::default()
+    };
+    if lane.has_deferred() {
+        lane.defer(record);
+        return true;
     }
-    if lane.notifications.notify().is_err() {
-        return false;
+    if let Err(record) = lane.producer.try_send(record) {
+        lane.defer(record);
+        return true;
+    }
+    if let Err(error) = lane.notifications.notify() {
+        eprintln!("failed to notify presentation input consumer: {error}");
     }
     true
 }
@@ -1500,6 +1636,146 @@ fn queue_backend_command(
     backend_commands
         .context("key-policy command requires a connected backend")?
         .try_send(description, argv)
+}
+
+fn pointer_target_for_cursor(
+    renderer: &Renderer,
+    cursor_position: Option<(f64, f64)>,
+    grab: Option<&PointerGrab>,
+) -> Option<PanePointerTarget> {
+    if let Some(grab) = grab {
+        return cursor_position
+            .and_then(|(x, y)| {
+                renderer.pointer_target_for_pane_at_window_point(grab.target.pane(), x, y)
+            })
+            .or(Some(grab.target));
+    }
+    cursor_position.and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y))
+}
+
+fn route_pointer_motion(
+    renderer: &Renderer,
+    cursor_position: Option<(f64, f64)>,
+    grab: &mut Option<PointerGrab>,
+    input_sender: Option<&mut InputLane>,
+    pending_plugin_pointer_motion: &mut Option<(u64, f32, f32)>,
+    managed_pointer_target: &mut Option<u64>,
+) {
+    let target = pointer_target_for_cursor(renderer, cursor_position, grab.as_ref());
+    if let (Some(grab), Some(target)) = (grab.as_mut(), target) {
+        grab.target = target;
+    }
+    match target {
+        Some(PanePointerTarget::Plugin { pane, x, y }) => {
+            *pending_plugin_pointer_motion = Some((pane, x, y));
+            send_managed_pointer_leave(input_sender, managed_pointer_target);
+        }
+        Some(PanePointerTarget::Managed { pane, x, y }) => {
+            *pending_plugin_pointer_motion = None;
+            if let Some(sender) = input_sender
+                && send_input(
+                    sender,
+                    manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+                    [pane, x.to_bits(), y.to_bits(), 0, 0],
+                )
+            {
+                *managed_pointer_target = Some(pane);
+            }
+        }
+        None => {
+            *pending_plugin_pointer_motion = None;
+            send_managed_pointer_leave(input_sender, managed_pointer_target);
+        }
+    }
+}
+
+fn send_pointer_button_to_target(
+    runtime: Option<&PresentationWasmRuntime>,
+    input_sender: Option<&mut InputLane>,
+    pending_plugin_pointer_motion: &mut Option<(u64, f32, f32)>,
+    managed_pointer_target: &mut Option<u64>,
+    target: PanePointerTarget,
+    button: PointerButtonState,
+) {
+    match target {
+        PanePointerTarget::Plugin { pane, x, y } => {
+            *pending_plugin_pointer_motion = None;
+            send_managed_pointer_leave(input_sender, managed_pointer_target);
+            if let Err(error) = send_presentation_event(
+                runtime,
+                PresentationEvent::PointerButton {
+                    pane,
+                    x,
+                    y,
+                    button: button.button,
+                    pressed: button.pressed,
+                    modifiers: button.modifiers,
+                },
+            ) {
+                eprintln!("dropped plugin pointer button: {error:#}");
+            }
+        }
+        PanePointerTarget::Managed { pane, x, y } => {
+            *pending_plugin_pointer_motion = None;
+            if let Some(sender) = input_sender
+                && send_input(
+                    sender,
+                    manifold_ipc::INPUT_WINDOW_POINTER_BUTTON,
+                    [
+                        pane,
+                        u64::from(button.button),
+                        u64::from(button.pressed),
+                        x.to_bits(),
+                        y.to_bits(),
+                    ],
+                )
+            {
+                *managed_pointer_target = Some(pane);
+            }
+        }
+    }
+}
+
+fn cancel_pointer_grab(
+    runtime: Option<&PresentationWasmRuntime>,
+    input_sender: Option<&mut InputLane>,
+    pending_plugin_pointer_motion: &mut Option<(u64, f32, f32)>,
+    managed_pointer_target: &mut Option<u64>,
+    grab: &mut Option<PointerGrab>,
+    modifiers: u32,
+) {
+    let Some(grab) = grab.take() else {
+        return;
+    };
+    let mut input_sender = input_sender;
+    for button in grab.buttons {
+        send_pointer_button_to_target(
+            runtime,
+            input_sender.as_deref_mut(),
+            pending_plugin_pointer_motion,
+            managed_pointer_target,
+            grab.target,
+            PointerButtonState {
+                button,
+                pressed: false,
+                modifiers,
+            },
+        );
+    }
+}
+
+fn wheel_v120(delta: f32) -> i32 {
+    let value = -f64::from(delta) * 120.0;
+    if !value.is_finite() {
+        return 0;
+    }
+    value.to_i32().unwrap_or_else(|| {
+        if value.is_sign_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    })
 }
 
 fn flush_presentation_pointer_motion(
@@ -1919,9 +2195,20 @@ impl Renderer {
         _height: u32,
         windows: Vec<SceneWindowUpdate>,
     ) -> Result<Option<FocusChange>> {
+        let previous_focus = self.focused_pane;
+        let previous_managed_panes = self
+            .current_windows
+            .iter()
+            .map(|window| window.window_id)
+            .collect::<Vec<_>>();
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
         for window in windows {
+            let previous_rect = self
+                .current_windows
+                .iter()
+                .find(|current| current.window_id == window.window_id)
+                .map_or(window.rect, |current| current.rect);
             if let Some(frame) = window.resource {
                 let imported = ImportedFrame::new(
                     &self.device,
@@ -1941,7 +2228,7 @@ impl Renderer {
                 app_id: window.app_id,
                 resource_id: window.resource_id,
                 source_rect: window.rect,
-                rect: window.rect,
+                rect: previous_rect,
                 active: window.active,
             });
         }
@@ -1952,33 +2239,35 @@ impl Renderer {
         {
             self.current_windows = scene_windows;
             self.current_sequence = Some(sequence);
-            self.focused_pane = match self.focused_pane {
-                Some(FocusedPane::Plugin(pane))
-                    if self
-                        .plugin_pane
-                        .as_ref()
-                        .is_some_and(|plugin| plugin.scene.pane == pane) =>
-                {
-                    Some(FocusedPane::Plugin(pane))
-                }
-                Some(FocusedPane::Managed(window_id))
-                    if self
-                        .current_windows
-                        .iter()
-                        .any(|window| window.window_id == window_id) =>
-                {
-                    Some(FocusedPane::Managed(window_id))
-                }
-                _ => backend_focus
-                    .or_else(|| self.current_windows.first().map(|window| window.window_id))
-                    .map(FocusedPane::Managed)
-                    .or_else(|| {
-                        self.plugin_pane
-                            .as_ref()
-                            .map(|plugin| FocusedPane::Plugin(plugin.scene.pane))
-                    }),
-            };
-            let focus_change = self.relayout_panes();
+            let managed_panes = self
+                .current_windows
+                .iter()
+                .map(|window| window.window_id)
+                .collect::<Vec<_>>();
+            let newly_active_pane = backend_focus
+                .filter(|pane| !previous_managed_panes.contains(pane))
+                .filter(|pane| managed_panes.contains(pane));
+            self.focused_pane = scene_focus_target(
+                if newly_active_pane.is_some() {
+                    None
+                } else {
+                    previous_focus
+                },
+                self.plugin_pane.as_ref().map(|plugin| plugin.scene.pane),
+                &managed_panes,
+                backend_focus,
+            );
+            let _focus_change = self.relayout_panes();
+            let focus_change =
+                focus_change_between(previous_focus, self.focused_pane).or_else(|| {
+                    let Some(FocusedPane::Managed(local_focus)) = self.focused_pane else {
+                        return None;
+                    };
+                    (backend_focus != Some(local_focus)).then_some(FocusChange {
+                        plugin: None,
+                        managed_window: Some(local_focus),
+                    })
+                });
             self.window.request_redraw();
             return Ok(focus_change);
         }
@@ -2125,11 +2414,20 @@ impl Renderer {
 
     fn pointer_target_for_window_point(&self, x: f64, y: f64) -> Option<PanePointerTarget> {
         let pane = self.pane_at_window_point(x, y)?;
+        self.pointer_target_for_pane_at_window_point(pane, x, y)
+    }
+
+    fn pointer_target_for_pane_at_window_point(
+        &self,
+        pane: u64,
+        x: f64,
+        y: f64,
+    ) -> Option<PanePointerTarget> {
         let (x, y) = self.scene_position_for_window_point(x, y);
         if let Some(plugin) = self
             .plugin_pane
             .as_ref()
-            .filter(|plugin| plugin.scene.pane == pane && rect_contains(plugin.rect, x, y))
+            .filter(|plugin| plugin.scene.pane == pane)
         {
             let (composition_width, composition_height) = self.composition_extent();
             let (x, y) = project_point_between_rects(
@@ -2153,7 +2451,7 @@ impl Renderer {
         let window = self
             .current_windows
             .iter()
-            .find(|window| window.window_id == pane && rect_contains(window.rect, x, y))?;
+            .find(|window| window.window_id == pane)?;
         let (x, y) = project_point_between_rects(x, y, window.rect, window.source_rect);
         Some(PanePointerTarget::Managed { pane, x, y })
     }
@@ -2556,6 +2854,27 @@ const fn toggled_plugin_managed_focus(
     }
 }
 
+fn scene_focus_target(
+    current: Option<FocusedPane>,
+    plugin_pane: Option<u64>,
+    managed_panes: &[u64],
+    backend_focus: Option<u64>,
+) -> Option<FocusedPane> {
+    match current {
+        Some(FocusedPane::Plugin(pane)) if plugin_pane == Some(pane) => {
+            Some(FocusedPane::Plugin(pane))
+        }
+        Some(FocusedPane::Managed(pane)) if managed_panes.contains(&pane) => {
+            Some(FocusedPane::Managed(pane))
+        }
+        Some(FocusedPane::Plugin(_) | FocusedPane::Managed(_)) | None => backend_focus
+            .filter(|pane| managed_panes.contains(pane))
+            .or_else(|| managed_panes.first().copied())
+            .map(FocusedPane::Managed)
+            .or_else(|| plugin_pane.map(FocusedPane::Plugin)),
+    }
+}
+
 fn focus_change_between(
     previous: Option<FocusedPane>,
     target: Option<FocusedPane>,
@@ -2597,14 +2916,6 @@ fn fullscreen_layout(pane: u64) -> ResolvedLayout {
             input: InputBehavior::Pane,
         }],
     }
-}
-
-fn rect_contains(rect: [i32; 4], x: f64, y: f64) -> bool {
-    let [left, top, width, height] = rect;
-    x >= f64::from(left)
-        && y >= f64::from(top)
-        && x < f64::from(left.saturating_add(width.max(0)))
-        && y < f64::from(top.saturating_add(height.max(0)))
 }
 
 fn project_point_between_rects(x: f64, y: f64, from: [i32; 4], to: [i32; 4]) -> (f64, f64) {
@@ -2784,5 +3095,159 @@ mod tests {
         let actual =
             project_point_between_rects(900.0, 200.0, [600, 0, 600, 400], [0, 400, 600, 400]);
         assert_eq!(actual, (300.0, 600.0));
+    }
+
+    #[test]
+    fn removed_focused_pane_selects_and_reports_a_live_fallback() {
+        let target = scene_focus_target(Some(FocusedPane::Managed(4)), Some(99), &[1, 2], None);
+        assert_eq!(target, Some(FocusedPane::Managed(1)));
+        assert_eq!(
+            focus_change_between(Some(FocusedPane::Managed(4)), target),
+            Some(FocusChange {
+                plugin: None,
+                managed_window: Some(1),
+            })
+        );
+        assert_eq!(
+            scene_focus_target(Some(FocusedPane::Managed(4)), Some(99), &[1, 2], Some(2)),
+            Some(FocusedPane::Managed(2))
+        );
+    }
+
+    #[test]
+    fn pointer_grab_stays_active_until_every_pressed_button_is_released() {
+        let target = PanePointerTarget::Managed {
+            pane: 7,
+            x: 10.0,
+            y: 20.0,
+        };
+        let mut grab = PointerGrab::new(target, 0x110);
+        grab.press(0x111);
+        assert!(!grab.release(0x110));
+        assert!(grab.release(0x111));
+    }
+
+    #[test]
+    fn full_input_lane_defers_button_release_until_the_consumer_catches_up() -> Result<()> {
+        let file = manifold_ipc::CriticalLaneFile::create(17)?;
+        let producer = manifold_ipc::CriticalProducer::map(file.as_fd(), 17)?;
+        let mut consumer = manifold_ipc::CriticalConsumer::map(file.as_fd(), 17)?;
+        let mut lane = InputLane {
+            producer,
+            notifications: manifold_ipc::EventNotifier::create()?,
+            generation: 17,
+            sequence: 0,
+            deferred: VecDeque::new(),
+            deferred_high_water: 0,
+            coalesced_motion: 0,
+        };
+        for sequence in 0..manifold_ipc::CRITICAL_CAPACITY as u64 {
+            anyhow::ensure!(
+                lane.producer
+                    .try_send(manifold_ipc::CriticalRecord {
+                        sequence,
+                        ..manifold_ipc::CriticalRecord::default()
+                    })
+                    .is_ok()
+            );
+        }
+
+        anyhow::ensure!(send_input(
+            &mut lane,
+            manifold_ipc::INPUT_WINDOW_POINTER_BUTTON,
+            [4, 0x110, 0, 30.0_f64.to_bits(), 40.0_f64.to_bits()],
+        ));
+        anyhow::ensure!(lane.deferred.len() == 1);
+        for _ in 0..manifold_ipc::CRITICAL_CAPACITY {
+            anyhow::ensure!(consumer.try_recv().is_some());
+        }
+
+        lane.flush_deferred();
+        let release = *consumer.try_recv().context("deferred release was lost")?;
+        anyhow::ensure!(release.opcode == manifold_ipc::INPUT_WINDOW_POINTER_BUTTON);
+        anyhow::ensure!(release.arguments.get(..3) == Some([4, 0x110, 0].as_slice()));
+        anyhow::ensure!(lane.deferred.is_empty());
+
+        for sequence in 0..manifold_ipc::CRITICAL_CAPACITY as u64 {
+            anyhow::ensure!(
+                lane.producer
+                    .try_send(manifold_ipc::CriticalRecord {
+                        sequence,
+                        ..manifold_ipc::CriticalRecord::default()
+                    })
+                    .is_ok()
+            );
+        }
+        anyhow::ensure!(send_input(
+            &mut lane,
+            manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+            [3, 1, 1, 0, 0],
+        ));
+        anyhow::ensure!(send_input(
+            &mut lane,
+            manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+            [3, 2, 2, 0, 0],
+        ));
+        anyhow::ensure!(send_input(
+            &mut lane,
+            manifold_ipc::INPUT_WINDOW_POINTER_BUTTON,
+            [3, 0x110, 1, 2, 2],
+        ));
+        anyhow::ensure!(send_input(
+            &mut lane,
+            manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+            [3, 3, 3, 0, 0],
+        ));
+        anyhow::ensure!(send_input(
+            &mut lane,
+            manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+            [3, 4, 4, 0, 0],
+        ));
+        anyhow::ensure!(lane.deferred.len() == 3);
+        anyhow::ensure!(lane.coalesced_motion == 2);
+        for _ in 0..manifold_ipc::CRITICAL_CAPACITY {
+            anyhow::ensure!(consumer.try_recv().is_some());
+        }
+        lane.flush_deferred();
+        let mut records = Vec::new();
+        for _ in 0..3 {
+            records.push(*consumer.try_recv().context("deferred input was lost")?);
+        }
+        anyhow::ensure!(
+            records
+                .iter()
+                .map(|record| record.opcode)
+                .collect::<Vec<_>>()
+                == vec![
+                    manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+                    manifold_ipc::INPUT_WINDOW_POINTER_BUTTON,
+                    manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+                ]
+        );
+        anyhow::ensure!(
+            records
+                .first()
+                .context("missing first deferred input")?
+                .arguments
+                .get(1)
+                == Some(&2)
+        );
+        anyhow::ensure!(
+            records
+                .last()
+                .context("missing final deferred input")?
+                .arguments
+                .get(1)
+                == Some(&4)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn line_scroll_converts_to_signed_wayland_v120() {
+        assert_eq!(wheel_v120(1.0), -120);
+        assert_eq!(wheel_v120(-1.0), 120);
+        assert_eq!(wheel_v120(0.5), -60);
+        assert_eq!(wheel_v120(f32::NAN), 0);
     }
 }
