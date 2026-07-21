@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use cosmic_text::{Attrs, Buffer, Color as TextColor, FontSystem, Metrics, Shaping, SwashCache};
 use manifold_graphics::{Command, Packet, PacketError};
 use manifold_wasm::{PresentationError, PresentationHost, TextLayoutOptions, TextLayoutResult};
@@ -16,6 +16,7 @@ use winit::event_loop::EventLoopProxy;
 use crate::ClientEvent;
 
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RESOURCE_DIMENSION: u32 = 4_096;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 const MAX_TEXT_LAYOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESOURCES_PER_PANE: usize = 1_024;
@@ -58,7 +59,7 @@ pub struct ImageResource {
     pub generation: u64,
     pub width: u32,
     pub height: u32,
-    pub premultiplied_rgba: Arc<[u8]>,
+    pub linear_premultiplied_rgba8: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,7 +80,7 @@ pub struct TextLayoutResource {
     pub generation: u64,
     pub width: u32,
     pub height: u32,
-    pub premultiplied_rgba: Arc<[u8]>,
+    pub linear_premultiplied_rgba8: Arc<[u8]>,
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +91,11 @@ struct GraphicsState {
     images: BTreeMap<u64, ImageResource>,
     text_layouts: BTreeMap<u64, TextLayoutResource>,
 }
+
+type ReferencedResources = (
+    BTreeMap<u64, ImageResource>,
+    BTreeMap<u64, TextLayoutResource>,
+);
 
 impl PluginGraphicsBridge {
     pub fn new(proxy: EventLoopProxy<ClientEvent>) -> Self {
@@ -119,33 +125,9 @@ impl PluginGraphicsBridge {
         let Some(scene) = state.panes.get(&pane) else {
             return Ok(None);
         };
-        let mut images = BTreeMap::new();
-        let mut text_layouts = BTreeMap::new();
-        for command in &scene.packet.commands {
-            match command {
-                Command::DrawImage { image, .. } => {
-                    let resource = state
-                        .images
-                        .get(image)
-                        .filter(|resource| {
-                            resource.pane == pane && resource.generation == scene.generation
-                        })
-                        .with_context(|| format!("accepted packet lost image resource {image}"))?;
-                    images.insert(*image, resource.clone());
-                }
-                Command::DrawTextLayout { layout, .. } => {
-                    let resource = state
-                        .text_layouts
-                        .get(layout)
-                        .filter(|resource| {
-                            resource.pane == pane && resource.generation == scene.generation
-                        })
-                        .with_context(|| format!("accepted packet lost text layout {layout}"))?;
-                    text_layouts.insert(*layout, resource.clone());
-                }
-                _ => {}
-            }
-        }
+        let (images, text_layouts) =
+            referenced_resources(&state, pane, scene.generation, &scene.packet)
+                .map_err(|_error| anyhow!("accepted packet lost a referenced resource"))?;
         let snapshot = GraphicsSnapshot {
             pane,
             sequence: scene.sequence,
@@ -160,8 +142,8 @@ impl PluginGraphicsBridge {
 
 impl ActorPresentationHost {
     pub fn bind_generation(&self, generation: u64) {
-        self.generation.store(generation, Ordering::Release);
         if let Ok(mut state) = self.bridge.shared.lock() {
+            self.generation.store(generation, Ordering::Release);
             state
                 .images
                 .retain(|_, resource| resource.pane != self.pane);
@@ -192,31 +174,36 @@ impl PresentationHost for ActorPresentationHost {
             PacketError::Limit(_) => PresentationError::LimitReached,
             PacketError::Invalid(_) => PresentationError::InvalidPacket,
         })?;
+        let (images, text_layouts) = {
+            let state = self
+                .bridge
+                .shared
+                .lock()
+                .map_err(|_poisoned| PresentationError::HostFailure)?;
+            if actor_generation != self.generation.load(Ordering::Acquire) {
+                return Err(PresentationError::InvalidPane);
+            }
+            referenced_resources(&state, pane, actor_generation, &packet)?
+        };
+        let candidate = GraphicsSnapshot {
+            pane,
+            sequence: 0,
+            packet,
+            images,
+            text_layouts,
+        };
+        crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
+        let packet = candidate.packet;
         let (sequence, previous) = {
             let mut state = self
                 .bridge
                 .shared
                 .lock()
                 .map_err(|_poisoned| PresentationError::HostFailure)?;
-            for command in &packet.commands {
-                match command {
-                    Command::DrawImage { image, .. }
-                        if state.images.get(image).is_none_or(|resource| {
-                            resource.pane != pane || resource.generation != actor_generation
-                        }) =>
-                    {
-                        return Err(PresentationError::InvalidResource);
-                    }
-                    Command::DrawTextLayout { layout, .. }
-                        if state.text_layouts.get(layout).is_none_or(|resource| {
-                            resource.pane != pane || resource.generation != actor_generation
-                        }) =>
-                    {
-                        return Err(PresentationError::InvalidResource);
-                    }
-                    _ => {}
-                }
+            if actor_generation != self.generation.load(Ordering::Acquire) {
+                return Err(PresentationError::InvalidPane);
             }
+            referenced_resources(&state, pane, actor_generation, &packet)?;
             state.next_sequence = state
                 .next_sequence
                 .checked_add(1)
@@ -263,6 +250,12 @@ impl PresentationHost for ActorPresentationHost {
         mut pixels: Vec<u8>,
     ) -> Result<u64, PresentationError> {
         self.authorize(actor_generation, pane)?;
+        if width == 0 || height == 0 {
+            return Err(PresentationError::InvalidArgument);
+        }
+        if width > MAX_RESOURCE_DIMENSION || height > MAX_RESOURCE_DIMENSION {
+            return Err(PresentationError::LimitReached);
+        }
         let expected = usize::try_from(width)
             .ok()
             .and_then(|width| {
@@ -272,27 +265,26 @@ impl PresentationHost for ActorPresentationHost {
             })
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or(PresentationError::InvalidArgument)?;
-        if width == 0 || height == 0 || expected != pixels.len() {
+        if expected != pixels.len() {
             return Err(PresentationError::InvalidArgument);
         }
         if expected > MAX_IMAGE_BYTES {
             return Err(PresentationError::LimitReached);
         }
         for pixel in pixels.chunks_exact_mut(4) {
-            let Some((&mut alpha, channels)) = pixel.split_last_mut() else {
+            let Ok(pixel) = <&mut [u8; 4]>::try_from(pixel) else {
                 return Err(PresentationError::HostFailure);
             };
-            let alpha = u16::from(alpha);
-            for channel in channels {
-                *channel =
-                    u8::try_from((u16::from(*channel) * alpha + 127) / 255).unwrap_or(u8::MAX);
-            }
+            *pixel = linear_premultiplied_srgba8(*pixel);
         }
         let mut state = self
             .bridge
             .shared
             .lock()
             .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if actor_generation != self.generation.load(Ordering::Acquire) {
+            return Err(PresentationError::InvalidPane);
+        }
         let handle = allocate_resource_handle(&mut state, pane, actor_generation, expected)?;
         state.images.insert(
             handle,
@@ -301,7 +293,7 @@ impl PresentationHost for ActorPresentationHost {
                 generation: actor_generation,
                 width,
                 height,
-                premultiplied_rgba: pixels.into(),
+                linear_premultiplied_rgba8: pixels.into(),
             },
         );
         drop(state);
@@ -330,11 +322,14 @@ impl PresentationHost for ActorPresentationHost {
             .shared
             .lock()
             .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if actor_generation != self.generation.load(Ordering::Acquire) {
+            return Err(PresentationError::InvalidPane);
+        }
         let handle = allocate_resource_handle(
             &mut state,
             pane,
             actor_generation,
-            resource.premultiplied_rgba.len(),
+            resource.linear_premultiplied_rgba8.len(),
         )?;
         state.text_layouts.insert(
             handle,
@@ -360,6 +355,9 @@ impl PresentationHost for ActorPresentationHost {
             .shared
             .lock()
             .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if actor_generation != self.generation.load(Ordering::Acquire) {
+            return Err(PresentationError::InvalidPane);
+        }
         if state.panes.values().any(|scene| {
             scene.packet.commands.iter().any(|command| match command {
                 Command::DrawImage { image, .. } => *image == resource,
@@ -385,6 +383,38 @@ impl PresentationHost for ActorPresentationHost {
         drop(state);
         Ok(())
     }
+}
+
+fn referenced_resources(
+    state: &GraphicsState,
+    pane: u64,
+    generation: u64,
+    packet: &Packet,
+) -> Result<ReferencedResources, PresentationError> {
+    let mut images = BTreeMap::new();
+    let mut text_layouts = BTreeMap::new();
+    for command in &packet.commands {
+        match command {
+            Command::DrawImage { image, .. } => {
+                let resource = state
+                    .images
+                    .get(image)
+                    .filter(|resource| resource.pane == pane && resource.generation == generation)
+                    .ok_or(PresentationError::InvalidResource)?;
+                images.insert(*image, resource.clone());
+            }
+            Command::DrawTextLayout { layout, .. } => {
+                let resource = state
+                    .text_layouts
+                    .get(layout)
+                    .filter(|resource| resource.pane == pane && resource.generation == generation)
+                    .ok_or(PresentationError::InvalidResource)?;
+                text_layouts.insert(*layout, resource.clone());
+            }
+            _ => {}
+        }
+    }
+    Ok((images, text_layouts))
 }
 
 impl Drop for ActorPresentationHost {
@@ -426,13 +456,13 @@ fn allocate_resource_handle(
         .images
         .values()
         .filter(|resource| resource.pane == pane && resource.generation == generation)
-        .map(|resource| resource.premultiplied_rgba.len())
+        .map(|resource| resource.linear_premultiplied_rgba8.len())
         .chain(
             state
                 .text_layouts
                 .values()
                 .filter(|resource| resource.pane == pane && resource.generation == generation)
-                .map(|resource| resource.premultiplied_rgba.len()),
+                .map(|resource| resource.linear_premultiplied_rgba8.len()),
         )
         .try_fold(0_usize, usize::checked_add)
         .and_then(|bytes| bytes.checked_add(new_bytes))
@@ -454,7 +484,7 @@ fn validate_text_request(text: &str, options: TextLayoutOptions) -> Result<(), P
     if !options.font_size.is_finite()
         || !(1.0..=512.0).contains(&options.font_size)
         || !options.max_width.is_finite()
-        || !(1.0..=16_384.0).contains(&options.max_width)
+        || !(1.0..=MAX_RESOURCE_DIMENSION as f32).contains(&options.max_width)
         || !options.line_height.is_finite()
         || options.line_height < options.font_size * 0.5
         || options.line_height > options.font_size * 4.0
@@ -495,6 +525,9 @@ fn create_text_layout(
     }
     let width = measured_width.ceil().max(1.0) as u32;
     let height = measured_height.ceil().max(options.line_height).max(1.0) as u32;
+    if width > MAX_RESOURCE_DIMENSION || height > MAX_RESOURCE_DIMENSION {
+        return Err(PresentationError::LimitReached);
+    }
     let bytes = usize::try_from(width)
         .ok()
         .and_then(|width| {
@@ -513,7 +546,7 @@ fn create_text_layout(
         unit_to_u8(red),
         unit_to_u8(green),
         unit_to_u8(blue),
-        unit_to_u8(alpha),
+        u8::MAX,
     );
     let TextSystem { fonts, swash } = text_system;
     buffer.draw(
@@ -547,7 +580,7 @@ fn create_text_layout(
                     let Ok(destination) = <&mut [u8; 4]>::try_from(destination) else {
                         continue;
                     };
-                    blend_text_pixel(destination, color);
+                    blend_text_pixel(destination, color, alpha);
                 }
             }
         },
@@ -558,7 +591,7 @@ fn create_text_layout(
             generation: 0,
             width,
             height,
-            premultiplied_rgba: pixels.into(),
+            linear_premultiplied_rgba8: pixels.into(),
         },
         TextLayoutResult {
             handle: 0,
@@ -574,20 +607,62 @@ fn unit_to_u8(value: f32) -> u8 {
     (value * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-fn blend_text_pixel(destination: &mut [u8; 4], color: TextColor) {
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_premultiplied_srgba8([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
+    let opacity = f32::from(alpha) / 255.0;
+    [
+        unit_to_u8(srgb_to_linear(f32::from(red) / 255.0) * opacity),
+        unit_to_u8(srgb_to_linear(f32::from(green) / 255.0) * opacity),
+        unit_to_u8(srgb_to_linear(f32::from(blue) / 255.0) * opacity),
+        alpha,
+    ]
+}
+
+fn blend_text_pixel(destination: &mut [u8; 4], color: TextColor, requested_alpha: f32) {
     let [red, green, blue, alpha] = color.as_rgba();
-    let alpha_u16 = u16::from(alpha);
-    let inverse = 255_u16.saturating_sub(alpha_u16);
-    let premultiplied = [red, green, blue].map(|channel| {
-        u8::try_from((u16::from(channel) * alpha_u16 + 127) / 255).unwrap_or(u8::MAX)
-    });
+    let opacity = f32::from(alpha) / 255.0 * requested_alpha;
+    let inverse = 1.0 - opacity;
+    let premultiplied =
+        [red, green, blue].map(|channel| srgb_to_linear(f32::from(channel) / 255.0) * opacity);
     let [red, green, blue, output_alpha] = destination;
     for (output, source) in [red, green, blue].into_iter().zip(premultiplied) {
-        *output = source.saturating_add(
-            u8::try_from((u16::from(*output) * inverse + 127) / 255).unwrap_or(u8::MAX),
-        );
+        *output = unit_to_u8((f32::from(*output) / 255.0).mul_add(inverse, source));
     }
-    *output_alpha = alpha.saturating_add(
-        u8::try_from((u16::from(*output_alpha) * inverse + 127) / 255).unwrap_or(u8::MAX),
-    );
+    *output_alpha = unit_to_u8((f32::from(*output_alpha) / 255.0).mul_add(inverse, opacity));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba8_resources_are_linearized_before_premultiplication() {
+        assert_eq!(
+            linear_premultiplied_srgba8([128, 128, 128, 255]),
+            [55, 55, 55, 255]
+        );
+        assert_eq!(
+            linear_premultiplied_srgba8([255, 0, 0, 128]),
+            [128, 0, 0, 128]
+        );
+        assert_eq!(linear_premultiplied_srgba8([20, 80, 240, 0]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn text_coverage_is_composited_in_linear_premultiplied_space() {
+        let mut destination = [0, 0, 0, 0];
+        blend_text_pixel(&mut destination, TextColor::rgba(255, 255, 255, 128), 1.0);
+        assert_eq!(destination, [128, 128, 128, 128]);
+
+        let mut translucent = [0, 0, 0, 0];
+        blend_text_pixel(&mut translucent, TextColor::rgba(255, 255, 255, 128), 0.5);
+        assert_eq!(translucent, [64, 64, 64, 64]);
+    }
 }

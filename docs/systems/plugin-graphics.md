@@ -68,10 +68,12 @@ the path latest-state rather than queue semantics:
 
 Acceptance is the final per-packet state, not admission to later validation.
 Every command and referenced resource is already valid and renderable when the
-packet becomes active. WGPU lowering does not later reject an individual
-accepted packet. Device loss, allocation failure, or another renderer-wide
-failure enters client renderer recovery and replays the accepted CPU-side scene;
-it is not reported as delayed packet rejection.
+packet becomes active. Before replacement, the client performs the same bounded
+path tessellation used by the renderer at its finest supported tolerance and
+checks the resulting vertex and index budgets. WGPU lowering does not later
+reject an individual accepted packet. Device loss, allocation failure, or
+another renderer-wide failure enters client renderer recovery and replays the
+accepted CPU-side scene; it is not reported as delayed packet rejection.
 
 The host assigns the submission sequence used for diagnostics. An actor may
 also include its own view revision for correlating input, drawing, and optional
@@ -88,8 +90,10 @@ The host validates the complete packet before acceptance, including:
 
 - total bytes and command count;
 - command lengths, offsets, alignment, and arithmetic;
-- finite coordinates, transforms, colors, and layer bounds;
-- balanced saved state, clips, and layers;
+- finite coordinates, transforms, and colors;
+- balanced saved state and layers;
+- save/restore-aware clip depth and nested layer depth;
+- bounded tessellated vertex and index output;
 - resource type, generation, ownership, and readiness;
 - supported enum values and packet version.
 
@@ -126,22 +130,30 @@ testing freezes the ABI. The important contract is canvas-like behavior rather
 than GPU pipeline state. Drawing commands carry their paint and stroke
 parameters directly or reference a simple immutable paint; transforms, clips,
 opacity, and compositing use the bounded saved-state stack.
+Filled and clipped paths use the canvas-standard nonzero winding rule.
 
 Coordinates are pane-local logical units. The host supplies pane size and scale
 events, clips every packet to the pane content area, and maps logical drawing to
 the physical target. The base profile defines one color and alpha convention so
-SDKs do not branch on the active WGPU backend. Native pane chrome, menus,
-recovery UI, and presentation overlays remain outside the packet's drawable
-area.
+SDKs do not branch on the active WGPU backend. Packet colors and copied RGBA8
+image inputs are straight-alpha sRGB. The host converts them to linear-light
+premultiplied values before filtering or blending; opacity, layer composition,
+and every blend mode operate in that linear premultiplied space. Presentation
+converts the final linear result to the output color space. Fully transparent
+colored texels therefore cannot bleed encoded RGB into filtered edges. Native
+pane chrome, menus, recovery UI, and presentation overlays remain outside the
+packet's drawable area.
 
 ## GPU Lowering
 
 The presentation client lowers an accepted packet to a retained GPU scene. Path
 curves and strokes are tessellated to bounded vertex and index data when the
-packet changes; this is geometry preparation, not CPU rasterization. Images,
-native text output, and other immutable resources are uploaded on first use and
-reused while retained across replacement packets which reference the same
-handles.
+packet changes; this is geometry preparation, not CPU rasterization. Curve
+tolerance accounts for the current transform and pane scale, has a bounded
+lower limit, and is preflighted against the scene geometry budget before packet
+acceptance. Images, native text output, and other immutable resources are
+uploaded on first use and reused while retained across replacement packets
+which reference the same handles.
 
 Repainting records the scene's ordered render passes, copies, and draw calls into
 the presentation frame's WGPU command encoder. Pane drawing, layer composition,
@@ -154,14 +166,21 @@ after every input event.
 Canvas state remains a lowering concern rather than protocol-visible GPU state:
 
 - transforms are applied while producing pane-local geometry;
-- nested clips use a bounded stencil representation;
-- layers use bounded transient render targets;
+- nested clips use a bounded stencil representation and restore with saved
+  canvas state;
+- layers reuse transient render targets by active nesting depth, so sequential
+  layers do not grow target allocation;
 - source-over, additive, and directly representable blend modes use fixed GPU
   blending;
 - blend modes which read the destination use a bounded target snapshot and a
   host shader selected by the canvas blend mode;
 - user-provided shaders, pipelines, or command buffers are never accepted by the
   base protocol.
+
+Canvas geometry and clip coverage use multisample antialiasing before each
+target is resolved for sampling or final composition. This keeps ordinary path
+and rounded-rectangle edges canvas-quality without introducing a CPU coverage
+buffer.
 
 Static accepted scenes retain their GPU output. Expose and composition-only
 frames reuse that output without replaying the packet. A replacement packet or

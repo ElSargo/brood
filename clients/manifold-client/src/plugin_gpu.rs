@@ -8,20 +8,48 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use lyon_tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor, LineCap,
-    LineJoin, StrokeOptions, StrokeTessellator, StrokeVertex, StrokeVertexConstructor,
-    VertexBuffers,
+    FillGeometryBuilder, FillOptions, FillRule, FillTessellator, FillVertex, GeometryBuilder,
+    GeometryBuilderError, LineCap, LineJoin, StrokeGeometryBuilder, StrokeOptions,
+    StrokeTessellator, StrokeVertex, TessellationError, VertexBuffers, VertexId,
     math::{Point, point},
     path::Path as LyonPath,
 };
 use manifold_graphics::{BlendMode, Color, Command, Path, PathSegment, Rect, Transform};
+use manifold_wasm::PresentationError;
+use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 use crate::plugin_graphics::{GraphicsSnapshot, ImageResource, TextLayoutResource};
 
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const RESOURCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
+const SAMPLE_COUNT: u32 = 4;
 const SLOW_FRAME: Duration = Duration::from_millis(8);
+const MAX_SCENE_VERTICES: usize = 262_144;
+const MAX_SCENE_INDICES: usize = 786_432;
+const TARGET_CURVE_ERROR_PIXELS: f32 = 0.25;
+const MIN_TESSELLATION_TOLERANCE: f32 = 0.01;
+const MAX_TESSELLATION_SCALE: f32 = 8.0;
+
+#[derive(Debug, Error)]
+enum SceneCompileError {
+    #[error("plugin GPU scene complexity limit exceeded")]
+    Limit,
+    #[error("plugin GPU scene is not renderable: {0}")]
+    Invalid(String),
+}
+
+impl SceneCompileError {
+    const fn presentation_error(&self) -> PresentationError {
+        match self {
+            Self::Limit => PresentationError::LimitReached,
+            Self::Invalid(_) => PresentationError::InvalidPacket,
+        }
+    }
+}
+
+type CompileResult<T> = std::result::Result<T, SceneCompileError>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -98,6 +126,8 @@ struct GpuTexture {
 
 #[derive(Clone)]
 struct CanvasTarget {
+    _multisample_texture: wgpu::Texture,
+    multisample_view: wgpu::TextureView,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
@@ -144,6 +174,15 @@ pub struct GpuCanvasRenderer {
     darken_pipeline: wgpu::RenderPipeline,
     lighten_pipeline: wgpu::RenderPipeline,
     difference_pipeline: wgpu::RenderPipeline,
+}
+
+pub fn validate_snapshot_lowering(
+    snapshot: &GraphicsSnapshot,
+) -> std::result::Result<(), PresentationError> {
+    let mut compiler = SceneCompiler::new(1, 1, MAX_TESSELLATION_SCALE);
+    compiler
+        .compile(snapshot)
+        .map_err(|error| error.presentation_error())
 }
 
 impl GpuCanvasRenderer {
@@ -490,8 +529,8 @@ impl GpuCanvasRenderer {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("plugin GPU canvas draw"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.view,
-                resolve_target: None,
+                view: &target.multisample_view,
+                resolve_target: Some(&target.view),
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
@@ -576,7 +615,7 @@ impl GpuCanvasRenderer {
             &self.texture_layout,
             &self.sampler,
             (resource.width, resource.height),
-            &resource.premultiplied_rgba,
+            &resource.linear_premultiplied_rgba8,
             &format!("plugin GPU image {handle}"),
         )
     }
@@ -594,7 +633,7 @@ impl GpuCanvasRenderer {
             &self.texture_layout,
             &self.sampler,
             (resource.width, resource.height),
-            &resource.premultiplied_rgba,
+            &resource.linear_premultiplied_rgba8,
             &format!("plugin GPU text layout {handle}"),
         )
     }
@@ -606,6 +645,22 @@ impl GpuCanvasRenderer {
         height: u32,
         label: &str,
     ) -> CanvasTarget {
+        let multisample_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("{label} multisample")),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: CANVAS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let multisample_view =
+            multisample_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -627,6 +682,8 @@ impl GpuCanvasRenderer {
         let bind_group =
             texture_bind_group(device, &self.texture_layout, &self.sampler, &view, label);
         CanvasTarget {
+            _multisample_texture: multisample_texture,
+            multisample_view,
             texture,
             view,
             bind_group,
@@ -673,7 +730,7 @@ impl SceneCompiler {
         }
     }
 
-    fn compile(&mut self, snapshot: &GraphicsSnapshot) -> Result<()> {
+    fn compile(&mut self, snapshot: &GraphicsSnapshot) -> CompileResult<()> {
         let mut state = CompileState::default();
         let mut saved = Vec::new();
         let mut layers = Vec::new();
@@ -681,7 +738,9 @@ impl SceneCompiler {
             match command {
                 Command::Save => saved.push(state.clone()),
                 Command::Restore => {
-                    state = saved.pop().context("validated GPU restore lost state")?;
+                    state = saved.pop().ok_or_else(|| {
+                        SceneCompileError::Invalid("restore stack underflow".to_owned())
+                    })?;
                 }
                 Command::SetTransform(transform) => state.transform = *transform,
                 Command::SetOpacity(opacity) => state.opacity = *opacity,
@@ -764,32 +823,31 @@ impl SceneCompiler {
                         state.transform,
                         [state.opacity; 4],
                         false,
-                    );
+                    )?;
                     self.push_draw(geometry, DrawSource::Resource(*image), &state);
                 }
                 Command::DrawTextLayout { layout, x, y } => {
-                    let resource = snapshot
-                        .text_layouts
-                        .get(layout)
-                        .with_context(|| format!("validated text layout {layout} disappeared"))?;
+                    let resource = snapshot.text_layouts.get(layout).ok_or_else(|| {
+                        SceneCompileError::Invalid(format!("text layout {layout} is unavailable"))
+                    })?;
                     let geometry = self.quad_geometry(
                         Rect::new(*x, *y, resource.width as f32, resource.height as f32),
                         state.transform,
                         [state.opacity; 4],
                         false,
-                    );
+                    )?;
                     self.push_draw(geometry, DrawSource::Resource(*layout), &state);
                 }
                 Command::BeginLayer => {
-                    let layer = self.layer_count;
-                    self.layer_count = self.layer_count.saturating_add(1);
+                    let layer = layers.len();
+                    self.layer_count = self.layer_count.max(layer.saturating_add(1));
                     layers.push(layer);
                     self.ops.push(CanvasOp::BeginLayer(layer));
                 }
                 Command::EndLayer => {
-                    let layer = layers
-                        .pop()
-                        .context("validated GPU layer stack underflowed")?;
+                    let layer = layers.pop().ok_or_else(|| {
+                        SceneCompileError::Invalid("layer stack underflow".to_owned())
+                    })?;
                     let logical_width = self.width as f32 / self.scale;
                     let logical_height = self.height as f32 / self.scale;
                     let geometry = self.quad_geometry(
@@ -797,7 +855,7 @@ impl SceneCompiler {
                         Transform::IDENTITY,
                         [1.0; 4],
                         true,
-                    );
+                    )?;
                     self.ops.push(CanvasOp::EndLayer {
                         layer,
                         draw: DrawOp {
@@ -827,16 +885,21 @@ impl SceneCompiler {
         path: &Path,
         transform: Transform,
         color: [f32; 4],
-    ) -> Result<Geometry> {
+    ) -> CompileResult<Geometry> {
         let path = lyon_path(path);
         let mut geometry = VertexBuffers::<Point, u32>::new();
-        FillTessellator::new()
-            .tessellate_path(
-                &path,
-                &FillOptions::tolerance(0.1),
-                &mut BuffersBuilder::new(&mut geometry, Positions),
-            )
-            .map_err(|error| anyhow!("tessellate plugin fill path: {error:?}"))?;
+        let mut builder = LimitedGeometryBuilder::new(
+            &mut geometry,
+            MAX_SCENE_VERTICES.saturating_sub(self.vertices.len()),
+            MAX_SCENE_INDICES.saturating_sub(self.indices.len()),
+        );
+        let result = FillTessellator::new().tessellate_path(
+            &path,
+            &FillOptions::tolerance(self.tessellation_tolerance(transform))
+                .with_fill_rule(FillRule::NonZero),
+            &mut builder,
+        );
+        check_tessellation(result, builder.overflowed())?;
         self.append_tessellation(geometry, transform, color)
     }
 
@@ -846,19 +909,23 @@ impl SceneCompiler {
         transform: Transform,
         color: [f32; 4],
         width: f32,
-    ) -> Result<Geometry> {
+    ) -> CompileResult<Geometry> {
         let path = lyon_path(path);
         let mut geometry = VertexBuffers::<Point, u32>::new();
-        StrokeTessellator::new()
-            .tessellate_path(
-                &path,
-                &StrokeOptions::tolerance(0.1)
-                    .with_line_width(width)
-                    .with_line_cap(LineCap::Round)
-                    .with_line_join(LineJoin::Round),
-                &mut BuffersBuilder::new(&mut geometry, Positions),
-            )
-            .map_err(|error| anyhow!("tessellate plugin stroke path: {error:?}"))?;
+        let mut builder = LimitedGeometryBuilder::new(
+            &mut geometry,
+            MAX_SCENE_VERTICES.saturating_sub(self.vertices.len()),
+            MAX_SCENE_INDICES.saturating_sub(self.indices.len()),
+        );
+        let result = StrokeTessellator::new().tessellate_path(
+            &path,
+            &StrokeOptions::tolerance(self.tessellation_tolerance(transform))
+                .with_line_width(width)
+                .with_line_cap(LineCap::Round)
+                .with_line_join(LineJoin::Round),
+            &mut builder,
+        );
+        check_tessellation(result, builder.overflowed())?;
         self.append_tessellation(geometry, transform, color)
     }
 
@@ -867,11 +934,12 @@ impl SceneCompiler {
         geometry: VertexBuffers<Point, u32>,
         transform: Transform,
         color: [f32; 4],
-    ) -> Result<Geometry> {
-        let base_vertex = u32::try_from(self.vertices.len())
-            .context("plugin GPU canvas vertex limit exceeded")?;
+    ) -> CompileResult<Geometry> {
+        self.ensure_capacity(geometry.vertices.len(), geometry.indices.len())?;
+        let base_vertex =
+            u32::try_from(self.vertices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
         let first_index =
-            u32::try_from(self.indices.len()).context("plugin GPU canvas index limit exceeded")?;
+            u32::try_from(self.indices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
         let width = self.width;
         let height = self.height;
         let scale = self.scale;
@@ -890,11 +958,11 @@ impl SceneCompiler {
             self.indices.push(
                 base_vertex
                     .checked_add(index)
-                    .context("plugin GPU canvas index overflow")?,
+                    .ok_or(SceneCompileError::Limit)?,
             );
         }
         let last_index =
-            u32::try_from(self.indices.len()).context("plugin GPU canvas index limit exceeded")?;
+            u32::try_from(self.indices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
         Ok(Geometry {
             indices: first_index..last_index,
         })
@@ -906,9 +974,12 @@ impl SceneCompiler {
         transform: Transform,
         color: [f32; 4],
         flip_vertical: bool,
-    ) -> Geometry {
-        let base_vertex = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX - 4);
-        let first_index = u32::try_from(self.indices.len()).unwrap_or(u32::MAX - 6);
+    ) -> CompileResult<Geometry> {
+        self.ensure_capacity(4, 6)?;
+        let base_vertex =
+            u32::try_from(self.vertices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
+        let first_index =
+            u32::try_from(self.indices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
         let right = rect.x + rect.width;
         let bottom = rect.y + rect.height;
         let (top_uv, bottom_uv) = if flip_vertical {
@@ -936,9 +1007,46 @@ impl SceneCompiler {
             base_vertex + 2,
             base_vertex + 3,
         ]);
-        Geometry {
+        Ok(Geometry {
             indices: first_index..first_index + 6,
+        })
+    }
+
+    fn ensure_capacity(&self, vertices: usize, indices: usize) -> CompileResult<()> {
+        if self
+            .vertices
+            .len()
+            .checked_add(vertices)
+            .is_none_or(|count| count > MAX_SCENE_VERTICES)
+            || self
+                .indices
+                .len()
+                .checked_add(indices)
+                .is_none_or(|count| count > MAX_SCENE_INDICES)
+        {
+            return Err(SceneCompileError::Limit);
         }
+        Ok(())
+    }
+
+    fn tessellation_tolerance(&self, transform: Transform) -> f32 {
+        let sx = f64::from(transform.sx);
+        let ky = f64::from(transform.ky);
+        let kx = f64::from(transform.kx);
+        let sy = f64::from(transform.sy);
+        let sum_of_squares = sy.mul_add(sy, kx.mul_add(kx, ky.mul_add(ky, sx * sx)));
+        let determinant = kx.mul_add(-ky, sx * sy);
+        let discriminant = (4.0 * determinant)
+            .mul_add(-determinant, sum_of_squares * sum_of_squares)
+            .max(0.0);
+        let transform_scale = ((sum_of_squares + discriminant.sqrt()) * 0.5)
+            .sqrt()
+            .max(1.0);
+        let device_scale = f64::from(self.scale.clamp(1.0, MAX_TESSELLATION_SCALE));
+        (f64::from(TARGET_CURVE_ERROR_PIXELS) / (transform_scale * device_scale)).clamp(
+            f64::from(MIN_TESSELLATION_TOLERANCE),
+            f64::from(TARGET_CURVE_ERROR_PIXELS),
+        ) as f32
     }
 
     fn ndc(&self, logical: [f32; 2]) -> [f32; 2] {
@@ -951,18 +1059,114 @@ impl SceneCompiler {
     }
 }
 
-struct Positions;
+struct LimitedGeometryBuilder<'a> {
+    buffers: &'a mut VertexBuffers<Point, u32>,
+    max_vertices: usize,
+    max_indices: usize,
+    first_vertex: usize,
+    first_index: usize,
+    overflowed: bool,
+}
 
-impl FillVertexConstructor<Point> for Positions {
-    fn new_vertex(&mut self, vertex: FillVertex<'_>) -> Point {
-        vertex.position()
+impl<'a> LimitedGeometryBuilder<'a> {
+    const fn new(
+        buffers: &'a mut VertexBuffers<Point, u32>,
+        max_vertices: usize,
+        max_indices: usize,
+    ) -> Self {
+        Self {
+            buffers,
+            max_vertices,
+            max_indices,
+            first_vertex: 0,
+            first_index: 0,
+            overflowed: false,
+        }
+    }
+
+    const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    fn add_position(
+        &mut self,
+        position: Point,
+    ) -> std::result::Result<VertexId, GeometryBuilderError> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return Err(GeometryBuilderError::InvalidVertex);
+        }
+        if self.buffers.vertices.len() >= self.max_vertices {
+            self.overflowed = true;
+            return Err(GeometryBuilderError::TooManyVertices);
+        }
+        let index = u32::try_from(self.buffers.vertices.len())
+            .map_err(|_overflow| GeometryBuilderError::TooManyVertices)?;
+        self.buffers.vertices.push(position);
+        Ok(VertexId(index))
     }
 }
 
-impl StrokeVertexConstructor<Point> for Positions {
-    fn new_vertex(&mut self, vertex: StrokeVertex<'_, '_>) -> Point {
-        vertex.position()
+impl GeometryBuilder for LimitedGeometryBuilder<'_> {
+    fn begin_geometry(&mut self) {
+        self.first_vertex = self.buffers.vertices.len();
+        self.first_index = self.buffers.indices.len();
     }
+
+    fn add_triangle(&mut self, a: VertexId, b: VertexId, c: VertexId) {
+        if self
+            .buffers
+            .indices
+            .len()
+            .checked_add(3)
+            .is_none_or(|count| count > self.max_indices)
+        {
+            self.overflowed = true;
+            return;
+        }
+        self.buffers.indices.extend_from_slice(&[a.0, b.0, c.0]);
+    }
+
+    fn abort_geometry(&mut self) {
+        self.buffers.vertices.truncate(self.first_vertex);
+        self.buffers.indices.truncate(self.first_index);
+    }
+}
+
+impl FillGeometryBuilder for LimitedGeometryBuilder<'_> {
+    fn add_fill_vertex(
+        &mut self,
+        vertex: FillVertex<'_>,
+    ) -> std::result::Result<VertexId, GeometryBuilderError> {
+        self.add_position(vertex.position())
+    }
+}
+
+impl StrokeGeometryBuilder for LimitedGeometryBuilder<'_> {
+    fn add_stroke_vertex(
+        &mut self,
+        vertex: StrokeVertex<'_, '_>,
+    ) -> std::result::Result<VertexId, GeometryBuilderError> {
+        self.add_position(vertex.position())
+    }
+}
+
+fn check_tessellation<T>(
+    result: std::result::Result<T, TessellationError>,
+    overflowed: bool,
+) -> CompileResult<()> {
+    if overflowed
+        || matches!(
+            result,
+            Err(TessellationError::GeometryBuilder(
+                GeometryBuilderError::TooManyVertices
+            ))
+        )
+    {
+        return Err(SceneCompileError::Limit);
+    }
+    result
+        .map(|_output| ())
+        .map_err(|error| SceneCompileError::Invalid(error.to_string()))
 }
 
 fn lyon_path(path: &Path) -> LyonPath {
@@ -1080,7 +1284,20 @@ fn ndc(width: u32, height: u32, scale: f32, logical: [f32; 2]) -> [f32; 2] {
 
 fn premultiplied(color: Color, opacity: f32) -> [f32; 4] {
     let alpha = color.a * opacity;
-    [color.r * alpha, color.g * alpha, color.b * alpha, alpha]
+    [
+        srgb_to_linear(color.r) * alpha,
+        srgb_to_linear(color.g) * alpha,
+        srgb_to_linear(color.b) * alpha,
+        alpha,
+    ]
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 const fn is_advanced_blend(mode: BlendMode) -> bool {
@@ -1114,7 +1331,7 @@ fn upload_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: CANVAS_FORMAT,
+        format: RESOURCE_FORMAT,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1177,7 +1394,7 @@ fn create_stencil(device: &wgpu::Device, width: u32, height: u32) -> StencilTarg
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: SAMPLE_COUNT,
         dimension: wgpu::TextureDimension::D2,
         format: STENCIL_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1194,8 +1411,8 @@ fn clear_target(encoder: &mut wgpu::CommandEncoder, target: &CanvasTarget, label
     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &target.view,
-            resolve_target: None,
+            view: &target.multisample_view,
+            resolve_target: Some(&target.view),
             depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -1281,7 +1498,10 @@ fn create_pipeline(
             },
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: SAMPLE_COUNT,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1427,3 +1647,404 @@ fn composite_blend(input: VertexOutput, blended: vec3<f32>) -> vec4<f32> {
     return composite_blend(input, abs(straight(dst.rgb, dst.a) - straight(src.rgb, src.a)));
 }
 ";
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::mpsc};
+
+    use anyhow::{Context, Result, ensure};
+
+    use super::*;
+
+    const TEST_WIDTH: u32 = 16;
+    const TEST_HEIGHT: u32 = 16;
+    const TEST_BYTES_PER_ROW: u32 = 256;
+
+    struct TestGpu {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        renderer: GpuCanvasRenderer,
+    }
+
+    impl TestGpu {
+        fn new() -> Result<Self> {
+            let instance = wgpu::Instance::default();
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    ..Default::default()
+                }))
+                .context("find a GPU adapter for canvas conformance")?;
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                    .context("create canvas conformance device")?;
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("canvas conformance texture layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("canvas conformance sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            let renderer = GpuCanvasRenderer::new(&device, &queue, &layout, &sampler);
+            Ok(Self {
+                device,
+                queue,
+                renderer,
+            })
+        }
+
+        fn render(&self, snapshot: &GraphicsSnapshot) -> Result<Vec<u8>> {
+            let mut scene = self.renderer.compile(
+                &self.device,
+                &self.queue,
+                snapshot,
+                (TEST_WIDTH, TEST_HEIGHT, 1.0),
+                None,
+            )?;
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("canvas conformance readback"),
+                size: u64::from(TEST_BYTES_PER_ROW) * u64::from(TEST_HEIGHT),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("canvas conformance encoder"),
+                });
+            ensure!(
+                self.renderer.encode_if_dirty(&mut encoder, &mut scene)?,
+                "new conformance scene was unexpectedly clean"
+            );
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &scene.root.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(TEST_BYTES_PER_ROW),
+                        rows_per_image: Some(TEST_HEIGHT),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: TEST_WIDTH,
+                    height: TEST_HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
+            let slice = readback.slice(..);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                drop(sender.send(result));
+            });
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .context("wait for canvas conformance readback")?;
+            receiver
+                .recv()
+                .context("canvas conformance callback dropped")?
+                .context("map canvas conformance readback")?;
+            let mapped = slice
+                .get_mapped_range()
+                .context("borrow canvas conformance readback")?;
+            let mut pixels = Vec::with_capacity((TEST_WIDTH * TEST_HEIGHT * 4) as usize);
+            for row in mapped.chunks_exact(TEST_BYTES_PER_ROW as usize) {
+                let contents = row
+                    .get(..(TEST_WIDTH * 4) as usize)
+                    .context("canvas conformance row is too short")?;
+                pixels.extend_from_slice(contents);
+            }
+            drop(mapped);
+            readback.unmap();
+            Ok(pixels)
+        }
+    }
+
+    fn snapshot(commands: Vec<Command>) -> GraphicsSnapshot {
+        GraphicsSnapshot {
+            pane: 1,
+            sequence: 1,
+            packet: manifold_graphics::Packet { commands },
+            images: BTreeMap::new(),
+            text_layouts: BTreeMap::new(),
+        }
+    }
+
+    fn pixel(pixels: &[u8], x: u32, y: u32) -> &[u8] {
+        let offset = ((y * TEST_WIDTH + x) * 4) as usize;
+        pixels.get(offset..offset + 4).unwrap_or_default()
+    }
+
+    fn assert_pixel_near(actual: &[u8], expected: [u8; 4]) {
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| i16::from(*actual).abs_diff(i16::from(expected)) <= 2),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    fn linear_to_srgb(value: f32) -> f32 {
+        if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055_f32.mul_add(value.powf(1.0 / 2.4), -0.055)
+        }
+    }
+
+    fn blend_channels(
+        backdrop: [f32; 3],
+        source: [f32; 3],
+        blend: impl Fn(f32, f32) -> f32,
+    ) -> [f32; 3] {
+        let [backdrop_red, backdrop_green, backdrop_blue] = backdrop;
+        let [source_red, source_green, source_blue] = source;
+        [
+            blend(backdrop_red, source_red),
+            blend(backdrop_green, source_green),
+            blend(backdrop_blue, source_blue),
+        ]
+    }
+
+    fn encoded_blend(mode: BlendMode, backdrop: Color, source: Color) -> [u8; 4] {
+        let backdrop = [backdrop.r, backdrop.g, backdrop.b].map(srgb_to_linear);
+        let source = [source.r, source.g, source.b].map(srgb_to_linear);
+        let blended = match mode {
+            BlendMode::SourceOver => source,
+            BlendMode::Multiply => {
+                blend_channels(backdrop, source, |backdrop, source| backdrop * source)
+            }
+            BlendMode::Screen => blend_channels(backdrop, source, |backdrop, source| {
+                backdrop.mul_add(-source, backdrop + source)
+            }),
+            BlendMode::Overlay => blend_channels(backdrop, source, |backdrop, source| {
+                if backdrop <= 0.5 {
+                    2.0 * backdrop * source
+                } else {
+                    (2.0 * (1.0 - backdrop)).mul_add(-(1.0 - source), 1.0)
+                }
+            }),
+            BlendMode::Darken => blend_channels(backdrop, source, f32::min),
+            BlendMode::Lighten => blend_channels(backdrop, source, f32::max),
+            BlendMode::Difference => blend_channels(backdrop, source, |backdrop, source| {
+                (backdrop - source).abs()
+            }),
+            BlendMode::Plus => blend_channels(backdrop, source, |backdrop, source| {
+                (backdrop + source).min(1.0)
+            }),
+        };
+        let [red, green, blue] = blended.map(linear_to_srgb);
+        [
+            (red * 255.0).round() as u8,
+            (green * 255.0).round() as u8,
+            (blue * 255.0).round() as u8,
+            255,
+        ]
+    }
+
+    #[test]
+    fn sequential_layers_reuse_targets_by_depth() -> Result<()> {
+        let mut commands = Vec::new();
+        for _ in 0..1_000 {
+            commands.extend([Command::BeginLayer, Command::EndLayer]);
+        }
+        let snapshot = snapshot(commands);
+        let mut compiler = SceneCompiler::new(TEST_WIDTH, TEST_HEIGHT, 1.0);
+        compiler.compile(&snapshot)?;
+        ensure!(
+            compiler.layer_count == 1,
+            "sequential layers allocated more than one target"
+        );
+        ensure!(
+            compiler.ops.iter().all(|operation| match operation {
+                CanvasOp::BeginLayer(layer) | CanvasOp::EndLayer { layer, .. } => *layer == 0,
+                CanvasOp::Draw(_) => true,
+            }),
+            "sequential layer operation used a target above depth zero"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transforms_tighten_curve_tessellation_tolerance() {
+        let compiler = SceneCompiler::new(TEST_WIDTH, TEST_HEIGHT, 2.0);
+        let identity = compiler.tessellation_tolerance(Transform::IDENTITY);
+        let scaled = compiler.tessellation_tolerance(Transform {
+            sx: 20.0,
+            sy: 20.0,
+            ..Transform::IDENTITY
+        });
+        assert!(scaled < identity);
+        assert!(scaled >= MIN_TESSELLATION_TOLERANCE);
+    }
+
+    #[test]
+    fn scene_geometry_budget_is_hard() {
+        let compiler = SceneCompiler::new(TEST_WIDTH, TEST_HEIGHT, 1.0);
+        assert!(matches!(
+            compiler.ensure_capacity(MAX_SCENE_VERTICES + 1, 0),
+            Err(SceneCompileError::Limit)
+        ));
+        assert!(matches!(
+            compiler.ensure_capacity(0, MAX_SCENE_INDICES + 1),
+            Err(SceneCompileError::Limit)
+        ));
+    }
+
+    #[test]
+    fn gpu_canvas_conforms_for_clips_layers_blends_resources_and_antialiasing() -> Result<()> {
+        let gpu = TestGpu::new()?;
+        let full = Rect::new(0.0, 0.0, TEST_WIDTH as f32, TEST_HEIGHT as f32);
+
+        let clipped = gpu.render(&snapshot(vec![
+            Command::FillRect {
+                rect: full,
+                color: Color::rgba(1.0, 0.0, 0.0, 1.0),
+            },
+            Command::Save,
+            Command::ClipRect(Rect::new(0.0, 0.0, 8.0, 16.0)),
+            Command::ClipRect(Rect::new(0.0, 0.0, 4.0, 16.0)),
+            Command::FillRect {
+                rect: full,
+                color: Color::rgba(0.0, 0.0, 1.0, 1.0),
+            },
+            Command::Restore,
+            Command::FillRect {
+                rect: Rect::new(4.0, 0.0, 4.0, 16.0),
+                color: Color::rgba(0.0, 1.0, 0.0, 1.0),
+            },
+            Command::BeginLayer,
+            Command::BeginLayer,
+            Command::FillRect {
+                rect: Rect::new(8.0, 0.0, 4.0, 16.0),
+                color: Color::rgba(1.0, 1.0, 0.0, 1.0),
+            },
+            Command::EndLayer,
+            Command::EndLayer,
+        ]))?;
+        assert_pixel_near(pixel(&clipped, 2, 8), [0, 0, 255, 255]);
+        assert_pixel_near(pixel(&clipped, 6, 8), [0, 255, 0, 255]);
+        assert_pixel_near(pixel(&clipped, 10, 8), [255, 255, 0, 255]);
+        assert_pixel_near(pixel(&clipped, 14, 8), [255, 0, 0, 255]);
+
+        let backdrop = Color::rgba(0.2, 0.4, 0.6, 1.0);
+        let source = Color::rgba(0.8, 0.5, 0.25, 1.0);
+        for mode in [
+            BlendMode::SourceOver,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::Difference,
+            BlendMode::Plus,
+        ] {
+            let pixels = gpu.render(&snapshot(vec![
+                Command::FillRect {
+                    rect: full,
+                    color: backdrop,
+                },
+                Command::SetBlendMode(mode),
+                Command::FillRect {
+                    rect: full,
+                    color: source,
+                },
+            ]))?;
+            assert_pixel_near(pixel(&pixels, 8, 8), encoded_blend(mode, backdrop, source));
+        }
+
+        let image_handle = 7;
+        let mut image_snapshot = snapshot(vec![Command::DrawImage {
+            image: image_handle,
+            destination: full,
+        }]);
+        image_snapshot.images.insert(
+            image_handle,
+            ImageResource {
+                pane: 1,
+                generation: 1,
+                width: 2,
+                height: 1,
+                linear_premultiplied_rgba8: [0, 0, 0, 0, 255, 0, 0, 255].into(),
+            },
+        );
+        let image = gpu.render(&image_snapshot)?;
+        let transition = pixel(&image, 7, 8);
+        let [red, green, blue, _alpha] =
+            <[u8; 4]>::try_from(transition).context("image transition pixel is incomplete")?;
+        ensure!(
+            red > 0 && green == 0 && blue == 0,
+            "transparent image edge gained a color fringe: {transition:?}"
+        );
+
+        let translucent = gpu.render(&snapshot(vec![Command::FillRect {
+            rect: full,
+            color: Color::rgba(1.0, 0.0, 0.0, 0.5),
+        }]))?;
+        assert_pixel_near(pixel(&translucent, 8, 8), [188, 0, 0, 128]);
+
+        let nonzero = Path::new()
+            .move_to(2.0, 2.0)
+            .line_to(14.0, 2.0)
+            .line_to(14.0, 14.0)
+            .line_to(2.0, 14.0)
+            .close()
+            .move_to(5.0, 5.0)
+            .line_to(11.0, 5.0)
+            .line_to(11.0, 11.0)
+            .line_to(5.0, 11.0)
+            .close();
+        let winding = gpu.render(&snapshot(vec![Command::FillPath {
+            path: nonzero,
+            color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+        }]))?;
+        assert_pixel_near(pixel(&winding, 8, 8), [255, 255, 255, 255]);
+
+        let diagonal = Path::new()
+            .move_to(0.0, 0.0)
+            .line_to(16.0, 16.0)
+            .line_to(0.0, 16.0)
+            .close();
+        let antialiased = gpu.render(&snapshot(vec![Command::FillPath {
+            path: diagonal,
+            color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+        }]))?;
+        ensure!(
+            antialiased
+                .chunks_exact(4)
+                .filter_map(|pixel| pixel.last())
+                .any(|alpha| *alpha > 0 && *alpha < 255),
+            "diagonal path had no multisample edge coverage"
+        );
+        Ok(())
+    }
+}

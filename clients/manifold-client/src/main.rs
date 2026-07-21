@@ -57,7 +57,8 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<ClientEvent>::with_user_event()
         .build()
         .context("create event loop")?;
-    let plugin_graphics = PluginGraphicsBridge::new(event_loop.create_proxy());
+    let event_proxy = event_loop.create_proxy();
+    let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
     let (input_sender, fast_path_enabled, backend_connected) = if args.no_server {
         eprintln!("starting Manifold presentation without a backend");
         (None, false, false)
@@ -114,6 +115,7 @@ fn main() -> Result<()> {
         input_sender,
         fast_path_enabled,
         backend_connected,
+        event_proxy: Some(event_proxy),
         ..Application::default()
     };
 
@@ -156,6 +158,10 @@ enum ClientEvent {
     PluginGraphicsChanged {
         pane: u64,
         sequence: u64,
+    },
+    RendererFailed {
+        generation: u64,
+        message: String,
     },
 }
 
@@ -310,6 +316,9 @@ struct Application {
     pending_plugin_pointer_motion: Option<(f32, f32)>,
     wasm_runtime: Option<PresentationWasmRuntime>,
     plugin_graphics: Option<PluginGraphicsBridge>,
+    event_proxy: Option<winit::event_loop::EventLoopProxy<ClientEvent>>,
+    next_renderer_generation: u64,
+    renderer_recoveries: u8,
 }
 
 impl Application {
@@ -325,6 +334,11 @@ impl Application {
             ClientEvent::PluginGraphicsChanged { .. } => {
                 return Err(anyhow!(
                     "plugin graphics event reached scene transport path"
+                ));
+            }
+            ClientEvent::RendererFailed { .. } => {
+                return Err(anyhow!(
+                    "renderer failure event reached scene transport path"
                 ));
             }
         };
@@ -355,6 +369,59 @@ impl Application {
         self.error = Some(error);
         event_loop.exit();
     }
+
+    fn allocate_renderer_generation(&mut self) -> Result<u64> {
+        self.next_renderer_generation = self
+            .next_renderer_generation
+            .checked_add(1)
+            .context("renderer generation limit exceeded")?;
+        Ok(self.next_renderer_generation)
+    }
+
+    fn recover_renderer(&mut self, failed_generation: u64, message: &str) -> Result<()> {
+        let Some(current) = self.renderer.as_ref() else {
+            return Ok(());
+        };
+        if current.generation != failed_generation {
+            return Ok(());
+        }
+        self.renderer_recoveries = self.renderer_recoveries.saturating_add(1);
+        if self.renderer_recoveries > 3 {
+            return Err(anyhow!(
+                "renderer recovery failed repeatedly after: {message}"
+            ));
+        }
+        let old = self
+            .renderer
+            .take()
+            .context("lost renderer during recovery")?;
+        let replay = old
+            .plugin_pane
+            .as_ref()
+            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence));
+        let window = Arc::clone(&old.window);
+        drop(old);
+        let generation = self.allocate_renderer_generation()?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .context("renderer recovery event proxy is unavailable")?;
+        eprintln!(
+            "recovering renderer generation={failed_generation} replacement={generation}: {message}"
+        );
+        let graphics = self
+            .plugin_graphics
+            .clone()
+            .context("plugin graphics bridge is unavailable")?;
+        let mut replacement =
+            Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
+        if let Some((pane, sequence)) = replay {
+            replacement.refresh_plugin_graphics(pane, sequence)?;
+        }
+        replacement.window.request_redraw();
+        self.renderer = Some(replacement);
+        Ok(())
+    }
 }
 
 impl ApplicationHandler<ClientEvent> for Application {
@@ -368,6 +435,17 @@ impl ApplicationHandler<ClientEvent> for Application {
         } else {
             "Manifold - No backend"
         };
+        let generation = match self.allocate_renderer_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        };
+        let Some(proxy) = self.event_proxy.clone() else {
+            self.fail(event_loop, anyhow!("renderer event proxy is unavailable"));
+            return;
+        };
         let result = event_loop
             .create_window(Window::default_attributes().with_title(title))
             .context("create presentation window")
@@ -376,7 +454,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                     .plugin_graphics
                     .clone()
                     .context("plugin graphics bridge is unavailable")?;
-                Renderer::new(Arc::new(window), self.fast_path_enabled, graphics)
+                Renderer::new(
+                    Arc::new(window),
+                    self.fast_path_enabled,
+                    graphics,
+                    generation,
+                    proxy,
+                )
             });
 
         match result {
@@ -437,6 +521,14 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Some(renderer) = self.renderer.as_mut()
                     && let Err(error) = renderer.refresh_plugin_graphics(pane, sequence)
                 {
+                    self.fail(event_loop, error);
+                }
+            }
+            ClientEvent::RendererFailed {
+                generation,
+                message,
+            } => {
+                if let Err(error) = self.recover_renderer(generation, &message) {
                     self.fail(event_loop, error);
                 }
             }
@@ -702,6 +794,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     sequence,
                     reconfigure,
                 } => {
+                    self.renderer_recoveries = 0;
                     if reconfigure {
                         renderer.reconfigure();
                     }
@@ -723,8 +816,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 RenderOutcome::Skipped => {}
                 RenderOutcome::Reconfigure => renderer.reconfigure(),
                 RenderOutcome::Failed(message) => {
-                    self.error = Some(anyhow!(message));
-                    event_loop.exit();
+                    let generation = renderer.generation;
+                    if let Err(error) = self.recover_renderer(generation, message) {
+                        self.fail(event_loop, error);
+                    }
                 }
             },
             _ => {}
@@ -733,6 +828,7 @@ impl ApplicationHandler<ClientEvent> for Application {
 }
 
 struct Renderer {
+    generation: u64,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -1032,7 +1128,18 @@ fn create_frame_pipeline(
             }),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
-                blend: None,
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -1090,14 +1197,24 @@ impl Renderer {
         window: Arc<Window>,
         fast_path_enabled: bool,
         plugin_graphics: PluginGraphicsBridge,
+        generation: u64,
+        proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
-        pollster::block_on(Self::new_async(window, fast_path_enabled, plugin_graphics))
+        pollster::block_on(Self::new_async(
+            window,
+            fast_path_enabled,
+            plugin_graphics,
+            generation,
+            proxy,
+        ))
     }
 
     async fn new_async(
         window: Arc<Window>,
         fast_path_enabled: bool,
         plugin_graphics: PluginGraphicsBridge,
+        generation: u64,
+        proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
         let instance = if fast_path_enabled {
             let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -1131,6 +1248,19 @@ impl Renderer {
             })
             .await
             .context("create wgpu device")?;
+        let lost_proxy = proxy.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            let _send_result = lost_proxy.send_event(ClientEvent::RendererFailed {
+                generation,
+                message: format!("wgpu device lost ({reason:?}): {message}"),
+            });
+        });
+        device.on_uncaptured_error(Arc::new(move |error| {
+            let _send_result = proxy.send_event(ClientEvent::RendererFailed {
+                generation,
+                message: format!("uncaptured wgpu error: {error}"),
+            });
+        }));
 
         let size = window.inner_size();
         let mut config = surface
@@ -1152,6 +1282,7 @@ impl Renderer {
             config.format, config.color_space
         );
         Ok(Self {
+            generation,
             window,
             surface,
             device,

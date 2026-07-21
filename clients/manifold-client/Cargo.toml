@@ -17,6 +17,7 @@ manifold-wasm = { path = "../../crates/manifold-wasm" }
 lyon_tessellation.workspace = true
 pollster.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 

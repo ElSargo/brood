@@ -2397,6 +2397,7 @@ dependencies = [
  "manifold-layout",
  "manifold-wasm",
  "pollster",
+ "thiserror 2.0.18",
  "tokio",
  "wgpu",
  "winit",

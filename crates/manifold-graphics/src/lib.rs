@@ -8,10 +8,15 @@ pub const MAX_COMMANDS: usize = 16_384;
 pub const MAX_PATH_SEGMENTS: usize = 65_536;
 pub const MAX_SAVED_STATES: usize = 32;
 pub const MAX_LAYER_DEPTH: usize = 8;
+pub const MAX_CLIP_DEPTH: usize = 32;
+pub const MAX_ABSOLUTE_COORDINATE: f32 = 1_000_000.0;
+pub const MAX_TRANSFORM_COMPONENT: f32 = 1_000_000.0;
 
 const MAGIC: [u8; 4] = *b"MFGX";
 const HEADER_BYTES: usize = 16;
 
+/// A straight-alpha sRGB color. The renderer converts it to linear premultiplied
+/// form before compositing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {
     pub r: f32,
@@ -60,18 +65,13 @@ impl Rect {
     }
 
     fn validate(self) -> Result<(), PacketError> {
-        if [self.x, self.y, self.width, self.height]
-            .into_iter()
-            .all(f32::is_finite)
-            && self.width >= 0.0
-            && self.height >= 0.0
-        {
-            Ok(())
-        } else {
-            Err(PacketError::Invalid(
+        let values = [self.x, self.y, self.width, self.height];
+        if !values.into_iter().all(f32::is_finite) || self.width < 0.0 || self.height < 0.0 {
+            return Err(PacketError::Invalid(
                 "rectangle values must be finite and extents non-negative",
-            ))
+            ));
         }
+        validate_coordinate_magnitude(&values)
     }
 }
 
@@ -96,14 +96,17 @@ impl Transform {
     };
 
     fn validate(self) -> Result<(), PacketError> {
-        if [self.sx, self.ky, self.kx, self.sy, self.tx, self.ty]
-            .into_iter()
-            .all(f32::is_finite)
-        {
-            Ok(())
-        } else {
-            Err(PacketError::Invalid("transform values must be finite"))
+        let values = [self.sx, self.ky, self.kx, self.sy, self.tx, self.ty];
+        if !values.into_iter().all(f32::is_finite) {
+            return Err(PacketError::Invalid("transform values must be finite"));
         }
+        if values
+            .into_iter()
+            .any(|value| value.abs() > MAX_TRANSFORM_COMPONENT)
+        {
+            return Err(PacketError::Limit("transform magnitude limit exceeded"));
+        }
+        Ok(())
     }
 }
 
@@ -207,6 +210,21 @@ impl Path {
             };
             if !valid {
                 return Err(PacketError::Invalid("path coordinates must be finite"));
+            }
+            let bounded = match segment {
+                PathSegment::MoveTo(x, y) | PathSegment::LineTo(x, y) => [*x, *y]
+                    .into_iter()
+                    .all(|value| value.abs() <= MAX_ABSOLUTE_COORDINATE),
+                PathSegment::QuadTo(x1, y1, x, y) => [*x1, *y1, *x, *y]
+                    .into_iter()
+                    .all(|value| value.abs() <= MAX_ABSOLUTE_COORDINATE),
+                PathSegment::CubicTo(x1, y1, x2, y2, x, y) => [*x1, *y1, *x2, *y2, *x, *y]
+                    .into_iter()
+                    .all(|value| value.abs() <= MAX_ABSOLUTE_COORDINATE),
+                PathSegment::Close => true,
+            };
+            if !bounded {
+                return Err(PacketError::Limit("coordinate magnitude limit exceeded"));
             }
         }
         Ok(())
@@ -365,21 +383,28 @@ impl Packet {
         if self.commands.len() > MAX_COMMANDS {
             return Err(PacketError::Limit("command limit exceeded"));
         }
-        let mut saved = 0_usize;
+        let mut saved_clips = Vec::new();
+        let mut clips = 0_usize;
         let mut layers = 0_usize;
         for command in &self.commands {
             validate_command(command)?;
             match command {
                 Command::Save => {
-                    saved = saved.saturating_add(1);
-                    if saved > MAX_SAVED_STATES {
+                    if saved_clips.len() >= MAX_SAVED_STATES {
                         return Err(PacketError::Limit("saved-state depth limit exceeded"));
                     }
+                    saved_clips.push(clips);
                 }
                 Command::Restore => {
-                    saved = saved
-                        .checked_sub(1)
+                    clips = saved_clips
+                        .pop()
                         .ok_or(PacketError::Invalid("restore without matching save"))?;
+                }
+                Command::ClipRect(_) | Command::ClipPath(_) => {
+                    clips = clips.saturating_add(1);
+                    if clips > MAX_CLIP_DEPTH {
+                        return Err(PacketError::Limit("clip depth limit exceeded"));
+                    }
                 }
                 Command::BeginLayer => {
                     layers = layers.saturating_add(1);
@@ -395,7 +420,7 @@ impl Packet {
                 _ => {}
             }
         }
-        if saved != 0 {
+        if !saved_clips.is_empty() {
             return Err(PacketError::Invalid("unbalanced saved-state stack"));
         }
         if layers != 0 {
@@ -481,11 +506,10 @@ fn validate_command(command: &Command) -> Result<(), PacketError> {
             if *layout == 0 {
                 return Err(PacketError::Invalid("text layout handle must be non-zero"));
             }
-            if x.is_finite() && y.is_finite() {
-                Ok(())
-            } else {
-                Err(PacketError::Invalid("text position must be finite"))
+            if !x.is_finite() || !y.is_finite() {
+                return Err(PacketError::Invalid("text position must be finite"));
             }
+            validate_coordinate_magnitude(&[*x, *y])
         }
     }
 }
@@ -720,10 +744,23 @@ fn validate_non_negative(value: f32, label: &'static str) -> Result<(), PacketEr
 }
 
 fn validate_positive(value: f32, label: &'static str) -> Result<(), PacketError> {
-    if value.is_finite() && value > 0.0 {
-        Ok(())
+    if !value.is_finite() || value <= 0.0 {
+        return Err(PacketError::Invalid(label));
+    }
+    if value > MAX_ABSOLUTE_COORDINATE {
+        return Err(PacketError::Limit("stroke width limit exceeded"));
+    }
+    Ok(())
+}
+
+fn validate_coordinate_magnitude(values: &[f32]) -> Result<(), PacketError> {
+    if values
+        .iter()
+        .any(|value| value.abs() > MAX_ABSOLUTE_COORDINATE)
+    {
+        Err(PacketError::Limit("coordinate magnitude limit exceeded"))
     } else {
-        Err(PacketError::Invalid(label))
+        Ok(())
     }
 }
 
@@ -940,6 +977,67 @@ mod tests {
         assert_eq!(
             packet.encode(),
             Err(PacketError::Limit("layer depth limit exceeded"))
+        );
+    }
+
+    #[test]
+    fn excessive_clip_depth_is_rejected() {
+        let packet = Packet {
+            commands: vec![Command::ClipRect(Rect::new(0.0, 0.0, 1.0, 1.0)); MAX_CLIP_DEPTH + 1],
+        };
+        assert_eq!(
+            packet.encode(),
+            Err(PacketError::Limit("clip depth limit exceeded"))
+        );
+    }
+
+    #[test]
+    fn restore_returns_to_the_saved_clip_depth() -> Result<(), PacketError> {
+        let mut commands =
+            vec![Command::ClipRect(Rect::new(0.0, 0.0, 1.0, 1.0)); MAX_CLIP_DEPTH - 1];
+        commands.extend([
+            Command::Save,
+            Command::ClipRect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+            Command::Restore,
+            Command::ClipRect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+        ]);
+        Packet { commands }.validate()
+    }
+
+    #[test]
+    fn unreasonable_coordinate_and_transform_magnitudes_are_rejected() {
+        let coordinate = Packet {
+            commands: vec![Command::FillRect {
+                rect: Rect::new(MAX_ABSOLUTE_COORDINATE + 1.0, 0.0, 1.0, 1.0),
+                color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+            }],
+        };
+        assert_eq!(
+            coordinate.validate(),
+            Err(PacketError::Limit("coordinate magnitude limit exceeded"))
+        );
+
+        let transform = Packet {
+            commands: vec![Command::SetTransform(Transform {
+                sx: MAX_TRANSFORM_COMPONENT + 1.0,
+                ..Transform::IDENTITY
+            })],
+        };
+        assert_eq!(
+            transform.validate(),
+            Err(PacketError::Limit("transform magnitude limit exceeded"))
+        );
+
+        let stroke = Packet {
+            commands: vec![Command::StrokeRect {
+                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+                width: MAX_ABSOLUTE_COORDINATE + 1.0,
+            }],
+        };
+        assert_eq!(
+            stroke.validate(),
+            Err(PacketError::Limit("stroke width limit exceeded"))
         );
     }
 }

@@ -36,6 +36,7 @@ pub struct TextLayoutOptions {
     pub font_size: f32,
     pub max_width: f32,
     pub line_height: f32,
+    /// Straight-alpha sRGB red, green, blue, and alpha channels.
     pub color: [f32; 4],
 }
 

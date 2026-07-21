@@ -97,6 +97,7 @@ interface host {
         packet: list<u8>,
     ) -> result<u64, graphics-error>;
 
+    /// Copies row-major straight-alpha sRGB pixels into an immutable image.
     graphics-create-image-rgba8: func(
         pane: u64,
         width: u32,
