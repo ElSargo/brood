@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in weston weston-simple-egl python3; do
+for tool in weston weston-simple-egl gtk4-demo python3; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the client layout-policy proof" >&2
     exit 2
@@ -140,11 +140,11 @@ rg -q "configured presentation surface" "$CLIENT_LOG" || {
   exit 1
 }
 
-ctl spawn weston-simple-egl > /dev/null
+ctl spawn env GTK_A11Y=none gtk4-demo > /dev/null
 ctl spawn weston-simple-egl > /dev/null
 
 layout_converged() {
-  python3 - "$CLIENT_LOG" <<'PY'
+  python3 - "$CLIENT_LOG" "$SERVER_LOG" <<'PY'
 import re
 import sys
 
@@ -164,10 +164,25 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if frame:
         imported[int(frame.group(1))] = (int(frame.group(2)), int(frame.group(3)))
 
+negotiated = {}
+for line in open(sys.argv[2], encoding="utf-8"):
+    resize = re.search(
+        r"negotiated presentation-client pane size pane=(\d+).*"
+        r"configured_width=(\d+) configured_height=(\d+)",
+        line,
+    )
+    if resize:
+        negotiated[int(resize.group(1))] = (int(resize.group(2)), int(resize.group(3)))
+
+expected = {
+    window_id: negotiated.get(window_id, size)
+    for window_id, size in requested.items()
+}
 sys.exit(
     0
     if len(requested) >= 2
-    and all(imported.get(window_id) == size for window_id, size in requested.items())
+    and negotiated
+    and all(imported.get(window_id) == size for window_id, size in expected.items())
     else 1
 )
 PY
@@ -190,11 +205,11 @@ if ! rg -q "presentation layout source changed source=wasm-policy" "$CLIENT_LOG"
   exit 1
 fi
 if ! layout_converged; then
-  echo "ERR managed clients did not converge on the requested layout sizes" >&2
+  echo "ERR managed clients did not converge on their accepted layout sizes" >&2
   exit 1
 fi
 
-python3 - "$CLIENT_LOG" <<'PY'
+python3 - "$CLIENT_LOG" "$SERVER_LOG" <<'PY'
 import re
 import sys
 
@@ -215,25 +230,54 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if frame:
         imported[int(frame.group(1))] = (int(frame.group(2)), int(frame.group(3)))
 
+negotiated = {}
+for line in open(sys.argv[2], encoding="utf-8"):
+    resize = re.search(
+        r"negotiated presentation-client pane size pane=(\d+).*"
+        r"configured_width=(\d+) configured_height=(\d+)",
+        line,
+    )
+    if resize:
+        negotiated[int(resize.group(1))] = (int(resize.group(2)), int(resize.group(3)))
+
 if len(requested) < 2:
     raise SystemExit(f"expected two client resize requests, got {requested}")
+if not negotiated:
+    raise SystemExit("expected a constrained real client to negotiate its pane size")
 
 latest = dict(sorted(requested.items())[-2:])
 missing = set(latest) - set(imported)
 if missing:
     raise SystemExit(f"missing imported frames for resized windows: {sorted(missing)}")
 
-for window_id, expected in latest.items():
+expected_sizes = {
+    window_id: negotiated.get(window_id, requested_size)
+    for window_id, requested_size in latest.items()
+}
+for window_id, expected in expected_sizes.items():
     if imported[window_id] != expected:
         raise SystemExit(
-            f"window {window_id} did not converge: requested={expected} imported={imported[window_id]}"
+            f"window {window_id} did not converge: requested={latest[window_id]} "
+            f"configured={expected} imported={imported[window_id]}"
         )
 
-sizes = set(latest.values())
-if len(sizes) != 1:
-    raise SystemExit(f"tile provider did not allocate equal pane sizes: {latest}")
+for window_id, configured in negotiated.items():
+    if window_id not in latest:
+        continue
+    requested_width, requested_height = latest[window_id]
+    configured_width, configured_height = configured
+    aspect_error = abs(
+        configured_width * requested_height - configured_height * requested_width
+    )
+    if aspect_error >= max(requested_width, requested_height):
+        raise SystemExit(
+            f"window {window_id} lost requested aspect: "
+            f"requested={latest[window_id]} configured={configured}"
+        )
 
-print(f"converged_layout={latest}")
+print(
+    f"converged_layout requested={latest} configured={expected_sizes} imported={imported}"
+)
 PY
 
 STATUS="$(ctl status)"
@@ -244,7 +288,7 @@ STATUS="$(ctl status)"
 
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
-echo "OK client-local WASM layout and key policy proof passed"
+echo "OK client-local WASM layout, constrained resize, and key policy proof passed"
 echo "status=$STATUS"
 echo "policy=$POLICY"
 

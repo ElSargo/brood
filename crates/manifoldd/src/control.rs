@@ -2760,6 +2760,7 @@ fn drain_fast_path_input(state: &mut Manifold) {
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
     };
+    state.dmabuf.fast_path_input_draining = true;
     let mut request_redraw = false;
     let mut disconnected = false;
     while let Some(record) = fast_path.input.try_recv() {
@@ -2891,10 +2892,12 @@ fn drain_fast_path_input(state: &mut Manifold) {
         }
     }
     if disconnected {
+        state.dmabuf.fast_path_input_draining = false;
         presentation::send_external_client_frame_callbacks(state);
         state.reconfigure_focus_stack();
     } else {
         state.dmabuf.fast_path = Some(fast_path);
+        state.dmabuf.fast_path_input_draining = false;
     }
     if request_redraw || disconnected {
         presentation::request_external_client_redraw(state);

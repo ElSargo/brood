@@ -66,7 +66,10 @@ use smithay::{
             ext_data_control::DataControlState as ExtDataControlState,
             wlr_data_control::DataControlState as WlrDataControlState,
         },
-        shell::xdg::{XdgShellState, XdgToplevelSurfaceData, decoration::XdgDecorationState},
+        shell::xdg::{
+            SurfaceCachedState, XdgShellState, XdgToplevelSurfaceData,
+            decoration::XdgDecorationState,
+        },
         socket::ListeningSocketSource,
         viewporter::ViewporterState,
     },
@@ -85,6 +88,7 @@ use crate::{
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     clipboard::HostClipboardBridge,
     command::{InputCommand, SurfaceCommand, WorkspaceCommand},
+    geometry::{WindowSizeNegotiation, negotiate_window_size},
     plugin_runtime::{
         PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary, PluginRuntime,
     },
@@ -745,6 +749,7 @@ pub struct Manifold {
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
+    presentation_client_requested_sizes: BTreeMap<u64, (i32, i32)>,
     known_surfaces: Vec<WlSurface>,
     pending_child_panes: Vec<PendingChildPane>,
     pub(crate) ctrl_pressed: bool,
@@ -895,6 +900,7 @@ impl Manifold {
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
+            presentation_client_requested_sizes: BTreeMap::new(),
             known_surfaces: Vec::new(),
             pending_child_panes: Vec::new(),
             ctrl_pressed: false,
@@ -1510,6 +1516,9 @@ impl Manifold {
 
     pub fn unregister_surface(&mut self, surface: &WlSurface) {
         self.known_surfaces.retain(|known| known != surface);
+        if let Some(pane) = self.pane_for_toplevel_surface(surface) {
+            self.presentation_client_requested_sizes.remove(&pane);
+        }
     }
 
     pub fn refresh_fractional_scales(&mut self) {
@@ -2526,7 +2535,7 @@ impl Manifold {
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
-        if self.dmabuf.fast_path.is_some() {
+        if self.presentation_client_controls_windows() {
             self.activate_windows_without_geometry(active_surface);
             return;
         }
@@ -2585,6 +2594,13 @@ impl Manifold {
             window.set_activated(is_active);
             toplevel.send_pending_configure();
         });
+    }
+
+    const fn presentation_client_controls_windows(&self) -> bool {
+        presentation_client_control_is_active(
+            self.dmabuf.fast_path.is_some(),
+            self.dmabuf.fast_path_input_draining,
+        )
     }
 
     pub fn window_toplevel_surface(window: &Window) -> Option<WlSurface> {
@@ -3748,13 +3764,82 @@ impl Manifold {
         let Some(toplevel) = window.toplevel() else {
             return false;
         };
-        let size = (width.max(1), height.max(1));
-        toplevel.with_pending_state(|state| {
-            state.size = Some(size.into());
-            state.bounds = Some(size.into());
-        });
-        toplevel.send_pending_configure();
+        let requested = (width.max(1), height.max(1));
+        self.presentation_client_requested_sizes
+            .insert(pane, requested);
+        self.configure_presentation_client_toplevel_size(pane, &surface, toplevel, requested);
         true
+    }
+
+    pub(crate) fn renegotiate_presentation_client_pane_size(
+        &mut self,
+        surface: &WlSurface,
+    ) -> bool {
+        let Some(pane) = self.pane_for_toplevel_surface(surface) else {
+            return false;
+        };
+        let Some(requested) = self.presentation_client_requested_sizes.get(&pane).copied() else {
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(surface) else {
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        self.configure_presentation_client_toplevel_size(pane, surface, toplevel, requested)
+    }
+
+    fn configure_presentation_client_toplevel_size(
+        &self,
+        pane: u64,
+        surface: &WlSurface,
+        toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+        requested: (i32, i32),
+    ) -> bool {
+        let constraints = with_states(surface, |states| {
+            *states.cached_state.get::<SurfaceCachedState>().current()
+        });
+        let (size, negotiation) = negotiate_window_size(
+            requested,
+            constraints.min_size.into(),
+            constraints.max_size.into(),
+        );
+        let size: Size<i32, Logical> = size.into();
+        let already_configured = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok())
+                .is_some_and(|data| {
+                    let current = data.current_server_state();
+                    current.size == Some(size) && current.bounds == Some(size)
+                })
+        });
+        if already_configured {
+            return false;
+        }
+        toplevel.with_pending_state(|state| {
+            state.size = Some(size);
+            state.bounds = Some(size);
+        });
+        let configured = toplevel.send_pending_configure().is_some();
+        if configured && negotiation != WindowSizeNegotiation::Requested {
+            info!(
+                pane,
+                requested_width = requested.0,
+                requested_height = requested.1,
+                minimum_width = constraints.min_size.w,
+                minimum_height = constraints.min_size.h,
+                maximum_width = constraints.max_size.w,
+                maximum_height = constraints.max_size.h,
+                configured_width = size.w,
+                configured_height = size.h,
+                ?negotiation,
+                "negotiated presentation-client pane size"
+            );
+        }
+        configured
     }
 
     pub fn active_window(&self) -> Option<Window> {
@@ -5499,7 +5584,7 @@ impl Manifold {
     }
 
     pub fn reconfigure_focus_stack(&mut self) {
-        if self.dmabuf.fast_path.is_some() {
+        if self.presentation_client_controls_windows() {
             self.reconfigure_presentation_client_focus();
             return;
         }
@@ -5732,10 +5817,11 @@ impl Manifold {
             .filter(|(surface, _)| !live_toplevel_surfaces.iter().any(|live| live == surface))
             .map(|(_, pane)| *pane)
             .collect::<Vec<_>>();
-        for pane_id in closed_panes {
-            for agent_id in self.unregister_agents_for_pane(pane_id) {
+        for pane_id in &closed_panes {
+            self.presentation_client_requested_sizes.remove(pane_id);
+            for agent_id in self.unregister_agents_for_pane(*pane_id) {
                 info!(
-                    pane_id,
+                    pane_id = *pane_id,
                     agent_id = %agent_id,
                     "unregistered agent for closed pane"
                 );
@@ -6127,6 +6213,25 @@ impl Manifold {
         {
             panel.width = width;
         }
+    }
+}
+
+const fn presentation_client_control_is_active(
+    fast_path_present: bool,
+    fast_path_input_draining: bool,
+) -> bool {
+    fast_path_present || fast_path_input_draining
+}
+
+#[cfg(test)]
+mod presentation_client_state_tests {
+    use super::presentation_client_control_is_active;
+
+    #[test]
+    fn presentation_control_remains_active_while_input_is_drained() {
+        assert!(!presentation_client_control_is_active(false, false));
+        assert!(presentation_client_control_is_active(true, false));
+        assert!(presentation_client_control_is_active(false, true));
     }
 }
 
@@ -6918,6 +7023,7 @@ pub struct DmabufRuntime {
     pub latest_client_buffer: Option<Dmabuf>,
     pub latest_client_buffer_sequence: u64,
     pub fast_path: Option<PresentationFastPath>,
+    pub fast_path_input_draining: bool,
     pub default_feedback: Option<DmabufFeedback>,
     pub importer: Option<SharedPresenterRuntime>,
     pub stats: DmabufStats,
@@ -6940,6 +7046,7 @@ impl Default for DmabufRuntime {
             latest_client_buffer: None,
             latest_client_buffer_sequence: 0,
             fast_path: None,
+            fast_path_input_draining: false,
             default_feedback: None,
             importer: None,
             stats: DmabufStats::default(),

@@ -441,6 +441,7 @@ fn handle_xdg_commit(state: &mut Manifold, surface: &WlSurface) {
         }
     }
 
+    state.renegotiate_presentation_client_pane_size(surface);
     state.popups.commit(surface);
     if let Some(PopupKind::Xdg(popup)) = state.popups.find_popup(surface)
         && !popup.is_initial_configure_sent()

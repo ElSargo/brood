@@ -478,6 +478,15 @@ accepted requested extent and later reports the extent actually committed by
 the application. The client continues displaying the previous frame, scaled or
 letterboxed according to local policy, while waiting for the new commit.
 
+Size negotiation prefers the requested extent when it satisfies the
+application's advertised constraints. If it is too small, the backend chooses
+the smallest extent near the advertised minimum that preserves the requested
+aspect ratio. If that extent exceeds an advertised maximum, the application's
+raw minimum extent is the final fallback. The backend retains the requested
+extent and repeats this decision when the application's double-buffered
+constraints commit, so a late minimum-size update cannot strand the window at
+an incorrect aspect ratio.
+
 Interactive resize is latest-state traffic. Intermediate requests may be
 coalesced before Wayland configure as long as protocol serial correctness is
 preserved. A settled request must eventually receive an accepted, rejected, or
@@ -707,6 +716,12 @@ retain reserved progress so a drag cannot strand the backend's implicit grab.
 The backend maps accepted input into its Wayland seat. The initial product may
 use one logical primary seat because zero or one controlling client is the target.
 Additional viewers do not receive independent application seats.
+
+Dispatching an accepted input batch does not suspend the presentation lease or
+its window-configuration authority. Focus changes produced by that batch may
+update activation, keyboard focus, and stacking, but must not reapply backend
+layout geometry. The last lease-authorized window size remains in force until a
+new resize request is accepted or the lease actually ends.
 
 IME, clipboard, drag-and-drop, cursor, relative-pointer, pointer-lock, tablet,
 and touch behavior are separate negotiated input/platform features. Their
