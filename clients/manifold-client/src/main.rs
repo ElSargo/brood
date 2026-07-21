@@ -2,7 +2,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
-    reason = "bounded window, text, and raster coordinates intentionally narrow to the f32 and integer formats used by WGPU and tiny-skia"
+    reason = "bounded window, text, and graphics coordinates intentionally narrow to the f32 and integer formats used by WGPU"
 )]
 
 use std::{
@@ -35,10 +35,12 @@ use winit::{
 };
 
 mod actor_runtime;
+mod plugin_gpu;
 mod plugin_graphics;
 
 use actor_runtime::PresentationWasmRuntime;
 use manifold_wasm::PresentationEvent;
+use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
 
 fn main() -> Result<()> {
@@ -739,6 +741,7 @@ struct Renderer {
     frame_bind_group_layout: wgpu::BindGroupLayout,
     frame_sampler: wgpu::Sampler,
     frame_pipeline: wgpu::RenderPipeline,
+    plugin_canvas: GpuCanvasRenderer,
     imported_frames: HashMap<u64, ImportedFrame>,
     current_windows: Vec<SceneWindow>,
     scene_extent: Option<(u32, u32)>,
@@ -761,12 +764,7 @@ struct ImportedFrame {
 }
 
 struct PluginPaneTexture {
-    pane: u64,
-    sequence: u64,
-    width: u32,
-    height: u32,
-    _texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
+    scene: GpuCanvasScene,
 }
 
 fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
@@ -1146,6 +1144,8 @@ impl Renderer {
         config.desired_maximum_frame_latency = 1;
         let (frame_bind_group_layout, frame_sampler, frame_pipeline) =
             create_frame_pipeline(&device, config.format);
+        let plugin_canvas =
+            GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
         surface.configure(&device, &config);
         eprintln!(
             "configured presentation surface format={:?} color_space={:?}",
@@ -1160,6 +1160,7 @@ impl Renderer {
             frame_bind_group_layout,
             frame_sampler,
             frame_pipeline,
+            plugin_canvas,
             imported_frames: HashMap::new(),
             current_windows: Vec::new(),
             scene_extent: None,
@@ -1302,90 +1303,33 @@ impl Renderer {
             return Ok(());
         }
         if self.plugin_pane.as_ref().is_some_and(|current| {
-            current.pane == snapshot.pane
-                && current.sequence >= snapshot.sequence
-                && current.width == self.config.width
-                && current.height == self.config.height
+            current.scene.pane == snapshot.pane
+                && current.scene.sequence >= snapshot.sequence
+                && current.scene.width == self.config.width
+                && current.scene.height == self.config.height
         }) {
             return Ok(());
         }
         let scale = self.window.scale_factor() as f32;
-        let mut pixels = plugin_graphics::rasterize(
+        let scene = self.plugin_canvas.compile(
+            &self.device,
+            &self.queue,
             &snapshot,
-            self.config.width.max(1),
-            self.config.height.max(1),
-            scale,
+            (self.config.width.max(1), self.config.height.max(1), scale),
+            self.plugin_pane.as_ref().map(|current| &current.scene),
         )?;
-        flip_rgba_rows(
-            &mut pixels,
-            self.config.width.max(1),
-            self.config.height.max(1),
-        );
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("plugin canvas pane"),
-            size: wgpu::Extent3d {
-                width: self.config.width.max(1),
-                height: self.config.height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(self.config.width.max(1).saturating_mul(4)),
-                rows_per_image: Some(self.config.height.max(1)),
-            },
-            wgpu::Extent3d {
-                width: self.config.width.max(1),
-                height: self.config.height.max(1),
-                depth_or_array_layers: 1,
-            },
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("plugin canvas pane bind group"),
-            layout: &self.frame_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.frame_sampler),
-                },
-            ],
-        });
-        eprintln!(
-            "accepted plugin draw packet pane={} sequence={} commands={} raster={}x{} scale={:.2}",
-            snapshot.pane,
-            snapshot.sequence,
-            snapshot.packet.commands.len(),
-            self.config.width,
-            self.config.height,
-            scale,
-        );
-        self.plugin_pane = Some(PluginPaneTexture {
-            pane: snapshot.pane,
-            sequence: snapshot.sequence,
-            width: self.config.width,
-            height: self.config.height,
-            _texture: texture,
-            bind_group,
-        });
+        if snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) {
+            eprintln!(
+                "accepted plugin draw packet pane={} sequence={} commands={} gpu_target={}x{} scale={:.2}",
+                snapshot.pane,
+                snapshot.sequence,
+                snapshot.packet.commands.len(),
+                self.config.width,
+                self.config.height,
+                scale,
+            );
+        }
+        self.plugin_pane = Some(PluginPaneTexture { scene });
         self.window.request_redraw();
         Ok(())
     }
@@ -1401,7 +1345,7 @@ impl Renderer {
         if let Some((pane, sequence)) = self
             .plugin_pane
             .as_ref()
-            .map(|plugin| (plugin.pane, plugin.sequence))
+            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
         {
             self.refresh_plugin_graphics(pane, sequence)?;
         }
@@ -1414,7 +1358,7 @@ impl Renderer {
         self.window.request_redraw();
     }
 
-    fn render(&self) -> RenderOutcome {
+    fn render(&mut self) -> RenderOutcome {
         let (frame, reconfigure) = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
             CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -1436,6 +1380,15 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("manifold-client frame encoder"),
             });
+
+        if let Some(plugin) = self.plugin_pane.as_mut()
+            && let Err(error) = self
+                .plugin_canvas
+                .encode_if_dirty(&mut encoder, &mut plugin.scene)
+        {
+            eprintln!("failed to encode plugin GPU scene: {error:#}");
+            return RenderOutcome::Failed("failed to encode plugin GPU scene");
+        }
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1469,7 +1422,7 @@ impl Renderer {
                     0.0,
                     1.0,
                 );
-                render_pass.set_bind_group(0, &plugin.bind_group, &[]);
+                render_pass.set_bind_group(0, plugin.scene.output_bind_group(), &[]);
                 render_pass.draw(0..3, 0..1);
             }
             if let Some((scene_width, scene_height)) = self.scene_extent {
@@ -1508,13 +1461,14 @@ impl Renderer {
         }
 
         let submission = self.queue.submit([encoder.finish()]);
-        if self
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(std::time::Duration::from_secs(1)),
-            })
-            .is_err()
+        if self.current_sequence.is_some()
+            && self
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(std::time::Duration::from_secs(1)),
+                })
+                .is_err()
         {
             return RenderOutcome::Failed("timed out waiting for composed frame consumption");
         }
@@ -1523,26 +1477,6 @@ impl Renderer {
             sequence: self.current_sequence,
             reconfigure,
         }
-    }
-}
-
-fn flip_rgba_rows(pixels: &mut [u8], width: u32, height: u32) {
-    let row_bytes = usize::try_from(width)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(4);
-    let height = usize::try_from(height).unwrap_or_default();
-    for row in 0..height / 2 {
-        let opposite = height - row - 1;
-        let first = row.saturating_mul(row_bytes);
-        let second = opposite.saturating_mul(row_bytes);
-        let (before_second, second_and_after) = pixels.split_at_mut(second);
-        let Some(first_row) = before_second.get_mut(first..first.saturating_add(row_bytes)) else {
-            return;
-        };
-        let Some(second_row) = second_and_after.get_mut(..row_bytes) else {
-            return;
-        };
-        first_row.swap_with_slice(second_row);
     }
 }
 

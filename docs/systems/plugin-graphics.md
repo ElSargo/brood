@@ -134,6 +134,41 @@ SDKs do not branch on the active WGPU backend. Native pane chrome, menus,
 recovery UI, and presentation overlays remain outside the packet's drawable
 area.
 
+## GPU Lowering
+
+The presentation client lowers an accepted packet to a retained GPU scene. Path
+curves and strokes are tessellated to bounded vertex and index data when the
+packet changes; this is geometry preparation, not CPU rasterization. Images,
+native text output, and other immutable resources are uploaded on first use and
+reused while retained across replacement packets which reference the same
+handles.
+
+Repainting records the scene's ordered render passes, copies, and draw calls into
+the presentation frame's WGPU command encoder. Pane drawing, layer composition,
+image sampling, clipping coverage, blending, and final composition therefore run
+on the GPU and are submitted with the rest of the frame as one command buffer.
+The normal repaint path does not allocate a full-size CPU pixel buffer, rasterize
+the pane on the event-loop thread, vertically copy it, or upload the whole pane
+after every input event.
+
+Canvas state remains a lowering concern rather than protocol-visible GPU state:
+
+- transforms are applied while producing pane-local geometry;
+- nested clips use a bounded stencil representation;
+- layers use bounded transient render targets;
+- source-over, additive, and directly representable blend modes use fixed GPU
+  blending;
+- blend modes which read the destination use a bounded target snapshot and a
+  host shader selected by the canvas blend mode;
+- user-provided shaders, pipelines, or command buffers are never accepted by the
+  base protocol.
+
+Static accepted scenes retain their GPU output. Expose and composition-only
+frames reuse that output without replaying the packet. A replacement packet or
+size/scale change rebuilds the necessary geometry and records a new GPU repaint.
+Device recovery recreates GPU resources from the accepted packet and immutable
+host resource copies.
+
 ## Graphics Resources
 
 Packets may contain small values inline and may reference a small set of

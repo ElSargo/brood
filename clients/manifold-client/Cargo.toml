@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytemuck.workspace = true
 clap.workspace = true
 cosmic-text = "0.19.0"
 manifold-cli.workspace = true
@@ -13,9 +14,9 @@ manifold-graphics.workspace = true
 manifold-ipc.workspace = true
 manifold-layout.workspace = true
 manifold-wasm = { path = "../../crates/manifold-wasm" }
+lyon_tessellation.workspace = true
 pollster.workspace = true
 tokio.workspace = true
-tiny-skia = "0.11.4"
 wgpu.workspace = true
 winit.workspace = true
 

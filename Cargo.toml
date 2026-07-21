@@ -16,6 +16,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+bytemuck = { version = "1.25.0", features = ["derive"] }
 calloop = "0.14.4"
 calloop-wayland-source = "0.4.1"
 cap-std = "3.4.5"
@@ -29,6 +30,7 @@ manifold-cli = { path = "crates/manifold-cli" }
 manifold-graphics = { path = "crates/manifold-graphics" }
 manifold-ipc = { path = "crates/manifold-ipc" }
 manifold-layout = { path = "crates/manifold-layout" }
+lyon_tessellation = "1.0.20"
 num-traits = "0.2.19"
 notify = "8.2.0"
 pollster = "0.4.0"

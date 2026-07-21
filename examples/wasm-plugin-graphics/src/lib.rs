@@ -304,7 +304,12 @@ fn build_scene(state: DemoState) -> Packet {
     packet.push(Command::BeginLayer);
     packet.push(Command::Save);
     packet.push(Command::SetOpacity(0.72));
-    packet.push(Command::SetBlendMode(BlendMode::Screen));
+    // Exercise both fixed-function and destination-reading GPU blend paths.
+    packet.push(Command::SetBlendMode(if state.active_palette {
+        BlendMode::Multiply
+    } else {
+        BlendMode::Screen
+    }));
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(margin, third_y, cell * 1.7, cell * 0.82),
         radius: cell * 0.2,

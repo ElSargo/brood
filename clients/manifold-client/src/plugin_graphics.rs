@@ -9,14 +9,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use cosmic_text::{Attrs, Buffer, Color as TextColor, FontSystem, Metrics, Shaping, SwashCache};
-use manifold_graphics::{
-    BlendMode, Color, Command, Packet, PacketError, Path, PathSegment, Rect, Transform,
-};
+use manifold_graphics::{Command, Packet, PacketError};
 use manifold_wasm::{PresentationError, PresentationHost, TextLayoutOptions, TextLayoutResult};
-use tiny_skia::{
-    FillRule, FilterQuality, LineCap, LineJoin, Mask, Paint, PathBuilder, Pixmap, PixmapPaint,
-    Stroke,
-};
 use winit::event_loop::EventLoopProxy;
 
 use crate::ClientEvent;
@@ -54,17 +48,17 @@ pub struct GraphicsSnapshot {
     pub pane: u64,
     pub sequence: u64,
     pub packet: Packet,
-    images: BTreeMap<u64, ImageResource>,
-    text_layouts: BTreeMap<u64, TextLayoutResource>,
+    pub images: BTreeMap<u64, ImageResource>,
+    pub text_layouts: BTreeMap<u64, TextLayoutResource>,
 }
 
 #[derive(Clone, Debug)]
-struct ImageResource {
-    pane: u64,
-    generation: u64,
-    width: u32,
-    height: u32,
-    premultiplied_rgba: Vec<u8>,
+pub struct ImageResource {
+    pub pane: u64,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub premultiplied_rgba: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,12 +74,12 @@ struct TextSystem {
 }
 
 #[derive(Clone, Debug)]
-struct TextLayoutResource {
-    pane: u64,
-    generation: u64,
-    width: u32,
-    height: u32,
-    premultiplied_rgba: Vec<u8>,
+pub struct TextLayoutResource {
+    pub pane: u64,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub premultiplied_rgba: Arc<[u8]>,
 }
 
 #[derive(Debug, Default)]
@@ -307,7 +301,7 @@ impl PresentationHost for ActorPresentationHost {
                 generation: actor_generation,
                 width,
                 height,
-                premultiplied_rgba: pixels,
+                premultiplied_rgba: pixels.into(),
             },
         );
         drop(state);
@@ -564,7 +558,7 @@ fn create_text_layout(
             generation: 0,
             width,
             height,
-            premultiplied_rgba: pixels,
+            premultiplied_rgba: pixels.into(),
         },
         TextLayoutResult {
             handle: 0,
@@ -596,403 +590,4 @@ fn blend_text_pixel(destination: &mut [u8; 4], color: TextColor) {
     *output_alpha = alpha.saturating_add(
         u8::try_from((u16::from(*output_alpha) * inverse + 127) / 255).unwrap_or(u8::MAX),
     );
-}
-
-#[derive(Clone)]
-struct CanvasState {
-    transform: Transform,
-    opacity: f32,
-    blend_mode: BlendMode,
-    clip: Mask,
-}
-
-pub fn rasterize(
-    snapshot: &GraphicsSnapshot,
-    width: u32,
-    height: u32,
-    scale: f32,
-) -> Result<Vec<u8>> {
-    let mut targets = vec![Pixmap::new(width, height).context("allocate plugin pane pixmap")?];
-    let mut clip = Mask::new(width, height).context("allocate plugin pane clip")?;
-    let full = tiny_skia::Rect::from_xywh(0.0, 0.0, width as f32, height as f32)
-        .context("create plugin pane bounds")?;
-    clip.fill_path(
-        &PathBuilder::from_rect(full),
-        FillRule::Winding,
-        false,
-        tiny_skia::Transform::identity(),
-    );
-    let mut state = CanvasState {
-        transform: Transform::IDENTITY,
-        opacity: 1.0,
-        blend_mode: BlendMode::SourceOver,
-        clip,
-    };
-    let mut saved = Vec::new();
-
-    for command in &snapshot.packet.commands {
-        match command {
-            Command::Save => saved.push(state.clone()),
-            Command::Restore => {
-                state = saved.pop().context("validated restore lost saved state")?;
-            }
-            Command::SetTransform(transform) => state.transform = *transform,
-            Command::SetOpacity(opacity) => state.opacity = *opacity,
-            Command::SetBlendMode(blend_mode) => state.blend_mode = *blend_mode,
-            Command::ClipRect(rect) => {
-                if let Some(path) = rect_path(*rect) {
-                    state.clip.intersect_path(
-                        &path,
-                        FillRule::Winding,
-                        true,
-                        device_transform(state.transform, scale),
-                    );
-                } else {
-                    state.clip.clear();
-                }
-            }
-            Command::ClipPath(path) => {
-                if let Some(path) = skia_path(path) {
-                    state.clip.intersect_path(
-                        &path,
-                        FillRule::Winding,
-                        true,
-                        device_transform(state.transform, scale),
-                    );
-                } else {
-                    state.clip.clear();
-                }
-            }
-            Command::FillRect { rect, color } => {
-                if let Some(path) = rect_path(*rect) {
-                    draw_fill(
-                        targets.last_mut().context("missing canvas target")?,
-                        &path,
-                        *color,
-                        &state,
-                        scale,
-                    );
-                }
-            }
-            Command::StrokeRect { rect, color, width } => {
-                if let Some(path) = rect_path(*rect) {
-                    draw_stroke(
-                        targets.last_mut().context("missing canvas target")?,
-                        &path,
-                        *color,
-                        *width,
-                        &state,
-                        scale,
-                    );
-                }
-            }
-            Command::FillRoundedRect {
-                rect,
-                radius,
-                color,
-            } => {
-                if let Some(path) = rounded_rect_path(*rect, *radius) {
-                    draw_fill(
-                        targets.last_mut().context("missing canvas target")?,
-                        &path,
-                        *color,
-                        &state,
-                        scale,
-                    );
-                }
-            }
-            Command::StrokeRoundedRect {
-                rect,
-                radius,
-                color,
-                width,
-            } => {
-                if let Some(path) = rounded_rect_path(*rect, *radius) {
-                    draw_stroke(
-                        targets.last_mut().context("missing canvas target")?,
-                        &path,
-                        *color,
-                        *width,
-                        &state,
-                        scale,
-                    );
-                }
-            }
-            Command::FillPath { path, color } => {
-                if let Some(path) = skia_path(path) {
-                    draw_fill(
-                        targets.last_mut().context("missing canvas target")?,
-                        &path,
-                        *color,
-                        &state,
-                        scale,
-                    );
-                }
-            }
-            Command::StrokePath { path, color, width } => {
-                if let Some(path) = skia_path(path) {
-                    draw_stroke(
-                        targets.last_mut().context("missing canvas target")?,
-                        &path,
-                        *color,
-                        *width,
-                        &state,
-                        scale,
-                    );
-                }
-            }
-            Command::DrawImage { image, destination } => {
-                if destination.width == 0.0 || destination.height == 0.0 {
-                    continue;
-                }
-                let resource = snapshot
-                    .images
-                    .get(image)
-                    .with_context(|| format!("missing retained image {image}"))?;
-                let image = Pixmap::from_vec(
-                    resource.premultiplied_rgba.clone(),
-                    tiny_skia::IntSize::from_wh(resource.width, resource.height)
-                        .context("invalid retained image size")?,
-                )
-                .context("invalid retained image pixels")?;
-                let local = Transform {
-                    sx: destination.width / resource.width as f32,
-                    ky: 0.0,
-                    kx: 0.0,
-                    sy: destination.height / resource.height as f32,
-                    tx: destination.x,
-                    ty: destination.y,
-                };
-                let transform = concatenate(state.transform, local);
-                targets
-                    .last_mut()
-                    .context("missing canvas target")?
-                    .draw_pixmap(
-                        0,
-                        0,
-                        image.as_ref(),
-                        &PixmapPaint {
-                            opacity: state.opacity,
-                            blend_mode: skia_blend(state.blend_mode),
-                            quality: FilterQuality::Bilinear,
-                        },
-                        device_transform(transform, scale),
-                        Some(&state.clip),
-                    );
-            }
-            Command::DrawTextLayout { layout, x, y } => {
-                let resource = snapshot
-                    .text_layouts
-                    .get(layout)
-                    .with_context(|| format!("missing retained text layout {layout}"))?;
-                let text = Pixmap::from_vec(
-                    resource.premultiplied_rgba.clone(),
-                    tiny_skia::IntSize::from_wh(resource.width, resource.height)
-                        .context("invalid retained text layout size")?,
-                )
-                .context("invalid retained text layout pixels")?;
-                let transform = concatenate(
-                    state.transform,
-                    Transform {
-                        tx: *x,
-                        ty: *y,
-                        ..Transform::IDENTITY
-                    },
-                );
-                targets
-                    .last_mut()
-                    .context("missing canvas target")?
-                    .draw_pixmap(
-                        0,
-                        0,
-                        text.as_ref(),
-                        &PixmapPaint {
-                            opacity: state.opacity,
-                            blend_mode: skia_blend(state.blend_mode),
-                            quality: FilterQuality::Bilinear,
-                        },
-                        device_transform(transform, scale),
-                        Some(&state.clip),
-                    );
-            }
-            Command::BeginLayer => {
-                targets.push(Pixmap::new(width, height).context("allocate canvas layer")?);
-            }
-            Command::EndLayer => {
-                let layer = targets.pop().context("validated layer stack underflowed")?;
-                targets
-                    .last_mut()
-                    .context("validated layer lost parent")?
-                    .draw_pixmap(
-                        0,
-                        0,
-                        layer.as_ref(),
-                        &PixmapPaint::default(),
-                        tiny_skia::Transform::identity(),
-                        Some(&state.clip),
-                    );
-            }
-        }
-    }
-    Ok(targets
-        .pop()
-        .context("canvas root target disappeared")?
-        .take())
-}
-
-fn draw_fill(
-    target: &mut Pixmap,
-    path: &tiny_skia::Path,
-    color: Color,
-    state: &CanvasState,
-    scale: f32,
-) {
-    target.fill_path(
-        path,
-        &paint(color, state),
-        FillRule::Winding,
-        device_transform(state.transform, scale),
-        Some(&state.clip),
-    );
-}
-
-fn draw_stroke(
-    target: &mut Pixmap,
-    path: &tiny_skia::Path,
-    color: Color,
-    width: f32,
-    state: &CanvasState,
-    scale: f32,
-) {
-    target.stroke_path(
-        path,
-        &paint(color, state),
-        &Stroke {
-            width,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Stroke::default()
-        },
-        device_transform(state.transform, scale),
-        Some(&state.clip),
-    );
-}
-
-fn paint(color: Color, state: &CanvasState) -> Paint<'static> {
-    let mut paint = Paint::default();
-    paint.set_color(
-        tiny_skia::Color::from_rgba(color.r, color.g, color.b, color.a * state.opacity)
-            .unwrap_or(tiny_skia::Color::TRANSPARENT),
-    );
-    paint.blend_mode = skia_blend(state.blend_mode);
-    paint
-}
-
-const fn skia_blend(mode: BlendMode) -> tiny_skia::BlendMode {
-    match mode {
-        BlendMode::SourceOver => tiny_skia::BlendMode::SourceOver,
-        BlendMode::Multiply => tiny_skia::BlendMode::Multiply,
-        BlendMode::Screen => tiny_skia::BlendMode::Screen,
-        BlendMode::Overlay => tiny_skia::BlendMode::Overlay,
-        BlendMode::Darken => tiny_skia::BlendMode::Darken,
-        BlendMode::Lighten => tiny_skia::BlendMode::Lighten,
-        BlendMode::Difference => tiny_skia::BlendMode::Difference,
-        BlendMode::Plus => tiny_skia::BlendMode::Plus,
-    }
-}
-
-fn device_transform(transform: Transform, scale: f32) -> tiny_skia::Transform {
-    tiny_skia::Transform::from_row(
-        transform.sx * scale,
-        transform.ky * scale,
-        transform.kx * scale,
-        transform.sy * scale,
-        transform.tx * scale,
-        transform.ty * scale,
-    )
-}
-
-fn concatenate(parent: Transform, local: Transform) -> Transform {
-    Transform {
-        sx: parent.sx.mul_add(local.sx, parent.kx * local.ky),
-        ky: parent.ky.mul_add(local.sx, parent.sy * local.ky),
-        kx: parent.sx.mul_add(local.kx, parent.kx * local.sy),
-        sy: parent.ky.mul_add(local.kx, parent.sy * local.sy),
-        tx: parent
-            .sx
-            .mul_add(local.tx, parent.kx.mul_add(local.ty, parent.tx)),
-        ty: parent
-            .ky
-            .mul_add(local.tx, parent.sy.mul_add(local.ty, parent.ty)),
-    }
-}
-
-fn rect_path(rect: Rect) -> Option<tiny_skia::Path> {
-    tiny_skia::Rect::from_xywh(rect.x, rect.y, rect.width, rect.height).map(PathBuilder::from_rect)
-}
-
-fn rounded_rect_path(rect: Rect, radius: f32) -> Option<tiny_skia::Path> {
-    let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
-    if radius <= f32::EPSILON {
-        return rect_path(rect);
-    }
-    let mut builder = PathBuilder::new();
-    let right = rect.x + rect.width;
-    let bottom = rect.y + rect.height;
-    let control = radius * 0.552_284_8;
-    builder.move_to(rect.x + radius, rect.y);
-    builder.line_to(right - radius, rect.y);
-    builder.cubic_to(
-        right - radius + control,
-        rect.y,
-        right,
-        rect.y + radius - control,
-        right,
-        rect.y + radius,
-    );
-    builder.line_to(right, bottom - radius);
-    builder.cubic_to(
-        right,
-        bottom - radius + control,
-        right - radius + control,
-        bottom,
-        right - radius,
-        bottom,
-    );
-    builder.line_to(rect.x + radius, bottom);
-    builder.cubic_to(
-        rect.x + radius - control,
-        bottom,
-        rect.x,
-        bottom - radius + control,
-        rect.x,
-        bottom - radius,
-    );
-    builder.line_to(rect.x, rect.y + radius);
-    builder.cubic_to(
-        rect.x,
-        rect.y + radius - control,
-        rect.x + radius - control,
-        rect.y,
-        rect.x + radius,
-        rect.y,
-    );
-    builder.close();
-    builder.finish()
-}
-
-fn skia_path(path: &Path) -> Option<tiny_skia::Path> {
-    let mut builder = PathBuilder::new();
-    for segment in &path.segments {
-        match *segment {
-            PathSegment::MoveTo(x, y) => builder.move_to(x, y),
-            PathSegment::LineTo(x, y) => builder.line_to(x, y),
-            PathSegment::QuadTo(x1, y1, x, y) => builder.quad_to(x1, y1, x, y),
-            PathSegment::CubicTo(x1, y1, x2, y2, x, y) => {
-                builder.cubic_to(x1, y1, x2, y2, x, y);
-            }
-            PathSegment::Close => builder.close(),
-        }
-    }
-    builder.finish()
 }
