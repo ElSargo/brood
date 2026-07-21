@@ -6,9 +6,9 @@
 )]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     os::fd::AsFd,
-    sync::Arc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -19,11 +19,14 @@ use manifold_cli::{
     ClientArgs,
     control::{
         ControlTarget, DmabufFrame, ServerLaunch, connect_or_spawn, dmabuf_resource,
-        open_presentation_fast_path, resolve_control_target,
+        open_presentation_fast_path, request_dbus_command, resolve_control_target,
     },
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
-use manifold_layout::{LayoutItemKind, LayoutRect, LayoutSize, LocalPoint, ResolvedLayout};
+use manifold_layout::{
+    InputBehavior, LayoutAction, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize, LocalPoint,
+    LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+};
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -35,13 +38,15 @@ use winit::{
 };
 
 mod actor_runtime;
+mod key_policy;
 mod layout_policy;
 mod plugin_gpu;
 mod plugin_graphics;
 
 use actor_runtime::PresentationWasmRuntime;
+use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
 use layout_policy::{ClientLayoutPolicy, LayoutSource};
-use manifold_wasm::PresentationEvent;
+use manifold_wasm::{GlobalKeyDecision, HostMessage, PresentationEvent};
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
 
@@ -57,6 +62,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut layout_policy = ClientLayoutPolicy::load(args.wasm_layout_policy.as_deref())?;
+    let mut key_policy = ClientKeyPolicy::load(args.wasm_key_policy.as_deref())?;
     if args.check_wasm_layout_policy {
         let resolution = layout_policy.resolve(&[1, 2], Some(1), LayoutSize { w: 1200, h: 800 });
         if resolution.source != LayoutSource::WasmPolicy || resolution.layout.pane_count() != 2 {
@@ -67,14 +73,86 @@ fn main() -> Result<()> {
         eprintln!("presentation WASM layout policy check passed");
         return Ok(());
     }
+    if args.check_wasm_key_policy {
+        let snapshot = KeyPolicySnapshot {
+            focused_pane: Some(1),
+            panes: vec![1, 2],
+            app_panes: vec![KeyPolicyAppPane {
+                pane: 2,
+                app_id: "manifold-terminal-1".to_string(),
+            }],
+        };
+        let evaluation = key_policy.evaluate(
+            44,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL,
+            &snapshot,
+        )?;
+        if evaluation.decision != GlobalKeyDecision::Consume
+            || !evaluation.host_messages.iter().any(|message| {
+                matches!(
+                    message,
+                    HostMessage::LayoutAction { action } if action == "focus-next"
+                )
+            })
+        {
+            return Err(anyhow!(
+                "presentation key policy did not consume Ctrl+J as focus-next"
+            ));
+        }
+        let mode_toggle = key_policy.evaluate(
+            56,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL,
+            &snapshot,
+        )?;
+        let _mode_toggle_release = key_policy.evaluate(
+            56,
+            manifold_wasm::ABI_KEY_RELEASED,
+            manifold_wasm::ABI_MOD_CTRL,
+            &snapshot,
+        )?;
+        let spawn = key_policy.evaluate(
+            32,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL,
+            &snapshot,
+        )?;
+        let focus_existing = key_policy.evaluate(
+            10,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL,
+            &snapshot,
+        )?;
+        if mode_toggle.decision != GlobalKeyDecision::Consume
+            || spawn.decision != GlobalKeyDecision::Consume
+            || !spawn.host_messages.iter().any(|message| {
+                matches!(
+                    message,
+                    HostMessage::SpawnApp { argv }
+                        if argv.first().is_some_and(|program| program == "foot")
+                )
+            })
+            || !focus_existing
+                .host_messages
+                .iter()
+                .any(|message| matches!(message, HostMessage::FocusPane { pane: 2 }))
+        {
+            return Err(anyhow!(
+                "presentation key policy did not preserve mode, spawn, and app-focus behavior"
+            ));
+        }
+        eprintln!("presentation WASM key policy check passed");
+        return Ok(());
+    }
     let event_loop = EventLoop::<ClientEvent>::with_user_event()
         .build()
         .context("create event loop")?;
     let event_proxy = event_loop.create_proxy();
     let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
-    let (input_sender, fast_path_enabled, backend_connected) = if args.no_server {
+    let (input_sender, backend_commands, fast_path_enabled, backend_connected) = if args.no_server {
         eprintln!("starting Manifold presentation without a backend");
-        (None, false, false)
+        (None, None, false, false)
     } else {
         let target = resolve_control_target(args.dbus_name, args.dbus_address);
         let mut server = ServerLaunch::discover()?;
@@ -101,7 +179,7 @@ fn main() -> Result<()> {
             let frame_notifications =
                 manifold_ipc::EventNotifier::from_owned_fd(fast_path.frame_notify_fd);
             spawn_frame_updates(
-                target,
+                target.clone(),
                 frames,
                 frame_notifications,
                 event_loop.create_proxy(),
@@ -117,7 +195,11 @@ fn main() -> Result<()> {
         } else {
             None
         };
-        (input_sender, fast_path_enabled, true)
+        let backend_commands = Some(BackendCommandLane::start(
+            target,
+            event_loop.create_proxy(),
+        )?);
+        (input_sender, backend_commands, fast_path_enabled, true)
     };
     let mut application = Application {
         wasm_runtime: Some(PresentationWasmRuntime::start(
@@ -125,8 +207,10 @@ fn main() -> Result<()> {
             Some(&plugin_graphics),
         )?),
         layout_policy: Some(layout_policy),
+        key_policy: Some(key_policy),
         plugin_graphics: Some(plugin_graphics),
         input_sender,
+        backend_commands,
         fast_path_enabled,
         backend_connected,
         window_focused: true,
@@ -150,10 +234,16 @@ fn main() -> Result<()> {
         .as_mut()
         .map_or(Ok(()), PresentationWasmRuntime::shutdown)
         .context("stop presentation WASM runtime");
+    let backend_shutdown_result = application
+        .backend_commands
+        .as_mut()
+        .map_or(Ok(()), BackendCommandLane::shutdown)
+        .context("stop presentation backend command worker");
     let error = application.error.take();
     drop(application);
     run_result?;
     shutdown_result?;
+    backend_shutdown_result?;
     if let Some(error) = error {
         return Err(error);
     }
@@ -178,6 +268,10 @@ enum ClientEvent {
         generation: u64,
         message: String,
     },
+    BackendCommandCompleted {
+        description: String,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Debug)]
@@ -186,6 +280,7 @@ struct SceneWindowUpdate {
     resource_id: u64,
     rect: [i32; 4],
     active: bool,
+    app_id: String,
     resource: Option<DmabufFrame>,
 }
 
@@ -206,7 +301,7 @@ fn spawn_frame_updates(
     let _worker = thread::Builder::new()
         .name("manifold-frame-updates".to_string())
         .spawn(move || {
-            let mut resources = HashSet::new();
+            let mut resources = HashMap::new();
             let mut pending_scene: Option<PendingScene> = None;
             loop {
                 if notifications.wait().is_err() {
@@ -237,20 +332,22 @@ fn spawn_frame_updates(
                                 return;
                             }
                             let resource_id = record.arguments[1];
-                            let resource = if resources.contains(&resource_id) {
-                                None
-                            } else {
-                                match dmabuf_resource(&target, resource_id) {
-                                    Ok(resource) => {
-                                        resources.insert(resource_id);
-                                        Some(resource)
-                                    }
-                                    Err(error) => {
-                                        let _send_result =
-                                            proxy.send_event(ClientEvent::TransportError(format!(
-                                                "fetch DMA-BUF resource {resource_id}: {error:#}"
-                                            )));
-                                        return;
+                            let resource = match resources.entry(resource_id) {
+                                std::collections::hash_map::Entry::Occupied(_) => None,
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    match dmabuf_resource(&target, resource_id) {
+                                        Ok(resource) => {
+                                            entry.insert(resource.app_id.clone());
+                                            Some(resource)
+                                        }
+                                        Err(error) => {
+                                            let _send_result = proxy.send_event(
+                                                ClientEvent::TransportError(format!(
+                                                    "fetch DMA-BUF resource {resource_id}: {error:#}"
+                                                )),
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                             };
@@ -261,6 +358,7 @@ fn spawn_frame_updates(
                                 resource_id,
                                 rect: [x, y, width, height],
                                 active: record.arguments[4] != 0,
+                                app_id: resources.get(&resource_id).cloned().unwrap_or_default(),
                                 resource,
                             });
                         }
@@ -317,6 +415,68 @@ struct InputLane {
     sequence: u64,
 }
 
+struct BackendCommandLane {
+    sender: Option<mpsc::SyncSender<BackendCommand>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+struct BackendCommand {
+    description: String,
+    argv: Vec<String>,
+}
+
+impl BackendCommandLane {
+    fn start(
+        target: ControlTarget,
+        proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
+    ) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<BackendCommand>(32);
+        let worker = thread::Builder::new()
+            .name("manifold-backend-commands".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    let result = request_dbus_command(&target, &command.argv, false)
+                        .map_err(|error| format!("{error:#}"));
+                    if proxy
+                        .send_event(ClientEvent::BackendCommandCompleted {
+                            description: command.description,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+            .context("spawn presentation backend command worker")?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn try_send(&self, description: impl Into<String>, argv: Vec<String>) -> Result<()> {
+        self.sender
+            .as_ref()
+            .context("presentation backend command worker is stopped")?
+            .try_send(BackendCommand {
+                description: description.into(),
+                argv,
+            })
+            .context("presentation backend command queue is full or closed")
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_panic| anyhow!("presentation backend command worker panicked"))?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct Application {
     renderer: Option<Renderer>,
@@ -332,7 +492,9 @@ struct Application {
     pending_plugin_pointer_motion: Option<(f32, f32)>,
     wasm_runtime: Option<PresentationWasmRuntime>,
     layout_policy: Option<ClientLayoutPolicy>,
+    key_policy: Option<ClientKeyPolicy>,
     plugin_graphics: Option<PluginGraphicsBridge>,
+    backend_commands: Option<BackendCommandLane>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<ClientEvent>>,
     next_renderer_generation: u64,
     renderer_recoveries: u8,
@@ -356,6 +518,11 @@ impl Application {
             ClientEvent::RendererFailed { .. } => {
                 return Err(anyhow!(
                     "renderer failure event reached scene transport path"
+                ));
+            }
+            ClientEvent::BackendCommandCompleted { .. } => {
+                return Err(anyhow!(
+                    "backend command completion reached scene transport path"
                 ));
             }
         };
@@ -593,6 +760,18 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.fail(event_loop, error);
                 }
             }
+            ClientEvent::BackendCommandCompleted {
+                description,
+                result,
+            } => match result {
+                Ok(response) => eprintln!(
+                    "presentation backend command completed command={description} response={}",
+                    response.trim()
+                ),
+                Err(error) => {
+                    eprintln!("presentation backend command failed command={description}: {error}");
+                }
+            },
             event => {
                 if let Err(error) = self.accept_frame(event) {
                     self.fail(event_loop, error);
@@ -833,6 +1012,64 @@ impl ApplicationHandler<ClientEvent> for Application {
                     return;
                 }
 
+                let policy_evaluation = event.physical_key.to_scancode().and_then(|scancode| {
+                    let snapshot = renderer.key_policy_snapshot();
+                    self.key_policy.as_mut().and_then(|policy| {
+                        match policy.evaluate(
+                            i32::try_from(scancode.saturating_add(8)).unwrap_or(i32::MAX),
+                            match event.state {
+                                ElementState::Pressed => manifold_wasm::ABI_KEY_PRESSED,
+                                ElementState::Released => manifold_wasm::ABI_KEY_RELEASED,
+                            },
+                            key_policy_modifier_bits(self.modifiers),
+                            &snapshot,
+                        ) {
+                            Ok(evaluation) => Some(evaluation),
+                            Err(error) => {
+                                eprintln!(
+                                    "presentation key policy failed; forwarding key: {error:#}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                });
+
+                let mut forward_key = true;
+                if let Some(evaluation) = policy_evaluation {
+                    forward_key = matches!(
+                        evaluation.decision,
+                        GlobalKeyDecision::Abstain
+                            | GlobalKeyDecision::Forward
+                            | GlobalKeyDecision::ForwardWithModifiers
+                    );
+                    for message in evaluation.actor_messages {
+                        if let Some(runtime) = self.wasm_runtime.as_ref()
+                            && let Err(error) =
+                                runtime.send_actor_message(&message.actor, message.payload)
+                        {
+                            eprintln!("dropped key-policy actor message: {error:#}");
+                        }
+                    }
+                    for message in evaluation.host_messages {
+                        if let Err(error) = apply_key_policy_host_message(
+                            renderer,
+                            &mut self.input_sender,
+                            self.backend_commands.as_ref(),
+                            self.wasm_runtime.as_ref(),
+                            message,
+                            self.window_focused,
+                        ) {
+                            eprintln!("rejected key-policy host message: {error:#}");
+                        }
+                    }
+                    flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+                }
+
+                if !forward_key {
+                    return;
+                }
+
                 let modifiers = modifier_bits(self.modifiers);
                 if let Some(pane) = renderer.focused_plugin_pane() {
                     if let Some(physical_key) = event.physical_key.to_scancode()
@@ -937,6 +1174,7 @@ struct Renderer {
     layout_policy: Option<ClientLayoutPolicy>,
     accepted_layout: ResolvedLayout,
     layout_source: LayoutSource,
+    fullscreen_pane: Option<u64>,
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
 }
 
@@ -954,6 +1192,7 @@ struct FocusChange {
 
 struct SceneWindow {
     window_id: u64,
+    app_id: String,
     resource_id: u64,
     source_rect: [i32; 4],
     rect: [i32; 4],
@@ -1090,6 +1329,130 @@ fn dispatch_focus_change(
     Ok(())
 }
 
+fn apply_key_policy_host_message(
+    renderer: &mut Renderer,
+    input_sender: &mut Option<InputLane>,
+    backend_commands: Option<&BackendCommandLane>,
+    runtime: Option<&PresentationWasmRuntime>,
+    message: HostMessage,
+    window_focused: bool,
+) -> Result<()> {
+    let focus_change = match message {
+        HostMessage::LayoutAction { action } => {
+            let action = action
+                .parse::<LayoutAction>()
+                .map_err(|error| anyhow!("parse key-policy layout action: {error}"))?;
+            match action {
+                LayoutAction::FocusNext | LayoutAction::FocusNextSplit => renderer.cycle_focus(1),
+                LayoutAction::FocusPrevious | LayoutAction::FocusPreviousSplit => {
+                    renderer.cycle_focus(-1)
+                }
+                LayoutAction::CloseActivePane => {
+                    if let Some(pane) = renderer.focused_managed_window() {
+                        queue_backend_command(
+                            backend_commands,
+                            format!("close-pane-{pane}"),
+                            vec!["close-pane".to_string(), pane.to_string()],
+                        )?;
+                    } else {
+                        eprintln!("key-policy close ignored for a presentation-local actor pane");
+                    }
+                    None
+                }
+                LayoutAction::ToggleManagedFullscreen => {
+                    if renderer.focused_managed_window().is_some() {
+                        renderer.toggle_focused_fullscreen()
+                    } else {
+                        None
+                    }
+                }
+                LayoutAction::SplitActiveRight
+                | LayoutAction::SplitActiveDown
+                | LayoutAction::JoinActivePane
+                | LayoutAction::SplitActiveSmart
+                | LayoutAction::MoveActiveToLeftDock
+                | LayoutAction::MoveActiveToRightDock
+                | LayoutAction::MoveActiveToBottomDock
+                | LayoutAction::MoveActiveToCenter
+                | LayoutAction::ToggleLeftDock
+                | LayoutAction::ToggleRightDock
+                | LayoutAction::ToggleBottomDock
+                | LayoutAction::IncreaseLeftDockWidth
+                | LayoutAction::DecreaseLeftDockWidth => {
+                    eprintln!(
+                        "key-policy layout action action={action} has no stateful operation in the selected flat layout provider"
+                    );
+                    None
+                }
+            }
+        }
+        HostMessage::FocusPane { pane } => renderer.focus_pane(pane),
+        HostMessage::SpawnApp { argv } => {
+            queue_spawn_command(backend_commands, argv)?;
+            None
+        }
+        HostMessage::FocusOrSpawnApp { app_id, argv } => {
+            if let Some(pane) = renderer.pane_for_app_id(&app_id) {
+                renderer.focus_pane(pane)
+            } else {
+                queue_spawn_command(backend_commands, argv)?;
+                None
+            }
+        }
+        HostMessage::SwitchActiveSessionNext => {
+            queue_backend_command(
+                backend_commands,
+                "switch-active-session-next",
+                vec!["surface-session".to_string(), "next".to_string()],
+            )?;
+            None
+        }
+        HostMessage::CreateAndAttachSession => {
+            queue_backend_command(
+                backend_commands,
+                "create-and-attach-session",
+                vec!["surface-session".to_string(), "new".to_string()],
+            )?;
+            None
+        }
+        HostMessage::ToggleShortcutPassthrough | HostMessage::SetShortcutPassthrough { .. } => None,
+        HostMessage::SetResolvedLayout { .. } => {
+            return Err(anyhow!(
+                "key policy cannot replace the selected client layout provider"
+            ));
+        }
+    };
+
+    if let Some(change) = focus_change {
+        dispatch_focus_change(runtime, input_sender.as_mut(), change, window_focused)?;
+    }
+    Ok(())
+}
+
+fn queue_spawn_command(
+    backend_commands: Option<&BackendCommandLane>,
+    argv: Vec<String>,
+) -> Result<()> {
+    let program = argv
+        .first()
+        .context("key-policy spawn argv is empty")?
+        .clone();
+    let mut command = Vec::with_capacity(argv.len() + 1);
+    command.push("spawn".to_string());
+    command.extend(argv);
+    queue_backend_command(backend_commands, format!("spawn-{program}"), command)
+}
+
+fn queue_backend_command(
+    backend_commands: Option<&BackendCommandLane>,
+    description: impl Into<String>,
+    argv: Vec<String>,
+) -> Result<()> {
+    backend_commands
+        .context("key-policy command requires a connected backend")?
+        .try_send(description, argv)
+}
+
 fn flush_presentation_pointer_motion(
     runtime: Option<&PresentationWasmRuntime>,
     pending: &mut Option<(f32, f32)>,
@@ -1122,6 +1485,12 @@ fn modifier_bits(modifiers: ModifiersState) -> u32 {
         | (u32::from(modifiers.control_key()) << 1)
         | (u32::from(modifiers.alt_key()) << 2)
         | (u32::from(modifiers.super_key()) << 3)
+}
+
+fn key_policy_modifier_bits(modifiers: ModifiersState) -> i32 {
+    (i32::from(modifiers.control_key()) * manifold_wasm::ABI_MOD_CTRL)
+        | (i32::from(modifiers.alt_key()) * manifold_wasm::ABI_MOD_ALT)
+        | (i32::from(modifiers.shift_key()) * manifold_wasm::ABI_MOD_SHIFT)
 }
 
 impl ImportedFrame {
@@ -1173,8 +1542,9 @@ impl ImportedFrame {
             ],
         });
         eprintln!(
-            "imported window DMA-BUF window_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={} modifier={} y_inverted={}",
+            "imported window DMA-BUF window_id={} app_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={} modifier={} y_inverted={}",
             window_id,
+            frame.app_id,
             resource_id,
             frame.width,
             frame.height,
@@ -1467,6 +1837,7 @@ impl Renderer {
             layout_policy: Some(layout_policy),
             accepted_layout: ResolvedLayout::empty(),
             layout_source: LayoutSource::NativeFallback,
+            fullscreen_pane: None,
             sent_managed_sizes: HashMap::new(),
         })
     }
@@ -1506,6 +1877,7 @@ impl Renderer {
             }
             scene_windows.push(SceneWindow {
                 window_id: window.window_id,
+                app_id: window.app_id,
                 resource_id: window.resource_id,
                 source_rect: window.rect,
                 rect: window.rect,
@@ -1584,6 +1956,63 @@ impl Renderer {
         };
         let target = toggled_plugin_managed_focus(self.focused_pane, plugin, managed);
         self.set_focus(target)
+    }
+
+    fn cycle_focus(&mut self, offset: isize) -> Option<FocusChange> {
+        let panes = self.pane_inventory();
+        if panes.is_empty() {
+            return None;
+        }
+        let current = self
+            .focused_pane_id()
+            .and_then(|focused| panes.iter().position(|pane| *pane == focused))
+            .unwrap_or(0);
+        let len = isize::try_from(panes.len()).unwrap_or(isize::MAX);
+        let target_index = (isize::try_from(current).unwrap_or_default() + offset).rem_euclid(len);
+        let target_pane = *panes.get(usize::try_from(target_index).ok()?)?;
+        let target = self.focus_target_for_pane(target_pane)?;
+        if self.fullscreen_pane.is_some() {
+            self.fullscreen_pane = Some(target_pane);
+        }
+        self.set_focus(target)
+    }
+
+    fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
+        let target = self.focus_target_for_pane(pane)?;
+        if self.fullscreen_pane.is_some() {
+            self.fullscreen_pane = Some(pane);
+        }
+        self.set_focus(target)
+    }
+
+    fn toggle_focused_fullscreen(&mut self) -> Option<FocusChange> {
+        let focused = self.focused_pane_id()?;
+        self.fullscreen_pane = (self.fullscreen_pane != Some(focused)).then_some(focused);
+        let focus_change = self.relayout_panes();
+        self.window.request_redraw();
+        focus_change
+    }
+
+    fn pane_for_app_id(&self, app_id: &str) -> Option<u64> {
+        self.current_windows
+            .iter()
+            .find_map(|window| (window.app_id == app_id).then_some(window.window_id))
+    }
+
+    fn key_policy_snapshot(&self) -> KeyPolicySnapshot {
+        KeyPolicySnapshot {
+            focused_pane: self.focused_pane_id(),
+            panes: self.pane_inventory(),
+            app_panes: self
+                .current_windows
+                .iter()
+                .filter(|window| !window.app_id.is_empty())
+                .map(|window| KeyPolicyAppPane {
+                    pane: window.window_id,
+                    app_id: window.app_id.clone(),
+                })
+                .collect(),
+        }
     }
 
     fn focus_pane_at_window_point(&mut self, x: f64, y: f64) -> Option<FocusChange> {
@@ -1697,6 +2126,9 @@ impl Renderer {
         }
         self.layout_source = resolution.source;
         self.accepted_layout = resolution.layout;
+        if let Some(pane) = self.fullscreen_pane.filter(|pane| panes.contains(pane)) {
+            self.accepted_layout = fullscreen_layout(pane);
+        }
 
         if let Some(plugin) = self.plugin_pane.as_mut() {
             plugin.rect = [0, 0, 0, 0];
@@ -1752,6 +2184,7 @@ impl Renderer {
                 .iter()
                 .any(|item| item.window_id == *window)
         });
+        self.fullscreen_pane = self.fullscreen_pane.filter(|pane| panes.contains(pane));
         focus_change_between(previous_focus, self.focused_pane)
     }
 
@@ -2093,6 +2526,21 @@ fn focus_change_between(
 
 const fn is_plugin_managed_focus_toggle(key: PhysicalKey) -> bool {
     matches!(key, PhysicalKey::Code(KeyCode::F6))
+}
+
+fn fullscreen_layout(pane: u64) -> ResolvedLayout {
+    ResolvedLayout {
+        items: vec![ResolvedLayoutItem {
+            id: LayoutItemId(pane),
+            kind: LayoutItemKind::Pane { pane },
+            z: 0.0,
+            transform: LocalTransform {
+                offset: LocalPoint { u: -1.0, v: -1.0 },
+                size: LocalPoint { u: 2.0, v: 2.0 },
+            },
+            input: InputBehavior::Pane,
+        }],
+    }
 }
 
 fn rect_contains(rect: [i32; 4], x: f64, y: f64) -> bool {

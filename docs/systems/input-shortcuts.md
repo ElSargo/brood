@@ -83,7 +83,7 @@ KeyPolicyResult {
 
 The provider may read its latest published state and return a message batch, but it does not mutate client or backend state or wait for actor work. The local client host applies accepted directives and enqueues messages only after the call returns.
 
-The current combined process constructs one typed invocation context before
+The presentation client constructs one typed invocation context before
 crossing into the WASM runtime. Its key query groups the code, press/release
 state, modifier bitset, and input mode; the same invocation carries an optional
 immutable publication lease. The core-module adapter alone lowers the two
@@ -93,10 +93,12 @@ fields as parallel arguments.
 
 The checked-in default-workspace plugin uses this boundary today: its
 `WasmGlobalKeyPolicy` returns a bounded decision envelope and actor-message
-batch after reading the latest immutable publication frame. The current native
-host validates and applies the result only after the provider returns. During
-the presentation split this policy runtime moves to the client without changing
-its typed invocation or synchronous local property.
+batch after reading the latest immutable client pane, focus, and application
+identity snapshot. The client validates and applies local actions only after the
+provider returns. Managed application and session mutations are queued to the
+backend asynchronously, so the synchronous key decision never waits for DBus or
+network work. The built-in daemon presenter retains the same provider host only
+as a compatibility path.
 
 ## Actor Follow-Up
 

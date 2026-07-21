@@ -2397,6 +2397,8 @@ dependencies = [
  "manifold-layout",
  "manifold-wasm",
  "pollster",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "wgpu",

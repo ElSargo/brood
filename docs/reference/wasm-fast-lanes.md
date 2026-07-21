@@ -47,13 +47,17 @@ subscriptions without a declared actor reject the module; consult
 See `module.rs`, `module_link.rs`, `actor.rs`, and `actor_link.rs` for the exact
 export and outbox ABI.
 
-## Global Key Policy
+## Presentation Key Policy
 
-The daemon selects a named key policy provider from the module inventory. It
-passes a serialized key query plus the latest immutable actor publication. The
-provider returns `consume`, `forward`, or `abstain` semantics and may include a
-bounded batch of actor messages. The host validates and applies the envelope;
-the provider does not perform host side effects directly.
+The presentation client selects a named key policy provider from the module
+inventory. It passes a serialized key query plus an immutable publication of
+the client-owned pane inventory, local focus, and managed application
+identities. The provider returns `consume`, `forward`, or `abstain` semantics
+and may include a bounded batch of actor messages. The client validates and
+applies the envelope; the provider does not perform host side effects directly.
+Backend commands leave the synchronous lane through a bounded asynchronous
+worker. The daemon keeps its older host for the built-in presenter compatibility
+path.
 
 See `global_key_policy.rs`, `global_key_policy_link.rs`, and
 `policy_provider.rs` for the exact export, descriptor, bounds, and decision

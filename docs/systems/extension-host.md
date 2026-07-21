@@ -41,9 +41,10 @@ capability oriented and should not expose compositor internals.
 
 Current runnable WASM lanes are prototypes, not the final product API. A
 self-contained core module can declare named actors and synchronous policy
-providers. The daemon currently executes the global key provider; layout takes
-the normal actor-message path. The separate core-WASM test harness remains for
-behavior-test orchestration.
+providers. The presentation client executes selected key and flat-layout
+providers over its own pane inventory; the daemon retains the older key and
+actor-driven layout paths for its built-in presenter compatibility path. The
+separate core-WASM test harness remains for behavior-test orchestration.
 
 See [[../reference/wasm-fast-lanes]] for ABI details.
 

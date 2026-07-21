@@ -22,12 +22,13 @@ use crate::{
 
 pub const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 pub const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 5;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 6;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
 type DbusDmabufFrame = (
     u64,
+    String,
     u32,
     u32,
     u32,
@@ -111,6 +112,7 @@ pub struct PresentationFastPath {
 #[derive(Debug)]
 pub struct DmabufFrame {
     pub sequence: u64,
+    pub app_id: String,
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
@@ -230,12 +232,24 @@ pub fn latest_dmabuf_frame(target: &ControlTarget) -> Result<DmabufFrame> {
         .interface(CONTROL_INTERFACE)?
         .build()
         .context("build Manifold presentation proxy")?;
-    let (sequence, width, height, fourcc, color_space, modifier, stride, offset, y_inverted, fd) =
-        proxy
-            .latest_dmabuf_frame()
-            .context("request latest hosted DMA-BUF frame")?;
+    let (
+        sequence,
+        app_id,
+        width,
+        height,
+        fourcc,
+        color_space,
+        modifier,
+        stride,
+        offset,
+        y_inverted,
+        fd,
+    ) = proxy
+        .latest_dmabuf_frame()
+        .context("request latest hosted DMA-BUF frame")?;
     Ok(DmabufFrame {
         sequence,
+        app_id,
         width,
         height,
         fourcc,
@@ -252,12 +266,24 @@ pub fn latest_dmabuf_frame(target: &ControlTarget) -> Result<DmabufFrame> {
 
 pub fn dmabuf_resource(target: &ControlTarget, resource_id: u64) -> Result<DmabufFrame> {
     let connection = connection(target)?;
-    let (sequence, width, height, fourcc, color_space, modifier, stride, offset, y_inverted, fd) =
-        presentation_proxy(&connection, target)?
-            .dmabuf_resource(resource_id)
-            .with_context(|| format!("fetch DMA-BUF resource {resource_id}"))?;
+    let (
+        sequence,
+        app_id,
+        width,
+        height,
+        fourcc,
+        color_space,
+        modifier,
+        stride,
+        offset,
+        y_inverted,
+        fd,
+    ) = presentation_proxy(&connection, target)?
+        .dmabuf_resource(resource_id)
+        .with_context(|| format!("fetch DMA-BUF resource {resource_id}"))?;
     Ok(DmabufFrame {
         sequence,
+        app_id,
         width,
         height,
         fourcc,

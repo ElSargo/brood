@@ -274,6 +274,9 @@ pub struct ClientArgs {
     /// Load a client-local WASM layout policy provider as NAME from PATH.
     #[arg(long = "wasm-layout-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     pub wasm_layout_policy: Option<Vec<String>>,
+    /// Load a client-local WASM key policy provider as NAME from PATH.
+    #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
+    pub wasm_key_policy: Option<Vec<String>>,
     /// Validate and invoke the configured layout policy without opening a presentation.
     #[arg(
         long = "check-wasm-layout-policy",
@@ -281,6 +284,13 @@ pub struct ClientArgs {
         requires = "wasm_layout_policy"
     )]
     pub check_wasm_layout_policy: bool,
+    /// Validate and invoke the configured key policy without opening a presentation.
+    #[arg(
+        long = "check-wasm-key-policy",
+        hide = true,
+        requires = "wasm_key_policy"
+    )]
+    pub check_wasm_key_policy: bool,
     /// Validate configured presentation actors without opening a presentation.
     #[arg(long = "check-wasm-actors", hide = true, requires = "wasm_actors")]
     pub check_wasm_actors: bool,
@@ -300,7 +310,9 @@ mod client_args_tests {
             assert!(args.dbus_address.is_none());
             assert!(args.server.is_none());
             assert!(args.wasm_layout_policy.is_none());
+            assert!(args.wasm_key_policy.is_none());
             assert!(!args.check_wasm_layout_policy);
+            assert!(!args.check_wasm_key_policy);
         }
     }
 
@@ -318,6 +330,24 @@ mod client_args_tests {
             assert_eq!(
                 args.wasm_layout_policy.as_deref(),
                 Some(&["tile".to_string(), "/tmp/layout.wasm".to_string()][..])
+            );
+        }
+    }
+
+    #[test]
+    fn key_policy_keeps_provider_and_path_together() {
+        let parsed = ClientArgs::try_parse_from([
+            "manifold-client",
+            "--no-server",
+            "--wasm-key-policy",
+            "workspace",
+            "/tmp/workspace.wasm",
+        ]);
+        assert!(parsed.is_ok());
+        if let Ok(args) = parsed {
+            assert_eq!(
+                args.wasm_key_policy.as_deref(),
+                Some(&["workspace".to_string(), "/tmp/workspace.wasm".to_string()][..])
             );
         }
     }

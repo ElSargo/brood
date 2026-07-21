@@ -151,6 +151,17 @@ impl PresentationWasmRuntime {
         }
     }
 
+    pub fn send_actor_message(&self, actor_id: &str, payload: Vec<u8>) -> Result<()> {
+        let actor = self
+            .actors
+            .get(actor_id)
+            .with_context(|| format!("presentation actor {actor_id:?} is unavailable"))?;
+        actor
+            .actor
+            .try_send_message("key-policy".to_string(), payload)
+            .with_context(|| format!("enqueue key-policy message for actor {actor_id:?}"))
+    }
+
     pub fn shutdown(&mut self) -> Result<()> {
         let actor_ids = self.actors.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;

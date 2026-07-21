@@ -662,6 +662,7 @@ fn render_presenter_frame_with_capture(
 #[derive(Clone)]
 struct ExternalWindowFrame {
     window_id: u64,
+    app_id: String,
     source_rect: LayoutRect,
     active: bool,
     element: MarkedWindow,
@@ -683,6 +684,7 @@ fn render_external_client_scene(
                 window_id: state
                     .window_pane_id(window)
                     .unwrap_or_else(|| state.window_test_marker_id(window, index)),
+                app_id: state.window_app_id(window).unwrap_or_default(),
                 source_rect,
                 active: active_window.as_ref() == Some(window),
                 element: marked_window(state, window, index),
@@ -829,6 +831,7 @@ fn publish_window_scene(
             fast_path.next_resource_id = id.wrapping_add(1);
             fast_path.resources.insert(weak_dmabuf, id);
             fast_path.buffers.insert(id, dmabuf);
+            fast_path.resource_app_ids.insert(id, window.app_id.clone());
             id
         };
         fast_path

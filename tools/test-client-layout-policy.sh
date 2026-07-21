@@ -21,6 +21,11 @@ cargo build \
   --target wasm32-unknown-unknown \
   --release
 
+target/debug/manifold-client \
+  --no-server \
+  --wasm-key-policy workspace "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm" \
+  --check-wasm-key-policy
+
 TEST_TMP="$(mktemp -d /tmp/manifold-client-layout-policy.XXXXXX)"
 RUNTIME_DIR="$TEST_TMP/runtime"
 WESTON_LOG="$TEST_TMP/weston.log"
@@ -118,6 +123,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
   --wasm-layout-policy tile "$POLICY" \
+  --wasm-key-policy workspace "$POLICY" \
   > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 
@@ -152,7 +158,7 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if request:
         requested[int(request.group(1))] = (int(request.group(2)), int(request.group(3)))
     frame = re.search(
-        r"imported window DMA-BUF window_id=(\d+) resource_id=\d+ size=(\d+)x(\d+)",
+        r"imported window DMA-BUF window_id=(\d+) app_id=\S* resource_id=\d+ size=(\d+)x(\d+)",
         line,
     )
     if frame:
@@ -203,7 +209,7 @@ for line in open(sys.argv[1], encoding="utf-8"):
         requested[int(request.group(1))] = (int(request.group(2)), int(request.group(3)))
 
     frame = re.search(
-        r"imported window DMA-BUF window_id=(\d+) resource_id=\d+ size=(\d+)x(\d+)",
+        r"imported window DMA-BUF window_id=(\d+) app_id=\S* resource_id=\d+ size=(\d+)x(\d+)",
         line,
     )
     if frame:
@@ -236,7 +242,9 @@ STATUS="$(ctl status)"
   exit 1
 }
 
-echo "OK client-local WASM layout policy proof passed"
+rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
+
+echo "OK client-local WASM layout and key policy proof passed"
 echo "status=$STATUS"
 echo "policy=$POLICY"
 

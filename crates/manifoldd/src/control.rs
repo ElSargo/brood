@@ -84,6 +84,7 @@ type DbusPluginActor = (String, String, u64, u64, u64, u64, String, String);
 type DbusPluginMailbox = (String, u64, u64, u64);
 type DbusDmabufFrame = (
     u64,
+    String,
     u32,
     u32,
     u32,
@@ -2723,6 +2724,7 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
         frame_notifications,
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
+        resource_app_ids: std::collections::HashMap::new(),
         window_buffers: std::collections::HashMap::new(),
         next_resource_id: 1,
         last_presented_sequence: None,
@@ -2872,22 +2874,34 @@ fn latest_dmabuf_frame(state: &Manifold) -> Result<DbusDmabufFrame> {
         .latest_client_buffer
         .as_ref()
         .context("no hosted DMA-BUF frame is available")?;
-    dmabuf_frame_tuple(dmabuf, state.dmabuf.latest_client_buffer_sequence)
+    dmabuf_frame_tuple(
+        dmabuf,
+        state.dmabuf.latest_client_buffer_sequence,
+        String::new(),
+    )
 }
 
 fn dmabuf_resource(state: &mut Manifold, resource_id: u64) -> Result<DbusDmabufFrame> {
-    let dmabuf = state
+    let fast_path = state
         .dmabuf
         .fast_path
         .as_mut()
-        .and_then(|fast_path| fast_path.buffers.remove(&resource_id))
+        .context("presentation fast path is unavailable")?;
+    let dmabuf = fast_path
+        .buffers
+        .remove(&resource_id)
         .with_context(|| format!("unknown DMA-BUF resource {resource_id}"))?;
-    dmabuf_frame_tuple(&dmabuf, resource_id)
+    let app_id = fast_path
+        .resource_app_ids
+        .remove(&resource_id)
+        .unwrap_or_default();
+    dmabuf_frame_tuple(&dmabuf, resource_id, app_id)
 }
 
 fn dmabuf_frame_tuple(
     dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
     sequence: u64,
+    app_id: String,
 ) -> Result<DbusDmabufFrame> {
     ensure!(
         dmabuf.num_planes() == 1,
@@ -2912,6 +2926,7 @@ fn dmabuf_frame_tuple(
         .context("duplicate DMA-BUF plane descriptor")?;
     Ok((
         sequence,
+        app_id,
         width,
         height,
         format.code as u32,
