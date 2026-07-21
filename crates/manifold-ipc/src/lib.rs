@@ -45,14 +45,20 @@ pub const INPUT_FRAME_PRESENTED: u32 = 6;
 pub const INPUT_CLIENT_DISCONNECT: u32 = 7;
 /// The presentation client selected a hosted window; argument zero is its window ID.
 pub const INPUT_WINDOW_FOCUS: u32 = 8;
+/// Request one managed window's logical content size.
+///
+/// Arguments are window ID, logical width, and logical height. Placement is
+/// deliberately absent: final layout belongs to the presentation client.
+pub const INPUT_WINDOW_RESIZE: u32 = 9;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.
 pub const FRAME_SCENE_BEGIN: u32 = 0x100;
 /// One separately transported window in the current scene batch.
 ///
-/// Arguments are window ID, resource ID, packed x/y, packed width/height,
-/// and whether the window is active.
+/// Arguments are window ID, resource ID, packed source x/y, packed source
+/// width/height, and whether the window is active. These coordinates describe
+/// content within the resource; they are not presentation placement.
 pub const FRAME_WINDOW_DMABUF: u32 = 0x101;
 /// End and publish the current atomic scene batch.
 pub const FRAME_SCENE_END: u32 = 0x102;

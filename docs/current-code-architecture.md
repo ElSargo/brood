@@ -15,8 +15,9 @@ a nested Wayland compositor with an optional presentation frontend. It hosts
 Wayland clients on an internal Wayland socket, exposes control APIs over DBus,
 can attach or detach a visible/offscreen presentation target, and keeps most
 mutable compositor state inside one central `Manifold` state object. The
-separate client owns its Winit/WGPU viewport, final layout and hit testing, and
-a client-local `manifold-wasm` actor runtime.
+separate client owns its Winit/WGPU viewport, WASM flat-layout policy, final
+layout and hit testing, managed-window size requests, and a client-local
+`manifold-wasm` actor runtime.
 
 At runtime, the core process combines these roles:
 
@@ -48,7 +49,7 @@ The most important architectural fact is that **`Manifold` is the actor-like sta
 | DBus isolation | `session_bus.rs` | In-process DBus bus per session, DBus auth/message router, name registry, host notification proxy. |
 | WASM core plugins and host integration | `crates/manifold-wasm/src/module.rs`, `crates/manifold-wasm/src/actor.rs`, `crates/manifold-wasm/src/hosted_actor.rs`, `crates/manifold-wasm/src/legacy_runtime.rs`, `crates/manifold-wasm/src/global_key_policy.rs`, `crates/manifold-wasm/src/policy_provider.rs`, `crates/manifold-wasm/src/test_harness.rs`, `state.rs`, `wasm_test.rs` | Runtime-owned artifact classification, hosted actor abstraction, core-module generation execution, policy execution, and test-harness engine, plus daemon capability policy and typed request adaptation. |
 | WASM actor/worker runtime | `crates/manifold-wasm/src/component_actor.rs`, `crates/manifold-wasm/src/preview1_worker.rs`, `crates/manifold-wasm/src/completion_io.rs`, `crates/manifold-wasm/src/coordination.rs` | Component Model actors, the Preview 1 POSIX compatibility actor/worker runtime, completion I/O, and shared notification/pollable coordination. |
-| Presentation client actor host | `clients/manifold-client/src/actor_runtime.rs`, `clients/manifold-client/src/main.rs` | Client-owned Tokio/WASM runtime, presentation actor loading and teardown, runtime failure observation, and Winit-loop ownership. |
+| Presentation client WASM host | `clients/manifold-client/src/actor_runtime.rs`, `clients/manifold-client/src/layout_policy.rs`, `clients/manifold-client/src/main.rs` | Client-owned actor runtime and synchronous flat-layout provider, local validation/fallback, runtime failure observation, and Winit-loop ownership. |
 | Plugins | `plugin_runtime.rs` | Built-in actor, host-mailbox, and publication scaffold used by the DBus plugin surface. |
 | Browser | `browser.rs` | Chromium process manager and DevTools HTTP helper under control commands. |
 | Diagnostics | `debug_dump.rs` | Status/composed/surface capture bundle. |
@@ -307,6 +308,12 @@ When `PresenterEvent::Created` arrives, `apply_presenter_created()`:
 10. Record frame timing statistics.
 11. Send frame callbacks and dmabuf feedback to visible clients unless early callbacks were already sent for a deferred input frame.
 12. Request another redraw from the backend.
+
+When the separate presentation-client fast path is active, the backend skips
+that composed-layout path. It exports one frame per managed pane in the active
+session without consulting backend layout rectangles. The client applies its
+own accepted flat layout and returns only the requested logical size for each
+managed pane; the backend applies the corresponding xdg-toplevel configure.
 
 The debug/test surface marker path wraps `Window` as `MarkedWindow`; when `test_surface_markers` is enabled, it draws deterministic marker patterns before each client surface.
 
@@ -644,15 +651,17 @@ a workspace actor.
 See the source files that define module export discovery and policy response
 decoding for the exact ABI.
 
-### 15.2 Actor-driven layout policy
+### 15.2 Layout policy during the client transition
 
-Layout is no longer a standalone direct map-hook import lane. When pane
-inventory changes, the daemon routes typed `pane-mapped` and `layout-state`
-messages only to actors whose declarations subscribe to that event kind. A
-new generation receives an initial layout snapshot. An actor can post a
-`set-resolved-layout` command to the host actor mailbox. The daemon validates
-pane identity, geometry, focus, and input behavior before accepting the layout,
-and falls back to native layout when no actor subscribes or validation fails.
+The separate presentation client invokes its own synchronous WASM layout
+provider with local pane inventory, focus, and viewport size. It validates the
+returned flat `ResolvedLayout` through `manifold-layout`, then uses that layout
+for WGPU composition and hit testing. Provider failure or abstention selects a
+deterministic client-local fallback.
+
+The daemon retains its older actor-driven resolved-layout path for its built-in
+compatibility presenter. That path does not determine placement in the separate
+client and is not carried over the presentation connection.
 
 ### 15.3 Test harness ABI
 

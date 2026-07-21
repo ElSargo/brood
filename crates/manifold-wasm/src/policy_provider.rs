@@ -1,7 +1,7 @@
 //! Policy provider support.
 //!
 //! A policy provider is latency-critical synchronous plugin code: key policy,
-//! focus preflight, and similar host pre-commit decisions.
+//! layout policy, focus preflight, and similar host pre-commit decisions.
 
 use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
@@ -18,6 +18,7 @@ const MAX_RETAINED_PUBLICATION_FRAMES: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyProviderKind {
     Key,
+    Layout,
     Map,
     Focus,
 }

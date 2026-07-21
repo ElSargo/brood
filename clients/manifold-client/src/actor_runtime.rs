@@ -47,7 +47,11 @@ impl PresentationWasmRuntime {
             filesystem_watcher_service: NativeFilesystemWatcherService::new(),
         };
         for (index, spec) in specs.into_iter().enumerate() {
-            let pane = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            // Backend-managed pane IDs grow upward from one. Client-local pane
+            // IDs grow downward from the top of the same flat namespace so a
+            // layout provider can address both without knowing their origin.
+            let pane = u64::MAX.saturating_sub(u64::try_from(index).unwrap_or(u64::MAX));
+            ensure!(pane != 0, "presentation actor pane ID space is exhausted");
             runtime.load_actor(spec, pane, graphics)?;
         }
         Ok(runtime)

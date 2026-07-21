@@ -54,8 +54,9 @@ packet opcode table.
 6. DMA-BUF is a preferred local frame transport, not the pane or frame model.
 7. WGPU is the only presentation renderer. Platform-specific import, window,
    input, accessibility, and media adapters may exist around it.
-8. Presentation actors run locally and can handle input, layout, UI, and custom
-   graphics without a backend round trip.
+8. Presentation actors and synchronous layout policy providers run locally and
+   can handle input, layout, UI, and custom graphics without a backend round
+   trip.
 9. Backend operations remain asynchronous and capability-rooted from a client
    actor's perspective.
 10. The protocol is bounded, generation-safe, observable, and recoverable after
@@ -742,7 +743,7 @@ are local:
 
 ```text
 key or pointer -> local policy -> local actor -> SDK state/draw update
-window inventory event -> local layout actor -> local viewport commit
+window inventory event -> local layout provider -> local viewport commit
 local actor -> local actor mailbox
 draw packet -> local validation -> local WGPU lowering
 ```

@@ -2335,6 +2335,25 @@ impl Manifold {
     }
 
     pub fn configure_presentation_output(&mut self, width: i32, height: i32, refresh_millihz: i32) {
+        self.configure_presentation_output_inner(width, height, refresh_millihz, true);
+    }
+
+    pub fn configure_external_presentation_output(
+        &mut self,
+        width: i32,
+        height: i32,
+        refresh_millihz: i32,
+    ) {
+        self.configure_presentation_output_inner(width, height, refresh_millihz, false);
+    }
+
+    fn configure_presentation_output_inner(
+        &mut self,
+        width: i32,
+        height: i32,
+        refresh_millihz: i32,
+        configure_managed_windows: bool,
+    ) {
         let size = Size::from((width.max(1), height.max(1)));
         let refresh = if refresh_millihz > 0 {
             refresh_millihz
@@ -2360,7 +2379,9 @@ impl Manifold {
             .change_current_state(Some(mode), None, None, None);
         self.session_output.set_preferred(mode);
         self.refresh_fractional_scales();
-        self.reconfigure_focus_stack();
+        if configure_managed_windows {
+            self.reconfigure_focus_stack();
+        }
         if let Some(importer) = self.dmabuf.importer.as_ref()
             && let Some(backend) = importer.borrow().backend.as_ref()
         {
@@ -2505,6 +2526,10 @@ impl Manifold {
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
+        if self.dmabuf.fast_path.is_some() {
+            self.activate_windows_without_geometry(active_surface);
+            return;
+        }
         self.space.elements().for_each(|window| {
             let Some(toplevel) = window.toplevel() else {
                 return;
@@ -2533,6 +2558,24 @@ impl Manifold {
                     }
                     state.fullscreen_output = fullscreen_output;
                 }
+                if is_active {
+                    state.states.set(xdg_toplevel::State::Activated);
+                } else {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                }
+            });
+            window.set_activated(is_active);
+            toplevel.send_pending_configure();
+        });
+    }
+
+    fn activate_windows_without_geometry(&mut self, active_surface: Option<&WlSurface>) {
+        self.space.elements().for_each(|window| {
+            let Some(toplevel) = window.toplevel() else {
+                return;
+            };
+            let is_active = active_surface == Some(toplevel.wl_surface());
+            toplevel.with_pending_state(|state| {
                 if is_active {
                     state.states.set(xdg_toplevel::State::Activated);
                 } else {
@@ -3387,6 +3430,32 @@ impl Manifold {
             == self.sessions.active()
     }
 
+    pub(crate) fn window_available_to_presentation_client(&self, window: &Window) -> bool {
+        let Some(surface) = Self::window_toplevel_surface(window) else {
+            return false;
+        };
+        self.window_belongs_to_active_surface_session(window)
+            && self.surface_participates_in_resolved_layout(&surface)
+            && self.pane_for_toplevel_surface(&surface).is_some()
+    }
+
+    pub(crate) fn presentation_client_source_rect(&self, window: &Window) -> LayoutRect {
+        let size = window.geometry().size;
+        LayoutRect {
+            x: 0,
+            y: 0,
+            w: size.w.max(1),
+            h: size.h.max(1),
+        }
+    }
+
+    pub(crate) fn active_presentation_client_window(&self) -> Option<Window> {
+        self.focus.active_toplevel().and_then(|active| {
+            self.window_for_any_toplevel_surface(active)
+                .filter(|window| self.window_available_to_presentation_client(window))
+        })
+    }
+
     pub fn window_visible_in_presentation(&self, window: &Window) -> bool {
         let Some(surface) = Self::window_toplevel_surface(window) else {
             return false;
@@ -3611,6 +3680,51 @@ impl Manifold {
         }
         self.focus_toplevel_surface(Some(surface));
         self.reconfigure_focus_stack();
+        true
+    }
+
+    pub fn focus_pane_from_presentation_client(&mut self, pane: u64) -> bool {
+        let Some(surface) = self.active_session_content_surface_for_pane(pane) else {
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            return false;
+        };
+        self.space.raise_element(&window, true);
+        if let Some(session) = self.session_for_toplevel_surface(&surface) {
+            self.record_surface_session_interaction(session);
+        }
+        self.focus.set_active_toplevel(Some(surface.clone()));
+        self.activate_windows_without_geometry(Some(&surface));
+        let serial = SERIAL_COUNTER.next_serial();
+        self.seat
+            .get_keyboard()
+            .expect("keyboard")
+            .set_focus(self, Some(surface), serial);
+        true
+    }
+
+    pub fn configure_presentation_client_pane_size(
+        &mut self,
+        pane: u64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let Some(surface) = self.active_session_content_surface_for_pane(pane) else {
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        let size = (width.max(1), height.max(1));
+        toplevel.with_pending_state(|state| {
+            state.size = Some(size.into());
+            state.bounds = Some(size.into());
+        });
+        toplevel.send_pending_configure();
         true
     }
 
@@ -5356,6 +5470,10 @@ impl Manifold {
     }
 
     pub fn reconfigure_focus_stack(&mut self) {
+        if self.dmabuf.fast_path.is_some() {
+            self.reconfigure_presentation_client_focus();
+            return;
+        }
         let windows = self
             .space
             .elements()
@@ -5402,6 +5520,31 @@ impl Manifold {
         } else {
             self.focus_toplevel_surface(None);
         }
+    }
+
+    fn reconfigure_presentation_client_focus(&mut self) {
+        let windows = self
+            .space
+            .elements()
+            .filter(|window| self.window_available_to_presentation_client(window))
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_window = self
+            .active_presentation_client_window()
+            .or_else(|| windows.last().cloned());
+        if let Some(window) = active_window.as_ref() {
+            self.space.raise_element(window, true);
+        }
+        let active_surface = active_window
+            .as_ref()
+            .and_then(Self::window_toplevel_surface);
+        self.focus.set_active_toplevel(active_surface.clone());
+        self.activate_windows_without_geometry(active_surface.as_ref());
+        let serial = SERIAL_COUNTER.next_serial();
+        self.seat
+            .get_keyboard()
+            .expect("keyboard")
+            .set_focus(self, active_surface, serial);
     }
 
     pub fn toggle_managed_fullscreen(&mut self) -> bool {

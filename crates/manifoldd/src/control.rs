@@ -2730,6 +2730,7 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
         pending_redraw: false,
     };
     state.dmabuf.fast_path = Some(fast_path);
+    state.reconfigure_focus_stack();
     presentation::request_external_client_redraw(state);
     state
         .loop_handle
@@ -2805,7 +2806,7 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 state.forward_pointer_axis(frame);
             }
             manifold_ipc::INPUT_PRESENTATION_SIZE => {
-                state.configure_presentation_output(
+                state.configure_external_presentation_output(
                     i32::try_from(record.arguments[0]).map_or(i32::MAX, |value| value),
                     i32::try_from(record.arguments[1]).map_or(i32::MAX, |value| value),
                     i32::try_from(record.arguments[2]).map_or(i32::MAX, |value| value),
@@ -2834,7 +2835,18 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 disconnected = true;
                 break;
             }
-            manifold_ipc::INPUT_WINDOW_FOCUS if state.focus_pane(record.arguments[0]) => {
+            manifold_ipc::INPUT_WINDOW_FOCUS
+                if state.focus_pane_from_presentation_client(record.arguments[0]) =>
+            {
+                request_redraw = true;
+            }
+            manifold_ipc::INPUT_WINDOW_RESIZE
+                if state.configure_presentation_client_pane_size(
+                    record.arguments[0],
+                    i32::try_from(record.arguments[1]).map_or(i32::MAX, |value| value),
+                    i32::try_from(record.arguments[2]).map_or(i32::MAX, |value| value),
+                ) =>
+            {
                 request_redraw = true;
             }
             _ => {}
@@ -2842,6 +2854,7 @@ fn drain_fast_path_input(state: &mut Manifold) {
     }
     if disconnected {
         presentation::send_external_client_frame_callbacks(state);
+        state.reconfigure_focus_stack();
     } else {
         state.dmabuf.fast_path = Some(fast_path);
     }

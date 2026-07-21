@@ -29,6 +29,13 @@ later debug request, so the manifest may honestly record `no_current_buffer`;
 SHM offset, stride, pixel, alpha, short-buffer, zero-size, and overflow behavior
 is covered by focused unit fixtures.
 
+Run `./tools/test-client-layout-policy.sh` inside the checked-in Nix development
+environment to exercise the client-local WASM layout boundary. It opens the
+real Winit/WGPU presentation client on a headless Weston compositor, maps two
+real managed clients, and proves that their imported buffers converge on the
+sizes requested from the accepted flat layout without sending placement back
+to the session server.
+
 Run `./tools/audit-v1-capabilities.sh` from the repo root for the concise v1 acceptance audit. It runs formatting, offline checking, unit tests, headless compositor checks, supported host-backed smoke tests when a host display is available, and the dmabuf capability checks. Set `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1` on a DRM-capable backend to make capability skips fail the audit.
 
 Run `./tools/smoke-v1-full.sh` from the repo root for the full supported v1 proof suite: formatting, offline build/test, dmabuf validator/classifier fixtures, headless Wayland globals, headless native-client mapping, headless input forwarding, headless control-error handling, headless JSON status, headless status parity, headless client lifecycle checks, startup attach fallback, native nesting, detach/reattach, host input forwarding, dmabuf diagnostics, explicit-sync diagnostics, and latency/cadence.

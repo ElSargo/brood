@@ -16,6 +16,7 @@ pub mod global_key_policy;
 mod global_key_policy_link;
 mod hosted_actor;
 pub mod layout_policy;
+mod layout_policy_link;
 mod legacy_runtime;
 mod lifecycle;
 pub mod mailbox;
@@ -71,8 +72,13 @@ pub use global_key_policy_link::{
 };
 pub use hosted_actor::{HostedWasmActor, aggregate_preview1_compat_stats};
 pub use layout_policy::{
-    InputBehavior, LayoutItemId, LayoutItemKind, LayoutSize, LocalPoint, LocalTransform,
-    ResolvedLayout, ResolvedLayoutItem,
+    DEFAULT_LAYOUT_POLICY_ARENA_BYTES, InputBehavior, LayoutItemId, LayoutItemKind,
+    LayoutPolicyInput, LayoutPolicyInvocationBuffers, LayoutPolicyOutcome, LayoutSize, LocalPoint,
+    LocalTransform, MAX_LAYOUT_POLICY_ARENA_BYTES, MAX_LAYOUT_POLICY_QUERY_BYTES,
+    MAX_LAYOUT_POLICY_RESULT_BYTES, ResolvedLayout, ResolvedLayoutItem, WasmLayoutPolicy,
+};
+pub use layout_policy_link::{
+    LAYOUT_POLICY_RESULT_ABSTAIN, LAYOUT_POLICY_RESULT_ERROR, LAYOUT_POLICY_RESULT_OK,
 };
 pub use legacy_runtime::{LegacyWasmActorGeneration, LegacyWasmRuntimeEvent};
 pub use lifecycle::{

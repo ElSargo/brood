@@ -271,6 +271,16 @@ pub struct ClientArgs {
     /// Start a presentation-scoped WASM actor as ID from PATH.
     #[arg(long = "wasm-actor", value_name = "ID=PATH")]
     pub wasm_actors: Vec<String>,
+    /// Load a client-local WASM layout policy provider as NAME from PATH.
+    #[arg(long = "wasm-layout-policy", value_names = ["NAME", "PATH"], num_args = 2)]
+    pub wasm_layout_policy: Option<Vec<String>>,
+    /// Validate and invoke the configured layout policy without opening a presentation.
+    #[arg(
+        long = "check-wasm-layout-policy",
+        hide = true,
+        requires = "wasm_layout_policy"
+    )]
+    pub check_wasm_layout_policy: bool,
     /// Validate configured presentation actors without opening a presentation.
     #[arg(long = "check-wasm-actors", hide = true, requires = "wasm_actors")]
     pub check_wasm_actors: bool,
@@ -289,6 +299,26 @@ mod client_args_tests {
             assert!(args.dbus_name.is_none());
             assert!(args.dbus_address.is_none());
             assert!(args.server.is_none());
+            assert!(args.wasm_layout_policy.is_none());
+            assert!(!args.check_wasm_layout_policy);
+        }
+    }
+
+    #[test]
+    fn layout_policy_keeps_provider_and_path_together() {
+        let parsed = ClientArgs::try_parse_from([
+            "manifold-client",
+            "--no-server",
+            "--wasm-layout-policy",
+            "tile",
+            "/tmp/layout.wasm",
+        ]);
+        assert!(parsed.is_ok());
+        if let Ok(args) = parsed {
+            assert_eq!(
+                args.wasm_layout_policy.as_deref(),
+                Some(&["tile".to_string(), "/tmp/layout.wasm".to_string()][..])
+            );
         }
     }
 

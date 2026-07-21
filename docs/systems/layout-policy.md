@@ -2,99 +2,102 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-21
 ---
 
-# Message-Based Layout
+# Client-Local Layout Policy
 
-The target layout model gives plugins flexible policy control while keeping presentation execution client-owned. Layout normally runs in a presentation actor next to the viewport, so pane changes and user layout actions do not cross the backend connection. Layout is not a synchronous policy-provider lane. It is an actor-owned local convergence path:
+Each presentation client owns an independent WASM layout policy provider. The
+provider produces a flat layout specification for that client's pane inventory;
+the client validates and executes it locally:
 
 ```text
-presentation-client layout event
-    -> presentation actor mailbox
-    -> actor updates client-local layout state
-    -> actor sends SetResolvedLayout to the local client host
-    -> local validation
-    -> accepted viewport layout
-    -> WGPU render, hit testing, focus, and input delivery
+client pane inventory + viewport size + local focus + published plugin state
+    -> client-local layout policy provider
+    -> flat resolved layout
+    -> client validation
+    -> WGPU composition, hit testing, focus, and input routing
 ```
+
+No placement rectangles cross the backend connection. Another presentation
+client may show the same session with a completely different policy, viewport,
+or visible arrangement.
 
 ## Ownership
 
 The presentation client owns:
 
-- presentation surfaces and native chrome
+- its WASM layout policy provider and immutable policy-state input
 - final layout validation and canonicalization
-- pane bounds, clipping, hit testing, and focus routing
-- pointer capture and drag bookkeeping
-- fallback layout when plugin layout is missing or invalid
+- pane bounds, clipping, z order, hit testing, and focus routing
+- native fallback when the provider is missing, abstains, traps, or returns an
+  invalid candidate
+- managed-window size requests derived from accepted pane bounds
 
-Plugins own:
+The backend owns:
 
-- layout policy state and preferences
-- split/tab/stack/floating/dock models internal to the plugin
-- rules for placement, resizing, focus preference, and visibility
-- actor logic that turns client events into candidate resolved layouts
+- session and managed-window lifecycle
+- stable managed-pane identity and per-window frame production
+- lease-authorized Wayland size configuration and application input
 
-## Portable Host Boundary
+The backend does not own viewport placement, z order, chrome, or hit testing.
+It receives a managed pane ID and requested logical content size when the
+client's accepted layout changes. It configures that Wayland client to the
+requested size and returns the resulting per-window content frame. The resize
+request deliberately carries no placement coordinate.
 
-The client host consumes layout through the compositor-independent
-`manifold-layout` crate. That crate owns resolved-layout validation,
-normalized coordinate projection, hit testing, and the deterministic native
-fallback. It must not depend on Smithay, Winit, WGPU, a transport, or a plugin
-runtime.
+## Policy Provider
 
-The current daemon and future presentation client should call this same API
-while ownership moves between processes. Pane inventory, focus, rendering,
-input delivery, actor execution, and persistence remain host responsibilities;
-they are inputs to or consumers of layout, not part of the portable mechanism.
-
-The plugin's internal layout tree is not the client host ABI. The client accepts only a bounded resolved layout through a locally validated message. Persistence is explicit: layout state remains client-local unless the actor chooses to coordinate it with a session actor or backend storage.
-
-## Layout Events
-
-The presentation client emits normal actor messages when layout-relevant state changes. Examples include:
+Layout is a synchronous policy provider because inventory, viewport, focus, or
+interactive geometry changes need an immediate local answer before the client
+commits its next scene. The provider reads a bounded query plus an optional
+immutable publication frame and returns a bounded candidate:
 
 ```text
-PaneMapped
-PaneUnmapped
-ActiveSessionChanged
-FocusChanged
-OutputResized
-LayoutStateSnapshot
-```
+LayoutPolicyInput {
+  visible_panes,
+  focused_pane,
+  presentation_size,
+}
 
-The current scaffold emits a `layout-state` snapshot containing visible panes, focused pane, and presentation size. This should evolve toward typed event envelopes with revisions so stale actor responses can be rejected.
-
-## SetResolvedLayout
-
-Actors request a visual layout by sending a host message equivalent to:
-
-```text
-SetResolvedLayout {
+LayoutPolicyOutcome {
   layout: ResolvedLayout,
-  focus: optional<PaneId>,
+  focus,
 }
 ```
 
-The presentation client validates that pane items reference real panes in the current inventory and viewport, canonicalizes the result, rejects invalid or oversized layouts, and then commits it as the accepted viewport layout.
+Provider implementation details and persistent split trees remain private WASM
+state. They are not part of the client host ABI.
 
-## Why Layout Is Not A Provider
+## Flat Resolved Layout
 
-The synchronous provider model remains valuable for global key handling because the presentation client must decide whether to consume or forward a key before it can continue.
+A resolved layout is a flat, client-validated presentation description. It may
+contain pane items, placeholders, handles, chrome, and overlays. Each item has
+a stable item ID, normalized transform, z value, and input behavior.
 
-Layout is different. It is usually an eventual-convergence problem: the world changes, then the visible layout should update promptly. If layout depends on plugin-owned split trees, session layout state, focus history, or dock state, a provider would still need a host-to-actor-to-publication round trip before it had current state. At that point the synchronous provider adds complexity without eliminating the real latency source.
+Pane items must reference a real pane in the current client inventory and may
+appear at most once. A policy may omit a pane to keep it out of this viewport.
+Non-pane items let the client report interactive targets without learning the
+provider's internal model.
+
+The portable `manifold-layout` crate owns validation, normalized projection,
+and hit testing. It does not depend on Smithay, Winit, WGPU, transport code, or
+the WASM runtime.
+
+## Pane Identity
+
+The client presents managed panes and client-local WASM panes in one flat
+identity namespace. Backend-managed IDs grow upward from the low end;
+client-local pane IDs grow downward from the high end. The provider therefore
+uses one `PaneId` shape without confusing a local actor pane with a managed
+Wayland pane.
 
 ## Fallback
 
-The presentation client must always have a deterministic native fallback layout. Fallback is used when:
-
-- no layout actor is registered
-- the actor does not produce a layout yet
-- the actor traps, stalls, or is disabled
-- the candidate layout is invalid or too large
-
-Fallback should keep panes visible enough for recovery and expose clear status so users can repair or disable a failing plugin.
+The client always retains a deterministic native flat-layout fallback. It is
+used when no provider is configured, the provider abstains or fails, or the
+candidate does not validate against the current inventory. Fallback keeps the
+viewport usable and never asks the backend to invent placement.
 
 Related:
 

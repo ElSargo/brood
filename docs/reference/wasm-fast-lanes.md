@@ -10,8 +10,12 @@ code-links:
   - crates/manifold-wasm/src/actor_link.rs
   - crates/manifold-wasm/src/global_key_policy.rs
   - crates/manifold-wasm/src/global_key_policy_link.rs
+  - crates/manifold-wasm/src/layout_policy.rs
+  - crates/manifold-wasm/src/layout_policy_link.rs
   - crates/manifold-wasm/src/policy_provider.rs
   - crates/manifold-wasm/src/test_harness.rs
+  - clients/manifold-client/src/layout_policy.rs
+  - clients/manifold-client/src/main.rs
   - crates/manifoldd/src/wasm_test.rs
   - crates/manifoldd/src/control.rs
   - crates/manifoldd/src/state.rs
@@ -34,11 +38,11 @@ batches; ordinary plugin work stays in actors and workers. See
 
 Core plugins declare actors and typed event subscriptions through named exports
 discovered by `module_link.rs`. Each actor processes one bounded mailbox epoch
-and returns an outbox containing messages and publication frames. Layout policy
-uses this path: the host routes pane/layout state only to subscribing actors,
-and an actor sends a validated `set-resolved-layout` command back through the
-host mailbox. Marker typos and subscriptions without a declared actor reject
-the module; consult `module_link.rs` for exact export spellings.
+and returns an outbox containing messages and publication frames. The built-in
+daemon presenter retains an actor-driven layout path for compatibility while
+the separate presentation client migration is in progress. Marker typos and
+subscriptions without a declared actor reject the module; consult
+`module_link.rs` for exact export spellings.
 
 See `module.rs`, `module_link.rs`, `actor.rs`, and `actor_link.rs` for the exact
 export and outbox ABI.
@@ -54,6 +58,19 @@ the provider does not perform host side effects directly.
 See `global_key_policy.rs`, `global_key_policy_link.rs`, and
 `policy_provider.rs` for the exact export, descriptor, bounds, and decision
 encoding.
+
+## Presentation Layout Policy
+
+The separate presentation client selects and invokes a named synchronous
+layout provider locally. Its bounded query contains the client-visible pane
+inventory, local focus, and viewport size. The result is a flat resolved layout
+that the client validates before composition and hit testing. Failure,
+abstention, or an invalid result selects the client-local native fallback.
+
+The client sends requested managed-pane sizes to the daemon after accepting a
+layout; it never sends placement. See `layout_policy.rs`,
+`layout_policy_link.rs`, and the client layout-policy host for the exact ABI and
+validation path.
 
 ## Async Test Harness
 

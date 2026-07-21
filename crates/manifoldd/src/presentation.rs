@@ -662,7 +662,7 @@ fn render_presenter_frame_with_capture(
 #[derive(Clone)]
 struct ExternalWindowFrame {
     window_id: u64,
-    rect: LayoutRect,
+    source_rect: LayoutRect,
     active: bool,
     element: MarkedWindow,
 }
@@ -671,19 +671,19 @@ fn render_external_client_scene(
     backend: &mut PresenterBackend,
     state: &mut Manifold,
 ) -> std::result::Result<(), PresentationRuntimeFailure> {
-    let active_window = state.active_presentation_window();
+    let active_window = state.active_presentation_client_window();
     let mut windows = state
         .space
         .elements()
-        .filter(|window| state.window_visible_in_presentation(window))
+        .filter(|window| state.window_available_to_presentation_client(window))
         .enumerate()
         .filter_map(|(index, window)| {
-            let rect = state.window_layout_rect(window)?;
-            (rect.w > 0 && rect.h > 0).then(|| ExternalWindowFrame {
+            let source_rect = state.presentation_client_source_rect(window);
+            (source_rect.w > 0 && source_rect.h > 0).then(|| ExternalWindowFrame {
                 window_id: state
                     .window_pane_id(window)
                     .unwrap_or_else(|| state.window_test_marker_id(window, index)),
-                rect,
+                source_rect,
                 active: active_window.as_ref() == Some(window),
                 element: marked_window(state, window, index),
             })
@@ -704,7 +704,8 @@ fn render_external_client_scene(
 
     let mut rendered = Vec::with_capacity(windows.len());
     for window in windows {
-        let size: Size<i32, Physical> = (window.rect.w.max(1), window.rect.h.max(1)).into();
+        let size: Size<i32, Physical> =
+            (window.source_rect.w.max(1), window.source_rect.h.max(1)).into();
         let existing = state
             .dmabuf
             .fast_path
@@ -737,7 +738,8 @@ fn render_window_dmabuf(
     window: &ExternalWindowFrame,
     dmabuf: &mut Dmabuf,
 ) -> std::result::Result<(), PresentationRuntimeFailure> {
-    let size: Size<i32, Physical> = (window.rect.w.max(1), window.rect.h.max(1)).into();
+    let size: Size<i32, Physical> =
+        (window.source_rect.w.max(1), window.source_rect.h.max(1)).into();
     let output = Output::new(
         format!("manifold-window-{}", window.window_id),
         PhysicalProperties {
@@ -838,8 +840,8 @@ fn publish_window_scene(
                 arguments: [
                     window.window_id,
                     resource_id,
-                    pack_i32_pair(window.rect.x, window.rect.y),
-                    pack_i32_pair(window.rect.w, window.rect.h),
+                    pack_i32_pair(window.source_rect.x, window.source_rect.y),
+                    pack_i32_pair(window.source_rect.w, window.source_rect.h),
                     u64::from(window.active),
                 ],
                 ..manifold_ipc::CriticalRecord::default()
@@ -1225,11 +1227,28 @@ fn send_active_client_frame_callbacks(
 
 pub fn send_external_client_frame_callbacks(state: &mut Manifold) -> u64 {
     let output = state.session_output.clone();
-    send_client_frame_callbacks(&output, state)
+    let active_window = state.active_presentation_client_window();
+    let active_surface = active_window
+        .as_ref()
+        .and_then(Manifold::window_toplevel_surface);
+    let mut windows = Vec::new();
+    if let Some(active_window) = active_window {
+        windows.push(active_window);
+    }
+    windows.extend(
+        state
+            .space
+            .elements()
+            .filter(|window| state.window_available_to_presentation_client(window))
+            .filter(|window| {
+                active_surface.as_ref() != Manifold::window_toplevel_surface(window).as_ref()
+            })
+            .cloned(),
+    );
+    send_frame_callbacks_for_windows(&output, state, &windows)
 }
 
 fn send_client_frame_callbacks(output: &Output, state: &mut Manifold) -> u64 {
-    let mut client_frame_callbacks = 0;
     let active_window = state.active_presentation_window();
     let active_surface = active_window
         .as_ref()
@@ -1248,6 +1267,15 @@ fn send_client_frame_callbacks(output: &Output, state: &mut Manifold) -> u64 {
             })
             .cloned(),
     );
+    send_frame_callbacks_for_windows(output, state, &windows)
+}
+
+fn send_frame_callbacks_for_windows(
+    output: &Output,
+    state: &mut Manifold,
+    windows: &[Window],
+) -> u64 {
+    let mut client_frame_callbacks = 0;
     windows.iter().for_each(|window| {
         window.send_frame(
             output,

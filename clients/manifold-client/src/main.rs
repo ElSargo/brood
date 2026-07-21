@@ -23,7 +23,7 @@ use manifold_cli::{
     },
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
-use manifold_layout::{LayoutAxis, LayoutRect, LayoutSize, LayoutState};
+use manifold_layout::{LayoutItemKind, LayoutRect, LayoutSize, LocalPoint, ResolvedLayout};
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -35,10 +35,12 @@ use winit::{
 };
 
 mod actor_runtime;
+mod layout_policy;
 mod plugin_gpu;
 mod plugin_graphics;
 
 use actor_runtime::PresentationWasmRuntime;
+use layout_policy::{ClientLayoutPolicy, LayoutSource};
 use manifold_wasm::PresentationEvent;
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
@@ -52,6 +54,17 @@ fn main() -> Result<()> {
             .context("stop checked presentation WASM runtime")?;
         drop(runtime);
         eprintln!("presentation WASM actor check passed");
+        return Ok(());
+    }
+    let mut layout_policy = ClientLayoutPolicy::load(args.wasm_layout_policy.as_deref())?;
+    if args.check_wasm_layout_policy {
+        let resolution = layout_policy.resolve(&[1, 2], Some(1), LayoutSize { w: 1200, h: 800 });
+        if resolution.source != LayoutSource::WasmPolicy || resolution.layout.pane_count() != 2 {
+            return Err(anyhow!(
+                "presentation layout policy did not produce the expected two-pane flat layout"
+            ));
+        }
+        eprintln!("presentation WASM layout policy check passed");
         return Ok(());
     }
     let event_loop = EventLoop::<ClientEvent>::with_user_event()
@@ -111,6 +124,7 @@ fn main() -> Result<()> {
             &args.wasm_actors,
             Some(&plugin_graphics),
         )?),
+        layout_policy: Some(layout_policy),
         plugin_graphics: Some(plugin_graphics),
         input_sender,
         fast_path_enabled,
@@ -317,6 +331,7 @@ struct Application {
     cursor_position: Option<(f64, f64)>,
     pending_plugin_pointer_motion: Option<(f32, f32)>,
     wasm_runtime: Option<PresentationWasmRuntime>,
+    layout_policy: Option<ClientLayoutPolicy>,
     plugin_graphics: Option<PluginGraphicsBridge>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<ClientEvent>>,
     next_renderer_generation: u64,
@@ -353,7 +368,17 @@ impl Application {
             });
             return Ok(());
         };
-        renderer.select_scene(sequence, width, height, windows)
+        let focus_change = renderer.select_scene(sequence, width, height, windows)?;
+        if let Some(change) = focus_change {
+            dispatch_focus_change(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                change,
+                self.window_focused,
+            )?;
+        }
+        flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+        Ok(())
     }
 
     fn drain_wasm_events(&mut self, event_loop: &ActiveEventLoop) -> bool {
@@ -393,7 +418,7 @@ impl Application {
                 "renderer recovery failed repeatedly after: {message}"
             ));
         }
-        let old = self
+        let mut old = self
             .renderer
             .take()
             .context("lost renderer during recovery")?;
@@ -402,6 +427,10 @@ impl Application {
             .as_ref()
             .map(|plugin| (plugin.scene.pane, plugin.scene.sequence));
         let window = Arc::clone(&old.window);
+        let layout_policy = old
+            .layout_policy
+            .take()
+            .context("lost layout policy during renderer recovery")?;
         drop(old);
         let generation = self.allocate_renderer_generation()?;
         let proxy = self
@@ -415,8 +444,14 @@ impl Application {
             .plugin_graphics
             .clone()
             .context("plugin graphics bridge is unavailable")?;
-        let mut replacement =
-            Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
+        let mut replacement = Renderer::new(
+            window,
+            self.fast_path_enabled,
+            graphics,
+            layout_policy,
+            generation,
+            proxy,
+        )?;
         if let Some((pane, sequence)) = replay {
             replacement.refresh_plugin_graphics(pane, sequence)?;
         }
@@ -448,6 +483,13 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.fail(event_loop, anyhow!("renderer event proxy is unavailable"));
             return;
         };
+        let Some(layout_policy) = self.layout_policy.take() else {
+            self.fail(
+                event_loop,
+                anyhow!("presentation layout policy is unavailable"),
+            );
+            return;
+        };
         let result = event_loop
             .create_window(Window::default_attributes().with_title(title))
             .context("create presentation window")
@@ -460,6 +502,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     Arc::new(window),
                     self.fast_path_enabled,
                     graphics,
+                    layout_policy,
                     generation,
                     proxy,
                 )
@@ -520,6 +563,7 @@ impl ApplicationHandler<ClientEvent> for Application {
         }
         match event {
             ClientEvent::PluginGraphicsChanged { pane, sequence } => {
+                let mut failure = None;
                 if let Some(renderer) = self.renderer.as_mut() {
                     match renderer.refresh_plugin_graphics(pane, sequence) {
                         Ok(Some(change)) => {
@@ -529,12 +573,16 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 change,
                                 self.window_focused,
                             ) {
-                                self.fail(event_loop, error);
+                                failure = Some(error);
                             }
                         }
                         Ok(None) => {}
-                        Err(error) => self.fail(event_loop, error),
+                        Err(error) => failure = Some(error),
                     }
+                    flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+                }
+                if let Some(error) = failure {
+                    self.fail(event_loop, error);
                 }
             }
             ClientEvent::RendererFailed {
@@ -590,7 +638,21 @@ impl ApplicationHandler<ClientEvent> for Application {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Err(error) = renderer.resize(size.width, size.height) {
+                let focus_change = match renderer.resize(size.width, size.height) {
+                    Ok(change) => change,
+                    Err(error) => {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                };
+                if let Some(change) = focus_change
+                    && let Err(error) = dispatch_focus_change(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        change,
+                        self.window_focused,
+                    )
+                {
                     self.fail(event_loop, error);
                     return;
                 }
@@ -609,6 +671,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Some(sender) = self.input_sender.as_mut() {
                     send_presentation_configuration(sender, renderer);
                 }
+                flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
@@ -633,15 +696,18 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if state == ElementState::Pressed
                     && button == MouseButton::Left
                     && let Some((x, y)) = self.cursor_position
-                    && let Some(change) = renderer.focus_pane_at_window_point(x, y)
-                    && let Err(error) = dispatch_focus_change(
-                        self.wasm_runtime.as_ref(),
-                        self.input_sender.as_mut(),
-                        change,
-                        self.window_focused,
-                    )
                 {
-                    eprintln!("dropped pane focus event: {error:#}");
+                    if let Some(change) = renderer.focus_pane_at_window_point(x, y)
+                        && let Err(error) = dispatch_focus_change(
+                            self.wasm_runtime.as_ref(),
+                            self.input_sender.as_mut(),
+                            change,
+                            self.window_focused,
+                        )
+                    {
+                        eprintln!("dropped pane focus event: {error:#}");
+                    }
+                    flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
                 }
 
                 let button_code = linux_button_code(button).unwrap_or_default();
@@ -748,17 +814,21 @@ impl ApplicationHandler<ClientEvent> for Application {
                 // TEMPORARY MVP BINDING: F6 toggles between the one local plugin pane
                 // and the backend-managed pane without carrying modifiers across them.
                 if is_plugin_managed_focus_toggle(event.physical_key) {
-                    if event.state == ElementState::Pressed
-                        && !event.repeat
-                        && let Some(change) = renderer.toggle_plugin_managed_focus()
-                        && let Err(error) = dispatch_focus_change(
-                            self.wasm_runtime.as_ref(),
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        if let Some(change) = renderer.toggle_plugin_managed_focus()
+                            && let Err(error) = dispatch_focus_change(
+                                self.wasm_runtime.as_ref(),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            )
+                        {
+                            eprintln!("dropped pane focus event: {error:#}");
+                        }
+                        flush_renderer_managed_resize_requests(
                             self.input_sender.as_mut(),
-                            change,
-                            self.window_focused,
-                        )
-                    {
-                        eprintln!("dropped pane focus event: {error:#}");
+                            renderer,
+                        );
                     }
                     return;
                 }
@@ -860,11 +930,14 @@ struct Renderer {
     plugin_canvas: GpuCanvasRenderer,
     imported_frames: HashMap<u64, ImportedFrame>,
     current_windows: Vec<SceneWindow>,
-    scene_extent: Option<(u32, u32)>,
     current_sequence: Option<u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_pane: Option<PluginPaneTexture>,
     focused_pane: Option<FocusedPane>,
+    layout_policy: Option<ClientLayoutPolicy>,
+    accepted_layout: ResolvedLayout,
+    layout_source: LayoutSource,
+    sent_managed_sizes: HashMap<u64, (u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -915,6 +988,24 @@ fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
             0,
         ],
     );
+}
+
+fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer: &mut Renderer) {
+    let Some(lane) = lane else {
+        return;
+    };
+    for (window, width, height) in renderer.pending_managed_resize_requests() {
+        if send_input(
+            lane,
+            manifold_ipc::INPUT_WINDOW_RESIZE,
+            [window, u64::from(width), u64::from(height), 0, 0],
+        ) {
+            renderer.mark_managed_resize_sent(window, width, height);
+            eprintln!(
+                "requested managed window resize window_id={window} logical_size={width}x{height}"
+            );
+        }
+    }
 }
 
 fn send_input(lane: &mut InputLane, opcode: u32, arguments: [u64; 5]) -> bool {
@@ -1269,6 +1360,7 @@ impl Renderer {
         window: Arc<Window>,
         fast_path_enabled: bool,
         plugin_graphics: PluginGraphicsBridge,
+        layout_policy: ClientLayoutPolicy,
         generation: u64,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
@@ -1276,6 +1368,7 @@ impl Renderer {
             window,
             fast_path_enabled,
             plugin_graphics,
+            layout_policy,
             generation,
             proxy,
         ))
@@ -1285,6 +1378,7 @@ impl Renderer {
         window: Arc<Window>,
         fast_path_enabled: bool,
         plugin_graphics: PluginGraphicsBridge,
+        layout_policy: ClientLayoutPolicy,
         generation: u64,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
@@ -1366,11 +1460,14 @@ impl Renderer {
             plugin_canvas,
             imported_frames: HashMap::new(),
             current_windows: Vec::new(),
-            scene_extent: None,
             current_sequence: None,
             plugin_graphics,
             plugin_pane: None,
             focused_pane: None,
+            layout_policy: Some(layout_policy),
+            accepted_layout: ResolvedLayout::empty(),
+            layout_source: LayoutSource::NativeFallback,
+            sent_managed_sizes: HashMap::new(),
         })
     }
 
@@ -1386,10 +1483,10 @@ impl Renderer {
     fn select_scene(
         &mut self,
         sequence: u64,
-        width: u32,
-        height: u32,
+        _width: u32,
+        _height: u32,
         windows: Vec<SceneWindowUpdate>,
-    ) -> Result<()> {
+    ) -> Result<Option<FocusChange>> {
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
         for window in windows {
@@ -1421,7 +1518,6 @@ impl Renderer {
             .all(|window| self.imported_frames.contains_key(&window.resource_id))
         {
             self.current_windows = scene_windows;
-            self.scene_extent = Some((width.max(1), height.max(1)));
             self.current_sequence = Some(sequence);
             self.focused_pane = match self.focused_pane {
                 Some(FocusedPane::Plugin(pane))
@@ -1449,10 +1545,11 @@ impl Renderer {
                             .map(|plugin| FocusedPane::Plugin(plugin.scene.pane))
                     }),
             };
-            self.relayout_panes();
+            let focus_change = self.relayout_panes();
             self.window.request_redraw();
+            return Ok(focus_change);
         }
-        Ok(())
+        Ok(None)
     }
 
     const fn focused_plugin_pane(&self) -> Option<u64> {
@@ -1470,7 +1567,7 @@ impl Renderer {
     }
 
     fn toggle_plugin_managed_focus(&mut self) -> Option<FocusChange> {
-        let plugin = self.plugin_pane.as_ref()?.scene.pane;
+        let plugin = self.plugin_pane.as_ref().map(|pane| pane.scene.pane)?;
         let managed = match self.focused_pane {
             Some(FocusedPane::Managed(window_id))
                 if self
@@ -1480,7 +1577,10 @@ impl Renderer {
             {
                 window_id
             }
-            _ => self.current_windows.first()?.window_id,
+            _ => {
+                let window = self.current_windows.first()?;
+                window.window_id
+            }
         };
         let target = toggled_plugin_managed_focus(self.focused_pane, plugin, managed);
         self.set_focus(target)
@@ -1488,17 +1588,22 @@ impl Renderer {
 
     fn focus_pane_at_window_point(&mut self, x: f64, y: f64) -> Option<FocusChange> {
         let (x, y) = self.scene_position_for_window_point(x, y);
-        let target = self
-            .current_windows
-            .iter()
-            .rfind(|window| rect_contains(window.rect, x, y))
-            .map(|window| FocusedPane::Managed(window.window_id))
-            .or_else(|| {
-                self.plugin_pane.as_ref().and_then(|plugin| {
-                    rect_contains(plugin.rect, x, y)
-                        .then_some(FocusedPane::Plugin(plugin.scene.pane))
-                })
-            })?;
+        let (width, height) = self.composition_extent();
+        let bounds = LayoutRect {
+            x: 0,
+            y: 0,
+            w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
+            h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
+        };
+        let hit = self
+            .accepted_layout
+            .hit_stack(LocalPoint::from_pixel_in_rect(x, y, bounds))
+            .into_iter()
+            .next()?;
+        let LayoutItemKind::Pane { pane } = hit.kind else {
+            return None;
+        };
+        let target = self.focus_target_for_pane(pane)?;
         self.set_focus(target)
     }
 
@@ -1508,21 +1613,16 @@ impl Renderer {
             return None;
         }
         self.focused_pane = Some(target);
+        let _focus_change = self.relayout_panes();
+        let target = self.focused_pane?;
+        if previous == Some(target) {
+            return None;
+        }
         for window in &mut self.current_windows {
             window.active = matches!(target, FocusedPane::Managed(id) if id == window.window_id);
         }
         self.window.request_redraw();
-        Some(FocusChange {
-            plugin: match (previous, target) {
-                (Some(FocusedPane::Plugin(pane)), FocusedPane::Managed(_)) => Some((pane, false)),
-                (_, FocusedPane::Plugin(pane)) => Some((pane, true)),
-                _ => None,
-            },
-            managed_window: match target {
-                FocusedPane::Managed(window_id) => Some(window_id),
-                FocusedPane::Plugin(_) => None,
-            },
-        })
+        focus_change_between(previous, Some(target))
     }
 
     fn scene_position_for_window_point(&self, x: f64, y: f64) -> (f64, f64) {
@@ -1574,22 +1674,120 @@ impl Renderer {
     }
 
     fn composition_extent(&self) -> (u32, u32) {
-        self.scene_extent
-            .unwrap_or_else(|| (self.config.width.max(1), self.config.height.max(1)))
+        (self.config.width.max(1), self.config.height.max(1))
     }
 
-    fn relayout_panes(&mut self) {
+    fn relayout_panes(&mut self) -> Option<FocusChange> {
+        let previous_focus = self.focused_pane;
         let (width, height) = self.composition_extent();
-        let plugin_rect = self.plugin_pane.as_mut().map(|plugin| &mut plugin.rect);
-        map_panes(
-            plugin_rect,
-            &mut self.current_windows,
-            LayoutSize {
-                w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
-                h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
-            },
-            self.focused_pane,
-        );
+        let extent = LayoutSize {
+            w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
+            h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
+        };
+        let panes = self.pane_inventory();
+        let focused = self.focused_pane_id();
+        let layout_policy = self.layout_policy.as_mut()?;
+        let resolution = layout_policy.resolve(&panes, focused, extent);
+        if self.layout_source != resolution.source {
+            let source = match resolution.source {
+                LayoutSource::NativeFallback => "native-fallback",
+                LayoutSource::WasmPolicy => "wasm-policy",
+            };
+            eprintln!("presentation layout source changed source={source}");
+        }
+        self.layout_source = resolution.source;
+        self.accepted_layout = resolution.layout;
+
+        if let Some(plugin) = self.plugin_pane.as_mut() {
+            plugin.rect = [0, 0, 0, 0];
+        }
+        for window in &mut self.current_windows {
+            window.rect = [0, 0, 0, 0];
+        }
+        for item in &self.accepted_layout.items {
+            let LayoutItemKind::Pane { pane } = item.kind else {
+                continue;
+            };
+            let rect = item.pixel_rect(extent);
+            let rect = [rect.x, rect.y, rect.w, rect.h];
+            if let Some(plugin) = self
+                .plugin_pane
+                .as_mut()
+                .filter(|plugin| plugin.scene.pane == pane)
+            {
+                plugin.rect = rect;
+            } else if let Some(window) = self
+                .current_windows
+                .iter_mut()
+                .find(|window| window.window_id == pane)
+            {
+                window.rect = rect;
+            }
+        }
+
+        let requested_focus = resolution
+            .focus
+            .and_then(|pane| self.focus_target_for_visible_pane(pane));
+        let retained_focus = self
+            .focused_pane_id()
+            .and_then(|pane| self.focus_target_for_visible_pane(pane));
+        let fallback_focus = self
+            .accepted_layout
+            .items
+            .iter()
+            .find_map(|item| match item.kind {
+                LayoutItemKind::Pane { pane } => Some(pane),
+                LayoutItemKind::Placeholder
+                | LayoutItemKind::Handle
+                | LayoutItemKind::Chrome
+                | LayoutItemKind::Overlay => None,
+            })
+            .and_then(|pane| self.focus_target_for_pane(pane));
+        self.focused_pane = requested_focus.or(retained_focus).or(fallback_focus);
+        for window in &mut self.current_windows {
+            window.active = self.focused_pane == Some(FocusedPane::Managed(window.window_id));
+        }
+        self.sent_managed_sizes.retain(|window, _| {
+            self.current_windows
+                .iter()
+                .any(|item| item.window_id == *window)
+        });
+        focus_change_between(previous_focus, self.focused_pane)
+    }
+
+    fn pane_inventory(&self) -> Vec<u64> {
+        self.plugin_pane
+            .iter()
+            .map(|plugin| plugin.scene.pane)
+            .chain(self.current_windows.iter().map(|window| window.window_id))
+            .collect()
+    }
+
+    const fn focused_pane_id(&self) -> Option<u64> {
+        match self.focused_pane {
+            Some(FocusedPane::Plugin(pane) | FocusedPane::Managed(pane)) => Some(pane),
+            None => None,
+        }
+    }
+
+    fn focus_target_for_pane(&self, pane: u64) -> Option<FocusedPane> {
+        if self
+            .plugin_pane
+            .as_ref()
+            .is_some_and(|plugin| plugin.scene.pane == pane)
+        {
+            return Some(FocusedPane::Plugin(pane));
+        }
+        self.current_windows
+            .iter()
+            .any(|window| window.window_id == pane)
+            .then_some(FocusedPane::Managed(pane))
+    }
+
+    fn focus_target_for_visible_pane(&self, pane: u64) -> Option<FocusedPane> {
+        self.accepted_layout
+            .pane_item(pane)
+            .and_then(|_| self.focus_target_for_pane(pane))
     }
 
     fn refresh_plugin_graphics(
@@ -1640,32 +1838,34 @@ impl Renderer {
                 i32::try_from(self.config.height).unwrap_or(i32::MAX),
             ],
         });
-        self.relayout_panes();
-        let focus_change = first_plugin_scene
-            .then(|| self.set_focus(FocusedPane::Plugin(pane)))
-            .flatten();
+        let focus_change = if first_plugin_scene {
+            self.set_focus(FocusedPane::Plugin(pane))
+        } else {
+            self.relayout_panes()
+        };
         self.window.request_redraw();
         Ok(focus_change)
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+    fn resize(&mut self, width: u32, height: u32) -> Result<Option<FocusChange>> {
         if width == 0 || height == 0 {
-            return Ok(());
+            return Ok(None);
         }
 
         self.config.width = width;
         self.config.height = height;
         self.reconfigure();
-        self.relayout_panes();
-        if let Some((pane, sequence)) = self
+        let focus_change = if let Some((pane, sequence)) = self
             .plugin_pane
             .as_ref()
             .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
         {
-            let _focus_change = self.refresh_plugin_graphics(pane, sequence)?;
-        }
+            self.refresh_plugin_graphics(pane, sequence)?
+        } else {
+            self.relayout_panes()
+        };
         self.window.request_redraw();
-        Ok(())
+        Ok(focus_change)
     }
 
     fn reconfigure(&self) {
@@ -1728,43 +1928,18 @@ impl Renderer {
                 multiview_mask: None,
             });
             render_pass.set_pipeline(&self.frame_pipeline);
-            if let Some(plugin) = self.plugin_pane.as_ref() {
-                let viewport = scaled_viewport(
-                    plugin.rect,
-                    self.composition_extent(),
-                    (self.config.width, self.config.height),
-                );
-                render_pass.set_viewport(
-                    viewport[0],
-                    viewport[1],
-                    viewport[2],
-                    viewport[3],
-                    0.0,
-                    1.0,
-                );
-                render_pass.set_bind_group(0, plugin.scene.output_bind_group(), &[]);
-                render_pass.draw(0..3, 0..1);
-            }
-            if let Some((scene_width, scene_height)) = self.scene_extent {
-                let scene_width_i32 = i32::try_from(scene_width).unwrap_or(i32::MAX);
-                let scene_height_i32 = i32::try_from(scene_height).unwrap_or(i32::MAX);
-                for window in &self.current_windows {
-                    let Some(imported) = self.imported_frames.get(&window.resource_id) else {
+            let extent = self.composition_extent();
+            for pane in self.layout_panes_in_render_order() {
+                if let Some(plugin) = self
+                    .plugin_pane
+                    .as_ref()
+                    .filter(|plugin| plugin.scene.pane == pane)
+                {
+                    let Some(rect) = clip_rect_to_extent(plugin.rect, extent) else {
                         continue;
                     };
-                    let [x, y, width, height] = window.rect;
-                    let x = x.clamp(0, scene_width_i32);
-                    let y = y.clamp(0, scene_height_i32);
-                    let width = width.max(0).min(scene_width_i32 - x);
-                    let height = height.max(0).min(scene_height_i32 - y);
-                    if width == 0 || height == 0 {
-                        continue;
-                    }
-                    let viewport = scaled_viewport(
-                        [x, y, width, height],
-                        (scene_width, scene_height),
-                        (self.config.width, self.config.height),
-                    );
+                    let viewport =
+                        scaled_viewport(rect, extent, (self.config.width, self.config.height));
                     render_pass.set_viewport(
                         viewport[0],
                         viewport[1],
@@ -1773,9 +1948,36 @@ impl Renderer {
                         0.0,
                         1.0,
                     );
-                    render_pass.set_bind_group(0, &imported.bind_group, &[]);
+                    render_pass.set_bind_group(0, plugin.scene.output_bind_group(), &[]);
                     render_pass.draw(0..3, 0..1);
+                    continue;
                 }
+
+                let Some(window) = self
+                    .current_windows
+                    .iter()
+                    .find(|window| window.window_id == pane)
+                else {
+                    continue;
+                };
+                let Some(imported) = self.imported_frames.get(&window.resource_id) else {
+                    continue;
+                };
+                let Some(rect) = clip_rect_to_extent(window.rect, extent) else {
+                    continue;
+                };
+                let viewport =
+                    scaled_viewport(rect, extent, (self.config.width, self.config.height));
+                render_pass.set_viewport(
+                    viewport[0],
+                    viewport[1],
+                    viewport[2],
+                    viewport[3],
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_bind_group(0, &imported.bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
             }
             drop(render_pass);
         }
@@ -1798,46 +2000,60 @@ impl Renderer {
             reconfigure,
         }
     }
+
+    fn layout_panes_in_render_order(&self) -> Vec<u64> {
+        let mut panes = self
+            .accepted_layout
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item.kind {
+                LayoutItemKind::Pane { pane } => Some((item.z, index, pane)),
+                LayoutItemKind::Placeholder
+                | LayoutItemKind::Handle
+                | LayoutItemKind::Chrome
+                | LayoutItemKind::Overlay => None,
+            })
+            .collect::<Vec<_>>();
+        panes.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        panes.into_iter().map(|(_, _, pane)| pane).collect()
+    }
+
+    fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32)> {
+        let scale = self.window.scale_factor().max(f64::EPSILON);
+        self.current_windows
+            .iter()
+            .filter_map(|window| {
+                let [_, _, width, height] = window.rect;
+                if width <= 0 || height <= 0 {
+                    return None;
+                }
+                let width = ((f64::from(width) / scale).round() as u32).max(1);
+                let height = ((f64::from(height) / scale).round() as u32).max(1);
+                (self.sent_managed_sizes.get(&window.window_id) != Some(&(width, height)))
+                    .then_some((window.window_id, width, height))
+            })
+            .collect()
+    }
+
+    fn mark_managed_resize_sent(&mut self, window: u64, width: u32, height: u32) {
+        self.sent_managed_sizes.insert(window, (width, height));
+    }
 }
 
-fn map_panes(
-    plugin_rect: Option<&mut [i32; 4]>,
-    windows: &mut [SceneWindow],
-    extent: LayoutSize,
-    focused_pane: Option<FocusedPane>,
-) {
-    let pane_count = windows.len() + usize::from(plugin_rect.is_some());
-    if pane_count == 0 {
-        return;
-    }
-    let mut layout = LayoutState::default();
-    for _ in 1..pane_count {
-        let active_rect = layout.active_rect(extent).unwrap_or(LayoutRect {
-            x: 0,
-            y: 0,
-            w: extent.w,
-            h: extent.h,
-        });
-        let axis = if active_rect.w >= active_rect.h {
-            LayoutAxis::Horizontal
-        } else {
-            LayoutAxis::Vertical
-        };
-        let Some(next_leaf) = layout.split_active(axis) else {
-            break;
-        };
-        layout.set_active_leaf(next_leaf);
-    }
-    let mut regions = layout.resolve(extent).into_iter();
-    if let Some(plugin_rect) = plugin_rect
-        && let Some(region) = regions.next()
-    {
-        *plugin_rect = [region.rect.x, region.rect.y, region.rect.w, region.rect.h];
-    }
-    for (window, region) in windows.iter_mut().zip(regions) {
-        window.rect = [region.rect.x, region.rect.y, region.rect.w, region.rect.h];
-        window.active = focused_pane == Some(FocusedPane::Managed(window.window_id));
-    }
+fn clip_rect_to_extent(rect: [i32; 4], extent: (u32, u32)) -> Option<[i32; 4]> {
+    let extent_width = i32::try_from(extent.0).unwrap_or(i32::MAX);
+    let extent_height = i32::try_from(extent.1).unwrap_or(i32::MAX);
+    let [x, y, width, height] = rect;
+    let x = x.clamp(0, extent_width);
+    let y = y.clamp(0, extent_height);
+    let width = width.max(0).min(extent_width - x);
+    let height = height.max(0).min(extent_height - y);
+    (width > 0 && height > 0).then_some([x, y, width, height])
 }
 
 const fn toggled_plugin_managed_focus(
@@ -1849,6 +2065,30 @@ const fn toggled_plugin_managed_focus(
         Some(FocusedPane::Plugin(_)) => FocusedPane::Managed(managed),
         _ => FocusedPane::Plugin(plugin),
     }
+}
+
+fn focus_change_between(
+    previous: Option<FocusedPane>,
+    target: Option<FocusedPane>,
+) -> Option<FocusChange> {
+    if matches!((previous, target), (None, None)) || previous == target {
+        return None;
+    }
+    let plugin = match (previous, target) {
+        (Some(FocusedPane::Plugin(pane)), Some(FocusedPane::Managed(_)) | None) => {
+            Some((pane, false))
+        }
+        (_, Some(FocusedPane::Plugin(pane))) => Some((pane, true)),
+        _ => None,
+    };
+    let managed_window = match target {
+        Some(FocusedPane::Managed(window_id)) => Some(window_id),
+        Some(FocusedPane::Plugin(_)) | None => None,
+    };
+    (plugin.is_some() || managed_window.is_some()).then_some(FocusChange {
+        plugin,
+        managed_window,
+    })
 }
 
 const fn is_plugin_managed_focus_toggle(key: PhysicalKey) -> bool {
@@ -2009,37 +2249,12 @@ mod tests {
     }
 
     #[test]
-    fn client_maps_three_windows_with_the_native_split_fallback() {
-        let mut windows = [scene_window(11), scene_window(12), scene_window(13)];
-        map_panes(
-            None,
-            &mut windows,
-            LayoutSize { w: 1200, h: 800 },
-            Some(FocusedPane::Managed(12)),
+    fn flat_layout_viewports_are_clipped_to_the_client_surface() {
+        assert_eq!(
+            clip_rect_to_extent([-20, 10, 200, 100], (120, 80)),
+            Some([0, 10, 120, 70])
         );
-
-        assert_eq!(windows[0].rect, [0, 0, 600, 800]);
-        assert_eq!(windows[1].rect, [600, 0, 600, 400]);
-        assert_eq!(windows[2].rect, [600, 400, 600, 400]);
-        assert!(!windows[0].active);
-        assert!(windows[1].active);
-        assert!(!windows[2].active);
-    }
-
-    #[test]
-    fn client_maps_a_plugin_and_managed_window_side_by_side() {
-        let mut plugin_rect = [0, 0, 1, 1];
-        let mut windows = [scene_window(42)];
-        map_panes(
-            Some(&mut plugin_rect),
-            &mut windows,
-            LayoutSize { w: 1200, h: 800 },
-            Some(FocusedPane::Plugin(7)),
-        );
-
-        assert_eq!(plugin_rect, [0, 0, 600, 800]);
-        assert_eq!(windows[0].rect, [600, 0, 600, 800]);
-        assert!(!windows[0].active);
+        assert_eq!(clip_rect_to_extent([200, 10, 20, 20], (120, 80)), None);
     }
 
     #[test]
@@ -2065,15 +2280,5 @@ mod tests {
         let actual =
             project_point_between_rects(900.0, 200.0, [600, 0, 600, 400], [0, 400, 600, 400]);
         assert_eq!(actual, (300.0, 600.0));
-    }
-
-    fn scene_window(window_id: u64) -> SceneWindow {
-        SceneWindow {
-            window_id,
-            resource_id: window_id,
-            source_rect: [0, 0, 1, 1],
-            rect: [0, 0, 1, 1],
-            active: false,
-        }
     }
 }

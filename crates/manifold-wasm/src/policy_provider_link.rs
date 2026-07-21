@@ -7,6 +7,7 @@ pub const POLICY_PROVIDER_EXPORT_PREFIX: &str = "manifold_policy_provider_";
 pub fn parse_policy_provider_export_tail(tail: &str) -> Option<(PolicyProviderKind, String)> {
     for (prefix, kind) in [
         ("key_", PolicyProviderKind::Key),
+        ("layout_", PolicyProviderKind::Layout),
         ("map_", PolicyProviderKind::Map),
         ("focus_", PolicyProviderKind::Focus),
     ] {
