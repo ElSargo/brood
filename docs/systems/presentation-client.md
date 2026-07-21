@@ -672,6 +672,10 @@ first passes through client-local policy and application actors. If not consumed
 and the target is a hosted window, the client sends a bounded input record to
 the backend.
 
+That record preserves the client's hit-test result. The backend resolves nested
+surfaces inside the named hosted pane, but it never interprets the coordinates
+through a backend-owned presentation layout.
+
 A hosted-window input record includes:
 
 - session and window identity;

@@ -281,6 +281,57 @@ impl Manifold {
         pointer.frame(self);
     }
 
+    pub fn forward_pointer_motion_to_pane(
+        &mut self,
+        pane: u64,
+        pos: Point<f64, Logical>,
+        time: u32,
+    ) {
+        let serial = SERIAL_COUNTER.next_serial();
+        let target_window = self.presentation_window_for_pane(pane);
+        let hover_surface = target_window
+            .as_ref()
+            .and_then(Self::window_toplevel_surface);
+        self.set_pointer_hover_toplevel_surface(hover_surface);
+        let under = self.presentation_surface_under_pane_local(pane, pos);
+        self.stats
+            .record_input(self.presentation == PresentationStatus::Attached && under.is_some());
+        self.stats.pointer_motion_events += 1;
+        if under.is_some() {
+            self.stats.pointer_target_hits += 1;
+        } else {
+            self.stats.pointer_target_misses += 1;
+        }
+        let pointer = self.seat.get_pointer().expect("pointer");
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    pub fn forward_pointer_leave_managed_pane(&mut self, time: u32) {
+        self.set_pointer_hover_toplevel_surface(None);
+        let serial = SERIAL_COUNTER.next_serial();
+        let pointer = self.seat.get_pointer().expect("pointer");
+        let location = pointer.current_location();
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
     pub fn forward_pointer_button(&mut self, button_code: u32, state: ButtonState, time: u32) {
         let pointer = self.seat.get_pointer().expect("pointer");
         if button_code == 0x110 {
@@ -385,6 +436,65 @@ impl Manifold {
         pointer.frame(self);
     }
 
+    pub fn forward_pointer_button_to_pane(
+        &mut self,
+        pane: u64,
+        button_code: u32,
+        state: ButtonState,
+        time: u32,
+    ) {
+        let pointer = self.seat.get_pointer().expect("pointer");
+        let keyboard = self.seat.get_keyboard().expect("keyboard");
+        let serial = SERIAL_COUNTER.next_serial();
+        let target_window = self.presentation_window_for_pane(pane);
+        let target_surface = target_window
+            .as_ref()
+            .and_then(Self::window_toplevel_surface);
+        self.stats.record_input(
+            self.presentation == PresentationStatus::Attached && target_window.is_some(),
+        );
+        self.stats.pointer_button_events += 1;
+        if target_window.is_some() {
+            self.stats.pointer_target_hits += 1;
+        } else {
+            self.stats.pointer_target_misses += 1;
+            return;
+        }
+
+        match state {
+            ButtonState::Pressed if !pointer.is_grabbed() => {
+                self.set_pending_pointer_focus_surface(target_surface);
+            }
+            ButtonState::Released => {
+                let focus_surface = self
+                    .take_pending_pointer_focus_surface()
+                    .or_else(|| target_surface.clone());
+                if let Some(surface) = focus_surface.as_ref() {
+                    if let Some(window) = self.window_for_toplevel_surface(surface) {
+                        self.focus_window(&window);
+                    } else {
+                        self.focus_toplevel_surface(Some(surface.clone()));
+                    }
+                } else if !pointer.is_grabbed() {
+                    self.activate_window_exclusively(None);
+                    keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+                }
+            }
+            ButtonState::Pressed => {}
+        }
+
+        pointer.button(
+            self,
+            &ButtonEvent {
+                button: button_code,
+                state,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
     fn record_consumed_pointer_button(&mut self) {
         self.stats
             .record_input(self.presentation == PresentationStatus::Attached);
@@ -404,5 +514,20 @@ impl Manifold {
         }
         pointer.axis(self, frame);
         pointer.frame(self);
+    }
+
+    pub fn forward_pointer_axis_to_pane(&mut self, pane: u64, frame: AxisFrame) {
+        let pointer = self.seat.get_pointer().expect("pointer");
+        let has_target = self.presentation_window_for_pane(pane).is_some();
+        self.stats
+            .record_input(self.presentation == PresentationStatus::Attached && has_target);
+        self.stats.pointer_axis_events += 1;
+        if has_target {
+            self.stats.pointer_target_hits += 1;
+            pointer.axis(self, frame);
+            pointer.frame(self);
+        } else {
+            self.stats.pointer_target_misses += 1;
+        }
     }
 }

@@ -375,14 +375,22 @@ policy. These behaviors are therefore plugin policy, not hard-coded branches in
 
 ### 8.2 Pointer motion/button/axis path
 
-Pointer motion:
+The separate presentation client hit-tests pointer events against its accepted
+flat layout. A local plugin target receives pane-local actor events. A managed
+target is sent through the input lane as the pane ID plus coordinates projected
+into that pane's source rectangle; button and axis records also carry their
+position so they remain correct if disposable motion samples are superseded.
+The daemon resolves the named pane's nested Wayland surface and does not consult
+its compatibility-presenter placement.
+
+For the built-in compatibility presenter, pointer motion:
 
 1. If left-panel resizing is active, pointer x adjusts the panel width, reconfigures focus stack, and consumes the event.
 2. Otherwise hit-testing determines hover/top-level and nested surface target.
 3. The event updates input stats and target hit/miss counters.
 4. Smithay pointer motion is sent to the surface under the layout position.
 
-Button handling:
+Built-in button handling:
 
 1. Left button press over the left-panel splitter starts panel resize and consumes the button.
 2. Left button release after resize ends resizing and consumes the button.
@@ -390,11 +398,14 @@ Button handling:
 4. On release, it focuses the stored or current target surface. If no surface is targeted and no grab is active, it clears keyboard focus.
 5. The button event is forwarded through Smithay pointer input.
 
-Axis handling computes the current pointer target, records stats, and forwards the axis frame.
+Built-in axis handling computes the current pointer target, records stats, and forwards the axis frame.
 
 ### 8.3 Hit-testing data flow
 
-Pointer hit testing uses the current presentation layout rather than raw Smithay stack order alone:
+The following backend hit-testing path belongs to the built-in compatibility
+presenter. The separate client has already supplied a pane identity and only
+surface-tree hit testing occurs in the daemon. Built-in pointer hit testing uses
+the current presentation layout rather than raw Smithay stack order alone:
 
 1. Panels are checked first.
 2. A focused fullscreen window is checked next.

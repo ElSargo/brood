@@ -3544,6 +3544,30 @@ impl Manifold {
         toplevel_app_id(&surface)
     }
 
+    pub(crate) fn presentation_window_for_pane(&self, pane: u64) -> Option<Window> {
+        let surface = self.surface_for_pane(pane)?;
+        let window = self.window_for_toplevel_surface(&surface)?;
+        self.window_available_to_presentation_client(&window)
+            .then_some(window)
+    }
+
+    pub(crate) fn presentation_surface_under_pane_local(
+        &self,
+        pane: u64,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let window = self.presentation_window_for_pane(pane)?;
+        let surface_origin =
+            window_surface_origin_in_compositor_space(Point::from((0, 0)), window.geometry().loc);
+        let local_pos = Point::from((
+            pos.x - f64::from(surface_origin.x),
+            pos.y - f64::from(surface_origin.y),
+        ));
+        window
+            .surface_under(local_pos, WindowSurfaceType::ALL)
+            .map(|(surface, point)| (surface, (surface_origin + point).to_f64()))
+    }
+
     pub(crate) fn window_test_marker_id(&self, window: &Window, fallback_index: usize) -> u64 {
         let Some(surface) = Self::window_toplevel_surface(window) else {
             return fallback_marker_id(fallback_index);

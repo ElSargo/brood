@@ -29,14 +29,8 @@ const ABI_VERSION: u32 = 1;
 pub const CRITICAL_CAPACITY: usize = 64;
 const CRITICAL_CAPACITY_U32: u32 = 64;
 
-/// Pointer moved to an absolute logical position; arguments are x/y `f64` bits.
-pub const INPUT_POINTER_MOTION: u32 = 1;
-/// Pointer button changed; arguments are Linux button code and pressed boolean.
-pub const INPUT_POINTER_BUTTON: u32 = 2;
 /// Keyboard key changed; arguments are xkb keycode and pressed boolean.
 pub const INPUT_KEYBOARD_KEY: u32 = 3;
-/// Pointer wheel changed; arguments are horizontal/vertical `f64` bits.
-pub const INPUT_POINTER_AXIS: u32 = 4;
 /// Presentation configuration changed; arguments are width, height, and refresh mHz.
 pub const INPUT_PRESENTATION_SIZE: u32 = 5;
 /// A frame reached the presentation queue; argument zero is its frame sequence.
@@ -50,6 +44,24 @@ pub const INPUT_WINDOW_FOCUS: u32 = 8;
 /// Arguments are window ID, logical width, and logical height. Placement is
 /// deliberately absent: final layout belongs to the presentation client.
 pub const INPUT_WINDOW_RESIZE: u32 = 9;
+/// Move the pointer over one managed pane using pane-local logical coordinates.
+///
+/// Arguments are window ID and x/y `f64` bits. Backend presentation placement
+/// is deliberately absent.
+pub const INPUT_WINDOW_POINTER_MOTION: u32 = 10;
+/// Change a pointer button over one managed pane.
+///
+/// Arguments are window ID, Linux button code, pressed boolean, and pane-local
+/// x/y `f64` bits. Including the position makes a click self-contained even if
+/// an earlier disposable motion sample was superseded.
+pub const INPUT_WINDOW_POINTER_BUTTON: u32 = 11;
+/// Scroll over one managed pane.
+///
+/// Arguments are window ID, horizontal/vertical `f64` bits, and pane-local x/y
+/// `f64` bits.
+pub const INPUT_WINDOW_POINTER_AXIS: u32 = 12;
+/// Leave the currently hovered managed pane; arguments are unused.
+pub const INPUT_WINDOW_POINTER_LEAVE: u32 = 13;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.

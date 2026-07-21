@@ -24,6 +24,10 @@ immutable snapshot of that combined pane inventory. Consumed focus and
 fullscreen actions stay local, plugin messages remain local, and application or
 session commands use the asynchronous backend control worker. Only keys the
 policy forwards reach the focused plugin or managed window.
+Pointer routing uses the same client-owned layout: plugin events stay in the
+local actor runtime, while hosted-window records carry the selected pane ID and
+pane-local coordinates. The server resolves only that pane's Wayland surface
+tree and never repeats hit testing against a server-side placement.
 
 The client also owns a `manifold-wasm` presentation runtime and its Tokio
 executor. Presentation-scoped Component and Preview 1 actors can be loaded with

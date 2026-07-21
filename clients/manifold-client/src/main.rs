@@ -489,7 +489,8 @@ struct Application {
     modifiers: ModifiersState,
     window_focused: bool,
     cursor_position: Option<(f64, f64)>,
-    pending_plugin_pointer_motion: Option<(f32, f32)>,
+    pending_plugin_pointer_motion: Option<(u64, f32, f32)>,
+    managed_pointer_target: Option<u64>,
     wasm_runtime: Option<PresentationWasmRuntime>,
     layout_policy: Option<ClientLayoutPolicy>,
     key_policy: Option<ClientKeyPolicy>,
@@ -854,29 +855,56 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
-                if renderer.focused_plugin_pane().is_some() {
-                    self.pending_plugin_pointer_motion =
-                        renderer.plugin_position_for_window_point(position.x, position.y);
-                } else if renderer.focused_managed_window().is_some() {
-                    self.pending_plugin_pointer_motion = None;
-                    if let (Some(sender), Some((x, y))) = (
-                        self.input_sender.as_mut(),
-                        renderer.backend_position_for_window_point(position.x, position.y),
-                    ) {
-                        send_input(
-                            sender,
-                            manifold_ipc::INPUT_POINTER_MOTION,
-                            [x.to_bits(), y.to_bits(), 0, 0, 0],
+                match renderer.pointer_target_for_window_point(position.x, position.y) {
+                    Some(PanePointerTarget::Plugin { pane, x, y }) => {
+                        self.pending_plugin_pointer_motion = Some((pane, x, y));
+                        send_managed_pointer_leave(
+                            self.input_sender.as_mut(),
+                            &mut self.managed_pointer_target,
+                        );
+                    }
+                    Some(PanePointerTarget::Managed { pane, x, y }) => {
+                        self.pending_plugin_pointer_motion = None;
+                        if let Some(sender) = self.input_sender.as_mut()
+                            && send_input(
+                                sender,
+                                manifold_ipc::INPUT_WINDOW_POINTER_MOTION,
+                                [pane, x.to_bits(), y.to_bits(), 0, 0],
+                            )
+                        {
+                            self.managed_pointer_target = Some(pane);
+                        }
+                    }
+                    None => {
+                        self.pending_plugin_pointer_motion = None;
+                        send_managed_pointer_leave(
+                            self.input_sender.as_mut(),
+                            &mut self.managed_pointer_target,
                         );
                     }
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_position = None;
+                self.pending_plugin_pointer_motion = None;
+                send_managed_pointer_leave(
+                    self.input_sender.as_mut(),
+                    &mut self.managed_pointer_target,
+                );
+            }
             WindowEvent::MouseInput { state, button, .. } => {
+                let pointer_target = self
+                    .cursor_position
+                    .and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y));
                 if state == ElementState::Pressed
                     && button == MouseButton::Left
-                    && let Some((x, y)) = self.cursor_position
+                    && let Some(target) = pointer_target
                 {
-                    if let Some(change) = renderer.focus_pane_at_window_point(x, y)
+                    let pane = match target {
+                        PanePointerTarget::Plugin { pane, .. }
+                        | PanePointerTarget::Managed { pane, .. } => pane,
+                    };
+                    if let Some(change) = renderer.focus_pane(pane)
                         && let Err(error) = dispatch_focus_change(
                             self.wasm_runtime.as_ref(),
                             self.input_sender.as_mut(),
@@ -889,52 +917,46 @@ impl ApplicationHandler<ClientEvent> for Application {
                     flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
                 }
 
-                let button_code = linux_button_code(button).unwrap_or_default();
+                let Some(target) = pointer_target else {
+                    return;
+                };
+                let Some(button_code) = linux_button_code(button) else {
+                    return;
+                };
                 let pressed = state == ElementState::Pressed;
-                let modifiers = modifier_bits(self.modifiers);
-                if let Some(pane) = renderer.focused_plugin_pane()
-                    && let Some((x, y)) = self
-                        .cursor_position
-                        .and_then(|(x, y)| renderer.plugin_position_for_window_point(x, y))
-                {
-                    if let Err(error) = send_presentation_event(
-                        self.wasm_runtime.as_ref(),
-                        PresentationEvent::PointerButton {
-                            pane,
-                            x,
-                            y,
-                            button: button_code,
-                            pressed,
-                            modifiers,
-                        },
-                    ) {
-                        eprintln!("dropped plugin pointer button: {error:#}");
+                match target {
+                    PanePointerTarget::Plugin { pane, x, y } => {
+                        if let Err(error) = send_presentation_event(
+                            self.wasm_runtime.as_ref(),
+                            PresentationEvent::PointerButton {
+                                pane,
+                                x,
+                                y,
+                                button: button_code,
+                                pressed,
+                                modifiers: modifier_bits(self.modifiers),
+                            },
+                        ) {
+                            eprintln!("dropped plugin pointer button: {error:#}");
+                        }
                     }
-                } else if renderer.focused_managed_window().is_some()
-                    && let (Some(sender), Some(code)) =
-                        (self.input_sender.as_mut(), linux_button_code(button))
-                {
-                    if let Some((x, y)) = self
-                        .cursor_position
-                        .and_then(|(x, y)| renderer.backend_position_for_window_point(x, y))
-                    {
-                        send_input(
-                            sender,
-                            manifold_ipc::INPUT_POINTER_MOTION,
-                            [x.to_bits(), y.to_bits(), 0, 0, 0],
-                        );
+                    PanePointerTarget::Managed { pane, x, y } => {
+                        if let Some(sender) = self.input_sender.as_mut()
+                            && send_input(
+                                sender,
+                                manifold_ipc::INPUT_WINDOW_POINTER_BUTTON,
+                                [
+                                    pane,
+                                    u64::from(button_code),
+                                    u64::from(pressed),
+                                    x.to_bits(),
+                                    y.to_bits(),
+                                ],
+                            )
+                        {
+                            self.managed_pointer_target = Some(pane);
+                        }
                     }
-                    send_input(
-                        sender,
-                        manifold_ipc::INPUT_POINTER_BUTTON,
-                        [
-                            u64::from(code),
-                            u64::from(state == ElementState::Pressed),
-                            0,
-                            0,
-                            0,
-                        ],
-                    );
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -942,33 +964,46 @@ impl ApplicationHandler<ClientEvent> for Application {
                     MouseScrollDelta::LineDelta(x, y) => (f64::from(x) * 15.0, f64::from(y) * 15.0),
                     MouseScrollDelta::PixelDelta(position) => (position.x, position.y),
                 };
-                if let Some(pane) = renderer.focused_plugin_pane()
-                    && let Some((x, y)) = self
-                        .cursor_position
-                        .and_then(|(x, y)| renderer.plugin_position_for_window_point(x, y))
-                {
-                    let scale = renderer.window.scale_factor() as f32;
-                    if let Err(error) = send_presentation_event(
-                        self.wasm_runtime.as_ref(),
-                        PresentationEvent::PointerScroll {
-                            pane,
-                            x,
-                            y,
-                            horizontal: horizontal as f32 / scale,
-                            vertical: vertical as f32 / scale,
-                            modifiers: modifier_bits(self.modifiers),
-                        },
-                    ) {
-                        eprintln!("dropped plugin pointer scroll: {error:#}");
+                let Some(target) = self
+                    .cursor_position
+                    .and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y))
+                else {
+                    return;
+                };
+                match target {
+                    PanePointerTarget::Plugin { pane, x, y } => {
+                        let scale = renderer.window.scale_factor() as f32;
+                        if let Err(error) = send_presentation_event(
+                            self.wasm_runtime.as_ref(),
+                            PresentationEvent::PointerScroll {
+                                pane,
+                                x,
+                                y,
+                                horizontal: horizontal as f32 / scale,
+                                vertical: vertical as f32 / scale,
+                                modifiers: modifier_bits(self.modifiers),
+                            },
+                        ) {
+                            eprintln!("dropped plugin pointer scroll: {error:#}");
+                        }
                     }
-                } else if renderer.focused_managed_window().is_some()
-                    && let Some(sender) = self.input_sender.as_mut()
-                {
-                    send_input(
-                        sender,
-                        manifold_ipc::INPUT_POINTER_AXIS,
-                        [horizontal.to_bits(), vertical.to_bits(), 0, 0, 0],
-                    );
+                    PanePointerTarget::Managed { pane, x, y } => {
+                        if let Some(sender) = self.input_sender.as_mut()
+                            && send_input(
+                                sender,
+                                manifold_ipc::INPUT_WINDOW_POINTER_AXIS,
+                                [
+                                    pane,
+                                    horizontal.to_bits(),
+                                    vertical.to_bits(),
+                                    x.to_bits(),
+                                    y.to_bits(),
+                                ],
+                            )
+                        {
+                            self.managed_pointer_target = Some(pane);
+                        }
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -976,6 +1011,14 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                if !focused {
+                    self.cursor_position = None;
+                    self.pending_plugin_pointer_motion = None;
+                    send_managed_pointer_leave(
+                        self.input_sender.as_mut(),
+                        &mut self.managed_pointer_target,
+                    );
+                }
                 if let Some(pane) = renderer.focused_plugin_pane()
                     && let Err(error) = send_presentation_event(
                         self.wasm_runtime.as_ref(),
@@ -1182,6 +1225,12 @@ struct Renderer {
 enum FocusedPane {
     Plugin(u64),
     Managed(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PanePointerTarget {
+    Plugin { pane: u64, x: f32, y: f32 },
+    Managed { pane: u64, x: f64, y: f64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1455,18 +1504,30 @@ fn queue_backend_command(
 
 fn flush_presentation_pointer_motion(
     runtime: Option<&PresentationWasmRuntime>,
-    pending: &mut Option<(f32, f32)>,
+    pending: &mut Option<(u64, f32, f32)>,
 ) -> Result<()> {
-    let Some((x, y)) = *pending else {
+    let Some((pane, x, y)) = *pending else {
         return Ok(());
     };
-    send_presentation_events(runtime, |pane| PresentationEvent::PointerMoved {
-        pane,
-        x,
-        y,
-    })?;
+    send_presentation_event(runtime, PresentationEvent::PointerMoved { pane, x, y })?;
     pending.take();
     Ok(())
+}
+
+fn send_managed_pointer_leave(lane: Option<&mut InputLane>, target: &mut Option<u64>) {
+    let Some(previous) = target.take() else {
+        return;
+    };
+    let Some(lane) = lane else {
+        return;
+    };
+    if !send_input(
+        lane,
+        manifold_ipc::INPUT_WINDOW_POINTER_LEAVE,
+        [0, 0, 0, 0, 0],
+    ) {
+        *target = Some(previous);
+    }
 }
 
 const fn linux_button_code(button: MouseButton) -> Option<u32> {
@@ -2015,7 +2076,7 @@ impl Renderer {
         }
     }
 
-    fn focus_pane_at_window_point(&mut self, x: f64, y: f64) -> Option<FocusChange> {
+    fn pane_at_window_point(&self, x: f64, y: f64) -> Option<u64> {
         let (x, y) = self.scene_position_for_window_point(x, y);
         let (width, height) = self.composition_extent();
         let bounds = LayoutRect {
@@ -2032,8 +2093,7 @@ impl Renderer {
         let LayoutItemKind::Pane { pane } = hit.kind else {
             return None;
         };
-        let target = self.focus_target_for_pane(pane)?;
-        self.set_focus(target)
+        Some(pane)
     }
 
     fn set_focus(&mut self, target: FocusedPane) -> Option<FocusChange> {
@@ -2063,43 +2123,39 @@ impl Renderer {
         )
     }
 
-    fn backend_position_for_window_point(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+    fn pointer_target_for_window_point(&self, x: f64, y: f64) -> Option<PanePointerTarget> {
+        let pane = self.pane_at_window_point(x, y)?;
         let (x, y) = self.scene_position_for_window_point(x, y);
-        let window = self.current_windows.iter().rev().find(|window| {
-            self.focused_managed_window() == Some(window.window_id)
-                && rect_contains(window.rect, x, y)
-        })?;
-        Some(project_point_between_rects(
-            x,
-            y,
-            window.rect,
-            window.source_rect,
-        ))
-    }
-
-    fn plugin_position_for_window_point(&self, x: f64, y: f64) -> Option<(f32, f32)> {
-        let plugin = self.plugin_pane.as_ref()?;
-        if self.focused_plugin_pane() != Some(plugin.scene.pane) {
-            return None;
+        if let Some(plugin) = self
+            .plugin_pane
+            .as_ref()
+            .filter(|plugin| plugin.scene.pane == pane && rect_contains(plugin.rect, x, y))
+        {
+            let (composition_width, composition_height) = self.composition_extent();
+            let (x, y) = project_point_between_rects(
+                x,
+                y,
+                plugin.rect,
+                [
+                    0,
+                    0,
+                    i32::try_from(composition_width).unwrap_or(i32::MAX),
+                    i32::try_from(composition_height).unwrap_or(i32::MAX),
+                ],
+            );
+            let scale = self.window.scale_factor() as f32;
+            return Some(PanePointerTarget::Plugin {
+                pane,
+                x: x as f32 / scale,
+                y: y as f32 / scale,
+            });
         }
-        let (x, y) = self.scene_position_for_window_point(x, y);
-        if !rect_contains(plugin.rect, x, y) {
-            return None;
-        }
-        let (composition_width, composition_height) = self.composition_extent();
-        let (x, y) = project_point_between_rects(
-            x,
-            y,
-            plugin.rect,
-            [
-                0,
-                0,
-                i32::try_from(composition_width).unwrap_or(i32::MAX),
-                i32::try_from(composition_height).unwrap_or(i32::MAX),
-            ],
-        );
-        let scale = self.window.scale_factor() as f32;
-        Some((x as f32 / scale, y as f32 / scale))
+        let window = self
+            .current_windows
+            .iter()
+            .find(|window| window.window_id == pane && rect_contains(window.rect, x, y))?;
+        let (x, y) = project_point_between_rects(x, y, window.rect, window.source_rect);
+        Some(PanePointerTarget::Managed { pane, x, y })
     }
 
     fn composition_extent(&self) -> (u32, u32) {
@@ -2724,7 +2780,7 @@ mod tests {
     }
 
     #[test]
-    fn client_pointer_position_projects_into_the_matching_backend_window() {
+    fn client_pointer_position_projects_into_the_managed_pane_source() {
         let actual =
             project_point_between_rects(900.0, 200.0, [600, 0, 600, 400], [0, 400, 600, 400]);
         assert_eq!(actual, (300.0, 600.0));

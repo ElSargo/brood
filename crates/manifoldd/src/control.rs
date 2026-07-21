@@ -2768,22 +2768,6 @@ fn drain_fast_path_input(state: &mut Manifold) {
         }
         let time = monotonic_time_msec(state);
         match record.opcode {
-            manifold_ipc::INPUT_POINTER_MOTION => state.forward_pointer_motion(
-                Point::from((
-                    f64::from_bits(record.arguments[0]),
-                    f64::from_bits(record.arguments[1]),
-                )),
-                time,
-            ),
-            manifold_ipc::INPUT_POINTER_BUTTON => state.forward_pointer_button(
-                u32::try_from(record.arguments[0]).map_or(u32::MAX, |value| value),
-                if record.arguments[1] == 0 {
-                    ButtonState::Released
-                } else {
-                    ButtonState::Pressed
-                },
-                time,
-            ),
             manifold_ipc::INPUT_KEYBOARD_KEY => state.forward_keyboard_key(
                 u32::try_from(record.arguments[0])
                     .map_or(u32::MAX, |value| value)
@@ -2795,9 +2779,49 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 },
                 time,
             ),
-            manifold_ipc::INPUT_POINTER_AXIS => {
-                let horizontal = f64::from_bits(record.arguments[0]);
-                let vertical = f64::from_bits(record.arguments[1]);
+            manifold_ipc::INPUT_WINDOW_POINTER_MOTION => {
+                state.forward_pointer_motion_to_pane(
+                    record.arguments[0],
+                    Point::from((
+                        f64::from_bits(record.arguments[1]),
+                        f64::from_bits(record.arguments[2]),
+                    )),
+                    time,
+                );
+            }
+            manifold_ipc::INPUT_WINDOW_POINTER_BUTTON => {
+                let pane = record.arguments[0];
+                state.forward_pointer_motion_to_pane(
+                    pane,
+                    Point::from((
+                        f64::from_bits(record.arguments[3]),
+                        f64::from_bits(record.arguments[4]),
+                    )),
+                    time,
+                );
+                state.forward_pointer_button_to_pane(
+                    pane,
+                    u32::try_from(record.arguments[1]).map_or(u32::MAX, |value| value),
+                    if record.arguments[2] == 0 {
+                        ButtonState::Released
+                    } else {
+                        ButtonState::Pressed
+                    },
+                    time,
+                );
+            }
+            manifold_ipc::INPUT_WINDOW_POINTER_AXIS => {
+                let pane = record.arguments[0];
+                state.forward_pointer_motion_to_pane(
+                    pane,
+                    Point::from((
+                        f64::from_bits(record.arguments[3]),
+                        f64::from_bits(record.arguments[4]),
+                    )),
+                    time,
+                );
+                let horizontal = f64::from_bits(record.arguments[1]);
+                let vertical = f64::from_bits(record.arguments[2]);
                 let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
                 if horizontal != 0.0 {
                     frame = frame.value(Axis::Horizontal, horizontal);
@@ -2805,7 +2829,10 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 if vertical != 0.0 {
                     frame = frame.value(Axis::Vertical, vertical);
                 }
-                state.forward_pointer_axis(frame);
+                state.forward_pointer_axis_to_pane(pane, frame);
+            }
+            manifold_ipc::INPUT_WINDOW_POINTER_LEAVE => {
+                state.forward_pointer_leave_managed_pane(time);
             }
             manifold_ipc::INPUT_PRESENTATION_SIZE => {
                 state.configure_external_presentation_output(
