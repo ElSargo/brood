@@ -2780,6 +2780,7 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 },
                 time,
             ),
+            manifold_ipc::INPUT_KEYBOARD_RESET => state.reset_transient_input_state(),
             manifold_ipc::INPUT_WINDOW_POINTER_MOTION => {
                 state.forward_pointer_motion_to_pane(
                     record.arguments[0],

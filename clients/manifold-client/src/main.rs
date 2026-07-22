@@ -1183,6 +1183,9 @@ impl ApplicationHandler<ClientEvent> for Application {
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    if let Some(sender) = self.input_sender.as_mut() {
+                        send_keyboard_reset(sender);
+                    }
                     cancel_pointer_grab(
                         self.wasm_runtime.as_ref(),
                         self.input_sender.as_mut(),
@@ -1456,6 +1459,7 @@ impl PointerGrab {
 struct FocusChange {
     plugin: Option<(u64, bool)>,
     managed_window: Option<u64>,
+    reset_keyboard: bool,
 }
 
 struct SceneWindow {
@@ -1564,6 +1568,10 @@ fn send_window_focus(lane: &mut InputLane, window_id: u64) {
     );
 }
 
+fn send_keyboard_reset(lane: &mut InputLane) {
+    let _sent = send_input(lane, manifold_ipc::INPUT_KEYBOARD_RESET, [0, 0, 0, 0, 0]);
+}
+
 fn send_presentation_events(
     runtime: Option<&PresentationWasmRuntime>,
     mut create: impl FnMut(u64) -> PresentationEvent,
@@ -1590,10 +1598,15 @@ fn send_presentation_event(
 
 fn dispatch_focus_change(
     runtime: Option<&PresentationWasmRuntime>,
-    input_sender: Option<&mut InputLane>,
+    mut input_sender: Option<&mut InputLane>,
     change: FocusChange,
     window_focused: bool,
 ) -> Result<()> {
+    if change.reset_keyboard
+        && let Some(sender) = input_sender.as_mut()
+    {
+        send_keyboard_reset(sender);
+    }
     if let Some((pane, focused)) = change.plugin {
         send_presentation_event(
             runtime,
@@ -1608,7 +1621,7 @@ fn dispatch_focus_change(
         );
     }
     if let Some(window_id) = change.managed_window {
-        if let Some(sender) = input_sender {
+        if let Some(sender) = input_sender.as_mut() {
             send_window_focus(sender, window_id);
         }
         eprintln!("focused backend-managed window={window_id}");
@@ -2338,6 +2351,7 @@ impl Renderer {
                     (backend_focus != Some(local_focus)).then_some(FocusChange {
                         plugin: None,
                         managed_window: Some(local_focus),
+                        reset_keyboard: false,
                     })
                 });
             self.window.request_redraw();
@@ -3015,6 +3029,7 @@ fn focus_change_between(
     (plugin.is_some() || managed_window.is_some()).then_some(FocusChange {
         plugin,
         managed_window,
+        reset_keyboard: true,
     })
 }
 
@@ -3210,6 +3225,7 @@ mod tests {
             Some(FocusChange {
                 plugin: None,
                 managed_window: Some(1),
+                reset_keyboard: true,
             })
         );
         assert_eq!(
@@ -3229,6 +3245,77 @@ mod tests {
         grab.press(0x111);
         assert!(!grab.release(0x110));
         assert!(grab.release(0x111));
+    }
+
+    #[test]
+    fn focus_transitions_reset_keyboard_before_rerouting_but_resync_does_not() -> Result<()> {
+        let file = manifold_ipc::CriticalLaneFile::create(17)?;
+        let producer = manifold_ipc::CriticalProducer::map(file.as_fd(), 17)?;
+        let mut consumer = manifold_ipc::CriticalConsumer::map(file.as_fd(), 17)?;
+        let mut lane = InputLane {
+            producer,
+            notifications: manifold_ipc::EventNotifier::create()?,
+            generation: 17,
+            sequence: 0,
+            deferred: VecDeque::new(),
+            deferred_high_water: 0,
+            coalesced_motion: 0,
+        };
+
+        dispatch_focus_change(
+            None,
+            Some(&mut lane),
+            FocusChange {
+                plugin: None,
+                managed_window: Some(7),
+                reset_keyboard: true,
+            },
+            true,
+        )?;
+        dispatch_focus_change(
+            None,
+            Some(&mut lane),
+            FocusChange {
+                plugin: Some((99, true)),
+                managed_window: None,
+                reset_keyboard: true,
+            },
+            true,
+        )?;
+        dispatch_focus_change(
+            None,
+            Some(&mut lane),
+            FocusChange {
+                plugin: None,
+                managed_window: Some(8),
+                reset_keyboard: false,
+            },
+            true,
+        )?;
+
+        let records = (0..4)
+            .map(|_| {
+                consumer
+                    .try_recv()
+                    .context("focus transition input was not queued")
+                    .map(|record| *record)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                manifold_ipc::INPUT_KEYBOARD_RESET,
+                manifold_ipc::INPUT_WINDOW_FOCUS,
+                manifold_ipc::INPUT_KEYBOARD_RESET,
+                manifold_ipc::INPUT_WINDOW_FOCUS,
+            ]
+        );
+        assert_eq!(records[1].arguments[0], 7);
+        assert_eq!(records[3].arguments[0], 8);
+        Ok(())
     }
 
     #[test]

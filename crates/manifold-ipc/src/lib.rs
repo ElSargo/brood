@@ -67,6 +67,12 @@ pub const INPUT_WINDOW_POINTER_LEAVE: u32 = 13;
 /// Arguments are window ID, horizontal/vertical signed v120 values, and
 /// pane-local x/y `f64` bits.
 pub const INPUT_WINDOW_POINTER_WHEEL: u32 = 14;
+/// Release all keyboard state forwarded through this presentation connection.
+///
+/// The presentation client sends this before changing its local focus target
+/// and when its outer window loses focus. This prevents a release from being
+/// routed somewhere other than the managed window that received the press.
+pub const INPUT_KEYBOARD_RESET: u32 = 15;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.
