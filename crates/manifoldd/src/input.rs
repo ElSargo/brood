@@ -53,6 +53,10 @@ pub fn managed_wheel_axis_frame(time: u32, horizontal_v120: i32, vertical_v120: 
     frame
 }
 
+const fn should_forward_managed_pointer_button(target_exists: bool, state: ButtonState) -> bool {
+    target_exists || matches!(state, ButtonState::Released)
+}
+
 impl Manifold {
     #[allow(
         dead_code,
@@ -484,14 +488,16 @@ impl Manifold {
             self.stats.pointer_target_hits += 1;
         } else {
             self.stats.pointer_target_misses += 1;
+        }
+        if !should_forward_managed_pointer_button(target_window.is_some(), state) {
             return;
         }
 
-        match state {
-            ButtonState::Pressed if !pointer.is_grabbed() => {
+        match (state, target_window.is_some()) {
+            (ButtonState::Pressed, _) if !pointer.is_grabbed() => {
                 self.set_pending_pointer_focus_surface(target_surface);
             }
-            ButtonState::Released => {
+            (ButtonState::Released, true) => {
                 let focus_surface = self
                     .take_pending_pointer_focus_surface()
                     .or_else(|| target_surface.clone());
@@ -506,7 +512,13 @@ impl Manifold {
                     keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                 }
             }
-            ButtonState::Pressed => {}
+            (ButtonState::Released, false) => {
+                // A pane can disappear between a button press and release. The
+                // release must still reach Smithay so its implicit click or DnD
+                // grab cannot remain attached to the destroyed surface.
+                self.take_pending_pointer_focus_surface();
+            }
+            (ButtonState::Pressed, _) => {}
         }
 
         pointer.button(
@@ -588,5 +600,17 @@ mod tests {
         assert_eq!(frame.source, Some(AxisSource::Continuous));
         assert_eq!(frame.v120, None);
         assert_eq!(frame.axis, (0.0, -2.5));
+    }
+
+    #[test]
+    fn managed_pointer_release_survives_target_destruction() {
+        assert!(should_forward_managed_pointer_button(
+            false,
+            ButtonState::Released
+        ));
+        assert!(!should_forward_managed_pointer_button(
+            false,
+            ButtonState::Pressed
+        ));
     }
 }

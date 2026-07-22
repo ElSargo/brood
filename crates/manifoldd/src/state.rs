@@ -3571,7 +3571,11 @@ impl Manifold {
 
     pub(crate) fn presentation_window_for_pane(&self, pane: u64) -> Option<Window> {
         let surface = self.surface_for_pane(pane)?;
-        let window = self.window_for_toplevel_surface(&surface)?;
+        // The external presentation client owns pane visibility. Its inventory
+        // can include a newly mapped window before the backend compatibility
+        // layout has incorporated that pane, so input must not use the
+        // compatibility layout's visibility filter.
+        let window = self.window_for_any_toplevel_surface(&surface)?;
         self.window_available_to_presentation_client(&window)
             .then_some(window)
     }

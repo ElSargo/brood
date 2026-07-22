@@ -593,6 +593,31 @@ impl Application {
             return Ok(());
         };
         let focus_change = renderer.select_scene(sequence, width, height, windows)?;
+        if self
+            .pointer_grab
+            .as_ref()
+            .is_some_and(|grab| renderer.focus_target_for_pane(grab.target.pane()).is_none())
+        {
+            // The grabbed pane may close before Winit reports the physical
+            // release. End the client-side grab now; the backend deliberately
+            // accepts this release even after removing the pane inventory.
+            cancel_pointer_grab(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                &mut self.pending_plugin_pointer_motion,
+                &mut self.managed_pointer_target,
+                &mut self.pointer_grab,
+                modifier_bits(self.modifiers),
+            );
+            route_pointer_motion(
+                renderer,
+                self.cursor_position,
+                &mut self.pointer_grab,
+                self.input_sender.as_mut(),
+                &mut self.pending_plugin_pointer_motion,
+                &mut self.managed_pointer_target,
+            );
+        }
         if let Some(change) = focus_change {
             dispatch_focus_change(
                 self.wasm_runtime.as_ref(),
@@ -3248,6 +3273,47 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_grabbed_managed_pane_queues_its_release() -> Result<()> {
+        let file = manifold_ipc::CriticalLaneFile::create(23)?;
+        let producer = manifold_ipc::CriticalProducer::map(file.as_fd(), 23)?;
+        let mut consumer = manifold_ipc::CriticalConsumer::map(file.as_fd(), 23)?;
+        let mut lane = InputLane {
+            producer,
+            notifications: manifold_ipc::EventNotifier::create()?,
+            generation: 23,
+            sequence: 0,
+            deferred: VecDeque::new(),
+            deferred_high_water: 0,
+            coalesced_motion: 0,
+        };
+        let target = PanePointerTarget::Managed {
+            pane: 41,
+            x: 12.0,
+            y: 34.0,
+        };
+        let mut grab = Some(PointerGrab::new(target, 0x110));
+        let mut pending_plugin_motion = None;
+        let mut managed_pointer_target = Some(41);
+
+        cancel_pointer_grab(
+            None,
+            Some(&mut lane),
+            &mut pending_plugin_motion,
+            &mut managed_pointer_target,
+            &mut grab,
+            0,
+        );
+
+        anyhow::ensure!(grab.is_none());
+        let record = consumer
+            .try_recv()
+            .context("closed-pane pointer release was not queued")?;
+        anyhow::ensure!(record.opcode == manifold_ipc::INPUT_WINDOW_POINTER_BUTTON);
+        anyhow::ensure!(record.arguments.get(..3) == Some([41, 0x110, 0].as_slice()));
+        Ok(())
+    }
+
+    #[test]
     fn focus_transitions_reset_keyboard_before_rerouting_but_resync_does_not() -> Result<()> {
         let file = manifold_ipc::CriticalLaneFile::create(17)?;
         let producer = manifold_ipc::CriticalProducer::map(file.as_fd(), 17)?;
@@ -3301,20 +3367,32 @@ mod tests {
                     .map(|record| *record)
             })
             .collect::<Result<Vec<_>>>()?;
-        assert_eq!(
+        anyhow::ensure!(
             records
                 .iter()
                 .map(|record| record.opcode)
-                .collect::<Vec<_>>(),
-            vec![
-                manifold_ipc::INPUT_KEYBOARD_RESET,
-                manifold_ipc::INPUT_WINDOW_FOCUS,
-                manifold_ipc::INPUT_KEYBOARD_RESET,
-                manifold_ipc::INPUT_WINDOW_FOCUS,
-            ]
+                .collect::<Vec<_>>()
+                == vec![
+                    manifold_ipc::INPUT_KEYBOARD_RESET,
+                    manifold_ipc::INPUT_WINDOW_FOCUS,
+                    manifold_ipc::INPUT_KEYBOARD_RESET,
+                    manifold_ipc::INPUT_WINDOW_FOCUS,
+                ]
         );
-        assert_eq!(records[1].arguments[0], 7);
-        assert_eq!(records[3].arguments[0], 8);
+        anyhow::ensure!(
+            records
+                .get(1)
+                .context("missing first focus record")?
+                .arguments[0]
+                == 7
+        );
+        anyhow::ensure!(
+            records
+                .get(3)
+                .context("missing second focus record")?
+                .arguments[0]
+                == 8
+        );
         Ok(())
     }
 
