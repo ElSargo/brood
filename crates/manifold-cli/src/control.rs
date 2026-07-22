@@ -381,7 +381,7 @@ fn spawn_server(target: &ControlTarget, launch: &ServerLaunch) -> Result<(PathBu
 
     let mut command = Command::new(&launch.executable);
     command
-        .arg("--headless")
+        .arg("--offscreen-presentation")
         .arg("--no-initial-surface-session")
         .arg("--dbus-destination")
         .arg(&target.destination)

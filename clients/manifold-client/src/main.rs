@@ -52,8 +52,20 @@ use plugin_graphics::PluginGraphicsBridge;
 
 fn main() -> Result<()> {
     let args = ClientArgs::parse();
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(manifold_cli::global_config_path);
+    let init_actor = if args.no_init {
+        None
+    } else if let Some(path) = args.init_actor.clone() {
+        Some(path)
+    } else {
+        manifold_cli::realm_init_actor_path(&config_path, manifold_cli::RealmKind::Client)?
+    };
     if args.check_wasm_actors {
-        let mut runtime = PresentationWasmRuntime::start(&args.wasm_actors, None, None)?;
+        let mut runtime =
+            PresentationWasmRuntime::start(&args.wasm_actors, init_actor.as_deref(), None, None)?;
         runtime
             .shutdown()
             .context("stop checked presentation WASM runtime")?;
@@ -156,6 +168,7 @@ fn main() -> Result<()> {
     } else {
         let target = resolve_control_target(args.dbus_name, args.dbus_address);
         let mut server = ServerLaunch::discover()?;
+        server.config = Some(config_path);
         if let Some(executable) = args.server {
             server.executable = executable;
         }
@@ -164,8 +177,14 @@ fn main() -> Result<()> {
             "connected to Manifold server pid={} protocol={}",
             handshake.server_pid, handshake.protocol_version
         );
+        let session = request_dbus_command(
+            &target,
+            &["surface-session".to_string(), "new".to_string()],
+            false,
+        )?;
+        eprintln!("created presentation session {}", session.trim());
 
-        let fast_path_enabled = std::env::var_os("MANIFOLD_DMABUF_HAPPY_PATH").is_some();
+        let fast_path_enabled = true;
         let input_sender = if fast_path_enabled {
             let fast_path = open_presentation_fast_path(&target)?;
             let input = manifold_ipc::CriticalProducer::map(
@@ -207,6 +226,7 @@ fn main() -> Result<()> {
     let mut application = Application {
         wasm_runtime: Some(PresentationWasmRuntime::start(
             &args.wasm_actors,
+            init_actor.as_deref(),
             Some(&plugin_graphics),
             Some(event_proxy.clone()),
         )?),

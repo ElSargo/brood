@@ -13,7 +13,11 @@ code-links:
 
 # Runtime
 
-The default `manifold` invocation starts the `run` command. The runtime creates a nested Wayland compositor, DBus control endpoint, initial surface session, startup modules, startup apps, and an attached presentation unless `--headless` or hidden test flags change that policy.
+The default `manifold` invocation starts the `run` command. The runtime creates
+a nested Wayland compositor, DBus control endpoint, initial surface session,
+surface-session init actor, and an attached presentation unless the selected
+runtime or recovery mode changes that policy. Each surface session's init actor
+owns its ordinary actor and app startup behavior.
 
 Exact flags are defined in `crates/manifoldd/src/lib.rs`; do not duplicate the full parser here.
 
@@ -24,14 +28,22 @@ Current high-level startup order:
 - resolve the config path
 - create the `Manifold` state and Wayland display
 - optionally clear the initial surface session
-- load config modules unless disabled
+- start the DBus control service and publish its environment to child processes
+- configure the blessed session init artifact and initialize roots for existing sessions
+- otherwise load legacy config modules as a compatibility fallback
 - load CLI-specified prototype WASM lanes
-- start the DBus control service
 - print `WAYLAND_DISPLAY` and DBus endpoint variables
 - attach offscreen, attach Winit presentation, or remain headless
-- load startup apps unless disabled
+- otherwise load legacy startup apps as part of that compatibility fallback
 - spawn CLI command or browser if requested
 - run the event loop
+
+The presentation client connects to or auto-starts the server, creates a new
+surface session, and then opens its presentation. Creating that session starts
+the configured session root, whose default artifact launches one `foot`
+terminal. The client performs its corresponding client-realm init step before
+it admits ordinary presentation actors. Session and client roots are separate
+artifacts and cannot exercise each other's local lifecycle capability.
 
 ## Presentation Modes
 

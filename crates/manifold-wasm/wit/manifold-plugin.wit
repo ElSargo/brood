@@ -339,6 +339,28 @@ interface actor {
     }
     variant lifecycle-event { start(start-context), stop(stop-context) }
 
+    record actor-start-request {
+        id: string,
+        /// Path relative to the init actor's capability root.
+        path: string,
+    }
+    record actor-started { id: string, generation: u64 }
+    record actor-failed { id: string, message: string }
+    variant child-event {
+        started(actor-started),
+        stopped(string),
+        failed(actor-failed),
+    }
+
+    record app-start-request { id: string, argv: list<string> }
+    record app-started { id: string, pane: u64 }
+    record app-failed { id: string, message: string }
+    variant app-event {
+        started(app-started),
+        stopped(string),
+        failed(app-failed),
+    }
+
     variant worker-event {
         /// The worker was admitted and its guest call was scheduled. This does
         /// not assert that it has reached a particular I/O operation.
@@ -408,6 +430,10 @@ interface actor {
         worker(worker-event),
         notification(notification-event),
         lifecycle(lifecycle-event),
+        /// Lifecycle feedback for actors owned by this realm's blessed init actor.
+        child(child-event),
+        /// Lifecycle feedback for apps launched by this session's blessed init actor.
+        app(app-event),
         presentation(presentation-event),
     }
 
@@ -419,6 +445,14 @@ interface actor {
         /// Completes the one pending start or stop hook. Hooks may span
         /// dispatcher turns while worker/completion results arrive.
         lifecycle-complete(result<_, string>),
+        /// Start or replace a child actor in the current realm. Only the blessed
+        /// init actor has this capability.
+        start-actor(actor-start-request),
+        /// Stop a child previously started by the current realm's init actor.
+        stop-actor(string),
+        /// Start a Wayland app in the current session. Only a blessed session
+        /// init actor has this capability.
+        start-app(app-start-request),
         stop,
     }
 

@@ -1,3 +1,6 @@
+[init]
+session = "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.component.wasm"
+
 [module.default-workspace]
 enabled = true
 kind = "plugin"
