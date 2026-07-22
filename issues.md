@@ -107,10 +107,10 @@ warnings without pretending these areas are already structurally clean.
   allowances are gone, capture dimensions are fallible, hit rectangles and
   split arithmetic cannot overflow, and boundary tests cover fractional values,
   the full signed range, NaN/infinities, zero and tiny scales, and host-size
-  overflow. The current `workspace` provider in
-  `examples/wasm-geometry-layout-policy` is the observable plugin proof through
-  `tools/test-geometry-conversions-nested.sh`: it emits a typed
-  `SetResolvedLayout` for two real 640x800 panes, after which global input at
+  overflow. The current `workspace` actor in `plugins/default-workspace` is the
+  observable plugin proof through `tools/test-geometry-conversions-nested.sh`:
+  it receives state through its mailbox and emits a typed `SetResolvedLayout`
+  through its host outbox for two real 640x800 panes, after which global input at
   `(960,400)` visibly reaches Weston eventdemo at local `(320,400)`. The client
   records motion, press/release, wheel value 15, and fractional scroll 7.5,
   while compositor metrics record six target hits, zero misses, and the

@@ -10,7 +10,7 @@ Use these current pages first:
 - [Plugin Runtime](../systems/plugin-runtime.md)
 - [Plugin UI And Pane Rendering](../systems/plugin-ui.md)
 - [Input And Keyboard Shortcuts](../systems/input-shortcuts.md)
-- [Layout Policy](../systems/layout-policy.md)
+- [Layout Actor](../systems/layout-actor.md)
 
 Use the narrower archived WASM pages only for historical focused design notes:
 

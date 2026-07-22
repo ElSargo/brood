@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-22
 code-links:
   - crates/manifold-wasm/src/module.rs
   - crates/manifold-wasm/src/module_link.rs
@@ -10,11 +10,10 @@ code-links:
   - crates/manifold-wasm/src/actor_link.rs
   - crates/manifold-wasm/src/global_key_policy.rs
   - crates/manifold-wasm/src/global_key_policy_link.rs
-  - crates/manifold-wasm/src/layout_policy.rs
-  - crates/manifold-wasm/src/layout_policy_link.rs
+  - crates/manifold-wasm/src/resolved_layout.rs
   - crates/manifold-wasm/src/policy_provider.rs
   - crates/manifold-wasm/src/test_harness.rs
-  - clients/manifold-client/src/layout_policy.rs
+  - clients/manifold-client/src/layout.rs
   - clients/manifold-client/src/main.rs
   - crates/manifoldd/src/wasm_test.rs
   - crates/manifoldd/src/control.rs
@@ -32,16 +31,16 @@ that must complete before host processing can continue. Policy providers read
 immutable published state and return bounded decision envelopes plus message
 batches; ordinary plugin work stays in actors and workers. See
 [[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and
-[[../systems/layout-policy]].
+[[../systems/layout-actor]].
 
 ## Core-Module Actors
 
 Core plugins declare actors and typed event subscriptions through named exports
 discovered by `module_link.rs`. Each actor processes one bounded mailbox epoch
-and returns an outbox containing messages and publication frames. The built-in
-daemon presenter retains an actor-driven layout path for compatibility while
-the separate presentation client migration is in progress. Marker typos and
-subscriptions without a declared actor reject the module; consult
+and returns an outbox containing messages and publication frames. Both the
+built-in daemon presenter and the separate presentation client use the same
+actor-driven layout path. Marker typos and subscriptions without a declared
+actor reject the module; consult
 `module_link.rs` for exact export spellings.
 
 See `module.rs`, `module_link.rs`, `actor.rs`, and `actor_link.rs` for the exact
@@ -63,18 +62,20 @@ See `global_key_policy.rs`, `global_key_policy_link.rs`, and
 `policy_provider.rs` for the exact export, descriptor, bounds, and decision
 encoding.
 
-## Presentation Layout Policy
+## Presentation Layout Actors
 
-The separate presentation client selects and invokes a named synchronous
-layout provider locally. Its bounded query contains the client-visible pane
-inventory, local focus, and viewport size. The result is a flat resolved layout
-that the client validates before composition and hit testing. Failure,
-abstention, or an invalid result selects the client-local native fallback.
+A core-module actor declares the layout-state subscription through normal actor
+metadata. The presentation host enqueues client-visible pane inventory, local
+focus, application identities, and viewport size into that actor's mailbox.
+Commands such as `layout-action` use the same addressed message route. The
+actor submits a candidate flat resolved layout only by addressing a
+`set-resolved-layout` message to the ordinary host mailbox.
 
-The client sends requested managed-pane sizes to the daemon after accepting a
-layout; it never sends placement. See `layout_policy.rs`,
-`layout_policy_link.rs`, and the client layout-policy host for the exact ABI and
-validation path.
+The client validates each candidate before composition and hit testing. An
+invalid result selects the client-local native fallback. The client sends
+requested managed-pane sizes to the daemon after accepting a layout; it never
+sends placement. See `actor.rs`, `legacy_runtime.rs`, `resolved_layout.rs`, and
+the client actor runtime for the exact mailbox and validation path.
 
 ## Async Test Harness
 
@@ -104,5 +105,5 @@ Related:
 - [[../systems/extension-host]]
 - [[../systems/plugin-runtime]]
 - [[../systems/input-shortcuts]]
-- [[../systems/layout-policy]]
+- [[../systems/layout-actor]]
 - [[../workflows/build-wasm-examples]]

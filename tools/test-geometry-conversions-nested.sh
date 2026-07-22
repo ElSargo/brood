@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug/manifold"
-POLICY_WASM="$ROOT/examples/wasm-geometry-layout-policy/target/wasm32-unknown-unknown/release/manifold_wasm_geometry_layout_policy.wasm"
+WORKSPACE_WASM="$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
 
 ctl() {
   RUST_LOG=off timeout 5s "$BIN" ctl "$@"
@@ -23,13 +23,13 @@ run_terminal_controller() {
   printf '\033[2J\033[H'
   echo 'Manifold checked geometry proof'
   echo
-  echo 'The real workspace policy plugin owns this two-pane layout.'
+  echo 'The real workspace actor owns this two-pane layout.'
   echo 'Pointer motion, click, and wheel input target Weston eventdemo on the right.'
   echo
 
-  plug_out="$("$BIN" plug "$POLICY_WASM")"
-  [[ "$plug_out" == OK\ plug\ kind=plugin\ path=* ]]
+  plug_out="$("$BIN" plug "$WORKSPACE_WASM")"
   echo "$plug_out"
+  [[ "$plug_out" == OK\ plug\ kind=plugin\ path=* ]]
 
   spawn_out="$(ctl spawn "$event_wrapper")"
   event_pane="$(sed -n 's/.*pane_id=\([0-9][0-9]*\).*/\1/p' <<<"$spawn_out")"
@@ -45,18 +45,14 @@ run_terminal_controller() {
   python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["windows"] >= 2 and p["frames"] >= 2, p' "$status"
   [[ "$event_pane" == 2 ]]
 
-  # The key invocation crosses the installed provider ABI and emits the typed
-  # SetResolvedLayout host message used for the remaining proof.
-  ctl inject key 30 pressed >/dev/null
-  ctl inject key 30 released >/dev/null
   for _ in $(seq 1 100); do
     status="$(ctl status-json)"
-    if python3 -c 'import json,sys; p=json.loads(sys.argv[1]); raise SystemExit(0 if p["resolved_layout_source"] == "wasm-policy" and p["resolved_layout_panes"] == 2 and p["resolved_layout_placeholders"] == 0 else 1)' "$status"; then
+    if python3 -c 'import json,sys; p=json.loads(sys.argv[1]); raise SystemExit(0 if p["resolved_layout_source"] == "actor" and p["resolved_layout_panes"] == 2 and p["resolved_layout_placeholders"] == 0 else 1)' "$status"; then
       break
     fi
     sleep 0.05
   done
-  python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["resolved_layout_source"] == "wasm-policy" and p["resolved_layout_panes"] == 2 and p["resolved_layout_placeholders"] == 0, p' "$status"
+  python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["resolved_layout_source"] == "actor" and p["resolved_layout_panes"] == 2 and p["resolved_layout_placeholders"] == 0, p' "$status"
   printf '%s\n' "$status" >"$before_json"
 
   ctl debug dump "$dump" >/dev/null
@@ -129,7 +125,7 @@ state = json.loads(pathlib.Path(sys.argv[1]).read_text())
 png = pathlib.Path(sys.argv[2])
 pane = int(sys.argv[3])
 status = state["status"]
-assert state["layout"]["source"] == "wasm-policy", state["layout"]
+assert state["layout"]["source"] == "actor", state["layout"]
 assert status["resolved_layout_panes"] >= 2, status
 assert status["resolved_layout_placeholders"] == 0, status
 assert any(
@@ -143,7 +139,7 @@ PY
   {
     echo '# Checked geometry nested proof'
     echo
-    echo 'The `workspace` geometry policy plugin visibly split a real Weston terminal and Weston eventdemo into signed logical rectangles. Manifold then targeted the eventdemo pane by its resolved global rectangle and forwarded motion, click, wheel-v120, and fractional continuous scroll input.'
+    echo 'The `workspace` actor visibly split a real Weston terminal and Weston eventdemo into signed logical rectangles. Manifold then targeted the eventdemo pane by its resolved global rectangle and forwarded motion, click, wheel-v120, and fractional continuous scroll input.'
     echo
     echo '```text'
     echo "$plug_out"
@@ -197,7 +193,7 @@ chmod +x "$OUT/eventdemo-wrapper.sh"
 
 nix develop --command cargo build -p manifoldd
 nix develop --command cargo build \
-  --manifest-path examples/wasm-geometry-layout-policy/Cargo.toml \
+  --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
 

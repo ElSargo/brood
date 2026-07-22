@@ -24,8 +24,7 @@ use manifold_cli::{
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use manifold_layout::{
-    InputBehavior, LayoutAction, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize, LocalPoint,
-    LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+    LayoutAction, LayoutItemKind, LayoutRect, LayoutSize, LocalPoint, ResolvedLayout,
 };
 use num_traits::ToPrimitive;
 use wgpu::{Color, CurrentSurfaceTexture};
@@ -40,13 +39,13 @@ use winit::{
 
 mod actor_runtime;
 mod key_policy;
-mod layout_policy;
+mod layout;
 mod plugin_gpu;
 mod plugin_graphics;
 
 use actor_runtime::PresentationWasmRuntime;
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
-use layout_policy::{ClientLayoutPolicy, LayoutSource};
+use layout::{LayoutSource, convert_actor_layout, native_flat_layout};
 use manifold_wasm::{GlobalKeyDecision, HostMessage, PresentationEvent};
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
@@ -54,7 +53,7 @@ use plugin_graphics::PluginGraphicsBridge;
 fn main() -> Result<()> {
     let args = ClientArgs::parse();
     if args.check_wasm_actors {
-        let mut runtime = PresentationWasmRuntime::start(&args.wasm_actors, None)?;
+        let mut runtime = PresentationWasmRuntime::start(&args.wasm_actors, None, None)?;
         runtime
             .shutdown()
             .context("stop checked presentation WASM runtime")?;
@@ -62,18 +61,7 @@ fn main() -> Result<()> {
         eprintln!("presentation WASM actor check passed");
         return Ok(());
     }
-    let mut layout_policy = ClientLayoutPolicy::load(args.wasm_layout_policy.as_deref())?;
     let mut key_policy = ClientKeyPolicy::load(args.wasm_key_policy.as_deref())?;
-    if args.check_wasm_layout_policy {
-        let resolution = layout_policy.resolve(&[1, 2], Some(1), LayoutSize { w: 1200, h: 800 });
-        if resolution.source != LayoutSource::WasmPolicy || resolution.layout.pane_count() != 2 {
-            return Err(anyhow!(
-                "presentation layout policy did not produce the expected two-pane flat layout"
-            ));
-        }
-        eprintln!("presentation WASM layout policy check passed");
-        return Ok(());
-    }
     if args.check_wasm_key_policy {
         let snapshot = KeyPolicySnapshot {
             focused_pane: Some(1),
@@ -90,15 +78,26 @@ fn main() -> Result<()> {
             &snapshot,
         )?;
         if evaluation.decision != GlobalKeyDecision::Consume
-            || !evaluation.host_messages.iter().any(|message| {
+            || evaluation.host_messages.iter().any(|message| {
                 matches!(
                     message,
-                    HostMessage::LayoutAction { action } if action == "focus-next"
+                    HostMessage::LayoutAction { .. } | HostMessage::SetResolvedLayout { .. }
                 )
+            })
+            || !evaluation.actor_messages.iter().any(|message| {
+                message.actor == "workspace"
+                    && serde_json::from_slice::<HostMessage>(&message.payload).is_ok_and(
+                        |message| {
+                            matches!(
+                                message,
+                                HostMessage::LayoutAction { action } if action == "focus-next"
+                            )
+                        },
+                    )
             })
         {
             return Err(anyhow!(
-                "presentation key policy did not consume Ctrl+J as focus-next"
+                "presentation key policy did not route Ctrl+J to the workspace actor"
             ));
         }
         let mode_toggle = key_policy.evaluate(
@@ -209,8 +208,8 @@ fn main() -> Result<()> {
         wasm_runtime: Some(PresentationWasmRuntime::start(
             &args.wasm_actors,
             Some(&plugin_graphics),
+            Some(event_proxy.clone()),
         )?),
-        layout_policy: Some(layout_policy),
         key_policy: Some(key_policy),
         plugin_graphics: Some(plugin_graphics),
         input_sender,
@@ -276,6 +275,7 @@ enum ClientEvent {
         description: String,
         result: Result<String, String>,
     },
+    ActorHostMessagesReady,
 }
 
 #[derive(Debug)]
@@ -545,13 +545,13 @@ struct Application {
     managed_pointer_target: Option<u64>,
     pointer_grab: Option<PointerGrab>,
     wasm_runtime: Option<PresentationWasmRuntime>,
-    layout_policy: Option<ClientLayoutPolicy>,
     key_policy: Option<ClientKeyPolicy>,
     plugin_graphics: Option<PluginGraphicsBridge>,
     backend_commands: Option<BackendCommandLane>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<ClientEvent>>,
     next_renderer_generation: u64,
     renderer_recoveries: u8,
+    layout_revision: u64,
 }
 
 impl Application {
@@ -579,6 +579,9 @@ impl Application {
                     "backend command completion reached scene transport path"
                 ));
             }
+            ClientEvent::ActorHostMessagesReady => {
+                return Err(anyhow!("actor host message reached scene transport path"));
+            }
         };
         let Some(renderer) = self.renderer.as_mut() else {
             self.pending_frame = Some(ClientEvent::SceneFrame {
@@ -599,6 +602,98 @@ impl Application {
             )?;
         }
         flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+        Ok(())
+    }
+
+    fn publish_layout_state(&mut self) -> Result<()> {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        self.layout_revision = self
+            .layout_revision
+            .checked_add(1)
+            .context("layout state revision limit exceeded")?;
+        let Some(message) = renderer.take_layout_state_message(self.layout_revision) else {
+            return Ok(());
+        };
+        let payload = serde_json::to_vec(&message).context("encode client layout-state message")?;
+        let recipients = match self
+            .wasm_runtime
+            .as_ref()
+            .map_or(Ok(0), |runtime| runtime.send_layout_state(&payload))
+        {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                renderer.layout_state_dirty = true;
+                eprintln!(
+                    "deferred layout-state revision={} after actor mailbox error: {error:#}",
+                    self.layout_revision
+                );
+                return Ok(());
+            }
+        };
+        if recipients > 0 {
+            eprintln!(
+                "queued layout-state revision={} actors={recipients}",
+                self.layout_revision
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_actor_host_messages(&mut self) -> Result<()> {
+        let messages = self
+            .wasm_runtime
+            .as_mut()
+            .map_or(Ok(Vec::new()), PresentationWasmRuntime::drain_host_messages)?;
+        for payload in messages {
+            let message: HostMessage = match serde_json::from_slice(&payload) {
+                Ok(message) => message,
+                Err(error) => {
+                    eprintln!("rejected malformed presentation actor host message: {error}");
+                    continue;
+                }
+            };
+            let Some(renderer) = self.renderer.as_mut() else {
+                continue;
+            };
+            let focus_change = match message {
+                HostMessage::SetResolvedLayout { layout, focus } => {
+                    let (focus_change, accepted) = renderer.commit_actor_layout(layout, focus);
+                    if accepted {
+                        eprintln!(
+                            "accepted actor layout items={} panes={}",
+                            renderer.accepted_layout.items.len(),
+                            renderer.accepted_layout.pane_count()
+                        );
+                    }
+                    focus_change
+                }
+                message => {
+                    if let Err(error) = apply_key_policy_host_message(
+                        renderer,
+                        &mut self.input_sender,
+                        self.backend_commands.as_ref(),
+                        self.wasm_runtime.as_ref(),
+                        message,
+                        self.window_focused,
+                    ) {
+                        eprintln!("rejected presentation actor host message: {error:#}");
+                    }
+                    None
+                }
+            };
+            if let Some(change) = focus_change {
+                dispatch_focus_change(
+                    self.wasm_runtime.as_ref(),
+                    self.input_sender.as_mut(),
+                    change,
+                    self.window_focused,
+                )?;
+            }
+            flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+            renderer.window.request_redraw();
+        }
         Ok(())
     }
 
@@ -639,7 +734,7 @@ impl Application {
                 "renderer recovery failed repeatedly after: {message}"
             ));
         }
-        let mut old = self
+        let old = self
             .renderer
             .take()
             .context("lost renderer during recovery")?;
@@ -648,10 +743,6 @@ impl Application {
             .as_ref()
             .map(|plugin| (plugin.scene.pane, plugin.scene.sequence));
         let window = Arc::clone(&old.window);
-        let layout_policy = old
-            .layout_policy
-            .take()
-            .context("lost layout policy during renderer recovery")?;
         drop(old);
         let generation = self.allocate_renderer_generation()?;
         let proxy = self
@@ -665,14 +756,8 @@ impl Application {
             .plugin_graphics
             .clone()
             .context("plugin graphics bridge is unavailable")?;
-        let mut replacement = Renderer::new(
-            window,
-            self.fast_path_enabled,
-            graphics,
-            layout_policy,
-            generation,
-            proxy,
-        )?;
+        let mut replacement =
+            Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
         if let Some((pane, sequence)) = replay {
             replacement.refresh_plugin_graphics(pane, sequence)?;
         }
@@ -704,13 +789,6 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.fail(event_loop, anyhow!("renderer event proxy is unavailable"));
             return;
         };
-        let Some(layout_policy) = self.layout_policy.take() else {
-            self.fail(
-                event_loop,
-                anyhow!("presentation layout policy is unavailable"),
-            );
-            return;
-        };
         let result = event_loop
             .create_window(Window::default_attributes().with_title(title))
             .context("create presentation window")
@@ -723,7 +801,6 @@ impl ApplicationHandler<ClientEvent> for Application {
                     Arc::new(window),
                     self.fast_path_enabled,
                     graphics,
-                    layout_policy,
                     generation,
                     proxy,
                 )
@@ -826,6 +903,11 @@ impl ApplicationHandler<ClientEvent> for Application {
                     eprintln!("presentation backend command failed command={description}: {error}");
                 }
             },
+            ClientEvent::ActorHostMessagesReady => {
+                if let Err(error) = self.apply_actor_host_messages() {
+                    self.fail(event_loop, error);
+                }
+            }
             event => {
                 if let Err(error) = self.accept_frame(event) {
                     self.fail(event_loop, error);
@@ -836,6 +918,10 @@ impl ApplicationHandler<ClientEvent> for Application {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if !self.drain_wasm_events(event_loop) {
+            return;
+        }
+        if let Err(error) = self.publish_layout_state() {
+            self.fail(event_loop, error);
             return;
         }
         let input_backpressured = self.input_sender.as_mut().is_some_and(|lane| {
@@ -1307,10 +1393,9 @@ struct Renderer {
     plugin_graphics: PluginGraphicsBridge,
     plugin_pane: Option<PluginPaneTexture>,
     focused_pane: Option<FocusedPane>,
-    layout_policy: Option<ClientLayoutPolicy>,
     accepted_layout: ResolvedLayout,
     layout_source: LayoutSource,
-    fullscreen_pane: Option<u64>,
+    layout_state_dirty: bool,
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
 }
 
@@ -1380,6 +1465,23 @@ struct SceneWindow {
     source_rect: [i32; 4],
     rect: [i32; 4],
     active: bool,
+}
+
+#[derive(serde::Serialize)]
+struct LayoutStateMessage {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    revision: u64,
+    visible_panes: Vec<u64>,
+    focused_pane: Option<u64>,
+    pane_app_ids: Vec<KeyPolicyAppPane>,
+    size: LayoutStateSize,
+}
+
+#[derive(serde::Serialize)]
+struct LayoutStateSize {
+    w: i32,
+    h: i32,
 }
 
 struct ImportedFrame {
@@ -1524,51 +1626,24 @@ fn apply_key_policy_host_message(
 ) -> Result<()> {
     let focus_change = match message {
         HostMessage::LayoutAction { action } => {
-            let action = action
+            let parsed = action
                 .parse::<LayoutAction>()
                 .map_err(|error| anyhow!("parse key-policy layout action: {error}"))?;
-            match action {
-                LayoutAction::FocusNext | LayoutAction::FocusNextSplit => renderer.cycle_focus(1),
-                LayoutAction::FocusPrevious | LayoutAction::FocusPreviousSplit => {
-                    renderer.cycle_focus(-1)
+            if parsed == LayoutAction::CloseActivePane {
+                if let Some(pane) = renderer.focused_managed_window() {
+                    queue_backend_command(
+                        backend_commands,
+                        format!("close-pane-{pane}"),
+                        vec!["close-pane".to_string(), pane.to_string()],
+                    )?;
+                } else {
+                    eprintln!("key-policy close ignored for a presentation-local actor pane");
                 }
-                LayoutAction::CloseActivePane => {
-                    if let Some(pane) = renderer.focused_managed_window() {
-                        queue_backend_command(
-                            backend_commands,
-                            format!("close-pane-{pane}"),
-                            vec!["close-pane".to_string(), pane.to_string()],
-                        )?;
-                    } else {
-                        eprintln!("key-policy close ignored for a presentation-local actor pane");
-                    }
-                    None
-                }
-                LayoutAction::ToggleManagedFullscreen => {
-                    if renderer.focused_managed_window().is_some() {
-                        renderer.toggle_focused_fullscreen()
-                    } else {
-                        None
-                    }
-                }
-                LayoutAction::SplitActiveRight
-                | LayoutAction::SplitActiveDown
-                | LayoutAction::JoinActivePane
-                | LayoutAction::SplitActiveSmart
-                | LayoutAction::MoveActiveToLeftDock
-                | LayoutAction::MoveActiveToRightDock
-                | LayoutAction::MoveActiveToBottomDock
-                | LayoutAction::MoveActiveToCenter
-                | LayoutAction::ToggleLeftDock
-                | LayoutAction::ToggleRightDock
-                | LayoutAction::ToggleBottomDock
-                | LayoutAction::IncreaseLeftDockWidth
-                | LayoutAction::DecreaseLeftDockWidth => {
-                    eprintln!(
-                        "key-policy layout action action={action} has no stateful operation in the selected flat layout provider"
-                    );
-                    None
-                }
+                None
+            } else {
+                return Err(anyhow!(
+                    "layout action {action:?} must be addressed to a layout actor"
+                ));
             }
         }
         HostMessage::FocusPane { pane } => renderer.focus_pane(pane),
@@ -1603,7 +1678,7 @@ fn apply_key_policy_host_message(
         HostMessage::ToggleShortcutPassthrough | HostMessage::SetShortcutPassthrough { .. } => None,
         HostMessage::SetResolvedLayout { .. } => {
             return Err(anyhow!(
-                "key policy cannot replace the selected client layout provider"
+                "key policy cannot submit layout directly; it must message a layout actor"
             ));
         }
     };
@@ -2067,7 +2142,6 @@ impl Renderer {
         window: Arc<Window>,
         fast_path_enabled: bool,
         plugin_graphics: PluginGraphicsBridge,
-        layout_policy: ClientLayoutPolicy,
         generation: u64,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
@@ -2075,7 +2149,6 @@ impl Renderer {
             window,
             fast_path_enabled,
             plugin_graphics,
-            layout_policy,
             generation,
             proxy,
         ))
@@ -2085,7 +2158,6 @@ impl Renderer {
         window: Arc<Window>,
         fast_path_enabled: bool,
         plugin_graphics: PluginGraphicsBridge,
-        layout_policy: ClientLayoutPolicy,
         generation: u64,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
@@ -2171,10 +2243,9 @@ impl Renderer {
             plugin_graphics,
             plugin_pane: None,
             focused_pane: None,
-            layout_policy: Some(layout_policy),
             accepted_layout: ResolvedLayout::empty(),
             layout_source: LayoutSource::NativeFallback,
-            fullscreen_pane: None,
+            layout_state_dirty: true,
             sent_managed_sizes: HashMap::new(),
         })
     }
@@ -2257,7 +2328,8 @@ impl Renderer {
                 &managed_panes,
                 backend_focus,
             );
-            let _focus_change = self.relayout_panes();
+            self.layout_state_dirty = true;
+            let _focus_change = self.reconcile_layout();
             let focus_change =
                 focus_change_between(previous_focus, self.focused_pane).or_else(|| {
                     let Some(FocusedPane::Managed(local_focus)) = self.focused_pane else {
@@ -2308,39 +2380,9 @@ impl Renderer {
         self.set_focus(target)
     }
 
-    fn cycle_focus(&mut self, offset: isize) -> Option<FocusChange> {
-        let panes = self.pane_inventory();
-        if panes.is_empty() {
-            return None;
-        }
-        let current = self
-            .focused_pane_id()
-            .and_then(|focused| panes.iter().position(|pane| *pane == focused))
-            .unwrap_or(0);
-        let len = isize::try_from(panes.len()).unwrap_or(isize::MAX);
-        let target_index = (isize::try_from(current).unwrap_or_default() + offset).rem_euclid(len);
-        let target_pane = *panes.get(usize::try_from(target_index).ok()?)?;
-        let target = self.focus_target_for_pane(target_pane)?;
-        if self.fullscreen_pane.is_some() {
-            self.fullscreen_pane = Some(target_pane);
-        }
-        self.set_focus(target)
-    }
-
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
         let target = self.focus_target_for_pane(pane)?;
-        if self.fullscreen_pane.is_some() {
-            self.fullscreen_pane = Some(pane);
-        }
         self.set_focus(target)
-    }
-
-    fn toggle_focused_fullscreen(&mut self) -> Option<FocusChange> {
-        let focused = self.focused_pane_id()?;
-        self.fullscreen_pane = (self.fullscreen_pane != Some(focused)).then_some(focused);
-        let focus_change = self.relayout_panes();
-        self.window.request_redraw();
-        focus_change
     }
 
     fn pane_for_app_id(&self, app_id: &str) -> Option<u64> {
@@ -2391,7 +2433,7 @@ impl Renderer {
             return None;
         }
         self.focused_pane = Some(target);
-        let _focus_change = self.relayout_panes();
+        self.layout_state_dirty = true;
         let target = self.focused_pane?;
         if previous == Some(target) {
             return None;
@@ -2460,29 +2502,71 @@ impl Renderer {
         (self.config.width.max(1), self.config.height.max(1))
     }
 
-    fn relayout_panes(&mut self) -> Option<FocusChange> {
-        let previous_focus = self.focused_pane;
-        let (width, height) = self.composition_extent();
-        let extent = LayoutSize {
-            w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
-            h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
-        };
+    fn reconcile_layout(&mut self) -> Option<FocusChange> {
         let panes = self.pane_inventory();
-        let focused = self.focused_pane_id();
-        let layout_policy = self.layout_policy.as_mut()?;
-        let resolution = layout_policy.resolve(&panes, focused, extent);
-        if self.layout_source != resolution.source {
-            let source = match resolution.source {
+        let valid = self
+            .accepted_layout
+            .clone()
+            .validate_for_panes(&panes)
+            .is_ok();
+        if self.layout_source == LayoutSource::NativeFallback || !valid {
+            let extent = self.layout_extent();
+            let focus = self.focused_pane_id();
+            return self.commit_layout(
+                native_flat_layout(&panes, extent),
+                focus,
+                LayoutSource::NativeFallback,
+            );
+        }
+        self.project_accepted_layout(None)
+    }
+
+    fn commit_actor_layout(
+        &mut self,
+        layout: manifold_wasm::ResolvedLayout,
+        focus: Option<u64>,
+    ) -> (Option<FocusChange>, bool) {
+        let panes = self.pane_inventory();
+        match convert_actor_layout(layout).validate_for_panes(&panes) {
+            Ok(layout) => (self.commit_layout(layout, focus, LayoutSource::Actor), true),
+            Err(error) => {
+                eprintln!("rejected actor-submitted layout; using native fallback: {error}");
+                self.layout_state_dirty = true;
+                let extent = self.layout_extent();
+                let focus = self.focused_pane_id();
+                (
+                    self.commit_layout(
+                        native_flat_layout(&panes, extent),
+                        focus,
+                        LayoutSource::NativeFallback,
+                    ),
+                    false,
+                )
+            }
+        }
+    }
+
+    fn commit_layout(
+        &mut self,
+        layout: ResolvedLayout,
+        focus: Option<u64>,
+        source: LayoutSource,
+    ) -> Option<FocusChange> {
+        if self.layout_source != source {
+            let source = match source {
                 LayoutSource::NativeFallback => "native-fallback",
-                LayoutSource::WasmPolicy => "wasm-policy",
+                LayoutSource::Actor => "actor",
             };
             eprintln!("presentation layout source changed source={source}");
         }
-        self.layout_source = resolution.source;
-        self.accepted_layout = resolution.layout;
-        if let Some(pane) = self.fullscreen_pane.filter(|pane| panes.contains(pane)) {
-            self.accepted_layout = fullscreen_layout(pane);
-        }
+        self.layout_source = source;
+        self.accepted_layout = layout;
+        self.project_accepted_layout(focus)
+    }
+
+    fn project_accepted_layout(&mut self, requested_focus: Option<u64>) -> Option<FocusChange> {
+        let previous_focus = self.focused_pane;
+        let extent = self.layout_extent();
 
         if let Some(plugin) = self.plugin_pane.as_mut() {
             plugin.rect = [0, 0, 0, 0];
@@ -2511,9 +2595,8 @@ impl Renderer {
             }
         }
 
-        let requested_focus = resolution
-            .focus
-            .and_then(|pane| self.focus_target_for_visible_pane(pane));
+        let requested_focus =
+            requested_focus.and_then(|pane| self.focus_target_for_visible_pane(pane));
         let retained_focus = self
             .focused_pane_id()
             .and_then(|pane| self.focus_target_for_visible_pane(pane));
@@ -2538,8 +2621,42 @@ impl Renderer {
                 .iter()
                 .any(|item| item.window_id == *window)
         });
-        self.fullscreen_pane = self.fullscreen_pane.filter(|pane| panes.contains(pane));
         focus_change_between(previous_focus, self.focused_pane)
+    }
+
+    fn layout_extent(&self) -> LayoutSize {
+        let (width, height) = self.composition_extent();
+        LayoutSize {
+            w: i32::try_from(width).unwrap_or(i32::MAX).max(1),
+            h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
+        }
+    }
+
+    fn take_layout_state_message(&mut self, revision: u64) -> Option<LayoutStateMessage> {
+        if !self.layout_state_dirty {
+            return None;
+        }
+        self.layout_state_dirty = false;
+        let extent = self.layout_extent();
+        Some(LayoutStateMessage {
+            message_type: "layout-state",
+            revision,
+            visible_panes: self.pane_inventory(),
+            focused_pane: self.focused_pane_id(),
+            pane_app_ids: self
+                .current_windows
+                .iter()
+                .filter(|window| !window.app_id.is_empty())
+                .map(|window| KeyPolicyAppPane {
+                    pane: window.window_id,
+                    app_id: window.app_id.clone(),
+                })
+                .collect(),
+            size: LayoutStateSize {
+                w: extent.w,
+                h: extent.h,
+            },
+        })
     }
 
     fn pane_inventory(&self) -> Vec<u64> {
@@ -2628,7 +2745,8 @@ impl Renderer {
         let focus_change = if first_plugin_scene {
             self.set_focus(FocusedPane::Plugin(pane))
         } else {
-            self.relayout_panes()
+            self.layout_state_dirty = true;
+            self.reconcile_layout()
         };
         self.window.request_redraw();
         Ok(focus_change)
@@ -2642,6 +2760,7 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.reconfigure();
+        self.layout_state_dirty = true;
         let focus_change = if let Some((pane, sequence)) = self
             .plugin_pane
             .as_ref()
@@ -2649,7 +2768,7 @@ impl Renderer {
         {
             self.refresh_plugin_graphics(pane, sequence)?
         } else {
-            self.relayout_panes()
+            self.reconcile_layout()
         };
         self.window.request_redraw();
         Ok(focus_change)
@@ -2901,21 +3020,6 @@ fn focus_change_between(
 
 const fn is_plugin_managed_focus_toggle(key: PhysicalKey) -> bool {
     matches!(key, PhysicalKey::Code(KeyCode::F6))
-}
-
-fn fullscreen_layout(pane: u64) -> ResolvedLayout {
-    ResolvedLayout {
-        items: vec![ResolvedLayoutItem {
-            id: LayoutItemId(pane),
-            kind: LayoutItemKind::Pane { pane },
-            z: 0.0,
-            transform: LocalTransform {
-                offset: LocalPoint { u: -1.0, v: -1.0 },
-                size: LocalPoint { u: 2.0, v: 2.0 },
-            },
-            input: InputBehavior::Pane,
-        }],
-    }
 }
 
 fn project_point_between_rects(x: f64, y: f64, from: [i32; 4], to: [i32; 4]) -> (f64, f64) {

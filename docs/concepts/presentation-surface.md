@@ -15,14 +15,14 @@ The current prototype's session process also owns the MVP Winit/GLES presentatio
 
 Presentation state is not pane state. A presentation surface may save layout or visibility preferences locally or explicitly coordinate them into session storage, but the pane remains owned by its producer or session state.
 
-Plugins may run presentation actors locally, influence presentation through validated requests, and provide layout policy. The presentation client still owns final rendering, hit testing, focus routing, and accepted viewport commits.
+Plugins may run presentation actors locally and influence presentation through validated actor messages. The presentation client still owns final rendering, hit testing, focus routing, and accepted viewport commits.
 
 Related:
 
 - [[session]]
 - [[pane]]
 - [[../systems/presentation-client]]
-- [[../systems/layout-policy]]
+- [[../systems/layout-actor]]
 - [[../systems/input-shortcuts]]
 - [[../systems/plugin-ui]]
 - [[../systems/runtime]]

@@ -73,7 +73,7 @@ pub enum HostMessage {
         enabled: bool,
     },
     SetResolvedLayout {
-        layout: crate::layout_policy::ResolvedLayout,
+        layout: crate::resolved_layout::ResolvedLayout,
         focus: Option<u64>,
     },
 }

@@ -311,7 +311,7 @@ pub enum InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedLayoutSource {
     NativeFallback,
-    WasmPolicy,
+    Actor,
 }
 
 #[derive(Debug, Clone)]
@@ -1204,11 +1204,21 @@ impl Manifold {
                 | manifold_wasm::GlobalKeyDecision::ForwardWithModifiers
         );
         for message in outcome.messages {
-            let result = self.try_route_wasm_actor_message(
-                &message.actor,
-                "host".to_string(),
-                message.payload,
-            );
+            let result = if message.actor == manifold_wasm::HOST_ACTOR_NAME {
+                validate_key_policy_host_message(&message.payload).and_then(|()| {
+                    self.try_route_wasm_actor_message(
+                        &message.actor,
+                        "host".to_string(),
+                        message.payload,
+                    )
+                })
+            } else {
+                self.try_route_wasm_actor_message(
+                    &message.actor,
+                    "host".to_string(),
+                    message.payload,
+                )
+            };
             if let Err(err) = result {
                 self.plugin_actor_failures += 1;
                 self.plugin_actor_last_status =
@@ -1411,7 +1421,6 @@ impl Manifold {
     fn handle_plugin_host_event(&mut self, event: PluginHostEvent) {
         match event {
             PluginHostEvent::DrainWasmHostMailbox => self.drain_wasm_host_mailbox(),
-            PluginHostEvent::RefreshWasmLayout => self.refresh_resolved_layout_from_policy(),
             PluginHostEvent::AppendPublicationFrame {
                 actor_id,
                 slot,
@@ -2623,7 +2632,7 @@ impl Manifold {
         self.apply_registered_extension_grants_for_surface(surface);
         if registered.presentation {
             self.mark_presentation_child_surface(surface);
-            self.refresh_resolved_layout_from_policy();
+            self.request_resolved_layout_update();
             return self.active_content_surface_for_layout_action();
         }
         self.emit_wasm_actor_event(
@@ -2639,7 +2648,7 @@ impl Manifold {
         {
             self.place_new_native_pane(registered.pane_id);
         }
-        self.apply_map_hook_for_pending_pane(registered.pane_id)
+        self.prepare_actor_layout_for_pending_pane(registered.pane_id)
     }
 
     fn place_new_native_pane(&mut self, pane: u64) {
@@ -2919,16 +2928,16 @@ impl Manifold {
         .then_some(surface)
     }
 
-    fn apply_map_hook_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
-        self.refresh_resolved_layout_from_policy_with_extra_pane(Some(pending_pane));
+    fn prepare_actor_layout_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
+        self.request_resolved_layout_update_with_extra_pane(Some(pending_pane));
         self.surface_for_pane(pending_pane)
     }
 
-    fn refresh_resolved_layout_from_policy(&mut self) {
-        self.refresh_resolved_layout_from_policy_with_extra_pane(None);
+    fn request_resolved_layout_update(&mut self) {
+        self.request_resolved_layout_update_with_extra_pane(None);
     }
 
-    fn refresh_resolved_layout_from_policy_with_extra_pane(&mut self, extra_pane: Option<u64>) {
+    fn request_resolved_layout_update_with_extra_pane(&mut self, extra_pane: Option<u64>) {
         let has_layout_subscriber =
             self.legacy_wasm_actor_generation
                 .as_ref()
@@ -2938,22 +2947,22 @@ impl Manifold {
                         .is_empty()
                 });
         if !has_layout_subscriber {
-            self.refresh_resolved_layout_from_native_policy();
+            self.refresh_native_resolved_layout();
             return;
         }
         self.emit_wasm_layout_snapshot_event(extra_pane);
     }
 
-    pub fn apply_plugin_resolved_layout(
+    pub fn apply_actor_resolved_layout(
         &mut self,
         layout: ResolvedLayout,
         focus: Option<u64>,
     ) -> bool {
-        self.apply_map_hook_resolved_layout(layout, focus).is_some()
-            || self.resolved_layout_source == ResolvedLayoutSource::WasmPolicy
+        self.accept_actor_resolved_layout(layout, focus).is_some()
+            || self.resolved_layout_source == ResolvedLayoutSource::Actor
     }
 
-    fn apply_map_hook_resolved_layout(
+    fn accept_actor_resolved_layout(
         &mut self,
         layout: ResolvedLayout,
         focus: Option<u64>,
@@ -2964,9 +2973,9 @@ impl Manifold {
             Err(err) => {
                 warn!(
                     ?err,
-                    "WASM map hook returned invalid resolved layout; using native placement"
+                    "layout actor returned invalid resolved layout; using native placement"
                 );
-                self.refresh_resolved_layout_from_native_policy();
+                self.refresh_native_resolved_layout();
                 return None;
             }
         };
@@ -2975,12 +2984,12 @@ impl Manifold {
             .filter(|pane| layout.pane_item(*pane).is_some())
             .and_then(|pane| self.surface_for_pane(pane));
         self.accepted_resolved_layout = layout;
-        self.resolved_layout_source = ResolvedLayoutSource::WasmPolicy;
+        self.resolved_layout_source = ResolvedLayoutSource::Actor;
         self.reconfigure_focus_stack();
         focus_surface
     }
 
-    fn refresh_resolved_layout_from_native_policy(&mut self) {
+    fn refresh_native_resolved_layout(&mut self) {
         self.repair_native_layout_leaf_selections();
         let layout = self.native_fallback_resolved_layout();
         match layout.validate_for_panes(&self.active_surface_session_panes()) {
@@ -3113,7 +3122,7 @@ impl Manifold {
         }
         self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -3276,7 +3285,7 @@ impl Manifold {
 
         self.remove_surface_session_record(session);
         self.restore_native_session_layout(self.sessions.active());
-        self.refresh_resolved_layout_from_native_policy();
+        self.refresh_native_resolved_layout();
         self.reconfigure_focus_stack();
         if closing_active {
             self.start_configured_workspace_plugins_after_rebind();
@@ -3377,7 +3386,7 @@ impl Manifold {
         }
         self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -3395,7 +3404,7 @@ impl Manifold {
         };
         self.restore_native_session_layout(next);
         self.prune_empty_unfocused_surface_sessions();
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -3427,7 +3436,7 @@ impl Manifold {
         )?;
         self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         Ok(session)
@@ -3685,7 +3694,7 @@ impl Manifold {
         }
         self.focus.set_active_toplevel(active_surface.clone());
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            self.refresh_resolved_layout_from_policy();
+            self.request_resolved_layout_update();
         }
         self.activate_window_exclusively(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
@@ -3716,7 +3725,7 @@ impl Manifold {
             };
             self.layout.set_active_leaf(leaf);
             self.set_layout_leaf_selected_pane(leaf, pane);
-            self.refresh_resolved_layout_from_policy();
+            self.request_resolved_layout_update();
         } else if !self.surface_has_visible_pane_item(&surface) {
             return false;
         }
@@ -4971,18 +4980,12 @@ impl Manifold {
             Arc::clone(&registry),
             path,
             move |event| {
-                let event = match event {
-                    manifold_wasm::LegacyWasmRuntimeEvent::DrainHostMailbox => {
-                        PluginHostEvent::DrainWasmHostMailbox
-                    }
-                    manifold_wasm::LegacyWasmRuntimeEvent::RefreshLayout => {
-                        PluginHostEvent::RefreshWasmLayout
-                    }
-                };
+                let manifold_wasm::LegacyWasmRuntimeEvent::DrainHostMailbox = event;
+                let event = PluginHostEvent::DrainWasmHostMailbox;
                 let _ = host_events.send(event);
             },
         ));
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         Ok(())
     }
 
@@ -5345,7 +5348,7 @@ impl Manifold {
         if self.sessions.assign_surface(surface, session).is_err() {
             return false;
         }
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         true
     }
@@ -5432,7 +5435,7 @@ impl Manifold {
             return false;
         }
         self.set_layout_leaf_selected_pane(active_leaf, next_pane);
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         let Some(next_surface) = self.surface_for_pane(next_pane) else {
             return false;
         };
@@ -5470,7 +5473,7 @@ impl Manifold {
             }
         }
 
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         true
     }
@@ -5517,7 +5520,7 @@ impl Manifold {
         if next_leaf == previous_leaf {
             return false;
         }
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
             self.focus_toplevel_surface(Some(next_surface));
         } else {
@@ -5536,7 +5539,7 @@ impl Manifold {
         };
         self.layout_leaf_selected_panes
             .retain(|(leaf, _)| *leaf != removed_leaf);
-        self.refresh_resolved_layout_from_policy();
+        self.request_resolved_layout_update();
         if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
             self.focus_toplevel_surface(Some(next_surface));
         } else {
@@ -5940,7 +5943,7 @@ impl Manifold {
     fn repair_resolved_layout_for_current_inventory(&mut self) {
         if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
             self.collapse_empty_native_layout_leaves();
-            self.refresh_resolved_layout_from_policy();
+            self.request_resolved_layout_update();
             return;
         }
 
@@ -5967,7 +5970,7 @@ impl Manifold {
                     ?err,
                     "accepted WASM resolved layout became invalid; using native fallback"
                 );
-                self.refresh_resolved_layout_from_policy();
+                self.request_resolved_layout_update();
             }
         }
     }
@@ -6041,7 +6044,7 @@ impl Manifold {
     pub const fn resolved_layout_source_name(&self) -> &'static str {
         match self.resolved_layout_source {
             ResolvedLayoutSource::NativeFallback => "native-fallback",
-            ResolvedLayoutSource::WasmPolicy => "wasm-policy",
+            ResolvedLayoutSource::Actor => "actor",
         }
     }
 
@@ -6697,11 +6700,16 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
     let message: manifold_wasm::HostMessage =
         serde_json::from_str(body).context("decode plugin host message")?;
     Ok(match message {
-        manifold_wasm::HostMessage::LayoutAction { action } => WorkspaceCommand::Layout(
-            action
+        manifold_wasm::HostMessage::LayoutAction { action } => {
+            let action = action
                 .parse::<LayoutAction>()
-                .with_context(|| format!("parse plugin host layout action {action:?}"))?,
-        ),
+                .with_context(|| format!("parse plugin host layout action {action:?}"))?;
+            ensure!(
+                action == LayoutAction::CloseActivePane,
+                "layout action {action:?} must be addressed to a layout actor"
+            );
+            WorkspaceCommand::Layout(action)
+        }
         manifold_wasm::HostMessage::FocusPane { pane } => WorkspaceCommand::FocusPane(pane),
         manifold_wasm::HostMessage::SpawnApp { argv } => WorkspaceCommand::SpawnApp(argv),
         manifold_wasm::HostMessage::FocusOrSpawnApp { app_id, argv } => {
@@ -6726,6 +6734,27 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
             }
         }
     })
+}
+
+fn validate_key_policy_host_message(payload: &[u8]) -> Result<()> {
+    let message: manifold_wasm::HostMessage =
+        serde_json::from_slice(payload).context("decode key policy host message")?;
+    match message {
+        manifold_wasm::HostMessage::SetResolvedLayout { .. } => {
+            anyhow::bail!("key policy cannot submit layout; it must message a layout actor")
+        }
+        manifold_wasm::HostMessage::LayoutAction { action } => {
+            let action = action
+                .parse::<LayoutAction>()
+                .with_context(|| format!("parse key policy host layout action {action:?}"))?;
+            ensure!(
+                action == LayoutAction::CloseActivePane,
+                "layout action {action:?} must be addressed to a layout actor"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Default)]

@@ -7,17 +7,16 @@ last-reviewed: 2026-07-11
 
 # Build WASM Examples
 
-The repository contains three kinds of WASM artifact. Build each with the target
+The repository contains several kinds of WASM artifact. Build each with the target
 expected by its runtime instead of treating every `.wasm` file as interchangeable.
 
-The legacy lane-specific examples are core modules targeting
-`wasm32-unknown-unknown`. They remain useful as isolated ABI examples, but the
-current config loader does not load their old lane kinds:
+The core-module examples and the default workspace actor target
+`wasm32-unknown-unknown`:
 
 ```sh
 nix develop --command cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release
-nix develop --command cargo build --manifest-path examples/wasm-map-hook/Cargo.toml --target wasm32-unknown-unknown --release
 nix develop --command cargo build --manifest-path examples/wasm-test-harness/Cargo.toml --target wasm32-unknown-unknown --release
+nix develop --command cargo build --manifest-path plugins/default-workspace/Cargo.toml --target wasm32-unknown-unknown --release
 ```
 
 The component actor is compiled without standard WASI imports and then encoded

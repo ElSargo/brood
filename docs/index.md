@@ -32,7 +32,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[systems/plugin-io-and-resources]] specifies completions, notifications,
   worker select, external resources, scopes, shutdown, and diagnostics.
 - [[systems/input-shortcuts]] describes host-owned shortcut routing with privileged sync key policy.
-- [[systems/layout-policy]] describes host-validated layout policy and resolved layouts.
+- [[systems/layout-actor]] describes actor-driven layout updates and host-validated resolved layouts.
 - [[systems/plugin-ui]] describes guest-side SDK components, pane input, native chrome, and canvas rendering.
 - [[systems/plugin-graphics]] specifies the base canvas draw-packet, native text, resource, submission, and replay contract.
 - [[systems/plugin-advanced-graphics]] records the separate future protocol direction for user geometry, shaders, pipelines, and other GPU-style facilities.

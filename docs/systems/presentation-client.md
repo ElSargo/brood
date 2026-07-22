@@ -31,7 +31,7 @@ models:
 - remote presentation using an authenticated network carrier and encoded or
   damage-based per-window surface transport;
 - one Rust presentation implementation for Linux, macOS, Windows, and the web;
-- client-side WASM applications, key policy, layout policy, SDK UI state, and
+- client-side WASM applications, key decisions, layout actors, SDK UI state, and
   canvas drawing that do not cross the network on their interactive path;
 - durable backend applications and actors that survive presentation detach;
 - explicit, asynchronous access from client actors to backend files, processes,
@@ -54,9 +54,9 @@ packet opcode table.
 6. DMA-BUF is a preferred local frame transport, not the pane or frame model.
 7. WGPU is the only presentation renderer. Platform-specific import, window,
    input, accessibility, and media adapters may exist around it.
-8. Presentation actors and synchronous key and layout policy providers run
-   locally and can handle input, layout, UI, and custom graphics without a
-   backend round trip.
+8. Presentation actors and the synchronous key-decision lane run locally and
+   can handle input, layout, UI, and custom graphics without a backend round
+   trip. Layout changes use ordinary actor messages and host outbox messages.
 9. Backend operations remain asynchronous and capability-rooted from a client
    actor's perspective.
 10. The protocol is bounded, generation-safe, observable, and recoverable after
@@ -772,14 +772,15 @@ The following paths remain entirely within the client when their participants
 are local:
 
 ```text
-key or pointer -> local policy -> local actor -> SDK state/draw update
-window inventory event -> local layout provider -> local viewport commit
+key or pointer -> local key decision -> local actor -> SDK state/draw update
+window inventory event -> layout-state message -> local actor mailbox
+local layout actor -> host outbox -> validated local viewport commit
 local actor -> local actor mailbox
 draw packet -> local validation -> local WGPU lowering
 ```
 
 Network completions and remote actor messages enter bounded reserved actor lanes.
-They never run a network wait inside synchronous key or layout policy.
+They never run a network wait inside the synchronous key-decision lane.
 
 ### Cross-runtime actor messages
 
@@ -1321,8 +1322,8 @@ Exit criteria:
   validate it, stop and join the old generation, run the candidate start hook,
   and only then publish the candidate.
 - Instantiate presentation actors per viewport.
-- Move the existing typed key-policy invocation and immutable-publication lane
-  to the client, and run layout policy locally.
+- Move the existing typed key-decision invocation and immutable-publication
+  lane to the client, and run the layout actor locally.
 - Route backend files, processes, PTYs, sockets, timers, streams, and watches
   through asynchronous remote capabilities with the same generation-owned
   handle and cancellation semantics as `RuntimeIoHub`.
@@ -1491,5 +1492,5 @@ lifecycle rules above.
 - [[plugin-graphics]]
 - [[plugin-advanced-graphics]]
 - [[input-shortcuts]]
-- [[layout-policy]]
+- [[layout-actor]]
 - [[testing]]

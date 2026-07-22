@@ -183,7 +183,7 @@ consults it; the WASM global-key policy owns synchronous key decisions.
 - [[plugin-runtime]]
 - [[plugin-io-and-resources]]
 - [[input-shortcuts]]
-- [[layout-policy]]
+- [[layout-actor]]
 - [[plugin-ui]]
 - [[dbus-control]]
 - [[configuration]]

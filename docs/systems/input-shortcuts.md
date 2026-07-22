@@ -134,6 +134,6 @@ Related:
 - [[presentation-client]]
 - [[../concepts/plugin]]
 - [[plugin-runtime]]
-- [[layout-policy]]
+- [[layout-actor]]
 - [[extension-host]]
 - [[../reference/wasm-fast-lanes]]

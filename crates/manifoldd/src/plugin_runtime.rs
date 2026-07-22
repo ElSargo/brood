@@ -40,7 +40,6 @@ pub(crate) enum PluginHostEvent {
         frame: PluginFramePayload,
     },
     DrainWasmHostMailbox,
-    RefreshWasmLayout,
 }
 
 #[derive(Clone, Debug)]

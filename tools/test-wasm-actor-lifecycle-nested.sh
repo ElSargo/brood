@@ -36,7 +36,7 @@ wait_for_shape() {
     ctl debug dump "$dump" >/dev/null
     if layout_shape "$dump" "$shape" >"$dump/rects.json" 2>/dev/null; then
       status="$(ctl status-json)"
-      python3 -c 'import json,sys; s=json.loads(sys.argv[1]); assert s["windows"] == 2 and s["resolved_layout_source"] == "wasm-policy" and s["plugin_actor_failures"] == 0, s' "$status"
+      python3 -c 'import json,sys; s=json.loads(sys.argv[1]); assert s["windows"] == 2 and s["resolved_layout_source"] == "actor" and s["plugin_actor_failures"] == 0, s' "$status"
       printf '%s\n' "$status" >"$dump/status.json"
       return
     fi

@@ -80,8 +80,7 @@ Actor -> Client: RequestFrame / CommandRequest / Status
 
 The actor returns from each dispatch without waiting for I/O, a worker, or GPU
 execution. It may delegate unrelated work and update the pane when a completion
-arrives. Drawing is normal actor output, not a synchronous key or layout policy
-lane.
+arrives. Drawing is normal actor output, not a synchronous key decision lane.
 
 ## Input And Text Editing
 
@@ -152,6 +151,6 @@ Related:
 - [[presentation-client]]
 - [[plugin-runtime]]
 - [[input-shortcuts]]
-- [[layout-policy]]
+- [[layout-actor]]
 - [[../concepts/pane]]
 - [[../experiments/session-switcher-ui]]

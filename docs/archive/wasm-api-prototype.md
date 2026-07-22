@@ -2,7 +2,7 @@
 
 This archived page is a focused target-design note for an earlier WASM API spike.
 
-Use [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Policy](../systems/layout-policy.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md) for the current target. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
+Use [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Actor](../systems/layout-actor.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md) for the current target. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
 This note scopes the first WASM API spike to workspace navigation, managed app launch, and keyboard shortcut handling. These are deliberately small because they already exist in the native prototype as focus commands, hosted app spawning, browser launch control, and normal-mode key handling.
 

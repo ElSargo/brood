@@ -1,6 +1,6 @@
 # WASM Integration
 
-This archived page was an earlier WASM design-target document. The current target plugin architecture is documented in [Plugin](../concepts/plugin.md), [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Policy](../systems/layout-policy.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md).
+This archived page was an earlier WASM design-target document. The current target plugin architecture is documented in [Plugin](../concepts/plugin.md), [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Actor](../systems/layout-actor.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md).
 
 It describes the intended Manifold app and module model as historical context, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
 
@@ -36,7 +36,7 @@ The runtime then becomes an adapter over this model. Linux-native `manifold` can
 
 The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold keeps the session process authoritative, uses actors as public mailbox and isolation domains, uses actor-scoped workers for shared-memory concurrency and blocking-looking WASI, and reserves policy providers for bounded pre-commit policy hooks that read immutable published state.
 
-The layout policy boundary is now promoted into [Layout Policy](../systems/layout-policy.md). In short, plugins return candidate resolved layout items through a policy provider, while the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
+The layout boundary is now defined in [Layout Actor](../systems/layout-actor.md). In short, the host sends state through an ordinary actor mailbox, the actor returns candidate resolved layout items through its ordinary host outbox, and the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
 
 The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md). In short, modules should target `global`, `session`, or `surface` realms, with mostly shared host APIs plus realm-local convenience bindings and lifetimes.
 
@@ -294,7 +294,7 @@ Current usability note:
 
 - the exact currently implemented CLI entry points are defined in `crates/manifoldd/src/main.rs`
 - config-loaded startup modules are defined in `manifold.toml` and parsed in `crates/manifoldd/src/config.rs`
-- the current runnable WASM paths are the fast key handler in `crates/manifoldd/src/wasm_key.rs`, the map hook in `crates/manifoldd/src/wasm_map.rs`, and the test harness in `crates/manifoldd/src/wasm_test.rs`
+- the current runnable core-module paths are named actors, the synchronous key-decision lane, and the test harness; layout is ordinary actor traffic
 
 Reload policy should be explicit:
 

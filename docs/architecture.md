@@ -79,4 +79,4 @@ chrome, focus, rendering, and bridges across the session boundary. Validation
 keeps host state coherent; it is not presented as containment of malicious
 installed plugin code.
 
-See [[systems/presentation-client]], [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-policy]], [[systems/plugin-ui]], [[systems/plugin-graphics]], [[systems/plugin-advanced-graphics]], and [[systems/extension-host]].
+See [[systems/presentation-client]], [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-actor]], [[systems/plugin-ui]], [[systems/plugin-graphics]], [[systems/plugin-advanced-graphics]], and [[systems/extension-host]].

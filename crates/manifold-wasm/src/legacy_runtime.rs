@@ -14,7 +14,6 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LegacyWasmRuntimeEvent {
     DrainHostMailbox,
-    RefreshLayout,
 }
 
 /// Owns all tasks and cancellation state for one legacy core-WASM generation.
@@ -130,7 +129,6 @@ fn spawn_actor_task(
             match outcome {
                 Ok(ActorEpochOutcome::Continue { outbox }) => {
                     if let Some(outbox) = outbox {
-                        let refresh_layout = !outbox.publications.is_empty();
                         let dispatch = {
                             let mut registry = registry.lock().await;
                             actor.dispatch_outbox(&mut registry, &outbox)
@@ -139,9 +137,6 @@ fn spawn_actor_task(
                             warn!(actor = %declaration.name, error = %error, "WASM plugin actor outbox dispatch failed");
                         }
                         event_handler(LegacyWasmRuntimeEvent::DrainHostMailbox);
-                        if refresh_layout {
-                            event_handler(LegacyWasmRuntimeEvent::RefreshLayout);
-                        }
                     }
                 }
                 Ok(ActorEpochOutcome::Stop) => {

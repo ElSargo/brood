@@ -15,8 +15,6 @@ mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
 mod hosted_actor;
-pub mod layout_policy;
-mod layout_policy_link;
 mod legacy_runtime;
 mod lifecycle;
 pub mod mailbox;
@@ -26,6 +24,7 @@ pub mod policy_provider;
 mod policy_provider_link;
 pub mod presentation;
 pub mod preview1_worker;
+pub mod resolved_layout;
 mod resource_limits;
 pub mod runtime_io;
 mod test_harness;
@@ -71,15 +70,6 @@ pub use global_key_policy_link::{
     GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GLOBAL_KEY_POLICY_RESULT_OK,
 };
 pub use hosted_actor::{HostedWasmActor, aggregate_preview1_compat_stats};
-pub use layout_policy::{
-    DEFAULT_LAYOUT_POLICY_ARENA_BYTES, InputBehavior, LayoutItemId, LayoutItemKind,
-    LayoutPolicyInput, LayoutPolicyInvocationBuffers, LayoutPolicyOutcome, LayoutSize, LocalPoint,
-    LocalTransform, MAX_LAYOUT_POLICY_ARENA_BYTES, MAX_LAYOUT_POLICY_QUERY_BYTES,
-    MAX_LAYOUT_POLICY_RESULT_BYTES, ResolvedLayout, ResolvedLayoutItem, WasmLayoutPolicy,
-};
-pub use layout_policy_link::{
-    LAYOUT_POLICY_RESULT_ABSTAIN, LAYOUT_POLICY_RESULT_ERROR, LAYOUT_POLICY_RESULT_OK,
-};
 pub use legacy_runtime::{LegacyWasmActorGeneration, LegacyWasmRuntimeEvent};
 pub use lifecycle::{
     PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext, PluginStartReason,
@@ -111,6 +101,10 @@ pub use preview1_worker::{
     Preview1Worker, Preview1WorkerConfig, Preview1WorkerError, Preview1WorkerId,
     Preview1WorkerRuntime, SHARED_MEMORY_IMPORT_MODULE, SHARED_MEMORY_IMPORT_NAME,
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
+};
+pub use resolved_layout::{
+    InputBehavior, LayoutItemId, LayoutItemKind, LocalPoint, LocalTransform, ResolvedLayout,
+    ResolvedLayoutItem,
 };
 pub use resource_limits::WasmResourceLimits;
 pub use runtime_io::{

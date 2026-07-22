@@ -60,7 +60,7 @@ Session backend                         Presentation client
 ├── session actor                       ├── presentation actor
 │   ├── worker                          │   ├── worker
 │   └── worker                          │   └── worker
-├── backend policy/service lanes        ├── local key/layout policy
+├── backend policy/service lanes        ├── local key decision + layout actor
 └── immutable publications              └── local UI and graphics publications
                  bounded addressed messages
 ```
@@ -338,7 +338,7 @@ Related:
 - [[../concepts/session]]
 - [[../decisions/0006-plugin-actors-and-workers]]
 - [[input-shortcuts]]
-- [[layout-policy]]
+- [[layout-actor]]
 - [[plugin-ui]]
 - [[plugin-graphics]]
 - [[plugin-advanced-graphics]]

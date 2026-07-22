@@ -49,7 +49,7 @@ The most important architectural fact is that **`Manifold` is the actor-like sta
 | DBus isolation | `session_bus.rs` | In-process DBus bus per session, DBus auth/message router, name registry, host notification proxy. |
 | WASM core plugins and host integration | `crates/manifold-wasm/src/module.rs`, `crates/manifold-wasm/src/actor.rs`, `crates/manifold-wasm/src/hosted_actor.rs`, `crates/manifold-wasm/src/legacy_runtime.rs`, `crates/manifold-wasm/src/global_key_policy.rs`, `crates/manifold-wasm/src/policy_provider.rs`, `crates/manifold-wasm/src/test_harness.rs`, `state.rs`, `wasm_test.rs` | Runtime-owned artifact classification, hosted actor abstraction, core-module generation execution, policy execution, and test-harness engine, plus daemon capability policy and typed request adaptation. |
 | WASM actor/worker runtime | `crates/manifold-wasm/src/component_actor.rs`, `crates/manifold-wasm/src/preview1_worker.rs`, `crates/manifold-wasm/src/completion_io.rs`, `crates/manifold-wasm/src/coordination.rs` | Component Model actors, the Preview 1 POSIX compatibility actor/worker runtime, completion I/O, and shared notification/pollable coordination. |
-| Presentation client WASM host | `clients/manifold-client/src/actor_runtime.rs`, `clients/manifold-client/src/key_policy.rs`, `clients/manifold-client/src/layout_policy.rs`, `clients/manifold-client/src/main.rs` | Client-owned actor runtime plus synchronous key and flat-layout providers, combined pane/focus/application publication, local validation/fallback, asynchronous backend commands, runtime failure observation, and Winit-loop ownership. |
+| Presentation client WASM host | `clients/manifold-client/src/actor_runtime.rs`, `clients/manifold-client/src/key_policy.rs`, `clients/manifold-client/src/layout.rs`, `clients/manifold-client/src/main.rs` | Client-owned actor runtime plus synchronous key decisions, actor-addressed layout state and commands, host-outbox resolved-layout updates, local validation/fallback, asynchronous backend commands, runtime failure observation, and Winit-loop ownership. |
 | Plugins | `plugin_runtime.rs` | Built-in actor, host-mailbox, and publication scaffold used by the DBus plugin surface. |
 | Browser | `browser.rs` | Chromium process manager and DevTools HTTP helper under control commands. |
 | Diagnostics | `debug_dump.rs` | Status/composed/surface capture bundle. |
@@ -458,10 +458,10 @@ Actions in `LayoutAction` can focus/cycle panes, split active panes, join/remove
 The current state can accept resolved layouts from two sources:
 
 - **Native fallback**: generated from `LayoutState` and `layout_leaf_selected_panes`.
-- **WASM policy**: supplied by a validated `set-resolved-layout` message from a
-  plugin actor after the host publishes pane/layout state.
+- **Actor**: supplied by a validated `set-resolved-layout` message from a plugin
+  actor after the host sends pane/layout state through the actor mailbox.
 
-When windows close or inventory changes, `repair_resolved_layout_for_current_inventory()` either rebuilds native layout or prunes/revalidates the accepted WASM layout. If a WASM layout becomes invalid, Manifold falls back to native layout.
+When windows close or inventory changes, `repair_resolved_layout_for_current_inventory()` either rebuilds native layout or prunes/revalidates the accepted actor layout. If an actor layout becomes invalid, Manifold falls back to native layout.
 
 ### 9.3 Native pane placement
 
@@ -680,21 +680,22 @@ pointer/length scalars. The provider returns a bounded decision envelope and
 message batch. The separate client applies client-local messages and queues
 backend commands asynchronously; the daemon applies messages only for its
 built-in presenter compatibility path. The checked-in default-workspace plugin
-combines this key provider with a workspace actor and a flat layout provider.
+combines this key provider with a workspace actor. Layout state and commands
+enter the actor's normal mailbox; resolved layouts leave through its ordinary
+host outbox.
 See the source files that define module export discovery and policy response
 decoding for the exact ABI.
 
-### 15.2 Layout policy during the client transition
+### 15.2 Layout actor
 
-The separate presentation client invokes its own synchronous WASM layout
-provider with local pane inventory, focus, and viewport size. It validates the
-returned flat `ResolvedLayout` through `manifold-layout`, then uses that layout
-for WGPU composition and hit testing. Provider failure or abstention selects a
-deterministic client-local fallback.
-
-The daemon retains its older actor-driven resolved-layout path for its built-in
-compatibility presenter. That path does not determine placement in the separate
-client and is not carried over the presentation connection.
+The separate presentation client now matches the built-in presenter. It sends
+local pane inventory, focus, application identities, and viewport size to a
+subscribed actor through the ordinary mailbox. The actor may receive addressed
+layout commands through the same route and submits `set-resolved-layout`
+through its normal host outbox. The presentation host validates the flat
+`ResolvedLayout` through `manifold-layout`, then uses it for composition and hit
+testing. Missing, stale, or invalid actor output selects a deterministic local
+fallback.
 
 ### 15.3 Test harness ABI
 

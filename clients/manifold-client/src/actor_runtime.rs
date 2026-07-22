@@ -1,17 +1,21 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, ensure};
 use manifold_wasm::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, FilesystemGrant, HostedWasmActor,
-    NativeFilesystemWatcherService, PresentationEvent, Preview1ActorCapabilities,
-    Preview1CompatActor, Preview1FilesystemGrant, Preview1WorkerConfig, RuntimeIoCapabilities,
-    RuntimeIoConfig, WasmPluginArtifact,
+    LegacyWasmActorGeneration, LegacyWasmRuntimeEvent, Mailbox, NativeFilesystemWatcherService,
+    PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor, Preview1FilesystemGrant,
+    Preview1WorkerConfig, Registry, RuntimeIoCapabilities, RuntimeIoConfig, WasmActor,
+    WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
 };
+use tokio::sync::Mutex;
+use winit::event_loop::EventLoopProxy;
 
-use crate::plugin_graphics::PluginGraphicsBridge;
+use crate::{ClientEvent, plugin_graphics::PluginGraphicsBridge};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PresentationActorSpec {
@@ -22,7 +26,11 @@ struct PresentationActorSpec {
 pub struct PresentationWasmRuntime {
     executor: tokio::runtime::Runtime,
     actors: BTreeMap<String, PresentationActor>,
+    legacy_actors: BTreeMap<String, LegacyPresentationActor>,
+    legacy_registry: Arc<Mutex<Registry>>,
+    host_mailbox: Mailbox,
     filesystem_watcher_service: NativeFilesystemWatcherService,
+    event_proxy: Option<EventLoopProxy<ClientEvent>>,
 }
 
 struct PresentationActor {
@@ -30,8 +38,17 @@ struct PresentationActor {
     actor: HostedWasmActor,
 }
 
+struct LegacyPresentationActor {
+    declaration: WasmActorDeclaration,
+    generation: LegacyWasmActorGeneration,
+}
+
 impl PresentationWasmRuntime {
-    pub fn start(actor_specs: &[String], graphics: Option<&PluginGraphicsBridge>) -> Result<Self> {
+    pub fn start(
+        actor_specs: &[String],
+        graphics: Option<&PluginGraphicsBridge>,
+        event_proxy: Option<EventLoopProxy<ClientEvent>>,
+    ) -> Result<Self> {
         let specs = actor_specs
             .iter()
             .map(|spec| PresentationActorSpec::parse(spec))
@@ -41,15 +58,24 @@ impl PresentationWasmRuntime {
             .enable_all()
             .build()
             .context("start presentation WASM executor")?;
+        let mut registry = Registry::new();
+        let host_mailbox = registry
+            .register_host_mailbox(64)
+            .context("register presentation host actor mailbox")?;
         let mut runtime = Self {
             executor,
             actors: BTreeMap::new(),
+            legacy_actors: BTreeMap::new(),
+            legacy_registry: Arc::new(Mutex::new(registry)),
+            host_mailbox,
             filesystem_watcher_service: NativeFilesystemWatcherService::new(),
+            event_proxy,
         };
         for (index, spec) in specs.into_iter().enumerate() {
             // Backend-managed pane IDs grow upward from one. Client-local pane
-            // IDs grow downward from the top of the same flat namespace so a
-            // layout provider can address both without knowing their origin.
+            // actors grow downward from the top of the same flat namespace so
+            // an actor-submitted layout can address both without knowing their
+            // origin. Controller actors do not receive a pane identity.
             let pane = u64::MAX.saturating_sub(u64::try_from(index).unwrap_or(u64::MAX));
             ensure!(pane != 0, "presentation actor pane ID space is exhausted");
             runtime.load_actor(spec, pane, graphics)?;
@@ -68,15 +94,108 @@ impl PresentationWasmRuntime {
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<()> {
         ensure!(
-            !self.actors.contains_key(&spec.id),
+            !self.actors.contains_key(&spec.id) && !self.legacy_actors.contains_key(&spec.id),
             "duplicate presentation actor id {:?}",
             spec.id
         );
-        let watcher = self.filesystem_watcher_service.clone();
-        let presentation = graphics.map(|graphics| graphics.actor_host(pane));
+        match WasmPluginArtifact::load(&spec.path)? {
+            WasmPluginArtifact::Legacy(artifact) => {
+                self.load_legacy_actor(spec, artifact.inventory.actors)
+            }
+            artifact => self.load_hosted_actor(spec, pane, graphics, artifact),
+        }
+    }
+
+    fn load_legacy_actor(
+        &mut self,
+        spec: PresentationActorSpec,
+        declarations: Vec<WasmActorDeclaration>,
+    ) -> Result<()> {
+        let declaration = declarations
+            .into_iter()
+            .find(|declaration| declaration.name == spec.id)
+            .with_context(|| {
+                format!(
+                    "{} does not declare actor {:?}",
+                    spec.path.display(),
+                    spec.id
+                )
+            })?;
+        let registry = Arc::clone(&self.legacy_registry);
+        let (registration, mailbox) = self.executor.block_on({
+            let registry = Arc::clone(&registry);
+            let actor_id = spec.id.clone();
+            async move { registry.lock().await.prepare_actor(actor_id, 64) }
+        })?;
         let actor = self
             .executor
-            .block_on(load_actor(&spec, watcher, presentation.clone()))?;
+            .block_on(WasmActor::load_named(
+                &spec.path,
+                mailbox,
+                &declaration.export_name,
+            ))
+            .with_context(|| format!("load presentation actor {:?}", spec.id))?;
+        let actor_id = actor.actor_id();
+        self.executor.block_on({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .activate_prepared_actors(vec![registration], &[])
+            }
+        })?;
+
+        let proxy = self.event_proxy.clone();
+        let mut actor_ids = BTreeMap::new();
+        actor_ids.insert(spec.id.clone(), actor_id);
+        let generation = LegacyWasmActorGeneration::start(
+            self.executor.handle(),
+            vec![(declaration.clone(), actor)],
+            actor_ids,
+            registry,
+            &spec.path,
+            move |event| {
+                let LegacyWasmRuntimeEvent::DrainHostMailbox = event;
+                if let Some(proxy) = &proxy {
+                    drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+                }
+            },
+        );
+        eprintln!(
+            "started presentation WASM actor id={} kind=core path={}",
+            spec.id,
+            spec.path.display()
+        );
+        self.legacy_actors.insert(
+            spec.id,
+            LegacyPresentationActor {
+                declaration,
+                generation,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the loaded actor is intentionally transferred into the long-lived client runtime"
+    )]
+    fn load_hosted_actor(
+        &mut self,
+        spec: PresentationActorSpec,
+        pane: u64,
+        graphics: Option<&PluginGraphicsBridge>,
+        artifact: WasmPluginArtifact,
+    ) -> Result<()> {
+        let watcher = self.filesystem_watcher_service.clone();
+        let presentation = graphics.map(|graphics| graphics.actor_host(pane));
+        let actor = self.executor.block_on(load_hosted_actor(
+            &spec,
+            watcher,
+            presentation.clone(),
+            artifact,
+        ))?;
         if let Some(presentation) = presentation {
             presentation.bind_generation(actor.generation());
         }
@@ -128,8 +247,16 @@ impl PresentationWasmRuntime {
         Ok(())
     }
 
+    pub fn drain_host_messages(&mut self) -> Result<Vec<Vec<u8>>> {
+        let mut messages = Vec::new();
+        while let Some(message) = self.host_mailbox.try_read_message()? {
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.actors.is_empty()
+        self.actors.is_empty() && self.legacy_actors.is_empty()
     }
 
     pub fn pane_ids(&self) -> impl Iterator<Item = u64> + '_ {
@@ -152,14 +279,50 @@ impl PresentationWasmRuntime {
     }
 
     pub fn send_actor_message(&self, actor_id: &str, payload: Vec<u8>) -> Result<()> {
-        let actor = self
-            .actors
-            .get(actor_id)
-            .with_context(|| format!("presentation actor {actor_id:?} is unavailable"))?;
-        actor
-            .actor
-            .try_send_message("key-policy".to_string(), payload)
-            .with_context(|| format!("enqueue key-policy message for actor {actor_id:?}"))
+        if let Some(actor) = self.actors.get(actor_id) {
+            return actor
+                .actor
+                .try_send_message("key-policy".to_string(), payload)
+                .with_context(|| format!("enqueue key-policy message for actor {actor_id:?}"));
+        }
+        ensure!(
+            self.legacy_actors.contains_key(actor_id),
+            "presentation actor {actor_id:?} is unavailable"
+        );
+        self.send_legacy_message(actor_id, payload)
+    }
+
+    pub fn send_layout_state(&self, payload: &[u8]) -> Result<usize> {
+        let recipients = self.layout_actor_ids();
+        for actor_id in &recipients {
+            self.send_legacy_message(actor_id, payload.to_owned())?;
+        }
+        Ok(recipients.len())
+    }
+
+    fn layout_actor_ids(&self) -> Vec<String> {
+        self.legacy_actors
+            .iter()
+            .filter(|(_, actor)| {
+                actor
+                    .declaration
+                    .subscribes_to(WasmActorEventKind::LayoutState)
+            })
+            .map(|(actor_id, _)| actor_id.clone())
+            .collect()
+    }
+
+    fn send_legacy_message(&self, actor_id: &str, payload: Vec<u8>) -> Result<()> {
+        self.executor.block_on({
+            let registry = Arc::clone(&self.legacy_registry);
+            let actor_id = actor_id.to_string();
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .try_post_named_message(&actor_id, payload)
+            }
+        })
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -174,6 +337,20 @@ impl PresentationWasmRuntime {
             {
                 first_error = Some(error);
             }
+        }
+
+        for (_actor_id, actor) in std::mem::take(&mut self.legacy_actors) {
+            let actor_ids = actor.generation.actor_ids().clone();
+            self.executor.block_on(actor.generation.cancel_and_join());
+            self.executor.block_on({
+                let registry = Arc::clone(&self.legacy_registry);
+                async move {
+                    let mut registry = registry.lock().await;
+                    for (name, actor_id) in actor_ids {
+                        registry.unregister_actor_generation(&name, actor_id);
+                    }
+                }
+            });
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -199,13 +376,13 @@ impl PresentationActorSpec {
     }
 }
 
-async fn load_actor(
+async fn load_hosted_actor(
     spec: &PresentationActorSpec,
     watcher: NativeFilesystemWatcherService,
     presentation: Option<std::sync::Arc<crate::plugin_graphics::ActorPresentationHost>>,
+    artifact: WasmPluginArtifact,
 ) -> Result<HostedWasmActor> {
     let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
-    let artifact = WasmPluginArtifact::load(&spec.path)?;
     let actor = match artifact {
         WasmPluginArtifact::Component { core_module_error } => {
             let actor = ComponentActor::load(
@@ -221,8 +398,9 @@ async fn load_actor(
                         capabilities: RuntimeIoCapabilities::default(),
                         ..RuntimeIoConfig::default()
                     },
-                    presentation: presentation
-                        .map(|presentation| presentation as std::sync::Arc<dyn manifold_wasm::PresentationHost>),
+                    presentation: presentation.map(|presentation| {
+                        presentation as std::sync::Arc<dyn manifold_wasm::PresentationHost>
+                    }),
                     ..ComponentActorConfig::default()
                 },
             )
@@ -253,9 +431,7 @@ async fn load_actor(
             HostedWasmActor::Preview1(actor)
         }
         WasmPluginArtifact::Legacy(_) => {
-            anyhow::bail!(
-                "legacy core WASM modules are not presentation actors; use a Component or Preview 1 actor"
-            );
+            anyhow::bail!("legacy actor must use the core-module runtime")
         }
     };
 
@@ -281,18 +457,18 @@ mod tests {
 
     #[test]
     fn actor_spec_keeps_explicit_identity_and_path() {
-        let result = PresentationActorSpec::parse("layout=/tmp/layout.component.wasm");
+        let result = PresentationActorSpec::parse("workspace=/tmp/workspace.wasm");
         assert!(result.is_ok());
         if let Ok(spec) = result {
-            assert_eq!(spec.id, "layout");
-            assert_eq!(spec.path, Path::new("/tmp/layout.component.wasm"));
+            assert_eq!(spec.id, "workspace");
+            assert_eq!(spec.path, Path::new("/tmp/workspace.wasm"));
         }
     }
 
     #[test]
     fn actor_spec_rejects_missing_identity_or_path() {
-        assert!(PresentationActorSpec::parse("/tmp/layout.component.wasm").is_err());
-        assert!(PresentationActorSpec::parse("=/tmp/layout.component.wasm").is_err());
-        assert!(PresentationActorSpec::parse("layout=").is_err());
+        assert!(PresentationActorSpec::parse("/tmp/workspace.wasm").is_err());
+        assert!(PresentationActorSpec::parse("=/tmp/workspace.wasm").is_err());
+        assert!(PresentationActorSpec::parse("workspace=").is_err());
     }
 }

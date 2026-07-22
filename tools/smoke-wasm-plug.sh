@@ -6,10 +6,10 @@ cd "$ROOT"
 
 cargo build -p manifoldd --bins > /dev/null
 cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release > /dev/null
-cargo build --manifest-path examples/wasm-map-hook/Cargo.toml --target wasm32-unknown-unknown --release > /dev/null
+cargo build --manifest-path plugins/default-workspace/Cargo.toml --target wasm32-unknown-unknown --release > /dev/null
 
 KEY_WASM="$ROOT/examples/wasm-key-handler/target/wasm32-unknown-unknown/release/manifold_wasm_key_handler.wasm"
-MAP_WASM="$ROOT/examples/wasm-map-hook/target/wasm32-unknown-unknown/release/manifold_wasm_map_hook.wasm"
+WORKSPACE_WASM="$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
 
 TMPDIR="$(mktemp -d /tmp/manifold-wasm-plug.XXXXXX)"
 CONF="$TMPDIR/session.conf"
@@ -69,15 +69,15 @@ KEY_OUT="$(target/debug/manifold plug --dbus-address "$DBUS_ADDRESS" --dbus-name
   exit 1
 }
 
-MAP_OUT="$(target/debug/manifold plug --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" --kind fast-map-hook "$MAP_WASM")"
-[[ "$MAP_OUT" == OK\ plug\ kind=fast-map-hook\ path=* ]] || {
-  echo "ERR map hook plug returned unexpected output: $MAP_OUT" >&2
+WORKSPACE_OUT="$(target/debug/manifold plug --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" "$WORKSPACE_WASM")"
+[[ "$WORKSPACE_OUT" == OK\ plug\ kind=plugin\ path=* ]] || {
+  echo "ERR workspace actor plug returned unexpected output: $WORKSPACE_OUT" >&2
   exit 1
 }
 
-AUTO_MAP_OUT="$(target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" plug "$MAP_WASM")"
-[[ "$AUTO_MAP_OUT" == OK\ plug\ kind=fast-map-hook\ path=* ]] || {
-  echo "ERR raw ctl auto map plug returned unexpected output: $AUTO_MAP_OUT" >&2
+AUTO_WORKSPACE_OUT="$(target/debug/manifold ctl --dbus-address "$DBUS_ADDRESS" --dbus-name "$DBUS_NAME" plug "$WORKSPACE_WASM")"
+[[ "$AUTO_WORKSPACE_OUT" == OK\ plug\ kind=plugin\ path=* ]] || {
+  echo "ERR raw ctl workspace plug returned unexpected output: $AUTO_WORKSPACE_OUT" >&2
   exit 1
 }
 
@@ -88,4 +88,4 @@ trap - EXIT
 
 echo "OK WASM plug smoke passed"
 echo "key_wasm=$KEY_WASM"
-echo "map_wasm=$MAP_WASM"
+echo "workspace_wasm=$WORKSPACE_WASM"

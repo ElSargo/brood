@@ -13,15 +13,15 @@ offscreen nested supervisor waits for its exact controller while a real Weston
 terminal maps and an unrelated hosted child exits. The proof exits normally
 without `--keep-running` and preserves a composed screenshot and transcript.
 
-Run `./tools/test-geometry-conversions-nested.sh` to load the real geometry
-layout policy plugin, render its accepted two-pane layout, and target
+Run `./tools/test-geometry-conversions-nested.sh` to load the real workspace
+actor, render its accepted two-pane layout, and target
 Weston eventdemo with pointer motion, click, wheel-v120, and fractional scroll
 input. The offscreen proof preserves the composed screenshot, accepted layout
 rectangles, before/after compositor metrics, and client-observed local events.
 
 Run `./tools/test-safe-boundaries-nested.sh` to verify the audited renderer,
 debug-buffer, and DBus wire boundaries. The offscreen proof loads the real
-geometry policy plugin, visibly splits a terminal and animated Weston SHM
+workspace actor, visibly splits a terminal and animated Weston SHM
 client, forwards a substantive desktop notification through the isolated realm
 bus, and preserves the returned host notification ID, debug manifest, and
 composed EGL screenshot. Smithay consumes transient buffer assignments before a
@@ -29,13 +29,13 @@ later debug request, so the manifest may honestly record `no_current_buffer`;
 SHM offset, stride, pixel, alpha, short-buffer, zero-size, and overflow behavior
 is covered by focused unit fixtures.
 
-Run `./tools/test-client-layout-policy.sh` inside the checked-in Nix development
-environment to exercise the client-local WASM layout and key-policy boundary.
-It checks the provider's stateful focus, mode, spawn, and application-identity
-decisions, then opens the real Winit/WGPU presentation client on a headless
-Weston compositor. Two real managed clients prove that imported buffers and app
-metadata converge on the sizes requested from the accepted flat layout without
-sending placement back to the session server.
+Run `./tools/test-client-layout-actor.sh` inside the checked-in Nix development
+environment to exercise the client-local layout actor and synchronous key
+boundary. It opens the real Winit/WGPU presentation client on a headless Weston
+compositor, sends client layout state through the workspace actor mailbox, and
+accepts the actor's host-outbox update. Two real managed clients prove that
+imported buffers and app metadata converge on the sizes requested from the
+accepted flat layout without sending placement back to the session server.
 
 Run `./tools/audit-v1-capabilities.sh` from the repo root for the concise v1 acceptance audit. It runs formatting, offline checking, unit tests, headless compositor checks, supported host-backed smoke tests when a host display is available, and the dmabuf capability checks. Set `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1` on a DRM-capable backend to make capability skips fail the audit.
 

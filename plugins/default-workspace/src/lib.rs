@@ -50,6 +50,11 @@ static mut RESPONSE: [u8; RESPONSE_BYTES] = [0; RESPONSE_BYTES];
 static mut RESPONSE_DESC: [i32; 4] = [0; 4];
 static mut OUTBOX: [u8; OUTBOX_BYTES] = [0; OUTBOX_BYTES];
 static mut WORKSPACE_INPUT_MODE: i32 = INPUT_MODE_PASSTHROUGH;
+static mut LAYOUT_PANES: [u64; 64] = [0; 64];
+static mut LAYOUT_PANE_COUNT: usize = 0;
+static mut LAYOUT_FOCUS: u64 = 0;
+static mut LAYOUT_HAS_FOCUS: bool = false;
+static mut LAYOUT_FULLSCREEN: bool = false;
 
 #[link(wasm_import_module = "manifold")]
 unsafe extern "C" {
@@ -134,7 +139,10 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
             write_consume(output, &[])
         } else {
             let mut buffer = [Message::Noop; 1];
-            write_consume(output, messages_for_global_key(input.key_code, state, &mut buffer))
+            write_consume(
+                output,
+                messages_for_global_key(input.key_code, state, &mut buffer),
+            )
         };
     }
 
@@ -176,7 +184,11 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
 }
 
 #[no_mangle]
-pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32, _inbox_cap: i32) -> i64 {
+pub extern "C" fn manifold_actor_workspace_epoch_run(
+    _epoch: i64,
+    inbox_ptr: i32,
+    _inbox_cap: i32,
+) -> i64 {
     let message_len = unsafe { read_message() };
     if message_len <= 0 {
         return 0;
@@ -184,17 +196,31 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32
     let Some(message) = guest_slice(inbox_ptr, message_len) else {
         return -2;
     };
-    if find_after(message, br#""type":"layout-state""#).is_none() {
-        return 0;
-    }
     let output = outbox_buffer_mut();
-    let mut panes = [0_u64; 64];
-    let pane_count = parse_visible_panes(message, &mut panes);
-    if pane_count == 0 {
+    if find_after(message, br#""type":"layout-state""#).is_some() {
+        let mut panes = [0_u64; 64];
+        let pane_count = parse_visible_panes(message, &mut panes);
+        let focus = parse_optional_u64_field(message, b"\"focused_pane\":");
+        store_layout_actor_state(&panes[..pane_count], focus);
+        let len = write_layout_actor_outbox(
+            output,
+            message,
+            &panes[..pane_count],
+            focus,
+            layout_actor_fullscreen(),
+        );
+        if len <= 0 {
+            return -2;
+        }
+        return pack_actor_outbox(output.as_ptr() as i32, len);
+    }
+
+    if find_after(message, br#""type":"layout-action""#).is_none() {
         return 0;
     }
-    let focus = parse_optional_u64_field(message, b"\"focused_pane\":");
-    let len = write_layout_actor_outbox(output, message, &panes[..pane_count], focus);
+    apply_layout_actor_action(message);
+    let (panes, focus, fullscreen) = layout_actor_state();
+    let len = write_layout_actor_update_outbox(output, panes, focus, fullscreen);
     if len <= 0 {
         return -2;
     }
@@ -203,52 +229,6 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(_epoch: i64, inbox_ptr: i32
 
 #[no_mangle]
 pub extern "C" fn manifold_actor_workspace_subscribe_layout_state() {}
-
-#[no_mangle]
-pub extern "C" fn manifold_policy_provider_layout_tile(
-    query_ptr: i32,
-    query_len: i32,
-    _state_ptr: i32,
-    _state_len: i32,
-) -> i32 {
-    let Some(query) = guest_slice(query_ptr, query_len) else {
-        return OUTPUT_ERROR;
-    };
-    let output = response_buffer_mut();
-    let mut panes = [0_u64; 64];
-    let pane_count = parse_visible_panes(query, &mut panes);
-    if pane_count == 0 {
-        return OUTPUT_ABSTAIN;
-    }
-    let focus = parse_optional_u64_field(query, b"\"focused_pane\":").unwrap_or(panes[0]);
-
-    let mut writer = Writer::new(output);
-    writer.bytes(br#"{"layout":{"items":["#);
-    if pane_count == 1 {
-        write_pane_item(&mut writer, panes[0], 0.0, -1.0, -1.0, 2.0, 2.0);
-    } else {
-        write_pane_item(&mut writer, panes[0], 0.0, -1.0, -1.0, 1.0, 2.0);
-        let each = 2.0 / ((pane_count - 1) as f32);
-        let mut index = 1;
-        while index < pane_count {
-            writer.byte(b',');
-            write_pane_item(
-                &mut writer,
-                panes[index],
-                index as f32,
-                0.0,
-                -1.0 + each * ((index - 1) as f32),
-                1.0,
-                each,
-            );
-            index += 1;
-        }
-    }
-    writer.bytes(br#"]},"focus":"#);
-    writer.u64(focus);
-    writer.byte(b'}');
-    finish_response(writer.finish())
-}
 
 fn messages_for_global_key<'a>(
     key_code: i32,
@@ -424,11 +404,12 @@ fn write_layout_actor_outbox(
     layout_message: &[u8],
     panes: &[u64],
     focus: Option<u64>,
+    fullscreen: bool,
 ) -> i32 {
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
-    write_set_resolved_layout_payload(&mut payload, panes, focus);
+    write_set_resolved_layout_payload(&mut payload, panes, focus, fullscreen);
     writer.bytes(br#"]}],"publications":[{"payload":["#);
     let mut publication = PayloadWriter::new(&mut writer);
     publication.bytes(br#"{"kind":"workspace-state","mode":"#);
@@ -450,7 +431,12 @@ fn write_layout_actor_outbox(
     }
     publication.bytes(br#"],"app_panes":["#);
     let mut first_app_pane = true;
-    write_app_pane(&mut publication, layout_message, b"pi-foot", &mut first_app_pane);
+    write_app_pane(
+        &mut publication,
+        layout_message,
+        b"pi-foot",
+        &mut first_app_pane,
+    );
     write_app_pane(
         &mut publication,
         layout_message,
@@ -486,6 +472,91 @@ fn write_layout_actor_outbox(
     writer.finish()
 }
 
+fn write_layout_actor_update_outbox(
+    output: &mut [u8],
+    panes: &[u64],
+    focus: Option<u64>,
+    fullscreen: bool,
+) -> i32 {
+    let mut writer = Writer::new(output);
+    writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    let mut payload = PayloadWriter::new(&mut writer);
+    write_set_resolved_layout_payload(&mut payload, panes, focus, fullscreen);
+    writer.bytes(br#"]}]}"#);
+    writer.finish()
+}
+
+fn store_layout_actor_state(panes: &[u64], focus: Option<u64>) {
+    let pane_count = panes.len().min(64);
+    unsafe {
+        let target = ptr::addr_of_mut!(LAYOUT_PANES).cast::<u64>();
+        let mut index = 0;
+        while index < pane_count {
+            target.add(index).write(panes[index]);
+            index += 1;
+        }
+        LAYOUT_PANE_COUNT = pane_count;
+        let accepted_focus = focus.filter(|focus| panes[..pane_count].contains(focus));
+        LAYOUT_FOCUS = accepted_focus
+            .or_else(|| panes.first().copied())
+            .unwrap_or(0);
+        LAYOUT_HAS_FOCUS = pane_count > 0;
+        if pane_count == 0 {
+            LAYOUT_FULLSCREEN = false;
+        }
+    }
+}
+
+fn layout_actor_fullscreen() -> bool {
+    unsafe { LAYOUT_FULLSCREEN }
+}
+
+fn layout_actor_state() -> (&'static [u64], Option<u64>, bool) {
+    unsafe {
+        let pane_count = LAYOUT_PANE_COUNT.min(64);
+        let panes = slice::from_raw_parts(ptr::addr_of!(LAYOUT_PANES).cast::<u64>(), pane_count);
+        let focus = LAYOUT_HAS_FOCUS.then_some(LAYOUT_FOCUS);
+        (panes, focus, LAYOUT_FULLSCREEN)
+    }
+}
+
+fn apply_layout_actor_action(message: &[u8]) {
+    let next = find_after(message, br#""action":"focus-next""#).is_some()
+        || find_after(message, br#""action":"focus-next-split""#).is_some();
+    let previous = find_after(message, br#""action":"focus-previous""#).is_some()
+        || find_after(message, br#""action":"focus-previous-split""#).is_some();
+    unsafe {
+        let pane_count = LAYOUT_PANE_COUNT.min(64);
+        if pane_count == 0 {
+            return;
+        }
+        let panes = slice::from_raw_parts(ptr::addr_of!(LAYOUT_PANES).cast::<u64>(), pane_count);
+        if find_after(message, br#""action":"toggle-managed-fullscreen""#).is_some() {
+            LAYOUT_FULLSCREEN = !LAYOUT_FULLSCREEN;
+            return;
+        }
+        if !next && !previous {
+            return;
+        }
+        let current = panes
+            .iter()
+            .position(|pane| LAYOUT_HAS_FOCUS && *pane == LAYOUT_FOCUS);
+        let target = if next {
+            current.map_or(0, |index| (index + 1) % pane_count)
+        } else {
+            current.map_or(pane_count - 1, |index| {
+                if index == 0 {
+                    pane_count - 1
+                } else {
+                    index - 1
+                }
+            })
+        };
+        LAYOUT_FOCUS = panes[target];
+        LAYOUT_HAS_FOCUS = true;
+    }
+}
+
 fn write_app_pane(
     publication: &mut PayloadWriter<'_, '_>,
     layout_message: &[u8],
@@ -510,10 +581,16 @@ fn write_set_resolved_layout_payload(
     payload: &mut PayloadWriter<'_, '_>,
     panes: &[u64],
     focus: Option<u64>,
+    fullscreen: bool,
 ) {
     payload.bytes(br#"{"type":"set-resolved-layout","layout":{"items":["#);
     let pane_count = panes.len();
-    if pane_count == 1 {
+    if fullscreen && pane_count > 0 {
+        let pane = focus
+            .filter(|focus| panes.contains(focus))
+            .unwrap_or(panes[0]);
+        write_pane_item_payload(payload, pane, 0.0, -1.0, -1.0, 2.0, 2.0);
+    } else if pane_count == 1 {
         write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, 2.0, 2.0);
     } else if pane_count > 1 {
         write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, 1.0, 2.0);
@@ -568,7 +645,14 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
         if index > 0 {
             writer.byte(b',');
         }
-        writer.bytes(br#"{"actor":"host","payload":["#);
+        let actor = match messages[index] {
+            Message::LayoutAction("close-active-pane") => "host",
+            Message::LayoutAction(_) => "workspace",
+            _ => "host",
+        };
+        writer.bytes(br#"{"actor":""#);
+        writer.bytes(actor.as_bytes());
+        writer.bytes(br#"","payload":["#);
         let mut payload = PayloadWriter::new(&mut writer);
         match messages[index] {
             Message::Noop => {}

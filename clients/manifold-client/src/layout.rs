@@ -1,100 +1,15 @@
-use std::path::Path;
-
-use anyhow::{Context, Result, ensure};
 use manifold_layout::{
     InputBehavior, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize, LayoutState,
     LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
 };
-use manifold_wasm::{LayoutPolicyInput, WasmLayoutPolicy};
-
-pub struct ClientLayoutPolicy {
-    wasm: Option<WasmLayoutPolicy>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct LayoutResolution {
-    pub layout: ResolvedLayout,
-    pub focus: Option<u64>,
-    pub source: LayoutSource,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutSource {
     NativeFallback,
-    WasmPolicy,
+    Actor,
 }
 
-impl ClientLayoutPolicy {
-    pub fn load(spec: Option<&[String]>) -> Result<Self> {
-        let wasm = spec.map(load_wasm_layout_policy).transpose()?;
-        Ok(Self { wasm })
-    }
-
-    pub fn resolve(
-        &mut self,
-        panes: &[u64],
-        focused_pane: Option<u64>,
-        presentation_size: LayoutSize,
-    ) -> LayoutResolution {
-        if let Some(policy) = self.wasm.as_mut() {
-            let input = LayoutPolicyInput::new(
-                panes.to_vec(),
-                focused_pane,
-                manifold_wasm::LayoutSize {
-                    w: presentation_size.w,
-                    h: presentation_size.h,
-                },
-            );
-            match policy.resolve_layout(input, None) {
-                Ok(Some(outcome)) => {
-                    let candidate = convert_wasm_layout(outcome.layout);
-                    match candidate.validate_for_panes(panes) {
-                        Ok(layout) => {
-                            let focus = outcome
-                                .focus
-                                .filter(|pane| layout.pane_item(*pane).is_some());
-                            return LayoutResolution {
-                                layout,
-                                focus,
-                                source: LayoutSource::WasmPolicy,
-                            };
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "WASM layout policy returned an invalid flat layout; using native fallback: {error}"
-                            );
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("WASM layout policy failed; using native fallback: {error:#}");
-                }
-            }
-        }
-
-        LayoutResolution {
-            layout: native_flat_layout(panes, presentation_size),
-            focus: focused_pane.filter(|pane| panes.contains(pane)),
-            source: LayoutSource::NativeFallback,
-        }
-    }
-}
-
-fn load_wasm_layout_policy(spec: &[String]) -> Result<WasmLayoutPolicy> {
-    ensure!(
-        spec.len() == 2,
-        "layout policy requires a provider name and WASM path"
-    );
-    let provider = spec.first().context("layout policy provider is missing")?;
-    let path = spec.get(1).context("layout policy path is missing")?;
-    let policy = WasmLayoutPolicy::load(Path::new(path), provider)
-        .with_context(|| format!("load presentation layout policy {provider:?} from {path}"))?;
-    eprintln!("loaded presentation layout policy provider={provider} path={path}");
-    Ok(policy)
-}
-
-fn convert_wasm_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLayout {
+pub fn convert_actor_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLayout {
     ResolvedLayout {
         items: layout
             .items
@@ -130,7 +45,7 @@ fn convert_wasm_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLayout 
     }
 }
 
-fn native_flat_layout(panes: &[u64], extent: LayoutSize) -> ResolvedLayout {
+pub fn native_flat_layout(panes: &[u64], extent: LayoutSize) -> ResolvedLayout {
     if panes.is_empty() {
         return ResolvedLayout::empty();
     }

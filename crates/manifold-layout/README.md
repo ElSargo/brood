@@ -6,7 +6,7 @@ or WASM-runtime dependencies.
 
 The crate owns:
 
-- the bounded, validated resolved-layout model accepted from layout policy;
+- the bounded, validated resolved-layout model accepted from layout actors;
 - normalized-to-pixel projection and layout-derived hit testing;
 - the deterministic native split-tree fallback and its actions.
 

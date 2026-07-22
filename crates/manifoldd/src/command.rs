@@ -47,7 +47,7 @@ impl WorkspaceCommand {
             Self::FocusPane(pane) => state.focus_pane(pane),
             Self::FocusOrSpawnApp { app_id, argv } => state.focus_app_id_or_spawn(&app_id, &argv),
             Self::SetResolvedLayout { layout, focus } => {
-                state.apply_plugin_resolved_layout(layout, focus)
+                state.apply_actor_resolved_layout(layout, focus)
             }
             Self::Surface(command) => command.apply(state),
             Self::Input(command) => command.apply(state),

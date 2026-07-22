@@ -107,7 +107,7 @@ The docs are organized as a wiki-style knowledge base.
 - [Presentation Client Target](docs/systems/presentation-client.md)
 - [Plugin Runtime Target](docs/systems/plugin-runtime.md)
 - [Input And Shortcuts Target](docs/systems/input-shortcuts.md)
-- [Layout Policy Target](docs/systems/layout-policy.md)
+- [Layout Actor Target](docs/systems/layout-actor.md)
 - [Plugin UI Target](docs/systems/plugin-ui.md)
 - [Plugin Graphics Target](docs/systems/plugin-graphics.md)
 - [Future Advanced Plugin Graphics](docs/systems/plugin-advanced-graphics.md)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug/manifold"
-POLICY_WASM="$ROOT/examples/wasm-geometry-layout-policy/target/wasm32-unknown-unknown/release/manifold_wasm_geometry_layout_policy.wasm"
+WORKSPACE_WASM="$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
 
 ctl() {
   RUST_LOG=off timeout 5s "$BIN" ctl "$@"
@@ -24,7 +24,7 @@ run_visible_controller() {
   echo 'then records client buffer state and captures the final offscreen EGL frame.'
   echo
 
-  plug="$("$BIN" plug "$POLICY_WASM")"
+  plug="$("$BIN" plug "$WORKSPACE_WASM")"
   echo "$plug"
   spawn="$(ctl spawn "$shm_wrapper")"
   pane="$(sed -n 's/.*pane_id=\([0-9][0-9]*\).*/\1/p' <<<"$spawn")"
@@ -39,17 +39,14 @@ run_visible_controller() {
   done
   python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["windows"] >= 2 and p["frames"] >= 2, p' "$status"
 
-  # The real policy plugin installs its typed layout on this key invocation.
-  ctl inject key 30 pressed >/dev/null
-  ctl inject key 30 released >/dev/null
   for _ in $(seq 1 100); do
     status="$(ctl status-json)"
-    if python3 -c 'import json,sys; p=json.loads(sys.argv[1]); raise SystemExit(0 if p["resolved_layout_source"] == "wasm-policy" and p["resolved_layout_panes"] == 2 else 1)' "$status"; then
+    if python3 -c 'import json,sys; p=json.loads(sys.argv[1]); raise SystemExit(0 if p["resolved_layout_source"] == "actor" and p["resolved_layout_panes"] == 2 else 1)' "$status"; then
       break
     fi
     sleep 0.05
   done
-  python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["resolved_layout_source"] == "wasm-policy" and p["resolved_layout_panes"] == 2, p' "$status"
+  python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["resolved_layout_source"] == "actor" and p["resolved_layout_panes"] == 2, p' "$status"
 
   # This shell is a managed Wayland client, so its session address names the
   # in-process realm bus rather than the host bus. `-p` returns the host's real
@@ -93,7 +90,7 @@ PY
     echo '```text'
     echo "$plug"
     echo "$spawn"
-    echo "plugin_layout_source=wasm-policy"
+    echo "plugin_layout_source=actor"
     echo "plugin_layout_panes=2"
     echo "session_bus_notification_summary=Audited boundaries crossed"
     echo "session_bus_host_notification_id=$notification_id"
@@ -131,7 +128,7 @@ chmod +x "$OUT/simple-shm-wrapper.sh"
 
 nix develop --command cargo build -p manifoldd
 nix develop --command cargo build \
-  --manifest-path examples/wasm-geometry-layout-policy/Cargo.toml \
+  --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
 
