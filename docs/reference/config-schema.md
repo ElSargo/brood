@@ -5,6 +5,7 @@ authority: implementation
 last-reviewed: 2026-07-11
 code-links:
   - crates/manifoldd/src/config.rs
+  - crates/manifold-cli/src/realm_init.rs
   - manifold.toml
 ---
 
@@ -14,6 +15,7 @@ Exact config schema behavior is defined by the deserializers in `crates/manifold
 
 Current top-level config families:
 
+- `init`
 - `session`
 - `layout`
 - `module`

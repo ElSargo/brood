@@ -46,6 +46,8 @@ let
   wasmCargoVendorDir = craneLib.vendorMultipleCargoDeps {
     cargoLockList = builtins.filter builtins.pathExists [
       "${src}/examples/wasm-component-actor/Cargo.lock"
+      "${src}/examples/wasm-init-actor/Cargo.lock"
+      "${src}/examples/wasm-init-child/Cargo.lock"
       "${src}/examples/wasm-plugin-graphics/Cargo.lock"
       "${src}/examples/wasm-preview1-worker/Cargo.lock"
       "${src}/plugins/component-workspace-watch/Cargo.lock"
@@ -304,6 +306,19 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f examples/wasm-init-actor/Cargo.toml ]]; then
+        component_core="examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm"
+        component_output="examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR session init actor core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       if [[ -f plugins/component-workspace-watch/Cargo.toml ]]; then
         component_core="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.wasm"
         component_output="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.component.wasm"
@@ -344,6 +359,9 @@ let
           continue
         fi
         if [[ "$wasm" == "examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/manifold_plugin_graphics_example.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm" ]]; then
           continue
         fi
         if [[ "$wasm" == "plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.wasm" ]]; then
@@ -560,7 +578,7 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in manifold manifold-sessiond manifold-runner-exec manifold-runner-nix-develop; do
+      for program in manifold manifold-client manifold-sessiond manifold-runner-exec manifold-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \

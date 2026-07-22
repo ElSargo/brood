@@ -108,7 +108,25 @@ fn configure_session(
         state.clear_initial_surface_session();
     }
     config::load_runtime_settings(state, &config_path)?;
-    if !args.no_default_modules {
+    let control_target =
+        control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
+    control::listen(event_loop, control_target.clone(), runtime)?;
+    configure_control_environment(state, &control_target);
+    let init_actor = if args.no_init {
+        None
+    } else if let Some(path) = args.init_actor.clone() {
+        Some(path)
+    } else {
+        manifold_cli::realm_init_actor_path(&config_path, manifold_cli::RealmKind::Session)?
+    };
+    if let Some(path) = init_actor.as_deref() {
+        state
+            .configure_session_init_actor(path)
+            .with_context(|| format!("configure session init actor {}", path.display()))?;
+        info!(path = %path.display(), "configured blessed session init actor");
+    }
+    let legacy_startup = init_actor.is_none() && !args.no_default_modules;
+    if legacy_startup {
         config::load_startup_modules(state, &config_path)?;
     }
     if let Some(path) = args.wasm_plugin.as_deref() {
@@ -128,14 +146,10 @@ fn configure_session(
         args.nested_inner_dbus_address.clone(),
     )?;
 
-    let control_target =
-        control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
-    control::listen(event_loop, control_target.clone(), runtime)?;
-    configure_control_environment(state, &control_target);
     print_session_environment(state, &control_target);
     attach_initial_presentation(event_loop, state, args);
 
-    if !args.no_default_modules {
+    if legacy_startup {
         let filter = if args.no_initial_surface_session {
             config::StartupAppFilter::PresentationOnly
         } else {
@@ -197,6 +211,7 @@ fn attach_initial_presentation(
 
 fn service_runtime_tick(state: &mut Manifold) {
     state.service_test_harness();
+    state.service_realm_init_actor();
     if state.attach_requested && !state.presentation_started && !state.attach_schedule_pending {
         state.attach_schedule_pending = true;
         state.schedule_attach();

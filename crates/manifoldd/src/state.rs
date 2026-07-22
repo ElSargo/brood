@@ -109,6 +109,7 @@ const LEFT_PANEL_MAX_WIDTH: i32 = 560;
 const LEFT_PANEL_KEYBOARD_STEP: i32 = 32;
 const LEFT_PANEL_SPLITTER_HITBOX: f64 = 8.0;
 const DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT: usize = 3;
+const SESSION_INIT_ACTOR_PREFIX: &str = "manifold.session-init";
 pub const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
 const MANIFOLD_SURFACE_SESSION_ID_ENV: &str = "MANIFOLD_SURFACE_SESSION_ID";
 const SESSION_OUTPUT_SIZE: (i32, i32) = (1280, 800);
@@ -636,6 +637,13 @@ struct HostedPluginFilesystem {
     writable: bool,
 }
 
+struct RealmInitState {
+    actor_id: String,
+    root: PathBuf,
+    children: BTreeMap<String, String>,
+    apps: BTreeMap<String, HostedChildToken>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfiguredWorkspacePlugin {
     path: PathBuf,
@@ -783,6 +791,8 @@ pub struct Manifold {
     wasm_host_mailbox: Option<manifold_wasm::Mailbox>,
     legacy_wasm_actor_generation: Option<manifold_wasm::LegacyWasmActorGeneration>,
     wasm_io_actors: BTreeMap<String, manifold_wasm::HostedWasmActor>,
+    session_init_actor: Option<PathBuf>,
+    realm_inits: BTreeMap<SurfaceSessionId, RealmInitState>,
     configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
     configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
     configured_plugin_resources: BTreeMap<String, ConfiguredPluginResources>,
@@ -937,6 +947,8 @@ impl Manifold {
             wasm_host_mailbox: Some(wasm_host_mailbox),
             legacy_wasm_actor_generation: None,
             wasm_io_actors: BTreeMap::new(),
+            session_init_actor: None,
+            realm_inits: BTreeMap::new(),
             configured_workspace_plugins: BTreeMap::new(),
             configured_plugin_lifecycles: BTreeMap::new(),
             configured_plugin_resources: BTreeMap::new(),
@@ -1465,7 +1477,14 @@ impl Manifold {
     }
 
     fn drain_hosted_actor_events(&mut self) {
+        enum InitRequest {
+            StartActor(SurfaceSessionId, String, String),
+            StopActor(SurfaceSessionId, String),
+            StartApp(SurfaceSessionId, String, Vec<String>),
+        }
+
         let mut events = Vec::new();
+        let mut init_requests = Vec::new();
         for (actor_name, actor) in &mut self.wasm_io_actors {
             match actor {
                 manifold_wasm::HostedWasmActor::Component(actor) => {
@@ -1488,6 +1507,15 @@ impl Manifold {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                     self.plugin_actor_last_status = Some(format!("{actor_name}:dispatcher_failed"));
                     warn!(actor = %actor_name, error = %message, "Preview 1 actor dispatcher failed");
+                    if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
+                        self.send_realm_init_child_event(
+                            session,
+                            manifold_wasm::ComponentChildEvent::Failed {
+                                id: child_id,
+                                message,
+                            },
+                        );
+                    }
                     continue;
                 }
             };
@@ -1496,6 +1524,15 @@ impl Manifold {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                     self.plugin_actor_last_status = Some(format!("{actor_name}:dispatcher_failed"));
                     warn!(actor = %actor_name, error = %message, "component actor dispatcher failed");
+                    if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
+                        self.send_realm_init_child_event(
+                            session,
+                            manifold_wasm::ComponentChildEvent::Failed {
+                                id: child_id,
+                                message,
+                            },
+                        );
+                    }
                 }
                 manifold_wasm::ComponentActorEvent::WorkerFailed { worker, message } => {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
@@ -1506,8 +1543,42 @@ impl Manifold {
                 manifold_wasm::ComponentActorEvent::Stopped => {
                     self.plugin_actor_last_status = Some(format!("{actor_name}:stopped"));
                     info!(actor = %actor_name, "component actor stopped");
+                    if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
+                        self.send_realm_init_child_event(
+                            session,
+                            manifold_wasm::ComponentChildEvent::Stopped { id: child_id },
+                        );
+                    }
+                }
+                manifold_wasm::ComponentActorEvent::ActorStartRequested { id, path } => {
+                    if let Some(session) = self.realm_init_root_session(&actor_name) {
+                        init_requests.push(InitRequest::StartActor(session, id, path));
+                    }
+                }
+                manifold_wasm::ComponentActorEvent::ActorStopRequested { id } => {
+                    if let Some(session) = self.realm_init_root_session(&actor_name) {
+                        init_requests.push(InitRequest::StopActor(session, id));
+                    }
+                }
+                manifold_wasm::ComponentActorEvent::AppStartRequested { id, argv } => {
+                    if let Some(session) = self.realm_init_root_session(&actor_name) {
+                        init_requests.push(InitRequest::StartApp(session, id, argv));
+                    }
                 }
                 _ => {}
+            }
+        }
+        for request in init_requests {
+            match request {
+                InitRequest::StartActor(session, id, path) => {
+                    self.handle_realm_init_start(session, id, &path);
+                }
+                InitRequest::StopActor(session, id) => {
+                    self.handle_realm_init_stop(session, id);
+                }
+                InitRequest::StartApp(session, id, argv) => {
+                    self.handle_realm_init_app_start(session, id, &argv);
+                }
             }
         }
     }
@@ -3317,6 +3388,9 @@ impl Manifold {
     }
 
     fn remove_surface_session_record(&mut self, session: SurfaceSessionId) {
+        if let Err(error) = self.stop_session_init_actor(session) {
+            warn!(surface_session = session.raw(), error = %error, "failed to stop surface-session init actor");
+        }
         self.native_session_layouts.remove(&session);
         let _ = self.sessions.remove(session);
     }
@@ -3439,6 +3513,9 @@ impl Manifold {
         self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
+        if self.session_init_actor.is_some() {
+            self.start_session_init_actor(session)?;
+        }
         Ok(session)
     }
 
@@ -4342,6 +4419,366 @@ impl Manifold {
         enabled
     }
 
+    /// Configure the root artifact used for every new surface-session realm.
+    pub(crate) fn configure_session_init_actor(&mut self, path: &Path) -> Result<()> {
+        ensure!(
+            self.session_init_actor.is_none(),
+            "session init actor is already configured"
+        );
+        let artifact = manifold_wasm::WasmPluginArtifact::load(path)?;
+        ensure!(
+            matches!(
+                artifact,
+                manifold_wasm::WasmPluginArtifact::Component { .. }
+            ),
+            "realm init actor must be a Component Model actor"
+        );
+        self.session_init_actor = Some(path.to_path_buf());
+        let sessions = self.sessions.sessions().to_vec();
+        for session in sessions {
+            self.start_session_init_actor(session)?;
+        }
+        Ok(())
+    }
+
+    fn start_session_init_actor(&mut self, session: SurfaceSessionId) -> Result<()> {
+        ensure!(
+            self.sessions.contains(session),
+            "cannot start init actor for unknown surface session {}",
+            session.raw()
+        );
+        ensure!(
+            !self.realm_inits.contains_key(&session),
+            "surface session {} init actor is already running",
+            session.raw()
+        );
+        let path = self
+            .session_init_actor
+            .clone()
+            .context("session init actor is not configured")?;
+        let actor_id = session_init_actor_id(session);
+        let lifecycle = ConfiguredPluginLifecycle {
+            start_timeout: Duration::from_secs(2),
+            stop_timeout: Duration::from_secs(2),
+            data: BTreeMap::new(),
+        };
+        self.replace_wasm_component_actor(
+            &actor_id,
+            &path,
+            None,
+            Some(&(lifecycle.clone(), manifold_wasm::PluginStartReason::Initial)),
+            ConfiguredPluginResources::default(),
+            manifold_wasm::RuntimeIoCapabilities::default(),
+            true,
+            true,
+            Some(session),
+        )?;
+        self.configured_plugin_lifecycles
+            .insert(actor_id.clone(), lifecycle);
+        self.realm_inits.insert(
+            session,
+            RealmInitState {
+                actor_id,
+                root: path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf(),
+                children: BTreeMap::new(),
+                apps: BTreeMap::new(),
+            },
+        );
+        self.drain_hosted_actor_events();
+        Ok(())
+    }
+
+    fn stop_session_init_actor(&mut self, session: SurfaceSessionId) -> Result<()> {
+        let Some(init) = self.realm_inits.remove(&session) else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for actor_id in init.children.values() {
+            if let Err(error) = self.stop_hosted_io_actor(actor_id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Err(error) = self.stop_hosted_io_actor_lifecycle(
+            &init.actor_id,
+            manifold_wasm::PluginStopReason::Shutdown,
+            None,
+        ) && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = self.stop_hosted_io_actor(&init.actor_id)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        self.configured_plugin_lifecycles.remove(&init.actor_id);
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Service lifecycle requests and failure feedback for the session init
+    /// actor. This is safe to call on every compositor turn.
+    pub(crate) fn service_realm_init_actor(&mut self) {
+        self.drain_hosted_actor_events();
+        let completed = self
+            .realm_inits
+            .iter()
+            .flat_map(|(session, init)| {
+                init.apps.iter().filter_map(|(id, token)| {
+                    let event = match self.hosted_child_status(*token) {
+                        HostedChildStatus::Exited { success: true, .. } => {
+                            manifold_wasm::ComponentAppEvent::Stopped { id: id.clone() }
+                        }
+                        HostedChildStatus::Exited {
+                            success: false,
+                            detail,
+                        } => manifold_wasm::ComponentAppEvent::Failed {
+                            id: id.clone(),
+                            message: detail,
+                        },
+                        HostedChildStatus::Launching
+                        | HostedChildStatus::Running
+                        | HostedChildStatus::Unknown => return None,
+                    };
+                    Some((*session, id.clone(), event))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (session, id, event) in completed {
+            if let Some(init) = self.realm_inits.get_mut(&session) {
+                init.apps.remove(&id);
+            }
+            self.send_realm_init_app_event(session, event);
+        }
+    }
+
+    fn handle_realm_init_start(&mut self, session: SurfaceSessionId, id: String, guest_path: &str) {
+        let result = self.start_realm_init_child(session, &id, guest_path);
+        match result {
+            Ok(generation) => {
+                self.send_realm_init_child_event(
+                    session,
+                    manifold_wasm::ComponentChildEvent::Started { id, generation },
+                );
+            }
+            Err(error) => {
+                self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+                warn!(actor = %id, path = %guest_path, error = %error, "realm init failed to start child actor");
+                self.send_realm_init_child_event(
+                    session,
+                    manifold_wasm::ComponentChildEvent::Failed {
+                        id,
+                        message: format!("{error:#}"),
+                    },
+                );
+            }
+        }
+    }
+
+    fn start_realm_init_child(
+        &mut self,
+        session: SurfaceSessionId,
+        id: &str,
+        guest_path: &str,
+    ) -> Result<u64> {
+        ensure!(
+            !id.trim().is_empty(),
+            "init child actor id must not be empty"
+        );
+        ensure!(
+            id != SESSION_INIT_ACTOR_PREFIX,
+            "init actor cannot replace itself"
+        );
+        let actor_id = session_init_child_actor_id(session, id);
+        ensure!(
+            !self.wasm_io_actors.contains_key(&actor_id)
+                || self
+                    .realm_inits
+                    .get(&session)
+                    .is_some_and(|init| init.children.get(id) == Some(&actor_id)),
+            "init actor cannot replace an actor it does not own"
+        );
+        let relative = Path::new(guest_path);
+        ensure!(
+            !guest_path.trim().is_empty()
+                && !relative.is_absolute()
+                && !relative.components().any(|component| matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )),
+            "init child actor path must stay inside the init package root"
+        );
+        let root = self
+            .realm_inits
+            .get(&session)
+            .context("session init actor is not running")?
+            .root
+            .clone();
+        let canonical_root = root
+            .canonicalize()
+            .with_context(|| format!("resolve init package root {}", root.display()))?;
+        let path = root.join(relative).canonicalize().with_context(|| {
+            format!("resolve init child actor {}", root.join(relative).display())
+        })?;
+        ensure!(
+            path.starts_with(&canonical_root),
+            "init child actor path must stay inside the init package root"
+        );
+        self.replace_wasm_plugin_with_instance_id(
+            Some(&actor_id),
+            false,
+            &path,
+            None,
+            None,
+            ConfiguredPluginResources::default(),
+            manifold_wasm::RuntimeIoCapabilities::default(),
+        )?;
+        let generation = self
+            .wasm_io_actors
+            .get(&actor_id)
+            .context("init child did not produce a hosted actor")?
+            .generation();
+        if let Some(init) = self.realm_inits.get_mut(&session) {
+            init.children.insert(id.to_string(), actor_id);
+        }
+        Ok(generation)
+    }
+
+    fn handle_realm_init_stop(&mut self, session: SurfaceSessionId, id: String) {
+        let owned = self
+            .realm_inits
+            .get(&session)
+            .and_then(|init| init.children.get(&id))
+            .cloned();
+        let Some(actor_id) = owned else {
+            self.send_realm_init_child_event(
+                session,
+                manifold_wasm::ComponentChildEvent::Failed {
+                    id,
+                    message: "init actor may stop only its own children".to_string(),
+                },
+            );
+            return;
+        };
+        let result = self.stop_hosted_io_actor(&actor_id);
+        if let Some(init) = self.realm_inits.get_mut(&session) {
+            init.children.remove(&id);
+        }
+        match result {
+            Ok(()) => {
+                self.send_realm_init_child_event(
+                    session,
+                    manifold_wasm::ComponentChildEvent::Stopped { id },
+                );
+            }
+            Err(error) => {
+                self.send_realm_init_child_event(
+                    session,
+                    manifold_wasm::ComponentChildEvent::Failed {
+                        id,
+                        message: format!("{error:#}"),
+                    },
+                );
+            }
+        }
+    }
+
+    fn handle_realm_init_app_start(
+        &mut self,
+        session: SurfaceSessionId,
+        id: String,
+        argv: &[String],
+    ) {
+        let result = (|| {
+            ensure!(!id.trim().is_empty(), "init app id must not be empty");
+            ensure!(!argv.is_empty(), "init app argv must not be empty");
+            ensure!(
+                self.realm_inits
+                    .get(&session)
+                    .is_some_and(|init| !init.apps.contains_key(&id)),
+                "init app id is already running"
+            );
+            self.spawn_hosted_app_argv_in_session(argv, session)
+        })();
+        match result {
+            Ok(token) => {
+                if let Some(init) = self.realm_inits.get_mut(&session) {
+                    init.apps.insert(id.clone(), token);
+                }
+                self.send_realm_init_app_event(
+                    session,
+                    manifold_wasm::ComponentAppEvent::Started {
+                        id,
+                        pane: token.raw(),
+                    },
+                );
+            }
+            Err(error) => self.send_realm_init_app_event(
+                session,
+                manifold_wasm::ComponentAppEvent::Failed {
+                    id,
+                    message: format!("{error:#}"),
+                },
+            ),
+        }
+    }
+
+    fn realm_init_root_session(&self, actor_id: &str) -> Option<SurfaceSessionId> {
+        self.realm_inits
+            .iter()
+            .find_map(|(session, init)| (init.actor_id == actor_id).then_some(*session))
+    }
+
+    fn realm_init_child_owner(&self, actor_id: &str) -> Option<(SurfaceSessionId, String)> {
+        self.realm_inits.iter().find_map(|(session, init)| {
+            init.children
+                .iter()
+                .find_map(|(id, hosted_id)| (hosted_id == actor_id).then(|| (*session, id.clone())))
+        })
+    }
+
+    fn send_realm_init_child_event(
+        &self,
+        session: SurfaceSessionId,
+        event: manifold_wasm::ComponentChildEvent,
+    ) {
+        let Some(init) = self.realm_inits.get(&session) else {
+            return;
+        };
+        let Some(manifold_wasm::HostedWasmActor::Component(actor)) =
+            self.wasm_io_actors.get(&init.actor_id)
+        else {
+            return;
+        };
+        if let Err(error) = actor.try_send_child_event(event) {
+            warn!(error = %error, "failed to deliver child lifecycle event to session init actor");
+        }
+    }
+
+    fn send_realm_init_app_event(
+        &self,
+        session: SurfaceSessionId,
+        event: manifold_wasm::ComponentAppEvent,
+    ) {
+        let Some(init) = self.realm_inits.get(&session) else {
+            return;
+        };
+        let Some(manifold_wasm::HostedWasmActor::Component(actor)) =
+            self.wasm_io_actors.get(&init.actor_id)
+        else {
+            return;
+        };
+        if let Err(error) = actor.try_send_app_event(event) {
+            warn!(error = %error, "failed to deliver app lifecycle event to session init actor");
+        }
+    }
+
     pub(crate) fn replace_wasm_plugin(&mut self, path: &Path) -> Result<()> {
         self.replace_wasm_plugin_with_instance_id(
             None,
@@ -4548,6 +4985,7 @@ impl Manifold {
         actor: &manifold_wasm::HostedWasmActor,
         lifecycle: &ConfiguredPluginLifecycle,
         reason: manifold_wasm::PluginStartReason,
+        session: Option<SurfaceSessionId>,
     ) -> Result<()> {
         let runtime = self
             .async_runtime
@@ -4557,7 +4995,7 @@ impl Manifold {
             instance_id: actor_name.to_string(),
             generation: actor.generation(),
             reason,
-            session_id: Some(self.sessions.active().raw()),
+            session_id: Some(session.unwrap_or_else(|| self.sessions.active()).raw()),
             workspace_root: ".".to_string(),
             data: lifecycle
                 .data
@@ -4627,7 +5065,7 @@ impl Manifold {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources, runtime_io)
+                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources, runtime_io, false, false, None)
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Manifold module ({core_module_error}) nor a component actor",
@@ -4665,6 +5103,10 @@ impl Manifold {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "component generation construction combines host capability, lifecycle, and resource policy"
+    )]
     fn replace_wasm_component_actor(
         &mut self,
         actor_name: &str,
@@ -4673,6 +5115,9 @@ impl Manifold {
         lifecycle: Option<&(ConfiguredPluginLifecycle, manifold_wasm::PluginStartReason)>,
         resources: ConfiguredPluginResources,
         runtime_io: manifold_wasm::RuntimeIoCapabilities,
+        actor_management: bool,
+        app_management: bool,
+        lifecycle_session: Option<SurfaceSessionId>,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4705,6 +5150,8 @@ impl Manifold {
                     capabilities: runtime_io,
                     ..manifold_wasm::RuntimeIoConfig::default()
                 },
+                actor_management,
+                app_management,
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
@@ -4719,8 +5166,13 @@ impl Manifold {
         }
         self.stop_hosted_io_actor(actor_name)?;
         if let Some((config, reason)) = lifecycle
-            && let Err(error) =
-                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason)
+            && let Err(error) = self.start_candidate_lifecycle(
+                actor_name,
+                &candidate,
+                config,
+                *reason,
+                lifecycle_session,
+            )
         {
             let _ = runtime.block_on(candidate.shutdown());
             return Err(error);
@@ -4784,7 +5236,7 @@ impl Manifold {
         self.stop_hosted_io_actor(actor_name)?;
         if let Some((config, reason)) = lifecycle
             && let Err(error) =
-                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason)
+                self.start_candidate_lifecycle(actor_name, &candidate, config, *reason, None)
         {
             let _ = runtime.block_on(candidate.shutdown());
             return Err(error);
@@ -6277,6 +6729,14 @@ fn default_surface_session_name(session: SurfaceSessionId) -> String {
         .copied()
         .unwrap_or("working");
     format!("{adjective}-{noun}-{action}")
+}
+
+fn session_init_actor_id(session: SurfaceSessionId) -> String {
+    format!("{SESSION_INIT_ACTOR_PREFIX}.{}", session.raw())
+}
+
+fn session_init_child_actor_id(session: SurfaceSessionId, child: &str) -> String {
+    format!("manifold.session.{}.{}", session.raw(), child)
 }
 
 fn fallback_marker_id(index: usize) -> u64 {

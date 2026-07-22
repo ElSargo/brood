@@ -100,6 +100,22 @@ impl WorkerId {
     }
 }
 
+/// Realm-host feedback delivered only to a blessed init actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentChildEvent {
+    Started { id: String, generation: u64 },
+    Stopped { id: String },
+    Failed { id: String, message: String },
+}
+
+/// Session-host app lifecycle feedback delivered only to a blessed init actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentAppEvent {
+    Started { id: String, pane: u64 },
+    Stopped { id: String },
+    Failed { id: String, message: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentActorEvent {
     DispatcherReturned,
@@ -131,6 +147,17 @@ pub enum ComponentActorEvent {
         token: u64,
     },
     CompletionDelivered(ActorCompletion),
+    ActorStartRequested {
+        id: String,
+        path: String,
+    },
+    ActorStopRequested {
+        id: String,
+    },
+    AppStartRequested {
+        id: String,
+        argv: Vec<String>,
+    },
     Stopped,
 }
 
@@ -162,6 +189,12 @@ pub struct ComponentActorConfig {
     pub runtime_io: RuntimeIoConfig,
     /// Presentation-local canvas, resource, and native text capability.
     pub presentation: Option<Arc<dyn PresentationHost>>,
+    /// Admit realm child lifecycle commands. Hosts set this only for the one
+    /// blessed init actor in a realm.
+    pub actor_management: bool,
+    /// Admit session-local Wayland app launch commands. Only a blessed
+    /// surface-session init actor receives this capability.
+    pub app_management: bool,
     pub dispatcher_deadline: Duration,
     /// Wall-clock cadence for guest interruption checks. Epoch yields keep the
     /// executor responsive; cross-call worker fairness uses `worker-yield`.
@@ -189,6 +222,8 @@ impl Default for ComponentActorConfig {
             max_wait_set: 64,
             runtime_io: RuntimeIoConfig::default(),
             presentation: None,
+            actor_management: false,
+            app_management: false,
             dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
@@ -1450,6 +1485,8 @@ enum RuntimeCommand {
         event: PluginLifecycleEvent,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
+    Child(ComponentChildEvent),
+    App(ComponentAppEvent),
     Presentation(PresentationEvent),
     Shutdown,
 }
@@ -1706,6 +1743,20 @@ impl ComponentActor {
             .map_err(|error| {
                 anyhow::anyhow!("component actor rejected presentation event: {error}")
             })
+    }
+
+    /// Deliver lifecycle feedback for one child owned by a blessed init actor.
+    pub fn try_send_child_event(&self, event: ComponentChildEvent) -> Result<()> {
+        self.commands
+            .try_send(RuntimeCommand::Child(event))
+            .map_err(|error| anyhow::anyhow!("component init actor rejected child event: {error}"))
+    }
+
+    /// Deliver app lifecycle feedback to a blessed session init actor.
+    pub fn try_send_app_event(&self, event: ComponentAppEvent) -> Result<()> {
+        self.commands
+            .try_send(RuntimeCommand::App(event))
+            .map_err(|error| anyhow::anyhow!("component init actor rejected app event: {error}"))
     }
 
     /// Snapshot cumulative mailbox delivery counters.
@@ -2126,6 +2177,20 @@ async fn run_component_event_loop(
                     )?;
                     pending_lifecycle = Some(reply);
                 }
+                Some(RuntimeCommand::Child(event)) => {
+                    enqueue_dispatch(
+                        &mut system_queue,
+                        component_system_capacity(config),
+                        component_child_to_guest(event),
+                    )?;
+                }
+                Some(RuntimeCommand::App(event)) => {
+                    enqueue_dispatch(
+                        &mut system_queue,
+                        component_system_capacity(config),
+                        component_app_to_guest(event),
+                    )?;
+                }
                 Some(RuntimeCommand::Presentation(event)) => {
                     enqueue_presentation_dispatch(
                         &mut presentation_queue,
@@ -2212,6 +2277,39 @@ async fn run_component_event_loop(
                                                 "component guest completed lifecycle with no pending hook",
                                             )?;
                                             let _ = reply.send(result);
+                                        }
+                                        abi::Command::StartActor(request) => {
+                                            ensure!(
+                                                config.actor_management,
+                                                "actor start requested without realm init capability"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::ActorStartRequested {
+                                                    id: request.id,
+                                                    path: request.path,
+                                                })
+                                                .context("realm init actor request queue is full")?;
+                                        }
+                                        abi::Command::StopActor(id) => {
+                                            ensure!(
+                                                config.actor_management,
+                                                "actor stop requested without realm init capability"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::ActorStopRequested { id })
+                                                .context("realm init actor request queue is full")?;
+                                        }
+                                        abi::Command::StartApp(request) => {
+                                            ensure!(
+                                                config.app_management,
+                                                "app start requested without session init capability"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::AppStartRequested {
+                                                    id: request.id,
+                                                    argv: request.argv,
+                                                })
+                                                .context("realm init actor request queue is full")?;
                                         }
                                         abi::Command::Stop => return Ok(()),
                                     }
@@ -2476,6 +2574,36 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
         }
     };
     abi::Event::Presentation(event)
+}
+
+fn component_child_to_guest(event: ComponentChildEvent) -> GuestEvent {
+    use bindings::exports::manifold::plugin::actor as abi;
+
+    let event = match event {
+        ComponentChildEvent::Started { id, generation } => {
+            abi::ChildEvent::Started(abi::ActorStarted { id, generation })
+        }
+        ComponentChildEvent::Stopped { id } => abi::ChildEvent::Stopped(id),
+        ComponentChildEvent::Failed { id, message } => {
+            abi::ChildEvent::Failed(abi::ActorFailed { id, message })
+        }
+    };
+    abi::Event::Child(event)
+}
+
+fn component_app_to_guest(event: ComponentAppEvent) -> GuestEvent {
+    use bindings::exports::manifold::plugin::actor as abi;
+
+    let event = match event {
+        ComponentAppEvent::Started { id, pane } => {
+            abi::AppEvent::Started(abi::AppStarted { id, pane })
+        }
+        ComponentAppEvent::Stopped { id } => abi::AppEvent::Stopped(id),
+        ComponentAppEvent::Failed { id, message } => {
+            abi::AppEvent::Failed(abi::AppFailed { id, message })
+        }
+    };
+    abi::Event::App(event)
 }
 
 fn pop_component_dispatch(

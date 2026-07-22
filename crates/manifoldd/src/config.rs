@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -9,8 +9,6 @@ use anyhow::{Context, Result, ensure};
 use tracing::{info, warn};
 
 use crate::state::Manifold;
-
-const MANIFOLD_CONFIG_ENV: &str = "MANIFOLD_CONFIG";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ManifoldConfig {
@@ -417,28 +415,7 @@ pub fn discover_session_runner(start_dir: &Path) -> Result<Option<SessionRunnerS
 }
 
 pub fn global_config_path() -> PathBuf {
-    if let Some(config_path) = env::var_os(MANIFOLD_CONFIG_ENV).filter(|path| !path.is_empty()) {
-        return PathBuf::from(config_path);
-    }
-    let config_path = xdg_config_path();
-    if config_path.exists() {
-        return config_path;
-    }
-    repo_config_path_from_current_exe().unwrap_or(config_path)
-}
-
-fn xdg_config_path() -> PathBuf {
-    let config_home = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(env::temp_dir);
-    config_home.join("manifold").join("manifold.toml")
-}
-
-fn repo_config_path_from_current_exe() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
-    let start_dir = exe.parent()?;
-    find_upwards(start_dir, "manifold.toml")
+    manifold_cli::global_config_path()
 }
 
 pub const fn override_session_runner(

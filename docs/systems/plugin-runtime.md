@@ -76,6 +76,40 @@ session. They support configuration, audit, portability, and least-accidental
 authority, but they are not advertised as protection from trusted plugin code
 or from a native subprocess launched by that plugin.
 
+## Realm Init Actors
+
+Every surface session and presentation client may have one blessed init actor.
+It is an ordinary Component Model actor with an ordinary Store, mailbox,
+lifecycle, resource table, and failure boundary. The host creates it as part of
+realm creation and delivers its normal start lifecycle event before admitting
+the rest of the realm's actor topology. A server with no surface sessions has no
+session init actor; creating a session creates its root.
+
+The blessing adds one capability: the init actor may request that the local host
+start, replace, or stop a named child actor. Child paths are capability-rooted
+inside the init package rather than ambient host paths. The host reports typed
+started, stopped, and failed child events back to the init actor. Restart
+policy, backoff, dependency order, optional services, and topology therefore
+remain guest behavior rather than a host-owned desired-graph format.
+
+A surface-session root may also request a named Wayland app with an argv. The
+host binds that process and its pane to the root's session and reports typed
+started, stopped, and failed events. Choosing `foot` as the default terminal is
+therefore behavior in the default root artifact, not compositor startup policy.
+
+Only the realm's root receives actor management, and only a surface-session
+root receives app launch. A child cannot replace the root or stop an actor it
+does not own, and actors in one placement cannot use init authority in another
+placement. A client init actor creates client-local actors; a session init actor
+creates backend actors and apps in its own surface session.
+
+The host retains mechanism and recovery responsibility. It validates identities
+and package-root paths, enforces generation and resource limits, and hard-stops
+Stores, workers, operations, native children, streams, mailboxes, and stale
+generations when a realm exits or an actor cannot cooperate. Recovery startup
+may explicitly omit the init actor so a broken root cannot make the realm
+uninspectable.
+
 ## Actors
 
 An actor is the public unit of plugin state, communication, and fault isolation.

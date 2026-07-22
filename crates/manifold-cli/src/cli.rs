@@ -76,6 +76,12 @@ pub struct SessionArgs {
     /// Load a self-contained target-shape WASM plugin module.
     #[arg(long = "wasm-plugin", value_name = "PATH")]
     pub wasm_plugin: Option<PathBuf>,
+    /// Override the blessed session init actor.
+    #[arg(long = "init-actor", value_name = "PATH", conflicts_with = "no_init")]
+    pub init_actor: Option<PathBuf>,
+    /// Start the realm without its configured init actor for recovery.
+    #[arg(long = "no-init")]
+    pub no_init: bool,
     /// Load a target-shape WASM key policy provider as NAME from PATH.
     #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     pub wasm_key_policy: Option<Vec<String>>,
@@ -119,6 +125,8 @@ impl Default for SessionArgs {
             test_surface_markers: false,
             browser: None,
             wasm_plugin: None,
+            init_actor: None,
+            no_init: false,
             wasm_key_policy: None,
             test_harness: None,
             nested_inner_dbus_name: None,
@@ -268,6 +276,15 @@ pub struct ClientArgs {
     /// Override the session server executable used for auto-start.
     #[arg(long = "server", value_name = "PATH")]
     pub server: Option<PathBuf>,
+    /// Config file used to select the blessed client init actor.
+    #[arg(long = "config", value_name = "PATH")]
+    pub config: Option<PathBuf>,
+    /// Override the blessed client init actor.
+    #[arg(long = "init-actor", value_name = "PATH", conflicts_with = "no_init")]
+    pub init_actor: Option<PathBuf>,
+    /// Start the realm without its configured init actor for recovery.
+    #[arg(long = "no-init")]
+    pub no_init: bool,
     /// Start a presentation-scoped WASM actor as ID from PATH.
     #[arg(long = "wasm-actor", value_name = "ID=PATH")]
     pub wasm_actors: Vec<String>,
@@ -282,7 +299,7 @@ pub struct ClientArgs {
     )]
     pub check_wasm_key_policy: bool,
     /// Validate configured presentation actors without opening a presentation.
-    #[arg(long = "check-wasm-actors", hide = true, requires = "wasm_actors")]
+    #[arg(long = "check-wasm-actors", hide = true)]
     pub check_wasm_actors: bool,
 }
 

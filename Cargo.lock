@@ -2378,6 +2378,8 @@ dependencies = [
  "manifold-ipc",
  "serde",
  "serde_json",
+ "tempfile",
+ "toml",
  "zbus",
 ]
 
