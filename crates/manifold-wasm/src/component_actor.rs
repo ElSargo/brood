@@ -43,7 +43,8 @@ use crate::filesystem_watch::{
 use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::presentation::{
-    PresentationError, PresentationEvent, PresentationHost, TextLayoutOptions,
+    PresentationError, PresentationEvent, PresentationHost, SessionCommandRequest, SessionEvent,
+    SessionOperation, TextLayoutOptions,
 };
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
@@ -163,6 +164,7 @@ pub enum ComponentActorEvent {
         actor: String,
         body: Vec<u8>,
     },
+    SessionCommandRequested(SessionCommandRequest),
     Stopped,
 }
 
@@ -203,6 +205,9 @@ pub struct ComponentActorConfig {
     /// Admit explicitly addressed presentation-to-session actor messages.
     /// Backend actors never receive this cross-placement capability.
     pub session_messaging: bool,
+    /// Admit typed session catalogue commands. Presentation clients set this
+    /// for client-realm Component actors only.
+    pub session_control: bool,
     pub dispatcher_deadline: Duration,
     /// Wall-clock cadence for guest interruption checks. Epoch yields keep the
     /// executor responsive; cross-call worker fairness uses `worker-yield`.
@@ -233,6 +238,7 @@ impl Default for ComponentActorConfig {
             actor_management: false,
             app_management: false,
             session_messaging: false,
+            session_control: false,
             dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
@@ -1497,6 +1503,7 @@ enum RuntimeCommand {
     Child(ComponentChildEvent),
     App(ComponentAppEvent),
     Presentation(PresentationEvent),
+    Session(SessionEvent),
     Shutdown,
 }
 
@@ -1752,6 +1759,14 @@ impl ComponentActor {
             .map_err(|error| {
                 anyhow::anyhow!("component actor rejected presentation event: {error}")
             })
+    }
+
+    /// Deliver one typed session snapshot or command completion without
+    /// blocking the presentation event loop.
+    pub fn try_send_session_event(&self, event: SessionEvent) -> Result<()> {
+        self.commands
+            .try_send(RuntimeCommand::Session(event))
+            .map_err(|error| anyhow::anyhow!("component actor rejected session event: {error}"))
     }
 
     /// Deliver lifecycle feedback for one child owned by a blessed init actor.
@@ -2207,6 +2222,13 @@ async fn run_component_event_loop(
                         event,
                     );
                 }
+                Some(RuntimeCommand::Session(event)) => {
+                    enqueue_dispatch(
+                        &mut system_queue,
+                        component_system_capacity(config),
+                        component_session_to_guest(event),
+                    )?;
+                }
                 Some(RuntimeCommand::Shutdown) | None => break,
             },
             completion = io_completions.recv(), if completion_queue.len() < config.max_outstanding_io => {
@@ -2336,6 +2358,16 @@ async fn run_component_event_loop(
                                                     body: request.body,
                                                 })
                                                 .context("session actor message request queue is full")?;
+                                        }
+                                        abi::Command::SessionCommand(request) => {
+                                            ensure!(
+                                                config.session_control,
+                                                "session command requested outside a client realm"
+                                            );
+                                            let request = component_session_command_from_guest(request)?;
+                                            event_observer
+                                                .try_send(ComponentActorEvent::SessionCommandRequested(request))
+                                                .context("session command request queue is full")?;
                                         }
                                         abi::Command::Stop => return Ok(()),
                                     }
@@ -2585,12 +2617,14 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
         PresentationEvent::Key {
             pane,
             physical_key,
+            logical_key,
             pressed,
             repeat,
             modifiers,
         } => abi::PresentationEvent::Key(abi::KeyEvent {
             pane,
             physical_key,
+            logical_key,
             pressed,
             repeat,
             modifiers,
@@ -2600,6 +2634,92 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
         }
     };
     abi::Event::Presentation(event)
+}
+
+fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
+    use bindings::exports::manifold::plugin::actor as abi;
+
+    let event = match event {
+        SessionEvent::Snapshot(snapshot) => abi::SessionEvent::Snapshot(abi::SessionSnapshot {
+            revision: snapshot.revision,
+            active: snapshot.active,
+            sessions: snapshot
+                .sessions
+                .into_iter()
+                .map(|session| abi::SessionSummary {
+                    id: session.id,
+                    name: session.name,
+                    active: session.active,
+                    windows: session.windows,
+                })
+                .collect(),
+        }),
+        SessionEvent::CommandCompleted(completion) => {
+            abi::SessionEvent::CommandCompleted(abi::SessionCommandCompleted {
+                request: completion.request,
+                operation: component_session_operation_to_guest(completion.operation),
+                success: completion.success,
+                session: completion.session,
+                message: completion.message,
+            })
+        }
+    };
+    abi::Event::Session(event)
+}
+
+fn component_session_command_from_guest(
+    request: bindings::exports::manifold::plugin::actor::SessionCommand,
+) -> Result<SessionCommandRequest> {
+    use bindings::exports::manifold::plugin::actor as abi;
+
+    let operation = match request.operation {
+        abi::SessionOperation::Refresh => SessionOperation::Refresh,
+        abi::SessionOperation::Activate => SessionOperation::Activate,
+        abi::SessionOperation::Create => SessionOperation::Create,
+        abi::SessionOperation::Rename => SessionOperation::Rename,
+        abi::SessionOperation::Close => SessionOperation::Close,
+    };
+    match operation {
+        SessionOperation::Refresh => ensure!(
+            request.session.is_none() && request.name.is_none(),
+            "refresh session command takes no arguments"
+        ),
+        SessionOperation::Activate | SessionOperation::Close => ensure!(
+            request.session.is_some_and(|session| session != 0) && request.name.is_none(),
+            "session command requires one non-zero session ID"
+        ),
+        SessionOperation::Create => ensure!(
+            request.session.is_none(),
+            "create session command does not accept a session ID"
+        ),
+        SessionOperation::Rename => ensure!(
+            request.session.is_some_and(|session| session != 0)
+                && request
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !name.trim().is_empty()),
+            "rename session command requires a session ID and non-empty name"
+        ),
+    }
+    Ok(SessionCommandRequest {
+        request: request.request,
+        operation,
+        session: request.session,
+        name: request.name,
+    })
+}
+
+const fn component_session_operation_to_guest(
+    operation: SessionOperation,
+) -> bindings::exports::manifold::plugin::actor::SessionOperation {
+    use bindings::exports::manifold::plugin::actor as abi;
+    match operation {
+        SessionOperation::Refresh => abi::SessionOperation::Refresh,
+        SessionOperation::Activate => abi::SessionOperation::Activate,
+        SessionOperation::Create => abi::SessionOperation::Create,
+        SessionOperation::Rename => abi::SessionOperation::Rename,
+        SessionOperation::Close => abi::SessionOperation::Close,
+    }
 }
 
 fn component_child_to_guest(event: ComponentChildEvent) -> GuestEvent {

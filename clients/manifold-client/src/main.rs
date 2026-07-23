@@ -18,9 +18,10 @@ use clap::Parser;
 use manifold_cli::{
     ClientArgs,
     control::{
-        ControlTarget, DmabufFrame, ServerLaunch, connect_or_spawn, dmabuf_resource,
-        open_presentation_fast_path, request_dbus_command, resolve_control_target,
-        session_marker_value,
+        ControlTarget, DmabufFrame, ServerLaunch, activate_surface_session, close_surface_session,
+        connect_or_spawn, create_surface_session, dmabuf_resource, list_surface_sessions,
+        open_presentation_fast_path, rename_surface_session, request_dbus_command,
+        resolve_control_target, session_marker_value,
     },
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
@@ -33,7 +34,7 @@ use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId},
 };
@@ -47,7 +48,10 @@ mod plugin_graphics;
 use actor_runtime::PresentationWasmRuntime;
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
 use layout::{LayoutSource, convert_actor_layout, native_flat_layout};
-use manifold_wasm::{GlobalKeyDecision, HostMessage, PresentationEvent};
+use manifold_wasm::{
+    GlobalKeyDecision, HostMessage, PresentationEvent, SessionCommandCompletion,
+    SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
+};
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
 
@@ -334,6 +338,11 @@ enum ClientEvent {
         description: String,
         result: Result<String, String>,
     },
+    SessionSnapshot(SessionSnapshot),
+    SessionCommandCompleted {
+        actor_id: String,
+        completion: SessionCommandCompletion,
+    },
     ActorHostMessagesReady,
 }
 
@@ -585,8 +594,13 @@ impl InputLane {
 }
 
 struct BackendCommandLane {
-    sender: Option<mpsc::SyncSender<BackendCommand>>,
+    sender: Option<mpsc::SyncSender<BackendRequest>>,
     worker: Option<thread::JoinHandle<()>>,
+}
+
+enum BackendRequest {
+    Control(BackendCommand),
+    Session(actor_runtime::SessionCommandEnvelope),
 }
 
 struct BackendCommand {
@@ -599,21 +613,49 @@ impl BackendCommandLane {
         target: ControlTarget,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel::<BackendCommand>(32);
+        let (sender, receiver) = mpsc::sync_channel::<BackendRequest>(32);
         let worker = thread::Builder::new()
             .name("manifold-backend-commands".to_string())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
-                    let result = request_dbus_command(&target, &command.argv, false)
-                        .map_err(|error| format!("{error:#}"));
-                    if proxy
-                        .send_event(ClientEvent::BackendCommandCompleted {
-                            description: command.description,
-                            result,
-                        })
-                        .is_err()
-                    {
-                        return;
+                let mut previous_sessions = Vec::new();
+                let mut session_revision = 0_u64;
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(500)) {
+                        Ok(BackendRequest::Control(command)) => {
+                            let result = request_dbus_command(&target, &command.argv, false)
+                                .map_err(|error| format!("{error:#}"));
+                            if proxy
+                                .send_event(ClientEvent::BackendCommandCompleted {
+                                    description: command.description,
+                                    result,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(BackendRequest::Session(command)) => {
+                            let completion = execute_session_command(&target, command.request);
+                            if proxy
+                                .send_event(ClientEvent::SessionCommandCompleted {
+                                    actor_id: command.actor_id,
+                                    completion,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if let Err(error) = publish_session_snapshot(
+                        &target,
+                        &proxy,
+                        &mut previous_sessions,
+                        &mut session_revision,
+                    ) {
+                        eprintln!("failed to refresh presentation session snapshot: {error:#}");
                     }
                 }
             })
@@ -628,11 +670,19 @@ impl BackendCommandLane {
         self.sender
             .as_ref()
             .context("presentation backend command worker is stopped")?
-            .try_send(BackendCommand {
+            .try_send(BackendRequest::Control(BackendCommand {
                 description: description.into(),
                 argv,
-            })
+            }))
             .context("presentation backend command queue is full or closed")
+    }
+
+    fn try_send_session(&self, command: actor_runtime::SessionCommandEnvelope) -> Result<()> {
+        self.sender
+            .as_ref()
+            .context("presentation backend command worker is stopped")?
+            .try_send(BackendRequest::Session(command))
+            .context("presentation session-command queue is full or closed")
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -643,6 +693,103 @@ impl BackendCommandLane {
                 .map_err(|_panic| anyhow!("presentation backend command worker panicked"))?;
         }
         Ok(())
+    }
+}
+
+fn publish_session_snapshot(
+    target: &ControlTarget,
+    proxy: &winit::event_loop::EventLoopProxy<ClientEvent>,
+    previous: &mut Vec<manifold_cli::control::SurfaceSessionSummary>,
+    revision: &mut u64,
+) -> Result<()> {
+    let sessions = list_surface_sessions(target)?;
+    if sessions == *previous {
+        return Ok(());
+    }
+    *revision = revision.saturating_add(1);
+    let active = sessions
+        .iter()
+        .find(|session| session.active)
+        .map_or(0, |session| session.id);
+    let snapshot = SessionSnapshot {
+        revision: *revision,
+        active,
+        sessions: sessions
+            .iter()
+            .map(|session| SessionSummary {
+                id: session.id,
+                name: session.name.clone(),
+                active: session.active,
+                windows: session.windows,
+            })
+            .collect(),
+    };
+    eprintln!(
+        "presentation session snapshot revision={} active={} sessions={}",
+        snapshot.revision,
+        snapshot.active,
+        snapshot.sessions.len()
+    );
+    *previous = sessions;
+    proxy
+        .send_event(ClientEvent::SessionSnapshot(snapshot))
+        .map_err(|_stopped| anyhow!("presentation event loop stopped"))
+}
+
+fn execute_session_command(
+    target: &ControlTarget,
+    request: SessionCommandRequest,
+) -> SessionCommandCompletion {
+    let request_id = request.request;
+    let operation = request.operation;
+    let session = request.session;
+    let name = request.name;
+    let result = match operation {
+        SessionOperation::Refresh => list_surface_sessions(target).map(|_| None),
+        SessionOperation::Activate => session
+            .context("activate request is missing a session ID")
+            .and_then(|session| {
+                activate_surface_session(target, session).and_then(|changed| {
+                    anyhow::ensure!(changed, "session {session} is unavailable");
+                    Ok(Some(session))
+                })
+            }),
+        SessionOperation::Create => {
+            create_surface_session(target, name.unwrap_or_default()).map(Some)
+        }
+        SessionOperation::Rename => session
+            .context("rename request is missing a session ID")
+            .and_then(|session| {
+                let name = name.context("rename request is missing a name")?;
+                rename_surface_session(target, session, name).and_then(|changed| {
+                    anyhow::ensure!(changed, "session {session} was not renamed");
+                    Ok(Some(session))
+                })
+            }),
+        SessionOperation::Close => session
+            .context("close request is missing a session ID")
+            .and_then(|session| {
+                close_surface_session(target, session).and_then(|changed| {
+                    anyhow::ensure!(changed, "session {session} was not closed");
+                    Ok(Some(session))
+                })
+            }),
+    };
+    match result {
+        Ok(session) => SessionCommandCompletion {
+            request: request_id,
+            operation,
+            success: true,
+            session,
+            message: String::new(),
+        },
+        Err(error) => SessionCommandCompletion {
+            request: request_id,
+            operation,
+            success: false,
+            session,
+            message: format!("{error:#}"),
+        },
     }
 }
 
@@ -696,6 +843,9 @@ impl Application {
                 return Err(anyhow!(
                     "backend command completion reached scene transport path"
                 ));
+            }
+            ClientEvent::SessionSnapshot(_) | ClientEvent::SessionCommandCompleted { .. } => {
+                return Err(anyhow!("session event reached scene transport path"));
             }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
@@ -841,24 +991,32 @@ impl Application {
     }
 
     fn drain_wasm_events(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        let result = (|| {
-            let Some(runtime) = self.wasm_runtime.as_mut() else {
-                return Ok(());
-            };
-            runtime.drain_events()?;
-            let messages = runtime.drain_session_messages();
-            if messages.is_empty() {
-                return Ok(());
-            }
-            let lane = self
-                .actor_message_sender
-                .as_mut()
-                .context("presentation actor requested a session message without a backend")?;
-            for message in &messages {
-                lane.send(message)?;
-            }
-            Ok(())
-        })();
+        let result =
+            (|| {
+                let Some(runtime) = self.wasm_runtime.as_mut() else {
+                    return Ok(());
+                };
+                runtime.drain_events()?;
+                let messages = runtime.drain_session_messages();
+                let commands = runtime.drain_session_commands();
+                if !commands.is_empty() {
+                    let lane = self.backend_commands.as_ref().context(
+                        "presentation actor requested session control without a backend",
+                    )?;
+                    for command in commands {
+                        lane.try_send_session(command)?;
+                    }
+                }
+                if !messages.is_empty() {
+                    let lane = self.actor_message_sender.as_mut().context(
+                        "presentation actor requested a session message without a backend",
+                    )?;
+                    for message in &messages {
+                        lane.send(message)?;
+                    }
+                }
+                Ok(())
+            })();
         if let Err(error) = result {
             self.error = Some(error);
             event_loop.exit();
@@ -1062,6 +1220,34 @@ impl ApplicationHandler<ClientEvent> for Application {
                     eprintln!("presentation backend command failed command={description}: {error}");
                 }
             },
+            ClientEvent::SessionSnapshot(snapshot) => {
+                if let Some(runtime) = self.wasm_runtime.as_ref()
+                    && let Err(error) =
+                        runtime.broadcast_session_event(&SessionEvent::Snapshot(snapshot))
+                {
+                    self.fail(event_loop, error);
+                }
+            }
+            ClientEvent::SessionCommandCompleted {
+                actor_id,
+                completion,
+            } => {
+                eprintln!(
+                    "presentation session command completed actor={} request={} operation={:?} success={} session={:?} message={}",
+                    actor_id,
+                    completion.request,
+                    completion.operation,
+                    completion.success,
+                    completion.session,
+                    completion.message,
+                );
+                if let Some(runtime) = self.wasm_runtime.as_ref()
+                    && let Err(error) = runtime
+                        .send_session_event(&actor_id, SessionEvent::CommandCompleted(completion))
+                {
+                    self.fail(event_loop, error);
+                }
+            }
             ClientEvent::ActorHostMessagesReady => {
                 if let Err(error) = self.apply_actor_host_messages() {
                     self.fail(event_loop, error);
@@ -1466,6 +1652,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                             PresentationEvent::Key {
                                 pane,
                                 physical_key,
+                                logical_key: plugin_logical_key(&event.logical_key),
                                 pressed: event.state == ElementState::Pressed,
                                 repeat: event.repeat,
                                 modifiers,
@@ -1539,6 +1726,29 @@ impl ApplicationHandler<ClientEvent> for Application {
             },
             _ => {}
         }
+    }
+}
+
+fn plugin_logical_key(key: &Key) -> String {
+    match key {
+        Key::Character(character) => character.to_string(),
+        Key::Named(named) => match named {
+            NamedKey::Enter => "Enter",
+            NamedKey::Escape => "Escape",
+            NamedKey::Backspace => "Backspace",
+            NamedKey::Delete => "Delete",
+            NamedKey::ArrowUp => "ArrowUp",
+            NamedKey::ArrowDown => "ArrowDown",
+            NamedKey::ArrowLeft => "ArrowLeft",
+            NamedKey::ArrowRight => "ArrowRight",
+            NamedKey::F2 => "F2",
+            _ => "",
+        }
+        .to_string(),
+        Key::Dead(character) => {
+            character.map_or_else(String::new, |character| character.to_string())
+        }
+        Key::Unidentified(_) => String::new(),
     }
 }
 

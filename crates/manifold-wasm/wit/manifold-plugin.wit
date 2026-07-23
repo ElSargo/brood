@@ -416,11 +416,55 @@ interface actor {
     record key-event {
         pane: u64,
         physical-key: u32,
+        /// Stable semantic name for non-text keys and the logical character
+        /// for printable keys. Text insertion still uses `text-event`.
+        logical-key: string,
         pressed: bool,
         repeat: bool,
         modifiers: u32,
     }
     record text-event { pane: u64, text: string }
+
+    record session-summary {
+        id: u64,
+        name: string,
+        active: bool,
+        windows: u64,
+    }
+
+    record session-snapshot {
+        revision: u64,
+        active: u64,
+        sessions: list<session-summary>,
+    }
+
+    enum session-operation {
+        refresh,
+        activate,
+        create,
+        rename,
+        close,
+    }
+
+    record session-command {
+        request: u64,
+        operation: session-operation,
+        session: option<u64>,
+        name: option<string>,
+    }
+
+    record session-command-completed {
+        request: u64,
+        operation: session-operation,
+        success: bool,
+        session: option<u64>,
+        message: string,
+    }
+
+    variant session-event {
+        snapshot(session-snapshot),
+        command-completed(session-command-completed),
+    }
 
     variant presentation-event {
         pane-created(pane-created),
@@ -444,6 +488,8 @@ interface actor {
         /// Lifecycle feedback for apps launched by this session's blessed init actor.
         app(app-event),
         presentation(presentation-event),
+        /// Client-realm session catalogue state and command completion.
+        session(session-event),
     }
 
     variant command {
@@ -466,6 +512,9 @@ interface actor {
         /// in a connected surface-session realm. Only presentation actors have
         /// this cross-placement capability.
         send-session-message(session-actor-message),
+        /// Request a typed session catalogue operation from the presentation
+        /// client. Completion and the resulting snapshot arrive as events.
+        session-command(session-command),
         stop,
     }
 

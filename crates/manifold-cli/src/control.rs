@@ -39,6 +39,7 @@ type DbusDmabufFrame = (
     bool,
     zbus::zvariant::OwnedFd,
 );
+type DbusSurfaceSession = (u64, String, bool, u64);
 
 #[proxy(
     interface = "org.manifold.Session.Control",
@@ -59,6 +60,26 @@ trait ManifoldControl {
         zbus::zvariant::OwnedFd,
     )>;
     fn dmabuf_resource(&self, resource_id: u64) -> zbus::Result<DbusDmabufFrame>;
+}
+
+#[proxy(
+    interface = "org.manifold.Session",
+    default_path = "/org/manifold/Session"
+)]
+trait ManifoldSession {
+    fn list_surface_sessions(&self) -> zbus::Result<Vec<DbusSurfaceSession>>;
+    fn activate_surface_session(&self, id: u64) -> zbus::Result<bool>;
+    fn create_surface_session(&self, name: String) -> zbus::Result<u64>;
+    fn rename_surface_session(&self, id: u64, name: String) -> zbus::Result<bool>;
+    fn close_surface_session(&self, id: u64) -> zbus::Result<bool>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceSessionSummary {
+    pub id: u64,
+    pub name: String,
+    pub active: bool,
+    pub windows: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +220,63 @@ pub fn request_dbus_command(
             target.destination
         )
     })
+}
+
+fn session_proxy<'a>(
+    connection: &'a zbus::blocking::Connection,
+    target: &'a ControlTarget,
+) -> Result<ManifoldSessionProxyBlocking<'a>> {
+    ManifoldSessionProxyBlocking::builder(connection)
+        .destination(target.destination.as_str())?
+        .path(CONTROL_OBJECT_PATH)?
+        .build()
+        .context("build Manifold session proxy")
+}
+
+pub fn list_surface_sessions(target: &ControlTarget) -> Result<Vec<SurfaceSessionSummary>> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .list_surface_sessions()
+        .context("list Manifold surface sessions")
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .map(|(id, name, active, windows)| SurfaceSessionSummary {
+                    id,
+                    name,
+                    active,
+                    windows,
+                })
+                .collect()
+        })
+}
+
+pub fn activate_surface_session(target: &ControlTarget, id: u64) -> Result<bool> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .activate_surface_session(id)
+        .with_context(|| format!("activate Manifold surface session {id}"))
+}
+
+pub fn create_surface_session(target: &ControlTarget, name: String) -> Result<u64> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .create_surface_session(name)
+        .context("create Manifold surface session")
+}
+
+pub fn rename_surface_session(target: &ControlTarget, id: u64, name: String) -> Result<bool> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .rename_surface_session(id, name)
+        .with_context(|| format!("rename Manifold surface session {id}"))
+}
+
+pub fn close_surface_session(target: &ControlTarget, id: u64) -> Result<bool> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .close_surface_session(id)
+        .with_context(|| format!("close Manifold surface session {id}"))
 }
 
 fn presentation_proxy<'a>(

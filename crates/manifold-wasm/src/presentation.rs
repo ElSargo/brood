@@ -125,6 +125,7 @@ pub enum PresentationEvent {
     Key {
         pane: u64,
         physical_key: u32,
+        logical_key: String,
         pressed: bool,
         repeat: bool,
         modifiers: u32,
@@ -133,4 +134,55 @@ pub enum PresentationEvent {
         pane: u64,
         text: String,
     },
+}
+
+/// One backend surface session as observed by a presentation-local actor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    pub id: u64,
+    pub name: String,
+    pub active: bool,
+    pub windows: u64,
+}
+
+/// Latest-state session catalogue delivered by the presentation client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSnapshot {
+    pub revision: u64,
+    pub active: u64,
+    pub sessions: Vec<SessionSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionOperation {
+    Refresh,
+    Activate,
+    Create,
+    Rename,
+    Close,
+}
+
+/// One actor-owned request to mutate or refresh the session catalogue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCommandRequest {
+    pub request: u64,
+    pub operation: SessionOperation,
+    pub session: Option<u64>,
+    pub name: Option<String>,
+}
+
+/// Terminal result for a [`SessionCommandRequest`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCommandCompletion {
+    pub request: u64,
+    pub operation: SessionOperation,
+    pub success: bool,
+    pub session: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEvent {
+    Snapshot(SessionSnapshot),
+    CommandCompleted(SessionCommandCompletion),
 }

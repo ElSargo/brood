@@ -1,5 +1,6 @@
 [init]
 session = "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.component.wasm"
+client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.component.wasm"
 
 [module.default-workspace]
 enabled = true
@@ -30,11 +31,6 @@ auto_split_visible_limit = 3
 [startup.agent]
 enabled = true
 argv = ["foot", "--app-id", "pi-foot", "pi"]
-
-[startup.session-switcher]
-enabled = true
-realm = "presentation"
-argv = ["python3", "apps/manifold-session-switcher.py", "--width", "300"]
 
 [session.runner]
 enabled = true

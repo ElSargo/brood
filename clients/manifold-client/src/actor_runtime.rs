@@ -12,7 +12,8 @@ use manifold_wasm::{
     NativeFilesystemWatcherService, PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext,
     PluginStartReason, PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor,
     Preview1FilesystemGrant, Preview1WorkerConfig, Registry, RuntimeIoCapabilities,
-    RuntimeIoConfig, WasmActor, WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
+    RuntimeIoConfig, SessionCommandRequest, SessionEvent, WasmActor, WasmActorDeclaration,
+    WasmActorEventKind, WasmPluginArtifact,
 };
 use tokio::sync::Mutex;
 use winit::event_loop::EventLoopProxy;
@@ -38,6 +39,7 @@ pub struct PresentationWasmRuntime {
     graphics: Option<PluginGraphicsBridge>,
     init: Option<PresentationInitState>,
     outbound_session_messages: VecDeque<SessionActorMessageRequest>,
+    outbound_session_commands: VecDeque<SessionCommandEnvelope>,
     bound_session_id: Option<u64>,
     next_actor_pane: u64,
 }
@@ -47,6 +49,11 @@ pub struct SessionActorMessageRequest {
     pub session_id: u64,
     pub actor: String,
     pub body: Vec<u8>,
+}
+
+pub struct SessionCommandEnvelope {
+    pub actor_id: String,
+    pub request: SessionCommandRequest,
 }
 
 struct PresentationInitState {
@@ -96,6 +103,7 @@ impl PresentationWasmRuntime {
             graphics: graphics.cloned(),
             init: None,
             outbound_session_messages: VecDeque::new(),
+            outbound_session_commands: VecDeque::new(),
             bound_session_id: session_id,
             next_actor_pane: u64::MAX,
         };
@@ -390,6 +398,18 @@ impl PresentationWasmRuntime {
                             body,
                         });
                 }
+                ComponentActorEvent::SessionCommandRequested(request) => {
+                    ensure!(
+                        self.outbound_session_commands.len() < 64,
+                        "presentation session-command queue is full"
+                    );
+                    eprintln!(
+                        "queued presentation actor session command actor={} request={} operation={:?}",
+                        actor_id, request.request, request.operation
+                    );
+                    self.outbound_session_commands
+                        .push_back(SessionCommandEnvelope { actor_id, request });
+                }
                 _ => {}
             }
         }
@@ -538,6 +558,36 @@ impl PresentationWasmRuntime {
 
     pub fn drain_session_messages(&mut self) -> Vec<SessionActorMessageRequest> {
         self.outbound_session_messages.drain(..).collect()
+    }
+
+    pub fn drain_session_commands(&mut self) -> Vec<SessionCommandEnvelope> {
+        self.outbound_session_commands.drain(..).collect()
+    }
+
+    pub fn broadcast_session_event(&self, event: &SessionEvent) -> Result<usize> {
+        let mut delivered = 0;
+        for (actor_id, actor) in &self.actors {
+            if let HostedWasmActor::Component(actor) = &actor.actor {
+                actor
+                    .try_send_session_event(event.clone())
+                    .with_context(|| format!("deliver session event to actor {actor_id:?}"))?;
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
+    pub fn send_session_event(&self, actor_id: &str, event: SessionEvent) -> Result<()> {
+        let actor = self
+            .actors
+            .get(actor_id)
+            .with_context(|| format!("presentation actor {actor_id:?} is unavailable"))?;
+        match &actor.actor {
+            HostedWasmActor::Component(actor) => actor.try_send_session_event(event),
+            HostedWasmActor::Preview1(_) => {
+                anyhow::bail!("Preview 1 compatibility actors cannot use session control")
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -692,6 +742,7 @@ async fn load_hosted_actor(
                     }),
                     actor_management,
                     session_messaging: true,
+                    session_control: true,
                     ..ComponentActorConfig::default()
                 },
             )

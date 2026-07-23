@@ -1,0 +1,14 @@
+[package]
+name = "manifold-session-switcher-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+manifold-graphics = { path = "../../crates/manifold-graphics" }
+wit-bindgen = "0.57.1"
+
+[workspace]

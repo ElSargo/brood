@@ -94,7 +94,9 @@ pub use policy_provider::{
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
 pub use presentation::{
-    PresentationError, PresentationEvent, PresentationHost, TextLayoutOptions, TextLayoutResult,
+    PresentationError, PresentationEvent, PresentationHost, SessionCommandCompletion,
+    SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
+    TextLayoutOptions, TextLayoutResult,
 };
 pub use preview1_worker::{
     COMPAT_DISPATCH_EXPORT, COMPAT_MARKER_EXPORT, COMPAT_MARKER_MAGIC, COMPAT_WORKER_EXPORT,
