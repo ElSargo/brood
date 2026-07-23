@@ -165,6 +165,9 @@ pub enum ComponentActorEvent {
         body: Vec<u8>,
     },
     SessionCommandRequested(SessionCommandRequest),
+    HostMessageRequested {
+        payload: Vec<u8>,
+    },
     Stopped,
 }
 
@@ -2368,6 +2371,17 @@ async fn run_component_event_loop(
                                             event_observer
                                                 .try_send(ComponentActorEvent::SessionCommandRequested(request))
                                                 .context("session command request queue is full")?;
+                                        }
+                                        abi::Command::SendHostMessage(payload) => {
+                                            ensure!(
+                                                payload.len() <= crate::MAX_MAILBOX_MESSAGE_BYTES,
+                                                "component host message exceeds the mailbox message byte limit"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::HostMessageRequested {
+                                                    payload,
+                                                })
+                                                .context("component host message request queue is full")?;
                                         }
                                         abi::Command::Stop => return Ok(()),
                                     }

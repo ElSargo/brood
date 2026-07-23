@@ -12,6 +12,18 @@ pub struct ResolvedLayout {
     pub items: Vec<ResolvedLayoutItem>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutLeaseToken {
+    pub id: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LayoutChildSlot {
+    pub z: f64,
+    pub transform: LocalTransform,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LayoutItemId(pub u64);

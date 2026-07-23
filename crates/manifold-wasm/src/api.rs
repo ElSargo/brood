@@ -119,6 +119,16 @@ impl Registry {
         self.mailboxes.try_post_named_message(recipient, payload)
     }
 
+    pub fn try_post_named_message_from(
+        &self,
+        sender: ActorId,
+        recipient: &str,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.mailboxes
+            .try_post_named_message_from(sender, recipient, payload)
+    }
+
     pub fn try_post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
         self.mailboxes.try_post_message(recipient, payload)
     }

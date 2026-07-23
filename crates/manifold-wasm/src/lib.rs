@@ -77,8 +77,8 @@ pub use lifecycle::{
     PluginStopContext, PluginStopReason,
 };
 pub use mailbox::{
-    ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxRegistry,
-    PreparedMailboxRegistration,
+    ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxEnvelope,
+    MailboxRegistry, PreparedMailboxRegistration,
 };
 pub use module::{
     DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, LegacyWasmPluginArtifact,
@@ -106,8 +106,8 @@ pub use preview1_worker::{
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
 };
 pub use resolved_layout::{
-    InputBehavior, LayoutItemId, LayoutItemKind, LocalPoint, LocalTransform, ResolvedLayout,
-    ResolvedLayoutItem,
+    InputBehavior, LayoutChildSlot, LayoutItemId, LayoutItemKind, LayoutLeaseToken, LocalPoint,
+    LocalTransform, ResolvedLayout, ResolvedLayoutItem,
 };
 pub use resource_limits::WasmResourceLimits;
 pub use runtime_io::{

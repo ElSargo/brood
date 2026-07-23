@@ -2,12 +2,17 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-24
 ---
 
 # Input And Keyboard Shortcuts
 
-The target input model keeps final viewport key routing in the presentation client while allowing privileged presentation plugins to participate in immediate keyboard policy through local policy providers. Keys consumed by local UI or actors do not cross the backend connection; keys forwarded to hosted applications are sent under the current presentation lease.
+The target input model keeps final viewport key routing in the presentation
+client. One replaceable, privileged key-policy lease holder sequences immediate
+global keyboard decisions; any number of plugins contribute lifecycle-bound
+actions and binding suggestions without executing on every physical key. Keys
+consumed by local UI or actors do not cross the backend connection; keys
+forwarded to hosted applications are sent under the current presentation lease.
 
 ## Ownership
 
@@ -17,6 +22,8 @@ The presentation client owns:
 - focused surface/widget selection
 - reserved escape and recovery shortcuts
 - keymap conflict resolution
+- the host-owned action registry and active input scopes
+- the exclusive key-policy lease and temporary capture lease
 - action invocation
 - forwarding keys under the session presentation lease to managed client panes
 - suppressing or replaying modifier events as needed
@@ -26,37 +33,73 @@ Plugins may contribute:
 - action and command registrations
 - default shortcut suggestions
 - contextual enablement predicates
-- privileged key policy providers
+- a candidate global key-policy provider
 - actor-handled command behavior after invocation
 
 ## Default Shortcut Model
 
-Most plugins should register actions, not observe raw keyboard input.
+Raw input is an ordered, consumable stream rather than a broadcast event. Most
+plugins register actions instead of observing it.
 
 ```text
 plugin registers Action { id, title, scope, default_binding, target_actor }
-user and client keymap resolve conflicts
-client matches key input in the current focus/context
-client sends InvokeAction to the owning actor or executes a client command
+host retains registration for the owner generation
+global key sequencer receives registry + active context publication
+sequencer matches arbitrary chords, leaders, modes, or contextual rules
+client validates the winner and sends InvokeAction
 ```
 
-User configuration and client-reserved bindings override plugin defaults. Conflicts should be visible in diagnostics and configuration UI.
+Action scopes include presentation-global, active session, active or visible
+layout lease, focused subtree, and focused pane. A registration scoped to a
+layout lease becomes inactive when that lease is hidden or revoked.
+
+Plugin bindings are suggestions, not claims over physical keys. User
+configuration and client-reserved bindings override plugin defaults. Conflicts
+are resolved deterministically rather than by plugin load or response order and
+remain visible in diagnostics and configuration UI.
 
 ## Routing Order
 
 The target routing order is:
 
 1. client-reserved safety and recovery keys
-2. focused native widget/text-input behavior
-3. granted local key policy provider for the active context
-4. client keymap/action dispatch
+2. active temporary input capture, when explicitly granted
+3. the current global key-policy lease holder
+4. focused client-local pane or native widget when forwarded
 5. lease-authorized forwarding to the focused managed client pane
 
-The exact order may be specialized for modes, but raw keyboard observation remains a separate capability. Ordinary plugins should not become global keyloggers.
+The global provider receives focus and input-method context and decides whether
+normal focused delivery continues. Raw keyboard observation remains a separate
+capability. Ordinary plugins do not become global keyloggers merely by
+registering an action.
+
+## Input Authority
+
+Input uses distinct authority objects:
+
+- `KeyPolicyLease` is the exclusive right to sequence global raw-key decisions;
+- `ActionRegistration` is a non-exclusive, lifecycle-bound action contribution;
+- `InputCaptureLease` is a temporary exclusive interception for a bounded scope;
+- the session presentation lease authorizes forwarding to hosted applications.
+
+The host mints and revokes the exclusive leases. An init actor may nominate or
+replace the key-policy provider, but the host records the holder and generation.
+Provider replacement, revocation, or failure clears partial chord state and
+resynchronizes consumed physical presses before the replacement can run.
+
+An input capture is the escape hatch for key-binding editors, command palettes,
+accessibility tools, or similar UI that genuinely needs raw input. It is
+exclusive for its scope, explicitly activated, bounded, and revocable. Global
+pointer, touch, or gesture capture follows the same rule; normal pointer input
+continues to use layout hit testing.
 
 ## Key Policy Provider
 
-A key policy provider is for modal or workspace-level behavior that must decide immediately whether a key is consumed, transformed, or forwarded.
+A key policy provider is the stateful global sequencer for modal or
+workspace-level behavior that must decide immediately whether a key is consumed,
+transformed, or forwarded. It may implement arbitrary chords, leaders, modes,
+tap/hold behavior, and contextual navigation. Centralizing sequencing does not
+restrict the policy language or require bindings to be hardcoded in the host.
 
 ```text
 KeyQuery {
@@ -67,7 +110,7 @@ KeyQuery {
   focus_context,
   pressed_modifier_state,
 }
-+ latest plugin publication frame
++ latest immutable registry and context publication
     -> KeyPolicyResult
 ```
 
@@ -81,7 +124,11 @@ KeyPolicyResult {
 }
 ```
 
-The provider may read its latest published state and return a message batch, but it does not mutate client or backend state or wait for actor work. The local client host applies accepted directives and enqueues messages only after the call returns.
+The provider may read its latest published state and return a message batch, but
+it does not mutate client or backend state, invoke another synchronous plugin,
+or wait for actor work. The local client host applies accepted directives and
+enqueues messages only after the call returns. There is at most one policy call
+per physical key event regardless of the number of registered actions.
 
 The presentation client constructs one typed invocation context before
 crossing into the WASM runtime. Its key query groups the code, press/release
@@ -112,14 +159,22 @@ shortcuts or wrapper arguments:
 These chords are guest policy. The client owns only validation, local focus and
 plugin-pane visibility, and the bounded backend command queue.
 
-## Configurable Actions TODO
+## Action Registry
 
-TODO: design configuration for user bindings and application actions before
-adding more compiled-in chords. The design needs one named action model shared
-by configuration and plugins, deterministic conflict resolution, bounded
-configuration delivery to the synchronous guest policy, and validated
-capabilities for application launch. Terminal choice and argv belong in that
-model rather than remaining hardcoded in the default-workspace WASM artifact.
+The host-owned registry retains stable action identity, owner generation,
+display metadata, scope, default binding suggestions, and the target actor or
+validated client command. Registration and conflict resolution happen outside
+the physical-key hot path. The provider receives a bounded immutable registry
+revision and active-context snapshot.
+
+Plugins update dynamic enablement asynchronously. The hot path does not call
+plugin-supplied predicates. A custom global policy may ignore suggested
+bindings and map the registered action identities using an entirely different
+key grammar.
+
+Configuration and plugin defaults share this named action model. Terminal
+choice, argument vectors, and similar application policy belong in registered
+actions and user configuration rather than compiled-in host chords.
 
 ## Actor Follow-Up
 
@@ -141,6 +196,8 @@ If a key should focus a local pane immediately, the result remains a client-vali
 
 Input diagnostics should separate client keymap behavior from policy provider and backend forwarding behavior:
 
+- active key-policy and input-capture lease generations
+- action-registry and active-context revisions
 - matched binding and scope
 - winning plugin/action
 - conflicts and overrides

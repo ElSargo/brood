@@ -81,6 +81,8 @@ pub extern "C" fn manifold_actor_layout_epoch_run(
         .collect::<Vec<_>>();
     let command = serde_json::json!({
         "type": "set-resolved-layout",
+        "lease": event.get("lease").cloned().unwrap_or(serde_json::Value::Null),
+        "revision": event.get("revision").cloned().unwrap_or(serde_json::Value::Null),
         "layout": {"items": items},
         "focus": panes[1]
     });

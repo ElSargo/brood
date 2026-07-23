@@ -7,6 +7,12 @@ session snapshots from `manifold-client`, renders them through canvas packets,
 and requests typed session operations without DBus, subprocesses, or a native
 toolkit inside the plugin.
 
+The child claims the root layout lease, keeps its own pane in a right sidebar,
+and asks the host to delegate every other pane through its `rest` slot to the
+configured `workspace` layout actor. Hiding the switcher removes its pane item
+and expands `rest` to the full viewport; showing it restores the sidebar without
+replacing the workspace actor or its private layout state.
+
 The pane supports:
 
 - pointer or keyboard session selection and activation;

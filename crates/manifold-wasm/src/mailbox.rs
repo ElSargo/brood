@@ -48,8 +48,15 @@ struct MailboxSender {
 
 #[derive(Debug)]
 struct MailboxMessage {
+    sender: Option<ActorId>,
     payload: Vec<u8>,
     _byte_permit: GenerationBytePermit,
+}
+
+#[derive(Debug)]
+pub struct MailboxEnvelope {
+    pub sender: Option<ActorId>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -198,7 +205,37 @@ impl MailboxRegistry {
         self.try_post_message(actor_id, payload)
     }
 
+    pub fn try_post_named_message_from(
+        &self,
+        sender: ActorId,
+        recipient: &str,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let actor_id = self
+            .actor_id_for_name(recipient)
+            .with_context(|| format!("unknown recipient actor name {recipient:?}"))?;
+        self.try_post_message_from(sender, actor_id, payload)
+    }
+
     pub fn try_post_message(&self, recipient: ActorId, payload: Vec<u8>) -> Result<()> {
+        self.try_post_message_with_sender(None, recipient, payload)
+    }
+
+    pub fn try_post_message_from(
+        &self,
+        sender: ActorId,
+        recipient: ActorId,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.try_post_message_with_sender(Some(sender), recipient, payload)
+    }
+
+    fn try_post_message_with_sender(
+        &self,
+        sender: Option<ActorId>,
+        recipient: ActorId,
+        payload: Vec<u8>,
+    ) -> Result<()> {
         ensure!(
             payload.len() <= MAX_MAILBOX_MESSAGE_BYTES,
             "mailbox message exceeds {MAX_MAILBOX_MESSAGE_BYTES} byte limit"
@@ -206,6 +243,7 @@ impl MailboxRegistry {
         let byte_permit = self.byte_budget.try_reserve(payload.len())?;
         self.mailbox_sender(recipient)?
             .try_send(MailboxMessage {
+                sender,
                 payload,
                 _byte_permit: byte_permit,
             })
@@ -221,6 +259,7 @@ impl MailboxRegistry {
         let sender = self.mailbox_sender(recipient)?.clone();
         sender
             .send(MailboxMessage {
+                sender: None,
                 payload,
                 _byte_permit: byte_permit,
             })
@@ -267,15 +306,29 @@ impl Mailbox {
     /// The WASM actor import copies this returned byte vector directly into the
     /// host-allocated guest mailbox arena before returning to guest code.
     pub async fn read_message(&mut self) -> Result<Vec<u8>> {
-        let Some(message) = self.inner.recv().await else {
+        let Some(envelope) = self.read_envelope().await else {
             bail!("actor {} mailbox is closed", self.actor_id.raw());
         };
-        Ok(message.payload)
+        Ok(envelope.payload)
     }
 
     pub fn try_read_message(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(self.try_read_envelope()?.map(|envelope| envelope.payload))
+    }
+
+    pub async fn read_envelope(&mut self) -> Option<MailboxEnvelope> {
+        self.inner.recv().await.map(|message| MailboxEnvelope {
+            sender: message.sender,
+            payload: message.payload,
+        })
+    }
+
+    pub fn try_read_envelope(&mut self) -> Result<Option<MailboxEnvelope>> {
         match self.inner.try_recv() {
-            Ok(message) => Ok(Some(message.payload)),
+            Ok(message) => Ok(Some(MailboxEnvelope {
+                sender: message.sender,
+                payload: message.payload,
+            })),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 bail!("actor {} mailbox is closed", self.actor_id.raw())

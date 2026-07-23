@@ -9,6 +9,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 manifold-graphics = { path = "../../crates/manifold-graphics" }
+serde = { version = "1.0", features = ["derive"] }
+serde-json-core = "0.6.0"
 wit-bindgen = "0.57.1"
 
 [workspace]

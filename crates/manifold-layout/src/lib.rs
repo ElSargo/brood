@@ -4,11 +4,16 @@
 //! transports, or plugin runtimes. Presentation hosts supply pane inventory and
 //! execute the accepted layout.
 
-use std::{collections::BTreeSet, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
 use num_traits::ToPrimitive;
 
 const MAX_RESOLVED_LAYOUT_ITEMS: usize = 512;
+const MAX_LAYOUT_LEASE_DEPTH: usize = 32;
 const NORMALIZED_MIN: f64 = -1.0;
 const NORMALIZED_MAX: f64 = 1.0;
 
@@ -168,6 +173,584 @@ impl ResolvedLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LayoutLeaseId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutLeaseToken {
+    pub id: LayoutLeaseId,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutChildSlot {
+    pub z: f64,
+    pub transform: LocalTransform,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutFragment {
+    pub layout: ResolvedLayout,
+    pub rest: Option<LayoutChildSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComposedLayout {
+    pub layout: ResolvedLayout,
+    pub focus: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayoutLeaseTree {
+    root: LayoutLeaseId,
+    nodes: BTreeMap<LayoutLeaseId, LayoutLeaseNode>,
+    next_lease: u64,
+    inventory_revision: u64,
+    inventory: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct LayoutLeaseNode {
+    generation: u64,
+    parent: Option<LayoutLeaseId>,
+    child: Option<LayoutLeaseId>,
+    owned_panes: Vec<u64>,
+    accepted: Option<AcceptedLayoutFragment>,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedLayoutFragment {
+    revision: u64,
+    fragment: LayoutFragment,
+    focus: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutLeaseError(String);
+
+impl Default for LayoutLeaseTree {
+    fn default() -> Self {
+        let root = LayoutLeaseId(1);
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            root,
+            LayoutLeaseNode {
+                generation: 1,
+                parent: None,
+                child: None,
+                owned_panes: Vec::new(),
+                accepted: None,
+            },
+        );
+        Self {
+            root,
+            nodes,
+            next_lease: 2,
+            inventory_revision: 0,
+            inventory: Vec::new(),
+        }
+    }
+}
+
+impl LayoutLeaseTree {
+    #[must_use]
+    pub fn root_token(&self) -> LayoutLeaseToken {
+        self.token_for(self.root).unwrap_or(LayoutLeaseToken {
+            id: self.root,
+            generation: 0,
+        })
+    }
+
+    #[must_use]
+    pub const fn inventory_revision(&self) -> u64 {
+        self.inventory_revision
+    }
+
+    pub fn renew_root(&mut self) -> Result<LayoutLeaseToken, LayoutLeaseError> {
+        let root_id = self.root;
+        let root = self.node_mut(root_id)?;
+        root.generation = root
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| LayoutLeaseError("layout lease generation is exhausted".into()))?;
+        root.accepted = None;
+        let token = self.root_token();
+        if token.generation == 0 {
+            return Err(LayoutLeaseError("root layout lease is unavailable".into()));
+        }
+        Ok(token)
+    }
+
+    pub fn update_inventory(
+        &mut self,
+        revision: u64,
+        panes: &[u64],
+    ) -> Result<(), LayoutLeaseError> {
+        if revision == 0 || revision < self.inventory_revision {
+            return Err(LayoutLeaseError(format!(
+                "layout inventory revision {revision} is not current after {}",
+                self.inventory_revision
+            )));
+        }
+        let inventory = panes.iter().copied().collect::<BTreeSet<_>>();
+        if inventory.len() != panes.len() {
+            return Err(LayoutLeaseError(
+                "layout inventory contains duplicate pane identities".into(),
+            ));
+        }
+        if revision != self.inventory_revision {
+            for node in self.nodes.values_mut() {
+                node.accepted = None;
+            }
+        }
+        for node in self.nodes.values_mut() {
+            node.owned_panes.retain(|pane| inventory.contains(pane));
+        }
+        let assigned = self
+            .nodes
+            .values()
+            .flat_map(|node| node.owned_panes.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let unassigned = panes
+            .iter()
+            .copied()
+            .filter(|pane| !assigned.contains(pane))
+            .collect::<Vec<_>>();
+        let leaf = self.deepest_lease()?;
+        let leaf_node = self.node_mut(leaf)?;
+        leaf_node.owned_panes.extend(unassigned);
+        for node in self.nodes.values_mut() {
+            let owned = node.owned_panes.iter().copied().collect::<BTreeSet<_>>();
+            node.owned_panes = panes
+                .iter()
+                .copied()
+                .filter(|pane| owned.contains(pane))
+                .collect();
+        }
+        self.inventory_revision = revision;
+        self.inventory = panes.to_vec();
+        Ok(())
+    }
+
+    pub fn grant_rest(
+        &mut self,
+        parent: LayoutLeaseToken,
+        panes: &[u64],
+    ) -> Result<LayoutLeaseToken, LayoutLeaseError> {
+        self.validate_token(parent)?;
+        let depth = self.depth(parent.id)?;
+        if depth >= MAX_LAYOUT_LEASE_DEPTH {
+            return Err(LayoutLeaseError(format!(
+                "layout lease depth exceeds {MAX_LAYOUT_LEASE_DEPTH}"
+            )));
+        }
+        let delegated = panes.iter().copied().collect::<BTreeSet<_>>();
+        if delegated.len() != panes.len() {
+            return Err(LayoutLeaseError(
+                "delegated layout pane set contains duplicates".into(),
+            ));
+        }
+        let parent_node = self.node(parent.id)?;
+        if parent_node.child.is_some() {
+            return Err(LayoutLeaseError(
+                "layout lease already has a rest child".into(),
+            ));
+        }
+        if !delegated
+            .iter()
+            .all(|pane| parent_node.owned_panes.contains(pane))
+        {
+            return Err(LayoutLeaseError(
+                "layout lease cannot delegate panes it does not own".into(),
+            ));
+        }
+        let id = LayoutLeaseId(self.next_lease);
+        self.next_lease = self
+            .next_lease
+            .checked_add(1)
+            .ok_or_else(|| LayoutLeaseError("layout lease identity space is exhausted".into()))?;
+        let parent_node = self.node_mut(parent.id)?;
+        parent_node
+            .owned_panes
+            .retain(|pane| !delegated.contains(pane));
+        parent_node.child = Some(id);
+        self.nodes.insert(
+            id,
+            LayoutLeaseNode {
+                generation: 1,
+                parent: Some(parent.id),
+                child: None,
+                owned_panes: panes.to_vec(),
+                accepted: None,
+            },
+        );
+        Ok(LayoutLeaseToken { id, generation: 1 })
+    }
+
+    pub fn submit(
+        &mut self,
+        token: LayoutLeaseToken,
+        revision: u64,
+        fragment: LayoutFragment,
+        focus: Option<u64>,
+    ) -> Result<(), LayoutLeaseError> {
+        self.validate_token(token)?;
+        if revision != self.inventory_revision {
+            return Err(LayoutLeaseError(format!(
+                "layout result revision {revision} does not match current revision {}",
+                self.inventory_revision
+            )));
+        }
+        let node = self.node(token.id)?;
+        if fragment.rest.is_some() != node.child.is_some() {
+            return Err(LayoutLeaseError(
+                "layout fragment rest slot does not match its delegated child".into(),
+            ));
+        }
+        fragment
+            .layout
+            .clone()
+            .validate_for_panes(&node.owned_panes)
+            .map_err(|error| LayoutLeaseError(error.to_string()))?;
+        if let Some(rest) = fragment.rest {
+            validate_child_slot(rest)?;
+        }
+        if let Some(focus) = focus
+            && !self.subtree_panes(token.id)?.contains(&focus)
+        {
+            return Err(LayoutLeaseError(format!(
+                "layout lease {} cannot focus pane {focus} outside its subtree",
+                token.id.0
+            )));
+        }
+        self.node_mut(token.id)?.accepted = Some(AcceptedLayoutFragment {
+            revision,
+            fragment,
+            focus,
+        });
+        Ok(())
+    }
+
+    pub fn compose(&self) -> Result<ComposedLayout, LayoutLeaseError> {
+        let (mut items, focus) = self.compose_node(self.root, 1)?;
+        for (index, item) in items.iter_mut().enumerate() {
+            item.z = index.to_f64().unwrap_or(f64::MAX);
+        }
+        let layout = ResolvedLayout { items }
+            .validate_for_panes(&self.inventory)
+            .map_err(|error| LayoutLeaseError(error.to_string()))?;
+        Ok(ComposedLayout { layout, focus })
+    }
+
+    pub fn collapse_wrapper(
+        &mut self,
+        token: LayoutLeaseToken,
+    ) -> Result<LayoutLeaseToken, LayoutLeaseError> {
+        self.validate_token(token)?;
+        let node = self.node(token.id)?.clone();
+        let child = node.child.ok_or_else(|| {
+            LayoutLeaseError("only a layout lease with a rest child can collapse".into())
+        })?;
+        let promoted_panes = self
+            .inventory
+            .iter()
+            .copied()
+            .filter(|pane| {
+                node.owned_panes.contains(pane)
+                    || self
+                        .node(child)
+                        .is_ok_and(|child_node| child_node.owned_panes.contains(pane))
+            })
+            .collect::<Vec<_>>();
+        {
+            let child_node = self.node_mut(child)?;
+            child_node.owned_panes = promoted_panes;
+            child_node.generation = child_node
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| LayoutLeaseError("layout lease generation is exhausted".into()))?;
+            child_node.parent = node.parent;
+        }
+        if let Some(parent) = node.parent {
+            self.node_mut(parent)?.child = Some(child);
+        } else {
+            self.root = child;
+        }
+        self.nodes.remove(&token.id);
+        self.token_for(child)
+    }
+
+    #[must_use]
+    pub fn owned_panes(&self, token: LayoutLeaseToken) -> Option<Vec<u64>> {
+        self.validate_token(token).ok()?;
+        Some(self.node(token.id).ok()?.owned_panes.clone())
+    }
+
+    #[must_use]
+    pub fn lease_tokens(&self) -> Vec<LayoutLeaseToken> {
+        self.nodes
+            .keys()
+            .filter_map(|id| self.token_for(*id).ok())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn has_rest(&self, token: LayoutLeaseToken) -> Option<bool> {
+        self.validate_token(token).ok()?;
+        Some(self.node(token.id).ok()?.child.is_some())
+    }
+
+    #[must_use]
+    pub fn rest_token(&self, token: LayoutLeaseToken) -> Option<LayoutLeaseToken> {
+        self.validate_token(token).ok()?;
+        self.token_for(self.node(token.id).ok()?.child?).ok()
+    }
+
+    #[must_use]
+    pub fn subtree_contains(&self, token: LayoutLeaseToken, pane: u64) -> bool {
+        self.validate_token(token).is_ok()
+            && self
+                .subtree_panes(token.id)
+                .is_ok_and(|panes| panes.contains(&pane))
+    }
+
+    pub fn assign_panes(
+        &mut self,
+        token: LayoutLeaseToken,
+        panes: &[u64],
+    ) -> Result<(), LayoutLeaseError> {
+        self.validate_token(token)?;
+        let assigned = panes.iter().copied().collect::<BTreeSet<_>>();
+        if assigned.len() != panes.len()
+            || !assigned.iter().all(|pane| self.inventory.contains(pane))
+        {
+            return Err(LayoutLeaseError(
+                "layout pane assignment must be a unique subset of current inventory".into(),
+            ));
+        }
+        for node in self.nodes.values_mut() {
+            node.owned_panes.retain(|pane| !assigned.contains(pane));
+        }
+        self.node_mut(token.id)?.owned_panes.extend(panes);
+        for node in self.nodes.values_mut() {
+            let owned = node.owned_panes.iter().copied().collect::<BTreeSet<_>>();
+            node.owned_panes = self
+                .inventory
+                .iter()
+                .copied()
+                .filter(|pane| owned.contains(pane))
+                .collect();
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn viewport_transform(&self, token: LayoutLeaseToken) -> Option<LocalTransform> {
+        self.validate_token(token).ok()?;
+        let mut path = Vec::new();
+        let mut current = token.id;
+        while current != self.root {
+            let node = self.node(current).ok()?;
+            let parent = node.parent?;
+            path.push(parent);
+            current = parent;
+        }
+        let mut transform = LocalTransform {
+            offset: LocalPoint {
+                u: NORMALIZED_MIN,
+                v: NORMALIZED_MIN,
+            },
+            size: LocalPoint { u: 2.0, v: 2.0 },
+        };
+        for parent in path.into_iter().rev() {
+            let accepted = self.node(parent).ok()?.accepted.as_ref()?;
+            if accepted.revision != self.inventory_revision {
+                return None;
+            }
+            let rest = accepted.fragment.rest?;
+            transform = transform.compose_child(rest.transform);
+        }
+        Some(transform)
+    }
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.nodes.values().all(|node| {
+            node.accepted
+                .as_ref()
+                .is_some_and(|accepted| accepted.revision == self.inventory_revision)
+        })
+    }
+
+    fn compose_node(
+        &self,
+        id: LayoutLeaseId,
+        depth: usize,
+    ) -> Result<(Vec<ResolvedLayoutItem>, Option<u64>), LayoutLeaseError> {
+        if depth > MAX_LAYOUT_LEASE_DEPTH {
+            return Err(LayoutLeaseError(format!(
+                "layout lease depth exceeds {MAX_LAYOUT_LEASE_DEPTH}"
+            )));
+        }
+        let node = self.node(id)?;
+        let accepted = node.accepted.as_ref().ok_or_else(|| {
+            LayoutLeaseError(format!("layout lease {} has no accepted fragment", id.0))
+        })?;
+        if accepted.revision != self.inventory_revision {
+            return Err(LayoutLeaseError(format!(
+                "layout lease {} has no fragment for revision {}",
+                id.0, self.inventory_revision
+            )));
+        }
+        let mut entries = accepted
+            .fragment
+            .layout
+            .items
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, item)| PaintEntry {
+                z: item.z,
+                index,
+                kind: PaintEntryKind::Item(item),
+            })
+            .collect::<Vec<_>>();
+        if let Some(rest) = accepted.fragment.rest {
+            entries.push(PaintEntry {
+                z: rest.z,
+                index: entries.len(),
+                kind: PaintEntryKind::Child(rest),
+            });
+        }
+        entries.sort_by(|left, right| {
+            left.z
+                .total_cmp(&right.z)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        let mut items = Vec::new();
+        let mut child_focus = None;
+        for entry in entries {
+            match entry.kind {
+                PaintEntryKind::Item(item) => items.push(item),
+                PaintEntryKind::Child(slot) => {
+                    let child = node.child.ok_or_else(|| {
+                        LayoutLeaseError(format!(
+                            "layout lease {} supplied a rest slot without a child",
+                            id.0
+                        ))
+                    })?;
+                    let (child_items, focus) = self.compose_node(child, depth + 1)?;
+                    items.extend(child_items.into_iter().map(|mut item| {
+                        item.transform = slot.transform.compose_child(item.transform);
+                        item
+                    }));
+                    child_focus = focus;
+                }
+            }
+        }
+        Ok((items, accepted.focus.or(child_focus)))
+    }
+
+    fn subtree_panes(&self, id: LayoutLeaseId) -> Result<BTreeSet<u64>, LayoutLeaseError> {
+        let node = self.node(id)?;
+        let mut panes = node.owned_panes.iter().copied().collect::<BTreeSet<_>>();
+        if let Some(child) = node.child {
+            panes.extend(self.subtree_panes(child)?);
+        }
+        Ok(panes)
+    }
+
+    fn deepest_lease(&self) -> Result<LayoutLeaseId, LayoutLeaseError> {
+        let mut current = self.root;
+        for _ in 0..MAX_LAYOUT_LEASE_DEPTH {
+            let Some(child) = self.node(current)?.child else {
+                return Ok(current);
+            };
+            current = child;
+        }
+        Err(LayoutLeaseError(format!(
+            "layout lease depth exceeds {MAX_LAYOUT_LEASE_DEPTH}"
+        )))
+    }
+
+    fn depth(&self, id: LayoutLeaseId) -> Result<usize, LayoutLeaseError> {
+        let mut current = Some(id);
+        let mut depth = 0;
+        while let Some(id) = current {
+            depth += 1;
+            if depth > MAX_LAYOUT_LEASE_DEPTH {
+                return Err(LayoutLeaseError(format!(
+                    "layout lease depth exceeds {MAX_LAYOUT_LEASE_DEPTH}"
+                )));
+            }
+            current = self.node(id)?.parent;
+        }
+        Ok(depth)
+    }
+
+    fn validate_token(&self, token: LayoutLeaseToken) -> Result<(), LayoutLeaseError> {
+        let node = self.node(token.id)?;
+        if token.generation != node.generation {
+            return Err(LayoutLeaseError(format!(
+                "stale layout lease generation {} for lease {}; current generation is {}",
+                token.generation, token.id.0, node.generation
+            )));
+        }
+        Ok(())
+    }
+
+    fn token_for(&self, id: LayoutLeaseId) -> Result<LayoutLeaseToken, LayoutLeaseError> {
+        Ok(LayoutLeaseToken {
+            id,
+            generation: self.node(id)?.generation,
+        })
+    }
+
+    fn node(&self, id: LayoutLeaseId) -> Result<&LayoutLeaseNode, LayoutLeaseError> {
+        self.nodes
+            .get(&id)
+            .ok_or_else(|| LayoutLeaseError(format!("unknown layout lease {}", id.0)))
+    }
+
+    fn node_mut(&mut self, id: LayoutLeaseId) -> Result<&mut LayoutLeaseNode, LayoutLeaseError> {
+        self.nodes
+            .get_mut(&id)
+            .ok_or_else(|| LayoutLeaseError(format!("unknown layout lease {}", id.0)))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaintEntry {
+    z: f64,
+    index: usize,
+    kind: PaintEntryKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PaintEntryKind {
+    Item(ResolvedLayoutItem),
+    Child(LayoutChildSlot),
+}
+
+fn validate_child_slot(slot: LayoutChildSlot) -> Result<(), LayoutLeaseError> {
+    if !slot.z.is_finite() {
+        return Err(LayoutLeaseError(
+            "layout fragment rest slot has non-finite z".into(),
+        ));
+    }
+    slot.transform
+        .validate(LayoutItemId(1))
+        .map_err(|error| LayoutLeaseError(format!("invalid layout rest slot: {error}")))
+}
+
+impl fmt::Display for LayoutLeaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LayoutLeaseError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(transparent)]
 pub struct LayoutItemId(pub u64);
@@ -292,6 +875,26 @@ impl LocalTransform {
             u: ((point.u - self.offset.u) / self.size.u).mul_add(2.0, -1.0),
             v: ((point.v - self.offset.v) / self.size.v).mul_add(2.0, -1.0),
         })
+    }
+
+    #[must_use]
+    pub fn compose_child(self, child: Self) -> Self {
+        Self {
+            offset: LocalPoint {
+                u: self
+                    .size
+                    .u
+                    .mul_add((child.offset.u + 1.0) * 0.5, self.offset.u),
+                v: self
+                    .size
+                    .v
+                    .mul_add((child.offset.v + 1.0) * 0.5, self.offset.v),
+            },
+            size: LocalPoint {
+                u: self.size.u * child.size.u * 0.5,
+                v: self.size.v * child.size.v * 0.5,
+            },
+        }
     }
 
     #[must_use]
@@ -809,8 +1412,9 @@ const fn split_rect(rect: LayoutRect, axis: LayoutAxis) -> (LayoutRect, LayoutRe
 )]
 mod tests {
     use super::{
-        InputBehavior, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize,
-        LayoutState, LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+        InputBehavior, LayoutAxis, LayoutChildSlot, LayoutFragment, LayoutItemId, LayoutItemKind,
+        LayoutLeaseTree, LayoutRect, LayoutSize, LayoutState, LocalPoint, LocalTransform,
+        ResolvedLayout, ResolvedLayoutItem,
     };
 
     #[test]
@@ -923,6 +1527,265 @@ mod tests {
                 h: 0,
             }
         );
+    }
+
+    #[test]
+    fn recursive_layout_leases_compose_into_one_flat_layout() {
+        let mut leases = LayoutLeaseTree::default();
+        leases
+            .update_inventory(7, &[10, 20, 30])
+            .expect("root inventory is accepted");
+        let root = leases.root_token();
+        let child = leases
+            .grant_rest(root, &[20, 30])
+            .expect("root delegates its ordinary panes");
+        leases
+            .submit(
+                child,
+                7,
+                LayoutFragment {
+                    layout: ResolvedLayout {
+                        items: vec![
+                            pane_item(20, 0.0, -1.0, -1.0, 1.0, 2.0),
+                            pane_item(30, 1.0, 0.0, -1.0, 1.0, 2.0),
+                        ],
+                    },
+                    rest: None,
+                },
+                Some(30),
+            )
+            .expect("child layout is accepted");
+        leases
+            .submit(
+                root,
+                7,
+                LayoutFragment {
+                    layout: ResolvedLayout {
+                        items: vec![pane_item(10, 10.0, -1.0, -1.0, 0.5, 2.0)],
+                    },
+                    rest: Some(LayoutChildSlot {
+                        z: 0.0,
+                        transform: LocalTransform {
+                            offset: LocalPoint { u: -0.5, v: -1.0 },
+                            size: LocalPoint { u: 1.5, v: 2.0 },
+                        },
+                    }),
+                },
+                None,
+            )
+            .expect("wrapper layout is accepted");
+
+        let composed = leases.compose().expect("lease tree composes");
+        assert_eq!(composed.focus, Some(30));
+        assert_eq!(composed.layout.pane_count(), 3);
+        assert_eq!(
+            composed
+                .layout
+                .pane_item(10)
+                .map(|item| item.pixel_rect(LayoutSize { w: 1200, h: 800 })),
+            Some(LayoutRect {
+                x: 0,
+                y: 0,
+                w: 300,
+                h: 800,
+            })
+        );
+        assert_eq!(
+            composed
+                .layout
+                .pane_item(20)
+                .map(|item| item.pixel_rect(LayoutSize { w: 1200, h: 800 })),
+            Some(LayoutRect {
+                x: 300,
+                y: 0,
+                w: 450,
+                h: 800,
+            })
+        );
+        assert_eq!(
+            composed
+                .layout
+                .pane_item(30)
+                .map(|item| item.pixel_rect(LayoutSize { w: 1200, h: 800 })),
+            Some(LayoutRect {
+                x: 750,
+                y: 0,
+                w: 450,
+                h: 800,
+            })
+        );
+        assert!(
+            composed.layout.pane_item(10).is_some_and(
+                |item| item.z > composed.layout.pane_item(30).map_or(-1.0, |item| item.z)
+            )
+        );
+    }
+
+    #[test]
+    fn child_publication_waits_for_a_current_parent_rest_slot() {
+        let mut leases = LayoutLeaseTree::default();
+        leases
+            .update_inventory(7, &[10, 20])
+            .expect("root inventory is accepted");
+        let root = leases.root_token();
+        let child = leases
+            .grant_rest(root, &[20])
+            .expect("root delegates its ordinary pane");
+
+        assert_eq!(
+            leases.viewport_transform(root),
+            Some(LocalTransform {
+                offset: LocalPoint { u: -1.0, v: -1.0 },
+                size: LocalPoint { u: 2.0, v: 2.0 },
+            })
+        );
+        assert_eq!(
+            leases.viewport_transform(child),
+            None,
+            "the host cannot scope a child query before its parent places rest"
+        );
+
+        let rest = LayoutChildSlot {
+            z: 0.0,
+            transform: LocalTransform {
+                offset: LocalPoint { u: -1.0, v: -1.0 },
+                size: LocalPoint { u: 1.5, v: 2.0 },
+            },
+        };
+        leases
+            .submit(
+                root,
+                7,
+                LayoutFragment {
+                    layout: ResolvedLayout {
+                        items: vec![pane_item(10, 1.0, 0.5, -1.0, 0.5, 2.0)],
+                    },
+                    rest: Some(rest),
+                },
+                None,
+            )
+            .expect("parent placement is accepted");
+        assert_eq!(
+            leases.viewport_transform(child),
+            Some(rest.transform),
+            "the child query is scoped to the accepted rest viewport"
+        );
+
+        leases
+            .update_inventory(8, &[10, 20])
+            .expect("next inventory revision is accepted");
+        assert!(!leases.is_complete());
+        assert_eq!(
+            leases.viewport_transform(child),
+            None,
+            "a stale parent fragment cannot position a current child query"
+        );
+    }
+
+    #[test]
+    fn layout_leases_reject_stale_revisions_and_foreign_panes() {
+        let mut leases = LayoutLeaseTree::default();
+        leases
+            .update_inventory(4, &[1, 2])
+            .expect("root inventory is accepted");
+        let root = leases.root_token();
+        let stale = leases.submit(
+            root,
+            3,
+            LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(1, 0.0, -1.0, -1.0, 2.0, 2.0)],
+                },
+                rest: None,
+            },
+            Some(1),
+        );
+        assert!(stale.is_err());
+
+        let child = leases
+            .grant_rest(root, &[2])
+            .expect("root delegates pane 2");
+        let foreign = leases.submit(
+            child,
+            4,
+            LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(1, 0.0, -1.0, -1.0, 2.0, 2.0)],
+                },
+                rest: None,
+            },
+            None,
+        );
+        assert!(foreign.is_err());
+    }
+
+    #[test]
+    fn inventory_updates_preserve_the_hosts_current_pane_order() {
+        let mut leases = LayoutLeaseTree::default();
+        leases
+            .update_inventory(1, &[20])
+            .expect("initial inventory is accepted");
+        leases
+            .update_inventory(2, &[10, 20, 30])
+            .expect("expanded inventory is accepted");
+
+        assert_eq!(
+            leases.owned_panes(leases.root_token()),
+            Some(vec![10, 20, 30])
+        );
+    }
+
+    #[test]
+    fn collapsing_a_wrapper_promotes_its_child_and_rejects_the_old_generation() {
+        let mut leases = LayoutLeaseTree::default();
+        leases
+            .update_inventory(9, &[10, 20])
+            .expect("root inventory is accepted");
+        let wrapper = leases.root_token();
+        let child = leases
+            .grant_rest(wrapper, &[20])
+            .expect("wrapper delegates its rest pane");
+        leases
+            .submit(
+                child,
+                9,
+                LayoutFragment {
+                    layout: ResolvedLayout {
+                        items: vec![pane_item(20, 0.0, -1.0, -1.0, 2.0, 2.0)],
+                    },
+                    rest: None,
+                },
+                Some(20),
+            )
+            .expect("child layout is accepted");
+
+        let promoted = leases.collapse_wrapper(wrapper).expect("child is promoted");
+        assert_eq!(promoted.id, child.id);
+        assert!(promoted.generation > child.generation);
+        assert_eq!(leases.root_token(), promoted);
+        assert_eq!(
+            leases.owned_panes(promoted),
+            Some(vec![10, 20]),
+            "the promoted subtree retains authority until pane inventory removes the wrapper pane"
+        );
+        let stale = leases.submit(
+            child,
+            9,
+            LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(20, 0.0, -1.0, -1.0, 2.0, 2.0)],
+                },
+                rest: None,
+            },
+            None,
+        );
+        assert!(stale.is_err());
+
+        let composed = leases
+            .compose()
+            .expect("the accepted child fragment survives promotion");
+        assert_eq!(composed.layout.pane_count(), 1);
+        assert_eq!(composed.focus, Some(20));
     }
 
     fn pane_item(

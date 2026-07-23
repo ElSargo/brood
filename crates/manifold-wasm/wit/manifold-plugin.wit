@@ -515,6 +515,10 @@ interface actor {
         /// Request a typed session catalogue operation from the presentation
         /// client. Completion and the resulting snapshot arrive as events.
         session-command(session-command),
+        /// Enqueue one ordinary message to the local realm host. The host
+        /// authenticates the emitting actor generation and validates the
+        /// payload before applying any requested capability operation.
+        send-host-message(list<u8>),
         stop,
     }
 

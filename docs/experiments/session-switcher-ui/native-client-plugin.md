@@ -8,14 +8,21 @@ construction. `manifold-client` supplies only typed session snapshots and
 operations, pane input, native text layouts, canvas validation, and final WGPU
 composition.
 
+As the blessed init child, the switcher claims the client's root layout lease.
+Its layout fragment places the plugin pane as a right sidebar and delegates all
+ordinary panes through `rest` to the `workspace` actor. The host scopes the
+workspace query to the remaining viewport and recursively composes both actor
+fragments. Hiding the switcher gives that child the full viewport rather than
+recreating or bypassing the workspace layout.
+
 The default config starts this artifact directly. The plugin supports session
 filtering, pointer and keyboard activation, creation, rename, close, and
 scrolling. The nested proof in
 `tools/test-session-switcher-plugin-nested.sh` creates three real sessions,
 switches with a real pointer click, creates and renames a session with injected
 keyboard input, closes it, and captures the initial and renamed client frames.
-It correlates those frames with typed command completions and backend catalogue
-snapshots.
+It correlates those frames with typed command completions, backend catalogue
+snapshots, and the root-to-`rest` lease chain.
 
 The canvas workload uses filled and stroked rounded rectangles, rectangles,
 one list clip, and native text layout handles. No component, row, button,

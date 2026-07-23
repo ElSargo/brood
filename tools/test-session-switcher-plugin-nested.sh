@@ -192,13 +192,12 @@ print(rect["x"], rect["y"], rect["w"], rect["h"])
 PY
 )
 
-# The Winit presentation is the active inner window. Its native plugin pane is
-# the left half; pointer coordinates are projected back into full pane-local
-# canvas coordinates by manifold-client.
-row_x=$((client_x + 50))
-# The nested Winit surface is configured at twice its logical input height;
-# manifold-client projects that logical input back into the full canvas.
-second_row_y=$((client_y + 173 * client_h / 1600))
+# The Winit presentation is the active inner window. The switcher wrapper
+# reserves at most 45% on the right; pointer coordinates are projected back
+# into its pane-local canvas by manifold-client.
+row_x=$((client_x + 55 * client_w / 100 + 50))
+# Pick the second catalogue row in the switcher's full-height pane.
+second_row_y=$((client_y + 173 * client_h / 800))
 
 # Vanilla config must load the workspace policy without client CLI overrides.
 # Ctrl+O spawns one real terminal in the active session.
@@ -351,6 +350,11 @@ trap - EXIT
 
 grep -q 'started presentation WASM actor id=session-switcher' "$OUT/client.log"
 grep -q 'loaded presentation key policy provider=workspace' "$OUT/client.log"
+grep -q 'granted claimed root layout lease actor=session-switcher' "$OUT/client.log"
+grep -q 'granted rest layout lease .* actor=workspace' "$OUT/client.log"
+grep -q 'accepted leased actor layout .* panes=3' "$OUT/client.log"
+grep -q 'requested managed window resize .* logical_size=320x800' "$OUT/client.log"
+! grep -q 'rejected actor-submitted layout' "$OUT/client.log"
 grep -q 'presentation session snapshot revision=.*sessions=3' "$OUT/client.log"
 grep -q 'operation=Create success=true' "$OUT/client.log"
 grep -q 'operation=Rename success=true' "$OUT/client.log"

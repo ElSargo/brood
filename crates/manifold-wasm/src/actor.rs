@@ -198,7 +198,7 @@ impl WasmActor {
         }
         for message in &outbox.messages {
             registry
-                .try_post_named_message(&message.actor, message.payload.clone())
+                .try_post_named_message_from(actor_id, &message.actor, message.payload.clone())
                 .with_context(|| format!("dispatch actor outbox message to {:?}", message.actor))?;
         }
         Ok(())

@@ -7238,11 +7238,15 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
         manifold_wasm::HostMessage::SetShortcutPassthrough { enabled } => {
             WorkspaceCommand::Input(InputCommand::SetShortcutPassthrough(enabled))
         }
-        manifold_wasm::HostMessage::SetResolvedLayout { layout, focus } => {
+        manifold_wasm::HostMessage::SetResolvedLayout { layout, focus, .. } => {
             WorkspaceCommand::SetResolvedLayout {
                 layout: convert_wasm_resolved_layout(layout),
                 focus,
             }
+        }
+        manifold_wasm::HostMessage::ClaimRootLayout
+        | manifold_wasm::HostMessage::DelegateLayoutRest { .. } => {
+            anyhow::bail!("layout leases are only valid in the client realm")
         }
     })
 }
@@ -7251,7 +7255,9 @@ fn validate_key_policy_host_message(payload: &[u8]) -> Result<()> {
     let message: manifold_wasm::HostMessage =
         serde_json::from_slice(payload).context("decode key policy host message")?;
     match message {
-        manifold_wasm::HostMessage::SetResolvedLayout { .. } => {
+        manifold_wasm::HostMessage::SetResolvedLayout { .. }
+        | manifold_wasm::HostMessage::ClaimRootLayout
+        | manifold_wasm::HostMessage::DelegateLayoutRest { .. } => {
             anyhow::bail!("key policy cannot submit layout; it must message a layout actor")
         }
         manifold_wasm::HostMessage::LayoutAction { action } => {

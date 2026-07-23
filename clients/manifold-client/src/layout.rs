@@ -1,6 +1,7 @@
 use manifold_layout::{
-    InputBehavior, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutRect, LayoutSize, LayoutState,
-    LocalPoint, LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+    InputBehavior, LayoutAxis, LayoutChildSlot, LayoutFragment, LayoutItemId, LayoutItemKind,
+    LayoutLeaseId, LayoutLeaseToken, LayoutRect, LayoutSize, LayoutState, LocalPoint,
+    LocalTransform, ResolvedLayout, ResolvedLayoutItem,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +43,37 @@ pub fn convert_actor_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLa
                 },
             })
             .collect(),
+    }
+}
+
+pub fn convert_actor_layout_fragment(
+    layout: manifold_wasm::ResolvedLayout,
+    rest: Option<manifold_wasm::LayoutChildSlot>,
+) -> LayoutFragment {
+    LayoutFragment {
+        layout: convert_actor_layout(layout),
+        rest: rest.map(|rest| LayoutChildSlot {
+            z: rest.z,
+            transform: LocalTransform {
+                offset: LocalPoint {
+                    u: rest.transform.offset.u,
+                    v: rest.transform.offset.v,
+                },
+                size: LocalPoint {
+                    u: rest.transform.size.u,
+                    v: rest.transform.size.v,
+                },
+            },
+        }),
+    }
+}
+
+pub const fn convert_actor_layout_lease(
+    lease: manifold_wasm::LayoutLeaseToken,
+) -> LayoutLeaseToken {
+    LayoutLeaseToken {
+        id: LayoutLeaseId(lease.id),
+        generation: lease.generation,
     }
 }
 

@@ -6,7 +6,7 @@
 )]
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     os::fd::AsFd,
     sync::{Arc, mpsc},
     thread,
@@ -26,7 +26,8 @@ use manifold_cli::{
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use manifold_layout::{
-    LayoutAction, LayoutItemKind, LayoutRect, LayoutSize, LocalPoint, ResolvedLayout,
+    LayoutAction, LayoutItemKind, LayoutLeaseId, LayoutLeaseTree, LayoutRect, LayoutSize,
+    LocalPoint, ResolvedLayout,
 };
 use num_traits::ToPrimitive;
 use wgpu::{Color, CurrentSurfaceTexture};
@@ -45,12 +46,15 @@ mod layout;
 mod plugin_gpu;
 mod plugin_graphics;
 
-use actor_runtime::PresentationWasmRuntime;
+use actor_runtime::{ActorIdentity, PresentationWasmRuntime};
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
-use layout::{LayoutSource, convert_actor_layout, native_flat_layout};
+use layout::{
+    LayoutSource, convert_actor_layout_fragment, convert_actor_layout_lease, native_flat_layout,
+};
 use manifold_wasm::{
     GlobalKeyDecision, HostMessage, PresentationEvent, SessionCommandCompletion,
     SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
+    WasmActorEventKind, WasmPluginArtifact,
 };
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
@@ -68,21 +72,6 @@ fn main() -> Result<()> {
     } else {
         manifold_cli::realm_init_actor_path(&config_path, manifold_cli::RealmKind::Client)?
     };
-    if args.check_wasm_actors {
-        let mut runtime = PresentationWasmRuntime::start(
-            &args.wasm_actors,
-            init_actor.as_deref(),
-            Some(1),
-            None,
-            None,
-        )?;
-        runtime
-            .shutdown()
-            .context("stop checked presentation WASM runtime")?;
-        drop(runtime);
-        eprintln!("presentation WASM actor check passed");
-        return Ok(());
-    }
     let configured_key_policy = if args.wasm_key_policy.is_none() {
         manifold_cli::client_key_policy_selection(&config_path)?
     } else {
@@ -98,6 +87,34 @@ fn main() -> Result<()> {
         .wasm_key_policy
         .as_deref()
         .or(configured_key_policy_spec.as_deref());
+    let mut wasm_actor_specs = args.wasm_actors.clone();
+    if let Some([provider, path]) = key_policy_spec
+        && !wasm_actor_specs
+            .iter()
+            .any(|spec| spec.split_once('=').is_some_and(|(id, _)| id == provider))
+        && let WasmPluginArtifact::Legacy(artifact) =
+            WasmPluginArtifact::load(std::path::Path::new(path))?
+        && artifact.inventory.actors.iter().any(|actor| {
+            actor.name == *provider && actor.subscribes_to(WasmActorEventKind::LayoutState)
+        })
+    {
+        wasm_actor_specs.push(format!("{provider}={path}"));
+    }
+    if args.check_wasm_actors {
+        let mut runtime = PresentationWasmRuntime::start(
+            &wasm_actor_specs,
+            init_actor.as_deref(),
+            Some(1),
+            None,
+            None,
+        )?;
+        runtime
+            .shutdown()
+            .context("stop checked presentation WASM runtime")?;
+        drop(runtime);
+        eprintln!("presentation WASM actor check passed");
+        return Ok(());
+    }
     let mut key_policy = ClientKeyPolicy::load(key_policy_spec)?;
     if args.check_wasm_key_policy {
         let snapshot = KeyPolicySnapshot {
@@ -280,7 +297,7 @@ fn main() -> Result<()> {
     };
     let mut application = Application {
         wasm_runtime: Some(PresentationWasmRuntime::start(
-            &args.wasm_actors,
+            &wasm_actor_specs,
             init_actor.as_deref(),
             bound_session_id,
             Some(&plugin_graphics),
@@ -831,6 +848,10 @@ struct Application {
     next_renderer_generation: u64,
     renderer_recoveries: u8,
     layout_revision: u64,
+    layout_leases: LayoutLeaseTree,
+    root_layout_actor: Option<ActorIdentity>,
+    layout_holders: BTreeMap<LayoutLeaseId, ActorIdentity>,
+    layout_publications: BTreeMap<LayoutLeaseId, u64>,
 }
 
 impl Application {
@@ -916,33 +937,176 @@ impl Application {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        self.layout_revision = self
-            .layout_revision
-            .checked_add(1)
-            .context("layout state revision limit exceeded")?;
-        let Some(message) = renderer.take_layout_state_message(self.layout_revision) else {
-            return Ok(());
-        };
-        let payload = serde_json::to_vec(&message).context("encode client layout-state message")?;
-        let recipients = match self
+        let live_actors = self
             .wasm_runtime
             .as_ref()
-            .map_or(Ok(0), |runtime| runtime.send_layout_state(&payload))
-        {
-            Ok(recipients) => recipients,
-            Err(error) => {
+            .map_or_else(Vec::new, PresentationWasmRuntime::actor_identities);
+        loop {
+            let failed = self.layout_leases.lease_tokens().into_iter().find(|lease| {
+                self.layout_holders
+                    .get(&lease.id)
+                    .is_some_and(|holder| !live_actors.contains(holder))
+            });
+            let Some(failed) = failed else {
+                break;
+            };
+            let was_root = failed.id == self.layout_leases.root_token().id;
+            let promoted = self.layout_leases.rest_token(failed).and_then(|child| {
+                self.layout_holders
+                    .get(&child.id)
+                    .cloned()
+                    .map(|holder| (child, holder))
+            });
+            if let Some((child, holder)) = promoted {
+                let promoted = self.layout_leases.collapse_wrapper(failed)?;
+                self.layout_holders.remove(&failed.id);
+                self.layout_holders.insert(promoted.id, holder.clone());
+                if was_root {
+                    self.root_layout_actor = Some(holder.clone());
+                }
+                self.layout_publications.clear();
                 renderer.layout_state_dirty = true;
                 eprintln!(
-                    "deferred layout-state revision={} after actor mailbox error: {error:#}",
-                    self.layout_revision
+                    "collapsed failed layout wrapper lease={} and promoted lease={} actor={}",
+                    failed.id.0, child.id.0, holder.name
                 );
-                return Ok(());
+                continue;
             }
-        };
-        if recipients > 0 {
+
             eprintln!(
-                "queued layout-state revision={} actors={recipients}",
-                self.layout_revision
+                "revoked layout tree after leaf actor failure lease={}",
+                failed.id.0
+            );
+            self.root_layout_actor = None;
+            self.layout_holders.clear();
+            self.layout_publications.clear();
+            self.layout_leases = LayoutLeaseTree::default();
+            renderer.layout_state_dirty = true;
+            break;
+        }
+        let candidates = self
+            .wasm_runtime
+            .as_ref()
+            .map_or_else(Vec::new, PresentationWasmRuntime::layout_actor_identities);
+        let selected = self
+            .root_layout_actor
+            .as_ref()
+            .filter(|holder| {
+                self.wasm_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.actor_identity(&holder.name))
+                    .as_ref()
+                    == Some(holder)
+            })
+            .cloned()
+            .or_else(|| candidates.first().cloned());
+        if selected != self.root_layout_actor {
+            self.root_layout_actor = selected;
+            self.layout_leases = LayoutLeaseTree::default();
+            self.layout_holders.clear();
+            self.layout_publications.clear();
+            if let Some(holder) = &self.root_layout_actor {
+                self.layout_holders
+                    .insert(self.layout_leases.root_token().id, holder.clone());
+                renderer.layout_state_dirty = true;
+                eprintln!(
+                    "granted root layout lease actor={} actor_generation={} lease_generation={}",
+                    holder.name,
+                    holder.generation,
+                    self.layout_leases.root_token().generation
+                );
+            }
+        }
+        let Some(holder) = self.root_layout_actor.clone() else {
+            return Ok(());
+        };
+        if candidates.len() > 1 {
+            let ignored = candidates
+                .iter()
+                .filter(|candidate| **candidate != holder)
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>();
+            eprintln!(
+                "root layout lease is exclusive holder={} ignored={ignored:?}",
+                holder.name
+            );
+        }
+
+        if renderer.layout_state_dirty {
+            self.layout_revision = self
+                .layout_revision
+                .checked_add(1)
+                .context("layout state revision limit exceeded")?;
+            let panes = renderer.pane_inventory();
+            self.layout_leases
+                .update_inventory(self.layout_revision, &panes)?;
+            if let Some(runtime) = self.wasm_runtime.as_ref() {
+                for token in self.layout_leases.lease_tokens() {
+                    let Some(holder) = self.layout_holders.get(&token.id) else {
+                        continue;
+                    };
+                    let Some(pane) = runtime.pane_for_actor(holder) else {
+                        continue;
+                    };
+                    if panes.contains(&pane) {
+                        self.layout_leases.assign_panes(token, &[pane])?;
+                    }
+                }
+            }
+            self.layout_publications.clear();
+            renderer.layout_state_dirty = false;
+        }
+        if self.layout_revision == 0 {
+            return Ok(());
+        }
+
+        let tokens = self.layout_leases.lease_tokens();
+        for lease in tokens {
+            if self.layout_publications.get(&lease.id) == Some(&self.layout_revision) {
+                continue;
+            }
+            let Some(viewport) = self.layout_leases.viewport_transform(lease) else {
+                continue;
+            };
+            let Some(holder) = self.layout_holders.get(&lease.id).cloned() else {
+                continue;
+            };
+            let owned_panes = self
+                .layout_leases
+                .owned_panes(lease)
+                .context("layout lease is unavailable during state publication")?;
+            let focused_pane = renderer
+                .focused_pane_id()
+                .filter(|pane| self.layout_leases.subtree_contains(lease, *pane));
+            let viewport = viewport.pixel_rect(renderer.layout_extent());
+            let message = renderer.layout_state_message(
+                self.layout_revision,
+                lease,
+                owned_panes,
+                focused_pane,
+                LayoutSize {
+                    w: viewport.w,
+                    h: viewport.h,
+                },
+                self.layout_leases.has_rest(lease).unwrap_or(false),
+            );
+            let payload =
+                serde_json::to_vec(&message).context("encode client layout-state message")?;
+            let result = self.wasm_runtime.as_ref().map_or(Ok(()), |runtime| {
+                runtime.send_layout_state_to(&holder, payload)
+            });
+            if let Err(error) = result {
+                eprintln!(
+                    "deferred layout-state revision={} lease={} actor={} after mailbox error: {error:#}",
+                    self.layout_revision, lease.id.0, holder.name
+                );
+                continue;
+            }
+            self.layout_publications
+                .insert(lease.id, self.layout_revision);
+            eprintln!(
+                "queued layout-state revision={} lease={} actor={}",
+                self.layout_revision, lease.id.0, holder.name
             );
         }
         Ok(())
@@ -953,30 +1117,207 @@ impl Application {
             .wasm_runtime
             .as_mut()
             .map_or(Ok(Vec::new()), PresentationWasmRuntime::drain_host_messages)?;
-        for payload in messages {
-            let message: HostMessage = match serde_json::from_slice(&payload) {
+        for actor_message in messages {
+            let message: HostMessage = match serde_json::from_slice(&actor_message.payload) {
                 Ok(message) => message,
                 Err(error) => {
                     eprintln!("rejected malformed presentation actor host message: {error}");
                     continue;
                 }
             };
-            let Some(renderer) = self.renderer.as_mut() else {
-                continue;
-            };
             let focus_change = match message {
-                HostMessage::SetResolvedLayout { layout, focus } => {
-                    let (focus_change, accepted) = renderer.commit_actor_layout(layout, focus);
+                HostMessage::ClaimRootLayout => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored root layout claim without authenticated actor identity");
+                        continue;
+                    };
+                    let authorized = self
+                        .wasm_runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.can_claim_root_layout(sender));
+                    if !authorized {
+                        eprintln!(
+                            "ignored unauthorized root layout claim actor={} actor_generation={}",
+                            sender.name, sender.generation
+                        );
+                        continue;
+                    }
+                    if self.root_layout_actor.as_ref() != Some(sender) {
+                        self.layout_leases = LayoutLeaseTree::default();
+                        self.layout_holders.clear();
+                        self.layout_publications.clear();
+                        self.root_layout_actor = Some(sender.clone());
+                        let root = self.layout_leases.root_token();
+                        self.layout_holders.insert(root.id, sender.clone());
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.layout_state_dirty = true;
+                        }
+                        eprintln!(
+                            "granted claimed root layout lease actor={} actor_generation={} lease_generation={}",
+                            sender.name, sender.generation, root.generation
+                        );
+                    }
+                    None
+                }
+                HostMessage::DelegateLayoutRest {
+                    lease,
+                    revision,
+                    actor,
+                    panes,
+                } => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored layout delegation without authenticated actor identity");
+                        continue;
+                    };
+                    let lease = convert_actor_layout_lease(lease);
+                    if self.layout_holders.get(&lease.id) != Some(sender) {
+                        eprintln!(
+                            "ignored layout delegation from non-holder actor={} lease={}",
+                            sender.name, lease.id.0
+                        );
+                        continue;
+                    }
+                    if revision != self.layout_leases.inventory_revision() {
+                        eprintln!(
+                            "ignored stale layout delegation revision={revision}; current revision={}",
+                            self.layout_leases.inventory_revision()
+                        );
+                        continue;
+                    }
+                    let Some(child_holder) = self
+                        .wasm_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.actor_identity(&actor))
+                    else {
+                        eprintln!("ignored layout delegation to unavailable actor={actor}");
+                        continue;
+                    };
+                    match self.layout_leases.grant_rest(lease, &panes) {
+                        Ok(child) => {
+                            self.layout_holders.insert(child.id, child_holder.clone());
+                            self.layout_publications.remove(&child.id);
+                            eprintln!(
+                                "granted rest layout lease parent={} child={} actor={} panes={}",
+                                lease.id.0,
+                                child.id.0,
+                                child_holder.name,
+                                panes.len()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("rejected rest layout delegation: {error}");
+                        }
+                    }
+                    None
+                }
+                HostMessage::SetResolvedLayout {
+                    lease,
+                    revision,
+                    layout,
+                    rest,
+                    focus,
+                } => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored layout result without authenticated actor identity");
+                        continue;
+                    };
+                    let Some(lease) = lease else {
+                        let Some(renderer) = self.renderer.as_mut() else {
+                            continue;
+                        };
+                        renderer.reject_actor_layout(&"layout result is missing its lease token");
+                        continue;
+                    };
+                    let submitted_lease = convert_actor_layout_lease(lease);
+                    let Some(holder) = self.layout_holders.get(&submitted_lease.id) else {
+                        eprintln!(
+                            "ignored layout result because lease={} has no holder",
+                            submitted_lease.id.0
+                        );
+                        continue;
+                    };
+                    if sender != holder {
+                        eprintln!(
+                            "ignored layout result from non-holder actor={} actor_generation={} lease={}",
+                            sender.name, sender.generation, submitted_lease.id.0
+                        );
+                        continue;
+                    }
+                    let Some(revision) = revision else {
+                        let Some(renderer) = self.renderer.as_mut() else {
+                            continue;
+                        };
+                        renderer
+                            .reject_actor_layout(&"layout result is missing its input revision");
+                        continue;
+                    };
+                    let current_lease = self
+                        .layout_leases
+                        .lease_tokens()
+                        .into_iter()
+                        .find(|token| token.id == submitted_lease.id);
+                    if current_lease != Some(submitted_lease) {
+                        eprintln!(
+                            "ignored stale layout result lease={} generation={}; current generation={}",
+                            submitted_lease.id.0,
+                            submitted_lease.generation,
+                            current_lease.map_or(0, |lease| lease.generation)
+                        );
+                        continue;
+                    }
+                    if revision != self.layout_leases.inventory_revision() {
+                        eprintln!(
+                            "ignored stale layout result revision={revision}; current revision={}",
+                            self.layout_leases.inventory_revision()
+                        );
+                        continue;
+                    }
+                    let result = (|| {
+                        self.layout_leases.submit(
+                            submitted_lease,
+                            revision,
+                            convert_actor_layout_fragment(layout, rest),
+                            focus,
+                        )?;
+                        if self.layout_leases.is_complete() {
+                            self.layout_leases
+                                .compose()
+                                .map(Some)
+                                .map_err(anyhow::Error::from)
+                        } else {
+                            Ok(None)
+                        }
+                    })();
+                    let Some(renderer) = self.renderer.as_mut() else {
+                        continue;
+                    };
+                    let (focus_change, accepted) = match result {
+                        Ok(Some(composed)) => {
+                            renderer.commit_actor_layout(composed.layout, composed.focus)
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "accepted layout fragment lease={} revision={revision}; waiting for child",
+                                submitted_lease.id.0
+                            );
+                            (None, false)
+                        }
+                        Err(error) => renderer.reject_actor_layout(&error),
+                    };
                     if accepted {
                         eprintln!(
-                            "accepted actor layout items={} panes={}",
+                            "accepted leased actor layout items={} panes={} revision={}",
                             renderer.accepted_layout.items.len(),
-                            renderer.accepted_layout.pane_count()
+                            renderer.accepted_layout.pane_count(),
+                            self.layout_leases.inventory_revision()
                         );
                     }
                     focus_change
                 }
                 message => {
+                    let Some(renderer) = self.renderer.as_mut() else {
+                        continue;
+                    };
                     if let Err(error) = apply_key_policy_host_message(
                         renderer,
                         &mut self.input_sender,
@@ -998,6 +1339,9 @@ impl Application {
                     self.window_focused,
                 )?;
             }
+            let Some(renderer) = self.renderer.as_mut() else {
+                continue;
+            };
             flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
             renderer.window.request_redraw();
         }
@@ -1842,10 +2186,12 @@ struct LayoutStateMessage {
     #[serde(rename = "type")]
     message_type: &'static str,
     revision: u64,
+    lease: manifold_wasm::LayoutLeaseToken,
     visible_panes: Vec<u64>,
     focused_pane: Option<u64>,
     pane_app_ids: Vec<KeyPolicyAppPane>,
     size: LayoutStateSize,
+    rest: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -2065,9 +2411,11 @@ fn apply_key_policy_host_message(
             None
         }
         HostMessage::ToggleShortcutPassthrough | HostMessage::SetShortcutPassthrough { .. } => None,
-        HostMessage::SetResolvedLayout { .. } => {
+        HostMessage::SetResolvedLayout { .. }
+        | HostMessage::ClaimRootLayout
+        | HostMessage::DelegateLayoutRest { .. } => {
             return Err(anyhow!(
-                "key policy cannot submit layout directly; it must message a layout actor"
+                "key policy cannot mutate layout authority directly; it must message a layout actor"
             ));
         }
     };
@@ -2662,6 +3010,11 @@ impl Renderer {
             .iter()
             .map(|window| window.window_id)
             .collect::<Vec<_>>();
+        let previous_managed_apps = self
+            .current_windows
+            .iter()
+            .map(|window| (window.window_id, window.app_id.clone()))
+            .collect::<Vec<_>>();
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
         for window in windows {
@@ -2721,7 +3074,14 @@ impl Renderer {
                 &managed_panes,
                 backend_focus,
             );
-            self.layout_state_dirty = true;
+            let managed_apps = self
+                .current_windows
+                .iter()
+                .map(|window| (window.window_id, window.app_id.clone()))
+                .collect::<Vec<_>>();
+            self.layout_state_dirty |= previous_managed_panes != managed_panes
+                || previous_managed_apps != managed_apps
+                || previous_focus != self.focused_pane;
             let _focus_change = self.reconcile_layout();
             let focus_change =
                 focus_change_between(previous_focus, self.focused_pane).or_else(|| {
@@ -2927,27 +3287,32 @@ impl Renderer {
 
     fn commit_actor_layout(
         &mut self,
-        layout: manifold_wasm::ResolvedLayout,
+        layout: ResolvedLayout,
         focus: Option<u64>,
     ) -> (Option<FocusChange>, bool) {
         let panes = self.pane_inventory();
-        match convert_actor_layout(layout).validate_for_panes(&panes) {
+        match layout.validate_for_panes(&panes) {
             Ok(layout) => (self.commit_layout(layout, focus, LayoutSource::Actor), true),
-            Err(error) => {
-                eprintln!("rejected actor-submitted layout; using native fallback: {error}");
-                self.layout_state_dirty = true;
-                let extent = self.layout_extent();
-                let focus = self.focused_pane_id();
-                (
-                    self.commit_layout(
-                        native_flat_layout(&panes, extent),
-                        focus,
-                        LayoutSource::NativeFallback,
-                    ),
-                    false,
-                )
-            }
+            Err(error) => self.reject_actor_layout(&error),
         }
+    }
+
+    fn reject_actor_layout(
+        &mut self,
+        error: &dyn std::fmt::Display,
+    ) -> (Option<FocusChange>, bool) {
+        eprintln!("rejected actor-submitted layout; using native fallback: {error}");
+        let panes = self.pane_inventory();
+        let extent = self.layout_extent();
+        let focus = self.focused_pane_id();
+        (
+            self.commit_layout(
+                native_flat_layout(&panes, extent),
+                focus,
+                LayoutSource::NativeFallback,
+            ),
+            false,
+        )
     }
 
     fn commit_layout(
@@ -3036,31 +3401,43 @@ impl Renderer {
         }
     }
 
-    fn take_layout_state_message(&mut self, revision: u64) -> Option<LayoutStateMessage> {
-        if !self.layout_state_dirty {
-            return None;
-        }
-        self.layout_state_dirty = false;
-        let extent = self.layout_extent();
-        Some(LayoutStateMessage {
+    fn layout_state_message(
+        &self,
+        revision: u64,
+        lease: manifold_layout::LayoutLeaseToken,
+        visible_panes: Vec<u64>,
+        focused_pane: Option<u64>,
+        size: LayoutSize,
+        rest: bool,
+    ) -> LayoutStateMessage {
+        let visible = visible_panes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        LayoutStateMessage {
             message_type: "layout-state",
             revision,
-            visible_panes: self.pane_inventory(),
-            focused_pane: self.focused_pane_id(),
+            lease: manifold_wasm::LayoutLeaseToken {
+                id: lease.id.0,
+                generation: lease.generation,
+            },
+            visible_panes,
+            focused_pane,
             pane_app_ids: self
                 .current_windows
                 .iter()
-                .filter(|window| !window.app_id.is_empty())
+                .filter(|window| !window.app_id.is_empty() && visible.contains(&window.window_id))
                 .map(|window| KeyPolicyAppPane {
                     pane: window.window_id,
                     app_id: window.app_id.clone(),
                 })
                 .collect(),
             size: LayoutStateSize {
-                w: extent.w,
-                h: extent.h,
+                w: size.w,
+                h: size.h,
             },
-        })
+            rest,
+        }
     }
 
     fn pane_inventory(&self) -> Vec<u64> {
@@ -3150,7 +3527,6 @@ impl Renderer {
         let focus_change = if first_plugin_scene {
             self.set_focus(FocusedPane::Plugin(pane))
         } else {
-            self.layout_state_dirty = true;
             self.reconcile_layout()
         };
         self.window.request_redraw();

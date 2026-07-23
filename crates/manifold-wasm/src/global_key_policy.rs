@@ -77,8 +77,21 @@ pub enum HostMessage {
         enabled: bool,
     },
     SetResolvedLayout {
+        #[serde(default)]
+        lease: Option<crate::resolved_layout::LayoutLeaseToken>,
+        #[serde(default)]
+        revision: Option<u64>,
         layout: crate::resolved_layout::ResolvedLayout,
+        #[serde(default)]
+        rest: Option<crate::resolved_layout::LayoutChildSlot>,
         focus: Option<u64>,
+    },
+    ClaimRootLayout,
+    DelegateLayoutRest {
+        lease: crate::resolved_layout::LayoutLeaseToken,
+        revision: u64,
+        actor: String,
+        panes: Vec<u64>,
     },
 }
 

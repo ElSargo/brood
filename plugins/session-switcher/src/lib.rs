@@ -11,6 +11,7 @@ use exports::manifold::plugin::actor::{
 };
 use manifold::plugin::host;
 use manifold_graphics::{Color, Command, Packet, Rect};
+use serde::Deserialize;
 
 const INIT_ACTOR_ID: &str = "manifold.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
@@ -21,6 +22,7 @@ const HEADER_HEIGHT: f32 = 104.0;
 const FOOTER_HEIGHT: f32 = 38.0;
 const ROW_HEIGHT: f32 = 46.0;
 const SIDE_MARGIN: f32 = 14.0;
+const SIDEBAR_WIDTH: f64 = 320.0;
 
 const BG: Color = Color::rgba(0.157, 0.157, 0.157, 1.0);
 const PANEL: Color = Color::rgba(0.235, 0.220, 0.204, 1.0);
@@ -60,6 +62,32 @@ struct SwitcherState {
     status: String,
     error: bool,
     text_resources: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct LayoutStateMessage {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+    revision: u64,
+    lease: LayoutLeaseToken,
+    visible_panes: serde_json_core::heapless::Vec<u64, 64>,
+    focused_pane: Option<u64>,
+    size: LayoutStateSize,
+    #[serde(default)]
+    rest: bool,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct LayoutLeaseToken {
+    id: u64,
+    generation: u64,
+}
+
+#[derive(Deserialize)]
+struct LayoutStateSize {
+    w: i32,
+    #[serde(rename = "h")]
+    _height: i32,
 }
 
 impl SwitcherState {
@@ -174,6 +202,9 @@ impl Guest for SessionSwitcher {
             }
             Event::Presentation(event) => handle_presentation(event),
             Event::Session(event) => handle_session_event(event),
+            Event::Mailbox(message) if message.sender == "layout-host" => {
+                handle_layout_message(&message.body)
+            }
             _ => Vec::new(),
         }
     }
@@ -256,12 +287,10 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.height = created.height.max(240.0);
             redraw_or_record_error(&mut state);
             let request = state.next_request();
-            vec![session_command(
-                request,
-                SessionOperation::Refresh,
-                None,
-                None,
-            )]
+            vec![
+                ActorCommand::SendHostMessage(br#"{"type":"claim-root-layout"}"#.to_vec()),
+                session_command(request, SessionOperation::Refresh, None, None),
+            ]
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(240.0);
@@ -306,6 +335,89 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         }
         _ => Vec::new(),
     }
+}
+
+fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<LayoutStateMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.message_type.as_str() != "layout-state" {
+        return Vec::new();
+    }
+    let pane = STATE.lock().ok().map_or(0, |state| state.pane);
+    if pane == 0 {
+        return Vec::new();
+    }
+
+    let delegated = message
+        .visible_panes
+        .iter()
+        .copied()
+        .filter(|visible| *visible != pane)
+        .collect::<Vec<_>>();
+    let needs_rest = !message.rest && !delegated.is_empty();
+    let has_rest = message.rest || needs_rest;
+    let pane_visible = message.visible_panes.contains(&pane);
+    let width = f64::from(message.size.w.max(1));
+    let sidebar_fraction = if has_rest && pane_visible {
+        (SIDEBAR_WIDTH / width).clamp(0.2, 0.45)
+    } else if has_rest {
+        0.0
+    } else {
+        1.0
+    };
+    let sidebar_offset = 1.0 - 2.0 * sidebar_fraction;
+    let sidebar_size = 2.0 * sidebar_fraction;
+    let rest_size = 2.0 * (1.0 - sidebar_fraction);
+
+    let mut commands = Vec::new();
+    if needs_rest {
+        let panes = delegated
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        commands.push(ActorCommand::SendHostMessage(
+            format!(
+                "{{\"type\":\"delegate-layout-rest\",\"lease\":{{\"id\":{},\"generation\":{}}},\"revision\":{},\"actor\":\"workspace\",\"panes\":[{}]}}",
+                message.lease.id, message.lease.generation, message.revision, panes
+            )
+            .into_bytes(),
+        ));
+    }
+
+    let layout_item = if pane_visible {
+        format!(
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
+            pane, pane, sidebar_offset, sidebar_size
+        )
+    } else {
+        String::new()
+    };
+    let rest = if has_rest {
+        format!(
+            ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}}}}",
+            rest_size
+        )
+    } else {
+        String::new()
+    };
+    let focus = message
+        .focused_pane
+        .map_or_else(|| "null".to_string(), |focus| focus.to_string());
+    commands.push(ActorCommand::SendHostMessage(
+        format!(
+            "{{\"type\":\"set-resolved-layout\",\"lease\":{{\"id\":{},\"generation\":{}}},\"revision\":{},\"layout\":{{\"items\":[{}]}}{},\"focus\":{}}}",
+            message.lease.id,
+            message.lease.generation,
+            message.revision,
+            layout_item,
+            rest,
+            focus
+        )
+        .into_bytes(),
+    ));
+    commands
 }
 
 fn handle_pointer_button(
@@ -767,6 +879,53 @@ fn truncate(text: &str, max_chars: usize) -> String {
         format!("{prefix}…")
     } else {
         prefix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_payload(command: &ActorCommand) -> &str {
+        let ActorCommand::SendHostMessage(payload) = command else {
+            panic!("expected a host message");
+        };
+        std::str::from_utf8(payload).expect("host message is utf-8 JSON")
+    }
+
+    #[test]
+    fn layout_state_delegates_content_and_places_the_switcher_on_the_right() {
+        STATE.lock().expect("switcher state").pane = 99;
+        let commands = handle_layout_message(
+            br#"{"type":"layout-state","revision":7,"lease":{"id":1,"generation":3},"visible_panes":[99,10,11],"focused_pane":10,"pane_app_ids":[],"size":{"w":640,"h":800},"rest":false}"#,
+        );
+
+        assert_eq!(commands.len(), 2);
+        let delegation = host_payload(&commands[0]);
+        assert!(delegation.contains(r#""type":"delegate-layout-rest""#));
+        assert!(delegation.contains(r#""lease":{"id":1,"generation":3}"#));
+        assert!(delegation.contains(r#""revision":7"#));
+        assert!(delegation.contains(r#""actor":"workspace""#));
+        assert!(delegation.contains(r#""panes":[10,11]"#));
+        let layout = host_payload(&commands[1]);
+        assert!(layout.contains(r#""kind":{"type":"pane","pane":99}"#));
+        assert!(layout.contains(r#""offset":{"u":0.09999999999999998,"v":-1}"#));
+        assert!(layout.contains(r#""size":{"u":0.9,"v":2}"#));
+        assert!(layout.contains(r#""rest":{"z":0"#));
+        assert!(layout.contains(r#""size":{"u":1.1,"v":2}"#));
+    }
+
+    #[test]
+    fn hidden_switcher_returns_the_full_viewport_to_rest() {
+        STATE.lock().expect("switcher state").pane = 99;
+        let commands = handle_layout_message(
+            br#"{"type":"layout-state","revision":8,"lease":{"id":1,"generation":3},"visible_panes":[],"focused_pane":10,"pane_app_ids":[],"size":{"w":640,"h":800},"rest":true}"#,
+        );
+
+        assert_eq!(commands.len(), 1);
+        let layout = host_payload(&commands[0]);
+        assert!(layout.contains(r#""layout":{"items":[]}"#));
+        assert!(layout.contains(r#""offset":{"u":-1,"v":-1},"size":{"u":2,"v":2}"#));
     }
 }
 

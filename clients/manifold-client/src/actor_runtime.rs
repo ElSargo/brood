@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use manifold_wasm::{
-    ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentChildEvent,
+    ActorId, ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentChildEvent,
     FilesystemGrant, HostedWasmActor, LegacyWasmActorGeneration, LegacyWasmRuntimeEvent, Mailbox,
     NativeFilesystemWatcherService, PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext,
     PluginStartReason, PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor,
@@ -40,6 +40,7 @@ pub struct PresentationWasmRuntime {
     init: Option<PresentationInitState>,
     outbound_session_messages: VecDeque<SessionActorMessageRequest>,
     outbound_session_commands: VecDeque<SessionCommandEnvelope>,
+    outbound_host_messages: VecDeque<HostActorMessage>,
     bound_session_id: Option<u64>,
     next_actor_pane: u64,
 }
@@ -54,6 +55,17 @@ pub struct SessionActorMessageRequest {
 pub struct SessionCommandEnvelope {
     pub actor_id: String,
     pub request: SessionCommandRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorIdentity {
+    pub name: String,
+    pub generation: u64,
+}
+
+pub struct HostActorMessage {
+    pub sender: Option<ActorIdentity>,
+    pub payload: Vec<u8>,
 }
 
 struct PresentationInitState {
@@ -104,6 +116,7 @@ impl PresentationWasmRuntime {
             init: None,
             outbound_session_messages: VecDeque::new(),
             outbound_session_commands: VecDeque::new(),
+            outbound_host_messages: VecDeque::new(),
             bound_session_id: session_id,
             next_actor_pane: u64::MAX,
         };
@@ -410,6 +423,22 @@ impl PresentationWasmRuntime {
                     self.outbound_session_commands
                         .push_back(SessionCommandEnvelope { actor_id, request });
                 }
+                ComponentActorEvent::HostMessageRequested { payload } => {
+                    ensure!(
+                        self.outbound_host_messages.len() < 64,
+                        "presentation actor host-message queue is full"
+                    );
+                    let sender = self
+                        .actor_identity(&actor_id)
+                        .context("component host message lost its actor identity")?;
+                    self.outbound_host_messages.push_back(HostActorMessage {
+                        sender: Some(sender),
+                        payload,
+                    });
+                    if let Some(proxy) = &self.event_proxy {
+                        drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+                    }
+                }
                 _ => {}
             }
         }
@@ -548,12 +577,31 @@ impl PresentationWasmRuntime {
         }
     }
 
-    pub fn drain_host_messages(&mut self) -> Result<Vec<Vec<u8>>> {
-        let mut messages = Vec::new();
-        while let Some(message) = self.host_mailbox.try_read_message()? {
-            messages.push(message);
+    pub fn drain_host_messages(&mut self) -> Result<Vec<HostActorMessage>> {
+        let mut messages = self.outbound_host_messages.drain(..).collect::<Vec<_>>();
+        while let Some(message) = self.host_mailbox.try_read_envelope()? {
+            messages.push(HostActorMessage {
+                sender: message
+                    .sender
+                    .and_then(|sender| self.legacy_actor_identity(sender)),
+                payload: message.payload,
+            });
         }
         Ok(messages)
+    }
+
+    fn legacy_actor_identity(&self, sender: ActorId) -> Option<ActorIdentity> {
+        self.legacy_actors.iter().find_map(|(actor_name, actor)| {
+            actor
+                .generation
+                .actor_ids()
+                .values()
+                .any(|actor_id| *actor_id == sender)
+                .then(|| ActorIdentity {
+                    name: actor_name.clone(),
+                    generation: sender.raw(),
+                })
+        })
     }
 
     pub fn drain_session_messages(&mut self) -> Vec<SessionActorMessageRequest> {
@@ -630,15 +678,66 @@ impl PresentationWasmRuntime {
         self.send_legacy_message(actor_id, payload)
     }
 
-    pub fn send_layout_state(&self, payload: &[u8]) -> Result<usize> {
-        let recipients = self.layout_actor_ids();
-        for actor_id in &recipients {
-            self.send_legacy_message(actor_id, payload.to_owned())?;
+    pub fn send_layout_state_to(&self, actor: &ActorIdentity, payload: Vec<u8>) -> Result<()> {
+        ensure!(
+            self.actor_identity(&actor.name).as_ref() == Some(actor),
+            "presentation actor {:?} generation {} does not hold layout-state authority",
+            actor.name,
+            actor.generation
+        );
+        if let Some(hosted) = self.actors.get(&actor.name) {
+            return hosted
+                .actor
+                .try_send_message("layout-host".to_string(), payload)
+                .with_context(|| {
+                    format!(
+                        "deliver lease-scoped layout state to component actor {:?}",
+                        actor.name
+                    )
+                });
         }
-        Ok(recipients.len())
+        self.send_legacy_message(&actor.name, payload)
     }
 
-    fn layout_actor_ids(&self) -> Vec<String> {
+    pub fn actor_identity(&self, actor_name: &str) -> Option<ActorIdentity> {
+        if let Some(actor) = self.actors.get(actor_name) {
+            return Some(ActorIdentity {
+                name: actor_name.to_string(),
+                generation: actor.actor.generation(),
+            });
+        }
+        self.legacy_actors.get(actor_name).and_then(|actor| {
+            actor
+                .generation
+                .actor_ids()
+                .get(actor_name)
+                .map(|actor_id| ActorIdentity {
+                    name: actor_name.to_string(),
+                    generation: actor_id.raw(),
+                })
+        })
+    }
+
+    pub fn actor_identities(&self) -> Vec<ActorIdentity> {
+        self.actors
+            .keys()
+            .chain(self.legacy_actors.keys())
+            .filter_map(|name| self.actor_identity(name))
+            .collect()
+    }
+
+    pub fn pane_for_actor(&self, actor: &ActorIdentity) -> Option<u64> {
+        (self.actor_identity(&actor.name).as_ref() == Some(actor))
+            .then(|| self.actors.get(&actor.name).map(|hosted| hosted.pane))
+            .flatten()
+            .filter(|pane| *pane != 0)
+    }
+
+    pub fn can_claim_root_layout(&self, actor: &ActorIdentity) -> bool {
+        self.actor_identity(&actor.name).as_ref() == Some(actor) && self.is_init_child(&actor.name)
+    }
+
+    pub fn layout_actor_identities(&self) -> Vec<ActorIdentity> {
         self.legacy_actors
             .iter()
             .filter(|(_, actor)| {
@@ -646,7 +745,16 @@ impl PresentationWasmRuntime {
                     .declaration
                     .subscribes_to(WasmActorEventKind::LayoutState)
             })
-            .map(|(actor_id, _)| actor_id.clone())
+            .filter_map(|(actor_name, actor)| {
+                actor
+                    .generation
+                    .actor_ids()
+                    .get(actor_name)
+                    .map(|actor_id| ActorIdentity {
+                        name: actor_name.clone(),
+                        generation: actor_id.raw(),
+                    })
+            })
             .collect()
     }
 

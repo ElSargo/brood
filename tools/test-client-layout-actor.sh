@@ -178,11 +178,22 @@ expected = {
     window_id: negotiated.get(window_id, size)
     for window_id, size in requested.items()
 }
+
+def close_enough(actual, target):
+    return (
+        actual is not None
+        # Terminal buffers may quantize to their cell grid and client-side
+        # decoration extent. GTK's explicit negotiation is still checked
+        # exactly by the final proof below.
+        and abs(actual[0] - target[0]) <= 16
+        and abs(actual[1] - target[1]) <= 16
+    )
+
 sys.exit(
     0
     if len(requested) >= 2
     and negotiated
-    and all(imported.get(window_id) == size for window_id, size in expected.items())
+    and all(close_enough(imported.get(window_id), size) for window_id, size in expected.items())
     else 1
 )
 PY
@@ -202,6 +213,22 @@ done
 
 if ! rg -q "presentation layout source changed source=actor" "$CLIENT_LOG"; then
   echo "ERR presentation client did not accept the actor layout" >&2
+  exit 1
+fi
+if ! rg -q "granted root layout lease actor=workspace" "$CLIENT_LOG"; then
+  echo "ERR presentation client did not grant the workspace actor a root layout lease" >&2
+  exit 1
+fi
+if ! rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"; then
+  echo "ERR session switcher did not claim the root layout lease" >&2
+  exit 1
+fi
+if ! rg -q "granted rest layout lease .* actor=workspace" "$CLIENT_LOG"; then
+  echo "ERR session switcher did not delegate its rest slot to the workspace" >&2
+  exit 1
+fi
+if ! rg -q "accepted leased actor layout" "$CLIENT_LOG"; then
+  echo "ERR presentation client did not accept a lease-authorized layout result" >&2
   exit 1
 fi
 if ! layout_converged; then
@@ -281,8 +308,8 @@ print(
 PY
 
 STATUS="$(ctl status)"
-[[ "$STATUS" =~ windows=2([[:space:]]|$) ]] || {
-  echo "ERR expected two managed clients: $STATUS" >&2
+[[ "$STATUS" =~ windows=3([[:space:]]|$) ]] || {
+  echo "ERR expected the session client and two spawned managed clients: $STATUS" >&2
   exit 1
 }
 

@@ -220,6 +220,11 @@ panes, and agents. Mailboxes are bounded, reject or expose backpressure, and
 carry sender, target, slot, generation, and causal identity. Workers report
 through their owning actor rather than adding another public addressing layer.
 
+An actor may also place a bounded message in its local host outbox. The host
+attaches the actor generation as authenticated origin before interpreting the
+message, so capabilities such as layout leases remain ordinary asynchronous
+actor traffic without trusting a sender identity supplied by guest bytes.
+
 Some host decisions cannot wait behind an actor queue. A policy provider is a
 bounded synchronous function over a host query and immutable published state.
 It may return a decision, validated directives, and a bounded message batch. It
