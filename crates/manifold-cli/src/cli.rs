@@ -292,11 +292,7 @@ pub struct ClientArgs {
     #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
     pub wasm_key_policy: Option<Vec<String>>,
     /// Validate and invoke the configured key policy without opening a presentation.
-    #[arg(
-        long = "check-wasm-key-policy",
-        hide = true,
-        requires = "wasm_key_policy"
-    )]
+    #[arg(long = "check-wasm-key-policy", hide = true)]
     pub check_wasm_key_policy: bool,
     /// Validate configured presentation actors without opening a presentation.
     #[arg(long = "check-wasm-actors", hide = true)]

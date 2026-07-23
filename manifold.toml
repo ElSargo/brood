@@ -2,6 +2,10 @@
 session = "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.component.wasm"
 client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.component.wasm"
 
+[client.key-policy]
+provider = "workspace"
+path = "plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
+
 [module.default-workspace]
 enabled = true
 kind = "plugin"

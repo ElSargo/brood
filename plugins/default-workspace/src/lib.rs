@@ -27,6 +27,7 @@ const KEY_5: i32 = 14;
 const KEY_ENTER: i32 = 36;
 const KEY_O: i32 = 32;
 const KEY_B: i32 = 56;
+const KEY_M: i32 = 58;
 const KEY_Q: i32 = 24;
 const KEY_D: i32 = 40;
 const KEY_F: i32 = 41;
@@ -119,6 +120,17 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
             toggle_workspace_input_mode();
         }
         return write_consume(output, &[]);
+    }
+
+    if input.modifiers & MOD_CTRL != 0
+        && input.modifiers & MOD_ALT != 0
+        && input.key_code == KEY_M
+    {
+        return if input.key_state == KEY_RELEASED {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::TogglePluginPane])
+        };
     }
 
     let workspace_input_mode = workspace_input_mode();
@@ -236,8 +248,9 @@ fn messages_for_global_key<'a>(
     buffer: &'a mut [Message<'static>; 1],
 ) -> &'a [Message<'static>] {
     match key_code {
-        KEY_J => &[Message::LayoutAction("focus-next")],
-        KEY_K => &[Message::LayoutAction("focus-previous")],
+        KEY_J => focus_cycle_managed_pane(state, true, buffer),
+        KEY_K => focus_cycle_managed_pane(state, false, buffer),
+        KEY_O => &[Message::SpawnApp(&["foot"])],
         KEY_H => &[Message::LayoutAction("split-active-down")],
         KEY_L => &[Message::LayoutAction("split-active-right")],
         KEY_S => &[Message::LayoutAction("split-active-smart")],
@@ -349,11 +362,38 @@ fn focus_cycle_terminal<'a>(
     Some(buffer)
 }
 
+fn focus_cycle_managed_pane<'a>(
+    state: &[u8],
+    next: bool,
+    buffer: &'a mut [Message<'static>; 1],
+) -> &'a [Message<'static>] {
+    let mut panes = [0_u64; 64];
+    let mut count = parse_pane_list(state, b"\"managed_panes\":[", &mut panes);
+    if count == 0 {
+        count = parse_pane_list(state, b"\"panes\":[", &mut panes);
+    }
+    if count == 0 {
+        return &[];
+    }
+    let focused = parse_optional_u64_field(state, b"\"focused_pane\":");
+    let current = focused.and_then(|focused| panes[..count].iter().position(|pane| *pane == focused));
+    let target = match (current, next) {
+        (Some(index), true) => (index + 1) % count,
+        (Some(0), false) => count - 1,
+        (Some(index), false) => index - 1,
+        (None, true) => 0,
+        (None, false) => count - 1,
+    };
+    buffer[0] = Message::FocusPane(panes[target]);
+    buffer
+}
+
 fn is_global_workspace_key(key_code: i32) -> bool {
     matches!(
         key_code,
         KEY_J
             | KEY_K
+            | KEY_O
             | KEY_G
             | KEY_H
             | KEY_L
@@ -397,6 +437,7 @@ enum Message<'a> {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
+    TogglePluginPane,
 }
 
 fn write_layout_actor_outbox(
@@ -689,6 +730,7 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::ToggleShortcutPassthrough => {
                 payload.bytes(br#"{"type":"toggle-shortcut-passthrough"}"#)
             }
+            Message::TogglePluginPane => payload.bytes(br#"{"type":"toggle-plugin-pane"}"#),
         }
         writer.bytes(br#"]}"#);
         index += 1;
@@ -928,7 +970,11 @@ fn object_has_string_field(object: &[u8], needle: &[u8], expected: &[u8]) -> boo
 }
 
 fn parse_visible_panes(bytes: &[u8], output: &mut [u64]) -> usize {
-    let Some(mut cursor) = find_after(bytes, b"\"visible_panes\":[") else {
+    parse_pane_list(bytes, b"\"visible_panes\":[", output)
+}
+
+fn parse_pane_list(bytes: &[u8], needle: &[u8], output: &mut [u64]) -> usize {
+    let Some(mut cursor) = find_after(bytes, needle) else {
         return 0;
     };
     let mut len = 0;

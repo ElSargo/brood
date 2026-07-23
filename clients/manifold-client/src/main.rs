@@ -34,7 +34,7 @@ use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
+    keyboard::{Key, ModifiersState, NamedKey},
     platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId},
 };
@@ -83,11 +83,27 @@ fn main() -> Result<()> {
         eprintln!("presentation WASM actor check passed");
         return Ok(());
     }
-    let mut key_policy = ClientKeyPolicy::load(args.wasm_key_policy.as_deref())?;
+    let configured_key_policy = if args.wasm_key_policy.is_none() {
+        manifold_cli::client_key_policy_selection(&config_path)?
+    } else {
+        None
+    };
+    let configured_key_policy_spec = configured_key_policy.as_ref().map(|policy| {
+        vec![
+            policy.provider.clone(),
+            policy.path.to_string_lossy().into_owned(),
+        ]
+    });
+    let key_policy_spec = args
+        .wasm_key_policy
+        .as_deref()
+        .or(configured_key_policy_spec.as_deref());
+    let mut key_policy = ClientKeyPolicy::load(key_policy_spec)?;
     if args.check_wasm_key_policy {
         let snapshot = KeyPolicySnapshot {
             focused_pane: Some(1),
             panes: vec![1, 2],
+            managed_panes: vec![2],
             app_panes: vec![KeyPolicyAppPane {
                 pane: 2,
                 app_id: "manifold-terminal-1".to_string(),
@@ -100,26 +116,14 @@ fn main() -> Result<()> {
             &snapshot,
         )?;
         if evaluation.decision != GlobalKeyDecision::Consume
-            || evaluation.host_messages.iter().any(|message| {
-                matches!(
-                    message,
-                    HostMessage::LayoutAction { .. } | HostMessage::SetResolvedLayout { .. }
-                )
-            })
-            || !evaluation.actor_messages.iter().any(|message| {
-                message.actor == "workspace"
-                    && serde_json::from_slice::<HostMessage>(&message.payload).is_ok_and(
-                        |message| {
-                            matches!(
-                                message,
-                                HostMessage::LayoutAction { action } if action == "focus-next"
-                            )
-                        },
-                    )
-            })
+            || !evaluation
+                .host_messages
+                .iter()
+                .any(|message| matches!(message, HostMessage::FocusPane { pane: 2 }))
+            || !evaluation.actor_messages.is_empty()
         {
             return Err(anyhow!(
-                "presentation key policy did not route Ctrl+J to the workspace actor"
+                "presentation key policy did not resolve Ctrl+J to the next visible pane"
             ));
         }
         let mode_toggle = key_policy.evaluate(
@@ -140,6 +144,12 @@ fn main() -> Result<()> {
             manifold_wasm::ABI_MOD_CTRL,
             &snapshot,
         )?;
+        let toggle_switcher = key_policy.evaluate(
+            58,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL | manifold_wasm::ABI_MOD_ALT,
+            &snapshot,
+        )?;
         let focus_existing = key_policy.evaluate(
             10,
             manifold_wasm::ABI_KEY_PRESSED,
@@ -155,6 +165,10 @@ fn main() -> Result<()> {
                         if argv.first().is_some_and(|program| program == "foot")
                 )
             })
+            || !toggle_switcher
+                .host_messages
+                .iter()
+                .any(|message| matches!(message, HostMessage::TogglePluginPane))
             || !focus_existing
                 .host_messages
                 .iter()
@@ -1564,28 +1578,6 @@ impl ApplicationHandler<ClientEvent> for Application {
                 is_synthetic,
                 ..
             } if !is_synthetic => {
-                // TEMPORARY MVP BINDING: F6 toggles between the one local plugin pane
-                // and the backend-managed pane without carrying modifiers across them.
-                if is_plugin_managed_focus_toggle(event.physical_key) {
-                    if event.state == ElementState::Pressed && !event.repeat {
-                        if let Some(change) = renderer.toggle_plugin_managed_focus()
-                            && let Err(error) = dispatch_focus_change(
-                                self.wasm_runtime.as_ref(),
-                                self.input_sender.as_mut(),
-                                change,
-                                self.window_focused,
-                            )
-                        {
-                            eprintln!("dropped pane focus event: {error:#}");
-                        }
-                        flush_renderer_managed_resize_requests(
-                            self.input_sender.as_mut(),
-                            renderer,
-                        );
-                    }
-                    return;
-                }
-
                 let policy_evaluation = event.physical_key.to_scancode().and_then(|scancode| {
                     let snapshot = renderer.key_policy_snapshot();
                     self.key_policy.as_mut().and_then(|policy| {
@@ -1768,6 +1760,7 @@ struct Renderer {
     current_sequence: Option<u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_pane: Option<PluginPaneTexture>,
+    plugin_pane_visible: bool,
     focused_pane: Option<FocusedPane>,
     accepted_layout: ResolvedLayout,
     layout_source: LayoutSource,
@@ -2032,7 +2025,16 @@ fn apply_key_policy_host_message(
                 ));
             }
         }
-        HostMessage::FocusPane { pane } => renderer.focus_pane(pane),
+        HostMessage::FocusPane { pane } => {
+            let inventory = renderer.pane_inventory();
+            let focused = renderer.focused_pane_id();
+            let change = renderer.focus_pane(pane);
+            eprintln!(
+                "presentation key policy requested pane focus pane={pane} focused={focused:?} inventory={inventory:?} changed={}",
+                change.is_some()
+            );
+            change
+        }
         HostMessage::SpawnApp { argv } => {
             queue_spawn_command(backend_commands, argv)?;
             None
@@ -2045,6 +2047,7 @@ fn apply_key_policy_host_message(
                 None
             }
         }
+        HostMessage::TogglePluginPane => renderer.toggle_plugin_pane(),
         HostMessage::SwitchActiveSessionNext => {
             queue_backend_command(
                 backend_commands,
@@ -2628,6 +2631,7 @@ impl Renderer {
             current_sequence: None,
             plugin_graphics,
             plugin_pane: None,
+            plugin_pane_visible: true,
             focused_pane: None,
             accepted_layout: ResolvedLayout::empty(),
             layout_source: LayoutSource::NativeFallback,
@@ -2710,7 +2714,10 @@ impl Renderer {
                 } else {
                     previous_focus
                 },
-                self.plugin_pane.as_ref().map(|plugin| plugin.scene.pane),
+                self.plugin_pane
+                    .as_ref()
+                    .filter(|_| self.plugin_pane_visible)
+                    .map(|plugin| plugin.scene.pane),
                 &managed_panes,
                 backend_focus,
             );
@@ -2747,24 +2754,29 @@ impl Renderer {
         }
     }
 
-    fn toggle_plugin_managed_focus(&mut self) -> Option<FocusChange> {
+    /// One chord owns the complete switcher lifecycle: show and focus a hidden
+    /// pane, focus a visible pane, then hide it when invoked while focused.
+    fn toggle_plugin_pane(&mut self) -> Option<FocusChange> {
         let plugin = self.plugin_pane.as_ref().map(|pane| pane.scene.pane)?;
-        let managed = match self.focused_pane {
-            Some(FocusedPane::Managed(window_id))
-                if self
-                    .current_windows
-                    .iter()
-                    .any(|window| window.window_id == window_id) =>
-            {
-                window_id
-            }
-            _ => {
-                let window = self.current_windows.first()?;
-                window.window_id
-            }
-        };
-        let target = toggled_plugin_managed_focus(self.focused_pane, plugin, managed);
-        self.set_focus(target)
+        if !self.plugin_pane_visible {
+            self.plugin_pane_visible = true;
+            self.layout_state_dirty = true;
+            let _layout_focus = self.reconcile_layout();
+            eprintln!("showed presentation session switcher pane={plugin}");
+            return self.set_focus(FocusedPane::Plugin(plugin));
+        }
+        if self.focused_pane != Some(FocusedPane::Plugin(plugin)) {
+            eprintln!("focused visible presentation session switcher pane={plugin}");
+            return self.set_focus(FocusedPane::Plugin(plugin));
+        }
+        if self.current_windows.is_empty() {
+            eprintln!("kept session switcher visible because no managed window is available");
+            return None;
+        }
+        self.plugin_pane_visible = false;
+        self.layout_state_dirty = true;
+        eprintln!("hid presentation session switcher pane={plugin}");
+        self.reconcile_layout()
     }
 
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
@@ -2782,6 +2794,11 @@ impl Renderer {
         KeyPolicySnapshot {
             focused_pane: self.focused_pane_id(),
             panes: self.pane_inventory(),
+            managed_panes: self
+                .current_windows
+                .iter()
+                .map(|window| window.window_id)
+                .collect(),
             app_panes: self
                 .current_windows
                 .iter()
@@ -3049,6 +3066,7 @@ impl Renderer {
     fn pane_inventory(&self) -> Vec<u64> {
         self.plugin_pane
             .iter()
+            .filter(|_| self.plugin_pane_visible)
             .map(|plugin| plugin.scene.pane)
             .chain(self.current_windows.iter().map(|window| window.window_id))
             .collect()
@@ -3065,7 +3083,7 @@ impl Renderer {
         if self
             .plugin_pane
             .as_ref()
-            .is_some_and(|plugin| plugin.scene.pane == pane)
+            .is_some_and(|plugin| self.plugin_pane_visible && plugin.scene.pane == pane)
         {
             return Some(FocusedPane::Plugin(pane));
         }
@@ -3349,17 +3367,6 @@ fn clip_rect_to_extent(rect: [i32; 4], extent: (u32, u32)) -> Option<[i32; 4]> {
     (width > 0 && height > 0).then_some([x, y, width, height])
 }
 
-const fn toggled_plugin_managed_focus(
-    current: Option<FocusedPane>,
-    plugin: u64,
-    managed: u64,
-) -> FocusedPane {
-    match current {
-        Some(FocusedPane::Plugin(_)) => FocusedPane::Managed(managed),
-        _ => FocusedPane::Plugin(plugin),
-    }
-}
-
 fn scene_focus_target(
     current: Option<FocusedPane>,
     plugin_pane: Option<u64>,
@@ -3404,10 +3411,6 @@ fn focus_change_between(
         managed_window,
         reset_keyboard: true,
     })
-}
-
-const fn is_plugin_managed_focus_toggle(key: PhysicalKey) -> bool {
-    matches!(key, PhysicalKey::Code(KeyCode::F6))
 }
 
 fn project_point_between_rects(x: f64, y: f64, from: [i32; 4], to: [i32; 4]) -> (f64, f64) {
@@ -3562,24 +3565,6 @@ mod tests {
             Some([0, 10, 120, 70])
         );
         assert_eq!(clip_rect_to_extent([200, 10, 20, 20], (120, 80)), None);
-    }
-
-    #[test]
-    fn focus_toggle_distinguishes_local_and_backend_ids() {
-        assert!(is_plugin_managed_focus_toggle(PhysicalKey::Code(
-            KeyCode::F6
-        )));
-        assert!(!is_plugin_managed_focus_toggle(PhysicalKey::Code(
-            KeyCode::F5
-        )));
-        assert_eq!(
-            toggled_plugin_managed_focus(Some(FocusedPane::Plugin(1)), 1, 1),
-            FocusedPane::Managed(1)
-        );
-        assert_eq!(
-            toggled_plugin_managed_focus(Some(FocusedPane::Managed(1)), 1, 1),
-            FocusedPane::Plugin(1)
-        );
     }
 
     #[test]

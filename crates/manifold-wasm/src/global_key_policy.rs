@@ -66,6 +66,10 @@ pub enum HostMessage {
         app_id: String,
         argv: Vec<String>,
     },
+    /// Toggle the presentation-local plugin pane. When hidden, the next
+    /// toggle restores and focuses it; when visible but unfocused, the first
+    /// toggle focuses it.
+    TogglePluginPane,
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,

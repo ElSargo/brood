@@ -100,6 +100,18 @@ backend asynchronously, so the synchronous key decision never waits for DBus or
 network work. The built-in daemon presenter retains the same provider host only
 as a compatibility path.
 
+The default policy keeps the normal launch usable without desktop-global
+shortcuts or wrapper arguments:
+
+- `Ctrl+Alt+M` focuses the visible session switcher, hides it when invoked
+  again while focused, and restores it on the next invocation;
+- `Ctrl+J` and `Ctrl+K` cycle focus through the presentation's managed
+  windows;
+- `Ctrl+O` queues a new `foot` window in the active surface session.
+
+These chords are guest policy. The client owns only validation, local focus and
+plugin-pane visibility, and the bounded backend command queue.
+
 ## Actor Follow-Up
 
 When a shortcut invokes long-running behavior, the policy path should only make

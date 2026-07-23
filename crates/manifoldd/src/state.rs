@@ -7223,6 +7223,9 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
         manifold_wasm::HostMessage::FocusOrSpawnApp { app_id, argv } => {
             WorkspaceCommand::FocusOrSpawnApp { app_id, argv }
         }
+        manifold_wasm::HostMessage::TogglePluginPane => {
+            anyhow::bail!("toggle-plugin-pane is only valid in the client realm")
+        }
         manifold_wasm::HostMessage::SwitchActiveSessionNext => {
             WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext)
         }

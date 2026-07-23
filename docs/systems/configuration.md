@@ -28,6 +28,7 @@ Current discovery order:
 Current section families:
 
 - `[init]` for the session and client realm root actors
+- `[client.key-policy]` for the presentation client's synchronous policy provider
 - `[module.<id>]` for startup modules
 - `[startup.<id>]` for startup hosted apps
 - `[session.runner]` for project environment activation
@@ -46,6 +47,12 @@ actor lifecycle protocol; legacy
 module and startup-app loading remains a compatibility fallback only for realms
 without a configured root. Exact recovery and override flags remain in the CLI
 definitions.
+
+`[client.key-policy]` selects the provider export and core-WASM artifact used
+before the client routes a key to either a local plugin pane or a managed
+window. Relative artifact paths resolve from the config directory. A CLI
+selection remains an explicit recovery override; normal `manifold` startup
+uses this config selection without wrapper arguments.
 
 The `<id>` in `[module.<id>]` is also the hosted actor instance ID for Component
 and Preview 1 modules. Multiple entries may therefore instantiate the same

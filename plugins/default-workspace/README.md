@@ -34,8 +34,10 @@ nix develop --command cargo run -- test nested --force-outer --inner-headless \
   plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm
 ```
 
-The repository's observable acceptance proof uses this exact module with a
-real terminal, injected key press/release events, modifier-state controls, and
-a compositor screenshot. Bare `B` leaves `Ctrl+O` forwarded; `Ctrl+B` changes
-the same policy context so `Ctrl+O` visibly opens exactly one second terminal.
-Run `tools/test-typed-key-policy-nested.sh` through the checked-in Nix shell.
+The normal config selects this provider for the presentation client. Its
+always-available workspace chords are `Ctrl+Alt+M` for the session-switcher
+pane, `Ctrl+J` / `Ctrl+K` for managed-window focus, and `Ctrl+O` for a new `foot`
+window. The repository acceptance proof uses this exact module with real
+terminal surfaces, injected key press/release events, and compositor
+screenshots. Run `tools/test-typed-key-policy-nested.sh` through the checked-in
+Nix shell.

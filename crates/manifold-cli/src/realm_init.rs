@@ -17,12 +17,32 @@ pub enum RealmKind {
 struct RootConfig {
     #[serde(default)]
     init: InitConfig,
+    #[serde(default)]
+    client: ClientConfig,
 }
 
 #[derive(Default, serde::Deserialize)]
 struct InitConfig {
     session: Option<PathBuf>,
     client: Option<PathBuf>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ClientConfig {
+    #[serde(rename = "key-policy")]
+    key_policy: Option<ClientKeyPolicyConfig>,
+}
+
+#[derive(serde::Deserialize)]
+struct ClientKeyPolicyConfig {
+    provider: String,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientKeyPolicySelection {
+    pub provider: String,
+    pub path: PathBuf,
 }
 
 /// Resolve the blessed init actor for one realm from a Manifold config.
@@ -48,6 +68,35 @@ pub fn realm_init_actor_path(config_path: &Path, realm: RealmKind) -> Result<Opt
                 .join(path)
         }
     }))
+}
+
+/// Resolve the synchronous key policy selected for the presentation client.
+pub fn client_key_policy_selection(config_path: &Path) -> Result<Option<ClientKeyPolicySelection>> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(config_path)
+        .with_context(|| format!("read Manifold config {}", config_path.display()))?;
+    let config: RootConfig = toml::from_str(&contents)
+        .with_context(|| format!("parse Manifold config {}", config_path.display()))?;
+    Ok(config
+        .client
+        .key_policy
+        .map(|policy| ClientKeyPolicySelection {
+            provider: policy.provider,
+            path: resolve_relative_path(config_path, policy.path),
+        }))
+}
+
+fn resolve_relative_path(config_path: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    }
 }
 
 /// Return the shared config path used by both session and client realms.
@@ -112,6 +161,28 @@ mod tests {
                 .ok()
                 .flatten(),
             Some(root.path().join("actors/client.wasm"))
+        );
+    }
+
+    #[test]
+    fn client_key_policy_resolves_relative_to_config() {
+        let root = tempfile::tempdir();
+        assert!(root.is_ok());
+        let Some(root) = root.ok() else {
+            return;
+        };
+        let config_path = root.path().join("manifold.toml");
+        let write = fs::write(
+            &config_path,
+            "[client.key-policy]\nprovider = \"workspace\"\npath = \"plugins/workspace.wasm\"\n",
+        );
+        assert!(write.is_ok());
+        assert_eq!(
+            client_key_policy_selection(&config_path).ok().flatten(),
+            Some(ClientKeyPolicySelection {
+                provider: "workspace".to_string(),
+                path: root.path().join("plugins/workspace.wasm"),
+            })
         );
     }
 }

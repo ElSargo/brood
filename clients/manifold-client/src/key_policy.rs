@@ -25,6 +25,7 @@ pub struct KeyPolicyAppPane {
 pub struct KeyPolicySnapshot {
     pub focused_pane: Option<u64>,
     pub panes: Vec<u64>,
+    pub managed_panes: Vec<u64>,
     pub app_panes: Vec<KeyPolicyAppPane>,
 }
 
@@ -145,6 +146,7 @@ mod tests {
         let snapshot = KeyPolicySnapshot {
             focused_pane: Some(u64::MAX),
             panes: vec![u64::MAX, 7],
+            managed_panes: vec![7],
             app_panes: vec![KeyPolicyAppPane {
                 pane: 7,
                 app_id: "firefox".to_string(),
@@ -158,6 +160,7 @@ mod tests {
                 serde_json::json!({
                     "focused_pane": u64::MAX,
                     "panes": [u64::MAX, 7],
+                    "managed_panes": [7],
                     "app_panes": [{"pane": 7, "app_id": "firefox"}],
                 })
             );

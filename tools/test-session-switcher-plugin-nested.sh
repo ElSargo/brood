@@ -25,6 +25,7 @@ if [[ "${MANIFOLD_SESSION_SWITCHER_CONTROLLER:-0}" == 1 ]]; then
   for _ in $(seq 1 400); do
     if [[ -f "$server_log" ]] \
       && grep -q 'started presentation WASM actor id=session-switcher' "$client_log" \
+      && grep -q 'loaded presentation key policy provider=workspace' "$client_log" \
       && grep -q 'accepted plugin draw packet' "$client_log" \
       && grep -q 'presentation session snapshot revision=.*sessions=1' "$client_log"; then
       break
@@ -101,10 +102,15 @@ nix develop --command cargo build \
 nix develop --command cargo run --quiet -p manifold-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
   "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
+nix develop --command cargo build \
+  --manifest-path plugins/default-workspace/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release
 
-printf '[init]\nsession = "%s"\nclient = "%s"\n' \
+printf '[init]\nsession = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
   "$PACKAGE/session-init.component.wasm" \
   "$PACKAGE/manifold_session_switcher_plugin.component.wasm" \
+  "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm" \
   >"$OUT/manifold.toml"
 
 export MANIFOLD_CONFIG="$OUT/manifold.toml"
@@ -137,9 +143,28 @@ ctl() {
   RUST_LOG=off "$BIN" ctl --dbus-destination "$inner_destination" "$@"
 }
 
+# The nested host carries its own Manifold shortcuts. Disable their interception
+# so this proof exercises the focused inner client's policy, just as a desktop
+# compositor with no conflicting global shortcut would.
+ctl passthrough-mode set on >/dev/null
+
 inject_key() {
   ctl inject key "$1" pressed >/dev/null
   ctl inject key "$1" released >/dev/null
+}
+
+inject_ctrl_key() {
+  ctl inject key 37 pressed >/dev/null
+  inject_key "$1"
+  ctl inject key 37 released >/dev/null
+}
+
+inject_ctrl_alt_key() {
+  ctl inject key 37 pressed >/dev/null
+  ctl inject key 64 pressed >/dev/null
+  inject_key "$1"
+  ctl inject key 64 released >/dev/null
+  ctl inject key 37 released >/dev/null
 }
 
 inject_click() {
@@ -174,6 +199,78 @@ row_x=$((client_x + 50))
 # The nested Winit surface is configured at twice its logical input height;
 # manifold-client projects that logical input back into the full canvas.
 second_row_y=$((client_y + 173 * client_h / 1600))
+
+# Vanilla config must load the workspace policy without client CLI overrides.
+# Ctrl+O spawns one real terminal in the active session.
+inject_ctrl_key 32
+for _ in $(seq 1 200); do
+  sessions_after_spawn="$(cat "$OUT/backend-sessions.json")"
+  active_windows="$(python3 - "$sessions_after_spawn" <<'PY'
+import json
+import sys
+
+sessions = json.loads(sys.argv[1])["sessions"]
+print(next(session["windows"] for session in sessions if session["active"]))
+PY
+)"
+  [[ "$active_windows" == 2 ]] && break
+  sleep 0.05
+done
+[[ "$active_windows" == 2 ]]
+
+# Return focus to the plugin, then prove Ctrl+J/K cycle between the two real
+# managed windows. The client logs the exact backend pane selected each time.
+input_y=$((client_y + 70 * client_h / 1600))
+inject_click "$row_x" "$input_y"
+focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
+inject_ctrl_key 44
+for _ in $(seq 1 100); do
+  next_focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
+  ((next_focus_count > focus_count)) && break
+  sleep 0.05
+done
+first_focus="$(grep 'focused backend-managed window=' "$OUT/client.log" | tail -1)"
+focus_count="$next_focus_count"
+inject_ctrl_key 44
+for _ in $(seq 1 100); do
+  next_focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
+  ((next_focus_count > focus_count)) && break
+  sleep 0.05
+done
+second_focus="$(grep 'focused backend-managed window=' "$OUT/client.log" | tail -1)"
+[[ "$first_focus" != "$second_focus" ]]
+focus_count="$next_focus_count"
+inject_ctrl_key 45
+for _ in $(seq 1 100); do
+  next_focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
+  ((next_focus_count > focus_count)) && break
+  sleep 0.05
+done
+previous_focus="$(grep 'focused backend-managed window=' "$OUT/client.log" | tail -1)"
+[[ "$previous_focus" == "$first_focus" ]]
+
+# Ctrl+Alt+M focuses the visible switcher, hides it on the next invocation,
+# and restores/focuses it on the third. Capture the managed-only middle state.
+inject_ctrl_alt_key 58
+for _ in $(seq 1 100); do
+  grep -q 'focused visible presentation session switcher' "$OUT/client.log" && break
+  sleep 0.05
+done
+grep -q 'focused visible presentation session switcher' "$OUT/client.log"
+inject_ctrl_alt_key 58
+for _ in $(seq 1 100); do
+  grep -q 'hid presentation session switcher' "$OUT/client.log" && break
+  sleep 0.05
+done
+grep -q 'hid presentation session switcher' "$OUT/client.log"
+ctl debug dump "$OUT/nested/switcher-hidden" >/dev/null
+inject_ctrl_alt_key 58
+for _ in $(seq 1 100); do
+  grep -q 'showed presentation session switcher' "$OUT/client.log" && break
+  sleep 0.05
+done
+grep -q 'showed presentation session switcher' "$OUT/client.log"
+
 for _ in $(seq 1 200); do
   # Winit may still be processing the configure generated by the debug dump;
   # retrying the idempotent activation also proves focus can return from the
@@ -186,7 +283,6 @@ done
 grep -q 'active_surface_session=2' <<<"$status_after_switch"
 
 # Type an unmatched query and let Enter create it. XKB keycodes spell delta.
-input_y=$((client_y + 70 * client_h / 1600))
 inject_click "$row_x" "$input_y"
 type_keys 40 26 46 28 38
 inject_key 36
@@ -227,11 +323,17 @@ done
 {
   printf '# Native session switcher proof\n\n'
   printf '%s\n' '- initial catalogue: three sessions rendered in a client-realm plugin pane'
+  printf '%s\n' "- vanilla Ctrl+O spawn: $sessions_after_spawn"
+  printf '%s\n' "- Ctrl+J first focus: $first_focus"
+  printf '%s\n' "- Ctrl+J second focus: $second_focus"
+  printf '%s\n' "- Ctrl+K previous focus: $previous_focus"
+  printf '%s\n' '- Ctrl+Alt+M: focus, hide, and restore completed'
   printf '%s\n' "- pointer switch: $status_after_switch"
   printf '%s\n' "- create: $sessions_after_create"
   printf '%s\n' "- rename: $sessions_after_rename"
   printf '%s\n' "- close: $sessions_after_close"
   printf '%s\n' "- initial screenshot: $OUT/nested/sessions-initial/composed.png"
+  printf '%s\n' "- switcher-hidden screenshot: $OUT/nested/switcher-hidden/composed.png"
   printf '%s\n' "- renamed screenshot: $OUT/nested/sessions-renamed/composed.png"
 } >"$OUT/proof.md"
 
@@ -248,12 +350,15 @@ wait "$test_pid" || true
 trap - EXIT
 
 grep -q 'started presentation WASM actor id=session-switcher' "$OUT/client.log"
+grep -q 'loaded presentation key policy provider=workspace' "$OUT/client.log"
 grep -q 'presentation session snapshot revision=.*sessions=3' "$OUT/client.log"
 grep -q 'operation=Create success=true' "$OUT/client.log"
 grep -q 'operation=Rename success=true' "$OUT/client.log"
 grep -q 'operation=Close success=true' "$OUT/client.log"
 test -s "$OUT/nested/sessions-initial/composed.png"
+test -s "$OUT/nested/switcher-hidden/composed.png"
 test -s "$OUT/nested/sessions-renamed/composed.png"
 test "$(magick "$OUT/nested/sessions-renamed/composed.png" -format '%k' info:)" -gt 50
+test "$(magick "$OUT/nested/switcher-hidden/composed.png" -format '%k' info:)" -gt 50
 
 echo "session_switcher_nested=verified proof=$OUT/proof.md initial=$OUT/nested/sessions-initial/composed.png renamed=$OUT/nested/sessions-renamed/composed.png"
