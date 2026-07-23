@@ -1,10 +1,18 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
-use core::{panic::PanicInfo, ptr, slice};
+#[cfg(not(test))]
+use core::panic::PanicInfo;
+use core::{ptr, slice};
+use serde::Deserialize;
+use serde_json_core::heapless::{String as FixedString, Vec as FixedVec};
 
 const HEAP_BYTES: usize = 256 * 1024;
 const RESPONSE_BYTES: usize = 64 * 1024;
 const OUTBOX_BYTES: usize = 64 * 1024;
+const MAX_PANES: usize = 64;
+const MAX_APP_ID_BYTES: usize = 256;
+const MAX_MESSAGE_KIND_BYTES: usize = 64;
+const JSON_UNESCAPE_BYTES: usize = 512;
 const OUTPUT_ERROR: i32 = -1;
 const OUTPUT_ABSTAIN: i32 = 0;
 const OUTPUT_OK: i32 = 1;
@@ -57,9 +65,59 @@ static mut LAYOUT_FOCUS: u64 = 0;
 static mut LAYOUT_HAS_FOCUS: bool = false;
 static mut LAYOUT_FULLSCREEN: bool = false;
 
+type PaneList = FixedVec<u64, MAX_PANES>;
+type AppPaneList = FixedVec<AppPane, MAX_PANES>;
+
+#[derive(Default, Deserialize)]
+struct PolicyState {
+    #[serde(default)]
+    focused_pane: Option<u64>,
+    #[serde(default)]
+    panes: PaneList,
+    #[serde(default)]
+    managed_panes: PaneList,
+    #[serde(default)]
+    app_panes: AppPaneList,
+}
+
+#[derive(Deserialize)]
+struct AppPane {
+    pane: u64,
+    app_id: FixedString<MAX_APP_ID_BYTES>,
+}
+
+#[derive(Default, Deserialize)]
+struct WorkspaceMessage {
+    #[serde(rename = "type")]
+    message_type: FixedString<MAX_MESSAGE_KIND_BYTES>,
+    #[serde(default)]
+    action: Option<FixedString<MAX_MESSAGE_KIND_BYTES>>,
+    #[serde(default)]
+    visible_panes: PaneList,
+    #[serde(default)]
+    focused_pane: Option<u64>,
+    #[serde(default)]
+    pane_app_ids: AppPaneList,
+}
+
+fn decode_json<T>(bytes: &[u8]) -> Option<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut unescape = [0_u8; JSON_UNESCAPE_BYTES];
+    let (value, consumed) = serde_json_core::from_slice_escaped::<T>(bytes, &mut unescape).ok()?;
+    (consumed == bytes.len()).then_some(value)
+}
+
+#[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "manifold")]
 unsafe extern "C" {
     fn read_message() -> i32;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn read_message() -> i32 {
+    0
 }
 
 #[no_mangle]
@@ -100,9 +158,19 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
     let Some(query) = guest_slice(query_ptr, query_len) else {
         return OUTPUT_ERROR;
     };
-    let state = guest_slice(state_ptr, state_len).unwrap_or(&[]);
+    let Some(input) = decode_json::<KeyInput>(query) else {
+        return OUTPUT_ERROR;
+    };
+    let state_bytes = guest_slice(state_ptr, state_len).unwrap_or(&[]);
+    let state = if state_bytes.is_empty() {
+        PolicyState::default()
+    } else {
+        let Some(state) = decode_json::<PolicyState>(state_bytes) else {
+            return OUTPUT_ERROR;
+        };
+        state
+    };
     let output = response_buffer_mut();
-    let input = KeyInput::parse(query);
 
     if input.modifiers & MOD_CTRL != 0
         && input.modifiers & MOD_SHIFT != 0
@@ -122,9 +190,7 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
         return write_consume(output, &[]);
     }
 
-    if input.modifiers & MOD_CTRL != 0
-        && input.modifiers & MOD_ALT != 0
-        && input.key_code == KEY_M
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_M
     {
         return if input.key_state == KEY_RELEASED {
             write_consume(output, &[])
@@ -153,7 +219,7 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
             let mut buffer = [Message::Noop; 1];
             write_consume(
                 output,
-                messages_for_global_key(input.key_code, state, &mut buffer),
+                messages_for_global_key(input.key_code, &state, &mut buffer),
             )
         };
     }
@@ -208,17 +274,17 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(
     let Some(message) = guest_slice(inbox_ptr, message_len) else {
         return -2;
     };
+    let Some(message) = decode_json::<WorkspaceMessage>(message) else {
+        return -2;
+    };
     let output = outbox_buffer_mut();
-    if find_after(message, br#""type":"layout-state""#).is_some() {
-        let mut panes = [0_u64; 64];
-        let pane_count = parse_visible_panes(message, &mut panes);
-        let focus = parse_optional_u64_field(message, b"\"focused_pane\":");
-        store_layout_actor_state(&panes[..pane_count], focus);
+    if message.message_type == "layout-state" {
+        store_layout_actor_state(&message.visible_panes, message.focused_pane);
         let len = write_layout_actor_outbox(
             output,
-            message,
-            &panes[..pane_count],
-            focus,
+            &message.pane_app_ids,
+            &message.visible_panes,
+            message.focused_pane,
             layout_actor_fullscreen(),
         );
         if len <= 0 {
@@ -227,10 +293,10 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(
         return pack_actor_outbox(output.as_ptr() as i32, len);
     }
 
-    if find_after(message, br#""type":"layout-action""#).is_none() {
+    if message.message_type != "layout-action" {
         return 0;
     }
-    apply_layout_actor_action(message);
+    apply_layout_actor_action(message.action.as_deref().unwrap_or(""));
     let (panes, focus, fullscreen) = layout_actor_state();
     let len = write_layout_actor_update_outbox(output, panes, focus, fullscreen);
     if len <= 0 {
@@ -244,7 +310,7 @@ pub extern "C" fn manifold_actor_workspace_subscribe_layout_state() {}
 
 fn messages_for_global_key<'a>(
     key_code: i32,
-    state: &[u8],
+    state: &PolicyState,
     buffer: &'a mut [Message<'static>; 1],
 ) -> &'a [Message<'static>] {
     match key_code {
@@ -304,7 +370,7 @@ fn messages_for_global_key<'a>(
 }
 
 fn focus_or_spawn_app<'a>(
-    state: &[u8],
+    state: &PolicyState,
     app_id: &'static [u8],
     argv: &'static [&'static str],
     buffer: &'a mut [Message<'static>; 1],
@@ -318,7 +384,7 @@ fn focus_or_spawn_app<'a>(
 }
 
 fn focus_cycle_terminal<'a>(
-    state: &[u8],
+    state: &PolicyState,
     next: bool,
     buffer: &'a mut [Message<'static>; 1],
 ) -> Option<&'a [Message<'static>]> {
@@ -340,7 +406,7 @@ fn focus_cycle_terminal<'a>(
         return None;
     }
 
-    let focused = parse_optional_u64_field(state, b"\"focused_pane\":");
+    let focused = state.focused_pane;
     let current = focused.and_then(|focused| {
         let mut index = 0;
         while index < count {
@@ -363,26 +429,27 @@ fn focus_cycle_terminal<'a>(
 }
 
 fn focus_cycle_managed_pane<'a>(
-    state: &[u8],
+    state: &PolicyState,
     next: bool,
     buffer: &'a mut [Message<'static>; 1],
 ) -> &'a [Message<'static>] {
-    let mut panes = [0_u64; 64];
-    let mut count = parse_pane_list(state, b"\"managed_panes\":[", &mut panes);
-    if count == 0 {
-        count = parse_pane_list(state, b"\"panes\":[", &mut panes);
-    }
-    if count == 0 {
+    let panes = if state.managed_panes.is_empty() {
+        &state.panes
+    } else {
+        &state.managed_panes
+    };
+    if panes.is_empty() {
         return &[];
     }
-    let focused = parse_optional_u64_field(state, b"\"focused_pane\":");
-    let current = focused.and_then(|focused| panes[..count].iter().position(|pane| *pane == focused));
+    let current = state
+        .focused_pane
+        .and_then(|focused| panes.iter().position(|pane| *pane == focused));
     let target = match (current, next) {
-        (Some(index), true) => (index + 1) % count,
-        (Some(0), false) => count - 1,
+        (Some(index), true) => (index + 1) % panes.len(),
+        (Some(0), false) => panes.len() - 1,
         (Some(index), false) => index - 1,
         (None, true) => 0,
-        (None, false) => count - 1,
+        (None, false) => panes.len() - 1,
     };
     buffer[0] = Message::FocusPane(panes[target]);
     buffer
@@ -442,7 +509,7 @@ enum Message<'a> {
 
 fn write_layout_actor_outbox(
     output: &mut [u8],
-    layout_message: &[u8],
+    app_panes: &[AppPane],
     panes: &[u64],
     focus: Option<u64>,
     fullscreen: bool,
@@ -472,39 +539,34 @@ fn write_layout_actor_outbox(
     }
     publication.bytes(br#"],"app_panes":["#);
     let mut first_app_pane = true;
+    write_app_pane(&mut publication, app_panes, b"pi-foot", &mut first_app_pane);
     write_app_pane(
         &mut publication,
-        layout_message,
-        b"pi-foot",
-        &mut first_app_pane,
-    );
-    write_app_pane(
-        &mut publication,
-        layout_message,
+        app_panes,
         b"manifold-terminal-1",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
-        layout_message,
+        app_panes,
         b"manifold-terminal-2",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
-        layout_message,
+        app_panes,
         b"manifold-terminal-3",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
-        layout_message,
+        app_panes,
         b"manifold-terminal-4",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
-        layout_message,
+        app_panes,
         b"manifold-terminal-5",
         &mut first_app_pane,
     );
@@ -561,18 +623,16 @@ fn layout_actor_state() -> (&'static [u64], Option<u64>, bool) {
     }
 }
 
-fn apply_layout_actor_action(message: &[u8]) {
-    let next = find_after(message, br#""action":"focus-next""#).is_some()
-        || find_after(message, br#""action":"focus-next-split""#).is_some();
-    let previous = find_after(message, br#""action":"focus-previous""#).is_some()
-        || find_after(message, br#""action":"focus-previous-split""#).is_some();
+fn apply_layout_actor_action(action: &str) {
+    let next = matches!(action, "focus-next" | "focus-next-split");
+    let previous = matches!(action, "focus-previous" | "focus-previous-split");
     unsafe {
         let pane_count = LAYOUT_PANE_COUNT.min(64);
         if pane_count == 0 {
             return;
         }
         let panes = slice::from_raw_parts(ptr::addr_of!(LAYOUT_PANES).cast::<u64>(), pane_count);
-        if find_after(message, br#""action":"toggle-managed-fullscreen""#).is_some() {
+        if action == "toggle-managed-fullscreen" {
             LAYOUT_FULLSCREEN = !LAYOUT_FULLSCREEN;
             return;
         }
@@ -600,11 +660,11 @@ fn apply_layout_actor_action(message: &[u8]) {
 
 fn write_app_pane(
     publication: &mut PayloadWriter<'_, '_>,
-    layout_message: &[u8],
+    app_panes: &[AppPane],
     app_id: &[u8],
     first: &mut bool,
 ) {
-    let Some(pane) = pane_for_app_id_in_layout_message(layout_message, app_id) else {
+    let Some(pane) = pane_for_app_id_in_list(app_panes, app_id) else {
         return;
     };
     if !*first {
@@ -765,20 +825,11 @@ fn write_pane_item(
     writer.bytes(br#"}},"input":"pane"}"#);
 }
 
+#[derive(Deserialize)]
 struct KeyInput {
     key_code: i32,
     key_state: i32,
     modifiers: i32,
-}
-
-impl KeyInput {
-    fn parse(bytes: &[u8]) -> Self {
-        Self {
-            key_code: parse_i32_field(bytes, b"\"key_code\":").unwrap_or(0),
-            key_state: parse_i32_field(bytes, b"\"key_state\":").unwrap_or(0),
-            modifiers: parse_i32_field(bytes, b"\"modifiers\":").unwrap_or(0),
-        }
-    }
 }
 
 struct Writer<'a> {
@@ -927,130 +978,14 @@ fn write_u64(writer: &mut Writer<'_>, mut value: u64) {
     }
 }
 
-fn pane_for_app_id(state: &[u8], app_id: &[u8]) -> Option<u64> {
-    pane_for_app_id_in_list(state, b"\"app_panes\":[", app_id)
+fn pane_for_app_id(state: &PolicyState, app_id: &[u8]) -> Option<u64> {
+    pane_for_app_id_in_list(&state.app_panes, app_id)
 }
 
-fn pane_for_app_id_in_layout_message(message: &[u8], app_id: &[u8]) -> Option<u64> {
-    pane_for_app_id_in_list(message, b"\"pane_app_ids\":[", app_id)
-}
-
-fn pane_for_app_id_in_list(bytes: &[u8], list_needle: &[u8], app_id: &[u8]) -> Option<u64> {
-    let mut cursor = find_after(bytes, list_needle)?;
-    loop {
-        cursor = skip_ws(bytes, cursor);
-        if cursor >= bytes.len() || bytes[cursor] == b']' {
-            return None;
-        }
-        let object_end = find_after(&bytes[cursor..], b"}")? + cursor;
-        let object = &bytes[cursor..object_end];
-        let pane = parse_optional_u64_field(object, b"\"pane\":");
-        if pane.is_some() && object_has_string_field(object, b"\"app_id\":", app_id) {
-            return pane;
-        }
-        cursor = object_end;
-        if cursor < bytes.len() && bytes[cursor] == b',' {
-            cursor += 1;
-        }
-    }
-}
-
-fn object_has_string_field(object: &[u8], needle: &[u8], expected: &[u8]) -> bool {
-    let Some(cursor) = find_after(object, needle) else {
-        return false;
-    };
-    let cursor = skip_ws(object, cursor);
-    if object.get(cursor).copied() != Some(b'"') {
-        return false;
-    }
-    let value_start = cursor + 1;
-    let value_end = value_start + expected.len();
-    object.get(value_start..value_end) == Some(expected)
-        && object.get(value_end).copied() == Some(b'"')
-}
-
-fn parse_visible_panes(bytes: &[u8], output: &mut [u64]) -> usize {
-    parse_pane_list(bytes, b"\"visible_panes\":[", output)
-}
-
-fn parse_pane_list(bytes: &[u8], needle: &[u8], output: &mut [u64]) -> usize {
-    let Some(mut cursor) = find_after(bytes, needle) else {
-        return 0;
-    };
-    let mut len = 0;
-    loop {
-        cursor = skip_ws(bytes, cursor);
-        if cursor >= bytes.len() || bytes[cursor] == b']' || len >= output.len() {
-            return len;
-        }
-        let (value, next) = parse_u64_at(bytes, cursor);
-        if next == cursor {
-            return len;
-        }
-        output[len] = value;
-        len += 1;
-        cursor = skip_ws(bytes, next);
-        if cursor < bytes.len() && bytes[cursor] == b',' {
-            cursor += 1;
-        }
-    }
-}
-
-fn parse_i32_field(bytes: &[u8], needle: &[u8]) -> Option<i32> {
-    let cursor = find_after(bytes, needle)?;
-    let cursor = skip_ws(bytes, cursor);
-    let negative = bytes.get(cursor).copied() == Some(b'-');
-    let cursor = if negative { cursor + 1 } else { cursor };
-    let (value, next) = parse_u64_at(bytes, cursor);
-    if next == cursor {
-        return None;
-    }
-    Some(if negative {
-        -(value as i32)
-    } else {
-        value as i32
-    })
-}
-
-fn parse_optional_u64_field(bytes: &[u8], needle: &[u8]) -> Option<u64> {
-    let cursor = skip_ws(bytes, find_after(bytes, needle)?);
-    if bytes.get(cursor).copied() == Some(b'n') {
-        return None;
-    }
-    let (value, next) = parse_u64_at(bytes, cursor);
-    (next != cursor).then_some(value)
-}
-
-fn parse_u64_at(bytes: &[u8], mut cursor: usize) -> (u64, usize) {
-    let mut value = 0_u64;
-    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-        value = value
-            .saturating_mul(10)
-            .saturating_add((bytes[cursor] - b'0') as u64);
-        cursor += 1;
-    }
-    (value, cursor)
-}
-
-fn find_after(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    let mut index = 0;
-    while index + needle.len() <= haystack.len() {
-        if &haystack[index..index + needle.len()] == needle {
-            return Some(index + needle.len());
-        }
-        index += 1;
-    }
-    None
-}
-
-fn skip_ws(bytes: &[u8], mut cursor: usize) -> usize {
-    while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\n' | b'\r' | b'\t') {
-        cursor += 1;
-    }
-    cursor
+fn pane_for_app_id_in_list(app_panes: &[AppPane], app_id: &[u8]) -> Option<u64> {
+    app_panes
+        .iter()
+        .find_map(|item| (item.app_id.as_bytes() == app_id).then_some(item.pane))
 }
 
 fn guest_slice(ptr: i32, len: i32) -> Option<&'static [u8]> {
@@ -1092,6 +1027,53 @@ fn pack_actor_outbox(ptr: i32, len: i32) -> i64 {
     ((ptr as i64) << 32) | (len as u32 as i64)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_state_json_accepts_whitespace_ordering_and_escapes() {
+        let state = decode_json::<PolicyState>(
+            br#"{
+                "app_panes": [{"app_id": "manifold-\u0074erminal-1", "pane": 9}],
+                "ignored": {"nested": [true, null, "value"]},
+                "managed_panes": [9, 10],
+                "focused_pane": 10,
+                "panes": [18446744073709551615, 9, 10]
+            }"#,
+        )
+        .expect("decode policy state");
+
+        assert_eq!(state.focused_pane, Some(10));
+        assert_eq!(state.panes.as_slice(), &[u64::MAX, 9, 10]);
+        assert_eq!(state.managed_panes.as_slice(), &[9, 10]);
+        assert_eq!(pane_for_app_id(&state, b"manifold-terminal-1"), Some(9));
+    }
+
+    #[test]
+    fn workspace_message_json_is_structural_not_substring_based() {
+        let message = decode_json::<WorkspaceMessage>(
+            br#"{
+                "action": "focus-next",
+                "metadata": "\"type\":\"layout-state\"",
+                "type": "layout-action"
+            }"#,
+        )
+        .expect("decode workspace message");
+
+        assert_eq!(message.message_type.as_str(), "layout-action");
+        assert_eq!(message.action.as_deref(), Some("focus-next"));
+        assert!(message.visible_panes.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_trailing_json_is_rejected() {
+        assert!(decode_json::<PolicyState>(br#"{"panes":[1,]}"#).is_none());
+        assert!(decode_json::<PolicyState>(br#"{"panes":[1]} trailing"#).is_none());
+    }
+}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}

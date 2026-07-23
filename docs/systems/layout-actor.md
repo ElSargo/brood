@@ -88,6 +88,18 @@ identity namespace. Backend-managed IDs grow upward from the low end;
 client-local pane IDs grow downward from the high end. Actors therefore use one
 pane ID shape without confusing a local pane with a managed Wayland pane.
 
+## Recursive Layout Follow-Up
+
+Recursive layouts will own compound client UI such as a session-switcher
+sidebar and its content subtree. Showing, hiding, and focusing that UI becomes
+a layout-tree action: the layout actor retains or restores the subtree,
+resolves its focus target, and emits the resulting flat validated layout.
+
+The current client-pane toggle message is therefore transitional. Do not grow
+it into a general collection of switcher-specific host commands; recursive
+layout nodes are the target abstraction for visibility and focus of compound
+plugin UI.
+
 ## Fallback And Failure
 
 The client immediately uses deterministic native flat layout when no layout

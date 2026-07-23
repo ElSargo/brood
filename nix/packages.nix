@@ -52,6 +52,7 @@ let
       "${src}/examples/wasm-preview1-worker/Cargo.lock"
       "${src}/plugins/component-workspace-watch/Cargo.lock"
       "${src}/plugins/component-runtime-io/Cargo.lock"
+      "${src}/plugins/default-workspace/Cargo.lock"
       "${src}/plugins/session-switcher/Cargo.lock"
       "${src}/plugins/workspace-file-log/Cargo.lock"
     ];

@@ -53,6 +53,20 @@ nix build .#software-e2e-artifacts
 
 The result contains `frame.png`, `layout-state.json`, and `detected-layout.json`.
 
+## Cleanup TODO
+
+TODO: make the checked-out source binary own the same `manifold test nested`
+surface documented here, so repository proofs never depend on a separately
+installed supervisor with a different parser. The supervisor should also own
+shortcut isolation for a nested subject instead of requiring each workload to
+toggle passthrough manually.
+
+Fix nested debug-dump orientation as part of that cleanup. Captured surfaces
+must have the same orientation as the real host-visible presentation, and the
+software proof should assert a directional marker so a vertically inverted
+capture cannot pass on color count alone. Once the consolidated proof is the
+only supported entry point, remove the historical typed-key-policy wrapper.
+
 Related:
 
 - [[../systems/testing]]

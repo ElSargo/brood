@@ -112,6 +112,15 @@ shortcuts or wrapper arguments:
 These chords are guest policy. The client owns only validation, local focus and
 plugin-pane visibility, and the bounded backend command queue.
 
+## Configurable Actions TODO
+
+TODO: design configuration for user bindings and application actions before
+adding more compiled-in chords. The design needs one named action model shared
+by configuration and plugins, deterministic conflict resolution, bounded
+configuration delivery to the synchronous guest policy, and validated
+capabilities for application launch. Terminal choice and argv belong in that
+model rather than remaining hardcoded in the default-workspace WASM artifact.
+
 ## Actor Follow-Up
 
 When a shortcut invokes long-running behavior, the policy path should only make
