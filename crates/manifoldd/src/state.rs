@@ -1021,6 +1021,50 @@ impl Manifold {
         Ok(())
     }
 
+    /// Deliver one presentation-originated mailbox message to an actor owned
+    /// by the explicitly named surface-session realm.
+    pub(crate) fn send_session_actor_message(
+        &mut self,
+        session: SurfaceSessionId,
+        actor: &str,
+        sender: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        self.drain_hosted_actor_events();
+        ensure!(
+            self.sessions.contains(session),
+            "unknown surface session {}",
+            session.raw()
+        );
+        let init = self
+            .realm_inits
+            .get(&session)
+            .context("surface session has no actor realm")?;
+        let actor_id = if actor == "init" || actor == init.actor_id {
+            init.actor_id.clone()
+        } else if let Some(actor_id) = init.children.get(actor) {
+            actor_id.clone()
+        } else if init.children.values().any(|actor_id| actor_id == actor) {
+            actor.to_string()
+        } else {
+            anyhow::bail!(
+                "actor {actor:?} does not belong to surface session {}",
+                session.raw()
+            );
+        };
+        let sender = format!("presentation:{sender}");
+        self.try_route_wasm_actor_message(&actor_id, sender.clone(), body)?;
+        self.plugin_actor_messages = self.plugin_actor_messages.saturating_add(1);
+        self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+        info!(
+            surface_session = session.raw(),
+            actor = %actor_id,
+            sender = %sender,
+            "delivered presentation-to-session actor message"
+        );
+        Ok(())
+    }
+
     pub fn send_plugin_actor_message_to_slot(
         &mut self,
         actor_id: &str,
@@ -7498,6 +7542,7 @@ pub struct PresentationFastPath {
     pub generation: u64,
     pub input: manifold_ipc::CriticalConsumer,
     pub frames: manifold_ipc::CriticalProducer,
+    pub actor_messages: manifold_ipc::ActorMessageConsumer,
     pub frame_notifications: manifold_ipc::EventNotifier,
     pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,

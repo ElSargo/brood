@@ -158,6 +158,11 @@ pub enum ComponentActorEvent {
         id: String,
         argv: Vec<String>,
     },
+    SessionMessageRequested {
+        session_id: u64,
+        actor: String,
+        body: Vec<u8>,
+    },
     Stopped,
 }
 
@@ -195,6 +200,9 @@ pub struct ComponentActorConfig {
     /// Admit session-local Wayland app launch commands. Only a blessed
     /// surface-session init actor receives this capability.
     pub app_management: bool,
+    /// Admit explicitly addressed presentation-to-session actor messages.
+    /// Backend actors never receive this cross-placement capability.
+    pub session_messaging: bool,
     pub dispatcher_deadline: Duration,
     /// Wall-clock cadence for guest interruption checks. Epoch yields keep the
     /// executor responsive; cross-call worker fairness uses `worker-yield`.
@@ -224,6 +232,7 @@ impl Default for ComponentActorConfig {
             presentation: None,
             actor_management: false,
             app_management: false,
+            session_messaging: false,
             dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
@@ -2310,6 +2319,23 @@ async fn run_component_event_loop(
                                                     argv: request.argv,
                                                 })
                                                 .context("realm init actor request queue is full")?;
+                                        }
+                                        abi::Command::SendSessionMessage(request) => {
+                                            ensure!(
+                                                config.session_messaging,
+                                                "session message requested outside a presentation realm"
+                                            );
+                                            ensure!(
+                                                request.session_id != 0 && !request.actor.trim().is_empty(),
+                                                "session actor address is invalid"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::SessionMessageRequested {
+                                                    session_id: request.session_id,
+                                                    actor: request.actor,
+                                                    body: request.body,
+                                                })
+                                                .context("session actor message request queue is full")?;
                                         }
                                         abi::Command::Stop => return Ok(()),
                                     }

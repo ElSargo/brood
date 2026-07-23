@@ -277,6 +277,15 @@ interface actor {
         body: list<u8>,
     }
 
+    /// Explicit address for a backend actor in one surface-session realm.
+    /// `actor` is either `init` for the blessed root or a child ID published
+    /// by that root. The client host supplies and authenticates placement.
+    record session-actor-message {
+        session-id: u64,
+        actor: string,
+        body: list<u8>,
+    }
+
     record read-completed {
         operation: operation-id,
         bytes: list<u8>,
@@ -453,6 +462,10 @@ interface actor {
         /// Start a Wayland app in the current session. Only a blessed session
         /// init actor has this capability.
         start-app(app-start-request),
+        /// Asynchronously enqueue a message for an explicitly addressed actor
+        /// in a connected surface-session realm. Only presentation actors have
+        /// this cross-placement capability.
+        send-session-message(session-actor-message),
         stop,
     }
 

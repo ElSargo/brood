@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -9,10 +9,10 @@ use anyhow::{Context, Result, ensure};
 use manifold_wasm::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentChildEvent,
     FilesystemGrant, HostedWasmActor, LegacyWasmActorGeneration, LegacyWasmRuntimeEvent, Mailbox,
-    NativeFilesystemWatcherService, PluginLifecycleEvent, PluginStartContext, PluginStartReason,
-    PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor, Preview1FilesystemGrant,
-    Preview1WorkerConfig, Registry, RuntimeIoCapabilities, RuntimeIoConfig, WasmActor,
-    WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
+    NativeFilesystemWatcherService, PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext,
+    PluginStartReason, PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor,
+    Preview1FilesystemGrant, Preview1WorkerConfig, Registry, RuntimeIoCapabilities,
+    RuntimeIoConfig, WasmActor, WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
 };
 use tokio::sync::Mutex;
 use winit::event_loop::EventLoopProxy;
@@ -37,7 +37,16 @@ pub struct PresentationWasmRuntime {
     event_proxy: Option<EventLoopProxy<ClientEvent>>,
     graphics: Option<PluginGraphicsBridge>,
     init: Option<PresentationInitState>,
+    outbound_session_messages: VecDeque<SessionActorMessageRequest>,
+    bound_session_id: Option<u64>,
     next_actor_pane: u64,
+}
+
+pub struct SessionActorMessageRequest {
+    pub sender: String,
+    pub session_id: u64,
+    pub actor: String,
+    pub body: Vec<u8>,
 }
 
 struct PresentationInitState {
@@ -59,6 +68,7 @@ impl PresentationWasmRuntime {
     pub fn start(
         actor_specs: &[String],
         init_actor: Option<&Path>,
+        session_id: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
         event_proxy: Option<EventLoopProxy<ClientEvent>>,
     ) -> Result<Self> {
@@ -85,10 +95,12 @@ impl PresentationWasmRuntime {
             event_proxy,
             graphics: graphics.cloned(),
             init: None,
+            outbound_session_messages: VecDeque::new(),
+            bound_session_id: session_id,
             next_actor_pane: u64::MAX,
         };
         if let Some(path) = init_actor {
-            runtime.load_init_actor(path, graphics)?;
+            runtime.load_init_actor(path, session_id, graphics)?;
         }
         for spec in specs {
             let pane = runtime.allocate_actor_pane()?;
@@ -111,6 +123,7 @@ impl PresentationWasmRuntime {
     fn load_init_actor(
         &mut self,
         path: &Path,
+        session_id: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<()> {
         let artifact = WasmPluginArtifact::load(path)?;
@@ -134,9 +147,12 @@ impl PresentationWasmRuntime {
                 instance_id: CLIENT_INIT_ACTOR_ID.to_string(),
                 generation: actor.generation(),
                 reason: PluginStartReason::Initial,
-                session_id: None,
+                session_id,
                 workspace_root: ".".to_string(),
-                data: Vec::new(),
+                data: vec![PluginLifecycleEntry {
+                    key: "realm".to_string(),
+                    value: "client".to_string(),
+                }],
             }),
             Duration::from_secs(2),
         ))?;
@@ -353,6 +369,27 @@ impl PresentationWasmRuntime {
                 ComponentActorEvent::Stopped => {
                     anyhow::bail!("presentation actor {actor_id:?} stopped");
                 }
+                ComponentActorEvent::SessionMessageRequested {
+                    session_id,
+                    actor,
+                    body,
+                } => {
+                    ensure!(
+                        self.bound_session_id == Some(session_id),
+                        "presentation actor addressed session {session_id} outside its bound viewport"
+                    );
+                    ensure!(
+                        self.outbound_session_messages.len() < 64,
+                        "presentation actor session-message queue is full"
+                    );
+                    self.outbound_session_messages
+                        .push_back(SessionActorMessageRequest {
+                            sender: actor_id,
+                            session_id,
+                            actor,
+                            body,
+                        });
+                }
                 _ => {}
             }
         }
@@ -497,6 +534,10 @@ impl PresentationWasmRuntime {
             messages.push(message);
         }
         Ok(messages)
+    }
+
+    pub fn drain_session_messages(&mut self) -> Vec<SessionActorMessageRequest> {
+        self.outbound_session_messages.drain(..).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -650,6 +691,7 @@ async fn load_hosted_actor(
                         presentation as std::sync::Arc<dyn manifold_wasm::PresentationHost>
                     }),
                     actor_management,
+                    session_messaging: true,
                     ..ComponentActorConfig::default()
                 },
             )

@@ -101,6 +101,8 @@ type DbusFastPath = (
     zvariant::OwnedFd,
     zvariant::OwnedFd,
     zvariant::OwnedFd,
+    zvariant::OwnedFd,
+    zvariant::OwnedFd,
 );
 type DbusAgent = (
     String,
@@ -2709,18 +2711,25 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     let generation = FAST_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
     let input_file = manifold_ipc::CriticalLaneFile::create(generation)?;
     let frame_file = manifold_ipc::CriticalLaneFile::create(generation)?;
+    let actor_message_file = manifold_ipc::ActorMessageLaneFile::create(generation)?;
     let input_notifications = manifold_ipc::EventNotifier::create()?;
     let frame_notifications = manifold_ipc::EventNotifier::create()?;
+    let actor_message_notifications = manifold_ipc::EventNotifier::create()?;
     let input_fd = input_file.as_fd().try_clone_to_owned()?;
     let input_notify_fd = input_notifications.as_fd().try_clone_to_owned()?;
     let frame_fd = frame_file.as_fd().try_clone_to_owned()?;
     let frame_notify_fd = frame_notifications.as_fd().try_clone_to_owned()?;
+    let actor_message_fd = actor_message_file.as_fd().try_clone_to_owned()?;
+    let actor_message_notify_fd = actor_message_notifications.as_fd().try_clone_to_owned()?;
     let input = manifold_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
     let frames = manifold_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
+    let actor_messages =
+        manifold_ipc::ActorMessageConsumer::map(actor_message_file.as_fd(), generation)?;
     let fast_path = crate::state::PresentationFastPath {
         generation,
         input,
         frames,
+        actor_messages,
         frame_notifications,
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
@@ -2747,13 +2756,63 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
             },
         )
         .map_err(|error| anyhow::anyhow!("install fast-path input notification: {error}"))?;
+    state
+        .loop_handle
+        .insert_source(
+            Generic::new(actor_message_notifications, Interest::READ, Mode::Level),
+            |_, notifications, state| {
+                if let Err(error) = notifications.drain() {
+                    warn!(?error, "drain actor-message notification failed");
+                }
+                drain_fast_path_actor_messages(state);
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("install actor-message notification: {error}"))?;
     Ok((
         generation,
         input_fd.into(),
         input_notify_fd.into(),
         frame_fd.into(),
         frame_notify_fd.into(),
+        actor_message_fd.into(),
+        actor_message_notify_fd.into(),
     ))
+}
+
+fn drain_fast_path_actor_messages(state: &mut Manifold) {
+    let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
+        return;
+    };
+    while let Some(message) = fast_path.actor_messages.try_recv() {
+        if message.connection_generation() != fast_path.generation {
+            continue;
+        }
+        let decoded = (|| {
+            let sender = message.sender()?.to_string();
+            let recipient = message.recipient()?.to_string();
+            let body = message.body()?.to_vec();
+            Ok::<_, manifold_ipc::ActorMessageLaneError>((sender, recipient, body))
+        })();
+        let session = SurfaceSessionId::from_raw(message.session_id());
+        drop(message);
+        match decoded {
+            Ok((sender, recipient, body)) => {
+                if let Err(error) =
+                    state.send_session_actor_message(session, &recipient, &sender, body)
+                {
+                    warn!(
+                        surface_session = session.raw(),
+                        actor = %recipient,
+                        error = %error,
+                        "rejected presentation-to-session actor message"
+                    );
+                }
+            }
+            Err(error) => warn!(error = %error, "rejected malformed actor-message record"),
+        }
+    }
+    state.dmabuf.fast_path = Some(fast_path);
 }
 
 fn drain_fast_path_input(state: &mut Manifold) {

@@ -20,6 +20,7 @@ use manifold_cli::{
     control::{
         ControlTarget, DmabufFrame, ServerLaunch, connect_or_spawn, dmabuf_resource,
         open_presentation_fast_path, request_dbus_command, resolve_control_target,
+        session_marker_value,
     },
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
@@ -64,8 +65,13 @@ fn main() -> Result<()> {
         manifold_cli::realm_init_actor_path(&config_path, manifold_cli::RealmKind::Client)?
     };
     if args.check_wasm_actors {
-        let mut runtime =
-            PresentationWasmRuntime::start(&args.wasm_actors, init_actor.as_deref(), None, None)?;
+        let mut runtime = PresentationWasmRuntime::start(
+            &args.wasm_actors,
+            init_actor.as_deref(),
+            Some(1),
+            None,
+            None,
+        )?;
         runtime
             .shutdown()
             .context("stop checked presentation WASM runtime")?;
@@ -162,9 +168,16 @@ fn main() -> Result<()> {
         .context("create event loop")?;
     let event_proxy = event_loop.create_proxy();
     let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
-    let (input_sender, backend_commands, fast_path_enabled, backend_connected) = if args.no_server {
+    let (
+        input_sender,
+        actor_message_sender,
+        backend_commands,
+        fast_path_enabled,
+        backend_connected,
+        bound_session_id,
+    ) = if args.no_server {
         eprintln!("starting Manifold presentation without a backend");
-        (None, None, false, false)
+        (None, None, None, false, false, None)
     } else {
         let target = resolve_control_target(args.dbus_name, args.dbus_address);
         let mut server = ServerLaunch::discover()?;
@@ -183,9 +196,13 @@ fn main() -> Result<()> {
             false,
         )?;
         eprintln!("created presentation session {}", session.trim());
+        let session_id = session_marker_value(&session, "active")
+            .context("created presentation session response missing active marker")?
+            .parse::<u64>()
+            .context("parse created presentation session ID")?;
 
         let fast_path_enabled = true;
-        let input_sender = if fast_path_enabled {
+        let (input_sender, actor_message_sender) = if fast_path_enabled {
             let fast_path = open_presentation_fast_path(&target)?;
             let input = manifold_ipc::CriticalProducer::map(
                 fast_path.input_fd.as_fd(),
@@ -203,7 +220,7 @@ fn main() -> Result<()> {
                 frame_notifications,
                 event_loop.create_proxy(),
             )?;
-            Some(InputLane {
+            let input_sender = InputLane {
                 producer: input,
                 notifications: manifold_ipc::EventNotifier::from_owned_fd(
                     fast_path.input_notify_fd,
@@ -213,26 +230,48 @@ fn main() -> Result<()> {
                 deferred: VecDeque::new(),
                 deferred_high_water: 0,
                 coalesced_motion: 0,
-            })
+            };
+            let actor_message_sender = ActorMessageLane {
+                producer: manifold_ipc::ActorMessageProducer::map(
+                    fast_path.actor_message_fd.as_fd(),
+                    fast_path.generation,
+                )?,
+                notifications: manifold_ipc::EventNotifier::from_owned_fd(
+                    fast_path.actor_message_notify_fd,
+                ),
+                generation: fast_path.generation,
+                sequence: 0,
+                deferred: VecDeque::new(),
+            };
+            (Some(input_sender), Some(actor_message_sender))
         } else {
-            None
+            (None, None)
         };
         let backend_commands = Some(BackendCommandLane::start(
             target,
             event_loop.create_proxy(),
         )?);
-        (input_sender, backend_commands, fast_path_enabled, true)
+        (
+            input_sender,
+            actor_message_sender,
+            backend_commands,
+            fast_path_enabled,
+            true,
+            Some(session_id),
+        )
     };
     let mut application = Application {
         wasm_runtime: Some(PresentationWasmRuntime::start(
             &args.wasm_actors,
             init_actor.as_deref(),
+            bound_session_id,
             Some(&plugin_graphics),
             Some(event_proxy.clone()),
         )?),
         key_policy: Some(key_policy),
         plugin_graphics: Some(plugin_graphics),
         input_sender,
+        actor_message_sender,
         backend_commands,
         fast_path_enabled,
         backend_connected,
@@ -442,6 +481,64 @@ struct InputLane {
     coalesced_motion: u64,
 }
 
+struct ActorMessageLane {
+    producer: manifold_ipc::ActorMessageProducer,
+    notifications: manifold_ipc::EventNotifier,
+    generation: u64,
+    sequence: u64,
+    deferred: VecDeque<Box<manifold_ipc::ActorMessageRecord>>,
+}
+
+impl ActorMessageLane {
+    fn send(&mut self, message: &actor_runtime::SessionActorMessageRequest) -> Result<()> {
+        self.flush_deferred();
+        self.sequence = self.sequence.wrapping_add(1);
+        let record = manifold_ipc::ActorMessageRecord::new(
+            self.generation,
+            self.sequence,
+            message.session_id,
+            &message.sender,
+            &message.actor,
+            &message.body,
+        )?;
+        if self.has_deferred() {
+            return self.defer(record);
+        }
+        if let Err(record) = self.producer.try_send(record) {
+            return self.defer(record);
+        }
+        self.notifications.notify()?;
+        Ok(())
+    }
+
+    fn flush_deferred(&mut self) {
+        let mut published = false;
+        while let Some(record) = self.deferred.pop_front() {
+            if let Err(record) = self.producer.try_send(record) {
+                self.deferred.push_front(record);
+                break;
+            }
+            published = true;
+        }
+        if published && let Err(error) = self.notifications.notify() {
+            eprintln!("failed to notify actor-message consumer: {error}");
+        }
+    }
+
+    fn defer(&mut self, record: Box<manifold_ipc::ActorMessageRecord>) -> Result<()> {
+        anyhow::ensure!(
+            self.deferred.len() < 64,
+            "presentation actor-message backlog is full"
+        );
+        self.deferred.push_back(record);
+        Ok(())
+    }
+
+    fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+}
+
 impl InputLane {
     fn flush_deferred(&mut self) {
         let had_deferred = !self.deferred.is_empty();
@@ -554,6 +651,7 @@ struct Application {
     renderer: Option<Renderer>,
     error: Option<anyhow::Error>,
     input_sender: Option<InputLane>,
+    actor_message_sender: Option<ActorMessageLane>,
     fast_path_enabled: bool,
     backend_connected: bool,
     pending_frame: Option<ClientEvent>,
@@ -743,9 +841,25 @@ impl Application {
     }
 
     fn drain_wasm_events(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        if let Some(runtime) = self.wasm_runtime.as_mut()
-            && let Err(error) = runtime.drain_events()
-        {
+        let result = (|| {
+            let Some(runtime) = self.wasm_runtime.as_mut() else {
+                return Ok(());
+            };
+            runtime.drain_events()?;
+            let messages = runtime.drain_session_messages();
+            if messages.is_empty() {
+                return Ok(());
+            }
+            let lane = self
+                .actor_message_sender
+                .as_mut()
+                .context("presentation actor requested a session message without a backend")?;
+            for message in &messages {
+                lane.send(message)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
             self.error = Some(error);
             event_loop.exit();
             return false;
@@ -973,13 +1087,17 @@ impl ApplicationHandler<ClientEvent> for Application {
             lane.flush_deferred();
             lane.has_deferred()
         });
+        let actor_message_backpressured = self.actor_message_sender.as_mut().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        });
         // A full actor lane keeps the latest position for the next Winit turn.
         // Motion is state, so intermediate samples are disposable.
         let _motion_result = flush_presentation_pointer_motion(
             self.wasm_runtime.as_ref(),
             &mut self.pending_plugin_pointer_motion,
         );
-        if input_backpressured {
+        if input_backpressured || actor_message_backpressured {
             // The shared-memory consumer already has a wakeup for the records
             // which filled its ring. Poll until it frees a slot so input state
             // transitions cannot remain deferred indefinitely.

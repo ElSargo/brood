@@ -27,7 +27,9 @@ if [[ "${MANIFOLD_INIT_TEST_CONTROLLER:-0}" == 1 ]]; then
       && grep -q 'connected to Manifold server' "$client_log" \
       && grep -q 'created presentation session' "$client_log" \
       && grep -q 'actor=manifold.session-init.1' "$server_log" \
-      && grep -q 'command=foot' "$server_log"; then
+      && grep -q 'command=foot' "$server_log" \
+      && grep -q 'delivered presentation-to-session actor message' "$server_log" \
+      && grep -q 'client-to-session-actor-proof' "$server_log"; then
       status="$($BIN ctl status 2>/dev/null || true)"
       if grep -q 'surface_sessions=1' <<<"$status" \
         && grep -q 'windows=1' <<<"$status"; then
@@ -54,11 +56,13 @@ if [[ "${MANIFOLD_INIT_TEST_CONTROLLER:-0}" == 1 ]]; then
   grep -q 'imported window DMA-BUF .*app_id=foot' "$client_log"
   grep -q 'actor=manifold.session-init.1' "$server_log"
   grep -q 'command=foot' "$server_log"
+  grep -q 'delivered presentation-to-session actor message' "$server_log"
+  grep -q 'client-to-session-actor-proof' "$server_log"
 
   echo 'Client-only actor init proof'
   echo
   grep -E 'connected to Manifold server|created presentation session' "$client_log"
-  grep -E 'actor=manifold.session-init.1|command=foot' "$server_log"
+  grep -E 'actor=manifold.session-init.1|command=foot|presentation-to-session actor message|client-to-session-actor-proof' "$server_log"
   echo "$status"
   touch "$MANIFOLD_INIT_TEST_OUT/controller.ready"
 
@@ -89,7 +93,8 @@ nix develop --command cargo run --quiet -p manifold-wasm --example componentize 
   examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm \
   "$PACKAGE/init.component.wasm"
 
-printf '[init]\nsession = "%s"\n' "$PACKAGE/init.component.wasm" >"$OUT/manifold.toml"
+printf '[init]\nsession = "%s"\nclient = "%s"\n' \
+  "$PACKAGE/init.component.wasm" "$PACKAGE/init.component.wasm" >"$OUT/manifold.toml"
 
 export MANIFOLD_CONFIG="$OUT/manifold.toml"
 export MANIFOLD_INIT_TEST_CONTROLLER=1
@@ -129,6 +134,8 @@ grep -q 'created presentation session' "$OUT/client.log"
 grep -q 'imported window DMA-BUF .*app_id=foot' "$OUT/client.log"
 grep -q 'actor=manifold.session-init.1' "$OUT/cache/manifold/session-server/global.log"
 grep -q 'command=foot' "$OUT/cache/manifold/session-server/global.log"
+grep -q 'delivered presentation-to-session actor message' "$OUT/cache/manifold/session-server/global.log"
+grep -q 'client-to-session-actor-proof' "$OUT/cache/manifold/session-server/global.log"
 grep -q 'surface_sessions=1' "$OUT/controller.log"
 grep -q 'windows=1' "$OUT/controller.log"
 test -s "$OUT/nested/inner-dump/composed.png"

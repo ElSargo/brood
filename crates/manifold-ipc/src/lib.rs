@@ -7,6 +7,13 @@
 
 #![cfg(target_os = "linux")]
 
+mod actor_message;
+
+pub use actor_message::{
+    ACTOR_MESSAGE_BODY_CAPACITY, ActorMessageConsumer, ActorMessageLaneError, ActorMessageLaneFile,
+    ActorMessageProducer, ActorMessageRecord,
+};
+
 use std::{
     cell::UnsafeCell,
     ffi::CString,
