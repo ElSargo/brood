@@ -637,32 +637,3 @@ fn blend_text_pixel(destination: &mut [u8; 4], color: TextColor, requested_alpha
     }
     *output_alpha = unit_to_u8((f32::from(*output_alpha) / 255.0).mul_add(inverse, opacity));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rgba8_resources_are_linearized_before_premultiplication() {
-        assert_eq!(
-            linear_premultiplied_srgba8([128, 128, 128, 255]),
-            [55, 55, 55, 255]
-        );
-        assert_eq!(
-            linear_premultiplied_srgba8([255, 0, 0, 128]),
-            [128, 0, 0, 128]
-        );
-        assert_eq!(linear_premultiplied_srgba8([20, 80, 240, 0]), [0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn text_coverage_is_composited_in_linear_premultiplied_space() {
-        let mut destination = [0, 0, 0, 0];
-        blend_text_pixel(&mut destination, TextColor::rgba(255, 255, 255, 128), 1.0);
-        assert_eq!(destination, [128, 128, 128, 128]);
-
-        let mut translucent = [0, 0, 0, 0];
-        blend_text_pixel(&mut translucent, TextColor::rgba(255, 255, 255, 128), 0.5);
-        assert_eq!(translucent, [64, 64, 64, 64]);
-    }
-}

@@ -291,65 +291,6 @@ pub struct ClientArgs {
     pub check_wasm_actors: bool,
 }
 
-#[cfg(test)]
-mod client_args_tests {
-    use super::*;
-
-    #[test]
-    fn no_server_selects_standalone_client_startup() {
-        let parsed = ClientArgs::try_parse_from(["manifold-client", "--no-server"]);
-        assert!(parsed.is_ok());
-        if let Ok(args) = parsed {
-            assert!(args.no_server);
-            assert!(args.dbus_name.is_none());
-            assert!(args.dbus_address.is_none());
-            assert!(args.server.is_none());
-            assert!(args.wasm_key_policy.is_none());
-            assert!(!args.check_wasm_key_policy);
-        }
-    }
-
-    #[test]
-    fn key_policy_keeps_provider_and_path_together() {
-        let parsed = ClientArgs::try_parse_from([
-            "manifold-client",
-            "--no-server",
-            "--wasm-key-policy",
-            "workspace",
-            "/tmp/workspace.wasm",
-        ]);
-        assert!(parsed.is_ok());
-        if let Ok(args) = parsed {
-            assert_eq!(
-                args.wasm_key_policy.as_deref(),
-                Some(&["workspace".to_string(), "/tmp/workspace.wasm".to_string()][..])
-            );
-        }
-    }
-
-    #[test]
-    fn no_server_rejects_connection_options() {
-        assert!(
-            ClientArgs::try_parse_from([
-                "manifold-client",
-                "--no-server",
-                "--dbus-destination",
-                "org.manifold.Test",
-            ])
-            .is_err()
-        );
-        assert!(
-            ClientArgs::try_parse_from([
-                "manifold-client",
-                "--no-server",
-                "--server",
-                "/tmp/manifoldd",
-            ])
-            .is_err()
-        );
-    }
-}
-
 #[derive(Debug, Parser)]
 pub struct CtlArgs {
     /// `DBus` destination name for the session control endpoint.

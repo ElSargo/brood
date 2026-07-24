@@ -15,7 +15,6 @@ The core-module examples and the default workspace actor target
 
 ```sh
 nix develop --command cargo build --manifest-path examples/wasm-key-handler/Cargo.toml --target wasm32-unknown-unknown --release
-nix develop --command cargo build --manifest-path examples/wasm-test-harness/Cargo.toml --target wasm32-unknown-unknown --release
 nix develop --command cargo build --manifest-path plugins/default-workspace/Cargo.toml --target wasm32-unknown-unknown --release
 ```
 
@@ -64,49 +63,9 @@ result/examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manif
 result/examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/manifold_preview1_worker_example.wasm
 ```
 
-Use `tools/test-wasm-component-worker.sh` and
-`tools/test-wasm-preview1-worker.sh` for the corresponding live runtime
-workloads. The Preview 1 script exercises both the low-level worker runtime and
-the daemon-compatible actor facade in-process.
-
-The Nix check builds both host workloads and both guest artifacts in the
-sandbox, then executes the notification, select, completion-I/O, cancellation,
-ordinary-WASI, and structured-shutdown proofs:
-
-```sh
-nix build .#wasm-io-check
-```
-
-The packaged Rube Goldberg runner supplies those same two guest artifacts to a
-multi-actor workload. `quick` is the deterministic CI profile, `stress` is the
-larger finite profile, and `soak` repeats deterministic epochs until its
-configured bound:
-
-```sh
-nix run .#wasm-io-rube -- --profile quick --out-dir ./rube-quick
-nix run .#wasm-io-rube -- --profile stress --seed 5566816691025824836 --out-dir ./rube-stress
-nix run .#wasm-io-rube -- --profile soak --seed 5566816691025824836 --out-dir ./rube-soak
-```
-
-For a source-tree run that rebuilds the packaged guests first, use
-`tools/test-wasm-io-rube-goldberg.sh`. Its exact development overrides are
-defined by that script. Profile, seed, and output directory belong to the
-wrapper before `--`; actor, worker, step, epoch, and duration overrides after
-`--` are forwarded to the Rust runner. The wrapper applies a profile-specific
-hard timeout, configurable with `MANIFOLD_WASM_IO_RUBE_TIMEOUT_SECONDS`.
-Preserve its reported output directory and replay line when reproducing a
-failure.
-
-Daemon-level acceptance loads the compatibility actor through the server plugin
-path and sends mailbox
-traffic through the normal control surface, proves actor completion I/O while
-workers select over a guest-owned shared-memory queue, retains an ordinary
-worker `read` compatibility case, and hot-reloads the actor while two worker
-wait sets are pending. It verifies that the old generation's notification,
-pollable, and wait-registration state is gone before the replacement handles
-traffic. Registry coverage hosts independently addressed Component
-and Preview 1 actors, replaces one suspended generation, and proves its seven
-peers continue without losing their state.
+These artifacts are examples and real plugin workloads, not a synthetic
+in-process correctness suite. Product acceptance should load them through the
+normal runtime path and judge their externally visible output.
 
 Related:
 

@@ -8,15 +8,6 @@ The first supported path is one plane imported by WGPU's Vulkan HAL using
 result is wrapped as an ordinary WGPU texture; WGPU remains the presentation
 renderer.
 
-Run the real import proof through Nix:
-
-```sh
-nix develop --command cargo run --release -p manifold-dmabuf \
-  --bin dmabuf-import-spike
-```
-
-The proof allocates an ARGB8888 GBM buffer on the render node, writes a known
-pixel pattern, exports its DMA-BUF descriptor, imports it into the selected
-Vulkan WGPU device without a CPU image copy, creates the compatible sRGB view
-used by the presentation client, performs a GPU texture-to-buffer copy, and
-verifies the resulting bytes.
+Acceptance belongs to the external presentation-client workloads, which import
+real managed-window DMA-BUFs and retain client-composed frames. A synthetic
+buffer/readback spike is not evidence for the final presentation path.

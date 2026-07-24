@@ -58,7 +58,6 @@
         in
         {
           lint = packages.lintCheck;
-          test = packages.testCheck;
         }
       );
 

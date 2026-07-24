@@ -19,7 +19,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 - [[systems/runtime]] describes server/client startup, config loading, and session runners.
 - [[systems/configuration]] describes `manifold.toml`, startup apps, modules, and config discovery.
-- [[systems/testing]] describes the supported behavior-test and smoke-test paths.
+- [[systems/testing]] describes the supported real-workload acceptance paths.
 - [[systems/dbus-control]] describes the DBus control surfaces.
 - [[systems/wayland-compositor]] describes the nested Wayland compositor path.
 - [[systems/extension-host]] describes current WASM and extension lanes.

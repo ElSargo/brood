@@ -136,28 +136,18 @@ possible, drop or replace publication frame roots for the reloaded components,
 and show reload failures in status output without tearing down the session
 process.
 
-## Runnable Proof
+## Acceptance
 
-`tools/test-wasm-component-worker.sh` drives the Component Model actor directly
-and proves actor progress during pending worker I/O, completion delivery and
-cancellation, cooperative CPU-worker yield, and dispatcher deadline
-enforcement.
+Extension-host acceptance loads real plugins through the normal runtime and
+judges their observable output. Presentation actors must run in
+`manifold-client`; same-name replacement must preserve the old generation until
+the candidate is ready, reject late layout results, and leave unrelated actors
+running. Rendered evidence is captured by the client.
 
-`tools/test-wasm-preview1-worker.sh` drives the low-level compatibility runtime
-and its actor facade, leaves an ordinary worker read pending while actor traffic
-and completion I/O continue, feeds the worker, then hot-reloads while another
-read is pending and verifies generation isolation and structured shutdown.
-
-Presentation-actor lifecycle proofs run their actor in `manifold-client`.
-Same-name replacement must preserve the old generation until the candidate is
-ready, reject late layout results, and leave unrelated actors running. Any
-rendered acceptance evidence is captured by the client.
-
-These workloads establish the execution and I/O model. The prototype still
-loads one actor artifact without package-manifest declarations, gives it a
-temporary read-only grant rooted at the artifact directory, and does not yet
-implement the complete target registry, publication, policy-provider, or SDK
-surface described below.
+The prototype still loads one actor artifact without package-manifest
+declarations, gives it a temporary read-only grant rooted at the artifact
+directory, and does not yet implement the complete target registry,
+publication, policy-provider, or SDK surface described below.
 
 ## Current DBus Extension Surfaces
 

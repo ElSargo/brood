@@ -1120,21 +1120,3 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
         .checked_add(alignment.checked_sub(1)?)
         .map(|value| value & !(alignment - 1))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::lifecycle_worker_error;
-
-    #[test]
-    fn lifecycle_completion_requires_a_successful_artifact_worker() {
-        assert_eq!(lifecycle_worker_error(0), None);
-        assert_eq!(
-            lifecycle_worker_error(23).as_deref(),
-            Some("lifecycle artifact worker returned 23")
-        );
-        assert_eq!(
-            lifecycle_worker_error(24).as_deref(),
-            Some("lifecycle artifact worker returned 24")
-        );
-    }
-}

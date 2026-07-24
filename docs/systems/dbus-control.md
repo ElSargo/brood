@@ -35,8 +35,7 @@ Common control requests include status, status-json, spawn, spawn-in-session, fo
 Raw argv and JSON requests cross one fallible parsing boundary before they can
 mutate compositor state. Command-specific parsers produce typed commands,
 validate exact arity, and reject ambiguous option forms; execution code does
-not interpret positional token indexes. Parser unit tests cover both encodings
-and exact rejection behavior.
+not interpret positional token indexes.
 
 ## Presentation Bootstrap
 

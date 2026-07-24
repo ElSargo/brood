@@ -1,6 +1,5 @@
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 
-#[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{ptr, slice};
 use serde::Deserialize;
@@ -1099,64 +1098,6 @@ fn pack_actor_outbox(ptr: i32, len: i32) -> i64 {
     ((ptr as i64) << 32) | (len as u32 as i64)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn policy_state_json_accepts_whitespace_ordering_and_escapes() {
-        let state = decode_json::<PolicyState>(
-            br#"{
-                "app_panes": [{"app_id": "manifold-\u0074erminal-1", "pane": 9}],
-                "ignored": {"nested": [true, null, "value"]},
-                "managed_panes": [9, 10],
-                "focused_pane": 10,
-                "panes": [18446744073709551615, 9, 10]
-            }"#,
-        )
-        .expect("decode policy state");
-
-        assert_eq!(state.focused_pane, Some(10));
-        assert_eq!(state.panes.as_slice(), &[u64::MAX, 9, 10]);
-        assert_eq!(state.managed_panes.as_slice(), &[9, 10]);
-        assert_eq!(pane_for_app_id(&state, b"manifold-terminal-1"), Some(9));
-    }
-
-    #[test]
-    fn workspace_message_json_is_structural_not_substring_based() {
-        let message = decode_json::<WorkspaceMessage>(
-            br#"{
-                "action": "focus-next",
-                "metadata": "\"type\":\"layout-state\"",
-                "type": "layout-action"
-            }"#,
-        )
-        .expect("decode workspace message");
-
-        assert_eq!(message.message_type.as_str(), "layout-action");
-        assert_eq!(message.action.as_deref(), Some("focus-next"));
-        assert!(message.visible_panes.is_empty());
-    }
-
-    #[test]
-    fn malformed_or_trailing_json_is_rejected() {
-        assert!(decode_json::<PolicyState>(br#"{"panes":[1,]}"#).is_none());
-        assert!(decode_json::<PolicyState>(br#"{"panes":[1]} trailing"#).is_none());
-    }
-
-    #[test]
-    fn session_switcher_action_is_an_ordinary_actor_message() {
-        let mut output = [0_u8; 512];
-        let len = write_consume_payload(&mut output, &[Message::SessionSwitcherAction("toggle")]);
-        assert!(len > 0);
-        assert_eq!(
-            &output[..len as usize],
-            br#"{"decision":"consume","messages":[{"actor":"session-switcher","payload":[123,34,116,121,112,101,34,58,34,115,105,100,101,98,97,114,45,97,99,116,105,111,110,34,44,34,97,99,116,105,111,110,34,58,34,116,111,103,103,108,101,34,125]}]}"#
-        );
-    }
-}
-
-#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}

@@ -31,9 +31,5 @@ ordinary Rust `std::io` and libc-style worker calls.
 
 `nix build .#wasm-examples` performs the same encoding in the Nix sandbox and
 installs only the runtime-ready component, not its intermediate core module.
-Run `tools/test-wasm-component-worker.sh` for the live `ComponentActor`
-prototype workload. It proves that actor traffic and completion I/O continue
-while worker I/O or notification select is pending, a waiting worker resumes,
-out-of-order generations coalesce to the maximum, cancellation removes wait
-registrations before its terminal event, cooperative CPU workers yield, and a
-non-yielding dispatcher is stopped by its call-local deadline.
+Load that component through the normal plugin runtime when validating its
+user-visible behavior.

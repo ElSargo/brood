@@ -31,8 +31,8 @@ def classify(
     if dmabuf == "v4" and explicit_sync == "v1":
         return (
             "drm_capable_dmabuf_and_explicit_sync",
-            "backend advertises dmabuf v4 and explicit sync; run strict no-skip audit",
-            "Run MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh",
+            "backend advertises dmabuf v4 and explicit sync",
+            "Run MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC=1 ./tools/validate-dmabuf-positive.sh",
         )
     if dmabuf == "v4" and explicit_sync == "none":
         if explicit_sync_disabled in EXPLICIT_SYNC_DISABLED_REASONS_WITH_DMABUF_V4:
@@ -46,7 +46,7 @@ def classify(
         return (
             "incoherent_dmabuf_status",
             "backend reports dmabuf v4 without explicit sync but the disabled reason is not coherent",
-            "Run ./tools/smoke-dmabuf-diagnostics.sh and ./tools/smoke-explicit-sync-diagnostics.sh",
+            "Run ./tools/diagnose-dmabuf-backend.sh and inspect the retained status and log",
         )
     if dmabuf == "v3":
         return (
@@ -59,7 +59,7 @@ def classify(
     return (
         "incoherent_dmabuf_status",
         "backend status is unusual; run dmabuf diagnostics and inspect status/logs",
-        "Run ./tools/smoke-dmabuf-diagnostics.sh and ./tools/smoke-explicit-sync-diagnostics.sh",
+        "Run ./tools/diagnose-dmabuf-backend.sh and inspect the retained status and log",
     )
 
 

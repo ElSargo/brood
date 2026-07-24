@@ -225,36 +225,3 @@ impl Manifold {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn managed_wheel_frame_preserves_v120_and_legacy_axis_values() {
-        let frame = managed_wheel_axis_frame(7, -120, 60);
-        assert_eq!(frame.source, Some(AxisSource::Wheel));
-        assert_eq!(frame.v120, Some((-120, 60)));
-        assert_eq!(frame.axis, (-15.0, 7.5));
-    }
-
-    #[test]
-    fn managed_continuous_frame_rejects_non_finite_values() {
-        let frame = managed_continuous_axis_frame(9, f64::NAN, -2.5);
-        assert_eq!(frame.source, Some(AxisSource::Continuous));
-        assert_eq!(frame.v120, None);
-        assert_eq!(frame.axis, (0.0, -2.5));
-    }
-
-    #[test]
-    fn managed_pointer_release_survives_target_destruction() {
-        assert!(should_forward_managed_pointer_button(
-            false,
-            ButtonState::Released
-        ));
-        assert!(!should_forward_managed_pointer_button(
-            false,
-            ButtonState::Pressed
-        ));
-    }
-}

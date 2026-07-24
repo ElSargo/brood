@@ -130,26 +130,6 @@ struct NativeRegistration {
     setup_complete: bool,
     subscribers: HashMap<u64, Weak<NativeSubscription>>,
     setup_id: u64,
-    #[cfg(test)]
-    _drop_probe: Option<RegistrationDropProbe>,
-}
-
-#[cfg(test)]
-struct RegistrationDropProbe {
-    inner: Weak<NativeWatcherInner>,
-    registry_was_unlocked: Arc<AtomicBool>,
-}
-
-#[cfg(test)]
-impl Drop for RegistrationDropProbe {
-    fn drop(&mut self) {
-        let unlocked = self
-            .inner
-            .upgrade()
-            .is_some_and(|inner| inner.registrations.try_lock().is_ok());
-        self.registry_was_unlocked
-            .store(unlocked, Ordering::Release);
-    }
 }
 
 struct NativeSubscription {
@@ -324,8 +304,6 @@ impl NativeFilesystemWatcherService {
                 setup_complete: false,
                 subscribers: HashMap::from([(id, Arc::downgrade(&subscription))]),
                 setup_id,
-                #[cfg(test)]
-                _drop_probe: None,
             },
         );
         drop(registrations);

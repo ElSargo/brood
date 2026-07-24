@@ -56,6 +56,7 @@ cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
+read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
 cc \
   -std=c11 \
   -Wall \
@@ -63,7 +64,7 @@ cc \
   -Werror \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
-  $(pkg-config --cflags --libs wayland-client xkbcommon)
+  "${WAYLAND_BUILD_FLAGS[@]}"
 cargo run --quiet -p manifold-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
   "$PACKAGE/manifold_session_switcher_plugin.component.wasm"

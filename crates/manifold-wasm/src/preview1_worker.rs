@@ -2364,54 +2364,6 @@ struct PreparedWorker {
     reservation: WorkerReservation,
 }
 
-#[cfg(test)]
-struct PreparationTestGate {
-    entered: oneshot::Sender<()>,
-    release: oneshot::Receiver<()>,
-}
-
-#[cfg(test)]
-static PREPARATION_TEST_GATE: Mutex<Option<PreparationTestGate>> = Mutex::new(None);
-
-#[cfg(test)]
-static SHUTDOWN_STARTED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
-
-#[cfg(test)]
-static HOLD_WORKER_RELEASE_TEST: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-static WORKER_RELEASE_QUEUED_TEST_OBSERVER: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
-
-#[cfg(test)]
-static WORKER_RELEASE_TEST_WAKEUP: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-#[cfg(test)]
-async fn wait_at_preparation_test_gate() {
-    let gate = PREPARATION_TEST_GATE
-        .lock()
-        .ok()
-        .and_then(|mut gate| gate.take());
-    if let Some(gate) = gate {
-        let _result = gate.entered.send(());
-        let _result = gate.release.await;
-    }
-}
-
-#[cfg(not(test))]
-fn wait_at_preparation_test_gate() -> std::future::Ready<()> {
-    std::future::ready(())
-}
-
-#[cfg(test)]
-async fn wait_for_worker_release_test_wakeup() {
-    WORKER_RELEASE_TEST_WAKEUP.notified().await;
-}
-
-#[cfg(not(test))]
-fn wait_for_worker_release_test_wakeup() -> std::future::Pending<()> {
-    std::future::pending()
-}
-
 struct ActiveWorker {
     abort: AbortHandle,
     completion: Option<oneshot::Sender<Result<u32, Preview1WorkerError>>>,
@@ -2485,23 +2437,7 @@ async fn parent_loop(
         let release_pending = actor_operations
             .iter()
             .any(|operation| matches!(operation, ActorOperation::ReleaseWorker { .. }));
-        #[cfg(test)]
-        let release_held = HOLD_WORKER_RELEASE_TEST.load(Ordering::Acquire);
-        #[cfg(not(test))]
-        let release_held = false;
-        #[cfg(test)]
-        if release_pending && release_held {
-            let observer = WORKER_RELEASE_QUEUED_TEST_OBSERVER
-                .lock()
-                .ok()
-                .and_then(|mut observer| observer.take());
-            if let Some(observer) = observer {
-                let _result = observer.send(());
-            }
-        }
-        let actor_dispatch_available = actor_store.is_some()
-            && (!stopping || release_pending)
-            && !(release_pending && release_held);
+        let actor_dispatch_available = actor_store.is_some() && (!stopping || release_pending);
         let actor_work_pending = !actor_operations.is_empty()
             || !completion_operations.is_empty()
             || !notification_operations.is_empty();
@@ -2570,7 +2506,6 @@ async fn parent_loop(
         }
 
         tokio::select! {
-            () = wait_for_worker_release_test_wakeup(), if release_held => {}
             completion = completion_rx.recv(), if completion_open
                 && completion_operations.can_receive() => {
                 match completion {
@@ -2732,15 +2667,6 @@ async fn parent_loop(
                     Command::Shutdown { reply } => {
                         cancel_all_workers(&mut active_workers);
                         coordination.stop();
-                        #[cfg(test)]
-                        let shutdown_observer = SHUTDOWN_STARTED_TEST_OBSERVER
-                            .lock()
-                            .ok()
-                            .and_then(|mut observer| observer.take());
-                        #[cfg(test)]
-                        if let Some(observer) = shutdown_observer {
-                            let _result = observer.send(());
-                        }
                         prepare_actor_operations_for_shutdown(
                             &mut actor_operations,
                             &mut preparing_workers,
@@ -3134,7 +3060,6 @@ fn start_actor_operation(
                 )
             })
             .and_then(std::convert::identity);
-            wait_at_preparation_test_gate().await;
             CallDone::WorkerPrepared {
                 actor_store,
                 worker,

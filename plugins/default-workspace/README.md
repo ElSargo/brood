@@ -41,4 +41,4 @@ pane, `Ctrl+J` / `Ctrl+K` for managed-window focus, and `Ctrl+O` for a new
 `session-switcher` actor; the policy does not toggle client-owned pane state.
 The repository acceptance proof uses this exact module with real terminal
 surfaces, injected key press/release events, and compositor screenshots. Run
-`tools/test-typed-key-policy-nested.sh` through the checked-in Nix shell.
+`tools/test-session-switcher-plugin-nested.sh` through the checked-in Nix shell.

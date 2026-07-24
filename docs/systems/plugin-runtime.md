@@ -366,7 +366,7 @@ and remain inside the watch ceiling if logical teardown races setup. The
 workspace logger's teardown probe repeats real guest watch creation and drop,
 then records a later file mutation through the still-live primary watcher.
 
-Current implementation details and runnable tests live in [[extension-host]],
+Current implementation details and acceptance guidance live in [[extension-host]],
 [[plugin-io-interaction-graph]], and [[../reference/wasm-fast-lanes]].
 
 Related:

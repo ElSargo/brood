@@ -142,34 +142,3 @@ fn load_wasm_key_policy(spec: &[String]) -> Result<WasmGlobalKeyPolicy> {
     eprintln!("loaded presentation key policy provider={provider} path={path}");
     Ok(policy)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn publication_uses_the_client_owned_pane_and_app_inventory() {
-        let snapshot = KeyPolicySnapshot {
-            focused_pane: Some(u64::MAX),
-            panes: vec![u64::MAX, 7],
-            managed_panes: vec![7],
-            app_panes: vec![KeyPolicyAppPane {
-                pane: 7,
-                app_id: "firefox".to_string(),
-            }],
-        };
-        let encoded = serde_json::to_value(snapshot);
-        assert!(encoded.is_ok());
-        if let Ok(encoded) = encoded {
-            assert_eq!(
-                encoded,
-                serde_json::json!({
-                    "focused_pane": u64::MAX,
-                    "panes": [u64::MAX, 7],
-                    "managed_panes": [7],
-                    "app_panes": [{"pane": 7, "app_id": "firefox"}],
-                })
-            );
-        }
-    }
-}

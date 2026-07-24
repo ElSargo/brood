@@ -350,7 +350,7 @@ documentation.
 
 ## Verification
 
-The contract is proven with real guests and daemon-level nested tests, not only
+The contract is proven with real guests and observable runtime workloads, not only
 mocked resource units. Required coverage includes:
 
 - pending worker I/O while actor mailbox traffic progresses;

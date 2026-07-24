@@ -147,10 +147,6 @@ struct CompletionIoInner {
     alive: AtomicBool,
     shutdown: Notify,
     commands: mpsc::Sender<IoSupervisorCommand>,
-    #[cfg(test)]
-    supervisor_exited: AtomicBool,
-    #[cfg(test)]
-    supervisor_exit: Notify,
 }
 
 #[derive(Debug)]
@@ -346,10 +342,6 @@ pub(crate) fn start_completion_io(
         alive: AtomicBool::new(true),
         shutdown: Notify::new(),
         commands: command_tx,
-        #[cfg(test)]
-        supervisor_exited: AtomicBool::new(false),
-        #[cfg(test)]
-        supervisor_exit: Notify::new(),
     });
     let io = CompletionIo {
         inner: Arc::clone(&inner),
@@ -432,11 +424,6 @@ async fn run_completion_io_supervisor(
     // Queued starts which lost the shutdown race were admitted but never
     // entered `running`; all admitted ownership is terminal now.
     state.outstanding.store(0, Ordering::Release);
-    #[cfg(test)]
-    {
-        state.supervisor_exited.store(true, Ordering::Release);
-        state.supervisor_exit.notify_waiters();
-    }
 }
 
 async fn execute_io_async(

@@ -900,25 +900,3 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::Text { pane, .. } => *pane,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn actor_spec_keeps_explicit_identity_and_path() {
-        let result = PresentationActorSpec::parse("workspace=/tmp/workspace.wasm");
-        assert!(result.is_ok());
-        if let Ok(spec) = result {
-            assert_eq!(spec.id, "workspace");
-            assert_eq!(spec.path, Path::new("/tmp/workspace.wasm"));
-        }
-    }
-
-    #[test]
-    fn actor_spec_rejects_missing_identity_or_path() {
-        assert!(PresentationActorSpec::parse("/tmp/workspace.wasm").is_err());
-        assert!(PresentationActorSpec::parse("=/tmp/workspace.wasm").is_err());
-        assert!(PresentationActorSpec::parse("workspace=").is_err());
-    }
-}

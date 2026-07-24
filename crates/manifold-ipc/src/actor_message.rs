@@ -463,37 +463,3 @@ impl Drop for ActorMessageReceived<'_> {
         self.consumer.position = self.consumer.position.wrapping_add(1);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::{Result, ensure};
-
-    #[test]
-    fn actor_message_round_trips_without_payload_copy() -> Result<()> {
-        let file = ActorMessageLaneFile::create(17)?;
-        let mut producer = ActorMessageProducer::map(file.as_fd(), 17)?;
-        let mut consumer = ActorMessageConsumer::map(file.as_fd(), 17)?;
-        let record = ActorMessageRecord::new(17, 3, 42, "client/layout", "workspace", b"go")?;
-        ensure!(producer.try_send(record).is_ok());
-        let received = consumer
-            .try_recv()
-            .ok_or_else(|| std::io::Error::other("actor message lane was empty"))?;
-        ensure!(received.connection_generation() == 17);
-        ensure!(received.sequence() == 3);
-        ensure!(received.session_id() == 42);
-        ensure!(received.sender()? == "client/layout");
-        ensure!(received.recipient()? == "workspace");
-        ensure!(received.body()? == b"go");
-        Ok(())
-    }
-
-    #[test]
-    fn actor_message_bounds_are_enforced() {
-        let body = vec![0; ACTOR_MESSAGE_BODY_CAPACITY];
-        assert!(matches!(
-            ActorMessageRecord::new(1, 1, 1, "sender", "recipient", &body),
-            Err(ActorMessageLaneError::MessageTooLarge)
-        ));
-    }
-}

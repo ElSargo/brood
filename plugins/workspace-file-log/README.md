@@ -79,11 +79,8 @@ file, and all documented exclusions. These filesystem artifacts are the proof,
 rather than a plugin-generated success value.
 
 This plugin is also the user-observable completion-write proof: the snapshot is
-created through the same host completion engine whose cancellation and
-replacement ownership is tested with a deliberately blocked filesystem
-mutation in `completion_io::tests`. The plugin demonstrates the real guest and
-daemon path and leaves inspectable bytes; the deterministic host test supplies
-the timing barrier which an ordinary regular-file write cannot reliably expose.
+created through the same host completion engine used by the normal guest and
+daemon path and leaves inspectable bytes.
 
 The workspace-grant lifecycle proof creates two real surface sessions whose
 working directories contain different files, activates each in turn, and checks
@@ -91,7 +88,7 @@ the live session ID and working directory through the control API. Each
 activation starts a new plugin generation under the same configured actor ID.
 The active workspace gains its own log, mirror, and index plus records for
 mutations made while it is active; byte hashes prove the inactive workspace's
-log remains unchanged. The preserved directories printed by the test make the
+log remains unchanged. The preserved directories printed by the workload make the
 absence of cross-workspace files and log records directly inspectable.
 
 The same workload is the typed lifecycle proof. Each start or stop hook captures

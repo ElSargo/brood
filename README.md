@@ -84,7 +84,11 @@ nix run github:ElSargo/manifold#dev-workflow-full
 For exact runtime, validation, and control commands, see the
 [CLI reference pointers](docs/reference/cli.md).
 
-Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
+Current acceptance uses the external presentation client rather than the old
+daemon smoke matrix. Run the focused layout and session-switcher workloads
+through the Nix shell, or use `nix run .#software-e2e-capture` for retained
+client-composed frames and reconnect evidence. See
+[Testing](docs/systems/testing.md) for the supported paths.
 
 The session server uses Smithay and Wasmtime. The presentation client uses WGPU,
 and shared CLI/DBus types live in `manifold-cli`. Local transport carries

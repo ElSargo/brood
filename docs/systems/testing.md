@@ -64,18 +64,20 @@ replacement client. The replacement receives the existing pane identities and
 frames, obtains new presentation and layout-lease generations, and reconstructs
 the sidebar/workspace composition.
 
-## Unit And CI Coverage
+## Acceptance And CI
 
-Unit tests cover layout-tree validation, disjoint pane authority, stale
-revision rejection, recursive transforms, clipping, z ordering, focus
-selection, wrapper collapse, input queues, and plugin action serialization.
+The repository does not maintain implementation-detail tests as product
+acceptance. A retained behavior test must exercise current, externally visible
+behavior through a real workload and leave evidence at the boundary whose
+behavior is being fixed.
 
-The sandboxed software graphical check uses Mesa software rendering and a real
-external client. Its exported frame and layout manifest are frontend artifacts.
-The CI check must fail if it silently falls back to a backend presenter.
+`software-e2e-capture.sh` uses Mesa software rendering and a real external
+client. Its initial and reconnected frames are frontend artifacts. The workload
+must fail if it silently falls back to a backend presenter.
 
-Actor/worker I/O tests remain independent of presentation unless their
-acceptance criterion is explicitly graphical.
+CI owns reproducible build and lint correctness. Graphical acceptance remains a
+host runtime workload because DMA-BUF export requires a render node that is not
+available in a pure Nix build sandbox.
 
 ## Related Pages
 

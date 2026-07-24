@@ -30,11 +30,9 @@ sliced at a byte offset. If a UI later needs a bounded preview, that UI must
 define its own display bound and truncate only at extended-grapheme boundaries;
 the launch record remains the lossless source of truth.
 
-`tools/test-unicode-launch-context.sh` exercises that contract through the real
-systemd scope and `manifold-runner-exec` sidecar. Its Markdown artifact shows
-the restored Unicode project, working, and cache paths plus a Unicode argument.
-A plugin is not applicable at this boundary: launch-record recovery happens
-before the entered command, session server, or plugin runtime starts.
+Launch-record recovery happens before the entered command, session server, or
+plugin runtime starts, so acceptance belongs in a real entered-project
+workflow rather than a plugin or parser-level fixture.
 
 Current built-in runner:
 

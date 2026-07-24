@@ -236,13 +236,6 @@ struct HubInner {
     children: Mutex<HashMap<u64, Arc<ChildInner>>>,
     timers: Mutex<HashMap<u64, Arc<TimerInner>>>,
     tasks: Mutex<HashMap<u64, Vec<JoinHandle<()>>>>,
-    #[cfg(test)]
-    connect_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
-    #[cfg(test)]
-    connect_registration_gate:
-        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    #[cfg(test)]
-    cleanup_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 struct ResourceReservation {
@@ -355,12 +348,6 @@ impl RuntimeIoHub {
                 children: Mutex::new(HashMap::new()),
                 timers: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
-                #[cfg(test)]
-                connect_gate: Mutex::new(None),
-                #[cfg(test)]
-                connect_registration_gate: Mutex::new(None),
-                #[cfg(test)]
-                cleanup_gate: Mutex::new(None),
             }),
         })
     }
@@ -563,17 +550,6 @@ impl RuntimeIoHub {
         if !address.ip().is_loopback() {
             return Err(RuntimeIoError::NotPermitted);
         }
-        #[cfg(test)]
-        if let Some((entered, release)) = self
-            .inner
-            .connect_registration_gate
-            .lock()
-            .ok()
-            .and_then(|mut gate| gate.take())
-        {
-            let _result = entered.send(());
-            let _result = release.recv();
-        }
         let _connect = ConnectGuard::new(&self.inner);
         let reservation = ResourceReservation::new(&self.inner, 1)?;
         let mut shutdown = self.inner.connect_shutdown.subscribe();
@@ -586,24 +562,6 @@ impl RuntimeIoHub {
                 return Err(RuntimeIoError::StaleHandle);
             }
         };
-        #[cfg(test)]
-        {
-            let gate = self
-                .inner
-                .connect_gate
-                .lock()
-                .ok()
-                .and_then(|gate| gate.clone());
-            if let Some((entered, release)) = gate {
-                entered.notify_one();
-                tokio::select! {
-                    () = release.notified() => {}
-                    _ = shutdown.changed() => {
-                        return Err(RuntimeIoError::StaleHandle);
-                    }
-                }
-            }
-        }
         let _admission = self
             .inner
             .admission
@@ -745,7 +703,6 @@ impl RuntimeIoHub {
             .ok_or(RuntimeIoError::StaleHandle)?;
         let _cleanup = CleanupGuard::new(&self.inner);
         drop(admission);
-        self.wait_cleanup_gate().await;
         stream.stop();
         let linked_child = stream
             .linked_child
@@ -793,7 +750,6 @@ impl RuntimeIoHub {
             .ok_or(RuntimeIoError::StaleHandle)?;
         let _cleanup = CleanupGuard::new(&self.inner);
         drop(admission);
-        self.wait_cleanup_gate().await;
         child.alive.store(false, Ordering::Release);
         child.shutdown.notify_one();
         loop {
@@ -834,7 +790,6 @@ impl RuntimeIoHub {
             .ok_or(RuntimeIoError::StaleHandle)?;
         let _cleanup = CleanupGuard::new(&self.inner);
         drop(admission);
-        self.wait_cleanup_gate().await;
         timer.alive.store(false, Ordering::Release);
         self.join_resource_tasks(raw, true).await?;
         self.inner
@@ -1181,23 +1136,6 @@ impl RuntimeIoHub {
             let _result = task.await;
         }
         Ok(())
-    }
-
-    async fn wait_cleanup_gate(&self) {
-        std::future::ready(()).await;
-        #[cfg(test)]
-        {
-            let gate = self
-                .inner
-                .cleanup_gate
-                .lock()
-                .ok()
-                .and_then(|mut gate| gate.take());
-            if let Some((entered, release)) = gate {
-                entered.notify_one();
-                release.notified().await;
-            }
-        }
     }
 
     fn reserve_resources(&self, amount: usize) -> Result<(), RuntimeIoError> {

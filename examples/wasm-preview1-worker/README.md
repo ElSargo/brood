@@ -29,14 +29,6 @@ entry points, and stack/TLS reservation exports are the compatibility ABI. The
 runtime derives each worker's WASI authority from the actor grant while keeping
 descriptor tables and worker-local state private to the worker Store.
 
-Run `tools/test-wasm-preview1-worker.sh` for the live shared-queue,
-notification/select, ordinary-read, scheduling, completion-I/O,
-ordinary-filesystem, and cancellation workloads. It drives
-both `Preview1WorkerRuntime` and the daemon-compatible `Preview1CompatActor`
-facade in-process; it is not the Component Model actor example.
-
-Daemon-level acceptance loads this artifact into a headless session server,
-addresses the actor through the normal control surface, verifies bounded wait
-sets and coalesced actor notifications, retains one ordinary-read compatibility
-check, then replaces the actor while two notification waits are pending and
-verifies that the new generation inherits no resources or registrations.
+Load this artifact through the normal plugin runtime when validating its
+ordinary WASI behavior. Acceptance should use observable plugin output rather
+than an in-process runtime fixture.
