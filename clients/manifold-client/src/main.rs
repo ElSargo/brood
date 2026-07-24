@@ -6,7 +6,8 @@
 )]
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    mem::size_of,
     os::fd::AsFd,
     sync::{Arc, mpsc},
     thread,
@@ -18,9 +19,9 @@ use clap::Parser;
 use manifold_cli::{
     ClientArgs,
     control::{
-        ControlTarget, DmabufFrame, ServerLaunch, activate_surface_session, close_surface_session,
-        connect_or_spawn, create_surface_session, dmabuf_resource, list_surface_sessions,
-        open_presentation_fast_path, rename_surface_session, request_dbus_command,
+        ControlTarget, DmabufFrame, PresentationWindowSummary, ServerLaunch,
+        activate_surface_session, close_surface_session, connect_or_spawn, create_surface_session,
+        dmabuf_resource, open_presentation_fast_path, rename_surface_session, request_dbus_command,
         resolve_control_target,
     },
 };
@@ -30,6 +31,7 @@ use manifold_layout::{
     LocalPoint, ResolvedLayout,
 };
 use num_traits::ToPrimitive;
+use serde::Deserialize;
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -239,10 +241,13 @@ fn main() -> Result<()> {
             "connected to Manifold server pid={} protocol={}",
             handshake.server_pid, handshake.protocol_version
         );
-        let sessions = list_surface_sessions(&target)?;
-        let session_id = if let Some(active) = sessions.iter().find(|session| session.active) {
-            eprintln!("attached presentation to active session id={}", active.id);
-            active.id
+        let fast_path = open_presentation_fast_path(&target)?;
+        let session_id = if fast_path.active_session != 0 {
+            eprintln!(
+                "attached presentation to active session id={}",
+                fast_path.active_session
+            );
+            fast_path.active_session
         } else {
             let created = create_surface_session(&target, String::new())?;
             eprintln!("created presentation session id={created}");
@@ -251,7 +256,6 @@ fn main() -> Result<()> {
 
         let fast_path_enabled = true;
         let (input_sender, actor_message_sender) = if fast_path_enabled {
-            let fast_path = open_presentation_fast_path(&target)?;
             let input = manifold_ipc::CriticalProducer::map(
                 fast_path.input_fd.as_fd(),
                 fast_path.generation,
@@ -260,14 +264,21 @@ fn main() -> Result<()> {
                 fast_path.frame_fd.as_fd(),
                 fast_path.generation,
             )?;
+            let catalog = manifold_ipc::CriticalConsumer::map(
+                fast_path.catalog_fd.as_fd(),
+                fast_path.generation,
+            )?;
             let frame_notifications =
                 manifold_ipc::EventNotifier::from_owned_fd(fast_path.frame_notify_fd);
+            let catalog_notifications =
+                manifold_ipc::EventNotifier::from_owned_fd(fast_path.catalog_notify_fd);
             spawn_frame_updates(
                 target.clone(),
                 frames,
                 frame_notifications,
                 event_loop.create_proxy(),
             )?;
+            spawn_catalog_updates(catalog, catalog_notifications, event_loop.create_proxy())?;
             let input_sender = InputLane {
                 producer: input,
                 notifications: manifold_ipc::EventNotifier::from_owned_fd(
@@ -384,7 +395,11 @@ enum ClientEvent {
         description: String,
         result: Result<String, String>,
     },
-    SessionSnapshot(SessionSnapshot),
+    BackendSnapshot {
+        session: Option<SessionSnapshot>,
+        active_session: u64,
+        windows: Vec<PresentationWindowSummary>,
+    },
     SessionCommandCompleted {
         actor_id: String,
         completion: SessionCommandCompletion,
@@ -398,7 +413,6 @@ struct SceneWindowUpdate {
     resource_id: u64,
     rect: [i32; 4],
     active: bool,
-    app_id: String,
     resource: Option<DmabufFrame>,
 }
 
@@ -410,6 +424,179 @@ struct PendingScene {
     windows: Vec<SceneWindowUpdate>,
 }
 
+#[derive(Deserialize)]
+struct CatalogWireSnapshot {
+    active_session: u64,
+    sessions: Vec<CatalogWireSession>,
+    windows: Vec<CatalogWireWindow>,
+}
+
+#[derive(Deserialize)]
+struct CatalogWireSession {
+    id: u64,
+    name: String,
+    active: bool,
+    windows: u64,
+}
+
+#[derive(Deserialize)]
+struct CatalogWireWindow {
+    pane: u64,
+    session: u64,
+    app_id: String,
+}
+
+struct PendingCatalog {
+    revision: u64,
+    expected_len: usize,
+    expected_chunks: usize,
+    chunks: usize,
+    payload: Vec<u8>,
+}
+
+fn spawn_catalog_updates(
+    mut catalog: manifold_ipc::CriticalConsumer,
+    notifications: manifold_ipc::EventNotifier,
+    proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
+) -> Result<()> {
+    let _worker = thread::Builder::new()
+        .name("manifold-catalog-updates".to_string())
+        .spawn(move || {
+            let mut pending: Option<PendingCatalog> = None;
+            loop {
+                if notifications.wait().is_err() {
+                    break;
+                }
+                while let Some(record) = catalog.try_recv() {
+                    match record.opcode {
+                        manifold_ipc::CATALOG_SNAPSHOT_BEGIN => {
+                            let expected_len =
+                                usize::try_from(record.arguments[0]).unwrap_or(usize::MAX);
+                            let expected_chunks =
+                                usize::try_from(record.arguments[1]).unwrap_or(usize::MAX);
+                            let valid = expected_chunks.saturating_add(2)
+                                <= manifold_ipc::CRITICAL_CAPACITY
+                                && expected_len.div_ceil(manifold_ipc::CATALOG_CHUNK_BYTES)
+                                    == expected_chunks;
+                            if !valid {
+                                let _send_result =
+                                    proxy.send_event(ClientEvent::TransportError(format!(
+                                        "invalid catalog snapshot header revision={} bytes={} chunks={}",
+                                        record.sequence, expected_len, expected_chunks
+                                    )));
+                                return;
+                            }
+                            pending = Some(PendingCatalog {
+                                revision: record.sequence,
+                                expected_len,
+                                expected_chunks,
+                                chunks: 0,
+                                payload: Vec::with_capacity(expected_len),
+                            });
+                        }
+                        manifold_ipc::CATALOG_SNAPSHOT_CHUNK => {
+                            let Some(snapshot) = pending.as_mut() else {
+                                continue;
+                            };
+                            if snapshot.revision != record.sequence {
+                                pending = None;
+                                continue;
+                            }
+                            let valid = usize::try_from(record.flags)
+                                .unwrap_or(usize::MAX)
+                                .min(manifold_ipc::CATALOG_CHUNK_BYTES);
+                            let remaining =
+                                snapshot.expected_len.saturating_sub(snapshot.payload.len());
+                            if valid == 0 || valid > remaining {
+                                pending = None;
+                                continue;
+                            }
+                            let mut bytes = [0_u8; manifold_ipc::CATALOG_CHUNK_BYTES];
+                            for (target, word) in bytes
+                                .chunks_mut(size_of::<u64>())
+                                .zip(record.arguments.iter())
+                            {
+                                target.copy_from_slice(&word.to_ne_bytes());
+                            }
+                            if let Some(chunk) = bytes.get(..valid) {
+                                snapshot.payload.extend_from_slice(chunk);
+                            }
+                            snapshot.chunks = snapshot.chunks.saturating_add(1);
+                        }
+                        manifold_ipc::CATALOG_SNAPSHOT_END => {
+                            let Some(snapshot) = pending.take() else {
+                                continue;
+                            };
+                            if snapshot.revision != record.sequence
+                                || snapshot.payload.len() != snapshot.expected_len
+                                || snapshot.chunks != snapshot.expected_chunks
+                            {
+                                continue;
+                            }
+                            let decoded =
+                                match serde_json::from_slice::<CatalogWireSnapshot>(&snapshot.payload)
+                                {
+                                    Ok(decoded) => decoded,
+                                    Err(error) => {
+                                        let _send_result = proxy.send_event(
+                                            ClientEvent::TransportError(format!(
+                                                "decode catalog snapshot revision={}: {error}",
+                                                snapshot.revision
+                                            )),
+                                        );
+                                        return;
+                                    }
+                                };
+                            let sessions = decoded
+                                .sessions
+                                .into_iter()
+                                .map(|session| SessionSummary {
+                                    id: session.id,
+                                    name: session.name,
+                                    active: session.active,
+                                    windows: session.windows,
+                                })
+                                .collect::<Vec<_>>();
+                            let windows = decoded
+                                .windows
+                                .into_iter()
+                                .map(|window| PresentationWindowSummary {
+                                    pane: window.pane,
+                                    session: window.session,
+                                    app_id: window.app_id,
+                                })
+                                .collect::<Vec<_>>();
+                            eprintln!(
+                                "presentation shared catalog revision={} active={} sessions={} windows={}",
+                                snapshot.revision,
+                                decoded.active_session,
+                                sessions.len(),
+                                windows.len()
+                            );
+                            if proxy
+                                .send_event(ClientEvent::BackendSnapshot {
+                                    session: Some(SessionSnapshot {
+                                        revision: snapshot.revision,
+                                        active: decoded.active_session,
+                                        sessions,
+                                    }),
+                                    active_session: decoded.active_session,
+                                    windows,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .context("spawn presentation catalog update worker")?;
+    Ok(())
+}
+
 fn spawn_frame_updates(
     target: ControlTarget,
     mut frames: manifold_ipc::CriticalConsumer,
@@ -419,7 +606,7 @@ fn spawn_frame_updates(
     let _worker = thread::Builder::new()
         .name("manifold-frame-updates".to_string())
         .spawn(move || {
-            let mut resources = HashMap::new();
+            let mut resources = HashSet::new();
             let mut pending_scene: Option<PendingScene> = None;
             loop {
                 if notifications.wait().is_err() {
@@ -450,24 +637,19 @@ fn spawn_frame_updates(
                                 return;
                             }
                             let resource_id = record.arguments[1];
-                            let resource = match resources.entry(resource_id) {
-                                std::collections::hash_map::Entry::Occupied(_) => None,
-                                std::collections::hash_map::Entry::Vacant(entry) => {
-                                    match dmabuf_resource(&target, resource_id) {
-                                        Ok(resource) => {
-                                            entry.insert(resource.app_id.clone());
-                                            Some(resource)
-                                        }
-                                        Err(error) => {
-                                            let _send_result = proxy.send_event(
-                                                ClientEvent::TransportError(format!(
-                                                    "fetch DMA-BUF resource {resource_id}: {error:#}"
-                                                )),
-                                            );
-                                            return;
-                                        }
+                            let resource = if resources.insert(resource_id) {
+                                match dmabuf_resource(&target, resource_id) {
+                                    Ok(resource) => Some(resource),
+                                    Err(error) => {
+                                        let _send_result =
+                                            proxy.send_event(ClientEvent::TransportError(format!(
+                                                "fetch DMA-BUF resource {resource_id}: {error:#}"
+                                            )));
+                                        return;
                                     }
                                 }
+                            } else {
+                                None
                             };
                             let (x, y) = unpack_i32_pair(record.arguments[2]);
                             let (width, height) = unpack_i32_pair(record.arguments[3]);
@@ -476,7 +658,6 @@ fn spawn_frame_updates(
                                 resource_id,
                                 rect: [x, y, width, height],
                                 active: record.arguments[4] != 0,
-                                app_id: resources.get(&resource_id).cloned().unwrap_or_default(),
                                 resource,
                             });
                         }
@@ -669,11 +850,9 @@ impl BackendCommandLane {
         let worker = thread::Builder::new()
             .name("manifold-backend-commands".to_string())
             .spawn(move || {
-                let mut previous_sessions = Vec::new();
-                let mut session_revision = 0_u64;
-                loop {
-                    match receiver.recv_timeout(Duration::from_millis(500)) {
-                        Ok(BackendRequest::Control(command)) => {
+                while let Ok(request) = receiver.recv() {
+                    match request {
+                        BackendRequest::Control(command) => {
                             let result = request_dbus_command(&target, &command.argv, false)
                                 .map_err(|error| format!("{error:#}"));
                             if proxy
@@ -686,7 +865,7 @@ impl BackendCommandLane {
                                 return;
                             }
                         }
-                        Ok(BackendRequest::Session(command)) => {
+                        BackendRequest::Session(command) => {
                             let completion = execute_session_command(&target, command.request);
                             if proxy
                                 .send_event(ClientEvent::SessionCommandCompleted {
@@ -698,16 +877,6 @@ impl BackendCommandLane {
                                 return;
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    if let Err(error) = publish_session_snapshot(
-                        &target,
-                        &proxy,
-                        &mut previous_sessions,
-                        &mut session_revision,
-                    ) {
-                        eprintln!("failed to refresh presentation session snapshot: {error:#}");
                     }
                 }
             })
@@ -748,46 +917,6 @@ impl BackendCommandLane {
     }
 }
 
-fn publish_session_snapshot(
-    target: &ControlTarget,
-    proxy: &winit::event_loop::EventLoopProxy<ClientEvent>,
-    previous: &mut Vec<manifold_cli::control::SurfaceSessionSummary>,
-    revision: &mut u64,
-) -> Result<()> {
-    let sessions = list_surface_sessions(target)?;
-    if sessions == *previous {
-        return Ok(());
-    }
-    *revision = revision.saturating_add(1);
-    let active = sessions
-        .iter()
-        .find(|session| session.active)
-        .map_or(0, |session| session.id);
-    let snapshot = SessionSnapshot {
-        revision: *revision,
-        active,
-        sessions: sessions
-            .iter()
-            .map(|session| SessionSummary {
-                id: session.id,
-                name: session.name.clone(),
-                active: session.active,
-                windows: session.windows,
-            })
-            .collect(),
-    };
-    eprintln!(
-        "presentation session snapshot revision={} active={} sessions={}",
-        snapshot.revision,
-        snapshot.active,
-        snapshot.sessions.len()
-    );
-    *previous = sessions;
-    proxy
-        .send_event(ClientEvent::SessionSnapshot(snapshot))
-        .map_err(|_stopped| anyhow!("presentation event loop stopped"))
-}
-
 fn execute_session_command(
     target: &ControlTarget,
     request: SessionCommandRequest,
@@ -797,7 +926,7 @@ fn execute_session_command(
     let session = request.session;
     let name = request.name;
     let result = match operation {
-        SessionOperation::Refresh => list_surface_sessions(target).map(|_| None),
+        SessionOperation::Refresh => Ok(None),
         SessionOperation::Activate => session
             .context("activate request is missing a session ID")
             .and_then(|session| {
@@ -854,6 +983,8 @@ struct Application {
     fast_path_enabled: bool,
     backend_connected: bool,
     pending_frame: Option<ClientEvent>,
+    pending_backend_snapshot: Option<(u64, Vec<PresentationWindowSummary>)>,
+    latest_session_snapshot: Option<SessionSnapshot>,
     last_presented_sequence: Option<u64>,
     modifiers: ModifiersState,
     window_focused: bool,
@@ -910,8 +1041,8 @@ impl Application {
                     "backend command completion reached scene transport path"
                 ));
             }
-            ClientEvent::SessionSnapshot(_) | ClientEvent::SessionCommandCompleted { .. } => {
-                return Err(anyhow!("session event reached scene transport path"));
+            ClientEvent::BackendSnapshot { .. } | ClientEvent::SessionCommandCompleted { .. } => {
+                return Err(anyhow!("backend event reached scene transport path"));
             }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
@@ -1115,7 +1246,7 @@ impl Application {
             let message = renderer.layout_state_message(
                 self.layout_revision,
                 lease,
-                owned_panes,
+                &owned_panes,
                 focused_pane,
                 LayoutSize {
                     w: viewport.w,
@@ -1453,6 +1584,8 @@ impl Application {
             .values()
             .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
             .collect::<Vec<_>>();
+        let available_windows = old.available_windows.clone();
+        let active_session = old.active_session;
         let window = Arc::clone(&old.window);
         drop(old);
         let generation = self.allocate_renderer_generation()?;
@@ -1469,6 +1602,8 @@ impl Application {
             .context("plugin graphics bridge is unavailable")?;
         let mut replacement =
             Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
+        replacement.available_windows = available_windows;
+        let _focus_change = replacement.apply_default_session_layout(active_session);
         for (pane, sequence) in replay {
             replacement.refresh_plugin_graphics(pane, sequence)?;
         }
@@ -1524,6 +1659,11 @@ impl ApplicationHandler<ClientEvent> for Application {
             Ok(renderer) => {
                 renderer.window.request_redraw();
                 self.renderer = Some(renderer);
+                if let Some((active_session, windows)) = self.pending_backend_snapshot.take()
+                    && let Some(renderer) = self.renderer.as_mut()
+                {
+                    let _focus_change = renderer.select_backend_snapshot(active_session, windows);
+                }
                 if let (Some(sender), Some(renderer)) =
                     (self.input_sender.as_mut(), self.renderer.as_ref())
                 {
@@ -1634,12 +1774,36 @@ impl ApplicationHandler<ClientEvent> for Application {
                     eprintln!("presentation backend command failed command={description}: {error}");
                 }
             },
-            ClientEvent::SessionSnapshot(snapshot) => {
-                if let Some(runtime) = self.wasm_runtime.as_ref()
-                    && let Err(error) =
-                        runtime.broadcast_session_event(&SessionEvent::Snapshot(snapshot))
+            ClientEvent::BackendSnapshot {
+                session,
+                active_session,
+                windows,
+            } => {
+                let focus_change = if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.select_backend_snapshot(active_session, windows)
+                } else {
+                    self.pending_backend_snapshot = Some((active_session, windows));
+                    None
+                };
+                if let Some(change) = focus_change
+                    && let Err(error) = dispatch_focus_change(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        change,
+                        self.window_focused,
+                    )
                 {
                     self.fail(event_loop, error);
+                    return;
+                }
+                if let Some(snapshot) = session {
+                    self.latest_session_snapshot = Some(snapshot.clone());
+                    if let Some(runtime) = self.wasm_runtime.as_ref()
+                        && let Err(error) =
+                            runtime.broadcast_session_event(&SessionEvent::Snapshot(snapshot))
+                    {
+                        self.fail(event_loop, error);
+                    }
                 }
             }
             ClientEvent::SessionCommandCompleted {
@@ -1655,6 +1819,42 @@ impl ApplicationHandler<ClientEvent> for Application {
                     completion.session,
                     completion.message,
                 );
+                let focus_change = completion
+                    .success
+                    .then_some(completion.operation)
+                    .filter(|operation| {
+                        matches!(
+                            operation,
+                            SessionOperation::Activate | SessionOperation::Create
+                        )
+                    })
+                    .and(completion.session)
+                    .and_then(|session| {
+                        self.renderer
+                            .as_mut()
+                            .and_then(|renderer| renderer.select_active_session(session))
+                    });
+                if let Some(change) = focus_change
+                    && let Err(error) = dispatch_focus_change(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        change,
+                        self.window_focused,
+                    )
+                {
+                    self.fail(event_loop, error);
+                    return;
+                }
+                if let Some(runtime) = self.wasm_runtime.as_ref()
+                    && completion.success
+                    && completion.operation == SessionOperation::Refresh
+                    && let Some(snapshot) = self.latest_session_snapshot.clone()
+                    && let Err(error) =
+                        runtime.send_session_event(&actor_id, SessionEvent::Snapshot(snapshot))
+                {
+                    self.fail(event_loop, error);
+                    return;
+                }
                 if let Some(runtime) = self.wasm_runtime.as_ref()
                     && let Err(error) = runtime
                         .send_session_event(&actor_id, SessionEvent::CommandCompleted(completion))
@@ -2161,8 +2361,11 @@ struct Renderer {
     frame_bind_group_layout: wgpu::BindGroupLayout,
     frame_sampler: wgpu::Sampler,
     frame_pipeline: wgpu::RenderPipeline,
+    placeholder_pipeline: wgpu::RenderPipeline,
     plugin_canvas: GpuCanvasRenderer,
     imported_frames: HashMap<u64, ImportedFrame>,
+    available_windows: Vec<AvailableWindow>,
+    active_session: u64,
     current_windows: Vec<SceneWindow>,
     current_sequence: Option<u64>,
     plugin_graphics: PluginGraphicsBridge,
@@ -2238,11 +2441,17 @@ struct FocusChange {
 
 struct SceneWindow {
     window_id: u64,
-    app_id: String,
     resource_id: u64,
     source_rect: [i32; 4],
     rect: [i32; 4],
     active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct AvailableWindow {
+    pane: u64,
+    session: u64,
+    app_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -2252,6 +2461,8 @@ struct LayoutStateMessage {
     revision: u64,
     lease: manifold_wasm::LayoutLeaseToken,
     visible_panes: Vec<u64>,
+    active_session: u64,
+    available_windows: Vec<AvailableWindow>,
     focused_pane: Option<u64>,
     pane_app_ids: Vec<KeyPolicyAppPane>,
     size: LayoutStateSize,
@@ -2935,6 +3146,65 @@ fn create_frame_pipeline(
     (bind_group_layout, sampler, pipeline)
 }
 
+fn create_placeholder_pipeline(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("managed window placeholder shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            "struct VertexOutput {
+                @builtin(position) position: vec4<f32>,
+            };
+            @vertex fn vertex(@builtin(vertex_index) index: u32) -> VertexOutput {
+                var positions = array<vec2<f32>, 3>(
+                    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+                var output: VertexOutput;
+                output.position = vec4<f32>(positions[index], 0.0, 1.0);
+                return output;
+            }
+            @fragment fn fragment(
+                @builtin(position) position: vec4<f32>
+            ) -> @location(0) vec4<f32> {
+                let stripe = f32((u32(position.x) / 12u + u32(position.y) / 12u) % 2u);
+                let base = 0.12 + stripe * 0.025;
+                return vec4<f32>(base, base + 0.01, base + 0.025, 1.0);
+            }"
+            .into(),
+        ),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("managed window placeholder pipeline layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("managed window placeholder pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fragment"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn dmabuf_texture_formats(fourcc: u32) -> Result<(wgpu::TextureFormat, wgpu::TextureFormat)> {
     const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
     const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -3056,6 +3326,7 @@ impl Renderer {
         config.desired_maximum_frame_latency = 1;
         let (frame_bind_group_layout, frame_sampler, frame_pipeline) =
             create_frame_pipeline(&device, config.format);
+        let placeholder_pipeline = create_placeholder_pipeline(&device, config.format);
         let plugin_canvas =
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
         surface.configure(&device, &config);
@@ -3073,8 +3344,11 @@ impl Renderer {
             frame_bind_group_layout,
             frame_sampler,
             frame_pipeline,
+            placeholder_pipeline,
             plugin_canvas,
             imported_frames: HashMap::new(),
+            available_windows: Vec::new(),
+            active_session: 0,
             current_windows: Vec::new(),
             current_sequence: None,
             plugin_graphics,
@@ -3097,6 +3371,70 @@ impl Renderer {
         )
     }
 
+    fn select_backend_snapshot(
+        &mut self,
+        active_session: u64,
+        windows: Vec<PresentationWindowSummary>,
+    ) -> Option<FocusChange> {
+        let previous_visible = self.default_visible_pane_inventory();
+        let previous_inventory = self
+            .available_windows
+            .iter()
+            .map(|window| (window.pane, window.session, window.app_id.clone()))
+            .collect::<Vec<_>>();
+        let previous_active = self.active_session;
+        let mut available_windows = windows
+            .into_iter()
+            .map(|window| AvailableWindow {
+                pane: window.pane,
+                session: window.session,
+                app_id: window.app_id,
+            })
+            .collect::<Vec<_>>();
+        available_windows.sort_by_key(|window| window.pane);
+        let inventory = available_windows
+            .iter()
+            .map(|window| (window.pane, window.session, window.app_id.clone()))
+            .collect::<Vec<_>>();
+        if previous_inventory == inventory && previous_active == active_session {
+            return None;
+        }
+
+        self.available_windows = available_windows;
+        let visible_changed = previous_visible
+            != default_visible_panes(
+                self.plugin_panes.keys().copied(),
+                &self.available_windows,
+                active_session,
+            );
+        if previous_active != active_session || visible_changed {
+            return self.apply_default_session_layout(active_session);
+        }
+        self.layout_state_dirty = true;
+        self.reconcile_layout()
+    }
+
+    fn select_active_session(&mut self, active_session: u64) -> Option<FocusChange> {
+        if self.active_session == active_session {
+            return None;
+        }
+        self.apply_default_session_layout(active_session)
+    }
+
+    fn apply_default_session_layout(&mut self, active_session: u64) -> Option<FocusChange> {
+        self.active_session = active_session;
+        self.layout_state_dirty = true;
+        let visible = self.default_visible_pane_inventory();
+        let previous_focus = self.focused_pane;
+        let focus_change = self.commit_layout(
+            native_flat_layout(&visible, self.layout_extent()),
+            self.focused_pane_id().filter(|pane| visible.contains(pane)),
+            LayoutSource::NativeFallback,
+        );
+        self.window.request_redraw();
+        focus_change.or_else(|| focus_change_between(previous_focus, self.focused_pane))
+    }
+
     fn select_scene(
         &mut self,
         sequence: u64,
@@ -3109,11 +3447,6 @@ impl Renderer {
             .current_windows
             .iter()
             .map(|window| window.window_id)
-            .collect::<Vec<_>>();
-        let previous_managed_apps = self
-            .current_windows
-            .iter()
-            .map(|window| (window.window_id, window.app_id.clone()))
             .collect::<Vec<_>>();
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
@@ -3139,7 +3472,6 @@ impl Renderer {
             }
             scene_windows.push(SceneWindow {
                 window_id: window.window_id,
-                app_id: window.app_id,
                 resource_id: window.resource_id,
                 source_rect: window.rect,
                 rect: previous_rect,
@@ -3171,14 +3503,7 @@ impl Renderer {
                 &managed_panes,
                 backend_focus,
             );
-            let managed_apps = self
-                .current_windows
-                .iter()
-                .map(|window| (window.window_id, window.app_id.clone()))
-                .collect::<Vec<_>>();
-            self.layout_state_dirty |= previous_managed_panes != managed_panes
-                || previous_managed_apps != managed_apps
-                || previous_focus != self.focused_pane;
+            self.layout_state_dirty |= previous_focus != self.focused_pane;
             let _focus_change = self.reconcile_layout();
             let focus_change =
                 focus_change_between(previous_focus, self.focused_pane).or_else(|| {
@@ -3218,9 +3543,9 @@ impl Renderer {
     }
 
     fn pane_for_app_id(&self, app_id: &str) -> Option<u64> {
-        self.current_windows
+        self.available_windows
             .iter()
-            .find_map(|window| (window.app_id == app_id).then_some(window.window_id))
+            .find_map(|window| (window.app_id == app_id).then_some(window.pane))
     }
 
     fn key_policy_snapshot(&self) -> KeyPolicySnapshot {
@@ -3228,16 +3553,16 @@ impl Renderer {
             focused_pane: self.focused_pane_id(),
             panes: self.pane_inventory(),
             managed_panes: self
-                .current_windows
+                .available_windows
                 .iter()
-                .map(|window| window.window_id)
+                .map(|window| window.pane)
                 .collect(),
             app_panes: self
-                .current_windows
+                .available_windows
                 .iter()
                 .filter(|window| !window.app_id.is_empty())
                 .map(|window| KeyPolicyAppPane {
-                    pane: window.window_id,
+                    pane: window.pane,
                     app_id: window.app_id.clone(),
                 })
                 .collect(),
@@ -3331,7 +3656,7 @@ impl Renderer {
             let extent = self.layout_extent();
             let focus = self.focused_pane_id();
             return self.commit_layout(
-                native_flat_layout(&panes, extent),
+                native_flat_layout(&self.default_visible_pane_inventory(), extent),
                 focus,
                 LayoutSource::NativeFallback,
             );
@@ -3356,12 +3681,12 @@ impl Renderer {
         error: &dyn std::fmt::Display,
     ) -> (Option<FocusChange>, bool) {
         eprintln!("rejected actor-submitted layout; using native fallback: {error}");
-        let panes = self.pane_inventory();
+        let visible = self.default_visible_pane_inventory();
         let extent = self.layout_extent();
         let focus = self.focused_pane_id();
         (
             self.commit_layout(
-                native_flat_layout(&panes, extent),
+                native_flat_layout(&visible, extent),
                 focus,
                 LayoutSource::NativeFallback,
             ),
@@ -3457,11 +3782,17 @@ impl Renderer {
         &self,
         revision: u64,
         lease: manifold_layout::LayoutLeaseToken,
-        visible_panes: Vec<u64>,
+        owned_panes: &[u64],
         focused_pane: Option<u64>,
         size: LayoutSize,
         rest: bool,
     ) -> LayoutStateMessage {
+        let default_visible = self.default_visible_pane_inventory();
+        let visible_panes = owned_panes
+            .iter()
+            .copied()
+            .filter(|pane| default_visible.contains(pane))
+            .collect::<Vec<_>>();
         let visible = visible_panes
             .iter()
             .copied()
@@ -3474,13 +3805,20 @@ impl Renderer {
                 generation: lease.generation,
             },
             visible_panes,
+            active_session: self.active_session,
+            available_windows: self
+                .available_windows
+                .iter()
+                .filter(|window| owned_panes.contains(&window.pane))
+                .cloned()
+                .collect(),
             focused_pane,
             pane_app_ids: self
-                .current_windows
+                .available_windows
                 .iter()
-                .filter(|window| !window.app_id.is_empty() && visible.contains(&window.window_id))
+                .filter(|window| !window.app_id.is_empty() && visible.contains(&window.pane))
                 .map(|window| KeyPolicyAppPane {
-                    pane: window.window_id,
+                    pane: window.pane,
                     app_id: window.app_id.clone(),
                 })
                 .collect(),
@@ -3496,8 +3834,16 @@ impl Renderer {
         self.plugin_panes
             .keys()
             .copied()
-            .chain(self.current_windows.iter().map(|window| window.window_id))
+            .chain(self.available_windows.iter().map(|window| window.pane))
             .collect()
+    }
+
+    fn default_visible_pane_inventory(&self) -> Vec<u64> {
+        default_visible_panes(
+            self.plugin_panes.keys().copied(),
+            &self.available_windows,
+            self.active_session,
+        )
     }
 
     const fn focused_pane_id(&self) -> Option<u64> {
@@ -3511,9 +3857,9 @@ impl Renderer {
         if self.plugin_panes.contains_key(&pane) {
             return Some(FocusedPane::Plugin(pane));
         }
-        self.current_windows
+        self.available_windows
             .iter()
-            .any(|window| window.window_id == pane)
+            .any(|window| window.pane == pane)
             .then_some(FocusedPane::Managed(pane))
     }
 
@@ -3723,7 +4069,6 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            render_pass.set_pipeline(&self.frame_pipeline);
             let extent = self.composition_extent();
             for pane in self.layout_panes_in_render_order() {
                 if let Some(plugin) = self.plugin_panes.get(&pane) {
@@ -3740,24 +4085,35 @@ impl Renderer {
                         0.0,
                         1.0,
                     );
+                    render_pass.set_pipeline(&self.frame_pipeline);
                     render_pass.set_bind_group(0, plugin.scene.output_bind_group(), &[]);
                     render_pass.draw(0..3, 0..1);
                     continue;
                 }
 
-                let Some(window) = self
+                let window = self
                     .current_windows
                     .iter()
-                    .find(|window| window.window_id == pane)
-                else {
+                    .find(|window| window.window_id == pane);
+                let imported =
+                    window.and_then(|window| self.imported_frames.get(&window.resource_id));
+                let rect = window
+                    .map(|window| window.rect)
+                    .or_else(|| {
+                        self.accepted_layout.pane_item(pane).map(|item| {
+                            let rect = item.pixel_rect(self.layout_extent());
+                            [rect.x, rect.y, rect.w, rect.h]
+                        })
+                    })
+                    .and_then(|rect| clip_rect_to_extent(rect, extent));
+                let Some(rect) = rect else {
                     continue;
                 };
-                let Some(imported) = self.imported_frames.get(&window.resource_id) else {
-                    continue;
-                };
-                let Some(rect) = clip_rect_to_extent(window.rect, extent) else {
-                    continue;
-                };
+                let available = self
+                    .available_windows
+                    .iter()
+                    .any(|window| window.pane == pane);
+                let frame_ready = imported.is_some();
                 let viewport =
                     scaled_viewport(rect, extent, (self.config.width, self.config.height));
                 render_pass.set_viewport(
@@ -3768,7 +4124,14 @@ impl Renderer {
                     0.0,
                     1.0,
                 );
-                render_pass.set_bind_group(0, &imported.bind_group, &[]);
+                if let Some(imported) = imported {
+                    render_pass.set_pipeline(&self.frame_pipeline);
+                    render_pass.set_bind_group(0, &imported.bind_group, &[]);
+                } else if managed_pane_uses_placeholder(available, frame_ready) {
+                    render_pass.set_pipeline(&self.placeholder_pipeline);
+                } else {
+                    continue;
+                }
                 render_pass.draw(0..3, 0..1);
             }
             drop(render_pass);
@@ -3835,6 +4198,26 @@ impl Renderer {
     fn mark_managed_resize_sent(&mut self, window: u64, width: u32, height: u32) {
         self.sent_managed_sizes.insert(window, (width, height));
     }
+}
+
+fn default_visible_panes(
+    plugin_panes: impl IntoIterator<Item = u64>,
+    windows: &[AvailableWindow],
+    active_session: u64,
+) -> Vec<u64> {
+    plugin_panes
+        .into_iter()
+        .chain(
+            windows
+                .iter()
+                .filter(|window| window.session == active_session)
+                .map(|window| window.pane),
+        )
+        .collect()
+}
+
+const fn managed_pane_uses_placeholder(available: bool, frame_ready: bool) -> bool {
+    available && !frame_ready
 }
 
 fn clip_rect_to_extent(rect: [i32; 4], extent: (u32, u32)) -> Option<[i32; 4]> {
@@ -3968,4 +4351,48 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
     .into_iter()
     .find(|candidate| supported.contains(candidate))
     .unwrap_or(wgpu::PresentMode::AutoNoVsync)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn available(pane: u64, session: u64) -> AvailableWindow {
+        AvailableWindow {
+            pane,
+            session,
+            app_id: format!("app-{pane}"),
+        }
+    }
+
+    #[test]
+    fn session_selection_filters_default_view_without_reducing_layout_authority() {
+        let windows = vec![available(10, 1), available(20, 2), available(30, 2)];
+        assert_eq!(
+            default_visible_panes([u64::MAX], &windows, 1),
+            [u64::MAX, 10]
+        );
+        assert_eq!(
+            default_visible_panes([u64::MAX], &windows, 2),
+            [u64::MAX, 20, 30]
+        );
+
+        let inventory = windows.iter().map(|window| window.pane).collect::<Vec<_>>();
+        let inactive_session_layout = native_flat_layout(&[20, 30], LayoutSize { w: 1280, h: 800 });
+        assert!(
+            inactive_session_layout
+                .validate_for_panes(&inventory)
+                .is_ok(),
+            "session selection must not constrain which available windows an actor can map"
+        );
+    }
+
+    #[test]
+    fn mapping_readiness_is_not_part_of_default_layout_input() {
+        let windows = vec![available(41, 7), available(42, 8)];
+        assert_eq!(default_visible_panes([], &windows, 7), [41]);
+        assert!(managed_pane_uses_placeholder(true, false));
+        assert!(!managed_pane_uses_placeholder(true, true));
+        assert!(!managed_pane_uses_placeholder(false, false));
+    }
 }

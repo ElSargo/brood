@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc grim magick pkg-config python3 sway weston-simple-shm; do
+for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the session-switcher proof" >&2
     exit 2
@@ -111,6 +111,20 @@ ctl status > /dev/null 2>&1 || {
   exit 1
 }
 
+ctl surface-session new Beta > /dev/null
+ctl spawn weston-simple-egl > /dev/null
+for _ in $(seq 1 100); do
+  rg -q "total_windows=1" <<< "$(ctl status)" && break
+  sleep 0.05
+done
+ctl surface-session new Gamma > /dev/null
+ctl spawn weston-simple-shm > /dev/null
+for _ in $(seq 1 100); do
+  rg -q "total_windows=2" <<< "$(ctl status)" && break
+  sleep 0.05
+done
+rg -q "total_windows=2" <<< "$(ctl status)"
+
 printf '%s\n' \
   'xwayland disable' \
   'output HEADLESS-1 mode 1280x720' \
@@ -175,20 +189,22 @@ rg -q "accepted plugin draw packet" "$CLIENT_LOG"
 rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
-ctl surface-session new Beta > /dev/null
-ctl surface-session new Gamma > /dev/null
-ctl spawn weston-simple-shm > /dev/null
-
 for _ in $(seq 1 200); do
-  if rg -q "granted rest layout lease .* actor=workspace" "$CLIENT_LOG" \
+  if rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG" \
     && rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG" \
+    && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG" \
+    && rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG" \
+    && rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG" \
     && rg -q "requested managed window resize .* logical_size=[0-9]+x[0-9]+" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
-rg -q "granted rest layout lease .* actor=workspace" "$CLIENT_LOG"
+rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG"
 rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG"
+rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG"
+rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG"
 read -r SIDEBAR_WIDTH SIDEBAR_HEIGHT < <(
   sed -n 's/.*requested managed window resize .* logical_size=\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' \
     "$CLIENT_LOG" \
@@ -221,7 +237,36 @@ send_toggle() {
     "$OUT/virtual-keyboard-key" 50
 }
 
+send_open_terminal() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --ctrl-only 24
+}
+
 capture "$OUT/sidebar-visible.png"
+
+accepted_before="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+ctl surface-session switch Beta > /dev/null
+for _ in $(seq 1 100); do
+  accepted_after="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  if rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG" \
+    && ((accepted_after > accepted_before)); then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG"
+((accepted_after > accepted_before))
+capture "$OUT/session-beta.png"
+
+gamma_snapshots_before="$(rg -c "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG")"
+ctl surface-session switch Gamma > /dev/null
+for _ in $(seq 1 100); do
+  gamma_snapshots_after="$(rg -c "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG")"
+  ((gamma_snapshots_after > gamma_snapshots_before)) && break
+  sleep 0.05
+done
+((gamma_snapshots_after > gamma_snapshots_before))
 
 full_width_resizes="$(rg -c "requested managed window resize .* logical_size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
 full_width_frames="$(rg -c "imported window DMA-BUF .* size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
@@ -259,7 +304,53 @@ done
 ((next_sidebar_frames > sidebar_frames))
 capture "$OUT/sidebar-restored.png"
 
-python3 - "$OUT/sidebar-visible.png" "$OUT/sidebar-hidden.png" "$OUT/sidebar-restored.png" <<'PY'
+CTRL_O_STARTED_MS="$(date +%s%3N)"
+send_open_terminal &
+CTRL_O_INPUT_PID=$!
+for _ in $(seq 1 200); do
+  if rg -q "total_windows=3" <<< "$(ctl status)" \
+    && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
+    && rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.01
+done
+wait "$CTRL_O_INPUT_PID"
+CTRL_O_LAYOUT_MS=$(( $(date +%s%3N) - CTRL_O_STARTED_MS ))
+rg -q "total_windows=3" <<< "$(ctl status)"
+rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
+rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"
+((CTRL_O_LAYOUT_MS < 150))
+capture "$OUT/ctrl-o-terminal.png"
+
+CATALOG_TWO_BEFORE="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
+LAYOUT_TWO_BEFORE="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+CLOSE_STARTED_MS="$(date +%s%3N)"
+ctl close-pane 3 > /dev/null
+for _ in $(seq 1 200); do
+  CATALOG_TWO_AFTER="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
+  LAYOUT_TWO_AFTER="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  if rg -q "total_windows=2" <<< "$(ctl status)" \
+    && ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE)) \
+    && ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE)); then
+    break
+  fi
+  sleep 0.01
+done
+CLOSE_LAYOUT_MS=$(( $(date +%s%3N) - CLOSE_STARTED_MS ))
+rg -q "total_windows=2" <<< "$(ctl status)"
+((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
+((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE))
+((CLOSE_LAYOUT_MS < 150))
+
+python3 - \
+  "$OUT/sidebar-visible.png" \
+  "$OUT/sidebar-hidden.png" \
+  "$OUT/sidebar-restored.png" \
+  "$OUT/session-beta.png" \
+  "$OUT/ctrl-o-terminal.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -284,14 +375,42 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.02:
     raise SystemExit(f"visible and hidden sidebar captures are too similar: RMSE={normalized}")
 print(f"sidebar_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[4], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"Gamma and Beta session captures are too similar: RMSE={normalized}")
+print(f"session_switch_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[3], sys.argv[5], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"layout did not visibly change after Ctrl+O: RMSE={normalized}")
+print(f"ctrl_o_capture_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
 rg -q "accepted leased actor layout .* panes=1" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
-if rg -q "rejected actor-submitted layout|ignored stale layout result" "$CLIENT_LOG"; then
+if rg -q "rejected actor-submitted layout" "$CLIENT_LOG"; then
   echo "ERR client rejected a recursive layout update" >&2
+  exit 1
+fi
+if rg -q "presentation backend snapshot" "$CLIENT_LOG"; then
+  echo "ERR client used the retired Zbus catalog refresh path" >&2
   exit 1
 fi
 
@@ -299,13 +418,18 @@ cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
 - backend: headless frame exporter, no presenter and no backend layout
-- input: real Ctrl+Alt+M events through the focused external Winit client
+- input: real Ctrl+Alt+M and Ctrl+O events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
+- catalog: atomic shared-memory snapshots carried both sessions and all window identities
+- switch: selecting Beta published a new layout revision and showed its already-mapped window
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
 - hidden: managed pane resized to ${FULL_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment
 - restored: managed pane returned to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}
-- captures: sidebar-visible.png, sidebar-hidden.png, sidebar-restored.png
+- Ctrl+O: spawned foot in Gamma, expanded the layout to three panes, and imported its DMA-BUF
+- Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted three-pane layout
+- close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
+- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
 - status: $STATUS
 EOF
 
@@ -313,5 +437,8 @@ ctl quit > /dev/null 2>&1 || true
 echo "session_switcher_recursive=verified"
 echo "proof=$OUT/proof.md"
 echo "visible=$OUT/sidebar-visible.png"
+echo "beta=$OUT/session-beta.png"
 echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"
+echo "ctrl_o=$OUT/ctrl-o-terminal.png"
+echo "ctrl_o_layout_ms=$CTRL_O_LAYOUT_MS"

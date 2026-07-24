@@ -74,10 +74,17 @@ struct LayoutStateMessage {
     revision: u64,
     lease: LayoutLeaseToken,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
+    #[serde(default)]
+    available_windows: serde_json_core::heapless::Vec<AvailableWindow, 64>,
     focused_pane: Option<u64>,
     size: LayoutStateSize,
     #[serde(default)]
     rest: bool,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct AvailableWindow {
+    pane: u64,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -98,6 +105,7 @@ struct LayoutContext {
     revision: u64,
     lease: LayoutLeaseToken,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
+    available_windows: serde_json_core::heapless::Vec<AvailableWindow, 64>,
     focused_pane: Option<u64>,
     size: LayoutStateSize,
     rest: bool,
@@ -398,6 +406,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         revision: message.revision,
         lease: message.lease,
         visible_panes: message.visible_panes,
+        available_windows: message.available_windows,
         focused_pane: message.focused_pane,
         size: message.size,
         rest: message.rest,
@@ -459,7 +468,18 @@ fn publish_layout(
         .iter()
         .copied()
         .filter(|visible| *visible != pane)
-        .collect::<Vec<_>>();
+        .chain(
+            message
+                .available_windows
+                .iter()
+                .map(|window| window.pane),
+        )
+        .fold(Vec::new(), |mut panes, candidate| {
+            if !panes.contains(&candidate) {
+                panes.push(candidate);
+            }
+            panes
+        });
     let needs_rest = allow_delegation && !message.rest && !delegated.is_empty();
     let has_rest = message.rest || !delegated.is_empty();
     let pane_visible = state.sidebar_visible && message.visible_panes.contains(&pane);

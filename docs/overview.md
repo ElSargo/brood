@@ -15,7 +15,7 @@ The product model is:
 
 - A [[concepts/workspace]] contains one or more [[concepts/session]]s.
 - A session groups panes, programs, agents, environment, cwd, and capabilities.
-- A [[concepts/presentation-surface]] is an independent client viewport that shows one session at a time.
+- A [[concepts/presentation-surface]] is an independent client viewport over the available window catalog.
 - A [[concepts/pane]] is the unit of presentation.
 - A [[concepts/managed-app]] is an external native app tracked by Manifold.
 - A [[concepts/plugin]] can extend behavior through addressed actors, private actor-scoped workers, completion-based I/O, WASI resources, policy providers, and publications.

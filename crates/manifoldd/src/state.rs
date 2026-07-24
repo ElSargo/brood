@@ -289,6 +289,13 @@ pub struct SurfaceSessionSummary {
     pub working_directory: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentationWindowSummary {
+    pub pane: u64,
+    pub session: u64,
+    pub app_id: String,
+}
+
 pub type ExtensionMetadata = BTreeMap<String, String>;
 pub const MANIFOLD_STATUS_PUBLISHER: &str = "manifold";
 
@@ -2162,7 +2169,7 @@ impl Manifold {
     }
 
     pub fn record_window_mapped(&mut self) {
-        self.last_window_count = self.active_surface_session_window_count();
+        self.last_window_count = self.presentation_window_count();
         self.reconfigure_focus_stack();
     }
 
@@ -2319,14 +2326,11 @@ impl Manifold {
             .find_map(|(surface, pane)| (*pane == target_pane).then(|| surface.clone()))
     }
 
-    fn active_session_content_surface_for_pane(&self, pane: u64) -> Option<WlSurface> {
+    fn content_surface_for_pane(&self, pane: u64) -> Option<WlSurface> {
         let surface = self.surface_for_pane(pane)?;
-        (self
-            .session_for_toplevel_surface(&surface)
-            .unwrap_or(SurfaceSessionId(1))
-            == self.sessions.active()
-            && self.window_for_any_toplevel_surface(&surface).is_some())
-        .then_some(surface)
+        self.window_for_any_toplevel_surface(&surface)
+            .is_some()
+            .then_some(surface)
     }
 
     pub const fn active_surface_session(&self) -> SurfaceSessionId {
@@ -2661,8 +2665,14 @@ impl Manifold {
         let Some(surface) = Self::window_toplevel_surface(window) else {
             return false;
         };
-        self.window_belongs_to_active_surface_session(window)
-            && self.pane_for_toplevel_surface(&surface).is_some()
+        self.pane_for_toplevel_surface(&surface).is_some()
+    }
+
+    fn presentation_window_count(&self) -> usize {
+        self.space
+            .elements()
+            .filter(|window| self.window_available_to_presentation_client(window))
+            .count()
     }
 
     pub(crate) fn active_presentation_client_window(&self) -> Option<Window> {
@@ -2673,8 +2683,7 @@ impl Manifold {
     }
 
     fn surface_can_receive_focus(&self, surface: &WlSurface) -> bool {
-        self.session_for_toplevel_surface(surface) == Some(self.sessions.active())
-            && self.pane_for_toplevel_surface(surface).is_some()
+        self.pane_for_toplevel_surface(surface).is_some()
     }
 
     pub(crate) fn window_pane_id(&self, window: &Window) -> Option<u64> {
@@ -2687,10 +2696,32 @@ impl Manifold {
         toplevel_app_id(&surface)
     }
 
+    pub fn presentation_window_summaries(&self) -> Vec<PresentationWindowSummary> {
+        let mut windows = self
+            .space
+            .elements()
+            .filter_map(|window| {
+                let surface = Self::window_toplevel_surface(window)?;
+                let pane = self.pane_for_toplevel_surface(&surface)?;
+                let session = self
+                    .session_for_toplevel_surface(&surface)
+                    .unwrap_or_else(|| self.default_surface_session())
+                    .raw();
+                Some(PresentationWindowSummary {
+                    pane,
+                    session,
+                    app_id: toplevel_app_id(&surface).unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        windows.sort_by_key(|window| window.pane);
+        windows
+    }
+
     pub(crate) fn presentation_window_for_pane(&self, pane: u64) -> Option<Window> {
         let surface = self.surface_for_pane(pane)?;
-        // The external presentation client owns pane visibility. The backend
-        // only verifies that the pane belongs to the active session.
+        // Presentation clients own visibility across the complete window
+        // inventory. Session membership is metadata, not a mapping boundary.
         let window = self.window_for_any_toplevel_surface(&surface)?;
         self.window_available_to_presentation_client(&window)
             .then_some(window)
@@ -2784,7 +2815,7 @@ impl Manifold {
     }
 
     pub fn focus_pane_from_presentation_client(&mut self, pane: u64) -> bool {
-        let Some(surface) = self.active_session_content_surface_for_pane(pane) else {
+        let Some(surface) = self.content_surface_for_pane(pane) else {
             return false;
         };
         let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
@@ -2810,7 +2841,7 @@ impl Manifold {
         width: i32,
         height: i32,
     ) -> bool {
-        let Some(surface) = self.active_session_content_surface_for_pane(pane) else {
+        let Some(surface) = self.content_surface_for_pane(pane) else {
             return false;
         };
         let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
@@ -2915,12 +2946,7 @@ impl Manifold {
             self.focus_toplevel_surface(None);
             return;
         };
-        if self
-            .session_for_toplevel_surface(&surface)
-            .unwrap_or(SurfaceSessionId(1))
-            == self.sessions.active()
-            && self.pane_for_toplevel_surface(&surface).is_some()
-            && let Some(pane) = self.pane_for_toplevel_surface(&surface)
+        if let Some(pane) = self.pane_for_toplevel_surface(&surface)
             && self.focus_pane(pane)
         {
             return;
@@ -4824,7 +4850,7 @@ impl Manifold {
         {
             self.focus.set_pointer_hover(None);
         }
-        let window_count = self.active_surface_session_window_count();
+        let window_count = self.presentation_window_count();
         let active_surface_is_live = self.focus.active_toplevel().is_some_and(|surface| {
             self.surface_is_live_focus_target(surface, &live_toplevel_surfaces)
         });
@@ -4833,11 +4859,7 @@ impl Manifold {
             self.reset_transient_input_state();
             if let Some(next_focus) = live_toplevel_surfaces
                 .iter()
-                .find(|surface| {
-                    self.session_for_toplevel_surface(surface)
-                        .unwrap_or(SurfaceSessionId(1))
-                        == self.sessions.active()
-                })
+                .find(|surface| self.pane_for_toplevel_surface(surface).is_some())
                 .cloned()
             {
                 self.focus_toplevel_surface(Some(next_focus));
@@ -4860,11 +4882,7 @@ impl Manifold {
                 self.reset_transient_input_state();
                 if let Some(next_focus) = live_toplevel_surfaces
                     .iter()
-                    .find(|surface| {
-                        self.session_for_toplevel_surface(surface)
-                            .unwrap_or(SurfaceSessionId(1))
-                            == self.sessions.active()
-                    })
+                    .find(|surface| self.pane_for_toplevel_surface(surface).is_some())
                     .cloned()
                 {
                     self.focus_toplevel_surface(Some(next_focus));
@@ -4894,10 +4912,7 @@ impl Manifold {
         live_toplevel_surfaces: &[WlSurface],
     ) -> bool {
         live_toplevel_surfaces.iter().any(|live| live == surface)
-            && self
-                .session_for_toplevel_surface(surface)
-                .unwrap_or(SurfaceSessionId(1))
-                == self.sessions.active()
+            && self.pane_for_toplevel_surface(surface).is_some()
     }
 }
 
@@ -5470,8 +5485,12 @@ pub struct PresentationFastPath {
     pub generation: u64,
     pub input: manifold_ipc::CriticalConsumer,
     pub frames: manifold_ipc::CriticalProducer,
+    pub catalog: manifold_ipc::CriticalProducer,
     pub actor_messages: manifold_ipc::ActorMessageConsumer,
     pub frame_notifications: manifold_ipc::EventNotifier,
+    pub catalog_notifications: manifold_ipc::EventNotifier,
+    pub catalog_revision: u64,
+    pub last_catalog_payload: Vec<u8>,
     pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,
     pub resource_app_ids: HashMap<u64, String>,

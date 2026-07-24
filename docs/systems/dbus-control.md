@@ -39,9 +39,12 @@ not interpret positional token indexes.
 
 ## Presentation Bootstrap
 
-DBus may discover or start the session server and exchange descriptors for the
-local presentation protocol. Viewport focus, placement, membership, layout, and
-switcher visibility are not daemon DBus operations.
+DBus may discover or start the session server, exchange descriptors for the
+local presentation protocol, and carry asynchronous control commands. The
+available window and session catalog is published through the server-to-client
+shared-memory state lane; it is not polled over DBus. Viewport focus, placement,
+selected membership, layout, and switcher visibility are not daemon DBus
+operations.
 
 ## Session Bus Services
 

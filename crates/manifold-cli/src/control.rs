@@ -22,7 +22,7 @@ use crate::{
 
 pub const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 pub const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 9;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 11;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -40,6 +40,19 @@ type DbusDmabufFrame = (
     zbus::zvariant::OwnedFd,
 );
 type DbusSurfaceSession = (u64, String, bool, u64);
+type DbusPresentationWindow = (u64, u64, String);
+type DbusFastPath = (
+    u64,
+    u64,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
+);
 
 #[proxy(
     interface = "org.manifold.Session.Control",
@@ -48,17 +61,7 @@ type DbusSurfaceSession = (u64, String, bool, u64);
 trait ManifoldControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
     fn latest_dmabuf_frame(&self) -> zbus::Result<DbusDmabufFrame>;
-    fn open_presentation_fast_path(
-        &self,
-    ) -> zbus::Result<(
-        u64,
-        zbus::zvariant::OwnedFd,
-        zbus::zvariant::OwnedFd,
-        zbus::zvariant::OwnedFd,
-        zbus::zvariant::OwnedFd,
-        zbus::zvariant::OwnedFd,
-        zbus::zvariant::OwnedFd,
-    )>;
+    fn open_presentation_fast_path(&self) -> zbus::Result<DbusFastPath>;
     fn dmabuf_resource(&self, resource_id: u64) -> zbus::Result<DbusDmabufFrame>;
 }
 
@@ -68,6 +71,7 @@ trait ManifoldControl {
 )]
 trait ManifoldSession {
     fn list_surface_sessions(&self) -> zbus::Result<Vec<DbusSurfaceSession>>;
+    fn list_presentation_windows(&self) -> zbus::Result<Vec<DbusPresentationWindow>>;
     fn activate_surface_session(&self, id: u64) -> zbus::Result<bool>;
     fn create_surface_session(&self, name: String) -> zbus::Result<u64>;
     fn rename_surface_session(&self, id: u64, name: String) -> zbus::Result<bool>;
@@ -80,6 +84,13 @@ pub struct SurfaceSessionSummary {
     pub name: String,
     pub active: bool,
     pub windows: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentationWindowSummary {
+    pub pane: u64,
+    pub session: u64,
+    pub app_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -126,10 +137,13 @@ pub struct Handshake {
 #[derive(Debug)]
 pub struct PresentationFastPath {
     pub generation: u64,
+    pub active_session: u64,
     pub input_fd: OwnedFd,
     pub input_notify_fd: OwnedFd,
     pub frame_fd: OwnedFd,
     pub frame_notify_fd: OwnedFd,
+    pub catalog_fd: OwnedFd,
+    pub catalog_notify_fd: OwnedFd,
     pub actor_message_fd: OwnedFd,
     pub actor_message_notify_fd: OwnedFd,
 }
@@ -251,6 +265,23 @@ pub fn list_surface_sessions(target: &ControlTarget) -> Result<Vec<SurfaceSessio
         })
 }
 
+pub fn list_presentation_windows(target: &ControlTarget) -> Result<Vec<PresentationWindowSummary>> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .list_presentation_windows()
+        .context("list Manifold presentation windows")
+        .map(|windows| {
+            windows
+                .into_iter()
+                .map(|(pane, session, app_id)| PresentationWindowSummary {
+                    pane,
+                    session,
+                    app_id,
+                })
+                .collect()
+        })
+}
+
 pub fn activate_surface_session(target: &ControlTarget, id: u64) -> Result<bool> {
     let connection = connection(target)?;
     session_proxy(&connection, target)?
@@ -295,10 +326,13 @@ pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<Presentatio
     let connection = connection(target)?;
     let (
         generation,
+        active_session,
         input_fd,
         input_notify_fd,
         frame_fd,
         frame_notify_fd,
+        catalog_fd,
+        catalog_notify_fd,
         actor_message_fd,
         actor_message_notify_fd,
     ) = presentation_proxy(&connection, target)?
@@ -306,10 +340,13 @@ pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<Presentatio
         .context("open local presentation fast path")?;
     Ok(PresentationFastPath {
         generation,
+        active_session,
         input_fd: input_fd.into(),
         input_notify_fd: input_notify_fd.into(),
         frame_fd: frame_fd.into(),
         frame_notify_fd: frame_notify_fd.into(),
+        catalog_fd: catalog_fd.into(),
+        catalog_notify_fd: catalog_notify_fd.into(),
         actor_message_fd: actor_message_fd.into(),
         actor_message_notify_fd: actor_message_notify_fd.into(),
     })

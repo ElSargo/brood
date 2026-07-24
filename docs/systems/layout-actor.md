@@ -95,6 +95,11 @@ is the recorded lease holder.
 The host sends `layout-state` after lease grant, pane inventory, viewport size,
 application identity, or focus changes. Delivery is queued and bounded like any
 other actor message; the client remains responsive while an actor processes it.
+Each snapshot includes the selected session, the lease's available managed
+windows with their session and application identities, and `visible_panes` as
+the client's default session-filtered subset. The available set defines layout
+authority; `visible_panes` is a convenience policy input, not a validation
+boundary.
 
 Other actors and the key lane may address ordinary commands such as
 `layout-action` to the layout actor. A result reaches the host only as a
@@ -141,10 +146,13 @@ A resolved layout is a flat, client-validated presentation description. It may
 contain pane items, placeholders, handles, chrome, and overlays. Each item has
 a stable item ID, normalized transform, z value, and input behavior.
 
-Pane items must reference a real pane in the current client inventory and may
-appear at most once. An actor may omit a pane to keep it out of this viewport.
-Non-pane items let the client expose interactive targets without learning the
-actor's internal model.
+Pane items must reference an available pane identity in the current client
+catalog and may appear at most once. Frame readiness is not part of layout
+validation: an available managed pane without a mapped frame is rendered as a
+placeholder in its specified rectangle and replaced in place when its frame
+arrives. An actor may omit a pane to keep it out of this viewport. Non-pane
+items let the client expose interactive targets without learning the actor's
+internal model.
 
 The portable `manifold-layout` crate owns validation, normalized projection,
 recursive lease-fragment composition, and hit testing. It does not depend on
