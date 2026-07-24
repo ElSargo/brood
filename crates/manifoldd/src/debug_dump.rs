@@ -20,13 +20,11 @@ use smithay::{
     },
 };
 
-use crate::{control, presentation, state::Manifold};
-use manifold_layout::LayoutItemKind;
+use crate::{control, frame_export, state::Manifold};
 
 #[derive(Clone, Copy)]
 pub struct DumpOptions {
     include_state: bool,
-    include_composed: bool,
     include_surfaces: bool,
 }
 
@@ -34,7 +32,6 @@ impl DumpOptions {
     pub fn parse(selector: Option<&str>) -> Result<Self> {
         let mut options = Self {
             include_state: true,
-            include_composed: true,
             include_surfaces: true,
         };
 
@@ -47,7 +44,6 @@ impl DumpOptions {
 
         options = Self {
             include_state: false,
-            include_composed: false,
             include_surfaces: false,
         };
         for token in selector
@@ -57,7 +53,6 @@ impl DumpOptions {
         {
             match token {
                 "state" => options.include_state = true,
-                "composed" | "final" => options.include_composed = true,
                 "surfaces" | "buffers" => options.include_surfaces = true,
                 other => bail!("unknown debug dump selector {other:?}"),
             }
@@ -74,7 +69,6 @@ pub fn dump_bundle(state: &mut Manifold, dir: &Path, options: DumpOptions) -> Re
         "selectors".to_string(),
         json!({
             "state": options.include_state,
-            "composed": options.include_composed,
             "surfaces": options.include_surfaces,
         }),
     );
@@ -90,16 +84,6 @@ pub fn dump_bundle(state: &mut Manifold, dir: &Path, options: DumpOptions) -> Re
         manifest.insert(
             "state".to_string(),
             json!({ "path": state_path.file_name().and_then(|s| s.to_str()).unwrap_or("state.json") }),
-        );
-    }
-
-    if options.include_composed {
-        let composed_path = dir.join("composed.png");
-        presentation::dump_composed_frame(state, &composed_path)
-            .map_err(|failure| anyhow::anyhow!("presentation capture failed: {failure:?}"))?;
-        manifest.insert(
-            "composed".to_string(),
-            json!({ "path": composed_path.file_name().and_then(|s| s.to_str()).unwrap_or("composed.png") }),
         );
     }
 
@@ -134,44 +118,16 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
                 .then(|| state.window_test_marker_id(window, index));
             let surface_id = Manifold::window_toplevel_surface(window).map_or_else(
                 || "none".to_string(),
-                |surface| {
-                    crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()))
-                },
+                |surface| frame_export::sanitize_status_value(&format!("{:?}", surface.id())),
             );
-            let rect = state
-                .window_layout_rect(window)
-                .map(|rect| json!({ "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h }));
+            let size = window.geometry().size;
             json!({
                 "index": index,
                 "surface_id": surface_id,
                 "marker_id": marker_id,
-                "rect": rect,
+                "pane": state.window_pane_id(window),
+                "source_size": { "w": size.w, "h": size.h },
                 "focused": state.focused_window_index() == Some(index),
-            })
-        })
-        .collect::<Vec<_>>();
-    let resolved_items = state
-        .resolved_layout_items()
-        .iter()
-        .map(|item| {
-            let kind = match item.kind {
-                LayoutItemKind::Pane { pane } => json!({ "type": "pane", "pane": pane }),
-                LayoutItemKind::Placeholder => json!({ "type": "placeholder" }),
-                LayoutItemKind::Handle => json!({ "type": "handle" }),
-                LayoutItemKind::Chrome => json!({ "type": "chrome" }),
-                LayoutItemKind::Overlay => json!({ "type": "overlay" }),
-            };
-            let rect = state.resolved_layout_item_rect(*item);
-            json!({
-                "id": item.id.0,
-                "kind": kind,
-                "z": item.z,
-                "rect": { "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h },
-                "transform": {
-                    "offset": { "u": item.transform.offset.u, "v": item.transform.offset.v },
-                    "size": { "u": item.transform.size.u, "v": item.transform.size.v },
-                },
-                "active": state.resolved_layout_item_active(*item),
             })
         })
         .collect::<Vec<_>>();
@@ -179,14 +135,6 @@ fn filtered_state_dump(state: &mut Manifold) -> Result<Value> {
         "status": status,
         "test_surface_markers": state.test_surface_markers,
         "windows": windows,
-        "layout": {
-            "source": state.resolved_layout_source_name(),
-            "active_rect": state.active_layout_rect().map(|rect| json!({
-                "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h
-            })),
-            "items": resolved_items,
-            "managed_fullscreen": state.managed_fullscreen(),
-        }
     }))
 }
 
@@ -199,7 +147,7 @@ fn dump_surfaces(state: &mut Manifold, dir: &Path) -> Result<Vec<Value>> {
         let marker_id = state
             .test_surface_markers
             .then(|| state.window_test_marker_id(window, index));
-        let surface_id = crate::presentation::sanitize_status_value(&format!("{:?}", surface.id()));
+        let surface_id = frame_export::sanitize_status_value(&format!("{:?}", surface.id()));
         let buffer = with_states(&surface, |states| {
             let mut guard = states.cached_state.get::<SurfaceAttributes>();
             match guard.current().buffer.as_ref() {

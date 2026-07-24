@@ -15,14 +15,8 @@ its generation notification into the ordinary worker pollable used by
 the wrapper drops the logical subscription, notification, and any projected
 pollables with the actor generation.
 
-Run the nested proof from the repository root:
-
-```sh
-nix develop --command tools/test-component-workspace-watch-plugin-nested.sh
-```
-
-The controller performs real workspace mutations, checks the human-readable
-artifact and daemon resource counts, then replaces the Component generation
+The acceptance workload performs real workspace mutations, checks the
+human-readable artifact and server resource counts, then replaces the Component generation
 and observes the old generation's watch counts return to zero. Its mutations
 include two Unix names whose different invalid UTF-8 bytes both lossy-render as
 the same replacement character; distinct `\xFF` and `\xFE` rows make preserved

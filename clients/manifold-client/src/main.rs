@@ -21,7 +21,7 @@ use manifold_cli::{
         ControlTarget, DmabufFrame, ServerLaunch, activate_surface_session, close_surface_session,
         connect_or_spawn, create_surface_session, dmabuf_resource, list_surface_sessions,
         open_presentation_fast_path, rename_surface_session, request_dbus_command,
-        resolve_control_target, session_marker_value,
+        resolve_control_target,
     },
 };
 use manifold_dmabuf::{SinglePlaneDmabuf, import_single_plane};
@@ -37,7 +37,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
     platform::scancode::PhysicalKeyExtScancode,
-    window::{Window, WindowId},
+    window::{UserAttentionType, Window, WindowId},
 };
 
 mod actor_runtime;
@@ -130,6 +130,7 @@ fn main() -> Result<()> {
             44,
             manifold_wasm::ABI_KEY_PRESSED,
             manifold_wasm::ABI_MOD_CTRL,
+            false,
             &snapshot,
         )?;
         if evaluation.decision != GlobalKeyDecision::Consume
@@ -147,30 +148,42 @@ fn main() -> Result<()> {
             56,
             manifold_wasm::ABI_KEY_PRESSED,
             manifold_wasm::ABI_MOD_CTRL,
+            false,
             &snapshot,
         )?;
         let _mode_toggle_release = key_policy.evaluate(
             56,
             manifold_wasm::ABI_KEY_RELEASED,
             manifold_wasm::ABI_MOD_CTRL,
+            false,
             &snapshot,
         )?;
         let spawn = key_policy.evaluate(
             32,
             manifold_wasm::ABI_KEY_PRESSED,
             manifold_wasm::ABI_MOD_CTRL,
+            false,
             &snapshot,
         )?;
         let toggle_switcher = key_policy.evaluate(
             58,
             manifold_wasm::ABI_KEY_PRESSED,
             manifold_wasm::ABI_MOD_CTRL | manifold_wasm::ABI_MOD_ALT,
+            false,
+            &snapshot,
+        )?;
+        let repeated_toggle_switcher = key_policy.evaluate(
+            58,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL | manifold_wasm::ABI_MOD_ALT,
+            true,
             &snapshot,
         )?;
         let focus_existing = key_policy.evaluate(
             10,
             manifold_wasm::ABI_KEY_PRESSED,
             manifold_wasm::ABI_MOD_CTRL,
+            false,
             &snapshot,
         )?;
         if mode_toggle.decision != GlobalKeyDecision::Consume
@@ -182,10 +195,11 @@ fn main() -> Result<()> {
                         if argv.first().is_some_and(|program| program == "foot")
                 )
             })
-            || !toggle_switcher
-                .host_messages
-                .iter()
-                .any(|message| matches!(message, HostMessage::TogglePluginPane))
+            || !toggle_switcher.actor_messages.iter().any(|message| {
+                message.actor == "session-switcher"
+                    && message.payload == br#"{"type":"sidebar-action","action":"toggle"}"#
+            })
+            || !repeated_toggle_switcher.actor_messages.is_empty()
             || !focus_existing
                 .host_messages
                 .iter()
@@ -225,16 +239,15 @@ fn main() -> Result<()> {
             "connected to Manifold server pid={} protocol={}",
             handshake.server_pid, handshake.protocol_version
         );
-        let session = request_dbus_command(
-            &target,
-            &["surface-session".to_string(), "new".to_string()],
-            false,
-        )?;
-        eprintln!("created presentation session {}", session.trim());
-        let session_id = session_marker_value(&session, "active")
-            .context("created presentation session response missing active marker")?
-            .parse::<u64>()
-            .context("parse created presentation session ID")?;
+        let sessions = list_surface_sessions(&target)?;
+        let session_id = if let Some(active) = sessions.iter().find(|session| session.active) {
+            eprintln!("attached presentation to active session id={}", active.id);
+            active.id
+        } else {
+            let created = create_surface_session(&target, String::new())?;
+            eprintln!("created presentation session id={created}");
+            created
+        };
 
         let fast_path_enabled = true;
         let (input_sender, actor_message_sender) = if fast_path_enabled {
@@ -356,6 +369,8 @@ enum ClientEvent {
         height: u32,
         windows: Vec<SceneWindowUpdate>,
     },
+    FocusPresentation,
+    ClosePresentation,
     TransportError(String),
     PluginGraphicsChanged {
         pane: u64,
@@ -492,6 +507,12 @@ fn spawn_frame_updates(
                             {
                                 return;
                             }
+                        }
+                        manifold_ipc::FRAME_FOCUS_PRESENTATION => {
+                            let _send_result = proxy.send_event(ClientEvent::FocusPresentation);
+                        }
+                        manifold_ipc::FRAME_CLOSE_PRESENTATION => {
+                            let _send_result = proxy.send_event(ClientEvent::ClosePresentation);
                         }
                         _ => {}
                     }
@@ -864,6 +885,16 @@ impl Application {
                 windows,
             } => (sequence, width, height, windows),
             ClientEvent::TransportError(message) => return Err(anyhow!(message)),
+            ClientEvent::FocusPresentation => {
+                return Err(anyhow!(
+                    "presentation focus event reached scene transport path"
+                ));
+            }
+            ClientEvent::ClosePresentation => {
+                return Err(anyhow!(
+                    "presentation close event reached scene transport path"
+                ));
+            }
             ClientEvent::PluginGraphicsChanged { .. } => {
                 return Err(anyhow!(
                     "plugin graphics event reached scene transport path"
@@ -1414,9 +1445,10 @@ impl Application {
             .take()
             .context("lost renderer during recovery")?;
         let replay = old
-            .plugin_pane
-            .as_ref()
-            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence));
+            .plugin_panes
+            .values()
+            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
+            .collect::<Vec<_>>();
         let window = Arc::clone(&old.window);
         drop(old);
         let generation = self.allocate_renderer_generation()?;
@@ -1433,7 +1465,7 @@ impl Application {
             .context("plugin graphics bridge is unavailable")?;
         let mut replacement =
             Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
-        if let Some((pane, sequence)) = replay {
+        for (pane, sequence) in replay {
             replacement.refresh_plugin_graphics(pane, sequence)?;
         }
         replacement.window.request_redraw();
@@ -1535,6 +1567,15 @@ impl ApplicationHandler<ClientEvent> for Application {
             return;
         }
         match event {
+            ClientEvent::FocusPresentation => {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    renderer
+                        .window
+                        .request_user_attention(Some(UserAttentionType::Critical));
+                    renderer.window.focus_window();
+                }
+            }
+            ClientEvent::ClosePresentation => event_loop.exit(),
             ClientEvent::PluginGraphicsChanged { pane, sequence } => {
                 let mut failure = None;
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -1889,6 +1930,13 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                if let Some(sender) = self.input_sender.as_mut() {
+                    let _sent = send_input(
+                        sender,
+                        manifold_ipc::INPUT_PRESENTATION_FOCUS,
+                        [u64::from(focused), 0, 0, 0, 0],
+                    );
+                }
                 if !focused {
                     if let Some(sender) = self.input_sender.as_mut() {
                         send_keyboard_reset(sender);
@@ -1932,6 +1980,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 ElementState::Released => manifold_wasm::ABI_KEY_RELEASED,
                             },
                             key_policy_modifier_bits(self.modifiers),
+                            event.repeat,
                             &snapshot,
                         ) {
                             Ok(evaluation) => Some(evaluation),
@@ -1954,11 +2003,16 @@ impl ApplicationHandler<ClientEvent> for Application {
                             | GlobalKeyDecision::ForwardWithModifiers
                     );
                     for message in evaluation.actor_messages {
-                        if let Some(runtime) = self.wasm_runtime.as_ref()
-                            && let Err(error) =
-                                runtime.send_actor_message(&message.actor, message.payload)
-                        {
-                            eprintln!("dropped key-policy actor message: {error:#}");
+                        if let Some(runtime) = self.wasm_runtime.as_ref() {
+                            match runtime.send_actor_message(&message.actor, message.payload) {
+                                Ok(()) => eprintln!(
+                                    "sent key-policy actor message actor={}",
+                                    message.actor
+                                ),
+                                Err(error) => {
+                                    eprintln!("dropped key-policy actor message: {error:#}");
+                                }
+                            }
                         }
                     }
                     for message in evaluation.host_messages {
@@ -2103,8 +2157,7 @@ struct Renderer {
     current_windows: Vec<SceneWindow>,
     current_sequence: Option<u64>,
     plugin_graphics: PluginGraphicsBridge,
-    plugin_pane: Option<PluginPaneTexture>,
-    plugin_pane_visible: bool,
+    plugin_panes: BTreeMap<u64, PluginPaneTexture>,
     focused_pane: Option<FocusedPane>,
     accepted_layout: ResolvedLayout,
     layout_source: LayoutSource,
@@ -2167,7 +2220,8 @@ impl PointerGrab {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FocusChange {
-    plugin: Option<(u64, bool)>,
+    plugin_blur: Option<u64>,
+    plugin_focus: Option<u64>,
     managed_window: Option<u64>,
     reset_keyboard: bool,
 }
@@ -2319,18 +2373,25 @@ fn dispatch_focus_change(
     {
         send_keyboard_reset(sender);
     }
-    if let Some((pane, focused)) = change.plugin {
+    if let Some(pane) = change.plugin_blur {
         send_presentation_event(
             runtime,
             PresentationEvent::PaneFocused {
                 pane,
-                focused: focused && window_focused,
+                focused: false,
             },
         )?;
-        eprintln!(
-            "focused {} plugin pane={pane}",
-            if focused { "local" } else { "away from" }
-        );
+        eprintln!("focused away from plugin pane={pane}");
+    }
+    if let Some(pane) = change.plugin_focus {
+        send_presentation_event(
+            runtime,
+            PresentationEvent::PaneFocused {
+                pane,
+                focused: window_focused,
+            },
+        )?;
+        eprintln!("focused local plugin pane={pane}");
     }
     if let Some(window_id) = change.managed_window {
         if let Some(sender) = input_sender.as_mut() {
@@ -2393,7 +2454,6 @@ fn apply_key_policy_host_message(
                 None
             }
         }
-        HostMessage::TogglePluginPane => renderer.toggle_plugin_pane(),
         HostMessage::SwitchActiveSessionNext => {
             queue_backend_command(
                 backend_commands,
@@ -2978,8 +3038,7 @@ impl Renderer {
             current_windows: Vec::new(),
             current_sequence: None,
             plugin_graphics,
-            plugin_pane: None,
-            plugin_pane_visible: true,
+            plugin_panes: BTreeMap::new(),
             focused_pane: None,
             accepted_layout: ResolvedLayout::empty(),
             layout_source: LayoutSource::NativeFallback,
@@ -3067,10 +3126,7 @@ impl Renderer {
                 } else {
                     previous_focus
                 },
-                self.plugin_pane
-                    .as_ref()
-                    .filter(|_| self.plugin_pane_visible)
-                    .map(|plugin| plugin.scene.pane),
+                self.plugin_panes.keys().copied(),
                 &managed_panes,
                 backend_focus,
             );
@@ -3089,7 +3145,8 @@ impl Renderer {
                         return None;
                     };
                     (backend_focus != Some(local_focus)).then_some(FocusChange {
-                        plugin: None,
+                        plugin_blur: None,
+                        plugin_focus: None,
                         managed_window: Some(local_focus),
                         reset_keyboard: false,
                     })
@@ -3112,31 +3169,6 @@ impl Renderer {
             Some(FocusedPane::Managed(window_id)) => Some(window_id),
             _ => None,
         }
-    }
-
-    /// One chord owns the complete switcher lifecycle: show and focus a hidden
-    /// pane, focus a visible pane, then hide it when invoked while focused.
-    fn toggle_plugin_pane(&mut self) -> Option<FocusChange> {
-        let plugin = self.plugin_pane.as_ref().map(|pane| pane.scene.pane)?;
-        if !self.plugin_pane_visible {
-            self.plugin_pane_visible = true;
-            self.layout_state_dirty = true;
-            let _layout_focus = self.reconcile_layout();
-            eprintln!("showed presentation session switcher pane={plugin}");
-            return self.set_focus(FocusedPane::Plugin(plugin));
-        }
-        if self.focused_pane != Some(FocusedPane::Plugin(plugin)) {
-            eprintln!("focused visible presentation session switcher pane={plugin}");
-            return self.set_focus(FocusedPane::Plugin(plugin));
-        }
-        if self.current_windows.is_empty() {
-            eprintln!("kept session switcher visible because no managed window is available");
-            return None;
-        }
-        self.plugin_pane_visible = false;
-        self.layout_state_dirty = true;
-        eprintln!("hid presentation session switcher pane={plugin}");
-        self.reconcile_layout()
     }
 
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
@@ -3230,11 +3262,7 @@ impl Renderer {
         y: f64,
     ) -> Option<PanePointerTarget> {
         let (x, y) = self.scene_position_for_window_point(x, y);
-        if let Some(plugin) = self
-            .plugin_pane
-            .as_ref()
-            .filter(|plugin| plugin.scene.pane == pane)
-        {
+        if let Some(plugin) = self.plugin_panes.get(&pane) {
             let (composition_width, composition_height) = self.composition_extent();
             let (x, y) = project_point_between_rects(
                 x,
@@ -3337,7 +3365,7 @@ impl Renderer {
         let previous_focus = self.focused_pane;
         let extent = self.layout_extent();
 
-        if let Some(plugin) = self.plugin_pane.as_mut() {
+        for plugin in self.plugin_panes.values_mut() {
             plugin.rect = [0, 0, 0, 0];
         }
         for window in &mut self.current_windows {
@@ -3349,11 +3377,7 @@ impl Renderer {
             };
             let rect = item.pixel_rect(extent);
             let rect = [rect.x, rect.y, rect.w, rect.h];
-            if let Some(plugin) = self
-                .plugin_pane
-                .as_mut()
-                .filter(|plugin| plugin.scene.pane == pane)
-            {
+            if let Some(plugin) = self.plugin_panes.get_mut(&pane) {
                 plugin.rect = rect;
             } else if let Some(window) = self
                 .current_windows
@@ -3441,10 +3465,9 @@ impl Renderer {
     }
 
     fn pane_inventory(&self) -> Vec<u64> {
-        self.plugin_pane
-            .iter()
-            .filter(|_| self.plugin_pane_visible)
-            .map(|plugin| plugin.scene.pane)
+        self.plugin_panes
+            .keys()
+            .copied()
             .chain(self.current_windows.iter().map(|window| window.window_id))
             .collect()
     }
@@ -3457,11 +3480,7 @@ impl Renderer {
     }
 
     fn focus_target_for_pane(&self, pane: u64) -> Option<FocusedPane> {
-        if self
-            .plugin_pane
-            .as_ref()
-            .is_some_and(|plugin| self.plugin_pane_visible && plugin.scene.pane == pane)
-        {
+        if self.plugin_panes.contains_key(&pane) {
             return Some(FocusedPane::Plugin(pane));
         }
         self.current_windows
@@ -3487,9 +3506,8 @@ impl Renderer {
         if snapshot.sequence < expected_sequence {
             return Ok(None);
         }
-        if self.plugin_pane.as_ref().is_some_and(|current| {
-            current.scene.pane == snapshot.pane
-                && current.scene.sequence >= snapshot.sequence
+        if self.plugin_panes.get(&pane).is_some_and(|current| {
+            current.scene.sequence >= snapshot.sequence
                 && current.scene.width == self.config.width
                 && current.scene.height == self.config.height
         }) {
@@ -3501,7 +3519,7 @@ impl Renderer {
             &self.queue,
             &snapshot,
             (self.config.width.max(1), self.config.height.max(1), scale),
-            self.plugin_pane.as_ref().map(|current| &current.scene),
+            self.plugin_panes.get(&pane).map(|current| &current.scene),
         )?;
         if snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) {
             eprintln!(
@@ -3514,16 +3532,19 @@ impl Renderer {
                 scale,
             );
         }
-        let first_plugin_scene = self.plugin_pane.is_none();
-        self.plugin_pane = Some(PluginPaneTexture {
-            scene,
-            rect: [
-                0,
-                0,
-                i32::try_from(self.config.width).unwrap_or(i32::MAX),
-                i32::try_from(self.config.height).unwrap_or(i32::MAX),
-            ],
-        });
+        let first_plugin_scene = self.plugin_panes.is_empty();
+        self.plugin_panes.insert(
+            pane,
+            PluginPaneTexture {
+                scene,
+                rect: [
+                    0,
+                    0,
+                    i32::try_from(self.config.width).unwrap_or(i32::MAX),
+                    i32::try_from(self.config.height).unwrap_or(i32::MAX),
+                ],
+            },
+        );
         let focus_change = if first_plugin_scene {
             self.set_focus(FocusedPane::Plugin(pane))
         } else {
@@ -3542,15 +3563,20 @@ impl Renderer {
         self.config.height = height;
         self.reconfigure();
         self.layout_state_dirty = true;
-        let focus_change = if let Some((pane, sequence)) = self
-            .plugin_pane
-            .as_ref()
+        let plugin_scenes = self
+            .plugin_panes
+            .values()
             .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
-        {
-            self.refresh_plugin_graphics(pane, sequence)?
-        } else {
-            self.reconcile_layout()
-        };
+            .collect::<Vec<_>>();
+        let mut focus_change = None;
+        for (pane, sequence) in plugin_scenes {
+            focus_change = self
+                .refresh_plugin_graphics(pane, sequence)?
+                .or(focus_change);
+        }
+        if self.plugin_panes.is_empty() {
+            focus_change = self.reconcile_layout();
+        }
         self.window.request_redraw();
         Ok(focus_change)
     }
@@ -3583,13 +3609,14 @@ impl Renderer {
                 label: Some("manifold-client frame encoder"),
             });
 
-        if let Some(plugin) = self.plugin_pane.as_mut()
-            && let Err(error) = self
+        for plugin in self.plugin_panes.values_mut() {
+            if let Err(error) = self
                 .plugin_canvas
                 .encode_if_dirty(&mut encoder, &mut plugin.scene)
-        {
-            eprintln!("failed to encode plugin GPU scene: {error:#}");
-            return RenderOutcome::Failed("failed to encode plugin GPU scene");
+            {
+                eprintln!("failed to encode plugin GPU scene: {error:#}");
+                return RenderOutcome::Failed("failed to encode plugin GPU scene");
+            }
         }
 
         {
@@ -3617,11 +3644,7 @@ impl Renderer {
             render_pass.set_pipeline(&self.frame_pipeline);
             let extent = self.composition_extent();
             for pane in self.layout_panes_in_render_order() {
-                if let Some(plugin) = self
-                    .plugin_pane
-                    .as_ref()
-                    .filter(|plugin| plugin.scene.pane == pane)
-                {
+                if let Some(plugin) = self.plugin_panes.get(&pane) {
                     let Some(rect) = clip_rect_to_extent(plugin.rect, extent) else {
                         continue;
                     };
@@ -3745,12 +3768,13 @@ fn clip_rect_to_extent(rect: [i32; 4], extent: (u32, u32)) -> Option<[i32; 4]> {
 
 fn scene_focus_target(
     current: Option<FocusedPane>,
-    plugin_pane: Option<u64>,
+    plugin_panes: impl IntoIterator<Item = u64>,
     managed_panes: &[u64],
     backend_focus: Option<u64>,
 ) -> Option<FocusedPane> {
+    let plugin_panes = plugin_panes.into_iter().collect::<Vec<_>>();
     match current {
-        Some(FocusedPane::Plugin(pane)) if plugin_pane == Some(pane) => {
+        Some(FocusedPane::Plugin(pane)) if plugin_panes.contains(&pane) => {
             Some(FocusedPane::Plugin(pane))
         }
         Some(FocusedPane::Managed(pane)) if managed_panes.contains(&pane) => {
@@ -3760,7 +3784,7 @@ fn scene_focus_target(
             .filter(|pane| managed_panes.contains(pane))
             .or_else(|| managed_panes.first().copied())
             .map(FocusedPane::Managed)
-            .or_else(|| plugin_pane.map(FocusedPane::Plugin)),
+            .or_else(|| plugin_panes.first().copied().map(FocusedPane::Plugin)),
     }
 }
 
@@ -3771,22 +3795,28 @@ fn focus_change_between(
     if matches!((previous, target), (None, None)) || previous == target {
         return None;
     }
-    let plugin = match (previous, target) {
-        (Some(FocusedPane::Plugin(pane)), Some(FocusedPane::Managed(_)) | None) => {
-            Some((pane, false))
+    let plugin_blur = match previous {
+        Some(FocusedPane::Plugin(pane)) if target != Some(FocusedPane::Plugin(pane)) => Some(pane),
+        Some(FocusedPane::Plugin(_) | FocusedPane::Managed(_)) | None => None,
+    };
+    let plugin_focus = match target {
+        Some(FocusedPane::Plugin(pane)) if previous != Some(FocusedPane::Plugin(pane)) => {
+            Some(pane)
         }
-        (_, Some(FocusedPane::Plugin(pane))) => Some((pane, true)),
-        _ => None,
+        Some(FocusedPane::Plugin(_) | FocusedPane::Managed(_)) | None => None,
     };
     let managed_window = match target {
         Some(FocusedPane::Managed(window_id)) => Some(window_id),
         Some(FocusedPane::Plugin(_)) | None => None,
     };
-    (plugin.is_some() || managed_window.is_some()).then_some(FocusChange {
-        plugin,
-        managed_window,
-        reset_keyboard: true,
-    })
+    (plugin_blur.is_some() || plugin_focus.is_some() || managed_window.is_some()).then_some(
+        FocusChange {
+            plugin_blur,
+            plugin_focus,
+            managed_window,
+            reset_keyboard: true,
+        },
+    )
 }
 
 fn project_point_between_rects(x: f64, y: f64, from: [i32; 4], to: [i32; 4]) -> (f64, f64) {
@@ -3952,19 +3982,37 @@ mod tests {
 
     #[test]
     fn removed_focused_pane_selects_and_reports_a_live_fallback() {
-        let target = scene_focus_target(Some(FocusedPane::Managed(4)), Some(99), &[1, 2], None);
+        let target = scene_focus_target(Some(FocusedPane::Managed(4)), [99], &[1, 2], None);
         assert_eq!(target, Some(FocusedPane::Managed(1)));
         assert_eq!(
             focus_change_between(Some(FocusedPane::Managed(4)), target),
             Some(FocusChange {
-                plugin: None,
+                plugin_blur: None,
+                plugin_focus: None,
                 managed_window: Some(1),
                 reset_keyboard: true,
             })
         );
         assert_eq!(
-            scene_focus_target(Some(FocusedPane::Managed(4)), Some(99), &[1, 2], Some(2)),
+            scene_focus_target(Some(FocusedPane::Managed(4)), [99], &[1, 2], Some(2)),
             Some(FocusedPane::Managed(2))
+        );
+    }
+
+    #[test]
+    fn focus_between_recursive_plugin_panes_blurs_then_focuses() {
+        assert_eq!(
+            scene_focus_target(Some(FocusedPane::Plugin(98)), [98, 99], &[1], None),
+            Some(FocusedPane::Plugin(98))
+        );
+        assert_eq!(
+            focus_change_between(Some(FocusedPane::Plugin(98)), Some(FocusedPane::Plugin(99))),
+            Some(FocusChange {
+                plugin_blur: Some(98),
+                plugin_focus: Some(99),
+                managed_window: None,
+                reset_keyboard: true,
+            })
         );
     }
 
@@ -4041,7 +4089,8 @@ mod tests {
             None,
             Some(&mut lane),
             FocusChange {
-                plugin: None,
+                plugin_blur: None,
+                plugin_focus: None,
                 managed_window: Some(7),
                 reset_keyboard: true,
             },
@@ -4051,7 +4100,8 @@ mod tests {
             None,
             Some(&mut lane),
             FocusChange {
-                plugin: Some((99, true)),
+                plugin_blur: None,
+                plugin_focus: Some(99),
                 managed_window: None,
                 reset_keyboard: true,
             },
@@ -4061,7 +4111,8 @@ mod tests {
             None,
             Some(&mut lane),
             FocusChange {
-                plugin: None,
+                plugin_blur: None,
+                plugin_focus: None,
                 managed_window: Some(8),
                 reset_keyboard: false,
             },

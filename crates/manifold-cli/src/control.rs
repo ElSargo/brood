@@ -420,6 +420,27 @@ pub fn launch_client() -> Result<ExitStatus> {
         .with_context(|| format!("start presentation client {}", client.display()))
 }
 
+pub fn spawn_client(target: &ControlTarget) -> Result<Child> {
+    let current_executable = env::current_exe().context("resolve current executable")?;
+    let client = env::var_os("MANIFOLD_CLIENT_BIN").map_or_else(
+        || current_executable.with_file_name("manifold-client"),
+        PathBuf::from,
+    );
+    let mut command = Command::new(&client);
+    command
+        .arg("--dbus-destination")
+        .arg(&target.destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(address) = target.address.as_deref() {
+        command.arg("--dbus-address").arg(address);
+    }
+    command
+        .spawn()
+        .with_context(|| format!("spawn presentation client {}", client.display()))
+}
+
 pub fn connect_or_spawn(target: &ControlTarget, launch: &ServerLaunch) -> Result<Handshake> {
     if let Ok(handshake) = handshake(target) {
         return Ok(handshake);
@@ -472,7 +493,7 @@ fn spawn_server(target: &ControlTarget, launch: &ServerLaunch) -> Result<(PathBu
 
     let mut command = Command::new(&launch.executable);
     command
-        .arg("--offscreen-presentation")
+        .arg("--headless")
         .arg("--no-initial-surface-session")
         .arg("--dbus-destination")
         .arg(&target.destination)

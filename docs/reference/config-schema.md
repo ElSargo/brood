@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-24
 code-links:
   - crates/manifoldd/src/config.rs
   - crates/manifold-cli/src/realm_init.rs
@@ -16,8 +16,8 @@ Exact config schema behavior is defined by the deserializers in `crates/manifold
 Current top-level config families:
 
 - `init`
+- `client`
 - `session`
-- `layout`
 - `module`
 - `startup`
 
@@ -50,10 +50,9 @@ grants, policy providers, actions, pane types, and publications. Workers
 themselves are spawned dynamically inside actors rather than registered as
 top-level plugin components.
 
-Current startup realms:
-
-- `session`
-- `presentation`
+Presentation layout is actor-owned client state, not a top-level backend config
+family. The client root and key policy select presentation behavior; session
+modules and startup applications remain server-owned.
 
 Related:
 

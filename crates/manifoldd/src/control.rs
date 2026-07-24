@@ -30,13 +30,11 @@ use anyhow::{Context, Result, bail, ensure};
 pub use manifold_cli::control::{
     ControlTarget, request_dbus_command, resolve_control_target, session_marker_value,
 };
-use manifold_layout::LayoutAction;
 use smithay::{
     backend::{
         allocator::Buffer,
-        input::{Axis, AxisSource, ButtonState, KeyState},
+        input::{ButtonState, KeyState},
     },
-    input::pointer::AxisFrame,
     reexports::calloop::{
         EventLoop, Interest, Mode, PostAction,
         channel::{self, Event},
@@ -54,10 +52,9 @@ use crate::{
     command::{SurfaceCommand, WorkspaceCommand},
     config,
     debug_dump::{self, DumpOptions},
-    presentation, session_runner,
+    session_runner,
     state::{
-        AgentNotification, FocusDirection, HostedChildStatus, HostedChildToken,
-        MANIFOLD_STATUS_PUBLISHER, Manifold, PASSTHROUGH_STATUS_CHANNEL, PresentationStatus,
+        AgentNotification, FocusDirection, HostedChildStatus, HostedChildToken, Manifold,
         SurfaceSessionId, SurfaceSessionSummary,
     },
 };
@@ -242,10 +239,6 @@ enum DbusStateRequest {
         channel: String,
         response: BoolResponse,
     },
-    SetPassthroughMode {
-        enabled: bool,
-        response: BoolResponse,
-    },
     ListAgents {
         response: AgentListResponse,
     },
@@ -302,18 +295,6 @@ enum DbusStateRequest {
         options: DbusMetadata,
         sender_name: String,
         response: BoolResponse,
-    },
-    RequestPlacement {
-        window_id: String,
-        placement: DbusMetadata,
-        sender_name: String,
-        response: ControlResponse,
-    },
-    RequestPresentationMembership {
-        window_id: String,
-        membership: DbusMetadata,
-        sender_name: String,
-        response: ControlResponse,
     },
     RequestShortcut {
         extension_id: String,
@@ -862,41 +843,6 @@ impl StatusDbus {
         Ok(changed)
     }
 
-    async fn set_passthrough_mode(
-        &self,
-        enabled: bool,
-        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
-    ) -> fdo::Result<bool> {
-        let changed = request_state(&self.sender, |response| {
-            DbusStateRequest::SetPassthroughMode { enabled, response }
-        })
-        .await?;
-        if changed && enabled {
-            let mut metadata = DbusMetadata::new();
-            metadata.insert("scope".to_string(), "workspace".to_string());
-            metadata.insert("click_action".to_string(), "disable".to_string());
-            Self::status_changed(
-                &emitter,
-                PASSTHROUGH_STATUS_CHANNEL,
-                "active",
-                "Passthrough",
-                MANIFOLD_STATUS_PUBLISHER,
-                &metadata,
-            )
-            .await
-            .map_err(|err| fdo::Error::Failed(err.to_string()))?;
-        } else if changed {
-            Self::status_cleared(
-                &emitter,
-                PASSTHROUGH_STATUS_CHANNEL,
-                MANIFOLD_STATUS_PUBLISHER,
-            )
-            .await
-            .map_err(|err| fdo::Error::Failed(err.to_string()))?;
-        }
-        Ok(changed)
-    }
-
     #[zbus(signal)]
     async fn status_changed(
         emitter: &SignalEmitter<'_>,
@@ -935,24 +881,6 @@ impl CompositorDbus {
         .await
     }
 
-    async fn request_placement(
-        &self,
-        window_id: String,
-        placement: DbusMetadata,
-        #[zbus(header)] header: Header<'_>,
-    ) -> fdo::Result<String> {
-        let sender_name = header_sender(&header);
-        request_state(&self.sender, |response| {
-            DbusStateRequest::RequestPlacement {
-                window_id,
-                placement,
-                sender_name,
-                response,
-            }
-        })
-        .await
-    }
-
     async fn replace_role(
         &self,
         window_id: String,
@@ -967,24 +895,6 @@ impl CompositorDbus {
             options,
             sender_name,
             response,
-        })
-        .await
-    }
-
-    async fn request_presentation_membership(
-        &self,
-        window_id: String,
-        membership: DbusMetadata,
-        #[zbus(header)] header: Header<'_>,
-    ) -> fdo::Result<String> {
-        let sender_name = header_sender(&header);
-        request_state(&self.sender, |response| {
-            DbusStateRequest::RequestPresentationMembership {
-                window_id,
-                membership,
-                sender_name,
-                response,
-            }
         })
         .await
     }
@@ -1175,7 +1085,6 @@ trait ManifoldStatus {
         metadata: DbusMetadata,
     ) -> zbus::Result<bool>;
     fn clear(&self, publisher: String, channel: String) -> zbus::Result<bool>;
-    fn set_passthrough_mode(&self, enabled: bool) -> zbus::Result<bool>;
 }
 
 #[proxy(
@@ -1195,13 +1104,6 @@ trait ManifoldCompositor {
         role: String,
         options: DbusMetadata,
     ) -> zbus::Result<bool>;
-    fn request_placement(&self, window_id: String, placement: DbusMetadata)
-    -> zbus::Result<String>;
-    fn request_presentation_membership(
-        &self,
-        window_id: String,
-        membership: DbusMetadata,
-    ) -> zbus::Result<String>;
     fn request_shortcut(
         &self,
         extension_id: String,
@@ -1426,7 +1328,7 @@ pub fn show(args: ShowArgs) -> Result<()> {
     }
 
     if status.presentation == "Detached" {
-        request_presentation_attach_and_focus(target)?;
+        manifold_cli::control::spawn_client(target)?;
     } else {
         request_presentation_window_focus(target)?;
     }
@@ -1457,7 +1359,7 @@ pub fn hide(args: HideArgs) -> Result<()> {
     switch_surface_session(target, resolution.session_id)?;
 
     if status.presentation == "Attached" {
-        let response = request_dbus_command(target, &["detach".to_string()], false)?;
+        let response = request_dbus_command(target, &["close-frontend".to_string()], false)?;
         ensure_ok_response(&response)?;
     }
     Ok(())
@@ -1844,7 +1746,7 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
     remember_directory_surface_session(target, &context.current_directory, selected_session, true)?;
 
     if list.presentation == "Detached" {
-        request_presentation_attach_and_focus(target)?;
+        manifold_cli::control::spawn_client(target)?;
     } else {
         request_presentation_window_focus(target)?;
     }
@@ -2054,11 +1956,6 @@ fn typed_connection(target: &ControlTarget) -> Result<zbus::blocking::Connection
             .with_context(|| format!("connect DBus address {address}")),
         None => zbus::blocking::Connection::session().context("connect session DBus"),
     }
-}
-
-fn request_presentation_attach_and_focus(target: &ControlTarget) -> Result<()> {
-    let response = request_dbus_command(target, &["attach-focus".to_string()], false)?;
-    ensure_ok_response(&response)
 }
 
 fn request_presentation_window_focus(target: &ControlTarget) -> Result<()> {
@@ -2560,9 +2457,6 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             channel,
             response,
         } => send_response(response, Ok(state.clear_status(&publisher, &channel))),
-        DbusStateRequest::SetPassthroughMode { enabled, response } => {
-            send_response(response, Ok(state.set_shortcut_passthrough(enabled)));
-        }
         DbusStateRequest::ListAgents { response } => {
             send_response(response, Ok(dbus_agents(state.agent_summaries())));
         }
@@ -2642,24 +2536,6 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         } => send_response(
             response,
             state.replace_window_role(&window_id, &role, &options, sender_name),
-        ),
-        DbusStateRequest::RequestPlacement {
-            window_id,
-            placement,
-            sender_name,
-            response,
-        } => send_response(
-            response,
-            state.request_window_placement(&window_id, &placement, sender_name),
-        ),
-        DbusStateRequest::RequestPresentationMembership {
-            window_id,
-            membership,
-            sender_name,
-            response,
-        } => send_response(
-            response,
-            state.request_presentation_membership(&window_id, membership, sender_name),
         ),
         DbusStateRequest::RequestShortcut {
             extension_id,
@@ -2742,7 +2618,7 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     };
     state.dmabuf.fast_path = Some(fast_path);
     state.reconfigure_focus_stack();
-    presentation::request_external_client_redraw(state);
+    crate::frame_export::request_redraw(state);
     state
         .loop_handle
         .insert_source(
@@ -2924,7 +2800,7 @@ fn drain_fast_path_input(state: &mut Manifold) {
                 }
                 drop(record);
                 if accepted {
-                    presentation::send_external_client_frame_callbacks(state);
+                    crate::frame_export::send_external_client_frame_callbacks(state);
                 }
                 if redraw_pending {
                     request_redraw = true;
@@ -2933,6 +2809,9 @@ fn drain_fast_path_input(state: &mut Manifold) {
             manifold_ipc::INPUT_CLIENT_DISCONNECT => {
                 disconnected = true;
                 break;
+            }
+            manifold_ipc::INPUT_PRESENTATION_FOCUS => {
+                state.set_presentation_window_focused(record.arguments[0] != 0);
             }
             manifold_ipc::INPUT_WINDOW_FOCUS
                 if state.focus_pane_from_presentation_client(record.arguments[0]) =>
@@ -2953,14 +2832,15 @@ fn drain_fast_path_input(state: &mut Manifold) {
     }
     if disconnected {
         state.dmabuf.fast_path_input_draining = false;
-        presentation::send_external_client_frame_callbacks(state);
+        state.set_presentation_window_focused(false);
+        crate::frame_export::send_external_client_frame_callbacks(state);
         state.reconfigure_focus_stack();
     } else {
         state.dmabuf.fast_path = Some(fast_path);
         state.dmabuf.fast_path_input_draining = false;
     }
     if request_redraw || disconnected {
-        presentation::request_external_client_redraw(state);
+        crate::frame_export::request_redraw(state);
     }
     if let Err(error) = state.display_handle.flush_clients() {
         warn!(?error, "flush clients after fast-path input failed");
@@ -3170,165 +3050,33 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             };
             format!("{}\n", serde_json::to_string(&handshake)?)
         }
-        "attach" if args.is_empty() => {
-            state.request_attach();
-            "OK attach requested\n".to_string()
-        }
-        "attach-focus" if args.is_empty() => {
-            state.request_attach();
-            let focused = state.focus_presentation_window();
-            format!("OK attach-focus requested focused={focused}\n")
-        }
         "focus-presentation" if args.is_empty() => {
             let focused = state.focus_presentation_window();
             format!("OK focus-presentation focused={focused}\n")
         }
-        "detach" if args.is_empty() => {
-            state.request_detach();
-            "OK detach requested\n".to_string()
-        }
         "close-frontend" | "frontend-close" if args.is_empty() => {
-            state.request_detach();
-            "OK frontend close requested\n".to_string()
+            let requested = state.close_presentation_client();
+            format!("OK frontend close requested={requested}\n")
         }
         "status" if args.is_empty() => {
             let snapshot = StatusSnapshot::from_state(state);
             format!(
-                "OK wayland_display={} wayland_client_insert_errors={} wayland_dispatch_errors={} xdg_configure_errors={} presentation={} presentation_target={} presentation_window_focused={} presentation_attach_failures={} presentation_runtime_failures={} presentation_last_error={} windows={} total_windows={} active_surface_session={} active_surface_session_name={} surface_sessions={} focused_windows={} focused_window_index={} focused_surface_id={} input_mode={} shortcut_passthrough={} managed_fullscreen={} requested_fullscreen={} focused_fullscreen={} layout_regions={} layout_placeholders={} layout_active_kind={} layout_active_rect={} resolved_layout_source={} resolved_layout_items={} resolved_layout_panes={} resolved_layout_placeholders={} left_panel_visible={} left_panel_width={} browsers={} preview1_compat_active={} preview1_compat_generation={} preview1_compat_mailbox_queued={} preview1_compat_mailbox_dropped={} preview1_compat_mailbox_capacity={} preview1_compat_mailbox_dispatched={} preview1_compat_completion_delivered={} preview1_compat_notifications_delivered={} preview1_compat_notifications={} preview1_compat_pollables={} preview1_compat_wait_registrations={} preview1_compat_pending_notification_events={} preview1_compat_workers_started={} preview1_compat_workers_active={} preview1_compat_worker_reads_started={} preview1_compat_workers_finished={} preview1_compat_workers_failed={} preview1_compat_workers_cancelled={} preview1_compat_last_worker_value={} hosted_children={} hosted_child_exits={} hosted_child_failures={} hosted_child_last_status={} frames={} client_frame_callbacks={} commits={} pending_commits={} commit_frame_count={} last_commit_batch_commits={} max_commit_batch_commits={} last_commit_to_frame_us={} max_commit_to_frame_us={} last_commit_to_submit_us={} max_commit_to_submit_us={} client_frame_callback_commit_count={} last_client_frame_callback_batch_callbacks={} max_client_frame_callback_batch_callbacks={} last_client_frame_callback_to_commit_us={} max_client_frame_callback_to_commit_us={} client_frame_deferrals={} client_deferred_frames={} last_frame_us={} max_frame_us={} last_frame_interval_us={} max_frame_interval_us={} input_frame_deferrals={} input_deferred_frames={} input_events={} keyboard_events={} pointer_motion_events={} pointer_button_events={} pointer_axis_events={} pointer_target_hits={} pointer_target_misses={} focus_clears={} focus_repairs={} window_lifecycle_refreshes={} window_lifecycle_focus_clears={} window_lifecycle_focus_repairs={} pending_input_events={} input_frame_count={} last_input_batch_events={} max_input_batch_events={} last_input_to_frame_us={} max_input_to_frame_us={} last_input_to_submit_us={} max_input_to_submit_us={} input_commit_frame_count={} input_without_commit_frame_count={} last_input_to_commit_us={} max_input_to_commit_us={} last_input_commit_to_submit_us={} max_input_commit_to_submit_us={} attach_count={} detach_count={} last_attach_latency_us={} max_attach_latency_us={} last_attach_to_frame_us={} max_attach_to_frame_us={} last_detach_latency_us={} max_detach_latency_us={} shm_formats={} egl_wl_bind={} dmabuf={} dmabuf_formats={} dmabuf_disabled={} dmabuf_attempts={} dmabuf_accepted={} dmabuf_rejected={} dmabuf_last_import={} dmabuf_last_error={} dmabuf_explicit_sync_release_points={} dmabuf_explicit_sync_blockers={} dmabuf_implicit_blockers={} dmabuf_blocker_failures={} dmabuf_last_blocker_error={} render_node={} explicit_sync={} explicit_sync_disabled={}",
+                "OK wayland_display={} presentation={} windows={} total_windows={} active_surface_session={} surface_sessions={} focused_windows={} hosted_children={} frames={} commits={} input_events={} dmabuf={} dmabuf_rejected={} dmabuf_last_error={}\n",
                 snapshot.wayland_display,
-                snapshot.wayland_client_insert_errors,
-                snapshot.wayland_dispatch_errors,
-                snapshot.xdg_configure_errors,
                 snapshot.presentation,
-                snapshot.presentation_target,
-                snapshot.presentation_window_focused,
-                snapshot.presentation_attach_failures,
-                snapshot.presentation_runtime_failures,
-                snapshot.presentation_last_error,
                 snapshot.windows,
                 snapshot.total_windows,
                 snapshot.active_surface_session,
-                snapshot.active_surface_session_name,
                 snapshot.surface_sessions,
                 snapshot.focused_windows,
-                snapshot.focused_window_index_text,
-                snapshot.focused_surface_id,
-                snapshot.input_mode,
-                snapshot.shortcut_passthrough,
-                snapshot.managed_fullscreen,
-                snapshot.requested_fullscreen,
-                snapshot.focused_fullscreen,
-                snapshot.layout_regions,
-                snapshot.layout_placeholders,
-                snapshot.layout_active_kind,
-                snapshot.layout_active_rect,
-                snapshot.resolved_layout_source,
-                snapshot.resolved_layout_items,
-                snapshot.resolved_layout_panes,
-                snapshot.resolved_layout_placeholders,
-                snapshot.left_panel_visible,
-                snapshot.left_panel_width,
-                snapshot.browsers,
-                snapshot.preview1_compat_active,
-                snapshot.preview1_compat_generation,
-                snapshot.preview1_compat_mailbox_queued,
-                snapshot.preview1_compat_mailbox_dropped,
-                snapshot.preview1_compat_mailbox_capacity,
-                snapshot.preview1_compat_mailbox_dispatched,
-                snapshot.preview1_compat_completion_delivered,
-                snapshot.preview1_compat_notifications_delivered,
-                snapshot.preview1_compat_notifications,
-                snapshot.preview1_compat_pollables,
-                snapshot.preview1_compat_wait_registrations,
-                snapshot.preview1_compat_pending_notification_events,
-                snapshot.preview1_compat_workers_started,
-                snapshot.preview1_compat_workers_active,
-                snapshot.preview1_compat_worker_reads_started,
-                snapshot.preview1_compat_workers_finished,
-                snapshot.preview1_compat_workers_failed,
-                snapshot.preview1_compat_workers_cancelled,
-                snapshot.preview1_compat_last_worker_value,
                 snapshot.hosted_children,
-                snapshot.hosted_child_exits,
-                snapshot.hosted_child_failures,
-                snapshot.hosted_child_last_status,
                 snapshot.frames,
-                snapshot.client_frame_callbacks,
                 snapshot.commits,
-                snapshot.pending_commits,
-                snapshot.commit_frame_count,
-                snapshot.last_commit_batch_commits,
-                snapshot.max_commit_batch_commits,
-                snapshot.last_commit_to_frame_us_text,
-                snapshot.max_commit_to_frame_us,
-                snapshot.last_commit_to_submit_us_text,
-                snapshot.max_commit_to_submit_us,
-                snapshot.client_frame_callback_commit_count,
-                snapshot.last_client_frame_callback_batch_callbacks,
-                snapshot.max_client_frame_callback_batch_callbacks,
-                snapshot.last_client_frame_callback_to_commit_us_text,
-                snapshot.max_client_frame_callback_to_commit_us,
-                snapshot.client_frame_deferrals,
-                snapshot.client_deferred_frames,
-                snapshot.last_frame_us,
-                snapshot.max_frame_us,
-                snapshot.last_frame_interval_us,
-                snapshot.max_frame_interval_us,
-                snapshot.input_frame_deferrals,
-                snapshot.input_deferred_frames,
                 snapshot.input_events,
-                snapshot.keyboard_events,
-                snapshot.pointer_motion_events,
-                snapshot.pointer_button_events,
-                snapshot.pointer_axis_events,
-                snapshot.pointer_target_hits,
-                snapshot.pointer_target_misses,
-                snapshot.focus_clears,
-                snapshot.focus_repairs,
-                snapshot.window_lifecycle_refreshes,
-                snapshot.window_lifecycle_focus_clears,
-                snapshot.window_lifecycle_focus_repairs,
-                snapshot.pending_input_events,
-                snapshot.input_frame_count,
-                snapshot.last_input_batch_events,
-                snapshot.max_input_batch_events,
-                snapshot.last_input_to_frame_us_text,
-                snapshot.max_input_to_frame_us,
-                snapshot.last_input_to_submit_us_text,
-                snapshot.max_input_to_submit_us,
-                snapshot.input_commit_frame_count,
-                snapshot.input_without_commit_frame_count,
-                snapshot.last_input_to_commit_us_text,
-                snapshot.max_input_to_commit_us,
-                snapshot.last_input_commit_to_submit_us_text,
-                snapshot.max_input_commit_to_submit_us,
-                snapshot.attach_count,
-                snapshot.detach_count,
-                snapshot.last_attach_latency_us_text,
-                snapshot.max_attach_latency_us,
-                snapshot.last_attach_to_frame_us_text,
-                snapshot.max_attach_to_frame_us,
-                snapshot.last_detach_latency_us_text,
-                snapshot.max_detach_latency_us,
-                snapshot.shm_formats,
-                snapshot.egl_wl_bind,
                 snapshot.dmabuf,
-                snapshot.dmabuf_formats,
-                snapshot.dmabuf_disabled,
-                snapshot.dmabuf_attempts,
-                snapshot.dmabuf_accepted,
                 snapshot.dmabuf_rejected,
-                snapshot.dmabuf_last_import,
                 snapshot.dmabuf_last_error,
-                snapshot.dmabuf_explicit_sync_release_points,
-                snapshot.dmabuf_explicit_sync_blockers,
-                snapshot.dmabuf_implicit_blockers,
-                snapshot.dmabuf_blocker_failures,
-                snapshot.dmabuf_last_blocker_error,
-                snapshot.render_node,
-                snapshot.explicit_sync,
-                snapshot.explicit_sync_disabled
-            ) + "\n"
+            )
         }
         "status-json" if args.is_empty() => {
             format!("{}\n", status_json_string(state)?)
@@ -3450,34 +3198,6 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
             _ => bail!("usage: close-client [active|<pane-id>]"),
         },
         "close-session" => close_surface_session_command(args, state)?,
-        "layout-action" | "layout" => {
-            let [action] = args else {
-                bail!("layout-action requires exactly one action name");
-            };
-            let action = action
-                .parse::<LayoutAction>()
-                .with_context(|| format!("parse layout action {action:?}"))?;
-            let changed = state.apply_layout_action(action);
-            format!("OK layout-action action={action} changed={changed}\n")
-        }
-        "passthrough-mode" | "passthrough" => match args {
-            [subcommand] if subcommand == "get" => {
-                format!(
-                    "OK passthrough-mode enabled={}\n",
-                    state.shortcut_passthrough()
-                )
-            }
-            [subcommand] if subcommand == "toggle" => {
-                let enabled = state.toggle_shortcut_passthrough();
-                format!("OK passthrough-mode enabled={enabled} changed=true\n")
-            }
-            [subcommand, value] if subcommand == "set" => {
-                let enabled = parse_enabled(value)?;
-                let changed = state.set_shortcut_passthrough(enabled);
-                format!("OK passthrough-mode enabled={enabled} changed={changed}\n")
-            }
-            _ => bail!("usage: passthrough-mode get|toggle|set <on|off>"),
-        },
         "status-items" => match args {
             [subcommand] if subcommand == "list-json" => {
                 format!("{}\n", serde_json::to_string(&state.status_summaries())?)
@@ -3630,24 +3350,8 @@ fn execute_tokens(tokens: &[String], state: &mut Manifold) -> Result<String> {
                 )?;
                 format!("OK debug dump {manifest}\n")
             }
-            _ => bail!("usage: debug dump <dir> [state,composed,surfaces]"),
+            _ => bail!("usage: debug dump <dir> [state,surfaces]"),
         },
-        "presentation-size" => {
-            let [width, height] = args else {
-                bail!("usage: presentation-size <width> <height>");
-            };
-            let width = width.parse::<i32>().context("parse presentation width")?;
-            let height = height.parse::<i32>().context("parse presentation height")?;
-            ensure!(
-                state.configure_first_window_size(width, height),
-                "no hosted toplevel is available"
-            );
-            format!("OK presentation-size {}x{}\n", width.max(1), height.max(1))
-        }
-        "inject" => {
-            handle_inject(args, state)?;
-            format!("OK injected {}\n", args.join(" "))
-        }
         _ => bail!("unknown command: {}", tokens.join(" ")),
     };
 
@@ -3675,7 +3379,6 @@ fn close_surface_session_command(args: &[String], state: &mut Manifold) -> Resul
 enum WasmPlugKind {
     Auto,
     Plugin,
-    KeyPolicy,
 }
 
 impl WasmPlugKind {
@@ -3683,8 +3386,7 @@ impl WasmPlugKind {
         match value {
             "auto" => Ok(Self::Auto),
             "plugin" | "wasm-plugin" => Ok(Self::Plugin),
-            "key-policy" | "key" => Ok(Self::KeyPolicy),
-            _ => bail!("plug kind must be auto, plugin, or key-policy"),
+            _ => bail!("plug kind must be auto or plugin"),
         }
     }
 }
@@ -3744,7 +3446,7 @@ impl PlugCommand {
             }
         }
 
-        let path = path.context("usage: plug [--kind auto|plugin|key-policy] [--id ID] <path>")?;
+        let path = path.context("usage: plug [--kind auto|plugin] [--id ID] <path>")?;
         Ok(Self {
             kind,
             instance_id,
@@ -3787,14 +3489,6 @@ fn plug_wasm_module(
             }
             Ok("plugin")
         }
-        WasmPlugKind::KeyPolicy => {
-            ensure!(
-                instance_id.is_none(),
-                "plug --id applies to plugin actors, not key policies"
-            );
-            state.replace_wasm_global_key_policy(path, "workspace")?;
-            Ok("key-policy")
-        }
     }
 }
 
@@ -3805,11 +3499,7 @@ struct StatusSnapshot {
     wayland_dispatch_errors: u64,
     xdg_configure_errors: u64,
     presentation: &'static str,
-    presentation_target: &'static str,
     presentation_window_focused: bool,
-    presentation_attach_failures: u64,
-    presentation_runtime_failures: u64,
-    presentation_last_error: String,
     windows: usize,
     total_windows: usize,
     active_surface_session: u64,
@@ -3817,24 +3507,9 @@ struct StatusSnapshot {
     surface_sessions: usize,
     focused_windows: usize,
     focused_window_index: Option<usize>,
-    #[serde(skip)]
-    focused_window_index_text: String,
     focused_surface_id: String,
-    input_mode: &'static str,
-    shortcut_passthrough: bool,
-    managed_fullscreen: bool,
     requested_fullscreen: usize,
     focused_fullscreen: bool,
-    layout_regions: usize,
-    layout_placeholders: usize,
-    layout_active_kind: &'static str,
-    layout_active_rect: String,
-    resolved_layout_source: &'static str,
-    resolved_layout_items: usize,
-    resolved_layout_panes: usize,
-    resolved_layout_placeholders: usize,
-    left_panel_visible: bool,
-    left_panel_width: i32,
     browsers: usize,
     agents: Vec<crate::state::AgentSummary>,
     plugin_actors: Vec<DbusPluginActor>,
@@ -3887,19 +3562,13 @@ struct StatusSnapshot {
     last_commit_batch_commits: u64,
     max_commit_batch_commits: u64,
     last_commit_to_frame_us: Option<u128>,
-    #[serde(skip)]
-    last_commit_to_frame_us_text: String,
     max_commit_to_frame_us: u128,
     last_commit_to_submit_us: Option<u128>,
-    #[serde(skip)]
-    last_commit_to_submit_us_text: String,
     max_commit_to_submit_us: u128,
     client_frame_callback_commit_count: u64,
     last_client_frame_callback_batch_callbacks: u64,
     max_client_frame_callback_batch_callbacks: u64,
     last_client_frame_callback_to_commit_us: Option<u128>,
-    #[serde(skip)]
-    last_client_frame_callback_to_commit_us_text: String,
     max_client_frame_callback_to_commit_us: u128,
     client_frame_deferrals: u64,
     client_deferred_frames: u64,
@@ -3926,37 +3595,15 @@ struct StatusSnapshot {
     last_input_batch_events: u64,
     max_input_batch_events: u64,
     last_input_to_frame_us: Option<u128>,
-    #[serde(skip)]
-    last_input_to_frame_us_text: String,
     max_input_to_frame_us: u128,
     last_input_to_submit_us: Option<u128>,
-    #[serde(skip)]
-    last_input_to_submit_us_text: String,
     max_input_to_submit_us: u128,
     input_commit_frame_count: u64,
     input_without_commit_frame_count: u64,
     last_input_to_commit_us: Option<u128>,
-    #[serde(skip)]
-    last_input_to_commit_us_text: String,
     max_input_to_commit_us: u128,
     last_input_commit_to_submit_us: Option<u128>,
-    #[serde(skip)]
-    last_input_commit_to_submit_us_text: String,
     max_input_commit_to_submit_us: u128,
-    attach_count: u64,
-    detach_count: u64,
-    last_attach_latency_us: Option<u128>,
-    #[serde(skip)]
-    last_attach_latency_us_text: String,
-    max_attach_latency_us: u128,
-    last_attach_to_frame_us: Option<u128>,
-    #[serde(skip)]
-    last_attach_to_frame_us_text: String,
-    max_attach_to_frame_us: u128,
-    last_detach_latency_us: Option<u128>,
-    #[serde(skip)]
-    last_detach_latency_us_text: String,
-    max_detach_latency_us: u128,
     shm_formats: usize,
     egl_wl_bind: String,
     dmabuf: String,
@@ -3989,26 +3636,12 @@ impl StatusSnapshot {
         let last_input_commit_to_submit_us = state.stats.last_input_commit_to_submit_micros;
         let last_client_frame_callback_to_commit_us =
             state.stats.last_client_frame_callback_to_commit_micros;
-        let last_attach_latency_us = state.stats.last_attach_latency_micros;
-        let last_attach_to_frame_us = state.stats.last_attach_to_frame_micros;
-        let last_detach_latency_us = state.stats.last_detach_latency_micros;
         state.refresh_hosted_children();
-        let presentation = match state.presentation {
-            crate::state::PresentationStatus::Attached => "Attached",
-            crate::state::PresentationStatus::Detached => "Detached",
+        let presentation = if state.dmabuf.fast_path.is_some() {
+            "Attached"
+        } else {
+            "Detached"
         };
-        let presentation_target = state
-            .presenter
-            .as_ref()
-            .and_then(|presenter| {
-                presenter
-                    .runtime
-                    .borrow()
-                    .backend
-                    .as_ref()
-                    .map(super::winit_presenter::PresenterBackend::target_name)
-            })
-            .unwrap_or("none");
         let dmabuf = state
             .dmabuf
             .protocol_version
@@ -4017,10 +3650,6 @@ impl StatusSnapshot {
             .dmabuf
             .explicit_sync_protocol_version
             .map_or_else(|| "none".to_string(), |version| format!("v{version}"));
-        let layout_active_rect = state.active_layout_rect().map_or_else(
-            || "none".to_string(),
-            |rect| format!("{},{},{},{}", rect.x, rect.y, rect.w, rect.h),
-        );
         let preview1_compat_stats = state.preview1_compat_stats();
         let filesystem_watcher_stats = state.filesystem_watcher_stats();
         let hosted_filesystem_watch_stats = state.hosted_filesystem_watch_stats();
@@ -4031,15 +3660,7 @@ impl StatusSnapshot {
             wayland_dispatch_errors: state.stats.wayland_dispatch_errors,
             xdg_configure_errors: state.stats.xdg_configure_errors,
             presentation,
-            presentation_target,
             presentation_window_focused: state.presentation_window_focused(),
-            presentation_attach_failures: state.presentation_attach_failures,
-            presentation_runtime_failures: state.presentation_runtime_failures,
-            presentation_last_error: state
-                .presentation_last_error
-                .as_deref()
-                .unwrap_or("none")
-                .to_string(),
             windows: state.active_surface_session_window_count(),
             total_windows: state.space.elements().count(),
             active_surface_session: state.active_surface_session().raw(),
@@ -4047,30 +3668,11 @@ impl StatusSnapshot {
             surface_sessions: state.surface_session_count(),
             focused_windows: state.focused_window_count(),
             focused_window_index: state.focused_window_index(),
-            focused_window_index_text: state
-                .focused_window_index()
-                .map_or_else(|| "none".to_string(), |index| index.to_string()),
             focused_surface_id: state
                 .focused_surface_id()
                 .unwrap_or_else(|| "none".to_string()),
-            input_mode: match state.input_mode {
-                crate::state::InputMode::Passthrough => "passthrough",
-                crate::state::InputMode::Normal => "normal",
-            },
-            shortcut_passthrough: state.shortcut_passthrough(),
-            managed_fullscreen: state.managed_fullscreen(),
             requested_fullscreen: state.requested_fullscreen_count(),
             focused_fullscreen: state.focused_window_fullscreen(),
-            layout_regions: state.resolved_layout_item_count(),
-            layout_placeholders: state.resolved_layout_placeholder_count(),
-            layout_active_kind: state.resolved_layout_active_kind(),
-            layout_active_rect,
-            resolved_layout_source: state.resolved_layout_source_name(),
-            resolved_layout_items: state.resolved_layout_item_count(),
-            resolved_layout_panes: state.resolved_layout_pane_count(),
-            resolved_layout_placeholders: state.resolved_layout_placeholder_count(),
-            left_panel_visible: state.left_panel_reserved_width() > 0,
-            left_panel_width: state.left_panel_reserved_width(),
             browsers: state.browsers.len(),
             agents: state.agent_summaries(),
             plugin_actors: dbus_plugin_actors(state.plugin_actor_summaries()),
@@ -4146,12 +3748,8 @@ impl StatusSnapshot {
             last_commit_batch_commits: state.stats.last_commit_batch_commits,
             max_commit_batch_commits: state.stats.max_commit_batch_commits,
             last_commit_to_frame_us,
-            last_commit_to_frame_us_text: last_commit_to_frame_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_commit_to_frame_us: state.stats.max_commit_to_frame_micros,
             last_commit_to_submit_us,
-            last_commit_to_submit_us_text: last_commit_to_submit_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_commit_to_submit_us: state.stats.max_commit_to_submit_micros,
             client_frame_callback_commit_count: state.stats.client_frame_callback_commit_count,
             last_client_frame_callback_batch_callbacks: state
@@ -4161,8 +3759,6 @@ impl StatusSnapshot {
                 .stats
                 .max_client_frame_callback_batch_callbacks,
             last_client_frame_callback_to_commit_us,
-            last_client_frame_callback_to_commit_us_text: last_client_frame_callback_to_commit_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_client_frame_callback_to_commit_us: state
                 .stats
                 .max_client_frame_callback_to_commit_micros,
@@ -4191,37 +3787,15 @@ impl StatusSnapshot {
             last_input_batch_events: state.stats.last_input_batch_events,
             max_input_batch_events: state.stats.max_input_batch_events,
             last_input_to_frame_us,
-            last_input_to_frame_us_text: last_input_to_frame_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_input_to_frame_us: state.stats.max_input_to_frame_micros,
             last_input_to_submit_us,
-            last_input_to_submit_us_text: last_input_to_submit_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_input_to_submit_us: state.stats.max_input_to_submit_micros,
             input_commit_frame_count: state.stats.input_commit_frame_count,
             input_without_commit_frame_count: state.stats.input_without_commit_frame_count,
             last_input_to_commit_us,
-            last_input_to_commit_us_text: last_input_to_commit_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_input_to_commit_us: state.stats.max_input_to_commit_micros,
             last_input_commit_to_submit_us,
-            last_input_commit_to_submit_us_text: last_input_commit_to_submit_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
             max_input_commit_to_submit_us: state.stats.max_input_commit_to_submit_micros,
-            attach_count: state.stats.attach_count,
-            detach_count: state.stats.detach_count,
-            last_attach_latency_us,
-            last_attach_latency_us_text: last_attach_latency_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
-            max_attach_latency_us: state.stats.max_attach_latency_micros,
-            last_attach_to_frame_us,
-            last_attach_to_frame_us_text: last_attach_to_frame_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
-            max_attach_to_frame_us: state.stats.max_attach_to_frame_micros,
-            last_detach_latency_us,
-            last_detach_latency_us_text: last_detach_latency_us
-                .map_or_else(|| "none".to_string(), |micros| micros.to_string()),
-            max_detach_latency_us: state.stats.max_detach_latency_micros,
             shm_formats: state.dmabuf.shm_formats,
             egl_wl_bind: state.dmabuf.egl_wl_bind_status.clone(),
             dmabuf,
@@ -4270,163 +3844,15 @@ impl StatusSnapshot {
     }
 }
 
-fn handle_inject(args: &[String], state: &mut Manifold) -> Result<()> {
-    let command = InjectCommand::parse(args)?;
-    let time = monotonic_time_msec(state);
-
-    match command {
-        InjectCommand::Motion { x, y } => {
-            state.forward_pointer_motion(Point::from((x, y)), time);
-        }
-        InjectCommand::CenterMotion => {
-            let Some(pos) = state.first_window_center() else {
-                bail!("no mapped window to target");
-            };
-            state.forward_pointer_motion(pos, time);
-        }
-        InjectCommand::Button {
-            code,
-            state: button_state,
-        } => {
-            state.forward_pointer_button(code, button_state, time);
-        }
-        InjectCommand::Key {
-            code,
-            state: key_state,
-        } => {
-            state.forward_keyboard_key(code.into(), key_state, time);
-        }
-        InjectCommand::Axis {
-            horizontal,
-            vertical,
-        } => {
-            let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
-            if horizontal != 0.0 {
-                frame = frame.value(Axis::Horizontal, horizontal);
-            }
-            if vertical != 0.0 {
-                frame = frame.value(Axis::Vertical, vertical);
-            }
-            state.forward_pointer_axis(frame);
-        }
-        InjectCommand::Wheel {
-            horizontal,
-            vertical,
-        } => {
-            let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
-            if horizontal != 0 {
-                frame = frame
-                    .value(Axis::Horizontal, f64::from(horizontal) * 15.0 / 120.0)
-                    .v120(Axis::Horizontal, horizontal);
-            }
-            if vertical != 0 {
-                frame = frame
-                    .value(Axis::Vertical, f64::from(vertical) * 15.0 / 120.0)
-                    .v120(Axis::Vertical, vertical);
-            }
-            state.forward_pointer_axis(frame);
-        }
-    }
-    if let Err(err) = state.display_handle.flush_clients() {
-        tracing::warn!(?err, "flush clients after injected input failed");
-    }
-
-    Ok(())
-}
-
-#[derive(Debug, PartialEq)]
-enum InjectCommand {
-    Motion { x: f64, y: f64 },
-    CenterMotion,
-    Button { code: u32, state: ButtonState },
-    Key { code: u32, state: KeyState },
-    Axis { horizontal: f64, vertical: f64 },
-    Wheel { horizontal: i32, vertical: i32 },
-}
-
-impl InjectCommand {
-    fn parse(args: &[String]) -> Result<Self> {
-        match args {
-            [kind, x, y] if kind == "motion" => Ok(Self::Motion {
-                x: parse_f64(x, "x")?,
-                y: parse_f64(y, "y")?,
-            }),
-            [kind] if kind == "center-motion" => Ok(Self::CenterMotion),
-            [kind, code, state] if kind == "button" => Ok(Self::Button {
-                code: parse_u32(code, "button")?,
-                state: parse_button_state(state)?,
-            }),
-            [kind, code, state] if kind == "key" => Ok(Self::Key {
-                code: parse_u32(code, "key")?,
-                state: parse_key_state(state)?,
-            }),
-            [kind, horizontal, vertical] if kind == "axis" => Ok(Self::Axis {
-                horizontal: parse_f64(horizontal, "horizontal")?,
-                vertical: parse_f64(vertical, "vertical")?,
-            }),
-            [kind, horizontal, vertical] if kind == "wheel" => Ok(Self::Wheel {
-                horizontal: parse_i32(horizontal, "horizontal_v120")?,
-                vertical: parse_i32(vertical, "vertical_v120")?,
-            }),
-            [] => bail!("inject requires a kind: motion, button, key, or axis"),
-            _ => bail!(
-                "usage: inject motion <x> <y> | center-motion | button <code> <pressed|released> | key <code> <pressed|released> | axis <horizontal> <vertical> | wheel <horizontal_v120> <vertical_v120>"
-            ),
-        }
-    }
-}
-
 fn monotonic_time_msec(state: &Manifold) -> u32 {
     let millis = state.start_time.elapsed().as_millis();
     u32::try_from(millis.min(u128::from(u32::MAX))).expect("millis clamped to u32 range")
-}
-
-fn parse_f64(value: &str, name: &str) -> Result<f64> {
-    value
-        .parse()
-        .with_context(|| format!("{name} must be a number"))
-}
-
-fn parse_u32(value: &str, name: &str) -> Result<u32> {
-    value
-        .parse()
-        .with_context(|| format!("{name} must be an unsigned integer"))
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64> {
     value
         .parse()
         .with_context(|| format!("{name} must be an unsigned integer"))
-}
-
-fn parse_enabled(value: &str) -> Result<bool> {
-    match value {
-        "on" | "true" | "yes" | "1" | "enabled" | "enable" => Ok(true),
-        "off" | "false" | "no" | "0" | "disabled" | "disable" => Ok(false),
-        _ => bail!("value must be on or off"),
-    }
-}
-
-fn parse_i32(value: &str, name: &str) -> Result<i32> {
-    value
-        .parse()
-        .with_context(|| format!("{name} must be an integer"))
-}
-
-fn parse_button_state(value: &str) -> Result<ButtonState> {
-    match value {
-        "pressed" | "press" | "down" => Ok(ButtonState::Pressed),
-        "released" | "release" | "up" => Ok(ButtonState::Released),
-        _ => bail!("button state must be pressed or released"),
-    }
-}
-
-fn parse_key_state(value: &str) -> Result<KeyState> {
-    match value {
-        "pressed" | "press" | "down" => Ok(KeyState::Pressed),
-        "released" | "release" | "up" => Ok(KeyState::Released),
-        _ => bail!("key state must be pressed or released"),
-    }
 }
 
 fn parse_command_tokens(input: &str) -> Result<Vec<String>> {
@@ -4453,9 +3879,10 @@ impl SurfaceSessionList {
     fn from_state(state: &mut Manifold) -> Self {
         state.refresh_window_state();
         Self {
-            presentation: match state.presentation {
-                PresentationStatus::Attached => "Attached".to_string(),
-                PresentationStatus::Detached => "Detached".to_string(),
+            presentation: if state.dmabuf.fast_path.is_some() {
+                "Attached".to_string()
+            } else {
+                "Detached".to_string()
             },
             active: state.active_surface_session().raw(),
             sessions: state.surface_session_summaries(),

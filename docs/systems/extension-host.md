@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-24
 code-links:
   - crates/manifold-wasm/src/module.rs
   - crates/manifold-wasm/src/actor.rs
@@ -22,10 +22,10 @@ code-links:
 
 # Extension Host
 
-The current extension story has four implementation layers:
+The extension story has four implementation layers:
 
 - DBus extension/status/agent/plugin surfaces for external tools and debugging.
-- A built-in lightweight plugin actor named `debug-toggle` plus a native host
+- A lightweight session actor named `debug-toggle` plus a native host
   mailbox/publication scaffold.
 - Core-WASM actors and synchronous key policy providers, plus the runtime-owned
   behavior-test harness engine and its thin daemon request adapter.
@@ -39,12 +39,12 @@ capability oriented and should not expose compositor internals.
 
 ## Current WASM Lanes
 
-Current runnable WASM lanes are prototypes, not the final product API. A
-self-contained core module can declare named actors and synchronous policy
-providers. The presentation client executes selected key and flat-layout
-providers over its own pane inventory; the daemon retains the older key and
-actor-driven layout paths for its built-in presenter compatibility path. The
-separate core-WASM test harness remains for behavior-test orchestration.
+Runnable WASM lanes remain experimental API surfaces. A self-contained core
+module can declare named actors and synchronous policy providers. The
+presentation client executes presentation actors, key policy, and recursive
+layout over its own pane inventory. The daemon hosts session actors, workers,
+resources, and the separate behavior-test harness; it has no presentation
+policy or layout path.
 
 See [[../reference/wasm-fast-lanes]] for ABI details.
 
@@ -124,12 +124,11 @@ has been observed and every task joined; the registry then activates candidate
 names as one transition before starting their tasks. Candidate actor or policy
 load failures leave the published actors and key policy unchanged.
 
-Core-module actors opt into daemon events with typed marker exports associated
-with their actor declaration. Pane mapping and layout snapshots are routed only
-to matching subscribers, and activation queues a fresh layout snapshot so a
-replacement converges without waiting for another client to map. Malformed,
-unknown-event, and orphan markers reject the module. Exact marker spellings are
-defined in `module_link.rs`.
+Core-module actors opt into events with typed marker exports associated with
+their actor declaration. Presentation pane and layout events are published by
+the client only to matching presentation actors. Malformed, unknown-event, and
+orphan markers reject the module. Exact marker spellings are defined in
+`module_link.rs`.
 
 Target hot reload should cancel affected workers and in-flight I/O before
 restarting actors and policy providers, preserve host-owned pane identity where
@@ -145,20 +144,14 @@ cancellation, cooperative CPU-worker yield, and dispatcher deadline
 enforcement.
 
 `tools/test-wasm-preview1-worker.sh` drives the low-level compatibility runtime
-and its actor facade. `tools/test-wasm-preview1-worker-nested.sh` is the
-end-to-end daemon proof: it uses the built-in nested test topology with an
-offscreen outer presentation, reaches the actor through the normal control
-surface, leaves an ordinary worker read pending while actor traffic and
-completion I/O continue, feeds the worker, then hot-reloads while another read
-is pending and verifies generation isolation and structured shutdown.
+and its actor facade, leaves an ordinary worker read pending while actor traffic
+and completion I/O continue, feeds the worker, then hot-reloads while another
+read is pending and verifies generation isolation and structured shutdown.
 
-`tools/test-wasm-actor-lifecycle-nested.sh` loads the real
-`wasm-actor-lifecycle-proof` core plugin beside two rendered Wayland clients.
-Its subscribed actor first arranges columns, then a same-name hot replacement
-arranges rows. An invalid middle candidate is rejected while the first actor
-still accepts a real mailbox probe and retains its rendered columns. A second actor has no subscriptions and would visibly spawn an
-unwanted client if routing regressed to broadcast; both screenshots retain
-exactly the intended two panes.
+Presentation-actor lifecycle proofs run their actor in `manifold-client`.
+Same-name replacement must preserve the old generation until the candidate is
+ready, reject late layout results, and leave unrelated actors running. Any
+rendered acceptance evidence is captured by the client.
 
 These workloads establish the execution and I/O model. The prototype still
 loads one actor artifact without package-manifest declarations, gives it a
@@ -168,7 +161,10 @@ surface described below.
 
 ## Current DBus Extension Surfaces
 
-The DBus extension surface supports extension registration, status publication, agent registration, plugin actor inspection/messaging, and related UI integration. The GTK session switcher uses these surfaces for status and agent rows.
+The DBus extension surface supports extension registration, status publication,
+agent registration, session actor inspection/messaging, and related external
+tool integration. Viewport placement and presentation membership are not DBus
+extension responsibilities.
 
 The first actor prototype is `debug-toggle`. It runs as a Tokio task with a
 bounded default mailbox slot and publishes an immutable boolean frame to a

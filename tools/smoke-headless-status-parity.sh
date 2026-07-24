@@ -92,7 +92,7 @@ if missing_from_text or missing_from_json:
         f"text={status_text!r} json={status_json!r}"
     )
 
-for key in ("wayland_display", "presentation", "presentation_last_error", "dmabuf", "dmabuf_disabled", "dmabuf_last_import", "dmabuf_last_error", "dmabuf_last_blocker_error", "render_node", "explicit_sync", "explicit_sync_disabled"):
+for key in ("wayland_display", "presentation", "dmabuf", "dmabuf_disabled", "dmabuf_last_import", "dmabuf_last_error", "dmabuf_last_blocker_error", "render_node", "explicit_sync", "explicit_sync_disabled"):
     if str(data[key]) != text_fields[key]:
         raise SystemExit(f"stable string field {key} differs: text={text_fields[key]!r} json={data[key]!r}")
 
@@ -104,9 +104,6 @@ optional_latency_keys = {
     "last_input_to_submit_us",
     "last_input_to_commit_us",
     "last_input_commit_to_submit_us",
-    "last_attach_latency_us",
-    "last_attach_to_frame_us",
-    "last_detach_latency_us",
 }
 for key in optional_latency_keys:
     text_value = text_fields[key]

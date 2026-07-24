@@ -138,14 +138,13 @@ bounded guest buffers to the raw pointer/length scalars required by the current
 Wasmtime function ABI. Input routing and policy logic do not pass those event
 fields as parallel arguments.
 
-The checked-in default-workspace plugin uses this boundary today: its
+The checked-in default-workspace plugin uses this boundary: its
 `WasmGlobalKeyPolicy` returns a bounded decision envelope and actor-message
 batch after reading the latest immutable client pane, focus, and application
 identity snapshot. The client validates and applies local actions only after the
 provider returns. Managed application and session mutations are queued to the
 backend asynchronously, so the synchronous key decision never waits for DBus or
-network work. The built-in daemon presenter retains the same provider host only
-as a compatibility path.
+network work. The session server has no key-policy provider.
 
 The default policy keeps the normal launch usable without desktop-global
 shortcuts or wrapper arguments:
@@ -156,8 +155,10 @@ shortcuts or wrapper arguments:
   windows;
 - `Ctrl+O` queues a new `foot` window in the active surface session.
 
-These chords are guest policy. The client owns only validation, local focus and
-plugin-pane visibility, and the bounded backend command queue.
+These chords are guest policy. Switcher visibility remains actor-owned:
+`Ctrl+Alt+M` sends an ordinary sidebar action to the switcher, which republishes
+its root layout fragment. The client validates the resulting layout and focus
+request; it has no switcher-specific visibility command.
 
 ## Action Registry
 

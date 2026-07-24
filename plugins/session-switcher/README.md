@@ -13,6 +13,10 @@ configured `workspace` layout actor. Hiding the switcher removes its pane item
 and expands `rest` to the full viewport; showing it restores the sidebar without
 replacing the workspace actor or its private layout state.
 
+Sidebar visibility and focus are actor state. The default key policy delivers
+`Ctrl+Alt+M` as an ordinary `sidebar-action` mailbox message; the plugin answers
+by publishing another fragment for its existing root lease.
+
 The pane supports:
 
 - pointer or keyboard session selection and activation;

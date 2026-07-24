@@ -2,367 +2,304 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/target/debug/manifold"
-CLIENT="$ROOT/target/debug/manifold-client"
+cd "$ROOT"
 
-if [[ "${MANIFOLD_SESSION_SWITCHER_CONTROLLER:-0}" == 1 ]]; then
-  if [[ "${MANIFOLD_SESSION_SWITCHER_DBUS_WRAPPED:-0}" != 1 ]]; then
-    exec env -u MANIFOLDD_DBUS_ADDRESS -u MANIFOLDD_DBUS_DESTINATION -u manifold_session \
-      dbus-run-session -- env MANIFOLD_SESSION_SWITCHER_DBUS_WRAPPED=1 "$0"
-  fi
-
-  exec > >(tee "$MANIFOLD_SESSION_SWITCHER_OUT/controller.log") 2>&1
-  export XDG_CACHE_HOME="$MANIFOLD_SESSION_SWITCHER_OUT/cache"
-  export MANIFOLD_CONFIG="$MANIFOLD_SESSION_SWITCHER_OUT/manifold.toml"
-  mkdir -p "$XDG_CACHE_HOME"
-  client_log="$MANIFOLD_SESSION_SWITCHER_OUT/client.log"
-  server_log="$XDG_CACHE_HOME/manifold/session-server/global.log"
-
-  "$CLIENT" >"$client_log" 2>&1 &
-  client_pid=$!
-  trap 'kill "$client_pid" 2>/dev/null || true' EXIT
-
-  for _ in $(seq 1 400); do
-    if [[ -f "$server_log" ]] \
-      && grep -q 'started presentation WASM actor id=session-switcher' "$client_log" \
-      && grep -q 'loaded presentation key policy provider=workspace' "$client_log" \
-      && grep -q 'accepted plugin draw packet' "$client_log" \
-      && grep -q 'presentation session snapshot revision=.*sessions=1' "$client_log"; then
-      break
-    fi
-    if ! kill -0 "$client_pid" 2>/dev/null; then
-      echo 'ERR manifold-client exited before the session switcher rendered' >&2
-      sed -n '1,260p' "$client_log" >&2
-      [[ -f "$server_log" ]] && sed -n '1,260p' "$server_log" >&2
-      exit 1
-    fi
-    sleep 0.05
-  done
-
-  "$BIN" ctl surface-session new Beta >/dev/null
-  "$BIN" ctl surface-session new Gamma >/dev/null
-  for _ in $(seq 1 300); do
-    if grep -q 'presentation session snapshot revision=.*sessions=3' "$client_log"; then
-      break
-    fi
-    sleep 0.05
-  done
-  grep -q 'presentation session snapshot revision=.*sessions=3' "$client_log"
-
-  refresh_backend_state() {
-    RUST_LOG=off "$BIN" ctl status >"$MANIFOLD_SESSION_SWITCHER_OUT/backend-status.tmp"
-    mv "$MANIFOLD_SESSION_SWITCHER_OUT/backend-status.tmp" \
-      "$MANIFOLD_SESSION_SWITCHER_OUT/backend-status"
-    RUST_LOG=off "$BIN" ctl surface-session list-json \
-      >"$MANIFOLD_SESSION_SWITCHER_OUT/backend-sessions.tmp"
-    mv "$MANIFOLD_SESSION_SWITCHER_OUT/backend-sessions.tmp" \
-      "$MANIFOLD_SESSION_SWITCHER_OUT/backend-sessions.json"
-  }
-  refresh_backend_state
-  touch "$MANIFOLD_SESSION_SWITCHER_OUT/controller.ready"
-
-  for _ in $(seq 1 600); do
-    [[ -f "$MANIFOLD_SESSION_SWITCHER_OUT/controller.stop" ]] && break
-    if ! kill -0 "$client_pid" 2>/dev/null; then
-      echo 'ERR manifold-client exited during session switcher interaction' >&2
-      sed -n '1,320p' "$client_log" >&2
-      exit 1
-    fi
-    refresh_backend_state
-    sleep 0.05
-  done
-  test -f "$MANIFOLD_SESSION_SWITCHER_OUT/controller.stop"
-
-  kill "$client_pid" 2>/dev/null || true
-  wait "$client_pid" || true
-  "$BIN" ctl quit >/dev/null 2>&1 || true
-  trap - EXIT
-  touch "$MANIFOLD_SESSION_SWITCHER_OUT/controller.done"
-  exit 0
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+  exec dbus-run-session -- "$0" "$@"
 fi
+
+for tool in cargo cc grim magick pkg-config python3 sway weston-simple-shm; do
+  if ! command -v "$tool" > /dev/null 2>&1; then
+    echo "ERR $tool is required for the session-switcher proof" >&2
+    exit 2
+  fi
+done
 
 OUT="${MANIFOLD_SESSION_SWITCHER_OUT:-$(mktemp -d /tmp/manifold-session-switcher.XXXXXX)}"
 PACKAGE="$OUT/package"
-mkdir -p "$PACKAGE"
-exec > >(tee "$OUT/driver.log") 2>&1
-trap 'status=$?; echo "ERR session switcher proof line=$LINENO status=$status"; exit "$status"' ERR
+RUNTIME_DIR="$OUT/runtime"
+COMPOSITOR_LOG="$OUT/compositor.log"
+SERVER_LOG="$OUT/server.log"
+CLIENT_LOG="$OUT/client.log"
+CONFIG="$OUT/manifold.toml"
+SWAY_CONFIG="$OUT/sway.conf"
+DBUS_DESTINATION="org.manifold.SessionSwitcherTest.p$$"
+mkdir -p "$PACKAGE" "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
 
-nix develop --command cargo build -p manifoldd -p manifold-client --bins
-nix develop --command cargo build \
-  --manifest-path examples/wasm-init-actor/Cargo.toml \
-  --target wasm32-unknown-unknown \
-  --release
-nix develop --command cargo run --quiet -p manifold-wasm --example componentize -- \
-  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm \
-  "$PACKAGE/session-init.component.wasm"
-nix develop --command cargo build \
+CLIENT_PID=""
+SERVER_PID=""
+COMPOSITOR_PID=""
+cleanup() {
+  local result=$?
+  set +e
+  for pid in "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
+      kill "$pid" > /dev/null 2>&1
+      wait "$pid" > /dev/null 2>&1
+    fi
+  done
+  if ((result != 0)); then
+    echo "client_log=$CLIENT_LOG" >&2
+    tail -n 200 "$CLIENT_LOG" >&2
+    echo "server_log=$SERVER_LOG" >&2
+    tail -n 120 "$SERVER_LOG" >&2
+    echo "compositor_log=$COMPOSITOR_LOG" >&2
+    tail -n 100 "$COMPOSITOR_LOG" >&2
+  fi
+  return "$result"
+}
+trap cleanup EXIT
+
+cargo build -p manifoldd -p manifold-client --bins
+cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
-nix develop --command cargo run --quiet -p manifold-wasm --example componentize -- \
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/virtual-keyboard-key.c \
+  -o "$OUT/virtual-keyboard-key" \
+  $(pkg-config --cflags --libs wayland-client xkbcommon)
+cargo run --quiet -p manifold-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
   "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
-nix develop --command cargo build \
+cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
 
-printf '[init]\nsession = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
-  "$PACKAGE/session-init.component.wasm" \
+printf '[init]\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
   "$PACKAGE/manifold_session_switcher_plugin.component.wasm" \
   "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm" \
-  >"$OUT/manifold.toml"
+  > "$CONFIG"
 
-export MANIFOLD_CONFIG="$OUT/manifold.toml"
-export MANIFOLD_SESSION_SWITCHER_CONTROLLER=1
-export MANIFOLD_SESSION_SWITCHER_OUT="$OUT"
-# The source checkout currently lacks the test subcommand carried by the
-# Nix-provided Manifold test supervisor, so use that checked tool after the
-# source binaries above have been built.
-RUST_LOG=manifoldd=info nix develop --command manifold test nested \
-  --force-outer \
-  --keep-running \
-  --out-dir "$OUT/nested" \
-  --inner-command "weston-terminal --shell=$ROOT/tools/test-session-switcher-plugin-nested.sh" \
-  > >(tee "$OUT/nested-test.stdout") 2>&1 &
-test_pid=$!
-trap 'kill "$test_pid" 2>/dev/null || true' EXIT
-
-for _ in $(seq 1 600); do
-  [[ -f "$OUT/controller.ready" ]] && break
-  sleep 0.05
-done
-test -f "$OUT/controller.ready"
-
-inner_destination="$(sed -n 's/^inner_dbus_destination=//p' "$OUT/nested-test.stdout" | tail -1)"
-outer_destination="$(sed -n 's/^outer_dbus_destination=//p' "$OUT/nested-test.stdout" | tail -1)"
-test -n "$inner_destination"
-test -n "$outer_destination"
+RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+env -u manifold_session \
+  RUST_LOG="$RUST_LOG" \
+  target/debug/manifold-sessiond \
+  --headless \
+  --no-init \
+  --no-default-modules \
+  --config "$CONFIG" \
+  --dbus-destination "$DBUS_DESTINATION" \
+  --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+  > "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
 
 ctl() {
-  RUST_LOG=off "$BIN" ctl --dbus-destination "$inner_destination" "$@"
+  env -u manifold_session target/debug/manifold ctl \
+    --dbus-destination "$DBUS_DESTINATION" \
+    --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+    "$@"
 }
 
-# The nested host carries its own Manifold shortcuts. Disable their interception
-# so this proof exercises the focused inner client's policy, just as a desktop
-# compositor with no conflicting global shortcut would.
-ctl passthrough-mode set on >/dev/null
-
-inject_key() {
-  ctl inject key "$1" pressed >/dev/null
-  ctl inject key "$1" released >/dev/null
+for _ in $(seq 1 100); do
+  ctl status > /dev/null 2>&1 && break
+  kill -0 "$SERVER_PID" 2> /dev/null || {
+    echo "ERR session server exited during startup" >&2
+    exit 1
+  }
+  sleep 0.1
+done
+ctl status > /dev/null 2>&1 || {
+  echo "ERR timed out waiting for the session server" >&2
+  exit 1
 }
 
-inject_ctrl_key() {
-  ctl inject key 37 pressed >/dev/null
-  inject_key "$1"
-  ctl inject key 37 released >/dev/null
+printf '%s\n' \
+  'xwayland disable' \
+  'output HEADLESS-1 mode 1280x720' \
+  'seat seat0 fallback true' \
+  'default_border none' \
+  'default_floating_border none' \
+  > "$SWAY_CONFIG"
+
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WLR_BACKENDS=headless \
+  WLR_HEADLESS_OUTPUTS=1 \
+  WLR_LIBINPUT_NO_DEVICES=1 \
+  sway \
+  --unsupported-gpu \
+  --config "$SWAY_CONFIG" \
+  > "$COMPOSITOR_LOG" 2>&1 &
+COMPOSITOR_PID=$!
+
+WAYLAND_SOCKET=""
+for _ in $(seq 1 100); do
+  WAYLAND_SOCKET="$(
+    find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' | head -1
+  )"
+  [[ -n "$WAYLAND_SOCKET" ]] && break
+  kill -0 "$COMPOSITOR_PID" 2> /dev/null || {
+    echo "ERR headless Sway exited during startup" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+[[ -n "$WAYLAND_SOCKET" ]] || {
+  echo "ERR timed out waiting for the Sway Wayland socket" >&2
+  exit 1
 }
 
-inject_ctrl_alt_key() {
-  ctl inject key 37 pressed >/dev/null
-  ctl inject key 64 pressed >/dev/null
-  inject_key "$1"
-  ctl inject key 64 released >/dev/null
-  ctl inject key 37 released >/dev/null
-}
+env -u manifold_session \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  WGPU_BACKEND=vulkan \
+  MANIFOLD_DMABUF_HAPPY_PATH=1 \
+  RUST_LOG="$RUST_LOG" \
+  target/debug/manifold-client \
+  --config "$CONFIG" \
+  --dbus-destination "$DBUS_DESTINATION" \
+  --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+  > "$CLIENT_LOG" 2>&1 &
+CLIENT_PID=$!
 
-inject_click() {
-  ctl inject motion "$1" "$2" >/dev/null
-  ctl inject button 272 pressed >/dev/null
-  ctl inject button 272 released >/dev/null
-}
+for _ in $(seq 1 200); do
+  if rg -q "accepted plugin draw packet" "$CLIENT_LOG" \
+    && rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG" \
+    && rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"; then
+    break
+  fi
+  kill -0 "$CLIENT_PID" 2> /dev/null || {
+    echo "ERR presentation client exited before the switcher rendered" >&2
+    exit 1
+  }
+  sleep 0.1
+done
+rg -q "accepted plugin draw packet" "$CLIENT_LOG"
+rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"
+rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
-type_keys() {
-  local key
-  for key in "$@"; do
-    inject_key "$key"
-  done
-}
+ctl surface-session new Beta > /dev/null
+ctl surface-session new Gamma > /dev/null
+ctl spawn weston-simple-shm > /dev/null
 
-ctl debug dump "$OUT/nested/sessions-initial" >/dev/null
-read -r client_x client_y client_w client_h < <(
-  python3 - "$OUT/nested/sessions-initial/state.json" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-rect = data["layout"]["active_rect"]
-print(rect["x"], rect["y"], rect["w"], rect["h"])
-PY
+for _ in $(seq 1 200); do
+  if rg -q "granted rest layout lease .* actor=workspace" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG" \
+    && rg -q "requested managed window resize .* logical_size=[0-9]+x[0-9]+" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.1
+done
+rg -q "granted rest layout lease .* actor=workspace" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+read -r SIDEBAR_WIDTH SIDEBAR_HEIGHT < <(
+  sed -n 's/.*requested managed window resize .* logical_size=\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' \
+    "$CLIENT_LOG" \
+    | tail -1
 )
+[[ -n "$SIDEBAR_WIDTH" && -n "$SIDEBAR_HEIGHT" ]]
+FULL_WIDTH=$((SIDEBAR_WIDTH + 320))
 
-# The Winit presentation is the active inner window. The switcher wrapper
-# reserves at most 45% on the right; pointer coordinates are projected back
-# into its pane-local canvas by manifold-client.
-row_x=$((client_x + 55 * client_w / 100 + 50))
-# Pick the second catalogue row in the switcher's full-height pane.
-second_row_y=$((client_y + 173 * client_h / 800))
+capture() {
+  local target="$1"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    grim "$target"
+  [[ -s "$target" ]]
+}
 
-# Vanilla config must load the workspace policy without client CLI overrides.
-# Ctrl+O spawns one real terminal in the active session.
-inject_ctrl_key 32
-for _ in $(seq 1 200); do
-  sessions_after_spawn="$(cat "$OUT/backend-sessions.json")"
-  active_windows="$(python3 - "$sessions_after_spawn" <<'PY'
-import json
-import sys
+send_toggle() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" 50
+}
 
-sessions = json.loads(sys.argv[1])["sessions"]
-print(next(session["windows"] for session in sessions if session["active"]))
-PY
-)"
-  [[ "$active_windows" == 2 ]] && break
-  sleep 0.05
+capture "$OUT/sidebar-visible.png"
+
+full_width_resizes="$(rg -c "requested managed window resize .* logical_size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+full_width_frames="$(rg -c "imported window DMA-BUF .* size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+next_full_width_resizes="$full_width_resizes"
+next_full_width_frames="$full_width_frames"
+for _ in 1 2; do
+  send_toggle
+  for _ in $(seq 1 40); do
+    next_full_width_resizes="$(rg -c "requested managed window resize .* logical_size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+    next_full_width_frames="$(rg -c "imported window DMA-BUF .* size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+    if ((next_full_width_resizes > full_width_resizes)) \
+      && ((next_full_width_frames > full_width_frames)); then
+      break 2
+    fi
+    sleep 0.05
+  done
 done
-[[ "$active_windows" == 2 ]]
+((next_full_width_resizes > full_width_resizes))
+((next_full_width_frames > full_width_frames))
+capture "$OUT/sidebar-hidden.png"
 
-# Return focus to the plugin, then prove Ctrl+J/K cycle between the two real
-# managed windows. The client logs the exact backend pane selected each time.
-input_y=$((client_y + 70 * client_h / 1600))
-inject_click "$row_x" "$input_y"
-focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
-inject_ctrl_key 44
+sidebar_resizes="$(rg -c "requested managed window resize .* logical_size=${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+sidebar_frames="$(rg -c "imported window DMA-BUF .* size=${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+send_toggle
 for _ in $(seq 1 100); do
-  next_focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
-  ((next_focus_count > focus_count)) && break
-  sleep 0.05
-done
-first_focus="$(grep 'focused backend-managed window=' "$OUT/client.log" | tail -1)"
-focus_count="$next_focus_count"
-inject_ctrl_key 44
-for _ in $(seq 1 100); do
-  next_focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
-  ((next_focus_count > focus_count)) && break
-  sleep 0.05
-done
-second_focus="$(grep 'focused backend-managed window=' "$OUT/client.log" | tail -1)"
-[[ "$first_focus" != "$second_focus" ]]
-focus_count="$next_focus_count"
-inject_ctrl_key 45
-for _ in $(seq 1 100); do
-  next_focus_count="$(grep -c 'focused backend-managed window=' "$OUT/client.log" || true)"
-  ((next_focus_count > focus_count)) && break
-  sleep 0.05
-done
-previous_focus="$(grep 'focused backend-managed window=' "$OUT/client.log" | tail -1)"
-[[ "$previous_focus" == "$first_focus" ]]
-
-# Ctrl+Alt+M focuses the visible switcher, hides it on the next invocation,
-# and restores/focuses it on the third. Capture the managed-only middle state.
-inject_ctrl_alt_key 58
-for _ in $(seq 1 100); do
-  grep -q 'focused visible presentation session switcher' "$OUT/client.log" && break
-  sleep 0.05
-done
-grep -q 'focused visible presentation session switcher' "$OUT/client.log"
-inject_ctrl_alt_key 58
-for _ in $(seq 1 100); do
-  grep -q 'hid presentation session switcher' "$OUT/client.log" && break
-  sleep 0.05
-done
-grep -q 'hid presentation session switcher' "$OUT/client.log"
-ctl debug dump "$OUT/nested/switcher-hidden" >/dev/null
-inject_ctrl_alt_key 58
-for _ in $(seq 1 100); do
-  grep -q 'showed presentation session switcher' "$OUT/client.log" && break
-  sleep 0.05
-done
-grep -q 'showed presentation session switcher' "$OUT/client.log"
-
-for _ in $(seq 1 200); do
-  # Winit may still be processing the configure generated by the debug dump;
-  # retrying the idempotent activation also proves focus can return from the
-  # managed pane to the plugin pane.
-  inject_click "$row_x" "$second_row_y"
-  status_after_switch="$(cat "$OUT/backend-status")"
-  grep -q 'active_surface_session=2' <<<"$status_after_switch" && break
-  sleep 0.05
-done
-grep -q 'active_surface_session=2' <<<"$status_after_switch"
-
-# Type an unmatched query and let Enter create it. XKB keycodes spell delta.
-inject_click "$row_x" "$input_y"
-type_keys 40 26 46 28 38
-inject_key 36
-for _ in $(seq 1 200); do
-  sessions_after_create="$(cat "$OUT/backend-sessions.json")"
-  grep -q '"name":"delta"' <<<"$sessions_after_create" && break
-  sleep 0.05
-done
-grep -q '"name":"delta"' <<<"$sessions_after_create"
-
-# Rename the selected new session through the plugin's F2 editor.
-inject_click "$row_x" "$input_y"
-inject_key 68
-for _ in $(seq 1 5); do inject_key 22; done
-type_keys 32 58 26 42 38
-inject_key 36
-for _ in $(seq 1 200); do
-  sessions_after_rename="$(cat "$OUT/backend-sessions.json")"
-  grep -q '"name":"omega"' <<<"$sessions_after_rename" && break
-  sleep 0.05
-done
-grep -q '"name":"omega"' <<<"$sessions_after_rename"
-ctl debug dump "$OUT/nested/sessions-renamed" >/dev/null
-
-# Delete closes the selected session and the catalogue reconciles to three.
-inject_key 119
-for _ in $(seq 1 200); do
-  sessions_after_close="$(cat "$OUT/backend-sessions.json")"
-  if ! grep -q '"name":"omega"' <<<"$sessions_after_close" \
-    && [[ "$(grep -o '"id":' <<<"$sessions_after_close" | wc -l)" == 3 ]]; then
+  next_sidebar_resizes="$(rg -c "requested managed window resize .* logical_size=${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+  next_sidebar_frames="$(rg -c "imported window DMA-BUF .* size=${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+  if ((next_sidebar_resizes > sidebar_resizes)) \
+    && ((next_sidebar_frames > sidebar_frames)); then
     break
   fi
   sleep 0.05
 done
-! grep -q '"name":"omega"' <<<"$sessions_after_close"
-[[ "$(grep -o '"id":' <<<"$sessions_after_close" | wc -l)" == 3 ]]
+((next_sidebar_resizes > sidebar_resizes))
+((next_sidebar_frames > sidebar_frames))
+capture "$OUT/sidebar-restored.png"
 
-{
-  printf '# Native session switcher proof\n\n'
-  printf '%s\n' '- initial catalogue: three sessions rendered in a client-realm plugin pane'
-  printf '%s\n' "- vanilla Ctrl+O spawn: $sessions_after_spawn"
-  printf '%s\n' "- Ctrl+J first focus: $first_focus"
-  printf '%s\n' "- Ctrl+J second focus: $second_focus"
-  printf '%s\n' "- Ctrl+K previous focus: $previous_focus"
-  printf '%s\n' '- Ctrl+Alt+M: focus, hide, and restore completed'
-  printf '%s\n' "- pointer switch: $status_after_switch"
-  printf '%s\n' "- create: $sessions_after_create"
-  printf '%s\n' "- rename: $sessions_after_rename"
-  printf '%s\n' "- close: $sessions_after_close"
-  printf '%s\n' "- initial screenshot: $OUT/nested/sessions-initial/composed.png"
-  printf '%s\n' "- switcher-hidden screenshot: $OUT/nested/switcher-hidden/composed.png"
-  printf '%s\n' "- renamed screenshot: $OUT/nested/sessions-renamed/composed.png"
-} >"$OUT/proof.md"
+python3 - "$OUT/sidebar-visible.png" "$OUT/sidebar-hidden.png" "$OUT/sidebar-restored.png" <<'PY'
+import pathlib
+import subprocess
+import sys
 
-touch "$OUT/controller.stop"
-for _ in $(seq 1 300); do
-  [[ -f "$OUT/controller.done" ]] && break
-  sleep 0.05
-done
-test -f "$OUT/controller.done"
+for value in sys.argv[1:]:
+    path = pathlib.Path(value)
+    data = path.read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 4096:
+        raise SystemExit(f"invalid graphical proof: {path}")
+    colors = int(subprocess.check_output(["magick", str(path), "-format", "%k", "info:"]))
+    if colors < 50:
+        raise SystemExit(f"graphical proof has too little rendered content: {path} colors={colors}")
 
-RUST_LOG=off "$BIN" ctl --dbus-destination "$inner_destination" quit >/dev/null || true
-RUST_LOG=off "$BIN" ctl --dbus-destination "$outer_destination" quit >/dev/null || true
-wait "$test_pid" || true
-trap - EXIT
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[2], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.02:
+    raise SystemExit(f"visible and hidden sidebar captures are too similar: RMSE={normalized}")
+print(f"sidebar_capture_rmse={normalized:.6f}")
+PY
 
-grep -q 'started presentation WASM actor id=session-switcher' "$OUT/client.log"
-grep -q 'loaded presentation key policy provider=workspace' "$OUT/client.log"
-grep -q 'granted claimed root layout lease actor=session-switcher' "$OUT/client.log"
-grep -q 'granted rest layout lease .* actor=workspace' "$OUT/client.log"
-grep -q 'accepted leased actor layout .* panes=3' "$OUT/client.log"
-grep -q 'requested managed window resize .* logical_size=320x800' "$OUT/client.log"
-! grep -q 'rejected actor-submitted layout' "$OUT/client.log"
-grep -q 'presentation session snapshot revision=.*sessions=3' "$OUT/client.log"
-grep -q 'operation=Create success=true' "$OUT/client.log"
-grep -q 'operation=Rename success=true' "$OUT/client.log"
-grep -q 'operation=Close success=true' "$OUT/client.log"
-test -s "$OUT/nested/sessions-initial/composed.png"
-test -s "$OUT/nested/switcher-hidden/composed.png"
-test -s "$OUT/nested/sessions-renamed/composed.png"
-test "$(magick "$OUT/nested/sessions-renamed/composed.png" -format '%k' info:)" -gt 50
-test "$(magick "$OUT/nested/switcher-hidden/composed.png" -format '%k' info:)" -gt 50
+STATUS="$(ctl status)"
+rg -q "presentation=Attached" <<< "$STATUS"
+rg -q "accepted leased actor layout .* panes=1" "$CLIENT_LOG"
+rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
+if rg -q "rejected actor-submitted layout|ignored stale layout result" "$CLIENT_LOG"; then
+  echo "ERR client rejected a recursive layout update" >&2
+  exit 1
+fi
 
-echo "session_switcher_nested=verified proof=$OUT/proof.md initial=$OUT/nested/sessions-initial/composed.png renamed=$OUT/nested/sessions-renamed/composed.png"
+cat > "$OUT/proof.md" <<EOF
+# Recursive session-switcher proof
+
+- backend: headless frame exporter, no presenter and no backend layout
+- input: real Ctrl+Alt+M events through the focused external Winit client
+- recursive ownership: session-switcher root lease delegates its rest slot to workspace
+- visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
+- hidden: managed pane resized to ${FULL_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment
+- restored: managed pane returned to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}
+- captures: sidebar-visible.png, sidebar-hidden.png, sidebar-restored.png
+- status: $STATUS
+EOF
+
+ctl quit > /dev/null 2>&1 || true
+echo "session_switcher_recursive=verified"
+echo "proof=$OUT/proof.md"
+echo "visible=$OUT/sidebar-visible.png"
+echo "hidden=$OUT/sidebar-hidden.png"
+echo "restored=$OUT/sidebar-restored.png"

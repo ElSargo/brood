@@ -1,13 +1,11 @@
 # WASM harness lifecycle proof plugin
 
-This core-WASM harness is the controller used by
-`tools/test-wasm-harness-lifecycle-nested.sh`. It starts a real animated EGL
-client and interactive terminal through the harness control import, waits until
-the outer compositor visibly contains both clients beside the nested
-presentation, then blocks on the named-signal import. The acceptance script
-either releases the harness to complete normally or quits the supervisor while
-the harness is blocked to prove cancellation and owned-child cleanup.
+This core-WASM harness starts a real animated EGL client and interactive
+terminal through the harness control import, then blocks on the named-signal
+import. A lifecycle acceptance test either releases the harness to complete
+normally or quits the supervisor while it is blocked to prove cancellation and
+owned-child cleanup.
 
-The screenshot and daemon transcript are the proof. The guest's integer return
-code is only the harness protocol outcome; it is not treated as the behavioral
-evidence.
+Presentation evidence must come from an external `manifold-client`; daemon
+state is only lifecycle and transport evidence. The guest's integer return code
+is only the harness protocol outcome and is not behavioral proof by itself.

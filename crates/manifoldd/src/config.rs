@@ -15,8 +15,6 @@ pub struct ManifoldConfig {
     #[serde(default)]
     session: SessionConfig,
     #[serde(default)]
-    layout: LayoutConfig,
-    #[serde(default)]
     module: BTreeMap<String, ModuleConfig>,
     #[serde(default)]
     startup: BTreeMap<String, StartupAppConfig>,
@@ -25,11 +23,6 @@ pub struct ManifoldConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 struct SessionConfig {
     runner: Option<SessionRunnerConfig>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct LayoutConfig {
-    auto_split_visible_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -165,18 +158,14 @@ struct StartupAppConfig {
 enum StartupRealm {
     #[default]
     Session,
-    Presentation,
 }
 
-pub fn load_runtime_settings(state: &mut Manifold, config_path: &Path) -> Result<()> {
+pub fn load_runtime_settings(_state: &mut Manifold, config_path: &Path) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
     }
 
-    let config = read_config(config_path)?;
-    if let Some(limit) = config.layout.auto_split_visible_limit {
-        state.set_native_auto_split_visible_limit(limit);
-    }
+    read_config(config_path)?;
     Ok(())
 }
 
@@ -320,17 +309,7 @@ fn runtime_io_capabilities(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartupAppFilter {
-    All,
-    PresentationOnly,
-}
-
-pub fn load_startup_apps(
-    state: &mut Manifold,
-    config_path: &Path,
-    filter: StartupAppFilter,
-) -> Result<()> {
+pub fn load_startup_apps(state: &mut Manifold, config_path: &Path) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
     }
@@ -348,20 +327,9 @@ pub fn load_startup_apps(
         }
         let argv = resolve_startup_argv(config_dir, &app.argv);
         match app.realm {
-            StartupRealm::Session if filter == StartupAppFilter::All => state
+            StartupRealm::Session => state
                 .spawn_hosted_app_argv(&argv)
                 .with_context(|| format!("spawn config startup app {id}"))
-                .map(|_| ())?,
-            StartupRealm::Session => {
-                info!(
-                    startup_app = %id,
-                    "skipping session startup app because no startup surface session exists"
-                );
-                continue;
-            }
-            StartupRealm::Presentation => state
-                .spawn_presentation_app_argv(&argv)
-                .with_context(|| format!("spawn config presentation startup app {id}"))
                 .map(|_| ())?,
         }
         info!(startup_app = %id, realm = ?app.realm, argv = ?argv, "spawned config startup app");

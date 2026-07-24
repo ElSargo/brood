@@ -35,10 +35,6 @@ PRESENTATION_SESSION = "presentation"
 WORKTREE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def metadata(**items):
-    return dbus.Dictionary({key: str(value) for key, value in items.items()}, signature="ss")
-
-
 def write_status(path, **items):
     if not path:
         return
@@ -69,10 +65,6 @@ class ManifoldBus:
         self.session = dbus.Interface(
             self.bus.get_object(self.destination, "/org/manifold/Session"),
             "org.manifold.Session",
-        )
-        self.extension = dbus.Interface(
-            self.bus.get_object(self.destination, "/org/manifold/Extension"),
-            "org.manifold.Extension",
         )
         self.compositor = dbus.Interface(
             self.bus.get_object(self.destination, "/org/manifold/Compositor"),
@@ -249,54 +241,6 @@ class ManifoldBus:
             raise RuntimeError(response.strip())
         return response.strip()
 
-    def register_sidebar(self, width):
-        extension_id = self.extension.RegisterExtension(
-            "session-switcher",
-            metadata(name="manifold-session-switcher", toolkit="gtk-libadwaita"),
-        )
-        window_id = self.compositor.RegisterWindow(
-            extension_id,
-            metadata(pid=os.getpid()),
-            "session-switcher",
-        )
-        replaced = self.compositor.ReplaceRole(
-            window_id,
-            "presentation.session-switcher",
-            metadata(dismiss_replaced="true"),
-        )
-        membership_grant = self.compositor.RequestPresentationMembership(
-            window_id,
-            metadata(audience="Presentation"),
-        )
-        placement_grant = self.compositor.RequestPlacement(
-            window_id,
-            metadata(
-                mode="sidebar",
-                edge="left",
-                audience="Presentation",
-                width=width,
-                visible="true",
-            ),
-        )
-        try:
-            shortcut_grant = self.compositor.RequestShortcut(
-                extension_id,
-                "Ctrl+Alt+M",
-                "Presentation",
-                "Focus session switcher",
-            )
-        except dbus.DBusException as err:
-            shortcut_grant = f"ungranted:{err.get_dbus_name()}"
-        return (
-            extension_id,
-            window_id,
-            replaced,
-            membership_grant,
-            placement_grant,
-            shortcut_grant,
-        )
-
-
 class SessionSwitcher:
     def __init__(self, args):
         self.args = args
@@ -315,7 +259,6 @@ class SessionSwitcher:
         self.notification_tokens = {}
         self.activated_notifications = set()
         self.animation_tick = 0
-        self.registered = False
         self.last_error = None
 
     def run(self):
@@ -327,7 +270,7 @@ class SessionSwitcher:
             self.setup_notifications()
             self.refresh_sessions()
             self.refresh_statuses()
-            self.register_with_manifold()
+            self.mark_ready()
             self.present_window()
             GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
             GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
@@ -356,7 +299,7 @@ class SessionSwitcher:
         self.setup_notifications()
         self.refresh_sessions()
         self.refresh_statuses()
-        self.register_with_manifold()
+        self.mark_ready()
         self.present_window()
         GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
         GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
@@ -572,39 +515,14 @@ class SessionSwitcher:
         else:
             box.pack_start(child, expand, expand, 0)
 
-    def register_with_manifold(self):
-        if not self.should_register_sidebar():
-            write_status(
-                self.args.ready_file,
-                ready="true",
-                pid=os.getpid(),
-                sidebar_registered="false",
-                manifold_session=os.environ.get(MANIFOLD_SESSION_ENV, ""),
-            )
-            return False
-
-        try:
-            extension_id, window_id, replaced, membership, placement, shortcut = (
-                self.bus.register_sidebar(self.args.width)
-            )
-            self.registered = True
-            write_status(
-                self.args.ready_file,
-                ready="true",
-                pid=os.getpid(),
-                extension_id=extension_id,
-                window_id=window_id,
-                replaced=replaced,
-                membership_grant=membership,
-                placement_grant=placement,
-                shortcut_grant=shortcut,
-            )
-        except Exception as err:
-            write_status(self.args.ready_file, ready="false", error=err)
+    def mark_ready(self):
+        write_status(
+            self.args.ready_file,
+            ready="true",
+            pid=os.getpid(),
+            manifold_session=os.environ.get(MANIFOLD_SESSION_ENV, ""),
+        )
         return False
-
-    def should_register_sidebar(self):
-        return bool(os.environ.get(MANIFOLD_SESSION_ENV) or os.environ.get("MANIFOLD_SURFACE_SESSION_ID"))
 
     def refresh_sessions(self):
         try:

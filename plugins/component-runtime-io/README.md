@@ -11,11 +11,7 @@ Stream, child, and timer readiness all use the ordinary notification,
 pollable, and `worker-wait-any` path; the plugin has no category-specific wait
 function.
 
-Run both backend proofs through the offscreen nested harness with:
-
-```sh
-nix develop --command tools/test-runtime-io-plugins-nested.sh
-```
-
-The same workload records the independent Preview 1 transcript and the local
-peer's request/response log, so the guest and peer observations can be compared.
+The Component and Preview 1 variants record independent transcripts and the
+local peer's request/response log, so the guest and peer observations can be
+compared. These are server-runtime workloads and do not require a presentation
+target.

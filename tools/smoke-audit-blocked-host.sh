@@ -32,7 +32,7 @@ if [[ "$RC" == "0" ]]; then
   exit 1
 fi
 
-for check in cargo_fmt cargo_check cargo_test headless_wayland_globals headless_native_client headless_input_forwarding headless_control_errors headless_status_json headless_status_parity headless_client_exit headless_multi_client headless_multi_client_input_focus headless_attach_diagnostics headless_frontend_close_idempotent headless_repeated_attach_failure startup_attach_fallback dmabuf_status_validator dmabuf_backend_classifier; do
+for check in cargo_fmt cargo_check cargo_test headless_wayland_globals headless_native_client headless_input_forwarding headless_control_errors headless_status_json headless_status_parity headless_client_exit headless_multi_client headless_multi_client_input_focus dmabuf_status_validator dmabuf_backend_classifier; do
   grep -q "^check=$check result=pass rc=0 " "$LOG" || {
     echo "ERR expected $check to pass before host block" >&2
     tail -160 "$LOG" >&2 || true
@@ -40,7 +40,7 @@ for check in cargo_fmt cargo_check cargo_test headless_wayland_globals headless_
   }
 done
 
-for req in rust_baseline nested_wayland_globals native_wayland_client_nesting input_forwarding close_frontend_keep_client_alive dmabuf_validator_logic; do
+for req in rust_baseline nested_wayland_globals native_wayland_client_nesting input_forwarding dmabuf_validator_logic; do
   grep -q "^requirement=$req result=pass " "$LOG" || {
     echo "ERR expected requirement $req to pass in blocked-host audit" >&2
     tail -160 "$LOG" >&2 || true
@@ -48,7 +48,7 @@ for req in rust_baseline nested_wayland_globals native_wayland_client_nesting in
   }
 done
 
-for req in frontend_window_rendering reopen_frontend_resume_client low_latency_cadence dmabuf_advertisement_correctness positive_dmabuf_import positive_explicit_sync_fences; do
+for req in frontend_window_rendering close_frontend_keep_client_alive reopen_frontend_resume_client low_latency_cadence dmabuf_advertisement_correctness positive_dmabuf_import positive_explicit_sync_fences; do
   grep -q "^requirement=$req result=blocked .*host display unavailable before full audit" "$LOG" || {
     echo "ERR expected requirement $req to be host-blocked" >&2
     tail -160 "$LOG" >&2 || true

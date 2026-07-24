@@ -90,28 +90,10 @@ STATUS1="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] &&
 require_field_ge "$STATUS1" shm_formats 2
 require_field_ge "$STATUS1" windows 1
 require_field_ge "$STATUS1" commits 1
-COMMITS1="$(field "$STATUS1" commits)"
-
-ctl inject center-motion > /dev/null
-STATUS_TARGET="$(wait_status '[[ "$(field "$status" pointer_motion_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_motion_events)" >= 1 )) && [[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 1 ))')"
-require_field_ge "$STATUS_TARGET" pointer_target_hits 1
-
-ctl attach > /dev/null
-
-STATUS2="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 1 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= COMMITS1 )) && [[ "$(field "$status" presentation_attach_failures)" =~ ^[0-9]+$ ]] && (( "$(field "$status" presentation_attach_failures)" >= 1 )) && [[ "$(field "$status" presentation_runtime_failures)" == "0" ]] && [[ "$(field "$status" presentation_last_error)" != "none" ]]')"
-require_field_ge "$STATUS2" windows 1
-require_field_ge "$STATUS2" commits "$COMMITS1"
-require_field_ge "$STATUS2" presentation_attach_failures 1
-[[ "$(field "$STATUS2" presentation_runtime_failures)" == "0" ]] || {
-  echo "ERR failed attach should not count as runtime redraw failure: $STATUS2" >&2
-  exit 1
-}
 
 echo "OK headless native-client smoke passed"
 echo "client=$CLIENT"
 echo "status_mapped=$STATUS1"
-echo "status_targeted=$STATUS_TARGET"
-echo "status_after_failed_attach=$STATUS2"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 

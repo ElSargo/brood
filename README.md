@@ -2,7 +2,11 @@
 
 Manifold is a new workspace project for a persistent, graphical developer environment.
 
-The core idea is a local virtual workspace containing isolated sessions. A local session process owns durable session state and can open a native presentation window. The presentation window is not a remote framebuffer viewer. It is a compositor endpoint that presents one session at a time, showing any number of that session's panes with presentation-surface-owned layout, animation, and interaction.
+The core idea is a local virtual workspace containing isolated sessions. A
+session server owns durable state and hosted applications; an independent
+presentation client opens the native viewport. The client is not a remote
+framebuffer viewer. It imports individual pane surfaces and owns recursive
+layout, composition, interaction, and presentation-local plugins.
 
 ## Thesis
 
@@ -23,21 +27,24 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 
 ## Current Status
 
-This repository now contains a v1 compositor proof of concept in `manifold`.
+This repository contains a split session-server and presentation-client proof
+of concept.
 
 The current PoC can:
 
 - expose a nested Wayland compositor socket
 - launch and map hosted Wayland apps
-- open a Winit/GLES presentation window and render nested Wayland clients
+- open an independent Winit/WGPU presentation client and render nested Wayland clients
 - forward keyboard, pointer, button, and axis input
-- close/detach the presentation window while hosted Wayland apps keep running
-- reattach the presentation window and resume the nested window
+- close the presentation client while hosted Wayland apps keep running
+- reconnect a new presentation client to the surviving session
+- compose client-local plugin panes and managed panes through recursive layout leases
 - report frame cadence, input-to-frame latency, client commits, frame callbacks, dmabuf state, and explicit-sync state
 - run async core-WASM behavior harnesses through `manifold run --test-harness`
-- orchestrate nested Manifold-in-Manifold tests through `manifold test nested`
 
-The intended default behavior-testing mode is nested Manifold-in-Manifold execution with outer-instance capture and full-path input driving. The built-in `manifold test` command defaults to that mode. When it is launched from inside an existing Manifold session, it reuses that session as the outer container and starts only the subject instance.
+Graphical behavior tests start a headless server and a real external
+`manifold-client`, then drive and capture that client through a headless Wayland
+compositor. The backend is never used as an outer presentation container.
 
 ## Common Commands
 
@@ -51,13 +58,9 @@ By default the CLI starts `manifold-client`. The client connects to the default
 session server, starts `manifold-sessiond` when necessary, performs a protocol
 handshake, and then opens its WGPU presentation window.
 
-Run the session service without attaching it to a desktop presentation:
-
-```sh
-nix develop --command cargo run -- run --headless
-```
-
-`run --headless` remains available for service managers and explicit server development.
+The session service is always usable without a presentation client. Service
+managers and backend development invoke `manifold-sessiond`; exact command
+options remain defined by the CLI parser.
 
 The repo includes `flake.nix`, and checked-in development workflows should prefer it for builds and tests. Its default package is the Manifold app; heavier development environments are exposed through explicit `full` outputs.
 
@@ -78,20 +81,15 @@ For the larger toolbox with Docker, Go, Firefox, and smoke tools:
 nix run github:ElSargo/manifold#dev-workflow-full
 ```
 
-Useful variants:
-
-```sh
-nix develop --command cargo run -- check
-nix develop --command cargo run -- run --no-default-modules
-nix develop --command cargo run -- run --config ./manifold.toml
-nix develop --command cargo run -- ctl status-json
-```
+For exact runtime, validation, and control commands, see the
+[CLI reference pointers](docs/reference/cli.md).
 
 Run `./tools/audit-v1-capabilities.sh` for the current acceptance audit. It runs the supported v1 smoke suite and separately checks positive dmabuf import plus strict explicit-sync validation. On a backend without importable dmabuf formats, those positive checks skip with `rc=77`. On a DRM-capable backend, run `MANIFOLD_AUDIT_REQUIRE_NO_SKIPS=1 ./tools/audit-v1-capabilities.sh` to make those skips fail the audit.
 
 The session server uses Smithay and Wasmtime. The presentation client uses WGPU,
-and shared CLI/DBus types live in `manifold-cli`. Durable presentation transport
-and rendering beyond the initial handshake and window remain open.
+and shared CLI/DBus types live in `manifold-cli`. Local transport carries
+per-window frames and bounded input/configuration lanes; viewport placement
+never crosses that boundary.
 
 ## Docs
 

@@ -3,16 +3,16 @@
 //! Compositor protocol wiring lives in `compositor`; this module owns process
 //! threads, startup policy, the calloop drive loop, and ordered shutdown.
 
-use std::{env, path::PathBuf, thread};
+use std::{env, thread};
 
 use anyhow::{Context, Result, anyhow, bail};
 use manifold_wasm::{TestHarnessOutcomeKind, TestHarnessRuntime};
 use smithay::reexports::{calloop::EventLoop, wayland_server::Display};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV, RunArgs, SessionArgs,
-    browser::BrowserLaunchOptions, config, control, presentation, session_runner, state::Manifold,
+    browser::BrowserLaunchOptions, config, control, frame_export, session_runner, state::Manifold,
 };
 
 pub fn run(args: RunArgs) -> Result<()> {
@@ -99,6 +99,7 @@ fn configure_session(
     runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     state.set_async_runtime(runtime.clone());
+    frame_export::initialize(state).context("initialize headless frame exporter")?;
     state.test_surface_markers = args.test_surface_markers;
     let config_path = args
         .config
@@ -133,10 +134,6 @@ fn configure_session(
         state.replace_wasm_plugin(path)?;
         info!(path = %path.display(), "loaded CLI WASM plugin");
     }
-    if let Some((provider, path)) = cli_policy_arg(args.wasm_key_policy.as_deref())? {
-        state.replace_wasm_global_key_policy(&path, &provider)?;
-        info!(provider, path = %path.display(), "loaded CLI WASM key policy");
-    }
     if let Some(path) = args.test_harness.as_deref() {
         state.install_test_harness(TestHarnessRuntime::start(path)?)?;
         info!(path = %path.display(), "loaded CLI test harness");
@@ -147,15 +144,8 @@ fn configure_session(
     )?;
 
     print_session_environment(state, &control_target);
-    attach_initial_presentation(event_loop, state, args);
-
-    if legacy_startup {
-        let filter = if args.no_initial_surface_session {
-            config::StartupAppFilter::PresentationOnly
-        } else {
-            config::StartupAppFilter::All
-        };
-        config::load_startup_apps(state, &config_path, filter)?;
+    if legacy_startup && !args.no_initial_surface_session {
+        config::load_startup_apps(state, &config_path)?;
     }
     if let Some(command) = args.command.as_ref() {
         state.spawn_hosted_app(command)?;
@@ -188,34 +178,9 @@ fn print_session_environment(state: &Manifold, target: &control::ControlTarget) 
     }
 }
 
-fn attach_initial_presentation(
-    event_loop: &EventLoop<'static, Manifold>,
-    state: &mut Manifold,
-    args: &SessionArgs,
-) {
-    let result = if args.offscreen_presentation {
-        presentation::attach_offscreen(&event_loop.handle(), state)
-    } else if args.headless {
-        return;
-    } else {
-        presentation::attach(&event_loop.handle(), state)
-    };
-    if let Err(err) = result {
-        warn!(
-            ?err,
-            "failed to attach initial presentation; continuing detached"
-        );
-        state.record_presentation_attach_failure(&err.to_string());
-    }
-}
-
 fn service_runtime_tick(state: &mut Manifold) {
     state.service_test_harness();
     state.service_realm_init_actor();
-    if state.attach_requested && !state.presentation_started && !state.attach_schedule_pending {
-        state.attach_schedule_pending = true;
-        state.schedule_attach();
-    }
 }
 
 fn report_harness_completion(state: &Manifold) -> Result<()> {
@@ -238,14 +203,4 @@ fn report_harness_completion(state: &Manifold) -> Result<()> {
         );
     }
     Ok(())
-}
-
-pub fn cli_policy_arg(values: Option<&[String]>) -> Result<Option<(String, PathBuf)>> {
-    let Some(values) = values else {
-        return Ok(None);
-    };
-    let [provider, path] = values else {
-        bail!("WASM policy arguments require NAME and PATH");
-    };
-    Ok(Some((provider.clone(), PathBuf::from(path))))
 }

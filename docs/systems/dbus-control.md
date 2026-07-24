@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-13
+last-reviewed: 2026-07-24
 code-links:
   - crates/manifoldd/src/control.rs
   - crates/manifoldd/src/browser.rs
@@ -11,7 +11,9 @@ code-links:
 
 # DBus And Control
 
-Manifold exposes DBus interfaces for control, session management, extension registration, status publication, agent rows, compositor activation, and notification forwarding.
+Manifold exposes DBus interfaces for server discovery and presentation
+bootstrap, session management, external tool registration, status publication,
+agent rows, and notification forwarding.
 
 Exact method signatures are defined in `crates/manifoldd/src/control.rs`.
 
@@ -33,14 +35,14 @@ Common control requests include status, status-json, spawn, spawn-in-session, fo
 Raw argv and JSON requests cross one fallible parsing boundary before they can
 mutate compositor state. Command-specific parsers produce typed commands,
 validate exact arity, and reject ambiguous option forms; execution code does
-not interpret positional token indexes. `tools/test-typed-control-parser-nested.sh`
-exercises both encodings in the offscreen nested harness and records the exact
-rejections alongside a real Component actor loaded through the typed `plug`
-command.
+not interpret positional token indexes. Parser unit tests cover both encodings
+and exact rejection behavior.
 
-## Host Activation
+## Presentation Bootstrap
 
-Presentation focusing can use activation-token-aware compositor calls where available. The switcher app uses the compositor DBus surface to avoid stealing focus incorrectly after session changes.
+DBus may discover or start the session server and exchange descriptors for the
+local presentation protocol. Viewport focus, placement, membership, layout, and
+switcher visibility are not daemon DBus operations.
 
 ## Session Bus Services
 
@@ -72,14 +74,11 @@ only a body and signature obtained from the same successfully parsed zbus
 message. The two zbus unsafe constructors remain private to these audited
 helpers; routing code operates on typed `Message` values.
 
-`tools/test-typed-session-bus-nested.sh` exercises those layers through the
-built-in offscreen nested supervisor. The real GTK session switcher visibly
-shows two surface sessions, clients on their distinct realm addresses observe
-different ownership for the same service name, and four managed Python DBus
-clients exchange introspection, properties, methods, replies, and signals. The
-last client sends a substantive notification through its ordinary managed
-session bus and records the real host notification id in a readable transcript
-beside the rendered screenshot.
+Session-bus proofs use clients on distinct realm addresses. They observe
+different ownership for the same service name, exchange introspection,
+properties, methods, replies, and signals, and route a substantive notification
+through the managed session bus. These proofs do not depend on presentation
+placement.
 
 ## Related Pages
 

@@ -103,25 +103,15 @@ STATUS1="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] &&
 require_field_ge "$STATUS1" windows 1
 require_field_ge "$STATUS1" commits 1
 
-ctl inject center-motion > /dev/null
-ctl inject button 272 pressed > /dev/null
-ctl inject button 272 released > /dev/null
-STATUS_FOCUSED="$(wait_status '[[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 3 )) && [[ "$(field "$status" pointer_button_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_button_events)" >= 2 ))')"
-require_field_ge "$STATUS_FOCUSED" pointer_target_hits 3
-require_field_ge "$STATUS_FOCUSED" pointer_button_events 2
-
 CLIENT_PID="$(cat "$CLIENT_PIDFILE")"
 kill "$CLIENT_PID"
 sleep 0.5
 
-STATUS2="$(wait_status '[[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 0 )) && [[ "$(field "$status" window_lifecycle_focus_clears)" =~ ^[0-9]+$ ]] && (( "$(field "$status" window_lifecycle_focus_clears)" >= 1 ))')"
-require_field_ge "$STATUS2" focus_clears 1
-require_field_ge "$STATUS2" window_lifecycle_focus_clears 1
+STATUS2="$(wait_status '[[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 0 ))')"
 
 echo "OK headless client-exit smoke passed"
 echo "client_pid=$CLIENT_PID"
 echo "status_mapped=$STATUS1"
-echo "status_focused=$STATUS_FOCUSED"
 echo "status_after_exit=$STATUS2"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"

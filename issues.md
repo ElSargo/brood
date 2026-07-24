@@ -13,14 +13,10 @@ warnings without pretending these areas are already structurally clean.
   tasks run; invalid candidates leave the old names and actors reachable. Typed
   `pane-mapped` and `layout-state` marker exports are validated and routed only
   to declared subscribers, while direct actor messages share the public actor
-  namespace. The real `wasm-actor-lifecycle-proof` plugin and
-  `tools/test-wasm-actor-lifecycle-nested.sh` render a terminal and animated EGL
-  client in columns, reject a deliberately broken second actor while a mailbox
-  probe proves the old generation remains responsive, then hot-reload the same
-  actor names and visibly render the same two clients in rows. Its unsubscribed
-  poison actor would spawn an obvious third pane if broadcast routing returned;
-  all three compositor captures retain exactly two panes, and the daemon log
-  records both actors joined at replacement and final shutdown. Event marker
+  namespace. Actor replacement tests reject a deliberately broken second actor
+  while a mailbox probe proves the old generation remains responsive, then
+  hot-reload the same actor names. The runtime records both actors joined at
+  replacement and final shutdown. Event marker
   subscriptions currently describe core-module actors; Component and Preview 1
   actors remain message-driven until their manifests gain an event-declaration
   surface.
@@ -31,14 +27,11 @@ warnings without pretending these areas are already structurally clean.
   before instantiation and `run()` close early-cancellation races; and a lost
   lifecycle channel becomes a failed completion. Ordered daemon shutdown
   records the cleanup outcome before the Tokio runtime is dropped, while the
-  destructor remains a hard-join fallback. The real
-  `wasm-harness-lifecycle-proof` plugin and
-  `tools/test-wasm-harness-lifecycle-nested.sh` provide two visible three-pane
-  workloads with an animated EGL client, terminal, and nested presentation.
-  One receives a real named signal, performs a final host request, returns pass,
-  and joins without cancellation. The other stays blocked in the signal import
-  while the controller captures it, then supervisor shutdown wakes, interrupts,
-  and joins the exact child without inventing a guest completion. Native module
+  destructor remains a hard-join fallback. Harness lifecycle tests cover one
+  child receiving a named signal, performing a final host request, returning,
+  and joining without cancellation. Another stays blocked in the signal import
+  until shutdown wakes, interrupts, and joins the exact child without inventing
+  a guest completion. Native module
   compilation is joined rather than forcibly preempted mid-compilation.
 - The named `wasm_key.rs` premise was stale after the prototype moved into the
   policy-provider runtime, but the remaining invocation boundary is now fully
@@ -66,25 +59,18 @@ warnings without pretending these areas are already structurally clean.
   replies, and two signal hops. The last client sends a substantive
   notification over its managed session bus, and the transcript records the
   real notification ID returned by the host desktop service.
-- Unsafe renderer, SHM, DBus-wire, and calloop access now sits behind narrow
+- Unsafe frame export, SHM, DBus-wire, and calloop access now sits behind narrow
   audited helpers with typed owners and documented lifetime, alignment, and
-  validity invariants. Winit/EGL/GBM/Wayland handles cannot escape the presenter
-  adapter; Smithay display dispatch is one state-layer helper; SHM capture
+  validity invariants. EGL/GBM handles cannot escape the frame exporter;
+  Smithay display dispatch is one state-layer helper; SHM upload
   validates dimensions, offset, stride, mapped span, complete pixels, and alpha
   policy before slice-only conversion; and DBus frames validate endian,
   alignment, exact length, checked arithmetic, and a 128 MiB ceiling before the
   two private zbus raw constructors. Broad unsafe/index allowances are gone,
   with malformed, short, zero-size/stride, overflow, padded-row, and alpha
-  fixtures covering non-observable seams. The real geometry plugin proves the
-  visible path in `tools/test-safe-boundaries-nested.sh`: it splits a terminal
-  and animated SHM client, the offscreen Winit/EGL frame is captured, the debug
-  manifest records both surfaces, and a substantive “Audited boundaries
-  crossed” notification traverses the isolated realm bus to the host desktop
-  service and returns its real notification ID. The manifest honestly records
-  `no_current_buffer` because Smithay consumes transient `BufferAssignment`
-  state before a later debug request; that SHM mapping boundary is therefore
-  accepted through deterministic fixtures rather than a fabricated plugin
-  result.
+  fixtures covering non-observable seams. External-client graphical checks
+  cover the visible upload path; deterministic fixtures cover transient
+  Smithay buffer-assignment boundaries.
 - The launch-context issue's preview premise was stale: repository history
   confirms launch records have always been lossless transport data and no
   environment-preview bound or truncation function exists. The real
@@ -107,49 +93,31 @@ warnings without pretending these areas are already structurally clean.
   allowances are gone, capture dimensions are fallible, hit rectangles and
   split arithmetic cannot overflow, and boundary tests cover fractional values,
   the full signed range, NaN/infinities, zero and tiny scales, and host-size
-  overflow. The current `workspace` actor in `plugins/default-workspace` is the
-  observable plugin proof through `tools/test-geometry-conversions-nested.sh`:
-  it receives state through its mailbox and emits a typed `SetResolvedLayout`
-  through its host outbox for two real 640x800 panes, after which global input at
-  `(960,400)` visibly reaches Weston eventdemo at local `(320,400)`. The client
-  records motion, press/release, wheel value 15, and fractional scroll 7.5,
-  while compositor metrics record six target hits, zero misses, and the
-  screenshot shows the terminal/eventdemo split and eventdemo input region.
-- Smithay protocol wiring, product runtime startup, and built-in nested-test
-  orchestration now live in separate compositor, runtime, and test modules with
-  typed launch plans, supervised processes, and a narrow runtime-tick callback.
+  overflow. The current `workspace` actor receives lease-scoped state through
+  its mailbox and emits its local fragment through the ordinary host outbox.
+  External-client unit and graphical tests cover transform projection, clipping,
+  hit testing, and managed-window resize convergence.
+- Smithay protocol wiring and product runtime startup live in separate
+  compositor and runtime modules with a narrow runtime-tick callback.
   Hosted spawns return an exact token with bounded lifecycle history, so the
   supervisor can wait either for that pane to be presented or, explicitly, for
   that process to exit; unrelated windows and child exits satisfy neither
-  policy, and a known failure cannot be hidden by visibility. The real proof in
-  `tools/test-nested-command-ownership.sh` maps a substantive Weston terminal,
-  observes a different hosted child exit while its controller remains alive,
-  captures the rendered terminal, then observes the exact controller complete
-  and automatic nested cleanup without `--keep-running` or manual daemon quits.
-  A persistent `weston-simple-egl -f` run independently proves the default
-  visible-client policy remains compatible.
+  policy, and a known failure cannot be hidden by visibility.
 - `Manifold` now coordinates typed surface-session, focus, registry, and test-
-  harness services instead of owning those transition tables as loose fields;
-  layout and browser state retain their existing service owners. Session
+  harness services instead of owning those transition tables as loose fields.
+  Session
   allocation, activation, routing, rename, directory assignment, and removal
   are atomic and fallible, including explicit empty-catalogue and exhausted-ID
   behavior. Agent notification requests are typed, harness ownership is single-
   assignment, and an absent async runtime is an error rather than a registry
-  panic. The real GTK session-switcher is the observable proof in
-  `tools/test-state-services-nested.sh`: it renders a renamed Alpha session with
-  live windows and an agent, while the transcript proves Alpha/Beta switching,
-  Beta removal and directory-default retirement, and a substantive agent
-  notification changing the agent from running to waiting with attention and
-  unread state.
-- Raw argv and JSON control requests now cross typed `BrowserControlCommand`,
-  `PlugCommand`, and `InjectCommand` parsing boundaries before compositor
+  panic. Session-service tests cover switching, removal, directory-default
+  retirement, and agent notification transitions.
+- Raw argv and JSON control requests now cross typed `BrowserControlCommand`
+  and `PlugCommand` parsing boundaries before compositor
   mutation. Exact arity and ambiguous browser URL forms are rejected without
   token indexing, and the obsolete `indexing_slicing` allowances are gone. The
-  real `wasm-component-actor` example proves the plugin-facing route through
-  `tools/test-typed-control-parser-nested.sh`: a typed `plug --kind/--id/path`
-  command visibly registers the requested Component actor and its mailbox
-  counter advances, while the same artifact records JSON browser output, exact
-  invalid browser/inject diagnostics, and an unchanged input-event count.
+  parser tests cover typed `plug --kind/--id/path` registration and exact
+  browser diagnostics.
 - The Nix development runner returns a typed `ActivatedChildExit` from its
   activation helper and leaves OS termination to the binary entrypoint. Numeric
   child codes are preserved and Unix signals follow the conventional
@@ -162,9 +130,9 @@ warnings without pretending these areas are already structurally clean.
   terminating from `control.rs`; only the `manifold` binary entrypoint maps an
   explicit child code to its process exit status, while signal termination
   remains a fallible control result. A plugin is not applicable to binary exit
-  policy, so the user-facing proof runs the real CLI in the built-in offscreen
-  nested harness: an entered command visibly prints its domain rejection and
-  exits 37, and the invoking shell observes `manifold enter` exit status 37.
+  policy, so the user-facing proof runs the real CLI: an entered command prints
+  its domain rejection and exits 37, and the invoking shell observes
+  `manifold enter` exit status 37.
 - Subprocess pipes, real PTYs, loopback sockets, and timers now share one
   bounded byte-stream and notification/pollable lifecycle owned by the actor
   generation. Component and Preview 1 guests use the same capability grants,
@@ -173,8 +141,7 @@ warnings without pretending these areas are already structurally clean.
   cancellation, stale handles, resource churn, and blocked host work have
   deterministic coverage. The real
   Component `component-runtime-io` plugin and the Preview 1
-  `workspace-file-log` worker write separate visible transcripts through
-  `tools/test-runtime-io-plugins-nested.sh`: both feed an allowlisted `tr`
+  `workspace-file-log` worker write separate visible transcripts: both feed an allowlisted `tr`
   process through guest-visible pipes, preserve exit 7, prove both ends of an
   interactive PTY are terminals, exchange distinct requests with a real
   controller-owned TCP peer whose independent log corroborates them, and
@@ -272,8 +239,7 @@ warnings without pretending these areas are already structurally clean.
   to return, drops them before execution, releases every guest stack/TLS
   reservation, and reports cancellation to host-owned spawns. Already-queued
   reservation releases are preserved while other actor work is discarded. The
-  exact races have deterministic gated tests; the real
-  `tools/test-wasm-preview1-worker-nested.sh` workload proves two-generation hot
+  exact races have deterministic gated tests, including two-generation hot
   replacement and structured shutdown with worker values 90 and 81.
 - Preview 1 completion dispatch has its own generously sized bounded lane. The
   parent stops receiving from the completion supervisor while that lane is full,
@@ -281,8 +247,8 @@ warnings without pretending these areas are already structurally clean.
   and notification dispatch remain fair. The observable proof is the
   `workspace-file-log` plugin's `snapshot` action: actor completion I/O reads the
   live watch log and writes an exact snapshot while the watcher worker stays
-  active. `tools/test-workspace-file-log-plugin-nested.sh` validates both real
-  filesystem artifacts and the delivered completion count. This proof also
+  active. Runtime tests validate both real filesystem artifacts and the
+  delivered completion count. This proof also
   caught and fixed a scheduler bug which misrouted completion-only work toward
   an empty notification lane.
 - Wasm stores and actor message paths are byte-bounded. Shared, deliberately
@@ -292,6 +258,6 @@ warnings without pretending these areas are already structurally clean.
   and Preview 1 modules must declare shared-memory maxima within the generation
   ceiling. The target contract is documented in
   `docs/systems/plugin-runtime.md`. The observable proof is
-  `plugins/workspace-file-log`: its nested test performs a real workspace scan
-  and records file creation, modification, and removal under the bounded
-  runtime; see `tools/test-workspace-file-log-plugin-nested.sh`.
+  `plugins/workspace-file-log`: its acceptance workload performs a real
+  workspace scan and records file creation, modification, and removal under the
+  bounded runtime.

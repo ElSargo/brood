@@ -39,6 +39,7 @@ pub struct GlobalKeyPolicyInput {
     pub key_state: i32,
     pub modifiers: i32,
     pub input_mode: i32,
+    pub repeat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,10 +67,6 @@ pub enum HostMessage {
         app_id: String,
         argv: Vec<String>,
     },
-    /// Toggle the presentation-local plugin pane. When hidden, the next
-    /// toggle restores and focuses it; when visible but unfocused, the first
-    /// toggle focuses it.
-    TogglePluginPane,
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
@@ -134,12 +131,19 @@ pub struct WasmGlobalKeyPolicyEntry {
 }
 
 impl GlobalKeyPolicyInput {
-    pub const fn new(key_code: i32, key_state: i32, modifiers: i32, input_mode: i32) -> Self {
+    pub const fn new(
+        key_code: i32,
+        key_state: i32,
+        modifiers: i32,
+        input_mode: i32,
+        repeat: bool,
+    ) -> Self {
         Self {
             key_code,
             key_state,
             modifiers,
             input_mode,
+            repeat,
         }
     }
 }

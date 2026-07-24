@@ -206,10 +206,10 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
 
     if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_M
     {
-        return if input.key_state == KEY_RELEASED {
+        return if input.key_state == KEY_RELEASED || input.repeat {
             write_consume(output, &[])
         } else {
-            write_consume(output, &[Message::TogglePluginPane])
+            write_consume(output, &[Message::SessionSwitcherAction("toggle")])
         };
     }
 
@@ -319,8 +319,7 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(
     }
     apply_layout_actor_action(message.action.as_deref().unwrap_or(""));
     let (panes, focus, fullscreen, lease, revision) = layout_actor_state();
-    let len =
-        write_layout_actor_update_outbox(output, panes, focus, fullscreen, lease, revision);
+    let len = write_layout_actor_update_outbox(output, panes, focus, fullscreen, lease, revision);
     if len <= 0 {
         return -2;
     }
@@ -526,7 +525,7 @@ enum Message<'a> {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
-    TogglePluginPane,
+    SessionSwitcherAction(&'a str),
 }
 
 fn write_layout_actor_outbox(
@@ -541,14 +540,7 @@ fn write_layout_actor_outbox(
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
-    write_set_resolved_layout_payload(
-        &mut payload,
-        panes,
-        focus,
-        fullscreen,
-        lease,
-        revision,
-    );
+    write_set_resolved_layout_payload(&mut payload, panes, focus, fullscreen, lease, revision);
     writer.bytes(br#"]}],"publications":[{"payload":["#);
     let mut publication = PayloadWriter::new(&mut writer);
     publication.bytes(br#"{"kind":"workspace-state","mode":"#);
@@ -617,14 +609,7 @@ fn write_layout_actor_update_outbox(
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
-    write_set_resolved_layout_payload(
-        &mut payload,
-        panes,
-        focus,
-        fullscreen,
-        lease,
-        revision,
-    );
+    write_set_resolved_layout_payload(&mut payload, panes, focus, fullscreen, lease, revision);
     writer.bytes(br#"]}]}"#);
     writer.finish()
 }
@@ -814,6 +799,10 @@ fn write_pane_item_payload(
 }
 
 fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
+    finish_response(write_consume_payload(output, messages))
+}
+
+fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"decision":"consume","messages":["#);
     let mut index = 0;
@@ -824,6 +813,7 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
         let actor = match messages[index] {
             Message::LayoutAction("close-active-pane") => "host",
             Message::LayoutAction(_) => "workspace",
+            Message::SessionSwitcherAction(_) => "session-switcher",
             _ => "host",
         };
         writer.bytes(br#"{"actor":""#);
@@ -865,13 +855,18 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::ToggleShortcutPassthrough => {
                 payload.bytes(br#"{"type":"toggle-shortcut-passthrough"}"#)
             }
-            Message::TogglePluginPane => payload.bytes(br#"{"type":"toggle-plugin-pane"}"#),
+            Message::SessionSwitcherAction(action) => {
+                payload.bytes(br#"{"type":"sidebar-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
         }
         writer.bytes(br#"]}"#);
         index += 1;
     }
     writer.bytes(br#"]}"#);
-    finish_response(writer.finish())
+    writer.finish()
 }
 
 fn write_pane_item(
@@ -905,6 +900,8 @@ struct KeyInput {
     key_code: i32,
     key_state: i32,
     modifiers: i32,
+    #[serde(default)]
+    repeat: bool,
 }
 
 struct Writer<'a> {
@@ -1145,6 +1142,17 @@ mod tests {
     fn malformed_or_trailing_json_is_rejected() {
         assert!(decode_json::<PolicyState>(br#"{"panes":[1,]}"#).is_none());
         assert!(decode_json::<PolicyState>(br#"{"panes":[1]} trailing"#).is_none());
+    }
+
+    #[test]
+    fn session_switcher_action_is_an_ordinary_actor_message() {
+        let mut output = [0_u8; 512];
+        let len = write_consume_payload(&mut output, &[Message::SessionSwitcherAction("toggle")]);
+        assert!(len > 0);
+        assert_eq!(
+            &output[..len as usize],
+            br#"{"decision":"consume","messages":[{"actor":"session-switcher","payload":[123,34,116,121,112,101,34,58,34,115,105,100,101,98,97,114,45,97,99,116,105,111,110,34,44,34,97,99,116,105,111,110,34,58,34,116,111,103,103,108,101,34,125]}]}"#
+        );
     }
 }
 

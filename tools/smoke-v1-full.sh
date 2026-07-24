@@ -3,10 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-. "$ROOT/tools/smoke-lib.sh"
-
-require_host_presentation_environment
-
 run_step() {
   local name="$1"
   shift
@@ -22,22 +18,19 @@ run_step "dmabuf backend classifier fixtures" ./tools/test-dmabuf-backend-classi
 
 run_step "headless Wayland globals smoke" ./tools/smoke-headless-wayland-info.sh
 run_step "headless native-client smoke" ./tools/smoke-headless-native-client.sh
-run_step "headless input forwarding smoke" ./tools/smoke-headless-input-forwarding.sh
 run_step "headless control error smoke" ./tools/smoke-headless-control-errors.sh
-run_step "headless status-json smoke" ./tools/smoke-headless-status-json.sh
 run_step "headless status parity smoke" ./tools/smoke-headless-status-parity.sh
 run_step "headless client-exit smoke" ./tools/smoke-headless-client-exit.sh
 run_step "headless multi-client smoke" ./tools/smoke-headless-multi-client.sh
-run_step "headless multi-client input focus smoke" ./tools/smoke-headless-multi-client-input-focus.sh
-run_step "headless attach diagnostics smoke" ./tools/smoke-headless-attach-diagnostics.sh
-run_step "headless frontend-close idempotency smoke" ./tools/smoke-headless-frontend-close-idempotent.sh
-run_step "headless repeated attach-failure smoke" ./tools/smoke-headless-repeated-attach-failure.sh
-run_step "startup attach fallback smoke" ./tools/smoke-startup-attach-fallback.sh
-run_step "nest/detach/reattach smoke" ./tools/smoke-manifoldd.sh
-run_step "input forwarding smoke" ./tools/smoke-input-forwarding.sh
-run_step "status-json smoke" ./tools/smoke-status-json.sh
-run_step "dmabuf diagnostics smoke" ./tools/smoke-dmabuf-diagnostics.sh
-run_step "explicit sync diagnostics smoke" ./tools/smoke-explicit-sync-diagnostics.sh
-run_step "latency/cadence smoke" ./tools/smoke-latency-cadence.sh
+run_step "external client layout actor proof" ./tools/test-client-layout-actor.sh
+run_step "recursive session-switcher proof" ./tools/test-session-switcher-plugin-nested.sh
+
+SOFTWARE_E2E_OUT="$(mktemp -d /tmp/manifold-software-e2e.XXXXXX)"
+run_step "external client software-rendering proof" \
+  ./tools/software-e2e-capture.sh \
+  --out-dir "$SOFTWARE_E2E_OUT" \
+  --manifold-bin target/debug/manifold \
+  --client-bin target/debug/manifold-client
 
 printf '\nOK v1 full smoke suite passed\n'
+printf 'software_e2e_out=%s\n' "$SOFTWARE_E2E_OUT"

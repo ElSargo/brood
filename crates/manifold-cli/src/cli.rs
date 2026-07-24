@@ -64,9 +64,6 @@ pub struct SessionArgs {
     /// Start the service/runtime process without tying it to a presentation session.
     #[arg(long)]
     pub headless: bool,
-    /// Start with an attached offscreen presentation target. Used by nested tests.
-    #[arg(long = "offscreen-presentation", hide = true)]
-    pub offscreen_presentation: bool,
     /// Render test fiducials in each hosted surface's local coordinate space.
     #[arg(long = "test-surface-markers", hide = true)]
     pub test_surface_markers: bool,
@@ -82,9 +79,6 @@ pub struct SessionArgs {
     /// Start the realm without its configured init actor for recovery.
     #[arg(long = "no-init")]
     pub no_init: bool,
-    /// Load a target-shape WASM key policy provider as NAME from PATH.
-    #[arg(long = "wasm-key-policy", value_names = ["NAME", "PATH"], num_args = 2)]
-    pub wasm_key_policy: Option<Vec<String>>,
     /// Load an async core-WASM test harness.
     #[arg(long = "test-harness", value_name = "PATH")]
     pub test_harness: Option<PathBuf>,
@@ -121,13 +115,11 @@ impl Default for SessionArgs {
             dbus_name: DEFAULT_MANIFOLD_DBUS_NAME.to_string(),
             dbus_address: None,
             headless: false,
-            offscreen_presentation: false,
             test_surface_markers: false,
             browser: None,
             wasm_plugin: None,
             init_actor: None,
             no_init: false,
-            wasm_key_policy: None,
             test_harness: None,
             nested_inner_dbus_name: None,
             nested_inner_dbus_address: None,
@@ -369,7 +361,7 @@ pub struct CtlArgs {
     /// Send COMMAND as a raw JSON argv array instead of parsing command-line words.
     #[arg(long)]
     pub json: bool,
-    /// Command to send: attach, detach, close-frontend, close-session, client close, spawn <cmd>, actors, browser, inject, status, quit.
+    /// Command to send to the session service.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
 }

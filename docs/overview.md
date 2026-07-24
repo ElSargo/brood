@@ -2,12 +2,14 @@
 status: canonical
 type: overview
 authority: product
-last-reviewed: 2026-07-20
+last-reviewed: 2026-07-24
 ---
 
 # Overview
 
-Manifold is a local persistent graphical workspace for development. It explores whether an extra compositor/session layer can feel native while preserving app and agent state across presentation attach, detach, and switching.
+Manifold is a local persistent graphical workspace for development. It explores
+whether an extra compositor/session layer can feel native while preserving app
+and agent state across frontend replacement and session switching.
 
 The product model is:
 
@@ -19,19 +21,13 @@ The product model is:
 - A [[concepts/plugin]] can extend behavior through addressed actors, private actor-scoped workers, completion-based I/O, WASI resources, policy providers, and publications.
 - A [[concepts/wasm-controller]] is one plugin role for changing workspace behavior through host APIs.
 
-The current Rust workspace contains `manifoldd`, which builds the user-facing
-`manifold` binary, and `manifold-wasm`, which owns Wasmtime configuration,
-plugin artifact loading, the hosted actor/worker runtimes, and the nested
-behavior-test harness engine. The daemon adapts typed runtime requests and
-outcomes to session state without depending on Wasmtime. It owns the session
-process, nested Wayland compositor, DBus control endpoint, and MVP presentation
-endpoint. The target
-architecture extracts a portable presentation client with client-side WASM
-actors and WGPU rendering. Local clients bootstrap through DBus and then use
-shared-memory protocol lanes plus DMA-BUF or copied per-window surfaces; remote
-clients retain the same client-owned actors and viewport over an authenticated
-network carrier and remote surface transports. See
-[[systems/presentation-client]].
+The Rust workspace contains an authoritative session server and an independent
+portable presentation client. The server owns the nested Wayland compositor,
+session state, hosted applications, durable actors, and DBus bootstrap. The
+client owns presentation actors, recursive layout leases, input policy, and
+WGPU rendering. Local clients use shared-memory protocol lanes plus DMA-BUF or
+copied per-window surfaces; remote clients retain the same client-owned
+viewport over an authenticated carrier. See [[systems/presentation-client]].
 
 See [[architecture]] for the implementation map.
 
@@ -40,7 +36,8 @@ See [[architecture]] for the implementation map.
 The repository is currently proving:
 
 - nested Wayland app hosting
-- native presentation attach/detach
+- external presentation-client reconnect without hosted-app loss
+- recursive client-local layouts and presentation plugins
 - keyboard and pointer forwarding
 - session switching
 - startup modules and startup apps from config

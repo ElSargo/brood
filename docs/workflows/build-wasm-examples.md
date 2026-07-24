@@ -97,22 +97,14 @@ hard timeout, configurable with `MANIFOLD_WASM_IO_RUBE_TIMEOUT_SECONDS`.
 Preserve its reported output directory and replay line when reproducing a
 failure.
 
-For the end-to-end daemon proof, run:
-
-```sh
-nix develop --command bash tools/test-wasm-preview1-worker-nested.sh
-nix develop --command bash tools/test-wasm-io-registry-nested.sh
-```
-
-Those workloads use `manifold test nested` with an offscreen outer presentation.
-The Preview 1 workload
-loads the compatibility actor through the daemon plugin path, sends mailbox
+Daemon-level acceptance loads the compatibility actor through the server plugin
+path and sends mailbox
 traffic through the normal control surface, proves actor completion I/O while
 workers select over a guest-owned shared-memory queue, retains an ordinary
 worker `read` compatibility case, and hot-reloads the actor while two worker
 wait sets are pending. It verifies that the old generation's notification,
 pollable, and wait-registration state is gone before the replacement handles
-traffic. The registry workload hosts eight independently addressed Component
+traffic. Registry coverage hosts independently addressed Component
 and Preview 1 actors, replaces one suspended generation, and proves its seven
 peers continue without losing their state.
 

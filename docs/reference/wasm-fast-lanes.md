@@ -37,10 +37,9 @@ batches; ordinary plugin work stays in actors and workers. See
 
 Core plugins declare actors and typed event subscriptions through named exports
 discovered by `module_link.rs`. Each actor processes one bounded mailbox epoch
-and returns an outbox containing messages and publication frames. Both the
-built-in daemon presenter and the separate presentation client use the same
-actor-driven layout path. Marker typos and subscriptions without a declared
-actor reject the module; consult
+and returns an outbox containing messages and publication frames. Presentation
+actors and layout run only in the presentation client. Marker typos and
+subscriptions without a declared actor reject the module; consult
 `module_link.rs` for exact export spellings.
 
 See `module.rs`, `module_link.rs`, `actor.rs`, and `actor_link.rs` for the exact
@@ -55,8 +54,7 @@ identities. The provider returns `consume`, `forward`, or `abstain` semantics
 and may include a bounded batch of actor messages. The client validates and
 applies the envelope; the provider does not perform host side effects directly.
 Backend commands leave the synchronous lane through a bounded asynchronous
-worker. The daemon keeps its older host for the built-in presenter compatibility
-path.
+worker. The daemon does not host presentation key policy.
 
 See `global_key_policy.rs`, `global_key_policy_link.rs`, and
 `policy_provider.rs` for the exact export, descriptor, bounds, and decision
@@ -68,11 +66,12 @@ A core-module actor declares the layout-state subscription through normal actor
 metadata. The presentation host enqueues client-visible pane inventory, local
 focus, application identities, and viewport size into that actor's mailbox.
 Commands such as `layout-action` use the same addressed message route. The
-actor submits a candidate flat resolved layout only by addressing a
-`set-resolved-layout` message to the ordinary host mailbox.
+actor submits one lease-local candidate only by addressing a
+`set-resolved-layout` message to the ordinary host mailbox. The client composes
+the current recursive lease tree into its final resolved layout.
 
 The client validates each candidate before composition and hit testing. An
-invalid result selects the client-local native fallback. The client sends
+invalid result selects the client-local fallback. The client sends
 requested managed-pane sizes to the daemon after accepting a layout; it never
 sends placement. See `actor.rs`, `legacy_runtime.rs`, `resolved_layout.rs`, and
 the client actor runtime for the exact mailbox and validation path.

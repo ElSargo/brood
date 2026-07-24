@@ -1,31 +1,28 @@
 ---
-status: current
+status: canonical
 type: workflow
-authority: implementation
-last-reviewed: 2026-07-03
+authority: product
+last-reviewed: 2026-07-24
 ---
 
 # Run Manifold
 
-From the repository root, prefer the Nix development shell:
+From the repository root, prefer the checked-in Nix development shell:
 
 ```sh
 nix develop --command cargo run
 ```
 
-This runs the default `manifold` binary and starts the default runtime path. By default it loads config modules and startup apps, starts the nested Wayland compositor, exposes DBus control, and attaches presentation.
+The user-facing command starts `manifold-client`. The client discovers or
+starts `manifold-sessiond`, completes the presentation handshake, loads its
+presentation actors, and opens the WGPU viewport.
 
-Useful variants:
+The session service may also run independently for service management and
+backend development. It never opens a presentation window. Exact runtime,
+configuration, and recovery options are defined by the CLI parser and linked
+from [[../reference/cli]].
 
-```sh
-nix develop --command cargo run -- check
-nix develop --command cargo run -- run --headless
-nix develop --command cargo run -- run --no-default-modules
-nix develop --command cargo run -- run --config ./manifold.toml
-nix develop --command cargo run -- ctl status-json
-```
-
-Use `run --headless` for service-style runtime sessions. Use [[test-nested]] for automated behavior validation.
+Use [[test-nested]] for automated behavior validation.
 
 Related:
 

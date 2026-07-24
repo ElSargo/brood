@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-07-24
 code-links:
   - crates/manifoldd/src/config.rs
   - manifold.toml
@@ -106,7 +106,9 @@ WASI/capability grants, policy providers, actions, pane types, and publications.
 Workers remain dynamically scoped to actors rather than top-level manifest
 components.
 
-Startup apps can target the session realm or presentation realm. Presentation startup apps remain available when an auto-started global control server skips creating its own initial surface session.
+Session startup applications remain server-owned. Presentation applications
+and wrapper layouts are started by the client root actor, so no backend startup
+entry can acquire viewport placement.
 
 ## Related Pages
 

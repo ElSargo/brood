@@ -6,17 +6,6 @@ client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/manifol
 provider = "workspace"
 path = "plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
 
-[module.default-workspace]
-enabled = true
-kind = "plugin"
-path = "plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
-capabilities = [
-  "shortcuts:handle",
-  "apps:run-argv",
-  "workspace:session",
-  "workspace:layout",
-]
-
 [module.dev]
 enabled = false
 kind = "fast-key-handler"
@@ -28,9 +17,6 @@ capabilities = [
   "workspace:focus-app-id",
   "workspace:close-focused-pane",
 ]
-
-[layout]
-auto_split_visible_limit = 3
 
 [startup.agent]
 enabled = true

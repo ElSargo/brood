@@ -33,7 +33,7 @@ bounded logical queues. `status-json` exposes two subscriptions backed by one
 native registration, while the two real logs demonstrate that both consumers
 remain useful; the proof also preserves those live counts in
 `.manifold/workspace-file-log.watch-status.json` for inspection after the
-offscreen daemon exits. This is the observable deduplication proof. A `snapshot`
+headless server exits. This is the observable deduplication proof. A `snapshot`
 mailbox message separately makes the actor submit a completion read of the live
 log. Its read-completion handler submits the returned bytes as a completion
 write to `.manifold/workspace-file-log.snapshot`. The actor verifies the write
@@ -51,11 +51,9 @@ An explicit `rescan` record means the recursive native registration window
 closed or the bounded host event queue overflowed. The index demonstrates the
 required reconciliation rather than merely logging that marker.
 
-Run `tools/test-workspace-file-log-plugin-nested.sh` from the repository root.
-The test uses Manifold's offscreen nested test topology and leaves the observed
-workspace under the printed path. Inspect
-both workspace file logs: their `initial`, `created`, `modified`, and `removed`
-records are the watch proof. The controller also checks the live daemon's one
+An acceptance workload leaves the observed workspace under its reported path.
+Inspect both workspace file logs: their `initial`, `created`, `modified`, and
+`removed` records are the watch proof. The controller also checks the live server's one
 native registration and two logical subscriptions, then sends `snapshot` and
 checks that `.manifold/workspace-file-log.snapshot` is a nonempty byte-for-byte
 prefix of the append-only log containing the observed create, modify, and remove
@@ -87,8 +85,7 @@ mutation in `completion_io::tests`. The plugin demonstrates the real guest and
 daemon path and leaves inspectable bytes; the deterministic host test supplies
 the timing barrier which an ordinary regular-file write cannot reliably expose.
 
-Run `tools/test-workspace-file-log-plugin-session-rebind-nested.sh` for the
-workspace-grant lifecycle proof. It creates two real surface sessions whose
+The workspace-grant lifecycle proof creates two real surface sessions whose
 working directories contain different files, activates each in turn, and checks
 the live session ID and working directory through the control API. Each
 activation starts a new plugin generation under the same configured actor ID.
@@ -107,8 +104,8 @@ data. After the nested daemon exits the active workspace ends with
 append afterward.
 
 The Preview 1 artifact also carries the compatibility half of the runtime-I/O
-proof. `tools/test-runtime-io-plugins-nested.sh` sends a dedicated worker a real
-loopback peer address and preserves
+proof. Its acceptance workload sends a dedicated worker a real loopback peer
+address and preserves
 `.manifold/preview1-runtime-io-transcript.md`. The report contains the
 PATH-selected command, pipe stdin and transformed stdout, exit 7, PTY terminal
 checks and interaction, the peer response, and distinct timer wake order. The

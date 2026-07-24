@@ -15,12 +15,17 @@ workspace query to the remaining viewport and recursively composes both actor
 fragments. Hiding the switcher gives that child the full viewport rather than
 recreating or bypassing the workspace layout.
 
+The global key policy sends an ordinary `sidebar-action` message to the
+switcher. The plugin owns its visible state and republishes its root fragment;
+the client has no switcher-specific pane toggle or visibility flag.
+
 The default config starts this artifact directly. The plugin supports session
 filtering, pointer and keyboard activation, creation, rename, close, and
 scrolling. The nested proof in
 `tools/test-session-switcher-plugin-nested.sh` creates three real sessions,
 switches with a real pointer click, creates and renames a session with injected
-keyboard input, closes it, and captures the initial and renamed client frames.
+keyboard input, closes it, hides and restores the sidebar, and captures
+client-owned visible and hidden frames.
 It correlates those frames with typed command completions, backend catalogue
 snapshots, and the root-to-`rest` lease chain.
 

@@ -375,7 +375,6 @@ pub struct FocusService {
     pointer_hover: Option<WlSurface>,
     pending_pointer_focus: Option<WlSurface>,
     presentation_window_focused: bool,
-    pending_presentation_activation_token: Option<String>,
 }
 
 impl FocusService {
@@ -420,18 +419,6 @@ impl FocusService {
         let lost_focus = self.presentation_window_focused && !focused;
         self.presentation_window_focused = focused;
         lost_focus
-    }
-
-    pub(crate) fn queue_presentation_activation(&mut self, token: String) {
-        self.pending_presentation_activation_token = Some(token);
-    }
-
-    pub(crate) fn clear_presentation_activation(&mut self) {
-        self.pending_presentation_activation_token = None;
-    }
-
-    pub(crate) const fn take_presentation_activation(&mut self) -> Option<String> {
-        self.pending_presentation_activation_token.take()
     }
 }
 

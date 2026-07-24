@@ -35,9 +35,8 @@ ordinary-filesystem, and cancellation workloads. It drives
 both `Preview1WorkerRuntime` and the daemon-compatible `Preview1CompatActor`
 facade in-process; it is not the Component Model actor example.
 
-Run `tools/test-wasm-preview1-worker-nested.sh` for the daemon-level proof. It
-loads this artifact through `manifold test nested`, addresses the actor through
-the normal control surface, verifies bounded wait sets and coalesced actor
-notifications, retains one ordinary-read compatibility check, then replaces
-the actor while two notification waits are pending and verifies that the new
-generation inherits no resources or registrations.
+Daemon-level acceptance loads this artifact into a headless session server,
+addresses the actor through the normal control surface, verifies bounded wait
+sets and coalesced actor notifications, retains one ordinary-read compatibility
+check, then replaces the actor while two notification waits are pending and
+verifies that the new generation inherits no resources or registrations.

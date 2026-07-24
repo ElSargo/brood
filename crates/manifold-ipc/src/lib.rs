@@ -80,6 +80,11 @@ pub const INPUT_WINDOW_POINTER_WHEEL: u32 = 14;
 /// and when its outer window loses focus. This prevents a release from being
 /// routed somewhere other than the managed window that received the press.
 pub const INPUT_KEYBOARD_RESET: u32 = 15;
+/// The external presentation window gained or lost operating-system focus.
+///
+/// Argument zero is the focused boolean. This is lifecycle metadata, not pane
+/// layout or hit-test state.
+pub const INPUT_PRESENTATION_FOCUS: u32 = 16;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.
@@ -92,6 +97,12 @@ pub const FRAME_SCENE_BEGIN: u32 = 0x100;
 pub const FRAME_WINDOW_DMABUF: u32 = 0x101;
 /// End and publish the current atomic scene batch.
 pub const FRAME_SCENE_END: u32 = 0x102;
+/// Ask the external presentation client to focus its operating-system window.
+///
+/// The record carries no pane placement or layout state.
+pub const FRAME_FOCUS_PRESENTATION: u32 = 0x103;
+/// Ask the external presentation client to close its operating-system window.
+pub const FRAME_CLOSE_PRESENTATION: u32 = 0x104;
 
 /// Preserve one signed 32-bit protocol value in a record argument.
 #[must_use]

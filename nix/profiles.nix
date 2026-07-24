@@ -111,7 +111,9 @@ let
     pkgs.foot
     pkgs.gobject-introspection
     pkgs.glmark2
+    pkgs.grim
     pkgs.mesa-demos
+    pkgs.sway
     pkgs.vulkan-tools
     pkgs.wayland-utils
     westonWithSimpleClients

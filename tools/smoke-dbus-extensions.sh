@@ -160,37 +160,16 @@ REPLACE_OUT="$(call /org/manifold/Compositor org.manifold.Compositor ReplaceRole
   exit 1
 }
 
-MEMBERSHIP_GRANT="$(call /org/manifold/Compositor org.manifold.Compositor RequestPresentationMembership 'sa{ss}' "$WINDOW_ID" 1 audience Presentation | extract_string)"
-PLACEMENT_GRANT="$(call /org/manifold/Compositor org.manifold.Compositor RequestPlacement 'sa{ss}' "$WINDOW_ID" 3 mode Overlay audience Presentation unsupported-field recorded | extract_string)"
 SHORTCUT_GRANT="$(call /org/manifold/Compositor org.manifold.Compositor RequestShortcut ssss "$EXT_ID" Ctrl+Alt+Space Presentation 'Open session switcher' | extract_string)"
 
-[[ -n "$MEMBERSHIP_GRANT" && -n "$PLACEMENT_GRANT" && -n "$SHORTCUT_GRANT" ]] || {
-  echo "ERR one or more grant requests failed: membership=$MEMBERSHIP_GRANT placement=$PLACEMENT_GRANT shortcut=$SHORTCUT_GRANT" >&2
+[[ -n "$SHORTCUT_GRANT" ]] || {
+  echo "ERR shortcut grant request failed" >&2
   exit 1
 }
 
 GRANTS_BEFORE="$(ctl extensions grants "$EXT_ID")"
-grep -q "grant id=$MEMBERSHIP_GRANT" <<< "$GRANTS_BEFORE" || {
-  echo "ERR membership grant not listed: $GRANTS_BEFORE" >&2
-  exit 1
-}
-grep -q "grant id=$PLACEMENT_GRANT" <<< "$GRANTS_BEFORE" || {
-  echo "ERR placement grant not listed: $GRANTS_BEFORE" >&2
-  exit 1
-}
-grep -q "unsupported-field=recorded" <<< "$GRANTS_BEFORE" || {
-  echo "ERR unsupported placement field was not recorded: $GRANTS_BEFORE" >&2
-  exit 1
-}
 grep -q "grant id=$SHORTCUT_GRANT" <<< "$GRANTS_BEFORE" || {
   echo "ERR shortcut grant not listed: $GRANTS_BEFORE" >&2
-  exit 1
-}
-
-call /org/manifold/Extension org.manifold.Extension ReleaseGrant s "$PLACEMENT_GRANT" > /dev/null
-GRANTS_AFTER="$(ctl extensions grants "$EXT_ID")"
-grep -q "grant id=$PLACEMENT_GRANT .* active=false" <<< "$GRANTS_AFTER" || {
-  echo "ERR released grant was not marked inactive: $GRANTS_AFTER" >&2
   exit 1
 }
 
@@ -207,10 +186,6 @@ REPLACE_AGAIN_OUT="$(call /org/manifold/Compositor org.manifold.Compositor Repla
   exit 1
 }
 GRANTS_AFTER_REPLACE="$(ctl extensions grants "$EXT_ID")"
-grep -q "grant id=$MEMBERSHIP_GRANT .* active=false" <<< "$GRANTS_AFTER_REPLACE" || {
-  echo "ERR replaced window membership grant was not marked inactive: $GRANTS_AFTER_REPLACE" >&2
-  exit 1
-}
 grep -q "grant id=$SHORTCUT_GRANT .* active=true" <<< "$GRANTS_AFTER_REPLACE" || {
   echo "ERR replace role should not revoke extension-level shortcut grant: $GRANTS_AFTER_REPLACE" >&2
   exit 1
@@ -265,7 +240,5 @@ echo "OK DBus extension smoke passed"
 echo "extension_id=$EXT_ID"
 echo "window_id=$WINDOW_ID"
 echo "replacement_window_id=$REPLACEMENT_WINDOW_ID"
-echo "membership_grant=$MEMBERSHIP_GRANT"
-echo "placement_grant=$PLACEMENT_GRANT"
 echo "shortcut_grant=$SHORTCUT_GRANT"
 echo "created_session=$CREATED_ID"

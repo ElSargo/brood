@@ -2,7 +2,7 @@
 status: canonical
 type: index
 authority: documentation
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-24
 ---
 
 # Manifold Knowledge Base
@@ -17,7 +17,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 ## Current Behavior
 
-- [[systems/runtime]] describes process startup, presentation attach, config loading, and session runners.
+- [[systems/runtime]] describes server/client startup, config loading, and session runners.
 - [[systems/configuration]] describes `manifold.toml`, startup apps, modules, and config discovery.
 - [[systems/testing]] describes the supported behavior-test and smoke-test paths.
 - [[systems/dbus-control]] describes the DBus control surfaces.
@@ -26,7 +26,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 ## Target Design
 
-- [[systems/presentation-client]] specifies the independent portable presentation client, session lease, window frame subscriptions, client-side WASM runtime, WGPU renderer, transports, and staged refactor.
+- [[systems/presentation-client]] specifies the independent portable presentation client, session lease, window frame subscriptions, client-side WASM runtime, recursive layout, WGPU renderer, and transports.
 - [[systems/plugin-runtime]] defines plugin trust, actors, actor-scoped workers,
   policy providers, publications, and session isolation.
 - [[systems/plugin-io-and-resources]] specifies completions, notifications,

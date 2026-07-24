@@ -58,6 +58,7 @@ impl ClientKeyPolicy {
         key_code: i32,
         key_state: i32,
         modifiers: i32,
+        repeat: bool,
         snapshot: &KeyPolicySnapshot,
     ) -> Result<KeyPolicyEvaluation> {
         let Some(policy) = self.wasm.as_mut() else {
@@ -72,8 +73,13 @@ impl ClientKeyPolicy {
             self.publication_actor,
             serde_json::to_vec(snapshot).context("encode client key-policy publication")?,
         )?;
-        let input =
-            GlobalKeyPolicyInput::new(key_code, key_state, modifiers, ABI_INPUT_MODE_PASSTHROUGH);
+        let input = GlobalKeyPolicyInput::new(
+            key_code,
+            key_state,
+            modifiers,
+            ABI_INPUT_MODE_PASSTHROUGH,
+            repeat,
+        );
         let outcome =
             policy.handle_key(GlobalKeyPolicyInvocation::new(input, Some(&publication)))?;
         let mut host_messages = Vec::new();

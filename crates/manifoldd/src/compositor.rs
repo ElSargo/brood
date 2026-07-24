@@ -57,8 +57,7 @@ use tracing::warn;
 
 use crate::{
     clipboard::{ClipboardSelection, send_clipboard_selection},
-    presentation,
-    state::{ClientState, Manifold, PresentationStatus},
+    state::{ClientState, Manifold},
 };
 
 impl CompositorHandler for Manifold {
@@ -196,8 +195,7 @@ impl CompositorHandler for Manifold {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        self.stats
-            .record_commit(self.presentation == PresentationStatus::Attached);
+        self.stats.record_commit(self.dmabuf.fast_path.is_some());
         on_commit_buffer_handler::<Self>(surface);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
@@ -214,7 +212,7 @@ impl CompositorHandler for Manifold {
         }
 
         handle_xdg_commit(self, surface);
-        presentation::request_presenter_redraw_after_client_commit(self);
+        crate::frame_export::request_redraw(self);
     }
 }
 
@@ -244,22 +242,17 @@ impl DmabufHandler for Manifold {
         self.dmabuf.stats.last_import = Some(dmabuf_import_summary(&dmabuf));
         self.dmabuf.stats.last_error = None;
 
-        let Some(importer) = self.dmabuf.importer.clone() else {
+        let Some(exporter) = self.dmabuf.exporter.clone() else {
             self.dmabuf.stats.rejected += 1;
-            self.dmabuf.stats.last_error = Some("no_presentation_importer".to_string());
+            self.dmabuf.stats.last_error = Some("no_frame_exporter".to_string());
             notifier.failed();
             return;
         };
 
-        let mut runtime = importer.borrow_mut();
-        let Some(importer) = runtime.backend.as_mut() else {
-            self.dmabuf.stats.rejected += 1;
-            self.dmabuf.stats.last_error = Some("no_presentation_importer".to_string());
-            notifier.failed();
-            return;
-        };
-
-        let result = importer.renderer().import_dmabuf(&dmabuf, None);
+        let result = exporter
+            .borrow_mut()
+            .renderer()
+            .import_dmabuf(&dmabuf, None);
 
         match result {
             Ok(_) => {
@@ -273,7 +266,7 @@ impl DmabufHandler for Manifold {
             }
             Err(err) => {
                 self.dmabuf.stats.rejected += 1;
-                self.dmabuf.stats.last_error = Some(crate::presentation::sanitize_status_value(
+                self.dmabuf.stats.last_error = Some(crate::frame_export::sanitize_status_value(
                     &format!("{err:?}"),
                 ));
                 warn!(
@@ -309,7 +302,7 @@ fn dmabuf_import_summary(dmabuf: &Dmabuf) -> String {
         .node()
         .map_or_else(|| "none".to_string(), |node| format!("{node:?}"));
 
-    crate::presentation::sanitize_status_value(&format!(
+    crate::frame_export::sanitize_status_value(&format!(
         "{}x{}:{:?}:{:?}:planes{}:strides{}:offsets{}:yinvert{}:node{}",
         size.w,
         size.h,

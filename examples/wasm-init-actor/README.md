@@ -7,5 +7,6 @@ and policy remain guest code.
 
 When selected for the client realm as well, the same artifact uses its bound
 session ID to send an explicitly addressed message to that session's root. The
-root reacts by launching the `client-to-session-actor-proof` workload. The
-nested session and client proof is `tools/test-actor-init-nested.sh`.
+root reacts by launching the `client-to-session-actor-proof` workload. Actor
+mailbox behavior is covered by the workspace tests; presentation behavior must
+be proved through an external `manifold-client`.

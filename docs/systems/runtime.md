@@ -1,101 +1,68 @@
 ---
-status: current
+status: canonical
 type: system
-authority: implementation
-last-reviewed: 2026-07-13
+authority: product
+last-reviewed: 2026-07-24
 code-links:
   - crates/manifoldd/src/lib.rs
-  - crates/manifoldd/src/compositor.rs
-  - crates/manifoldd/src/state_services.rs
+  - crates/manifoldd/src/runtime.rs
+  - clients/manifold-client/src/main.rs
   - crates/manifoldd/src/config.rs
   - crates/manifoldd/src/session_runner.rs
 ---
 
 # Runtime
 
-The default `manifold` invocation starts the `run` command. The runtime creates
-a nested Wayland compositor, DBus control endpoint, initial surface session,
-surface-session init actor, and an attached presentation unless the selected
-runtime or recovery mode changes that policy. Each surface session's init actor
-owns its ordinary actor and app startup behavior.
+Manifold has two runtime roles: an authoritative session server and an
+independent presentation client. The server is coherent with zero connected
+clients and never creates a native or offscreen presentation target.
 
-Exact flags are defined in `crates/manifoldd/src/lib.rs`; do not duplicate the full parser here.
+Exact commands and parser behavior remain defined in the CLI code; this page
+describes ownership and startup order.
 
-## Startup Order
+## Session Server
 
-Current high-level startup order:
+The session server:
 
-- resolve the config path
-- create the `Manifold` state and Wayland display
-- optionally clear the initial surface session
-- start the DBus control service and publish its environment to child processes
-- configure the blessed session init artifact and initialize roots for existing sessions
-- otherwise load legacy config modules as a compatibility fallback
-- load CLI-specified prototype WASM lanes
-- print `WAYLAND_DISPLAY` and DBus endpoint variables
-- attach offscreen, attach Winit presentation, or remain headless
-- otherwise load legacy startup apps as part of that compatibility fallback
-- spawn CLI command or browser if requested
-- run the event loop
+- creates the nested Wayland display and session catalogue;
+- starts the control endpoint and publishes its connection environment;
+- starts session init actors and configured durable applications;
+- accepts presentation-client handshakes and grants bounded protocol lanes;
+- publishes revisioned pane inventory and per-window frame streams;
+- applies lease-authorized pane focus, input, and requested content sizes;
+- keeps hosted applications alive when every presentation client disconnects.
 
-The presentation client connects to or auto-starts the server, creates a new
-surface session, and then opens its presentation. Creating that session starts
-the configured session root, whose default artifact launches one `foot`
-terminal. The client performs its corresponding client-realm init step before
-it admits ordinary presentation actors. Session and client roots are separate
-artifacts and cannot exercise each other's local lifecycle capability.
+It does not own a viewport, presentation window, layout tree, chrome, global
+hit testing, or presentation-local key policy.
 
-## Presentation Modes
+## Presentation Client
 
-Attached Winit presentation is the current product runtime default. The target architecture replaces direct attachment with an independent presentation client; see [[presentation-client]].
+The presentation client:
 
-Headless runtime is for service-managed sessions and long-lived control endpoints. It is not the preferred behavior-test entry point.
+- discovers or starts a session server and completes the presentation handshake;
+- creates its Winit/WGPU viewport;
+- starts the client init actor, presentation plugins, and selected key policy;
+- combines local plugin panes with backend-managed pane inventory;
+- grants and recursively composes layout leases;
+- imports subscribed window frames and renders the accepted layout;
+- performs hit testing, local focus, and physical input routing;
+- sends only pane-local input and requested content sizes to the server.
 
-Offscreen presentation is used by nested tests so composition can run without creating a host OS window.
+Closing the client revokes its presentation authority. Starting another client
+creates a new presentation and layout-lease generation without restarting the
+session server or its applications.
 
 ## Session Runners
 
-`run` may hand off to a [[../concepts/session-runner]] before serving the session. The Nix developer workflow deliberately bypasses configured session runners because the package already provides the runtime environment.
-
-## Runtime State Ownership
-
-The session thread remains the sole authority that commits compositor-visible
-changes, but `Manifold` is an orchestrator rather than the owner of every
-state transition:
-
-- `SurfaceSessionService` owns the session catalogue, directory routing,
-  surface assignments, interaction order, and session-local bus lifetimes.
-  It validates allocation, activation, assignment, and removal before the
-  compositor applies layout or focus effects. An empty catalogue has an
-  explicit no-active-session state.
-- `FocusService` owns focused and pointer-target identities plus pending
-  presentation activation. Smithay seat focus remains an effect applied by
-  the compositor after the service transition.
-- `RegistryService` owns extension, window, grant, agent, notification, and
-  status records. Agent notification input is typed as one request, and an
-  unknown agent is rejected without a partial attention or notification
-  mutation.
-- `TestHarnessService` owns harness runtime/completion and nested target
-  transitions. The compositor still decides when to service requests and stop
-  the loop; process orchestration is not part of the state container.
-
-`LayoutState` and `BrowserManager` are already independently owned service
-boundaries. Geometry conversion policy and compositor/test process
-orchestration are documented and evolved separately from these ownership
-services.
-
-The Nix-backed nested proof in
-`tools/test-state-services-nested.sh` launches the real GTK session-switcher
-extension, creates a directory-bound named session, publishes a substantive
-agent notification, and captures the rendered switcher plus compositor state.
-The screenshot and transcript expose the accepted behavior directly rather
-than reducing the proof to a success flag.
+A session runner prepares a project environment before the server launches
+session-owned applications. Runner activation does not absorb the presentation
+client into the server process.
 
 ## Related Pages
 
 - [[presentation-client]]
+- [[layout-actor]]
+- [[input-shortcuts]]
 - [[configuration]]
 - [[testing]]
-- [[plugin-runtime]]
 - [[../workflows/run-manifold]]
-- [[../workflows/enter-session]]

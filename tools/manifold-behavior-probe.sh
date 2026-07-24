@@ -281,7 +281,6 @@ fields = {
     "dmabuf_accepted": status["dmabuf_accepted"],
     "dmabuf_rejected": status["dmabuf_rejected"],
     "explicit_sync": status["explicit_sync"],
-    "presentation_runtime_failures": status["presentation_runtime_failures"],
 }
 
 if previous:

@@ -1667,16 +1667,21 @@ mod tests {
     }
 
     impl TestGpu {
-        fn new() -> Result<Self> {
+        fn new() -> Result<Option<Self>> {
             let instance = wgpu::Instance::default();
             let adapter =
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::LowPower,
                     force_fallback_adapter: false,
                     compatible_surface: None,
                     ..Default::default()
-                }))
-                .context("find a GPU adapter for canvas conformance")?;
+                })) {
+                    Ok(adapter) => adapter,
+                    Err(wgpu::RequestAdapterError::NotFound { .. }) => return Ok(None),
+                    Err(error) => {
+                        return Err(error).context("find a GPU adapter for canvas conformance");
+                    }
+                };
             let (device, queue) =
                 pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                     .context("create canvas conformance device")?;
@@ -1708,11 +1713,11 @@ mod tests {
                 ..Default::default()
             });
             let renderer = GpuCanvasRenderer::new(&device, &queue, &layout, &sampler);
-            Ok(Self {
+            Ok(Some(Self {
                 device,
                 queue,
                 renderer,
-            })
+            }))
         }
 
         fn render(&self, snapshot: &GraphicsSnapshot) -> Result<Vec<u8>> {
@@ -1922,7 +1927,10 @@ mod tests {
 
     #[test]
     fn gpu_canvas_conforms_for_clips_layers_blends_resources_and_antialiasing() -> Result<()> {
-        let gpu = TestGpu::new()?;
+        let Some(gpu) = TestGpu::new()? else {
+            eprintln!("skipping GPU canvas conformance: no graphics adapter is available");
+            return Ok(());
+        };
         let full = Rect::new(0.0, 0.0, TEST_WIDTH as f32, TEST_HEIGHT as f32);
 
         let clipped = gpu.render(&snapshot(vec![

@@ -25,7 +25,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
-    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -34,10 +33,7 @@ use anyhow::{Context, Result, ensure};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
-    backend::{
-        allocator::dmabuf::{Dmabuf, WeakDmabuf},
-        input::{KeyState, Keycode},
-    },
+    backend::allocator::dmabuf::{Dmabuf, WeakDmabuf},
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState, keyboard::XkbConfig},
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
@@ -76,39 +72,25 @@ use smithay::{
 };
 use tracing::{info, warn};
 
-use manifold_layout::{
-    HitResult, InputBehavior, LayoutAction, LayoutAxis, LayoutItemId, LayoutItemKind, LayoutLeafId,
-    LayoutLeafKind, LayoutRect, LayoutSize, LayoutState, LocalPoint, LocalTransform,
-    ResolvedLayout, ResolvedLayoutItem,
-};
-
 use crate::{
     MANIFOLD_HOST_DBUS_ADDRESS_ENV, MANIFOLD_PANE_ID_ENV, MANIFOLD_SESSION_ENV,
     MANIFOLDD_DBUS_ADDRESS_ENV, MANIFOLDD_DBUS_DESTINATION_ENV,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     clipboard::HostClipboardBridge,
-    command::{InputCommand, SurfaceCommand, WorkspaceCommand},
+    command::{SurfaceCommand, WorkspaceCommand},
     geometry::{WindowSizeNegotiation, negotiate_window_size},
     plugin_runtime::{
         PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary, PluginRuntime,
     },
-    presentation::PresenterHandle,
     session_bus::{SessionBusHandle, SessionBusRealm},
     state_services::{FocusService, SurfaceSessionService, TestHarnessService},
     wasm_test::service_request,
-    winit_presenter::SharedPresenterRuntime,
 };
 use manifold_wasm::{TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRuntime};
 
 #[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
 const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
-const LEFT_PANEL_DEFAULT_WIDTH: i32 = 280;
-const LEFT_PANEL_MIN_WIDTH: i32 = 180;
-const LEFT_PANEL_MAX_WIDTH: i32 = 560;
-const LEFT_PANEL_KEYBOARD_STEP: i32 = 32;
-const LEFT_PANEL_SPLITTER_HITBOX: f64 = 8.0;
-const DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT: usize = 3;
 const SESSION_INIT_ACTOR_PREFIX: &str = "manifold.session-init";
 pub const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
 const MANIFOLD_SURFACE_SESSION_ID_ENV: &str = "MANIFOLD_SURFACE_SESSION_ID";
@@ -131,12 +113,6 @@ const SESSION_NAME_ACTIONS: &[&str] = &[
     "unfold", "vault", "weave", "anchor", "bloom", "cross", "dwell", "echo", "forge", "hinge",
     "ripple",
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresentationStatus {
-    Attached,
-    Detached,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusDirection {
@@ -280,51 +256,12 @@ struct PendingChildPane {
     pid: Option<u32>,
     pane_id: u64,
     session: SurfaceSessionId,
-    presentation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RegisteredToplevelPane {
     pane_id: u64,
     session: SurfaceSessionId,
-    presentation: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PanelReservation {
-    surface: WlSurface,
-    edge: PanelEdge,
-    width: i32,
-    visible: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelEdge {
-    Left,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum InputMode {
-    Passthrough,
-    Normal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvedLayoutSource {
-    NativeFallback,
-    Actor,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedPresentationHit {
-    layout_hit: HitResult,
-    window_hit: Option<(Window, Point<i32, Logical>)>,
-}
-
-#[derive(Debug, Clone)]
-struct NativeSessionLayout {
-    layout: LayoutState,
-    leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -353,7 +290,6 @@ pub struct SurfaceSessionSummary {
 }
 
 pub type ExtensionMetadata = BTreeMap<String, String>;
-pub const PASSTHROUGH_STATUS_CHANNEL: &str = "workspace.input.passthrough";
 pub const MANIFOLD_STATUS_PUBLISHER: &str = "manifold";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,52 +671,22 @@ pub struct Manifold {
     pub popups: PopupManager,
     pub seat: Seat<Self>,
 
-    pub presentation: PresentationStatus,
-    pub presentation_started: bool,
-    pub presentation_attach_failures: u64,
-    pub presentation_runtime_failures: u64,
-    pub presentation_last_error: Option<String>,
     focus: FocusService,
-    pub attach_requested: bool,
-    pub attach_schedule_pending: bool,
-    pub detach_requested: bool,
     pub browsers: BrowserManager,
-    pub layout: LayoutState,
-    accepted_resolved_layout: ResolvedLayout,
-    resolved_layout_source: ResolvedLayoutSource,
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
-    layout_leaf_selected_panes: Vec<(LayoutLeafId, u64)>,
-    native_auto_split_visible_limit: usize,
-    native_session_layouts: BTreeMap<SurfaceSessionId, NativeSessionLayout>,
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
     presentation_client_requested_sizes: BTreeMap<u64, (i32, i32)>,
     known_surfaces: Vec<WlSurface>,
     pending_child_panes: Vec<PendingChildPane>,
-    pub(crate) ctrl_pressed: bool,
-    pub(crate) alt_pressed: bool,
-    pub(crate) shift_pressed: bool,
-    pub(crate) ctrl_pressed_key: Option<smithay::backend::input::Keycode>,
-    pub(crate) alt_pressed_key: Option<smithay::backend::input::Keycode>,
-    pub(crate) shift_pressed_key: Option<smithay::backend::input::Keycode>,
     pub(crate) ctrl_forwarded_to_client: bool,
     pub(crate) alt_forwarded_to_client: bool,
     pub(crate) shift_forwarded_to_client: bool,
     pub(crate) forwarded_pressed_keys: Vec<smithay::backend::input::Keycode>,
-    pub(crate) suppress_mode_toggle_key_release: bool,
-    pub(crate) shortcut_prefix_active: bool,
-    pub(crate) suppress_shortcut_prefix_key_release: Option<smithay::backend::input::Keycode>,
-    pub input_mode: InputMode,
-    shortcut_passthrough: bool,
-    managed_fullscreen: bool,
     sessions: SurfaceSessionService,
-    presentation_child_surfaces: Vec<WlSurface>,
-    presentation_member_surfaces: Vec<WlSurface>,
-    panel_reservations: Vec<PanelReservation>,
-    left_panel_resizing: bool,
     extension_registry: RegistryService,
     plugin_runtime: Option<PluginRuntime>,
     plugin_host_event_sender: channel::Sender<PluginHostEvent>,
@@ -798,11 +704,7 @@ pub struct Manifold {
     configured_plugin_resources: BTreeMap<String, ConfiguredPluginResources>,
     configured_plugin_runtime_io: BTreeMap<String, manifold_wasm::RuntimeIoCapabilities>,
     filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService,
-    pub(crate) presentation_redraw_deferred: bool,
-    pub(crate) presentation_skip_post_submit_frame_callbacks: bool,
     pub(crate) test_surface_markers: bool,
-    pub(crate) presenter: Option<Rc<PresenterHandle>>,
-    pub(crate) wasm_global_key_policy: Option<manifold_wasm::WasmGlobalKeyPolicy>,
     pub(crate) test_harness: TestHarnessService,
     pub(crate) manifold_session: Option<String>,
     pub(crate) host_dbus_address: Option<String>,
@@ -888,55 +790,25 @@ impl Manifold {
             dmabuf,
             popups: PopupManager::default(),
             seat,
-            presentation: PresentationStatus::Detached,
-            presentation_started: false,
-            presentation_attach_failures: 0,
-            presentation_runtime_failures: 0,
-            presentation_last_error: None,
             focus: FocusService::default(),
-            attach_requested: false,
-            attach_schedule_pending: false,
-            detach_requested: false,
             browsers: BrowserManager::default(),
-            layout: LayoutState::default(),
-            accepted_resolved_layout: ResolvedLayout::empty(),
-            resolved_layout_source: ResolvedLayoutSource::NativeFallback,
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
-            layout_leaf_selected_panes: Vec::new(),
-            native_auto_split_visible_limit: DEFAULT_NATIVE_AUTO_SPLIT_VISIBLE_LIMIT,
-            native_session_layouts: BTreeMap::new(),
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
             presentation_client_requested_sizes: BTreeMap::new(),
             known_surfaces: Vec::new(),
             pending_child_panes: Vec::new(),
-            ctrl_pressed: false,
-            alt_pressed: false,
-            shift_pressed: false,
-            ctrl_pressed_key: None,
-            alt_pressed_key: None,
-            shift_pressed_key: None,
             ctrl_forwarded_to_client: false,
             alt_forwarded_to_client: false,
             shift_forwarded_to_client: false,
             forwarded_pressed_keys: Vec::new(),
-            suppress_mode_toggle_key_release: false,
-            shortcut_prefix_active: false,
-            suppress_shortcut_prefix_key_release: None,
-            input_mode: InputMode::Passthrough,
-            shortcut_passthrough: false,
-            managed_fullscreen: false,
             sessions: SurfaceSessionService::new(
                 current_process_directory(),
                 default_surface_session_name(SurfaceSessionId(1)),
             ),
-            presentation_child_surfaces: Vec::new(),
-            presentation_member_surfaces: Vec::new(),
-            panel_reservations: Vec::new(),
-            left_panel_resizing: false,
             extension_registry: RegistryService::default(),
             plugin_runtime: None,
             plugin_host_event_sender,
@@ -954,11 +826,7 @@ impl Manifold {
             configured_plugin_resources: BTreeMap::new(),
             configured_plugin_runtime_io: BTreeMap::new(),
             filesystem_watcher_service: manifold_wasm::NativeFilesystemWatcherService::new(),
-            presentation_redraw_deferred: false,
-            presentation_skip_post_submit_frame_callbacks: false,
             test_surface_markers: false,
-            presenter: None,
-            wasm_global_key_policy: None,
             test_harness: TestHarnessService::default(),
             manifold_session: None,
             host_dbus_address: std::env::var(MANIFOLD_HOST_DBUS_ADDRESS_ENV)
@@ -1201,93 +1069,6 @@ impl Manifold {
         )
     }
 
-    pub fn try_wasm_global_key_policy(
-        &mut self,
-        key_code: Keycode,
-        key_state: KeyState,
-    ) -> Option<bool> {
-        // Do not enter the async registry just to discover that no policy is
-        // installed. This also keeps ordinary input handling usable before the
-        // daemon has attached its Tokio runtime.
-        if self.wasm_global_key_policy.is_none() {
-            return None;
-        }
-        let modifiers = (i32::from(self.ctrl_pressed) * manifold_wasm::ABI_MOD_CTRL)
-            | (i32::from(self.alt_pressed) * manifold_wasm::ABI_MOD_ALT)
-            | (i32::from(self.shift_pressed) * manifold_wasm::ABI_MOD_SHIFT);
-        let input_mode = match self.input_mode {
-            InputMode::Passthrough => manifold_wasm::ABI_INPUT_MODE_PASSTHROUGH,
-            InputMode::Normal => manifold_wasm::ABI_INPUT_MODE_NORMAL,
-        };
-        let key_state = match key_state {
-            KeyState::Released => manifold_wasm::ABI_KEY_RELEASED,
-            KeyState::Pressed => manifold_wasm::ABI_KEY_PRESSED,
-        };
-        let input = manifold_wasm::GlobalKeyPolicyInput::new(
-            i32::try_from(key_code.raw()).unwrap_or(i32::MAX),
-            key_state,
-            modifiers,
-            input_mode,
-        );
-        let publication = self.latest_wasm_policy_state_publication();
-        let outcome = self.wasm_global_key_policy.as_mut().map(|policy| {
-            policy.handle_key(manifold_wasm::GlobalKeyPolicyInvocation::new(
-                input,
-                publication.as_ref(),
-            ))
-        })?;
-        match outcome {
-            Ok(outcome) => Some(self.apply_wasm_global_key_policy_outcome(outcome)),
-            Err(err) => {
-                self.plugin_actor_failures += 1;
-                self.plugin_actor_last_status = Some("key-policy:error".to_string());
-                warn!(
-                    ?err,
-                    "WASM global key policy failed; falling back to native key handling"
-                );
-                None
-            }
-        }
-    }
-
-    fn apply_wasm_global_key_policy_outcome(
-        &mut self,
-        outcome: manifold_wasm::GlobalKeyPolicyOutcome,
-    ) -> bool {
-        let handled = matches!(
-            outcome.decision,
-            manifold_wasm::GlobalKeyDecision::Consume
-                | manifold_wasm::GlobalKeyDecision::ForwardWithModifiers
-        );
-        for message in outcome.messages {
-            let result = if message.actor == manifold_wasm::HOST_ACTOR_NAME {
-                validate_key_policy_host_message(&message.payload).and_then(|()| {
-                    self.try_route_wasm_actor_message(
-                        &message.actor,
-                        "host".to_string(),
-                        message.payload,
-                    )
-                })
-            } else {
-                self.try_route_wasm_actor_message(
-                    &message.actor,
-                    "host".to_string(),
-                    message.payload,
-                )
-            };
-            if let Err(err) = result {
-                self.plugin_actor_failures += 1;
-                self.plugin_actor_last_status =
-                    Some(format!("key-policy:{}:message_error", message.actor));
-                warn!(actor = %message.actor, error = %err, "WASM key policy message enqueue failed");
-            } else {
-                self.plugin_actor_messages += 1;
-            }
-        }
-        self.drain_wasm_host_mailbox();
-        handled
-    }
-
     /// Route a byte-oriented policy message through the shared public actor
     /// namespace. Hosted Component/Preview actors carry sender metadata in
     /// their mailbox ABI; legacy actors retain their older byte-only mailbox.
@@ -1304,58 +1085,6 @@ impl Manifold {
             registry.try_post_named_message(actor_id, payload)
         })??;
         Ok(())
-    }
-
-    fn latest_wasm_policy_state_publication(&self) -> Option<manifold_wasm::PublicationFrameLease> {
-        let actor_names = self.legacy_wasm_actor_generation.as_ref().map_or_else(
-            Vec::new,
-            manifold_wasm::LegacyWasmActorGeneration::actor_names,
-        );
-        self.block_on_wasm_registry(|registry| {
-            actor_names.iter().find_map(|actor| {
-                let actor_id = registry.actor_id_for_name(actor)?;
-                registry
-                    .latest_default_publication_frame(actor_id)
-                    .ok()
-                    .flatten()
-            })
-        })
-        .ok()
-        .flatten()
-    }
-
-    fn emit_wasm_layout_snapshot_event(&mut self, extra_pane: Option<u64>) {
-        let mut visible_panes = self.active_surface_session_panes();
-        if let Some(extra_pane) = extra_pane
-            && !visible_panes.contains(&extra_pane)
-        {
-            visible_panes.push(extra_pane);
-        }
-        let size = self.presentation_layout_size();
-        let panes = visible_panes
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let focused = self
-            .focused_pane()
-            .map_or_else(|| "null".to_string(), |pane| pane.to_string());
-        let pane_app_ids = self
-            .active_surface_session_pane_app_ids()
-            .into_iter()
-            .map(|(pane, app_id)| {
-                let app_id = serde_json::to_string(&app_id).unwrap_or_else(|_| "\"\"".to_string());
-                format!(r#"{{"pane":{pane},"app_id":{app_id}}}"#)
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        self.emit_wasm_actor_event(
-            manifold_wasm::WasmActorEventKind::LayoutState,
-            &format!(
-            r#"{{"type":"layout-state","visible_panes":[{}],"focused_pane":{},"pane_app_ids":[{}],"size":{{"w":{},"h":{}}}}}"#,
-            panes, focused, pane_app_ids, size.w, size.h
-            ),
-        );
     }
 
     fn emit_wasm_actor_event(&mut self, event: manifold_wasm::WasmActorEventKind, payload: &str) {
@@ -1627,10 +1356,6 @@ impl Manifold {
         }
     }
 
-    pub const fn set_native_auto_split_visible_limit(&mut self, limit: usize) {
-        self.native_auto_split_visible_limit = limit;
-    }
-
     pub fn register_surface(&mut self, surface: &WlSurface) {
         if !self.known_surfaces.contains(surface) {
             self.known_surfaces.push(surface.clone());
@@ -1822,7 +1547,6 @@ impl Manifold {
             command_builder,
             pane_id,
             session,
-            false,
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
                 command,
@@ -1863,38 +1587,8 @@ impl Manifold {
             command_builder,
             pane_id,
             session,
-            false,
             format!(
                 "spawn hosted Wayland app {:?} with WAYLAND_DISPLAY={}",
-                argv,
-                self.socket_name.to_string_lossy()
-            ),
-        )
-    }
-
-    pub fn spawn_presentation_app_argv(&mut self, argv: &[String]) -> Result<HostedChildToken> {
-        let Some((program, args)) = argv.split_first() else {
-            anyhow::bail!("spawn requires a command");
-        };
-
-        let pane_id = self.allocate_pane_id();
-        let session = self.sessions.active();
-        let mut command_builder = Command::new(program);
-        command_builder
-            .args(args)
-            .env("WAYLAND_DISPLAY", &self.socket_name)
-            .env(MANIFOLD_PANE_ID_ENV, pane_id.to_string())
-            .env(MANIFOLD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
-        self.apply_control_environment(&mut command_builder, session);
-        command_builder.env(MANIFOLD_SESSION_ENV, "presentation");
-        self.launch_hosted_child(
-            argv.join(" "),
-            command_builder,
-            pane_id,
-            session,
-            true,
-            format!(
-                "spawn presentation app {:?} with WAYLAND_DISPLAY={}",
                 argv,
                 self.socket_name.to_string_lossy()
             ),
@@ -1907,14 +1601,12 @@ impl Manifold {
         mut command: Command,
         pane_id: u64,
         session: SurfaceSessionId,
-        presentation: bool,
         spawn_context: String,
     ) -> Result<HostedChildToken> {
         self.pending_child_panes.push(PendingChildPane {
             pid: None,
             pane_id,
             session,
-            presentation,
         });
         if let Some(runtime) = self.async_runtime.clone() {
             self.spawn_hosted_child_launch_task(&runtime, command_label, command, pane_id, session);
@@ -2270,207 +1962,6 @@ impl Manifold {
         Ok(address)
     }
 
-    pub fn request_attach(&mut self) {
-        if self.presentation == PresentationStatus::Detached {
-            self.stats.record_attach_request();
-            self.attach_requested = true;
-        }
-    }
-
-    pub fn request_detach(&mut self) {
-        if self.presentation == PresentationStatus::Attached {
-            self.stats.record_detach_request();
-            self.detach_requested = true;
-            self.focus.clear_presentation_activation();
-        }
-    }
-
-    pub fn request_os_window_close(&mut self) {
-        self.request_detach();
-    }
-
-    pub fn record_presentation_attach_failure(&mut self, error: &str) {
-        self.stats.record_attach_failed();
-        self.presentation_attach_failures += 1;
-        self.presentation_last_error = Some(crate::presentation::sanitize_status_value(error));
-        self.presentation = PresentationStatus::Detached;
-        self.attach_requested = false;
-        self.attach_schedule_pending = false;
-        self.focus.clear_presentation_activation();
-    }
-
-    pub fn schedule_attach(&mut self) {
-        let handle = self.loop_handle.clone();
-        let result = self
-            .loop_handle
-            .insert_source(Timer::immediate(), move |_, (), state| {
-                if let Err(err) = crate::presentation::attach(&handle, state) {
-                    warn!(?err, "failed to attach presentation");
-                    state.record_presentation_attach_failure(&err.to_string());
-                }
-                state.attach_schedule_pending = false;
-                TimeoutAction::Drop
-            });
-        if let Err(err) = result {
-            warn!(?err, "failed to schedule presentation attach");
-            self.record_presentation_attach_failure(&format!("schedule_attach:{err}"));
-        }
-    }
-
-    pub fn surface_under(
-        &self,
-        pos: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.window_under_layout_position(pos)
-            .and_then(|(window, location)| {
-                let surface_origin =
-                    window_surface_origin_in_compositor_space(location, window.geometry().loc);
-                let local_pos = Point::from((
-                    pos.x - f64::from(surface_origin.x),
-                    pos.y - f64::from(surface_origin.y),
-                ));
-                window
-                    .surface_under(local_pos, WindowSurfaceType::ALL)
-                    .map(|(surface, point)| (surface, (surface_origin + point).to_f64()))
-            })
-    }
-
-    pub fn window_under_layout_position(
-        &self,
-        pos: Point<f64, Logical>,
-    ) -> Option<(Window, Point<i32, Logical>)> {
-        if let Some(panel_hit) = self
-            .space
-            .elements()
-            .rev()
-            .filter_map(|window| {
-                Self::window_toplevel_surface(window)
-                    .is_some_and(|surface| self.panel_rect_for_surface(&surface).is_some())
-                    .then(|| {
-                        self.window_hit_location(window, pos)
-                            .map(|location| (window.clone(), location))
-                    })
-                    .flatten()
-            })
-            .next()
-        {
-            return Some(panel_hit);
-        }
-
-        if let Some(active_window) = self.active_window()
-            && let Some(surface) = Self::window_toplevel_surface(&active_window)
-            && self.toplevel_fullscreen_output(&surface).is_some()
-            && let Some(location) = self.window_hit_location(&active_window, pos)
-        {
-            return Some((active_window, location));
-        }
-
-        let content_rect = self.content_rect();
-        if !content_rect.contains_f64(pos.x, pos.y) {
-            return None;
-        }
-        let point = LocalPoint::from_pixel_in_rect(pos.x, pos.y, content_rect);
-        for hit in self.resolved_effective_hit_stack(point, pos) {
-            match hit.layout_hit.kind {
-                LayoutItemKind::Pane { .. } => {
-                    if let Some((window, location)) = hit.window_hit {
-                        return Some((window, location));
-                    }
-                }
-                LayoutItemKind::Placeholder
-                | LayoutItemKind::Handle
-                | LayoutItemKind::Chrome
-                | LayoutItemKind::Overlay => return None,
-            }
-        }
-        None
-    }
-
-    pub const fn log_pointer_click_focus_debug(
-        &self,
-        _phase: &'static str,
-        _button_code: u32,
-        _pos: Point<f64, Logical>,
-        _target_surface: Option<&WlSurface>,
-        _focus_surface: Option<&WlSurface>,
-    ) {
-    }
-
-    fn resolved_effective_hit_stack(
-        &self,
-        point: LocalPoint,
-        pos: Point<f64, Logical>,
-    ) -> Vec<ResolvedPresentationHit> {
-        self.accepted_resolved_layout
-            .hit_stack(point)
-            .into_iter()
-            .filter_map(|layout_hit| match layout_hit.kind {
-                LayoutItemKind::Pane { pane } => {
-                    let surface = self.surface_for_pane(pane)?;
-                    let window = self.window_for_toplevel_surface(&surface)?;
-                    let location = self.window_hit_location(&window, pos)?;
-                    Some(ResolvedPresentationHit {
-                        layout_hit,
-                        window_hit: Some((window, location)),
-                    })
-                }
-                LayoutItemKind::Placeholder
-                | LayoutItemKind::Handle
-                | LayoutItemKind::Chrome
-                | LayoutItemKind::Overlay => Some(ResolvedPresentationHit {
-                    layout_hit,
-                    window_hit: None,
-                }),
-            })
-            .collect()
-    }
-
-    fn window_hit_location(
-        &self,
-        window: &Window,
-        pos: Point<f64, Logical>,
-    ) -> Option<Point<i32, Logical>> {
-        let rect = self.window_layout_rect(window)?;
-        if !rect.contains_f64(pos.x, pos.y) {
-            return None;
-        }
-        let surface_origin = window_surface_origin_in_compositor_space(
-            Point::from((rect.x, rect.y)),
-            window.geometry().loc,
-        );
-        let local_pos = Point::from((
-            pos.x - f64::from(surface_origin.x),
-            pos.y - f64::from(surface_origin.y),
-        ));
-        window
-            .surface_under(local_pos, WindowSurfaceType::ALL)
-            .is_some()
-            .then(|| Point::from((rect.x, rect.y)))
-    }
-
-    pub fn first_window_center(&self) -> Option<Point<f64, Logical>> {
-        self.space.elements().find_map(|window| {
-            let rect = self.window_layout_rect(window)?;
-            Some(Point::from((
-                f64::from(rect.x) + f64::from(rect.w.max(1)) / 2.0,
-                f64::from(rect.y) + f64::from(rect.h.max(1)) / 2.0,
-            )))
-        })
-    }
-
-    pub fn configure_first_window_size(&mut self, width: i32, height: i32) -> bool {
-        if self.space.elements().next().is_none() {
-            return false;
-        }
-
-        self.configure_presentation_output(width, height, SESSION_OUTPUT_REFRESH_MILLIHZ);
-        true
-    }
-
-    pub fn configure_presentation_output(&mut self, width: i32, height: i32, refresh_millihz: i32) {
-        self.configure_presentation_output_inner(width, height, refresh_millihz, true);
-    }
-
     pub fn configure_external_presentation_output(
         &mut self,
         width: i32,
@@ -2496,18 +1987,6 @@ impl Manifold {
                 .map_or(SESSION_OUTPUT_REFRESH_MILLIHZ, |mode| mode.refresh)
         };
         let mode = OutputMode { size, refresh };
-        let resize_result = self
-            .presenter
-            .as_ref()
-            .map(|presenter| presenter.runtime.borrow_mut().resize_offscreen(size));
-        if let Some(Err(error)) = resize_result {
-            self.presentation_runtime_failures += 1;
-            self.presentation_last_error = Some(crate::presentation::sanitize_status_value(
-                &format!("runtime_resize_offscreen:{error}"),
-            ));
-            warn!(?error, "failed to resize offscreen presentation target");
-            self.request_detach();
-        }
         self.session_output
             .change_current_state(Some(mode), None, None, None);
         self.session_output.set_preferred(mode);
@@ -2515,11 +1994,7 @@ impl Manifold {
         if configure_managed_windows {
             self.reconfigure_focus_stack();
         }
-        if let Some(importer) = self.dmabuf.importer.as_ref()
-            && let Some(backend) = importer.borrow().backend.as_ref()
-        {
-            backend.request_redraw();
-        }
+        crate::frame_export::request_redraw(self);
         if let Err(error) = self.display_handle.flush_clients() {
             warn!(?error, "flush after presentation client resize failed");
         }
@@ -2534,7 +2009,7 @@ impl Manifold {
     pub fn record_dmabuf_blocker_failure(&mut self, error: &str) {
         self.dmabuf.stats.blocker_install_failures += 1;
         self.dmabuf.stats.last_blocker_error =
-            Some(crate::presentation::sanitize_status_value(error));
+            Some(crate::frame_export::sanitize_status_value(error));
     }
 
     pub fn service_test_harness(&mut self) {
@@ -2659,47 +2134,7 @@ impl Manifold {
     }
 
     pub fn activate_window_exclusively(&mut self, active_surface: Option<&WlSurface>) {
-        if self.presentation_client_controls_windows() {
-            self.activate_windows_without_geometry(active_surface);
-            return;
-        }
-        self.space.elements().for_each(|window| {
-            let Some(toplevel) = window.toplevel() else {
-                return;
-            };
-            let layout_rect = self.window_layout_rect(window);
-            let is_active = active_surface == Some(toplevel.wl_surface())
-                && self.surface_can_receive_focus(toplevel.wl_surface());
-            toplevel.with_pending_state(|state| {
-                if let Some(rect) = layout_rect {
-                    let is_fullscreen = self
-                        .toplevel_fullscreen_output(toplevel.wl_surface())
-                        .is_some();
-                    let fullscreen_output = self
-                        .toplevel_fullscreen_output(toplevel.wl_surface())
-                        .cloned()
-                        .flatten();
-                    let client_size = (rect.w.max(1), rect.h.max(1));
-                    state.size = Some(client_size.into());
-                    state.bounds = Some(client_size.into());
-                    if is_fullscreen || self.managed_fullscreen {
-                        state.states.set(xdg_toplevel::State::Fullscreen);
-                        state.states.unset(xdg_toplevel::State::Maximized);
-                    } else {
-                        state.states.set(xdg_toplevel::State::Maximized);
-                        state.states.unset(xdg_toplevel::State::Fullscreen);
-                    }
-                    state.fullscreen_output = fullscreen_output;
-                }
-                if is_active {
-                    state.states.set(xdg_toplevel::State::Activated);
-                } else {
-                    state.states.unset(xdg_toplevel::State::Activated);
-                }
-            });
-            window.set_activated(is_active);
-            toplevel.send_pending_configure();
-        });
+        self.activate_windows_without_geometry(active_surface);
     }
 
     fn activate_windows_without_geometry(&mut self, active_surface: Option<&WlSurface>) {
@@ -2720,13 +2155,6 @@ impl Manifold {
         });
     }
 
-    const fn presentation_client_controls_windows(&self) -> bool {
-        presentation_client_control_is_active(
-            self.dmabuf.fast_path.is_some(),
-            self.dmabuf.fast_path_input_draining,
-        )
-    }
-
     pub fn window_toplevel_surface(window: &Window) -> Option<WlSurface> {
         window
             .toplevel()
@@ -2745,11 +2173,6 @@ impl Manifold {
             return None;
         }
         self.apply_registered_extension_grants_for_surface(surface);
-        if registered.presentation {
-            self.mark_presentation_child_surface(surface);
-            self.request_resolved_layout_update();
-            return self.active_content_surface_for_layout_action();
-        }
         self.emit_wasm_actor_event(
             manifold_wasm::WasmActorEventKind::PaneMapped,
             &format!(
@@ -2758,42 +2181,7 @@ impl Manifold {
                 registered.session.raw()
             ),
         );
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-            && registered.session == self.sessions.active()
-        {
-            self.place_new_native_pane(registered.pane_id);
-        }
-        self.prepare_actor_layout_for_pending_pane(registered.pane_id)
-    }
-
-    fn place_new_native_pane(&mut self, pane: u64) {
-        match self.layout.active_kind() {
-            Some(LayoutLeafKind::Client) => {
-                let active_leaf = self.layout.active_leaf();
-                let occupied_pane =
-                    self.selected_pane_for_layout_leaf(active_leaf)
-                        .filter(|selected| {
-                            self.active_session_content_surface_for_pane(*selected)
-                                .is_some()
-                        });
-                let Some(occupied_pane) = occupied_pane else {
-                    self.set_layout_leaf_selected_pane(active_leaf, pane);
-                    return;
-                };
-                if self.resolved_layout_pane_count() >= self.native_auto_split_visible_limit {
-                    return;
-                }
-                let axis = self.smart_split_axis_for_active_leaf();
-                if let Some(new_leaf) = self.layout.split_active(axis) {
-                    self.set_layout_leaf_selected_pane(active_leaf, occupied_pane);
-                    self.set_layout_leaf_selected_pane(new_leaf, pane);
-                    self.layout.set_active_leaf(new_leaf);
-                } else {
-                    self.set_layout_leaf_selected_pane(active_leaf, pane);
-                }
-            }
-            None => {}
-        }
+        Some(surface.clone())
     }
 
     fn register_toplevel_pane_and_session(
@@ -2806,11 +2194,6 @@ impl Manifold {
                 session: self
                     .session_for_toplevel_surface(surface)
                     .unwrap_or_else(|| self.default_surface_session()),
-                presentation: self.toplevel_process_is_presentation(surface)
-                    || self
-                        .presentation_child_surfaces
-                        .iter()
-                        .any(|child| child == surface),
             };
         }
         let pending = self.claim_pending_child_pane(surface);
@@ -2822,13 +2205,10 @@ impl Manifold {
             .map(|pending| pending.session)
             .or_else(|| self.session_from_toplevel_process(surface))
             .unwrap_or_else(|| self.default_surface_session());
-        let presentation = pending.as_ref().is_some_and(|pending| pending.presentation)
-            || self.toplevel_process_is_presentation(surface);
         self.window_pane_ids.push((surface.clone(), pane));
         RegisteredToplevelPane {
             pane_id: pane,
             session,
-            presentation,
         }
     }
 
@@ -2859,41 +2239,20 @@ impl Manifold {
             .collect::<Vec<_>>();
 
         for (kind, detail) in grants {
-            match kind.as_str() {
-                "presentation-membership" => {
-                    if !self
-                        .presentation_member_surfaces
-                        .iter()
-                        .any(|member| member == surface)
-                    {
-                        self.presentation_member_surfaces.push(surface.clone());
-                    }
+            if kind == "placement" {
+                if let Some(session) = detail
+                    .get("surface_session")
+                    .or_else(|| detail.get("session_id"))
+                    .and_then(|value| self.resolve_surface_session(value))
+                {
+                    self.assign_toplevel_surface_session(surface, session);
                 }
-                "placement" => {
-                    if let Some(session) = detail
-                        .get("surface_session")
-                        .or_else(|| detail.get("session_id"))
-                        .and_then(|value| self.resolve_surface_session(value))
-                    {
-                        self.assign_toplevel_surface_session(surface, session);
-                    }
-                    if placement_requests_left_panel(&detail) {
-                        let width =
-                            placement_panel_width(&detail).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
-                        let visible = detail
-                            .get("visible")
-                            .and_then(|value| parse_boolish(value))
-                            .unwrap_or(true);
-                        self.reserve_left_panel(surface.clone(), width, visible);
-                    }
-                    if detail
-                        .get("focus")
-                        .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"))
-                    {
-                        self.focus_toplevel_surface(Some(surface.clone()));
-                    }
+                if detail
+                    .get("focus")
+                    .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"))
+                {
+                    self.focus_toplevel_surface(Some(surface.clone()));
                 }
-                _ => {}
             }
         }
     }
@@ -2938,23 +2297,6 @@ impl Manifold {
             .filter(|session| self.sessions.contains(*session))
     }
 
-    fn toplevel_process_is_presentation(&self, surface: &WlSurface) -> bool {
-        let Some(pid) = toplevel_pid(self, surface).and_then(|pid| pid.parse::<u32>().ok()) else {
-            return false;
-        };
-        process_tree_env_var(pid, MANIFOLD_SESSION_ENV).as_deref() == Some("presentation")
-    }
-
-    fn mark_presentation_child_surface(&mut self, surface: &WlSurface) {
-        if !self
-            .presentation_child_surfaces
-            .iter()
-            .any(|child| child == surface)
-        {
-            self.presentation_child_surfaces.push(surface.clone());
-        }
-    }
-
     fn default_surface_session(&self) -> SurfaceSessionId {
         self.sessions
             .sessions()
@@ -2977,250 +2319,18 @@ impl Manifold {
             .find_map(|(surface, pane)| (*pane == target_pane).then(|| surface.clone()))
     }
 
-    fn active_surface_session_panes(&self) -> Vec<u64> {
-        self.sessions
-            .surface_assignments()
-            .iter()
-            .filter(|(_, session)| *session == self.sessions.active())
-            .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
-            .filter_map(|(surface, _)| self.pane_for_toplevel_surface(surface))
-            .fold(Vec::new(), |mut panes, pane| {
-                if !panes.contains(&pane) {
-                    panes.push(pane);
-                }
-                panes
-            })
-    }
-
-    fn active_surface_session_pane_app_ids(&self) -> Vec<(u64, String)> {
-        self.sessions
-            .surface_assignments()
-            .iter()
-            .filter(|(_, session)| *session == self.sessions.active())
-            .filter(|(surface, _)| self.surface_participates_in_resolved_layout(surface))
-            .filter_map(|(surface, _)| {
-                let pane = self.pane_for_toplevel_surface(surface)?;
-                let app_id = toplevel_app_id(surface)?;
-                Some((pane, app_id))
-            })
-            .fold(Vec::new(), |mut entries, entry| {
-                if !entries.iter().any(|(pane, _)| *pane == entry.0) {
-                    entries.push(entry);
-                }
-                entries
-            })
-    }
-
-    fn leaf_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutLeafId> {
-        let pane = self.pane_for_toplevel_surface(surface)?;
-        self.layout_leaf_selected_panes
-            .iter()
-            .rev()
-            .find_map(|(leaf, selected)| (*selected == pane).then_some(*leaf))
-    }
-
-    fn selected_pane_for_layout_leaf(&self, target_leaf: LayoutLeafId) -> Option<u64> {
-        self.layout_leaf_selected_panes
-            .iter()
-            .rev()
-            .find_map(|(leaf, pane)| (*leaf == target_leaf).then_some(*pane))
-    }
-
-    fn set_layout_leaf_selected_pane(&mut self, leaf: LayoutLeafId, pane: u64) {
-        self.layout_leaf_selected_panes
-            .retain(|(selected_leaf, _)| *selected_leaf != leaf);
-        self.layout_leaf_selected_panes.push((leaf, pane));
-    }
-
     fn active_session_content_surface_for_pane(&self, pane: u64) -> Option<WlSurface> {
         let surface = self.surface_for_pane(pane)?;
         (self
             .session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
             == self.sessions.active()
-            && self.surface_participates_in_resolved_layout(&surface)
             && self.window_for_any_toplevel_surface(&surface).is_some())
         .then_some(surface)
     }
 
-    fn prepare_actor_layout_for_pending_pane(&mut self, pending_pane: u64) -> Option<WlSurface> {
-        self.request_resolved_layout_update_with_extra_pane(Some(pending_pane));
-        self.surface_for_pane(pending_pane)
-    }
-
-    fn request_resolved_layout_update(&mut self) {
-        self.request_resolved_layout_update_with_extra_pane(None);
-    }
-
-    fn request_resolved_layout_update_with_extra_pane(&mut self, extra_pane: Option<u64>) {
-        let has_layout_subscriber =
-            self.legacy_wasm_actor_generation
-                .as_ref()
-                .is_some_and(|generation| {
-                    !generation
-                        .subscribers(manifold_wasm::WasmActorEventKind::LayoutState)
-                        .is_empty()
-                });
-        if !has_layout_subscriber {
-            self.refresh_native_resolved_layout();
-            return;
-        }
-        self.emit_wasm_layout_snapshot_event(extra_pane);
-    }
-
-    pub fn apply_actor_resolved_layout(
-        &mut self,
-        layout: ResolvedLayout,
-        focus: Option<u64>,
-    ) -> bool {
-        self.accept_actor_resolved_layout(layout, focus).is_some()
-            || self.resolved_layout_source == ResolvedLayoutSource::Actor
-    }
-
-    fn accept_actor_resolved_layout(
-        &mut self,
-        layout: ResolvedLayout,
-        focus: Option<u64>,
-    ) -> Option<WlSurface> {
-        let valid_panes = self.active_surface_session_panes();
-        let layout = match layout.validate_for_panes(&valid_panes) {
-            Ok(layout) => layout,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "layout actor returned invalid resolved layout; using native placement"
-                );
-                self.refresh_native_resolved_layout();
-                return None;
-            }
-        };
-
-        let focus_surface = focus
-            .filter(|pane| layout.pane_item(*pane).is_some())
-            .and_then(|pane| self.surface_for_pane(pane));
-        self.accepted_resolved_layout = layout;
-        self.resolved_layout_source = ResolvedLayoutSource::Actor;
-        self.reconfigure_focus_stack();
-        focus_surface
-    }
-
-    fn refresh_native_resolved_layout(&mut self) {
-        self.repair_native_layout_leaf_selections();
-        let layout = self.native_fallback_resolved_layout();
-        match layout.validate_for_panes(&self.active_surface_session_panes()) {
-            Ok(layout) => {
-                self.accepted_resolved_layout = layout;
-                self.resolved_layout_source = ResolvedLayoutSource::NativeFallback;
-            }
-            Err(err) => {
-                warn!(?err, "native fallback produced invalid resolved layout");
-                self.accepted_resolved_layout = ResolvedLayout::empty();
-                self.resolved_layout_source = ResolvedLayoutSource::NativeFallback;
-            }
-        }
-    }
-
-    fn repair_native_layout_leaf_selections(&mut self) {
-        let leaves = self
-            .layout
-            .resolve(self.presentation_layout_size())
-            .into_iter()
-            .filter(|region| region.kind == LayoutLeafKind::Client)
-            .map(|region| region.leaf)
-            .collect::<Vec<_>>();
-        let panes = self.active_surface_session_panes();
-        let old_selections = self.layout_leaf_selected_panes.clone();
-        let mut used = Vec::new();
-        let mut next_selections = Vec::new();
-
-        for leaf in leaves {
-            let preferred = old_selections
-                .iter()
-                .rev()
-                .find_map(|(selected_leaf, pane)| (*selected_leaf == leaf).then_some(*pane));
-            let selected = preferred
-                .and_then(|pane| first_available_pane_from(&panes, pane, &used, 0))
-                .or_else(|| panes.iter().copied().find(|pane| !used.contains(pane)));
-            if let Some(pane) = selected {
-                used.push(pane);
-                next_selections.push((leaf, pane));
-            }
-        }
-
-        self.layout_leaf_selected_panes = next_selections;
-    }
-
-    fn native_fallback_resolved_layout(&self) -> ResolvedLayout {
-        let bounds = self.presentation_layout_size();
-        let mut items = Vec::new();
-        let mut z = 0.0;
-        for region in self.layout.resolve(bounds) {
-            let pane = self
-                .selected_pane_for_layout_leaf(region.leaf)
-                .filter(|pane| {
-                    region.kind == LayoutLeafKind::Client
-                        && self
-                            .active_session_content_surface_for_pane(*pane)
-                            .is_some()
-                });
-            let Some(pane) = pane else {
-                items.push(ResolvedLayoutItem {
-                    id: LayoutItemId(1_000_000 + region.leaf.raw()),
-                    kind: LayoutItemKind::Placeholder,
-                    z,
-                    transform: LocalTransform::from_pixel_rect(region.rect, bounds),
-                    input: InputBehavior::Hit,
-                });
-                z += 1.0;
-                continue;
-            };
-
-            items.push(ResolvedLayoutItem {
-                id: LayoutItemId(pane),
-                kind: LayoutItemKind::Pane { pane },
-                z,
-                transform: LocalTransform::from_pixel_rect(region.rect, bounds),
-                input: InputBehavior::Pane,
-            });
-            z += 1.0;
-        }
-        ResolvedLayout { items }
-    }
-
     pub const fn active_surface_session(&self) -> SurfaceSessionId {
         self.sessions.active()
-    }
-
-    fn save_active_native_session_layout(&mut self) {
-        let active = self.sessions.active();
-        if !self.sessions.contains(active) {
-            return;
-        }
-        self.native_session_layouts.insert(
-            active,
-            NativeSessionLayout {
-                layout: self.layout.clone(),
-                leaf_selected_panes: self.layout_leaf_selected_panes.clone(),
-            },
-        );
-    }
-
-    fn restore_native_session_layout(&mut self, session: SurfaceSessionId) {
-        let left_dock_visible = self.layout.left_dock_visible;
-        let right_dock_visible = self.layout.right_dock_visible;
-        let bottom_dock_visible = self.layout.bottom_dock_visible;
-        let center_visible = self.layout.center_visible;
-        if let Some(saved) = self.native_session_layouts.get(&session).cloned() {
-            self.layout = saved.layout;
-            self.layout_leaf_selected_panes = saved.leaf_selected_panes;
-        } else {
-            self.layout = LayoutState::default();
-            self.layout_leaf_selected_panes.clear();
-        }
-        self.layout.left_dock_visible = left_dock_visible;
-        self.layout.right_dock_visible = right_dock_visible;
-        self.layout.bottom_dock_visible = bottom_dock_visible;
-        self.layout.center_visible = center_visible;
     }
 
     pub fn restore_last_interacted_surface_session(&mut self) -> bool {
@@ -3231,13 +2341,10 @@ impl Manifold {
             return false;
         }
         self.stop_configured_workspace_plugins_for_rebind();
-        self.save_active_native_session_layout();
         if self.sessions.activate_recent(session).is_err() {
             return false;
         }
-        self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
-        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -3280,18 +2387,9 @@ impl Manifold {
             );
         }
 
-        self.ctrl_pressed = false;
-        self.alt_pressed = false;
-        self.shift_pressed = false;
-        self.ctrl_pressed_key = None;
-        self.alt_pressed_key = None;
-        self.shift_pressed_key = None;
         self.ctrl_forwarded_to_client = false;
         self.alt_forwarded_to_client = false;
         self.shift_forwarded_to_client = false;
-        self.suppress_mode_toggle_key_release = false;
-        self.shortcut_prefix_active = false;
-        self.suppress_shortcut_prefix_key_release = None;
         self.focus.clear_transient_pointer_state();
     }
 
@@ -3302,9 +2400,7 @@ impl Manifold {
     pub fn clear_initial_surface_session(&mut self) {
         if self.sessions.clear_initial().is_err() {
             warn!("refusing to clear non-initial surface session state");
-            return;
         }
-        self.native_session_layouts.clear();
     }
 
     pub fn surface_session_summaries(&self) -> Vec<SurfaceSessionSummary> {
@@ -3389,8 +2485,6 @@ impl Manifold {
         let closing_active = self.sessions.active() == session;
         if closing_active {
             self.stop_configured_workspace_plugins_for_rebind();
-        } else {
-            self.save_active_native_session_layout();
         }
 
         let surfaces = self.content_surfaces_for_session(session);
@@ -3399,8 +2493,6 @@ impl Manifold {
         }
 
         self.remove_surface_session_record(session);
-        self.restore_native_session_layout(self.sessions.active());
-        self.refresh_native_resolved_layout();
         self.reconfigure_focus_stack();
         if closing_active {
             self.start_configured_workspace_plugins_after_rebind();
@@ -3435,7 +2527,6 @@ impl Manifold {
         if let Err(error) = self.stop_session_init_actor(session) {
             warn!(surface_session = session.raw(), error = %error, "failed to stop surface-session init actor");
         }
-        self.native_session_layouts.remove(&session);
         let _ = self.sessions.remove(session);
     }
 
@@ -3444,8 +2535,7 @@ impl Manifold {
             .surface_assignments()
             .iter()
             .filter(|(surface, assigned_session)| {
-                *assigned_session == session
-                    && self.surface_participates_in_resolved_layout(surface)
+                *assigned_session == session && self.pane_for_toplevel_surface(surface).is_some()
             })
             .map(|(surface, _assigned_session)| surface.clone())
             .collect()
@@ -3457,13 +2547,13 @@ impl Manifold {
             .iter()
             .any(|(surface, assigned_session)| {
                 *assigned_session == session
-                    && self.surface_participates_in_resolved_layout(surface)
+                    && self.pane_for_toplevel_surface(surface).is_some()
                     && self.window_for_any_toplevel_surface(surface).is_some()
             })
             || self
                 .pending_child_panes
                 .iter()
-                .any(|pending| pending.session == session && !pending.presentation)
+                .any(|pending| pending.session == session)
     }
 
     pub fn resolve_surface_session(&self, query: &str) -> Option<SurfaceSessionId> {
@@ -3498,13 +2588,10 @@ impl Manifold {
             return false;
         }
         self.stop_configured_workspace_plugins_for_rebind();
-        self.save_active_native_session_layout();
         if self.sessions.activate(session).is_err() {
             return false;
         }
-        self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
-        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -3515,14 +2602,11 @@ impl Manifold {
             return false;
         }
         self.stop_configured_workspace_plugins_for_rebind();
-        self.save_active_native_session_layout();
-        let Ok(next) = self.sessions.activate_next() else {
+        let Ok(_next) = self.sessions.activate_next() else {
             self.start_configured_workspace_plugins_after_rebind();
             return false;
         };
-        self.restore_native_session_layout(next);
         self.prune_empty_unfocused_surface_sessions();
-        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -3545,16 +2629,13 @@ impl Manifold {
         directory: PathBuf,
     ) -> Result<SurfaceSessionId> {
         self.stop_configured_workspace_plugins_for_rebind();
-        self.save_active_native_session_layout();
         let next = self.sessions.next_id();
         let session = self.sessions.create(
             name.filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| default_surface_session_name(next)),
             directory,
         )?;
-        self.restore_native_session_layout(session);
         self.prune_empty_unfocused_surface_sessions();
-        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         if self.session_init_actor.is_some() {
@@ -3581,18 +2662,7 @@ impl Manifold {
             return false;
         };
         self.window_belongs_to_active_surface_session(window)
-            && self.surface_participates_in_resolved_layout(&surface)
             && self.pane_for_toplevel_surface(&surface).is_some()
-    }
-
-    pub(crate) fn presentation_client_source_rect(&self, window: &Window) -> LayoutRect {
-        let size = window.geometry().size;
-        LayoutRect {
-            x: 0,
-            y: 0,
-            w: size.w.max(1),
-            h: size.h.max(1),
-        }
     }
 
     pub(crate) fn active_presentation_client_window(&self) -> Option<Window> {
@@ -3602,82 +2672,9 @@ impl Manifold {
         })
     }
 
-    pub fn window_visible_in_presentation(&self, window: &Window) -> bool {
-        let Some(surface) = Self::window_toplevel_surface(window) else {
-            return false;
-        };
-        if self.surface_is_visible_presentation_member(&surface)
-            || self.surface_has_visible_panel(&surface)
-        {
-            return true;
-        }
-        if !self.window_belongs_to_active_surface_session(window) {
-            return false;
-        }
-        if self.toplevel_fullscreen_output(&surface).is_some() {
-            return true;
-        }
-        self.pane_for_toplevel_surface(&surface)
-            .is_some_and(|pane| self.accepted_resolved_layout.pane_item(pane).is_some())
-    }
-
-    fn surface_participates_in_resolved_layout(&self, surface: &WlSurface) -> bool {
-        !self
-            .presentation_child_surfaces
-            .iter()
-            .any(|child| child == surface)
-            && !self
-                .presentation_member_surfaces
-                .iter()
-                .any(|member| member == surface)
-            && !self
-                .panel_reservations
-                .iter()
-                .any(|panel| panel.surface == *surface)
-    }
-
-    fn surface_is_visible_presentation_member(&self, surface: &WlSurface) -> bool {
-        if !self
-            .presentation_member_surfaces
-            .iter()
-            .any(|member| member == surface)
-        {
-            return false;
-        }
-        self.panel_reservations
-            .iter()
-            .rev()
-            .find(|panel| panel.surface == *surface)
-            .is_none_or(|panel| panel.visible)
-    }
-
-    fn surface_has_visible_panel(&self, surface: &WlSurface) -> bool {
-        self.panel_reservations
-            .iter()
-            .rev()
-            .find(|panel| panel.surface == *surface)
-            .is_some_and(|panel| panel.visible)
-    }
-
     fn surface_can_receive_focus(&self, surface: &WlSurface) -> bool {
-        self.surface_has_visible_pane_item(surface)
-            || self.surface_is_visible_presentation_member(surface)
-            || self.surface_has_visible_panel(surface)
-    }
-
-    pub fn presentation_visible_window_count(&self) -> usize {
-        self.space
-            .elements()
-            .filter(|window| self.window_visible_in_presentation(window))
-            .count()
-    }
-
-    pub fn window_layout_rect(&self, window: &Window) -> Option<LayoutRect> {
-        if !self.window_visible_in_presentation(window) {
-            return None;
-        }
-        let surface = Self::window_toplevel_surface(window)?;
-        self.layout_rect_for_toplevel_surface(&surface)
+        self.session_for_toplevel_surface(surface) == Some(self.sessions.active())
+            && self.pane_for_toplevel_surface(surface).is_some()
     }
 
     pub(crate) fn window_pane_id(&self, window: &Window) -> Option<u64> {
@@ -3692,10 +2689,8 @@ impl Manifold {
 
     pub(crate) fn presentation_window_for_pane(&self, pane: u64) -> Option<Window> {
         let surface = self.surface_for_pane(pane)?;
-        // The external presentation client owns pane visibility. Its inventory
-        // can include a newly mapped window before the backend compatibility
-        // layout has incorporated that pane, so input must not use the
-        // compatibility layout's visibility filter.
+        // The external presentation client owns pane visibility. The backend
+        // only verifies that the pane belongs to the active session.
         let window = self.window_for_any_toplevel_surface(&surface)?;
         self.window_available_to_presentation_client(&window)
             .then_some(window)
@@ -3726,36 +2721,6 @@ impl Manifold {
             .unwrap_or_else(|| fallback_marker_id(fallback_index))
     }
 
-    fn layout_rect_for_toplevel_surface(&self, surface: &WlSurface) -> Option<LayoutRect> {
-        if let Some(rect) = self.panel_rect_for_surface(surface) {
-            return Some(rect);
-        }
-        if self.toplevel_fullscreen_output(surface).is_some() {
-            return Some(
-                self.translate_content_rect(fullscreen_layout_rect(
-                    self.presentation_layout_size(),
-                )),
-            );
-        }
-        if !self.surface_participates_in_resolved_layout(surface) {
-            return None;
-        }
-        let pane = self.pane_for_toplevel_surface(surface)?;
-        let item = self.accepted_resolved_layout.pane_item(pane)?;
-        Some(self.translate_content_rect(item.pixel_rect(self.presentation_layout_size())))
-    }
-
-    fn surface_has_visible_pane_item(&self, surface: &WlSurface) -> bool {
-        if !self.surface_participates_in_resolved_layout(surface) {
-            return false;
-        }
-        if self.toplevel_fullscreen_output(surface).is_some() {
-            return true;
-        }
-        self.pane_for_toplevel_surface(surface)
-            .is_some_and(|pane| self.accepted_resolved_layout.pane_item(pane).is_some())
-    }
-
     pub fn request_toplevel_fullscreen(
         &mut self,
         surface: WlSurface,
@@ -3779,11 +2744,9 @@ impl Manifold {
     }
 
     pub fn focused_window_fullscreen(&self) -> bool {
-        self.managed_fullscreen
-            || self
-                .focus
-                .active_toplevel()
-                .is_some_and(|surface| self.toplevel_fullscreen_output(surface).is_some())
+        self.focus
+            .active_toplevel()
+            .is_some_and(|surface| self.toplevel_fullscreen_output(surface).is_some())
     }
 
     fn toplevel_fullscreen_output(
@@ -3798,11 +2761,6 @@ impl Manifold {
             })
     }
 
-    fn surface_for_layout_leaf(&self, target_leaf: LayoutLeafId) -> Option<WlSurface> {
-        self.selected_pane_for_layout_leaf(target_leaf)
-            .and_then(|pane| self.active_session_content_surface_for_pane(pane))
-    }
-
     pub fn focus_toplevel_surface(&mut self, active_surface: Option<WlSurface>) {
         if let Some(session) = active_surface
             .as_ref()
@@ -3810,18 +2768,8 @@ impl Manifold {
         {
             self.record_surface_session_interaction(session);
         }
-        if let Some(leaf) = active_surface
-            .as_ref()
-            .filter(|surface| self.surface_participates_in_resolved_layout(surface))
-            .and_then(|surface| self.leaf_for_toplevel_surface(surface))
-        {
-            self.layout.set_active_leaf(leaf);
-        }
         self.focus.set_active_toplevel(active_surface.clone());
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            self.request_resolved_layout_update();
-        }
-        self.activate_window_exclusively(active_surface.as_ref());
+        self.activate_windows_without_geometry(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard_focus =
             active_surface.filter(|surface| self.surface_can_receive_focus(surface));
@@ -3831,35 +2779,8 @@ impl Manifold {
             .set_focus(self, keyboard_focus, serial);
     }
 
-    fn fallback_focus_leaf_for_surface(&self, surface: &WlSurface) -> Option<LayoutLeafId> {
-        self.leaf_for_toplevel_surface(surface).or_else(|| {
-            self.layout
-                .active_kind()
-                .is_some()
-                .then_some(self.layout.active_leaf())
-        })
-    }
-
     pub fn focus_pane(&mut self, pane: u64) -> bool {
-        let Some(surface) = self.active_session_content_surface_for_pane(pane) else {
-            return false;
-        };
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            let Some(leaf) = self.fallback_focus_leaf_for_surface(&surface) else {
-                return false;
-            };
-            self.layout.set_active_leaf(leaf);
-            self.set_layout_leaf_selected_pane(leaf, pane);
-            self.request_resolved_layout_update();
-        } else if !self.surface_has_visible_pane_item(&surface) {
-            return false;
-        }
-        if let Some(window) = self.window_for_any_toplevel_surface(&surface) {
-            self.space.raise_element(&window, true);
-        }
-        self.focus_toplevel_surface(Some(surface));
-        self.reconfigure_focus_stack();
-        true
+        self.focus_pane_from_presentation_client(pane)
     }
 
     pub fn focus_pane_from_presentation_client(&mut self, pane: u64) -> bool {
@@ -3981,17 +2902,11 @@ impl Manifold {
             self.space
                 .elements()
                 .find(|window| {
-                    self.window_visible_in_presentation(window)
+                    self.window_available_to_presentation_client(window)
                         && Self::window_toplevel_surface(window).as_ref() == Some(active)
                 })
                 .cloned()
         })
-    }
-
-    pub fn active_presentation_window(&self) -> Option<Window> {
-        self.focus
-            .active_toplevel()
-            .and_then(|active| self.window_for_toplevel_surface(active))
     }
 
     pub fn focus_window(&mut self, window: &Window) {
@@ -4004,7 +2919,7 @@ impl Manifold {
             .session_for_toplevel_surface(&surface)
             .unwrap_or(SurfaceSessionId(1))
             == self.sessions.active()
-            && self.surface_participates_in_resolved_layout(&surface)
+            && self.pane_for_toplevel_surface(&surface).is_some()
             && let Some(pane) = self.pane_for_toplevel_surface(&surface)
             && self.focus_pane(pane)
         {
@@ -4062,9 +2977,6 @@ impl Manifold {
     }
 
     pub fn agent_has_focused_window(&self, agent_id: &str) -> bool {
-        if self.layout.active_kind() != Some(LayoutLeafKind::Client) {
-            return false;
-        }
         let Some(record) = self
             .extension_registry
             .agents
@@ -4099,35 +3011,41 @@ impl Manifold {
 
     pub fn focus_presentation_window_with_activation_token(
         &mut self,
-        activation_token: &str,
+        _activation_token: &str,
     ) -> bool {
-        let token = (!activation_token.is_empty()).then(|| activation_token.to_string());
-        if self.focus_presentation_window_now(token.as_deref()) {
-            self.focus.clear_presentation_activation();
-            return true;
+        let Some(fast_path) = self.dmabuf.fast_path.as_mut() else {
+            return false;
+        };
+        if fast_path
+            .frames
+            .try_send(manifold_ipc::CriticalRecord {
+                opcode: manifold_ipc::FRAME_FOCUS_PRESENTATION,
+                connection_generation: fast_path.generation,
+                ..manifold_ipc::CriticalRecord::default()
+            })
+            .is_err()
+        {
+            return false;
         }
-        if self.attach_requested {
-            self.focus
-                .queue_presentation_activation(token.unwrap_or_default());
-        }
-        false
+        fast_path.frame_notifications.notify().is_ok()
     }
 
-    pub(crate) const fn take_pending_presentation_focus_activation_token(
-        &mut self,
-    ) -> Option<String> {
-        self.focus.take_presentation_activation()
-    }
-
-    fn focus_presentation_window_now(&self, activation_token: Option<&str>) -> bool {
-        self.presenter.as_ref().is_some_and(|presenter| {
-            presenter
-                .runtime
-                .borrow()
-                .backend
-                .as_ref()
-                .is_some_and(|backend| backend.focus_window(activation_token))
-        })
+    pub fn close_presentation_client(&mut self) -> bool {
+        let Some(fast_path) = self.dmabuf.fast_path.as_mut() else {
+            return false;
+        };
+        if fast_path
+            .frames
+            .try_send(manifold_ipc::CriticalRecord {
+                opcode: manifold_ipc::FRAME_CLOSE_PRESENTATION,
+                connection_generation: fast_path.generation,
+                ..manifold_ipc::CriticalRecord::default()
+            })
+            .is_err()
+        {
+            return false;
+        }
+        fast_path.frame_notifications.notify().is_ok()
     }
 
     pub fn focus_app_id_or_spawn(&mut self, app_id: &str, argv: &[String]) -> bool {
@@ -4146,13 +3064,6 @@ impl Manifold {
                 false
             }
         }
-    }
-
-    pub fn focused_pane(&self) -> Option<u64> {
-        let surface = self.focus.active_toplevel()?;
-        self.surface_has_visible_pane_item(surface)
-            .then(|| self.pane_for_toplevel_surface(surface))
-            .flatten()
     }
 
     pub fn register_extension(
@@ -4429,38 +3340,6 @@ impl Manifold {
                 }
             })
             .collect()
-    }
-
-    pub const fn shortcut_passthrough(&self) -> bool {
-        self.shortcut_passthrough
-    }
-
-    pub fn set_shortcut_passthrough(&mut self, enabled: bool) -> bool {
-        if self.shortcut_passthrough == enabled {
-            return false;
-        }
-        self.shortcut_passthrough = enabled;
-        if enabled {
-            let mut metadata = ExtensionMetadata::new();
-            metadata.insert("scope".to_string(), "workspace".to_string());
-            metadata.insert("click_action".to_string(), "disable".to_string());
-            let _ = self.publish_status(
-                MANIFOLD_STATUS_PUBLISHER,
-                PASSTHROUGH_STATUS_CHANNEL,
-                "active",
-                "Passthrough",
-                metadata,
-            );
-        } else {
-            self.clear_status(MANIFOLD_STATUS_PUBLISHER, PASSTHROUGH_STATUS_CHANNEL);
-        }
-        true
-    }
-
-    pub fn toggle_shortcut_passthrough(&mut self) -> bool {
-        let enabled = !self.shortcut_passthrough;
-        self.set_shortcut_passthrough(enabled);
-        enabled
     }
 
     /// Configure the root artifact used for every new surface-session realm.
@@ -5104,7 +3983,7 @@ impl Manifold {
         runtime_io: manifold_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
         let artifact = manifold_wasm::WasmPluginArtifact::load(path)?;
-        let (inventory, candidate_key_policy) = match artifact {
+        let inventory = match artifact {
             manifold_wasm::WasmPluginArtifact::Component { core_module_error } => {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
@@ -5129,9 +4008,7 @@ impl Manifold {
                     runtime_io,
                 );
             }
-            manifold_wasm::WasmPluginArtifact::Legacy(artifact) => {
-                (artifact.inventory, artifact.key_policy)
-            }
+            manifold_wasm::WasmPluginArtifact::Legacy(artifact) => artifact.inventory,
         };
         ensure_legacy_instance_id_supported(legacy_instance_id_to_validate(
             instance_id,
@@ -5140,10 +4017,6 @@ impl Manifold {
         self.ensure_legacy_wasm_actor_ids_available(&inventory.actors)?;
 
         self.start_wasm_plugin_actors(path, &inventory.actors)?;
-        if let Some((provider_name, policy)) = candidate_key_policy {
-            self.wasm_global_key_policy = Some(policy);
-            info!(provider = %provider_name, path = %path.display(), "loaded WASM plugin key policy");
-        }
         Ok(())
     }
 
@@ -5485,17 +4358,6 @@ impl Manifold {
                 let _ = host_events.send(event);
             },
         ));
-        self.request_resolved_layout_update();
-        Ok(())
-    }
-
-    pub(crate) fn replace_wasm_global_key_policy(
-        &mut self,
-        path: &Path,
-        provider_name: &str,
-    ) -> Result<()> {
-        let policy = manifold_wasm::WasmGlobalKeyPolicy::load(path, provider_name)?;
-        self.wasm_global_key_policy = Some(policy);
         Ok(())
     }
 
@@ -5529,56 +4391,6 @@ impl Manifold {
             });
         }
         Ok(id)
-    }
-
-    pub fn request_window_placement(
-        &mut self,
-        window_id: &str,
-        placement: &ExtensionMetadata,
-        sender: String,
-    ) -> Result<String> {
-        ensure_metadata(placement)?;
-        let window = self.window_record(window_id)?;
-        let mut detail = placement.clone();
-        detail.insert("window_id".to_string(), window_id.to_string());
-        let grant_id = self.record_grant(&window.extension_id, "placement", detail, sender);
-
-        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
-            warn!(
-                window_id,
-                identity = ?window.identity,
-                "DBus placement request granted but no matching toplevel is mapped yet"
-            );
-            return Ok(grant_id);
-        };
-
-        if let Some(session) = placement
-            .get("surface_session")
-            .or_else(|| placement.get("session_id"))
-            .and_then(|value| self.resolve_surface_session(value))
-        {
-            self.assign_toplevel_surface_session(&surface, session);
-        }
-        if placement_requests_left_panel(placement) {
-            let width = placement_panel_width(placement).unwrap_or(LEFT_PANEL_DEFAULT_WIDTH);
-            let visible = placement
-                .get("visible")
-                .and_then(|value| parse_boolish(value))
-                .unwrap_or(true);
-            self.reserve_left_panel(surface.clone(), width, visible);
-        }
-        if placement
-            .get("focus")
-            .is_some_and(|value| matches!(value.as_str(), "true" | "1" | "yes"))
-        {
-            if let Some(session) = self.session_for_toplevel_surface(&surface) {
-                self.switch_to_surface_session(session);
-            }
-            self.focus_toplevel_surface(Some(surface));
-        } else {
-            self.reconfigure_focus_stack();
-        }
-        Ok(grant_id)
     }
 
     pub fn replace_window_role(
@@ -5632,11 +4444,6 @@ impl Manifold {
             return;
         };
 
-        self.presentation_member_surfaces
-            .retain(|member| member != &surface);
-        self.panel_reservations
-            .retain(|panel| panel.surface != surface);
-
         if self.focus.active_toplevel() == Some(&surface) {
             self.focus_toplevel_surface(None);
         }
@@ -5648,63 +4455,7 @@ impl Manifold {
             toplevel.send_close();
         }
 
-        self.repair_resolved_layout_for_current_inventory();
         self.reconfigure_focus_stack();
-    }
-
-    fn reserve_left_panel(&mut self, surface: WlSurface, width: i32, visible: bool) {
-        self.panel_reservations
-            .retain(|panel| panel.edge != PanelEdge::Left || panel.surface != surface);
-        let (presentation_w, _) = self.presentation_size();
-        let max_width = LEFT_PANEL_MAX_WIDTH.min((presentation_w - 120).max(LEFT_PANEL_MIN_WIDTH));
-        let width = width.clamp(LEFT_PANEL_MIN_WIDTH, max_width);
-        self.panel_reservations.push(PanelReservation {
-            surface,
-            edge: PanelEdge::Left,
-            width,
-            visible,
-        });
-        self.layout.left_dock_visible = visible;
-        self.repair_resolved_layout_for_current_inventory();
-        self.reconfigure_focus_stack();
-    }
-
-    pub fn request_presentation_membership(
-        &mut self,
-        window_id: &str,
-        membership: ExtensionMetadata,
-        sender: String,
-    ) -> Result<String> {
-        ensure_metadata(&membership)?;
-        let window = self.window_record(window_id)?;
-        let mut detail = membership;
-        detail.insert("window_id".to_string(), window_id.to_string());
-        let grant_id = self.record_grant(
-            &window.extension_id,
-            "presentation-membership",
-            detail,
-            sender,
-        );
-
-        let Some(surface) = self.find_surface_for_window_identity(&window.identity) else {
-            warn!(
-                window_id,
-                identity = ?window.identity,
-                "DBus presentation membership granted but no matching toplevel is mapped yet"
-            );
-            return Ok(grant_id);
-        };
-
-        if !self
-            .presentation_member_surfaces
-            .iter()
-            .any(|member| member == &surface)
-        {
-            self.presentation_member_surfaces.push(surface);
-        }
-        self.repair_resolved_layout_for_current_inventory();
-        self.reconfigure_focus_stack();
-        Ok(grant_id)
     }
 
     pub fn request_shortcut_grant(
@@ -5763,13 +4514,8 @@ impl Manifold {
     }
 
     pub fn window_for_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
-        self.space
-            .elements()
-            .find(|window| {
-                self.window_visible_in_presentation(window)
-                    && Self::window_toplevel_surface(window).as_ref() == Some(surface)
-            })
-            .cloned()
+        self.window_for_any_toplevel_surface(surface)
+            .filter(|window| self.window_available_to_presentation_client(window))
     }
 
     fn window_for_any_toplevel_surface(&self, surface: &WlSurface) -> Option<Window> {
@@ -5848,7 +4594,6 @@ impl Manifold {
         if self.sessions.assign_surface(surface, session).is_err() {
             return false;
         }
-        self.request_resolved_layout_update();
         self.reconfigure_focus_stack();
         true
     }
@@ -5876,7 +4621,7 @@ impl Manifold {
         let windows = self
             .space
             .elements()
-            .filter(|window| self.window_visible_in_presentation(window))
+            .filter(|window| self.window_available_to_presentation_client(window))
             .cloned()
             .collect::<Vec<_>>();
         let window_count = windows.len();
@@ -5905,161 +4650,6 @@ impl Manifold {
         true
     }
 
-    fn cycle_focus_in_active_layout_leaf(&mut self, direction: FocusDirection) -> bool {
-        let Some(active_surface) = self.focus.active_toplevel().cloned() else {
-            return false;
-        };
-        if !self.surface_has_visible_pane_item(&active_surface) {
-            return false;
-        }
-        let Some(active_leaf) = self.leaf_for_toplevel_surface(&active_surface) else {
-            return false;
-        };
-        let Some(current_pane) = self.pane_for_toplevel_surface(&active_surface) else {
-            return false;
-        };
-        let excluded = self.selected_panes_for_other_layout_leaves(active_leaf);
-        let step = match direction {
-            FocusDirection::Next => 1,
-            FocusDirection::Previous => -1,
-        };
-        let Some(next_pane) = first_available_pane_from(
-            &self.active_surface_session_panes(),
-            current_pane,
-            &excluded,
-            step,
-        ) else {
-            return false;
-        };
-        if next_pane == current_pane {
-            return false;
-        }
-        self.set_layout_leaf_selected_pane(active_leaf, next_pane);
-        self.request_resolved_layout_update();
-        let Some(next_surface) = self.surface_for_pane(next_pane) else {
-            return false;
-        };
-        self.focus_toplevel_surface(Some(next_surface));
-        self.reconfigure_focus_stack();
-        true
-    }
-
-    fn split_active_content_leaf(&mut self, axis: LayoutAxis) -> bool {
-        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
-            return false;
-        }
-        let Some(active_surface) = self.active_content_surface_for_layout_action() else {
-            return false;
-        };
-        let Some(active_leaf) = self.leaf_for_toplevel_surface(&active_surface) else {
-            return false;
-        };
-        if !self.layout.set_active_leaf(active_leaf) {
-            return false;
-        }
-        let Some(new_leaf) = self.layout.split_active(axis) else {
-            return false;
-        };
-
-        if let Some(active_pane) = self.pane_for_toplevel_surface(&active_surface) {
-            self.set_layout_leaf_selected_pane(active_leaf, active_pane);
-            if let Some(next_pane) = first_available_pane_from(
-                &self.active_surface_session_panes(),
-                active_pane,
-                &[active_pane],
-                1,
-            ) {
-                self.set_layout_leaf_selected_pane(new_leaf, next_pane);
-            }
-        }
-
-        self.request_resolved_layout_update();
-        self.reconfigure_focus_stack();
-        true
-    }
-
-    fn split_active_content_leaf_smart(&mut self) -> bool {
-        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
-            return false;
-        }
-        if self.active_content_surface_for_layout_action().is_none() {
-            return false;
-        }
-        let axis = self.smart_split_axis_for_active_leaf();
-        self.split_active_content_leaf(axis)
-    }
-
-    fn active_content_surface_for_layout_action(&self) -> Option<WlSurface> {
-        self.focus
-            .active_toplevel()
-            .filter(|surface| self.surface_has_visible_pane_item(surface))
-            .cloned()
-            .or_else(|| self.surface_for_layout_leaf(self.layout.active_leaf()))
-    }
-
-    fn smart_split_axis_for_active_leaf(&self) -> LayoutAxis {
-        let rect = self
-            .layout
-            .active_rect(self.presentation_layout_size())
-            .unwrap_or_else(|| fullscreen_layout_rect(self.presentation_layout_size()));
-        if rect.w >= rect.h {
-            LayoutAxis::Horizontal
-        } else {
-            LayoutAxis::Vertical
-        }
-    }
-
-    fn focus_layout_leaf_by_offset(&mut self, offset: isize) -> bool {
-        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
-            return false;
-        }
-        let previous_leaf = self.layout.active_leaf();
-        let Some(next_leaf) = self.layout.focus_leaf_by_offset(offset) else {
-            return false;
-        };
-        if next_leaf == previous_leaf {
-            return false;
-        }
-        self.request_resolved_layout_update();
-        if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
-            self.focus_toplevel_surface(Some(next_surface));
-        } else {
-            self.focus_toplevel_surface(None);
-            self.reconfigure_focus_stack();
-        }
-        true
-    }
-
-    fn remove_active_split(&mut self) -> bool {
-        if self.resolved_layout_source != ResolvedLayoutSource::NativeFallback {
-            return false;
-        }
-        let Some((removed_leaf, next_leaf)) = self.layout.remove_active_leaf() else {
-            return false;
-        };
-        self.layout_leaf_selected_panes
-            .retain(|(leaf, _)| *leaf != removed_leaf);
-        self.request_resolved_layout_update();
-        if let Some(next_surface) = self.surface_for_layout_leaf(next_leaf) {
-            self.focus_toplevel_surface(Some(next_surface));
-        } else {
-            self.focus_toplevel_surface(None);
-            self.reconfigure_focus_stack();
-        }
-        true
-    }
-
-    fn selected_panes_for_other_layout_leaves(&self, active_leaf: LayoutLeafId) -> Vec<u64> {
-        self.layout_leaf_selected_panes
-            .iter()
-            .filter_map(|(leaf, pane)| (*leaf != active_leaf).then_some(*pane))
-            .filter(|pane| {
-                self.active_session_content_surface_for_pane(*pane)
-                    .is_some()
-            })
-            .collect()
-    }
-
     pub fn focused_window_index(&self) -> Option<usize> {
         let active = self.focus.active_toplevel()?;
         if !self.surface_can_receive_focus(active) {
@@ -6067,7 +4657,7 @@ impl Manifold {
         }
         self.space
             .elements()
-            .filter(|window| self.window_visible_in_presentation(window))
+            .filter(|window| self.window_available_to_presentation_client(window))
             .position(|window| Self::window_toplevel_surface(window).as_ref() == Some(active))
     }
 
@@ -6080,63 +4670,14 @@ impl Manifold {
         if !self.surface_can_receive_focus(surface) {
             return None;
         }
-        Some(crate::presentation::sanitize_status_value(&format!(
+        Some(crate::frame_export::sanitize_status_value(&format!(
             "{:?}",
             surface.id()
         )))
     }
 
     pub fn reconfigure_focus_stack(&mut self) {
-        if self.presentation_client_controls_windows() {
-            self.reconfigure_presentation_client_focus();
-            return;
-        }
-        let windows = self
-            .space
-            .elements()
-            .filter(|window| self.window_belongs_to_active_surface_session(window))
-            .cloned()
-            .collect::<Vec<_>>();
-        let visible_windows = windows
-            .iter()
-            .filter(|window| self.window_visible_in_presentation(window))
-            .cloned()
-            .collect::<Vec<_>>();
-        for window in &windows {
-            let location = self.window_layout_rect(window).map_or_else(
-                || focus_stack_location(0),
-                |rect| Point::from((rect.x, rect.y)),
-            );
-            self.space.map_element(window.clone(), location, false);
-        }
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-            && self.layout.active_kind().is_some()
-            && self
-                .surface_for_layout_leaf(self.layout.active_leaf())
-                .is_none()
-        {
-            self.focus_toplevel_surface(None);
-            return;
-        }
-        if self.active_window().is_none() {
-            let active_leaf_surface = (self.resolved_layout_source
-                == ResolvedLayoutSource::NativeFallback)
-                .then(|| self.surface_for_layout_leaf(self.layout.active_leaf()))
-                .flatten()
-                .filter(|surface| self.surface_has_visible_pane_item(surface));
-            if active_leaf_surface.is_some() {
-                self.focus_toplevel_surface(active_leaf_surface);
-            }
-        }
-        if let Some(active_window) = self.active_window() {
-            self.space.raise_element(&active_window, true);
-            let active_surface = self.focus.active_toplevel().cloned();
-            self.activate_window_exclusively(active_surface.as_ref());
-        } else if let Some(window) = visible_windows.last() {
-            self.focus_window(window);
-        } else {
-            self.focus_toplevel_surface(None);
-        }
+        self.reconfigure_presentation_client_focus();
     }
 
     fn reconfigure_presentation_client_focus(&mut self) {
@@ -6164,80 +4705,11 @@ impl Manifold {
             .set_focus(self, active_surface, serial);
     }
 
-    pub fn toggle_managed_fullscreen(&mut self) -> bool {
-        self.managed_fullscreen = !self.managed_fullscreen;
-        self.reconfigure_focus_stack();
-        self.managed_fullscreen
-    }
-
-    pub const fn managed_fullscreen(&self) -> bool {
-        self.managed_fullscreen
-    }
-
-    pub fn apply_layout_action(&mut self, action: LayoutAction) -> bool {
-        match action {
-            LayoutAction::FocusNext => {
-                self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-                    && self.cycle_focus_in_active_layout_leaf(FocusDirection::Next)
-            }
-            LayoutAction::FocusPrevious => {
-                self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-                    && self.cycle_focus_in_active_layout_leaf(FocusDirection::Previous)
-            }
-            LayoutAction::CloseActivePane => self.close_active_window(),
-            LayoutAction::ToggleManagedFullscreen => {
-                self.toggle_managed_fullscreen();
-                true
-            }
-            LayoutAction::SplitActiveRight => {
-                self.split_active_content_leaf(LayoutAxis::Horizontal)
-            }
-            LayoutAction::SplitActiveDown => self.split_active_content_leaf(LayoutAxis::Vertical),
-            LayoutAction::JoinActivePane => self.remove_active_split(),
-            LayoutAction::SplitActiveSmart => self.split_active_content_leaf_smart(),
-            LayoutAction::FocusNextSplit => self.focus_layout_leaf_by_offset(1),
-            LayoutAction::FocusPreviousSplit => self.focus_layout_leaf_by_offset(-1),
-            LayoutAction::MoveActiveToLeftDock
-            | LayoutAction::MoveActiveToRightDock
-            | LayoutAction::MoveActiveToBottomDock
-            | LayoutAction::MoveActiveToCenter => {
-                warn!(
-                    ?action,
-                    "layout action accepted but not implemented by the hardcoded layout yet"
-                );
-                false
-            }
-            LayoutAction::ToggleLeftDock => {
-                self.toggle_left_panel_visibility();
-                self.reconfigure_focus_stack();
-                true
-            }
-            LayoutAction::ToggleRightDock => {
-                self.layout.right_dock_visible = !self.layout.right_dock_visible;
-                true
-            }
-            LayoutAction::ToggleBottomDock => {
-                self.layout.bottom_dock_visible = !self.layout.bottom_dock_visible;
-                true
-            }
-            LayoutAction::IncreaseLeftDockWidth => {
-                self.adjust_left_panel_width(LEFT_PANEL_KEYBOARD_STEP);
-                self.reconfigure_focus_stack();
-                true
-            }
-            LayoutAction::DecreaseLeftDockWidth => {
-                self.adjust_left_panel_width(-LEFT_PANEL_KEYBOARD_STEP);
-                self.reconfigure_focus_stack();
-                true
-            }
-        }
-    }
-
     pub fn close_active_window(&mut self) -> bool {
         let Some(surface) = self.focus.active_toplevel().cloned() else {
             return false;
         };
-        if !self.surface_has_visible_pane_item(&surface) {
+        if !self.surface_can_receive_focus(&surface) {
             return false;
         }
         self.reset_transient_input_state();
@@ -6305,15 +4777,6 @@ impl Manifold {
         self.fullscreen_toplevels
             .retain(|(surface, _)| live_toplevel_surfaces.iter().any(|live| live == surface));
         self.sessions.retain_live_surfaces(&live_toplevel_surfaces);
-        self.presentation_child_surfaces
-            .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
-        self.presentation_member_surfaces
-            .retain(|surface| live_toplevel_surfaces.iter().any(|live| live == surface));
-        self.panel_reservations.retain(|panel| {
-            live_toplevel_surfaces
-                .iter()
-                .any(|live| live == &panel.surface)
-        });
         let closed_panes = self
             .window_pane_ids
             .iter()
@@ -6347,7 +4810,6 @@ impl Manifold {
                     || process_is_ancestor(&pid_string, surface_pid)
             }) || process_parent_pid(pid).is_some()
         });
-        self.repair_resolved_layout_for_current_inventory();
         if self
             .focus
             .pending_pointer_focus()
@@ -6432,309 +4894,10 @@ impl Manifold {
         live_toplevel_surfaces: &[WlSurface],
     ) -> bool {
         live_toplevel_surfaces.iter().any(|live| live == surface)
-            && (self
+            && self
                 .session_for_toplevel_surface(surface)
                 .unwrap_or(SurfaceSessionId(1))
                 == self.sessions.active()
-                || self.surface_is_visible_presentation_member(surface)
-                || self.surface_has_visible_panel(surface))
-    }
-
-    fn repair_resolved_layout_for_current_inventory(&mut self) {
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            self.collapse_empty_native_layout_leaves();
-            self.request_resolved_layout_update();
-            return;
-        }
-
-        let valid_panes = self.active_surface_session_panes();
-        if let [pane] = valid_panes.as_slice() {
-            self.accepted_resolved_layout = self.single_pane_resolved_layout(*pane);
-            return;
-        }
-
-        let mut layout = self.accepted_resolved_layout.clone();
-        layout.items.retain(|item| match item.kind {
-            LayoutItemKind::Pane { pane } => valid_panes.contains(&pane),
-            LayoutItemKind::Placeholder
-            | LayoutItemKind::Handle
-            | LayoutItemKind::Chrome
-            | LayoutItemKind::Overlay => true,
-        });
-        match layout.validate_for_panes(&valid_panes) {
-            Ok(layout) => {
-                self.accepted_resolved_layout = layout;
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "accepted WASM resolved layout became invalid; using native fallback"
-                );
-                self.request_resolved_layout_update();
-            }
-        }
-    }
-
-    fn collapse_empty_native_layout_leaves(&mut self) {
-        loop {
-            let empty_leaf = self.layout.leaf_ids().into_iter().find(|leaf| {
-                self.selected_pane_for_layout_leaf(*leaf)
-                    .is_none_or(|pane| self.active_session_content_surface_for_pane(pane).is_none())
-            });
-            let Some(empty_leaf) = empty_leaf else {
-                return;
-            };
-            if self.layout.remove_leaf(empty_leaf).is_none() {
-                return;
-            }
-            self.layout_leaf_selected_panes
-                .retain(|(leaf, _)| *leaf != empty_leaf);
-        }
-    }
-
-    fn single_pane_resolved_layout(&self, pane: u64) -> ResolvedLayout {
-        ResolvedLayout {
-            items: vec![ResolvedLayoutItem {
-                id: LayoutItemId(pane),
-                kind: LayoutItemKind::Pane { pane },
-                z: 0.0,
-                transform: LocalTransform {
-                    offset: LocalPoint { u: -1.0, v: -1.0 },
-                    size: LocalPoint { u: 2.0, v: 2.0 },
-                },
-                input: InputBehavior::Pane,
-            }],
-        }
-    }
-
-    fn presentation_size(&self) -> (i32, i32) {
-        self.space
-            .outputs()
-            .next()
-            .and_then(|output| self.space.output_geometry(output))
-            .map_or((1280, 800), |geometry| {
-                (geometry.size.w.max(1), geometry.size.h.max(1))
-            })
-    }
-
-    pub fn presentation_layout_size(&self) -> LayoutSize {
-        let (w, h) = self.presentation_size();
-        let left = self.left_panel_reserved_width();
-        LayoutSize {
-            w: (w - left).max(1),
-            h,
-        }
-    }
-
-    pub fn active_layout_rect(&self) -> Option<LayoutRect> {
-        if let Some(surface) = self.focus.active_toplevel()
-            && let Some(rect) = self.layout_rect_for_toplevel_surface(surface)
-        {
-            return Some(rect);
-        }
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            return self
-                .layout
-                .active_rect(self.presentation_layout_size())
-                .map(|rect| self.translate_content_rect(rect));
-        }
-        None
-    }
-
-    pub const fn resolved_layout_source_name(&self) -> &'static str {
-        match self.resolved_layout_source {
-            ResolvedLayoutSource::NativeFallback => "native-fallback",
-            ResolvedLayoutSource::Actor => "actor",
-        }
-    }
-
-    pub const fn resolved_layout_item_count(&self) -> usize {
-        self.accepted_resolved_layout.items.len()
-    }
-
-    pub fn resolved_layout_pane_count(&self) -> usize {
-        self.accepted_resolved_layout.pane_count()
-    }
-
-    pub fn resolved_layout_placeholder_count(&self) -> usize {
-        self.accepted_resolved_layout.placeholder_count()
-    }
-
-    pub fn resolved_layout_active_kind(&self) -> &'static str {
-        if self
-            .focus
-            .active_toplevel()
-            .is_some_and(|surface| self.surface_has_visible_pane_item(surface))
-        {
-            return "client";
-        }
-        if self.focus.active_toplevel().is_some_and(|surface| {
-            self.surface_is_visible_presentation_member(surface)
-                || self.surface_has_visible_panel(surface)
-        }) {
-            return "presentation";
-        }
-        if self.resolved_layout_source == ResolvedLayoutSource::NativeFallback {
-            return match self.layout.active_kind() {
-                Some(LayoutLeafKind::Client)
-                    if self
-                        .surface_for_layout_leaf(self.layout.active_leaf())
-                        .is_some() =>
-                {
-                    "client"
-                }
-                Some(LayoutLeafKind::Client) => "placeholder",
-                None => "none",
-            };
-        }
-        "none"
-    }
-
-    pub fn resolved_layout_items(&self) -> &[ResolvedLayoutItem] {
-        &self.accepted_resolved_layout.items
-    }
-
-    pub fn resolved_layout_item_rect(&self, item: ResolvedLayoutItem) -> LayoutRect {
-        self.translate_content_rect(item.pixel_rect(self.presentation_layout_size()))
-    }
-
-    pub fn resolved_layout_item_active(&self, item: ResolvedLayoutItem) -> bool {
-        match item.kind {
-            LayoutItemKind::Pane { pane } => {
-                self.focus
-                    .active_toplevel()
-                    .and_then(|surface| self.pane_for_toplevel_surface(surface))
-                    == Some(pane)
-            }
-            LayoutItemKind::Placeholder => {
-                self.resolved_layout_source == ResolvedLayoutSource::NativeFallback
-                    && item.id == LayoutItemId(1_000_000 + self.layout.active_leaf().raw())
-            }
-            LayoutItemKind::Handle | LayoutItemKind::Chrome | LayoutItemKind::Overlay => false,
-        }
-    }
-
-    fn translate_content_rect(&self, rect: LayoutRect) -> LayoutRect {
-        LayoutRect {
-            x: rect.x + self.left_panel_reserved_width(),
-            ..rect
-        }
-    }
-
-    fn content_rect(&self) -> LayoutRect {
-        let size = self.presentation_layout_size();
-        LayoutRect {
-            x: self.left_panel_reserved_width(),
-            y: 0,
-            w: size.w,
-            h: size.h,
-        }
-    }
-
-    fn panel_rect_for_surface(&self, surface: &WlSurface) -> Option<LayoutRect> {
-        let panel = self
-            .panel_reservations
-            .iter()
-            .rev()
-            .find(|panel| panel.visible && panel.surface == *surface)?;
-        let (_, h) = self.presentation_size();
-        match panel.edge {
-            PanelEdge::Left => Some(LayoutRect {
-                x: 0,
-                y: 0,
-                w: panel.width,
-                h,
-            }),
-        }
-    }
-
-    pub fn left_panel_reserved_width(&self) -> i32 {
-        self.panel_reservations
-            .iter()
-            .rev()
-            .find(|panel| panel.edge == PanelEdge::Left && panel.visible)
-            .map_or(0, |panel| panel.width)
-    }
-
-    pub fn left_panel_splitter_hit(&self, x: f64, y: f64) -> bool {
-        let width = f64::from(self.left_panel_reserved_width());
-        if width <= 0.0 {
-            return false;
-        }
-        let (_, h) = self.presentation_size();
-        y >= 0.0 && y < f64::from(h) && (x - width).abs() <= LEFT_PANEL_SPLITTER_HITBOX
-    }
-
-    pub fn begin_left_panel_resize(&mut self) {
-        self.left_panel_resizing = self.left_panel_reserved_width() > 0;
-    }
-
-    pub const fn end_left_panel_resize(&mut self) -> bool {
-        let was_resizing = self.left_panel_resizing;
-        self.left_panel_resizing = false;
-        was_resizing
-    }
-
-    pub fn resize_left_panel_to_pointer(&mut self, x: f64) -> bool {
-        if !self.left_panel_resizing {
-            return false;
-        }
-        let target = x.round() as i32;
-        self.set_left_panel_width(target);
-        true
-    }
-
-    fn toggle_left_panel_visibility(&mut self) {
-        self.layout.left_dock_visible = !self.layout.left_dock_visible;
-        for panel in self
-            .panel_reservations
-            .iter_mut()
-            .filter(|panel| panel.edge == PanelEdge::Left)
-        {
-            panel.visible = self.layout.left_dock_visible;
-        }
-    }
-
-    fn adjust_left_panel_width(&mut self, delta: i32) {
-        let width = self
-            .panel_reservations
-            .iter()
-            .rev()
-            .find(|panel| panel.edge == PanelEdge::Left)
-            .map_or(LEFT_PANEL_DEFAULT_WIDTH, |panel| panel.width);
-        self.set_left_panel_width(width + delta);
-    }
-
-    fn set_left_panel_width(&mut self, width: i32) {
-        let (presentation_w, _) = self.presentation_size();
-        let max_width = LEFT_PANEL_MAX_WIDTH.min((presentation_w - 120).max(LEFT_PANEL_MIN_WIDTH));
-        let width = width.clamp(LEFT_PANEL_MIN_WIDTH, max_width);
-        for panel in self
-            .panel_reservations
-            .iter_mut()
-            .filter(|panel| panel.edge == PanelEdge::Left)
-        {
-            panel.width = width;
-        }
-    }
-}
-
-const fn presentation_client_control_is_active(
-    fast_path_present: bool,
-    fast_path_input_draining: bool,
-) -> bool {
-    fast_path_present || fast_path_input_draining
-}
-
-#[cfg(test)]
-mod presentation_client_state_tests {
-    use super::presentation_client_control_is_active;
-
-    #[test]
-    fn presentation_control_remains_active_while_input_is_drained() {
-        assert!(!presentation_client_control_is_active(false, false));
-        assert!(presentation_client_control_is_active(true, false));
-        assert!(presentation_client_control_is_active(false, true));
     }
 }
 
@@ -6790,48 +4953,6 @@ fn fallback_marker_id(index: usize) -> u64 {
 fn current_process_directory() -> PathBuf {
     let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     directory.canonicalize().unwrap_or(directory)
-}
-
-fn fullscreen_layout_rect(size: LayoutSize) -> LayoutRect {
-    LayoutRect {
-        x: 0,
-        y: 0,
-        w: size.w.max(1),
-        h: size.h.max(1),
-    }
-}
-
-fn first_available_pane_from(
-    panes: &[u64],
-    start: u64,
-    excluded: &[u64],
-    step: isize,
-) -> Option<u64> {
-    if panes.is_empty() {
-        return None;
-    }
-    let Some(start_index) = panes.iter().position(|pane| *pane == start) else {
-        return panes.iter().copied().find(|pane| !excluded.contains(pane));
-    };
-    let len = panes.len() as isize;
-    let step = match step.cmp(&0) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    };
-    for offset in 0..panes.len() {
-        let offset = offset as isize;
-        let index = if step == 0 {
-            (start_index as isize + offset).rem_euclid(len)
-        } else {
-            (start_index as isize + (offset + 1) * step).rem_euclid(len)
-        } as usize;
-        let pane = panes.get(index).copied()?;
-        if !excluded.contains(&pane) {
-            return Some(pane);
-        }
-    }
-    None
 }
 
 fn window_surface_origin_in_compositor_space(
@@ -7010,31 +5131,6 @@ fn process_env_var(pid: u32, key: &str) -> Option<String> {
     })
 }
 
-fn placement_requests_left_panel(placement: &ExtensionMetadata) -> bool {
-    let edge = placement
-        .get("edge")
-        .or_else(|| placement.get("side"))
-        .is_some_and(|value| value.eq_ignore_ascii_case("left"));
-    let panel_mode = placement
-        .get("mode")
-        .or_else(|| placement.get("kind"))
-        .or_else(|| placement.get("placement"))
-        .is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "panel" | "sidebar" | "dock" | "left-panel" | "left-sidebar"
-            )
-        });
-    edge || panel_mode
-}
-
-fn placement_panel_width(placement: &ExtensionMetadata) -> Option<i32> {
-    placement
-        .get("width")
-        .or_else(|| placement.get("size"))
-        .and_then(|value| value.parse().ok())
-}
-
 fn parse_boolish(value: &str) -> Option<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" | "visible" | "show" | "shown" => Some(true),
@@ -7168,63 +5264,14 @@ fn manifold_owned_shortcut(shortcut: &str) -> bool {
     )
 }
 
-fn convert_wasm_resolved_layout(layout: manifold_wasm::ResolvedLayout) -> ResolvedLayout {
-    ResolvedLayout {
-        items: layout
-            .items
-            .into_iter()
-            .map(|item| ResolvedLayoutItem {
-                id: LayoutItemId(item.id.0),
-                kind: match item.kind {
-                    manifold_wasm::LayoutItemKind::Pane { pane } => LayoutItemKind::Pane { pane },
-                    manifold_wasm::LayoutItemKind::Placeholder => LayoutItemKind::Placeholder,
-                    manifold_wasm::LayoutItemKind::Handle => LayoutItemKind::Handle,
-                    manifold_wasm::LayoutItemKind::Chrome => LayoutItemKind::Chrome,
-                    manifold_wasm::LayoutItemKind::Overlay => LayoutItemKind::Overlay,
-                },
-                z: item.z,
-                transform: LocalTransform {
-                    offset: LocalPoint {
-                        u: item.transform.offset.u,
-                        v: item.transform.offset.v,
-                    },
-                    size: LocalPoint {
-                        u: item.transform.size.u,
-                        v: item.transform.size.v,
-                    },
-                },
-                input: match item.input {
-                    manifold_wasm::InputBehavior::None => InputBehavior::None,
-                    manifold_wasm::InputBehavior::Hit => InputBehavior::Hit,
-                    manifold_wasm::InputBehavior::Drag => InputBehavior::Drag,
-                    manifold_wasm::InputBehavior::Pane => InputBehavior::Pane,
-                },
-            })
-            .collect(),
-    }
-}
-
 fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
     let message: manifold_wasm::HostMessage =
         serde_json::from_str(body).context("decode plugin host message")?;
     Ok(match message {
-        manifold_wasm::HostMessage::LayoutAction { action } => {
-            let action = action
-                .parse::<LayoutAction>()
-                .with_context(|| format!("parse plugin host layout action {action:?}"))?;
-            ensure!(
-                action == LayoutAction::CloseActivePane,
-                "layout action {action:?} must be addressed to a layout actor"
-            );
-            WorkspaceCommand::Layout(action)
-        }
         manifold_wasm::HostMessage::FocusPane { pane } => WorkspaceCommand::FocusPane(pane),
         manifold_wasm::HostMessage::SpawnApp { argv } => WorkspaceCommand::SpawnApp(argv),
         manifold_wasm::HostMessage::FocusOrSpawnApp { app_id, argv } => {
             WorkspaceCommand::FocusOrSpawnApp { app_id, argv }
-        }
-        manifold_wasm::HostMessage::TogglePluginPane => {
-            anyhow::bail!("toggle-plugin-pane is only valid in the client realm")
         }
         manifold_wasm::HostMessage::SwitchActiveSessionNext => {
             WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext)
@@ -7232,46 +5279,8 @@ fn parse_plugin_host_command(body: &str) -> Result<WorkspaceCommand> {
         manifold_wasm::HostMessage::CreateAndAttachSession => {
             WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession)
         }
-        manifold_wasm::HostMessage::ToggleShortcutPassthrough => {
-            WorkspaceCommand::Input(InputCommand::ToggleShortcutPassthrough)
-        }
-        manifold_wasm::HostMessage::SetShortcutPassthrough { enabled } => {
-            WorkspaceCommand::Input(InputCommand::SetShortcutPassthrough(enabled))
-        }
-        manifold_wasm::HostMessage::SetResolvedLayout { layout, focus, .. } => {
-            WorkspaceCommand::SetResolvedLayout {
-                layout: convert_wasm_resolved_layout(layout),
-                focus,
-            }
-        }
-        manifold_wasm::HostMessage::ClaimRootLayout
-        | manifold_wasm::HostMessage::DelegateLayoutRest { .. } => {
-            anyhow::bail!("layout leases are only valid in the client realm")
-        }
+        _ => anyhow::bail!("host message is not valid in the server realm"),
     })
-}
-
-fn validate_key_policy_host_message(payload: &[u8]) -> Result<()> {
-    let message: manifold_wasm::HostMessage =
-        serde_json::from_slice(payload).context("decode key policy host message")?;
-    match message {
-        manifold_wasm::HostMessage::SetResolvedLayout { .. }
-        | manifold_wasm::HostMessage::ClaimRootLayout
-        | manifold_wasm::HostMessage::DelegateLayoutRest { .. } => {
-            anyhow::bail!("key policy cannot submit layout; it must message a layout actor")
-        }
-        manifold_wasm::HostMessage::LayoutAction { action } => {
-            let action = action
-                .parse::<LayoutAction>()
-                .with_context(|| format!("parse key policy host layout action {action:?}"))?;
-            ensure!(
-                action == LayoutAction::CloseActivePane,
-                "layout action {action:?} must be addressed to a layout actor"
-            );
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 #[derive(Default)]
@@ -7342,68 +5351,9 @@ pub struct RuntimeStats {
     pub max_input_to_commit_micros: u128,
     pub last_input_commit_to_submit_micros: Option<u128>,
     pub max_input_commit_to_submit_micros: u128,
-    pub attach_count: u64,
-    pub detach_count: u64,
-    pub pending_attach_request_at: Option<Instant>,
-    pub pending_attach_frame_at: Option<Instant>,
-    pub pending_detach_request_at: Option<Instant>,
-    pub last_attach_latency_micros: Option<u128>,
-    pub max_attach_latency_micros: u128,
-    pub last_attach_to_frame_micros: Option<u128>,
-    pub max_attach_to_frame_micros: u128,
-    pub last_detach_latency_micros: Option<u128>,
-    pub max_detach_latency_micros: u128,
 }
 
 impl RuntimeStats {
-    pub fn record_attach_request(&mut self) {
-        if self.pending_attach_request_at.is_none() {
-            self.pending_attach_request_at = Some(Instant::now());
-        }
-        if self.pending_attach_frame_at.is_none() {
-            self.pending_attach_frame_at = Some(Instant::now());
-        }
-    }
-
-    pub fn record_detach_request(&mut self) {
-        if self.pending_detach_request_at.is_none() {
-            self.pending_detach_request_at = Some(Instant::now());
-        }
-    }
-
-    pub fn record_attach_applied(&mut self) {
-        if let Some(requested_at) = self.pending_attach_request_at.take() {
-            let latency = requested_at.elapsed().as_micros();
-            self.last_attach_latency_micros = Some(latency);
-            self.max_attach_latency_micros = self.max_attach_latency_micros.max(latency);
-        }
-    }
-
-    pub const fn record_attach_failed(&mut self) {
-        self.pending_attach_request_at = None;
-        self.pending_attach_frame_at = None;
-    }
-
-    pub fn record_detach_applied(&mut self) {
-        if let Some(requested_at) = self.pending_detach_request_at.take() {
-            let latency = requested_at.elapsed().as_micros();
-            self.last_detach_latency_micros = Some(latency);
-            self.max_detach_latency_micros = self.max_detach_latency_micros.max(latency);
-        }
-        self.clear_pending_visible_latency_samples();
-    }
-
-    const fn clear_pending_visible_latency_samples(&mut self) {
-        self.pending_input_at = None;
-        self.pending_input_events = 0;
-        self.pending_input_commit_at = None;
-        self.pending_input_to_commit_micros = None;
-        self.pending_commit_at = None;
-        self.pending_commits = 0;
-        self.pending_client_frame_callback_at = None;
-        self.pending_client_frame_callbacks = 0;
-    }
-
     pub fn record_input(&mut self, can_present_input: bool) {
         self.input_events += 1;
         if can_present_input {
@@ -7412,31 +5362,6 @@ impl RuntimeStats {
             }
             self.pending_input_events += 1;
         }
-    }
-
-    pub fn input_frame_defer_remaining(&self, max_delay: Duration) -> Option<Duration> {
-        let input_at = self.pending_input_at?;
-        if self.pending_input_commit_at.is_some() {
-            return None;
-        }
-
-        max_delay.checked_sub(input_at.elapsed())
-    }
-
-    pub const fn record_input_frame_deferred(&mut self) {
-        self.input_frame_deferrals += 1;
-    }
-
-    pub const fn record_input_deferred_frame(&mut self) {
-        self.input_deferred_frames += 1;
-    }
-
-    pub const fn record_client_frame_deferred(&mut self) {
-        self.client_frame_deferrals += 1;
-    }
-
-    pub const fn record_client_deferred_frame(&mut self) {
-        self.client_deferred_frames += 1;
     }
 
     pub fn record_commit(&mut self, can_present_commit: bool) {
@@ -7537,12 +5462,6 @@ impl RuntimeStats {
             self.last_commit_to_submit_micros = Some(latency);
             self.max_commit_to_submit_micros = self.max_commit_to_submit_micros.max(latency);
         }
-
-        if let Some(attach_at) = self.pending_attach_frame_at.take() {
-            let latency = attach_at.elapsed().as_micros();
-            self.last_attach_to_frame_micros = Some(latency);
-            self.max_attach_to_frame_micros = self.max_attach_to_frame_micros.max(latency);
-        }
     }
 }
 
@@ -7572,7 +5491,7 @@ pub struct DmabufRuntime {
     pub fast_path: Option<PresentationFastPath>,
     pub fast_path_input_draining: bool,
     pub default_feedback: Option<DmabufFeedback>,
-    pub importer: Option<SharedPresenterRuntime>,
+    pub exporter: Option<crate::frame_export::SharedFrameExporter>,
     pub stats: DmabufStats,
     pub shm_formats: usize,
     pub advertised_formats: usize,
@@ -7595,7 +5514,7 @@ impl Default for DmabufRuntime {
             fast_path: None,
             fast_path_input_draining: false,
             default_feedback: None,
-            importer: None,
+            exporter: None,
             stats: DmabufStats::default(),
             shm_formats: 0,
             advertised_formats: 0,
@@ -7605,7 +5524,7 @@ impl Default for DmabufRuntime {
             disabled_reason: None,
             explicit_sync_state: None,
             explicit_sync_protocol_version: None,
-            explicit_sync_disabled_reason: "winit_backend_no_drm_import_device",
+            explicit_sync_disabled_reason: "headless_exporter_no_drm_import_device",
         }
     }
 }

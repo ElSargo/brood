@@ -104,36 +104,19 @@ expect_json_error() {
 }
 
 STATUS_BEFORE="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= 1 )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= 1 ))')"
-ATTACHES_BEFORE="$(numeric_field "$STATUS_BEFORE" attach_count)"
-DETACHES_BEFORE="$(numeric_field "$STATUS_BEFORE" detach_count)"
 WINDOWS_BEFORE="$(numeric_field "$STATUS_BEFORE" windows)"
 COMMITS_BEFORE="$(numeric_field "$STATUS_BEFORE" commits)"
-INPUT_BEFORE="$(numeric_field "$STATUS_BEFORE" input_events)"
 
 EMPTY_RESPONSE="$(expect_json_error empty-json '')"
 MALFORMED_JSON_RESPONSE="$(expect_json_error malformed-json '[')"
 BAD_JSON_TYPE_RESPONSE="$(expect_json_error bad-json-type '{}')"
 UNKNOWN_RESPONSE="$(expect_ctl_error unknown-command no-such-command)"
 SPAWN_RESPONSE="$(expect_ctl_error spawn-missing-command spawn)"
-INJECT_RESPONSE="$(expect_ctl_error bad-inject inject motion na 1)"
-ATTACH_ARGS_RESPONSE="$(expect_ctl_error attach-extra-arg attach nope)"
 
 STATUS_AFTER="$(wait_status '[[ "$(field "$status" presentation)" == "Detached" ]] && [[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" >= WINDOWS_BEFORE )) && [[ "$(field "$status" commits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" commits)" >= COMMITS_BEFORE ))')"
 
-[[ "$(numeric_field "$STATUS_AFTER" attach_count)" == "$ATTACHES_BEFORE" ]] || {
-  echo "ERR invalid control commands changed attach_count: before=$STATUS_BEFORE after=$STATUS_AFTER" >&2
-  exit 1
-}
-[[ "$(numeric_field "$STATUS_AFTER" detach_count)" == "$DETACHES_BEFORE" ]] || {
-  echo "ERR invalid control commands changed detach_count: before=$STATUS_BEFORE after=$STATUS_AFTER" >&2
-  exit 1
-}
 [[ "$(numeric_field "$STATUS_AFTER" windows)" -ge "$WINDOWS_BEFORE" ]] || {
   echo "ERR invalid control commands lost nested windows: before=$STATUS_BEFORE after=$STATUS_AFTER" >&2
-  exit 1
-}
-[[ "$(numeric_field "$STATUS_AFTER" input_events)" == "$INPUT_BEFORE" ]] || {
-  echo "ERR invalid inject command changed input counters: before=$STATUS_BEFORE after=$STATUS_AFTER" >&2
   exit 1
 }
 
@@ -145,8 +128,6 @@ echo "malformed_json_response=$MALFORMED_JSON_RESPONSE"
 echo "bad_json_type_response=$BAD_JSON_TYPE_RESPONSE"
 echo "unknown_response=$UNKNOWN_RESPONSE"
 echo "spawn_response=$SPAWN_RESPONSE"
-echo "inject_response=$INJECT_RESPONSE"
-echo "attach_args_response=$ATTACH_ARGS_RESPONSE"
 echo "client_log=$CLIENT_LOG"
 echo "log=$LOG"
 

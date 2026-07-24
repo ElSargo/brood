@@ -20,6 +20,13 @@ cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
+cargo build \
+  --manifest-path plugins/session-switcher/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release
+cargo run --quiet -p manifold-wasm --example componentize -- \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
+  plugins/session-switcher/manifold_session_switcher_plugin.component.wasm
 
 target/debug/manifold-client \
   --no-server \
@@ -87,7 +94,7 @@ done
 RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 env RUST_LOG="$RUST_LOG" \
   target/debug/manifold-sessiond \
-  --offscreen-presentation \
+  --headless \
   --no-default-modules \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
@@ -308,10 +315,11 @@ print(
 PY
 
 STATUS="$(ctl status)"
-[[ "$STATUS" =~ windows=3([[:space:]]|$) ]] || {
-  echo "ERR expected the session client and two spawned managed clients: $STATUS" >&2
+WINDOWS="$(sed -n 's/.* windows=\([0-9][0-9]*\) .*/\1/p' <<<"$STATUS")"
+if [[ -z "$WINDOWS" ]] || ((WINDOWS < 2)); then
+  echo "ERR expected at least the two explicitly spawned managed clients: $STATUS" >&2
   exit 1
-}
+fi
 
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 

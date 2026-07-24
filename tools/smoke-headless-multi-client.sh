@@ -116,13 +116,6 @@ STATUS_ONE_INITIAL="$(wait_status '[[ "$(field "$status" presentation)" == "Deta
 require_field_ge "$STATUS_ONE_INITIAL" windows 1
 require_field_ge "$STATUS_ONE_INITIAL" commits 1
 
-ctl inject center-motion > /dev/null
-ctl inject button 272 pressed > /dev/null
-ctl inject button 272 released > /dev/null
-STATUS_FOCUSED_ONE="$(wait_status '[[ "$(field "$status" pointer_target_hits)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_target_hits)" >= 3 )) && [[ "$(field "$status" pointer_button_events)" =~ ^[0-9]+$ ]] && (( "$(field "$status" pointer_button_events)" >= 2 ))')"
-require_field_ge "$STATUS_FOCUSED_ONE" pointer_target_hits 3
-require_field_ge "$STATUS_FOCUSED_ONE" pointer_button_events 2
-
 ctl spawn "$WRAPPER2" > /dev/null
 wait_pidfile "$CLIENT2_PIDFILE"
 
@@ -134,21 +127,16 @@ CLIENT1_PID="$(cat "$CLIENT1_PIDFILE")"
 CLIENT2_PID="$(cat "$CLIENT2_PIDFILE")"
 kill "$CLIENT2_PID"
 sleep 0.5
-STATUS_ONE="$(wait_status '[[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 1 )) && [[ "$(field "$status" focus_repairs)" =~ ^[0-9]+$ ]] && (( "$(field "$status" focus_repairs)" >= 1 )) && [[ "$(field "$status" window_lifecycle_focus_repairs)" =~ ^[0-9]+$ ]] && (( "$(field "$status" window_lifecycle_focus_repairs)" >= 1 ))')"
-require_field_ge "$STATUS_ONE" focus_repairs 1
-require_field_ge "$STATUS_ONE" window_lifecycle_focus_repairs 1
+STATUS_ONE="$(wait_status '[[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 1 ))')"
 
 kill "$CLIENT1_PID"
 sleep 0.5
-STATUS_ZERO="$(wait_status '[[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 0 )) && [[ "$(field "$status" focus_clears)" =~ ^[0-9]+$ ]] && (( "$(field "$status" focus_clears)" >= 1 )) && [[ "$(field "$status" window_lifecycle_focus_clears)" =~ ^[0-9]+$ ]] && (( "$(field "$status" window_lifecycle_focus_clears)" >= 1 ))')"
-require_field_ge "$STATUS_ZERO" focus_clears 1
-require_field_ge "$STATUS_ZERO" window_lifecycle_focus_clears 1
+STATUS_ZERO="$(wait_status '[[ "$(field "$status" windows)" =~ ^[0-9]+$ ]] && (( "$(field "$status" windows)" == 0 ))')"
 
 echo "OK headless multi-client smoke passed"
 echo "client_1_pid=$CLIENT1_PID"
 echo "client_2_pid=$CLIENT2_PID"
 echo "status_one_initial=$STATUS_ONE_INITIAL"
-echo "status_focused_one=$STATUS_FOCUSED_ONE"
 echo "status_two=$STATUS_TWO"
 echo "status_one=$STATUS_ONE"
 echo "status_zero=$STATUS_ZERO"

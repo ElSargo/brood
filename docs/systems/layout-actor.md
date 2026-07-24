@@ -8,9 +8,8 @@ last-reviewed: 2026-07-24
 # Client-Local Layout Actor
 
 Each presentation client owns a host-validated tree of layout leases. Every
-lease is held by an ordinary mailbox-driven actor using the same execution model
-as an actor in the in-process presenter. Layout does not have a synchronous
-provider lane.
+lease is held by an ordinary mailbox-driven presentation actor. Layout does not
+have a synchronous provider lane or a session-server implementation.
 
 ```text
 root viewport lease
@@ -42,7 +41,7 @@ The presentation client owns:
 - final layout validation and canonicalization;
 - recursive transform, clipping, and paint-order composition;
 - pane bounds, clipping, z order, hit testing, and focus routing;
-- deterministic native fallback while no valid actor result is available;
+- deterministic client-local fallback while no valid actor result is available;
 - managed-window size requests derived from accepted pane bounds.
 
 Each layout actor owns its internal layout model and the decision to emit a new
@@ -160,8 +159,8 @@ pane ID shape without confusing a local pane with a managed Wayland pane.
 
 ## Fallback And Failure
 
-The client immediately uses deterministic native flat layout when no root
-layout actor is configured or the accepted lease tree no longer matches current
+The client immediately uses a deterministic local fallback when no root layout
+actor is configured or the accepted lease tree no longer matches current
 inventory. It also falls back after an invalid root candidate. A later valid
 actor outbox message can become authoritative again.
 
