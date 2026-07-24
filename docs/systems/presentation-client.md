@@ -143,6 +143,13 @@ delegates `rest` to the workspace actor. Hiding and showing are ordinary
 switcher actor actions that republish the root fragment; the client has no
 switcher-specific visibility mechanism.
 
+An accepted layout rectangle is also the sizing authority for a local plugin
+pane. The client converts that physical rectangle through the current output
+scale for pane resize events, replays the retained graphics packet into a
+matching physical canvas, and routes pointer coordinates in the same pane-local
+logical space. Presentation-window dimensions are not substituted for an
+individual pane's dimensions.
+
 See [[layout-actor]].
 
 ## Input

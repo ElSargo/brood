@@ -196,6 +196,16 @@ read -r SIDEBAR_WIDTH SIDEBAR_HEIGHT < <(
 [[ -n "$SIDEBAR_WIDTH" && -n "$SIDEBAR_HEIGHT" ]]
 FULL_WIDTH=$((SIDEBAR_WIDTH + 320))
 
+for _ in $(seq 1 100); do
+  if rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
+    && rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+
 capture() {
   local target="$1"
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -290,6 +300,7 @@ cat > "$OUT/proof.md" <<EOF
 - backend: headless frame exporter, no presenter and no backend layout
 - input: real Ctrl+Alt+M events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
+- plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
 - hidden: managed pane resized to ${FULL_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment
 - restored: managed pane returned to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}

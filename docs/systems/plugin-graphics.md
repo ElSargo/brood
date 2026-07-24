@@ -134,15 +134,21 @@ Filled and clipped paths use the canvas-standard nonzero winding rule.
 
 Coordinates are pane-local logical units. The host supplies pane size and scale
 events, clips every packet to the pane content area, and maps logical drawing to
-the physical target. The base profile defines one color and alpha convention so
-SDKs do not branch on the active WGPU backend. Packet colors and copied RGBA8
-image inputs are straight-alpha sRGB. The host converts them to linear-light
-premultiplied values before filtering or blending; opacity, layer composition,
-and every blend mode operate in that linear premultiplied space. Presentation
-converts the final linear result to the output color space. Fully transparent
-colored texels therefore cannot bleed encoded RGB into filtered edges. Native
-pane chrome, menus, recovery UI, and presentation overlays remain outside the
-packet's drawable area.
+the physical target. Each retained canvas target has the physical extent of its
+accepted pane rectangle, not the extent of the presentation window. A layout
+commit or output-scale change replays the retained packet into that target and
+delivers the new pane-local logical size to the actor. Composition may translate
+and clip the result, but does not independently stretch its axes to fit a pane.
+
+The base profile defines one color and alpha convention so SDKs do not branch on
+the active WGPU backend. Packet colors and copied RGBA8 image inputs are
+straight-alpha sRGB. The host converts them to linear-light premultiplied values
+before filtering or blending; opacity, layer composition, and every blend mode
+operate in that linear premultiplied space. Presentation converts the final
+linear result to the output color space. Fully transparent colored texels
+therefore cannot bleed encoded RGB into filtered edges. Native pane chrome,
+menus, recovery UI, and presentation overlays remain outside the packet's
+drawable area.
 
 ## GPU Lowering
 

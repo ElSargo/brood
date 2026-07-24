@@ -927,6 +927,7 @@ impl Application {
             return Ok(());
         };
         let focus_change = renderer.select_scene(sequence, width, height, windows)?;
+        renderer.sync_plugin_graphics_extents()?;
         if self
             .pointer_grab
             .as_ref()
@@ -961,6 +962,7 @@ impl Application {
             )?;
         }
         flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+        flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
         Ok(())
     }
 
@@ -1373,7 +1375,9 @@ impl Application {
             let Some(renderer) = self.renderer.as_mut() else {
                 continue;
             };
+            renderer.sync_plugin_graphics_extents()?;
             flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+            flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
             renderer.window.request_redraw();
         }
         Ok(())
@@ -1470,6 +1474,9 @@ impl Application {
         }
         replacement.window.request_redraw();
         self.renderer = Some(replacement);
+        if let Some(renderer) = self.renderer.as_mut() {
+            flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+        }
         Ok(())
     }
 }
@@ -1594,6 +1601,14 @@ impl ApplicationHandler<ClientEvent> for Application {
                         Err(error) => failure = Some(error),
                     }
                     flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+                    if failure.is_none()
+                        && let Err(error) = flush_renderer_plugin_resize_events(
+                            self.wasm_runtime.as_ref(),
+                            renderer,
+                        )
+                    {
+                        failure = Some(error);
+                    }
                 }
                 if let Some(error) = failure {
                     self.fail(event_loop, error);
@@ -1734,15 +1749,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.fail(event_loop, error);
                     return;
                 }
-                let (width, height, scale) = renderer.logical_extent();
-                if let Err(error) = send_presentation_events(self.wasm_runtime.as_ref(), |pane| {
-                    PresentationEvent::PaneResized {
-                        pane,
-                        width,
-                        height,
-                        scale,
-                    }
-                }) {
+                if let Err(error) =
+                    flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)
+                {
                     self.fail(event_loop, error);
                     return;
                 }
@@ -2163,6 +2172,7 @@ struct Renderer {
     layout_source: LayoutSource,
     layout_state_dirty: bool,
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
+    sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2264,6 +2274,13 @@ struct PluginPaneTexture {
     rect: [i32; 4],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PluginPaneSize {
+    width: f32,
+    height: f32,
+    scale: f32,
+}
+
 fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
     let size = renderer.window.inner_size();
     let refresh_millihz = renderer
@@ -2300,6 +2317,29 @@ fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer
             );
         }
     }
+}
+
+fn flush_renderer_plugin_resize_events(
+    runtime: Option<&PresentationWasmRuntime>,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    for (pane, size) in renderer.pending_plugin_resize_events() {
+        send_presentation_event(
+            runtime,
+            PresentationEvent::PaneResized {
+                pane,
+                width: size.width,
+                height: size.height,
+                scale: size.scale,
+            },
+        )?;
+        renderer.mark_plugin_resize_sent(pane, size);
+        eprintln!(
+            "sent plugin pane resize pane={pane} logical_size={:.0}x{:.0} scale={:.2}",
+            size.width, size.height, size.scale
+        );
+    }
+    Ok(())
 }
 
 fn send_input(lane: &mut InputLane, opcode: u32, arguments: [u64; 5]) -> bool {
@@ -3044,6 +3084,7 @@ impl Renderer {
             layout_source: LayoutSource::NativeFallback,
             layout_state_dirty: true,
             sent_managed_sizes: HashMap::new(),
+            sent_plugin_sizes: HashMap::new(),
         })
     }
 
@@ -3263,24 +3304,9 @@ impl Renderer {
     ) -> Option<PanePointerTarget> {
         let (x, y) = self.scene_position_for_window_point(x, y);
         if let Some(plugin) = self.plugin_panes.get(&pane) {
-            let (composition_width, composition_height) = self.composition_extent();
-            let (x, y) = project_point_between_rects(
-                x,
-                y,
-                plugin.rect,
-                [
-                    0,
-                    0,
-                    i32::try_from(composition_width).unwrap_or(i32::MAX),
-                    i32::try_from(composition_height).unwrap_or(i32::MAX),
-                ],
-            );
             let scale = self.window.scale_factor() as f32;
-            return Some(PanePointerTarget::Plugin {
-                pane,
-                x: x as f32 / scale,
-                y: y as f32 / scale,
-            });
+            let (x, y) = plugin_local_point(x, y, plugin.rect, scale);
+            return Some(PanePointerTarget::Plugin { pane, x, y });
         }
         let window = self
             .current_windows
@@ -3414,6 +3440,8 @@ impl Renderer {
                 .iter()
                 .any(|item| item.window_id == *window)
         });
+        self.sent_plugin_sizes
+            .retain(|pane, _| self.plugin_panes.contains_key(pane));
         focus_change_between(previous_focus, self.focused_pane)
     }
 
@@ -3506,52 +3534,118 @@ impl Renderer {
         if snapshot.sequence < expected_sequence {
             return Ok(None);
         }
-        if self.plugin_panes.get(&pane).is_some_and(|current| {
-            current.scene.sequence >= snapshot.sequence
-                && current.scene.width == self.config.width
-                && current.scene.height == self.config.height
-        }) {
+        let target = self.plugin_scene_extent(pane);
+        let target_changed = self.plugin_panes.get(&pane).is_none_or(|current| {
+            current.scene.width != target.0
+                || current.scene.height != target.1
+                || current.scene.scale.to_bits() != target.2.to_bits()
+        });
+        if self
+            .plugin_panes
+            .get(&pane)
+            .is_some_and(|current| current.scene.sequence >= snapshot.sequence && !target_changed)
+        {
             return Ok(None);
         }
-        let scale = self.window.scale_factor() as f32;
         let scene = self.plugin_canvas.compile(
             &self.device,
             &self.queue,
             &snapshot,
-            (self.config.width.max(1), self.config.height.max(1), scale),
+            target,
             self.plugin_panes.get(&pane).map(|current| &current.scene),
         )?;
-        if snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) {
+        if target_changed || snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) {
             eprintln!(
                 "accepted plugin draw packet pane={} sequence={} commands={} gpu_target={}x{} scale={:.2}",
                 snapshot.pane,
                 snapshot.sequence,
                 snapshot.packet.commands.len(),
-                self.config.width,
-                self.config.height,
-                scale,
+                target.0,
+                target.1,
+                target.2,
             );
         }
         let first_plugin_scene = self.plugin_panes.is_empty();
-        self.plugin_panes.insert(
-            pane,
-            PluginPaneTexture {
-                scene,
-                rect: [
+        let rect = self.plugin_panes.get(&pane).map_or_else(
+            || {
+                [
                     0,
                     0,
                     i32::try_from(self.config.width).unwrap_or(i32::MAX),
                     i32::try_from(self.config.height).unwrap_or(i32::MAX),
-                ],
+                ]
             },
+            |current| current.rect,
         );
+        self.plugin_panes
+            .insert(pane, PluginPaneTexture { scene, rect });
         let focus_change = if first_plugin_scene {
             self.set_focus(FocusedPane::Plugin(pane))
         } else {
             self.reconcile_layout()
         };
+        let updated_target = self.plugin_scene_extent(pane);
+        if updated_target.0 != target.0
+            || updated_target.1 != target.1
+            || updated_target.2.to_bits() != target.2.to_bits()
+        {
+            let scene = self.plugin_canvas.compile(
+                &self.device,
+                &self.queue,
+                &snapshot,
+                updated_target,
+                self.plugin_panes.get(&pane).map(|current| &current.scene),
+            )?;
+            if let Some(plugin) = self.plugin_panes.get_mut(&pane) {
+                plugin.scene = scene;
+            }
+        }
         self.window.request_redraw();
         Ok(focus_change)
+    }
+
+    fn sync_plugin_graphics_extents(&mut self) -> Result<()> {
+        let scenes = self
+            .plugin_panes
+            .values()
+            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
+            .collect::<Vec<_>>();
+        for (pane, sequence) in scenes {
+            let _focus_change = self.refresh_plugin_graphics(pane, sequence)?;
+        }
+        Ok(())
+    }
+
+    fn plugin_scene_extent(&self, pane: u64) -> (u32, u32, f32) {
+        let scale = self.window.scale_factor() as f32;
+        let extent = self.plugin_panes.get(&pane).map_or_else(
+            || (self.config.width.max(1), self.config.height.max(1)),
+            |plugin| {
+                positive_rect_extent(plugin.rect)
+                    .unwrap_or((plugin.scene.width, plugin.scene.height))
+            },
+        );
+        (extent.0, extent.1, scale)
+    }
+
+    fn pending_plugin_resize_events(&self) -> Vec<(u64, PluginPaneSize)> {
+        let scale = self.window.scale_factor() as f32;
+        self.plugin_panes
+            .iter()
+            .filter_map(|(pane, plugin)| {
+                let (width, height) = positive_rect_extent(plugin.rect)?;
+                let size = PluginPaneSize {
+                    width: width as f32 / scale,
+                    height: height as f32 / scale,
+                    scale,
+                };
+                (self.sent_plugin_sizes.get(pane) != Some(&size)).then_some((*pane, size))
+            })
+            .collect()
+    }
+
+    fn mark_plugin_resize_sent(&mut self, pane: u64, size: PluginPaneSize) {
+        self.sent_plugin_sizes.insert(pane, size);
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<Option<FocusChange>> {
@@ -3563,20 +3657,8 @@ impl Renderer {
         self.config.height = height;
         self.reconfigure();
         self.layout_state_dirty = true;
-        let plugin_scenes = self
-            .plugin_panes
-            .values()
-            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
-            .collect::<Vec<_>>();
-        let mut focus_change = None;
-        for (pane, sequence) in plugin_scenes {
-            focus_change = self
-                .refresh_plugin_graphics(pane, sequence)?
-                .or(focus_change);
-        }
-        if self.plugin_panes.is_empty() {
-            focus_change = self.reconcile_layout();
-        }
+        let focus_change = self.reconcile_layout();
+        self.sync_plugin_graphics_extents()?;
         self.window.request_redraw();
         Ok(focus_change)
     }
@@ -3830,6 +3912,21 @@ fn project_point_between_rects(x: f64, y: f64, from: [i32; 4], to: [i32; 4]) -> 
     )
 }
 
+fn positive_rect_extent(rect: [i32; 4]) -> Option<(u32, u32)> {
+    let width = u32::try_from(rect[2]).ok().filter(|width| *width > 0)?;
+    let height = u32::try_from(rect[3]).ok().filter(|height| *height > 0)?;
+    Some((width, height))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "plugin pointer events use pane-local f32 logical coordinates"
+)]
+fn plugin_local_point(x: f64, y: f64, rect: [i32; 4], scale: f32) -> (f32, f32) {
+    let (x, y) = project_point_between_rects(x, y, rect, [0, 0, rect[2], rect[3]]);
+    (x as f32 / scale, y as f32 / scale)
+}
+
 #[allow(
     clippy::cast_precision_loss,
     reason = "WGPU viewports require f32 while protocol and surface extents are integer pixels"
@@ -3978,6 +4075,18 @@ mod tests {
         let actual =
             project_point_between_rects(900.0, 200.0, [600, 0, 600, 400], [0, 400, 600, 400]);
         assert_eq!(actual, (300.0, 600.0));
+    }
+
+    #[test]
+    fn plugin_pointer_position_is_local_to_its_pane() {
+        let actual = plugin_local_point(1120.0, 300.0, [960, 0, 320, 720], 2.0);
+        assert_eq!(actual, (80.0, 150.0));
+    }
+
+    #[test]
+    fn hidden_plugin_rect_has_no_render_extent() {
+        assert_eq!(positive_rect_extent([0, 0, 0, 720]), None);
+        assert_eq!(positive_rect_extent([960, 0, 320, 720]), Some((320, 720)));
     }
 
     #[test]
