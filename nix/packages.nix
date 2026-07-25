@@ -54,6 +54,7 @@ let
       "${src}/plugins/component-runtime-io/Cargo.lock"
       "${src}/plugins/coding-agent/Cargo.lock"
       "${src}/plugins/default-workspace/Cargo.lock"
+      "${src}/plugins/diff-viewer/Cargo.lock"
       "${src}/plugins/session-switcher/Cargo.lock"
       "${src}/plugins/workspace-file-log/Cargo.lock"
     ];
@@ -259,6 +260,24 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/diff-viewer/Cargo.toml ]]; then
+        component_core="plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm"
+        component_output="plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR diff viewer core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+
+        # The presentation init actor supervises the viewer from its package
+        # root so the child artifact must travel with the shell component.
+        install -D "$component_output" \
+          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm
+      fi
+
       if [[ -f plugins/coding-agent/Cargo.toml ]]; then
         component_core="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm"
         component_output="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm"
@@ -334,6 +353,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"

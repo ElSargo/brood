@@ -22,6 +22,12 @@ Sidebar visibility and focus are actor state. The default key policy delivers
 `Ctrl+Alt+M` as an ordinary `sidebar-action` mailbox message; the plugin answers
 by publishing another fragment for its existing root lease.
 
+The init actor also owns the diff viewer's pane lifecycle. `Ctrl+Alt+D` starts
+the diff actor with narrow read-only workspace and `subprocess:git`
+capabilities; the next press stops the actor and therefore closes the pane. The
+diff viewer stays an ordinary workspace pane and does not participate in the
+switcher's root layout policy.
+
 The pane supports:
 
 - pointer or keyboard session selection and activation;

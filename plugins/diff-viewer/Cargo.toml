@@ -1,0 +1,14 @@
+[package]
+name = "brood-diff-viewer-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brood-graphics = { path = "../../crates/brood-graphics" }
+wit-bindgen = "0.57.1"
+
+[workspace]

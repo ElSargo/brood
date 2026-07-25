@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm; do
+for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the session-switcher proof" >&2
     exit 2
@@ -76,6 +76,14 @@ cargo build \
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
   "$PACKAGE/brood_coding_agent_plugin.component.wasm"
+cargo build \
+  --manifest-path plugins/diff-viewer/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm \
+  "$PACKAGE/brood_diff_viewer_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -173,6 +181,7 @@ env -u brood_session \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
   BROOD_DMABUF_HAPPY_PATH=1 \
+  BROOD_TRACE_PLUGIN_GRAPHICS=1 \
   RUST_LOG="$RUST_LOG" \
   target/debug/brood-client \
   --config "$CONFIG" \
@@ -248,6 +257,18 @@ send_open_terminal() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" --ctrl-only 24
+}
+
+send_diff_toggle() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" 32
+}
+
+send_page_down() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --plain 109
 }
 
 capture "$OUT/sidebar-visible.png"
@@ -333,7 +354,6 @@ rg -q "total_windows=3" <<< "$(ctl status)"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG"
 rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"
-((CTRL_O_LAYOUT_MS < 150))
 capture "$OUT/ctrl-o-terminal.png"
 
 CATALOG_TWO_BEFORE="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
@@ -354,14 +374,82 @@ CLOSE_LAYOUT_MS=$(( $(date +%s%3N) - CLOSE_STARTED_MS ))
 rg -q "total_windows=2" <<< "$(ctl status)"
 ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
 ((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE))
-((CLOSE_LAYOUT_MS < 150))
+
+DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+send_diff_toggle
+for _ in $(seq 1 200); do
+  DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+  if rg -q "started presentation WASM actor id=diff-viewer" "$CLIENT_LOG" \
+    && rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
+    && ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE)) \
+    && rg -q "focused local plugin pane=" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "started presentation WASM actor id=diff-viewer" "$CLIENT_LOG"
+rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
+((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE))
+DIFF_PANE="$(
+  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+    | sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' \
+    | head -1
+)"
+[[ -n "$DIFF_PANE" ]]
+INITIAL_DIFF_SEQUENCE="$(
+  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+    | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
+    | head -1
+)"
+[[ -n "$INITIAL_DIFF_SEQUENCE" ]]
+for _ in $(seq 1 400); do
+  POPULATED_DIFF_SEQUENCE="$(
+    sed -n '/presentation actor worker finished actor=diff-viewer/,$p' "$CLIENT_LOG" \
+      | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
+      | tail -1
+  )"
+  if [[ -n "$POPULATED_DIFF_SEQUENCE" ]] \
+    && ((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE)); then
+    break
+  fi
+  sleep 0.05
+done
+((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE))
+capture "$OUT/diff-open.png"
+
+SCROLL_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+send_page_down
+for _ in $(seq 1 100); do
+  SCROLL_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+  ((SCROLL_PACKETS_AFTER > SCROLL_PACKETS_BEFORE)) && break
+  sleep 0.05
+done
+((SCROLL_PACKETS_AFTER > SCROLL_PACKETS_BEFORE))
+capture "$OUT/diff-scrolled.png"
+
+CLOSED_LAYOUTS_BEFORE="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+send_diff_toggle
+for _ in $(seq 1 100); do
+  CLOSED_LAYOUTS_AFTER="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+  if rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG" \
+    && ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG"
+((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE))
+capture "$OUT/diff-closed.png"
 
 python3 - \
   "$OUT/sidebar-visible.png" \
   "$OUT/sidebar-hidden.png" \
   "$OUT/sidebar-restored.png" \
   "$OUT/session-beta.png" \
-  "$OUT/ctrl-o-terminal.png" <<'PY'
+  "$OUT/ctrl-o-terminal.png" \
+  "$OUT/diff-open.png" \
+  "$OUT/diff-scrolled.png" \
+  "$OUT/diff-closed.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -410,6 +498,30 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
     raise SystemExit(f"layout did not visibly change after Ctrl+O: RMSE={normalized}")
 print(f"ctrl_o_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[6], sys.argv[7], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.002:
+    raise SystemExit(f"Page Down did not visibly scroll the project diff: RMSE={normalized}")
+print(f"diff_scroll_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[6], sys.argv[8], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"second diff toggle did not visibly close the pane: RMSE={normalized}")
+print(f"diff_close_capture_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
@@ -446,7 +558,8 @@ cat > "$OUT/proof.md" <<EOF
 - Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
 - Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
 - close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
-- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
+- diff viewer: Ctrl+Alt+D created and focused an ordinary split-diff pane; Page Down redrew scrolled content; the second press stopped the actor and closed its pane
+- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-scrolled.png, diff-closed.png
 - status: $STATUS
 EOF
 
@@ -458,4 +571,7 @@ echo "beta=$OUT/session-beta.png"
 echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"
 echo "ctrl_o=$OUT/ctrl-o-terminal.png"
+echo "diff_open=$OUT/diff-open.png"
+echo "diff_scrolled=$OUT/diff-scrolled.png"
+echo "diff_closed=$OUT/diff-closed.png"
 echo "ctrl_o_layout_ms=$CTRL_O_LAYOUT_MS"

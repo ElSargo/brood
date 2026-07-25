@@ -42,8 +42,10 @@ pub struct PresentationWasmRuntime {
     outbound_session_commands: VecDeque<SessionCommandEnvelope>,
     outbound_host_messages: VecDeque<HostActorMessage>,
     pending_pane_creations: VecDeque<u64>,
+    pending_pane_removals: VecDeque<u64>,
     bound_session_id: Option<u64>,
     next_actor_pane: u64,
+    workspace_root: PathBuf,
 }
 
 pub struct SessionActorMessageRequest {
@@ -92,6 +94,8 @@ impl PresentationWasmRuntime {
         graphics: Option<&PluginGraphicsBridge>,
         event_proxy: Option<EventLoopProxy<ClientEvent>>,
     ) -> Result<Self> {
+        let workspace_root =
+            std::env::current_dir().context("resolve presentation client workspace root")?;
         let specs = actor_specs
             .iter()
             .map(|spec| PresentationActorSpec::parse(spec))
@@ -119,15 +123,17 @@ impl PresentationWasmRuntime {
             outbound_session_commands: VecDeque::new(),
             outbound_host_messages: VecDeque::new(),
             pending_pane_creations: VecDeque::new(),
+            pending_pane_removals: VecDeque::new(),
             bound_session_id: session_id,
             next_actor_pane: u64::MAX,
+            workspace_root,
         };
         if let Some(path) = init_actor {
             runtime.load_init_actor(path, session_id, graphics)?;
         }
         for spec in specs {
             let pane = runtime.allocate_actor_pane()?;
-            runtime.load_actor(spec, pane, graphics)?;
+            runtime.load_actor(spec, pane, graphics, &[])?;
         }
         Ok(runtime)
     }
@@ -167,6 +173,8 @@ impl PresentationWasmRuntime {
             None,
             artifact,
             true,
+            &[],
+            &self.workspace_root,
         ))?;
         self.executor.block_on(actor.lifecycle(
             PluginLifecycleEvent::Start(PluginStartContext {
@@ -205,6 +213,7 @@ impl PresentationWasmRuntime {
         spec: PresentationActorSpec,
         pane: u64,
         graphics: Option<&PluginGraphicsBridge>,
+        capabilities: &[String],
     ) -> Result<()> {
         ensure!(
             !self.actors.contains_key(&spec.id) && !self.legacy_actors.contains_key(&spec.id),
@@ -215,7 +224,7 @@ impl PresentationWasmRuntime {
             WasmPluginArtifact::Legacy(artifact) => {
                 self.load_legacy_actor(spec, artifact.inventory.actors)
             }
-            artifact => self.load_hosted_actor(spec, pane, graphics, artifact),
+            artifact => self.load_hosted_actor(spec, pane, graphics, artifact, capabilities),
         }
     }
 
@@ -300,6 +309,7 @@ impl PresentationWasmRuntime {
         pane: u64,
         graphics: Option<&PluginGraphicsBridge>,
         artifact: WasmPluginArtifact,
+        capabilities: &[String],
     ) -> Result<()> {
         let watcher = self.filesystem_watcher_service.clone();
         let presentation = graphics.map(|graphics| graphics.actor_host(pane));
@@ -309,6 +319,8 @@ impl PresentationWasmRuntime {
             presentation.clone(),
             artifact,
             false,
+            capabilities,
+            &self.workspace_root,
         ))?;
         if let Some(presentation) = presentation {
             presentation.bind_generation(actor.generation());
@@ -397,6 +409,25 @@ impl PresentationWasmRuntime {
                     "presentation actor {actor_id:?} worker {} failed: {message}",
                     worker.raw()
                 ),
+                ComponentActorEvent::WorkerStarted { worker } => {
+                    eprintln!(
+                        "presentation actor worker started actor={actor_id} worker={}",
+                        worker.raw()
+                    );
+                }
+                ComponentActorEvent::WorkerFinished { worker, output } => {
+                    eprintln!(
+                        "presentation actor worker finished actor={actor_id} worker={} bytes={}",
+                        worker.raw(),
+                        output.len()
+                    );
+                }
+                ComponentActorEvent::WorkerCancelled { worker } => {
+                    eprintln!(
+                        "presentation actor worker cancelled actor={actor_id} worker={}",
+                        worker.raw()
+                    );
+                }
                 ComponentActorEvent::Stopped if self.is_init_child(&actor_id) => {
                     self.send_init_child_event(ComponentChildEvent::Stopped { id: actor_id });
                 }
@@ -494,10 +525,6 @@ impl PresentationWasmRuntime {
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<u64> {
         ensure!(
-            capabilities.is_empty(),
-            "presentation init children cannot request backend capabilities"
-        );
-        ensure!(
             !id.trim().is_empty(),
             "init child actor id must not be empty"
         );
@@ -549,7 +576,7 @@ impl PresentationWasmRuntime {
             "init child actors must use the hosted Component or Preview 1 runtime"
         );
         let pane = self.allocate_actor_pane()?;
-        self.load_actor(spec, pane, graphics)?;
+        self.load_actor(spec, pane, graphics, capabilities)?;
         let generation = self
             .actors
             .get(id)
@@ -571,15 +598,28 @@ impl PresentationWasmRuntime {
             });
             return;
         }
+        let mut removed_pane = None;
         let result = self.actors.remove(&id).map_or_else(
             || Err(anyhow::anyhow!("init child actor is unavailable")),
-            |mut actor| self.executor.block_on(actor.actor.shutdown()),
+            |mut actor| {
+                removed_pane = (actor.pane != 0).then_some(actor.pane);
+                self.executor.block_on(actor.actor.shutdown())
+            },
         );
         if let Some(init) = self.init.as_mut() {
             init.children.remove(&id);
         }
         match result {
-            Ok(()) => self.send_init_child_event(ComponentChildEvent::Stopped { id }),
+            Ok(()) => {
+                if let Some(pane) = removed_pane {
+                    self.pending_pane_removals.push_back(pane);
+                }
+                eprintln!("stopped presentation init child actor id={id}");
+                self.send_init_child_event(ComponentChildEvent::Stopped { id });
+                if let Some(proxy) = &self.event_proxy {
+                    drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+                }
+            }
             Err(error) => self.send_init_child_event(ComponentChildEvent::Failed {
                 id,
                 message: format!("{error:#}"),
@@ -674,6 +714,10 @@ impl PresentationWasmRuntime {
 
     pub fn drain_pending_pane_creations(&mut self) -> impl Iterator<Item = u64> + '_ {
         self.pending_pane_creations.drain(..)
+    }
+
+    pub fn drain_pending_pane_removals(&mut self) -> impl Iterator<Item = u64> + '_ {
+        self.pending_pane_removals.drain(..)
     }
 
     pub fn send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
@@ -883,23 +927,19 @@ async fn load_hosted_actor(
     presentation: Option<std::sync::Arc<crate::plugin_graphics::ActorPresentationHost>>,
     artifact: WasmPluginArtifact,
     actor_management: bool,
+    capabilities: &[String],
+    workspace_root: &Path,
 ) -> Result<HostedWasmActor> {
     let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
+    let (filesystem, runtime_io) = presentation_actor_grants(root, workspace_root, capabilities)?;
     let actor = match artifact {
         WasmPluginArtifact::Component { core_module_error } => {
             let actor = ComponentActor::load(
                 &spec.path,
                 ComponentActorConfig {
-                    filesystem: Some(FilesystemGrant {
-                        host_path: root.to_path_buf(),
-                        guest_path: ".".to_string(),
-                        writable: false,
-                    }),
+                    filesystem: Some(filesystem.clone()),
                     filesystem_watcher_service: watcher,
-                    runtime_io: RuntimeIoConfig {
-                        capabilities: RuntimeIoCapabilities::default(),
-                        ..RuntimeIoConfig::default()
-                    },
+                    runtime_io,
                     presentation: presentation.map(|presentation| {
                         presentation as std::sync::Arc<dyn brood_wasm::PresentationHost>
                     }),
@@ -923,11 +963,11 @@ async fn load_hosted_actor(
                 &spec.path,
                 Preview1ActorCapabilities {
                     filesystem: Some(Preview1FilesystemGrant {
-                        host_path: root.to_path_buf(),
+                        host_path: filesystem.host_path,
                         guest_path: ".".to_string(),
-                        writable: false,
+                        writable: filesystem.writable,
                     }),
-                    runtime_io: RuntimeIoCapabilities::default(),
+                    runtime_io: runtime_io.capabilities,
                 },
                 Preview1WorkerConfig::default(),
                 watcher,
@@ -943,6 +983,76 @@ async fn load_hosted_actor(
     Ok(actor)
 }
 
+fn presentation_actor_grants(
+    package_root: &Path,
+    workspace_root: &Path,
+    requested: &[String],
+) -> Result<(FilesystemGrant, RuntimeIoConfig)> {
+    let workspace_write = requested
+        .iter()
+        .any(|capability| capability == "filesystem:workspace-write");
+    let workspace_read = requested
+        .iter()
+        .any(|capability| capability == "filesystem:workspace-read");
+    ensure!(
+        !(workspace_read && workspace_write),
+        "presentation actor cannot request both workspace-read and workspace-write"
+    );
+
+    let mut commands = Vec::new();
+    let mut allow_pty = false;
+    let mut allow_loopback = false;
+    for capability in requested {
+        match capability.as_str() {
+            "filesystem:workspace-read" | "filesystem:workspace-write" => {}
+            "pty" => allow_pty = true,
+            "network:loopback" => allow_loopback = true,
+            _ => {
+                let Some(command) = capability.strip_prefix("subprocess:") else {
+                    anyhow::bail!("unsupported presentation actor capability {capability:?}");
+                };
+                ensure!(
+                    !command.is_empty()
+                        && !command.contains('/')
+                        && !command.contains('\\')
+                        && !command.chars().any(char::is_whitespace),
+                    "invalid presentation subprocess capability {capability:?}"
+                );
+                ensure!(
+                    !commands.iter().any(|existing| existing == command),
+                    "duplicate presentation subprocess capability {capability:?}"
+                );
+                commands.push(command.to_string());
+            }
+        }
+    }
+    ensure!(
+        !allow_pty || !commands.is_empty(),
+        "presentation actor PTY capability requires an allowed subprocess"
+    );
+
+    let workspace_filesystem = workspace_read || workspace_write;
+    let filesystem = FilesystemGrant {
+        host_path: if workspace_filesystem {
+            workspace_root.to_path_buf()
+        } else {
+            package_root.to_path_buf()
+        },
+        guest_path: ".".to_string(),
+        writable: workspace_write,
+    };
+    let runtime_io = RuntimeIoConfig {
+        capabilities: RuntimeIoCapabilities {
+            commands,
+            allow_pty,
+            allow_loopback,
+        },
+        working_directory: (!requested.is_empty()).then(|| workspace_root.to_path_buf()),
+        ..RuntimeIoConfig::default()
+    };
+    Ok((filesystem, runtime_io))
+}
+
 const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
     match event {
         PresentationEvent::PaneCreated { pane, .. }
@@ -953,5 +1063,47 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::PointerScroll { pane, .. }
         | PresentationEvent::Key { pane, .. }
         | PresentationEvent::Text { pane, .. } => *pane,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_child_git_capability_keeps_package_filesystem_read_only() -> Result<()> {
+        let package = Path::new("/package");
+        let workspace = Path::new("/workspace");
+        let (filesystem, runtime) =
+            presentation_actor_grants(package, workspace, &["subprocess:git".to_string()])?;
+        ensure!(filesystem.host_path == package);
+        ensure!(!filesystem.writable);
+        ensure!(runtime.capabilities.commands == ["git"]);
+        ensure!(runtime.working_directory.as_deref() == Some(workspace));
+        Ok(())
+    }
+
+    #[test]
+    fn presentation_child_workspace_grants_are_explicit() -> Result<()> {
+        let (filesystem, _) = presentation_actor_grants(
+            Path::new("/package"),
+            Path::new("/workspace"),
+            &["filesystem:workspace-read".to_string()],
+        )?;
+        ensure!(filesystem.host_path == Path::new("/workspace"));
+        ensure!(!filesystem.writable);
+        Ok(())
+    }
+
+    #[test]
+    fn presentation_child_rejects_unknown_capabilities() {
+        assert!(
+            presentation_actor_grants(
+                Path::new("/package"),
+                Path::new("/workspace"),
+                &["display:ambient".to_string()],
+            )
+            .is_err()
+        );
     }
 }

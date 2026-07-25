@@ -1609,6 +1609,20 @@ impl Application {
                         })?;
                     }
                 }
+                let panes = runtime.drain_pending_pane_removals().collect::<Vec<_>>();
+                if let Some(renderer) = self.renderer.as_mut() {
+                    for pane in panes {
+                        let change = renderer.remove_plugin_pane(pane);
+                        if let Some(change) = change {
+                            dispatch_focus_change(
+                                Some(runtime),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            )?;
+                        }
+                    }
+                }
                 let messages = runtime.drain_session_messages();
                 let commands = runtime.drain_session_commands();
                 if !commands.is_empty() {
@@ -1965,7 +1979,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             ClientEvent::ActorHostMessagesReady => {
-                if let Err(error) = self.apply_actor_host_messages() {
+                if let Err(error) = self
+                    .apply_actor_host_messages()
+                    .and_then(|()| self.publish_layout_state())
+                {
                     self.fail(event_loop, error);
                 }
             }
@@ -2484,6 +2501,10 @@ fn plugin_logical_key(key: &Key) -> String {
             NamedKey::ArrowDown => "ArrowDown",
             NamedKey::ArrowLeft => "ArrowLeft",
             NamedKey::ArrowRight => "ArrowRight",
+            NamedKey::PageUp => "PageUp",
+            NamedKey::PageDown => "PageDown",
+            NamedKey::Home => "Home",
+            NamedKey::End => "End",
             NamedKey::F2 => "F2",
             NamedKey::F6 => "F6",
             NamedKey::F7 => "F7",
@@ -4080,7 +4101,11 @@ impl Renderer {
             target,
             self.plugin_panes.get(&pane).map(|current| &current.scene),
         )?;
-        if target_changed || snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) {
+        if target_changed
+            || snapshot.sequence <= 3
+            || snapshot.sequence.is_multiple_of(120)
+            || std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some()
+        {
             eprintln!(
                 "accepted plugin draw packet pane={} sequence={} commands={} gpu_target={}x{} scale={:.2}",
                 snapshot.pane,
@@ -4137,6 +4162,23 @@ impl Renderer {
             let _focus_change = self.refresh_plugin_graphics(pane, sequence)?;
         }
         Ok(())
+    }
+
+    fn remove_plugin_pane(&mut self, pane: u64) -> Option<FocusChange> {
+        let removed = self.plugin_panes.remove(&pane).is_some();
+        self.sent_plugin_sizes.remove(&pane);
+        if !removed {
+            return None;
+        }
+        self.layout_state_dirty = true;
+        let mut focus_change = self.reconcile_layout();
+        if let Some(change) = &mut focus_change
+            && change.plugin_blur == Some(pane)
+        {
+            change.plugin_blur = None;
+        }
+        self.window.request_redraw();
+        focus_change
     }
 
     fn plugin_scene_extent(&self, pane: u64) -> (u32, u32, f32) {

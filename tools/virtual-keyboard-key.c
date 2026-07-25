@@ -148,14 +148,18 @@ static uint32_t monotonic_milliseconds(void) {
 
 int main(int argc, char **argv) {
     bool ctrl_only = false;
+    bool plain = false;
     const char *keycode = NULL;
     if (argc == 2) {
         keycode = argv[1];
     } else if (argc == 3 && strcmp(argv[1], "--ctrl-only") == 0) {
         ctrl_only = true;
         keycode = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "--plain") == 0) {
+        plain = true;
+        keycode = argv[2];
     } else {
-        fail("usage: virtual-keyboard-key [--ctrl-only] <linux-evdev-keycode>");
+        fail("usage: virtual-keyboard-key [--ctrl-only|--plain] <linux-evdev-keycode>");
     }
     char *end = NULL;
     unsigned long parsed = strtoul(keycode, &end, 10);
@@ -213,9 +217,12 @@ int main(int argc, char **argv) {
         fail("the compositor rejected the virtual keyboard keymap");
     }
     usleep(10000);
-    uint32_t modifiers = modifier_mask(keymap, XKB_MOD_NAME_CTRL);
-    if (!ctrl_only) {
-        modifiers |= modifier_mask(keymap, XKB_MOD_NAME_ALT);
+    uint32_t modifiers = 0;
+    if (!plain) {
+        modifiers = modifier_mask(keymap, XKB_MOD_NAME_CTRL);
+        if (!ctrl_only) {
+            modifiers |= modifier_mask(keymap, XKB_MOD_NAME_ALT);
+        }
     }
     uint32_t time = monotonic_milliseconds();
     wl_proxy_marshal_flags(
