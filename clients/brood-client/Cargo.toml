@@ -14,7 +14,9 @@ brood-graphics.workspace = true
 brood-ipc.workspace = true
 brood-layout.workspace = true
 brood-protocol.workspace = true
+brood-transport.workspace = true
 brood-wasm = { path = "../../crates/brood-wasm" }
+quinn.workspace = true
 lyon_tessellation.workspace = true
 num-traits.workspace = true
 pollster.workspace = true

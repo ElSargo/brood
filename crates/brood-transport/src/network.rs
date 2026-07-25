@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use brood_protocol::{
@@ -33,9 +33,10 @@ pub fn server_endpoint(
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![certificate], private_key)
         .context("configure QUIC server identity")?;
-    let config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(tls).context("configure QUIC server TLS")?,
     ));
+    config.transport_config(Arc::new(network_transport_config()));
     Endpoint::server(config, bind_address).context("bind QUIC presentation listener")
 }
 
@@ -59,13 +60,20 @@ pub fn client_endpoint(
             rustls::pki_types::PrivatePkcs8KeyDer::from(private_key_der).into(),
         )
         .context("configure QUIC presentation client identity")?;
-    let config = quinn::ClientConfig::new(Arc::new(
+    let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(tls).context("configure QUIC client TLS")?,
     ));
+    config.transport_config(Arc::new(network_transport_config()));
     let mut endpoint =
         Endpoint::client(bind_address).context("bind QUIC presentation client socket")?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
+}
+
+fn network_transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    config.keep_alive_interval(Some(Duration::from_secs(10)));
+    config
 }
 
 const LANES: [Lane; 5] = [
@@ -235,6 +243,19 @@ impl NetworkSendLane {
         );
         send_value(&mut self.send, frame).await
     }
+
+    /// Finish this lane and wait until the peer acknowledges every buffered byte.
+    pub async fn finish(&mut self) -> Result<()> {
+        self.send
+            .finish()
+            .context("finish presentation network lane")?;
+        let _peer_stop = self
+            .send
+            .stopped()
+            .await
+            .context("wait for presentation network lane acknowledgement")?;
+        Ok(())
+    }
 }
 
 impl NetworkReceiveLane {
@@ -265,6 +286,20 @@ impl NetworkReceiveLane {
             "network frame belongs on the frame-resource lane"
         );
         receive_value(&mut self.receive).await
+    }
+
+    /// Read the peer's lane finish marker after its final framed message.
+    pub async fn wait_for_finish(&mut self) -> Result<()> {
+        let trailing = self
+            .receive
+            .read_to_end(0)
+            .await
+            .context("wait for presentation network lane finish")?;
+        ensure!(
+            trailing.is_empty(),
+            "peer sent trailing bytes after the final presentation message"
+        );
+        Ok(())
     }
 }
 
@@ -526,7 +561,8 @@ async fn read_frame(stream: &mut RecvStream) -> Result<Vec<u8>> {
         .context("presentation message length is invalid")?;
     ensure!(
         length <= MAX_WIRE_MESSAGE_BYTES,
-        "presentation message exceeds the carrier limit"
+        "presentation message length {length} exceeds the carrier limit of \
+         {MAX_WIRE_MESSAGE_BYTES} bytes"
     );
     let mut bytes = vec![0; length];
     stream
@@ -561,15 +597,21 @@ const fn client_message_lane(message: &ClientMessage) -> Lane {
     match message {
         ClientMessage::Input(input) => input.lane(),
         ClientMessage::Lifecycle(_) => Lane::Critical,
-        ClientMessage::Actor(_) | ClientMessage::ReleaseResource { .. } => Lane::Reliable,
+        ClientMessage::Actor(_)
+        | ClientMessage::BackendRequest(_)
+        | ClientMessage::ReleaseResource { .. } => Lane::Reliable,
     }
 }
 
 const fn server_message_lane(message: &ServerMessage) -> Lane {
     match message {
-        ServerMessage::Catalog(_) | ServerMessage::Actor(_) => Lane::Reliable,
+        ServerMessage::Catalog(_) | ServerMessage::Actor(_) | ServerMessage::BackendResponse(_) => {
+            Lane::Reliable
+        }
         ServerMessage::Scene(_) => Lane::LatestState,
-        ServerMessage::FocusPresentation | ServerMessage::ClosePresentation => Lane::Critical,
+        ServerMessage::FocusPresentation
+        | ServerMessage::ClosePresentation
+        | ServerMessage::DisconnectAcknowledged => Lane::Critical,
     }
 }
 
@@ -664,8 +706,9 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use brood_protocol::{
-        ClientMessage, EndpointCapabilities, FrameColorSpace, FramePixelFormat, InputEvent, Lane,
-        PanePosition, ServerMessage,
+        BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, ClientMessage,
+        EndpointCapabilities, FrameColorSpace, FramePixelFormat, InputEvent, Lane, PanePosition,
+        ServerMessage,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -728,6 +771,26 @@ mod tests {
                     position: PanePosition { pane: 7, .. }
                 })
             ));
+            let backend = connection
+                .receive_client_message(Lane::Reliable)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(
+                backend,
+                ClientMessage::BackendRequest(BackendRequest {
+                    id: 9,
+                    operation: BackendOperation::Control {
+                        argv: vec!["status".to_string()],
+                    },
+                })
+            );
+            connection
+                .send_server_message(&ServerMessage::BackendResponse(BackendResponse {
+                    id: 9,
+                    result: Ok(BackendResponseValue::Control("ready".to_string())),
+                }))
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
             connection
                 .send_server_message(&ServerMessage::FocusPresentation)
                 .await
@@ -776,6 +839,25 @@ mod tests {
             }))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
+        client
+            .send_client_message(&ClientMessage::BackendRequest(BackendRequest {
+                id: 9,
+                operation: BackendOperation::Control {
+                    argv: vec!["status".to_string()],
+                },
+            }))
+            .await
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            client
+                .receive_server_message(Lane::Reliable)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            ServerMessage::BackendResponse(BackendResponse {
+                id: 9,
+                result: Ok(BackendResponseValue::Control("ready".to_string())),
+            })
+        );
         assert_eq!(
             client
                 .receive_server_message(Lane::Critical)

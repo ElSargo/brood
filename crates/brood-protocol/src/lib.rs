@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 13;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 15;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
@@ -380,6 +380,7 @@ pub enum ClientMessage {
     Input(InputEvent),
     Lifecycle(ClientLifecycle),
     Actor(ActorMessage),
+    BackendRequest(BackendRequest),
     ReleaseResource { resource: u64 },
 }
 
@@ -390,6 +391,53 @@ pub struct ActorMessage {
     pub sender: String,
     pub recipient: String,
     pub body: Vec<u8>,
+}
+
+/// One asynchronous general-backend request from a presentation client.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackendRequest {
+    pub id: u64,
+    pub operation: BackendOperation,
+}
+
+/// Transport-neutral backend operations needed by presentation actors.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendOperation {
+    /// Execute one ordinary Brood control command.
+    Control { argv: Vec<String> },
+    /// Change or refresh the surface-session catalog.
+    Session {
+        operation: SessionOperation,
+        session: Option<u64>,
+        name: Option<String>,
+    },
+}
+
+/// Surface-session operation carried independently from the WASM ABI.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionOperation {
+    Refresh,
+    Activate,
+    Create,
+    Rename,
+    Close,
+}
+
+/// Result of one asynchronous general-backend request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackendResponse {
+    pub id: u64,
+    pub result: Result<BackendResponseValue, String>,
+}
+
+/// Successful value returned by a general-backend request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendResponseValue {
+    Control(String),
+    Session(Option<u64>),
 }
 
 /// Transport-independent frame-resource reference.
@@ -437,8 +485,10 @@ pub enum ServerMessage {
     Catalog(CatalogSnapshot),
     Scene(FrameScene),
     Actor(ActorMessage),
+    BackendResponse(BackendResponse),
     FocusPresentation,
     ClosePresentation,
+    DisconnectAcknowledged,
 }
 
 #[cfg(test)]

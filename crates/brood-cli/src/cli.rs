@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -276,6 +276,48 @@ pub struct ClientArgs {
         default_value_t = FrameTransportArg::Auto
     )]
     pub frame_transport: FrameTransportArg,
+    /// Connect to a remote presentation relay instead of local `DBus`.
+    #[arg(
+        long = "remote-connect",
+        value_name = "ADDRESS",
+        requires_all = [
+            "remote_server_certificate",
+            "remote_client_certificate",
+            "remote_client_private_key"
+        ],
+        conflicts_with_all = [
+            "no_server",
+            "dbus_name",
+            "dbus_address",
+            "server",
+            "frame_transport"
+        ]
+    )]
+    pub remote_connect: Option<SocketAddr>,
+    /// TLS server name expected from the remote presentation relay.
+    #[arg(long = "remote-server-name", default_value = "localhost")]
+    pub remote_server_name: String,
+    /// DER certificate trusted for the remote presentation relay.
+    #[arg(
+        long = "remote-server-certificate",
+        value_name = "PATH",
+        requires = "remote_connect"
+    )]
+    pub remote_server_certificate: Option<PathBuf>,
+    /// DER certificate presented as the remote client's identity.
+    #[arg(
+        long = "remote-client-certificate",
+        value_name = "PATH",
+        requires = "remote_connect"
+    )]
+    pub remote_client_certificate: Option<PathBuf>,
+    /// PKCS#8 DER private key for the remote client identity.
+    #[arg(
+        long = "remote-client-private-key",
+        value_name = "PATH",
+        requires = "remote_connect"
+    )]
+    pub remote_client_private_key: Option<PathBuf>,
     /// Config file used to select the blessed client init actor.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,

@@ -48,6 +48,7 @@ mod key_policy;
 mod layout;
 mod plugin_gpu;
 mod plugin_graphics;
+mod remote;
 
 use actor_runtime::{ActorIdentity, PresentationWasmRuntime};
 use brood_wasm::{
@@ -246,9 +247,44 @@ fn main() -> Result<()> {
         fast_path_enabled,
         backend_connected,
         bound_session_id,
+        mut remote_connection,
     ) = if args.no_server {
         eprintln!("starting Brood presentation without a backend");
-        (None, None, None, false, false, None)
+        (None, None, None, false, false, None, None)
+    } else if let Some(connect) = args.remote_connect {
+        let mut connection = remote::RemoteConnection::start(
+            remote::RemoteConfig {
+                connect,
+                server_name: args.remote_server_name.clone(),
+                server_certificate: args
+                    .remote_server_certificate
+                    .clone()
+                    .context("--remote-server-certificate is required for remote transport")?,
+                client_certificate: args
+                    .remote_client_certificate
+                    .clone()
+                    .context("--remote-client-certificate is required for remote transport")?,
+                client_private_key: args
+                    .remote_client_private_key
+                    .clone()
+                    .context("--remote-client-private-key is required for remote transport")?,
+            },
+            &event_proxy,
+        )?;
+        eprintln!(
+            "selected presentation transport carrier={:?} frames={:?} generation={} peer={connect}",
+            connection.profile.carrier, connection.profile.frames, connection.generation
+        );
+        let (input, actor_messages, backend_commands) = connection.take_lanes()?;
+        (
+            Some(InputLane::Remote(input)),
+            Some(ActorMessageLane::Remote(actor_messages)),
+            Some(BackendCommandLane::Remote(backend_commands)),
+            false,
+            true,
+            None,
+            Some(connection),
+        )
     } else {
         let target = resolve_control_target(args.dbus_name, args.dbus_address);
         let mut server = ServerLaunch::discover()?;
@@ -278,8 +314,9 @@ fn main() -> Result<()> {
             created
         };
 
-        let fast_path_enabled = true;
-        let (input_sender, actor_message_sender) = if fast_path_enabled {
+        let dmabuf_import_enabled =
+            fast_path.profile.frames == brood_protocol::FrameTransportKind::Dmabuf;
+        let (input_sender, actor_message_sender) = {
             let input =
                 brood_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
             let frames =
@@ -309,7 +346,7 @@ fn main() -> Result<()> {
                 brood_ipc::EventNotifier::from_owned_fd(fast_path.presentation_message_notify_fd),
                 event_loop.create_proxy(),
             )?;
-            let input_sender = InputLane {
+            let input_sender = InputLane::Local(LocalInputLane {
                 producer: input,
                 notifications: brood_ipc::EventNotifier::from_owned_fd(fast_path.input_notify_fd),
                 generation: fast_path.generation,
@@ -317,8 +354,8 @@ fn main() -> Result<()> {
                 deferred: VecDeque::new(),
                 deferred_high_water: 0,
                 coalesced_motion: 0,
-            };
-            let actor_message_sender = ActorMessageLane {
+            });
+            let actor_message_sender = ActorMessageLane::Local(LocalActorMessageLane {
                 producer: brood_ipc::ActorMessageProducer::map(
                     fast_path.actor_message_fd.as_fd(),
                     fast_path.generation,
@@ -329,22 +366,21 @@ fn main() -> Result<()> {
                 generation: fast_path.generation,
                 sequence: 0,
                 deferred: VecDeque::new(),
-            };
+            });
             (Some(input_sender), Some(actor_message_sender))
-        } else {
-            (None, None)
         };
-        let backend_commands = Some(BackendCommandLane::start(
+        let backend_commands = Some(BackendCommandLane::Local(LocalBackendCommandLane::start(
             target,
             event_loop.create_proxy(),
-        )?);
+        )?));
         (
             input_sender,
             actor_message_sender,
             backend_commands,
-            fast_path_enabled,
+            dmabuf_import_enabled,
             true,
             Some(session_id),
+            None,
         )
     };
     let mut application = Application {
@@ -371,7 +407,9 @@ fn main() -> Result<()> {
         .run_app(&mut application)
         .context("run event loop");
 
-    if let Some(sender) = application.input_sender.as_mut() {
+    if remote_connection.is_none()
+        && let Some(sender) = application.input_sender.as_mut()
+    {
         let _ = send_input(
             sender,
             ClientMessage::Lifecycle(ClientLifecycle::Disconnect),
@@ -387,11 +425,16 @@ fn main() -> Result<()> {
         .as_mut()
         .map_or(Ok(()), BackendCommandLane::shutdown)
         .context("stop presentation backend command worker");
+    let remote_shutdown_result = remote_connection
+        .as_mut()
+        .map_or(Ok(()), remote::RemoteConnection::shutdown)
+        .context("stop remote presentation transport");
     let error = application.error.take();
     drop(application);
     run_result?;
     shutdown_result?;
     backend_shutdown_result?;
+    remote_shutdown_result?;
     if let Some(error) = error {
         return Err(error);
     }
@@ -453,6 +496,7 @@ struct SceneWindowUpdate {
 enum FrameResource {
     Dmabuf(DmabufFrame),
     SharedMemory(SharedMemoryFrame),
+    Network(remote::NetworkFrame),
 }
 
 struct PendingScene {
@@ -862,7 +906,12 @@ fn unpack_i32_pair(value: u64) -> (i32, i32) {
     )
 }
 
-struct InputLane {
+enum InputLane {
+    Local(LocalInputLane),
+    Remote(remote::RemoteInputLane),
+}
+
+struct LocalInputLane {
     producer: brood_ipc::CriticalProducer,
     notifications: brood_ipc::EventNotifier,
     generation: u64,
@@ -872,7 +921,12 @@ struct InputLane {
     coalesced_motion: u64,
 }
 
-struct ActorMessageLane {
+enum ActorMessageLane {
+    Local(LocalActorMessageLane),
+    Remote(remote::RemoteActorMessageLane),
+}
+
+struct LocalActorMessageLane {
     producer: brood_ipc::ActorMessageProducer,
     notifications: brood_ipc::EventNotifier,
     generation: u64,
@@ -880,7 +934,7 @@ struct ActorMessageLane {
     deferred: VecDeque<Box<brood_ipc::ActorMessageRecord>>,
 }
 
-impl ActorMessageLane {
+impl LocalActorMessageLane {
     fn send(&mut self, message: &actor_runtime::SessionActorMessageRequest) -> Result<()> {
         self.flush_deferred();
         self.sequence = self.sequence.wrapping_add(1);
@@ -930,7 +984,55 @@ impl ActorMessageLane {
     }
 }
 
-impl InputLane {
+impl ActorMessageLane {
+    fn send(&mut self, message: &actor_runtime::SessionActorMessageRequest) -> Result<()> {
+        match self {
+            Self::Local(lane) => lane.send(message),
+            Self::Remote(lane) => lane.send(message),
+        }
+    }
+
+    fn flush_deferred(&mut self) {
+        match self {
+            Self::Local(lane) => lane.flush_deferred(),
+            Self::Remote(lane) => lane.flush_deferred(),
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        match self {
+            Self::Local(lane) => lane.has_deferred(),
+            Self::Remote(lane) => lane.has_deferred(),
+        }
+    }
+}
+
+impl LocalInputLane {
+    fn send(&mut self, message: ClientMessage) -> bool {
+        self.flush_deferred();
+        self.sequence = self.sequence.wrapping_add(1);
+        let record = match brood_ipc::encode_client_record(message, self.generation, self.sequence)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("cannot encode local presentation input: {error}");
+                return false;
+            }
+        };
+        if self.has_deferred() {
+            self.defer(record);
+            return true;
+        }
+        if let Err(record) = self.producer.try_send(record) {
+            self.defer(record);
+            return true;
+        }
+        if let Err(error) = self.notifications.notify() {
+            eprintln!("failed to notify presentation input consumer: {error}");
+        }
+        true
+    }
+
     fn flush_deferred(&mut self) {
         let had_deferred = !self.deferred.is_empty();
         let mut published = false;
@@ -975,7 +1077,35 @@ impl InputLane {
     }
 }
 
-struct BackendCommandLane {
+impl InputLane {
+    fn send(&mut self, message: ClientMessage) -> bool {
+        match self {
+            Self::Local(lane) => lane.send(message),
+            Self::Remote(lane) => lane.send(message),
+        }
+    }
+
+    fn flush_deferred(&mut self) {
+        match self {
+            Self::Local(lane) => lane.flush_deferred(),
+            Self::Remote(lane) => lane.flush_deferred(),
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        match self {
+            Self::Local(lane) => lane.has_deferred(),
+            Self::Remote(lane) => lane.has_deferred(),
+        }
+    }
+}
+
+enum BackendCommandLane {
+    Local(LocalBackendCommandLane),
+    Remote(remote::RemoteBackendCommandLane),
+}
+
+struct LocalBackendCommandLane {
     sender: Option<mpsc::SyncSender<BackendRequest>>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -990,7 +1120,7 @@ struct BackendCommand {
     argv: Vec<String>,
 }
 
-impl BackendCommandLane {
+impl LocalBackendCommandLane {
     fn start(
         target: ControlTarget,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
@@ -1063,6 +1193,30 @@ impl BackendCommandLane {
                 .map_err(|_panic| anyhow!("presentation backend command worker panicked"))?;
         }
         Ok(())
+    }
+}
+
+impl BackendCommandLane {
+    fn try_send(&self, description: impl Into<String>, argv: Vec<String>) -> Result<()> {
+        let description = description.into();
+        match self {
+            Self::Local(lane) => lane.try_send(description, argv),
+            Self::Remote(lane) => lane.try_send(description, argv),
+        }
+    }
+
+    fn try_send_session(&self, command: actor_runtime::SessionCommandEnvelope) -> Result<()> {
+        match self {
+            Self::Local(lane) => lane.try_send_session(command),
+            Self::Remote(lane) => lane.try_send_session(command),
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Local(lane) => lane.shutdown(),
+            Self::Remote(_) => Ok(()),
+        }
     }
 }
 
@@ -2698,6 +2852,7 @@ struct ImportedFrame {
 enum ImportedFrameSource {
     Dmabuf,
     SharedMemory(brood_ipc::SharedImageConsumer),
+    Network,
 }
 
 struct PluginPaneTexture {
@@ -2774,27 +2929,7 @@ fn flush_renderer_plugin_resize_events(
 }
 
 fn send_input(lane: &mut InputLane, message: ClientMessage) -> bool {
-    lane.flush_deferred();
-    lane.sequence = lane.sequence.wrapping_add(1);
-    let record = match brood_ipc::encode_client_record(message, lane.generation, lane.sequence) {
-        Ok(record) => record,
-        Err(error) => {
-            eprintln!("cannot encode local presentation input: {error}");
-            return false;
-        }
-    };
-    if lane.has_deferred() {
-        lane.defer(record);
-        return true;
-    }
-    if let Err(record) = lane.producer.try_send(record) {
-        lane.defer(record);
-        return true;
-    }
-    if let Err(error) = lane.notifications.notify() {
-        eprintln!("failed to notify presentation input consumer: {error}");
-    }
-    true
+    lane.send(message)
 }
 
 fn send_window_focus(lane: &mut InputLane, window_id: u64) {
@@ -3270,6 +3405,58 @@ impl ImportedFrame {
                     ImportedFrameSource::SharedMemory(frame.image),
                 )
             }
+            FrameResource::Network(frame) => {
+                if frame.color_space != brood_protocol::FrameColorSpace::Srgb {
+                    return Err(anyhow!(
+                        "unsupported network frame color space {:?}",
+                        frame.color_space
+                    ));
+                }
+                let (format, view_format) = match frame.pixel_format {
+                    brood_protocol::FramePixelFormat::Rgba8 => (
+                        wgpu::TextureFormat::Rgba8Unorm,
+                        wgpu::TextureFormat::Rgba8UnormSrgb,
+                    ),
+                    brood_protocol::FramePixelFormat::Bgra8 => (
+                        wgpu::TextureFormat::Bgra8Unorm,
+                        wgpu::TextureFormat::Bgra8UnormSrgb,
+                    ),
+                };
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("hosted network image"),
+                    size: wgpu::Extent3d {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[view_format],
+                });
+                write_packed_image(
+                    &texture,
+                    queue,
+                    frame.width,
+                    frame.height,
+                    frame.stride,
+                    &frame.pixels,
+                )?;
+                eprintln!(
+                    "uploaded network image window_id={window_id} resource_id={resource_id} \
+                     sequence={sequence} size={}x{} format={format:?} color_space={:?} stride={} \
+                     compressed_bytes={} decoded_bytes={}",
+                    frame.width,
+                    frame.height,
+                    frame.color_space,
+                    frame.stride,
+                    frame.compressed_bytes,
+                    frame.pixels.len()
+                );
+                (texture, view_format, ImportedFrameSource::Network)
+            }
         };
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("hosted frame sRGB view"),
@@ -3315,6 +3502,35 @@ fn write_shared_image(
     let pixels = image
         .pixels(sequence)
         .context("read published shared-memory frame")?;
+    write_packed_image(
+        texture,
+        queue,
+        metadata.width,
+        metadata.height,
+        metadata.stride,
+        pixels,
+    )
+}
+
+fn write_packed_image(
+    texture: &wgpu::Texture,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixels: &[u8],
+) -> Result<()> {
+    let expected = usize::try_from(
+        u64::from(stride)
+            .checked_mul(u64::from(height))
+            .context("packed image length overflow")?,
+    )
+    .context("packed image length exceeds address space")?;
+    anyhow::ensure!(
+        pixels.len() == expected,
+        "packed image length mismatch: expected {expected}, received {}",
+        pixels.len()
+    );
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -3325,12 +3541,12 @@ fn write_shared_image(
         pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(metadata.stride),
-            rows_per_image: Some(metadata.height),
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(height),
         },
         wgpu::Extent3d {
-            width: metadata.width,
-            height: metadata.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
     );

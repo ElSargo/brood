@@ -10,13 +10,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_cli::control::{
-    ControlTarget, handshake, open_presentation_fast_path, resolve_control_target,
-    shared_memory_resource,
+    ControlTarget, activate_surface_session, close_surface_session, create_surface_session,
+    handshake, open_presentation_fast_path, rename_surface_session, request_dbus_command,
+    resolve_control_target, shared_memory_resource,
 };
 use brood_protocol::{
-    ActorMessage, CatalogSession, CatalogSnapshot, CatalogWindow, ClientLifecycle, ClientMessage,
+    ActorMessage, BackendOperation, BackendRequest, BackendResponse, BackendResponseValue,
+    CatalogSession, CatalogSnapshot, CatalogWindow, ClientLifecycle, ClientMessage,
     EndpointCapabilities, FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane,
-    ServerMessage, WindowFrame,
+    ServerMessage, SessionOperation, WindowFrame,
 };
 use brood_transport::{
     NetworkFramePacket, NetworkSendLane, accept_network_connection, client_endpoint,
@@ -72,15 +74,23 @@ enum Command {
         client_certificate: PathBuf,
         #[arg(long)]
         client_private_key: PathBuf,
+        /// Optional XKB keycode whose focused-pane pixel effect must be observed.
+        #[arg(long)]
+        keycode: Option<u32>,
     },
 }
 
 #[derive(Clone)]
 struct Outbound {
-    critical: mpsc::UnboundedSender<ServerMessage>,
+    critical: mpsc::UnboundedSender<CriticalOutbound>,
     reliable: mpsc::UnboundedSender<ServerMessage>,
     latest: mpsc::UnboundedSender<ServerMessage>,
     frames: mpsc::UnboundedSender<NetworkFramePacket>,
+}
+
+enum CriticalOutbound {
+    Message(ServerMessage),
+    DisconnectAcknowledgement(oneshot::Sender<()>),
 }
 
 #[derive(Deserialize)]
@@ -135,6 +145,7 @@ async fn main() -> Result<()> {
             certificate,
             client_certificate,
             client_private_key,
+            keycode,
         } => {
             probe(
                 connect,
@@ -142,6 +153,7 @@ async fn main() -> Result<()> {
                 &certificate,
                 &client_certificate,
                 &client_private_key,
+                keycode,
             )
             .await
         }
@@ -221,7 +233,7 @@ async fn relay(
     let (latest_tx, latest_rx) = mpsc::unbounded_channel();
     let (frame_tx, frame_rx) = mpsc::unbounded_channel();
     let outbound = Outbound {
-        critical: critical_tx,
+        critical: critical_tx.clone(),
         reliable: reliable_tx,
         latest: latest_tx,
         frames: frame_tx,
@@ -234,7 +246,7 @@ async fn relay(
         outbound.clone(),
     )?;
     spawn_frame_forwarder(
-        target,
+        target.clone(),
         &fast_path.frame_fd,
         fast_path.frame_notify_fd,
         fast_path.generation,
@@ -244,7 +256,7 @@ async fn relay(
         &fast_path.presentation_message_fd,
         fast_path.presentation_message_notify_fd,
         fast_path.generation,
-        outbound,
+        outbound.clone(),
     )?;
 
     let input = brood_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
@@ -275,13 +287,14 @@ async fn relay(
     let (latest_send, latest_receive) = network.take_lane(Lane::LatestState)?.split();
     let (frame_send, _frame_receive) = network.take_lane(Lane::FrameResource)?.split();
 
-    tokio::spawn(send_server_messages(critical_send, critical_rx));
+    tokio::spawn(send_critical_messages(critical_send, critical_rx));
     tokio::spawn(send_server_messages(reliable_send, reliable_rx));
     tokio::spawn(send_server_messages(latest_send, latest_rx));
     tokio::spawn(send_network_frames(frame_send, frame_rx));
 
     let (disconnect_tx, disconnect_rx) = oneshot::channel();
     let critical_input_tx = local_input_tx.clone();
+    let disconnect_critical_tx = critical_tx;
     tokio::spawn(async move {
         loop {
             let message = critical_receive.receive_client_message().await?;
@@ -290,13 +303,26 @@ async fn relay(
                 .send(message)
                 .map_err(|_error| anyhow!("local input writer stopped"))?;
             if disconnect {
+                critical_receive.wait_for_finish().await?;
+                let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
+                disconnect_critical_tx
+                    .send(CriticalOutbound::DisconnectAcknowledgement(acknowledged_tx))
+                    .map_err(|_error| anyhow!("critical network sender stopped"))?;
+                acknowledged_rx
+                    .await
+                    .context("critical network sender dropped the disconnect acknowledgement")?;
                 let _send_result = disconnect_tx.send(());
                 return Ok::<(), anyhow::Error>(());
             }
         }
     });
     tokio::spawn(receive_latest_input(latest_receive, local_input_tx));
-    tokio::spawn(receive_reliable_input(reliable_receive, local_actor_tx));
+    tokio::spawn(receive_reliable_input(
+        reliable_receive,
+        local_actor_tx,
+        target,
+        outbound,
+    ));
 
     disconnect_rx
         .await
@@ -319,16 +345,88 @@ async fn receive_latest_input(
 async fn receive_reliable_input(
     mut lane: brood_transport::NetworkReceiveLane,
     sender: mpsc::UnboundedSender<ActorMessage>,
+    target: ControlTarget,
+    outbound: Outbound,
 ) -> Result<()> {
     loop {
         match lane.receive_client_message().await? {
             ClientMessage::Actor(message) => sender
                 .send(message)
                 .map_err(|_error| anyhow!("local actor writer stopped"))?,
+            ClientMessage::BackendRequest(request) => {
+                let request_target = target.clone();
+                let response = tokio::task::spawn_blocking(move || {
+                    execute_backend_request(&request_target, request)
+                })
+                .await
+                .context("join remote backend request")?;
+                outbound
+                    .reliable
+                    .send(ServerMessage::BackendResponse(response))
+                    .map_err(|_error| anyhow!("remote reliable sender stopped"))?;
+            }
             ClientMessage::ReleaseResource { .. } => {}
             ClientMessage::Input(_) | ClientMessage::Lifecycle(_) => {
                 bail!("critical client message reached the reliable lane");
             }
+        }
+    }
+}
+
+fn execute_backend_request(target: &ControlTarget, request: BackendRequest) -> BackendResponse {
+    let result = match request.operation {
+        BackendOperation::Control { argv } => request_dbus_command(target, &argv, false)
+            .map(BackendResponseValue::Control)
+            .map_err(|error| format!("{error:#}")),
+        BackendOperation::Session {
+            operation,
+            session,
+            name,
+        } => execute_session_operation(target, operation, session, name)
+            .map(BackendResponseValue::Session)
+            .map_err(|error| format!("{error:#}")),
+    };
+    BackendResponse {
+        id: request.id,
+        result,
+    }
+}
+
+fn execute_session_operation(
+    target: &ControlTarget,
+    operation: SessionOperation,
+    session: Option<u64>,
+    name: Option<String>,
+) -> Result<Option<u64>> {
+    match operation {
+        SessionOperation::Refresh => Ok(None),
+        SessionOperation::Activate => {
+            let session = session.context("activate request is missing a session ID")?;
+            ensure!(
+                activate_surface_session(target, session)?,
+                "session {session} is unavailable"
+            );
+            Ok(Some(session))
+        }
+        SessionOperation::Create => {
+            create_surface_session(target, name.unwrap_or_default()).map(Some)
+        }
+        SessionOperation::Rename => {
+            let session = session.context("rename request is missing a session ID")?;
+            let name = name.context("rename request is missing a name")?;
+            ensure!(
+                rename_surface_session(target, session, name)?,
+                "session {session} was not renamed"
+            );
+            Ok(Some(session))
+        }
+        SessionOperation::Close => {
+            let session = session.context("close request is missing a session ID")?;
+            ensure!(
+                close_surface_session(target, session)?,
+                "session {session} was not closed"
+            );
+            Ok(Some(session))
         }
     }
 }
@@ -339,6 +437,27 @@ async fn send_server_messages(
 ) -> Result<()> {
     while let Some(message) = receiver.recv().await {
         lane.send_server_message(&message).await?;
+    }
+    Ok(())
+}
+
+async fn send_critical_messages(
+    mut lane: NetworkSendLane,
+    mut receiver: mpsc::UnboundedReceiver<CriticalOutbound>,
+) -> Result<()> {
+    while let Some(command) = receiver.recv().await {
+        match command {
+            CriticalOutbound::Message(message) => {
+                lane.send_server_message(&message).await?;
+            }
+            CriticalOutbound::DisconnectAcknowledgement(completion) => {
+                lane.send_server_message(&ServerMessage::DisconnectAcknowledged)
+                    .await?;
+                lane.finish().await?;
+                let _send_result = completion.send(());
+                return Ok(());
+            }
+        }
     }
     Ok(())
 }
@@ -606,7 +725,11 @@ fn spawn_frame_forwarder(
                             } else {
                                 ServerMessage::ClosePresentation
                             };
-                            if outbound.critical.send(message).is_err() {
+                            if outbound
+                                .critical
+                                .send(CriticalOutbound::Message(message))
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -664,6 +787,7 @@ async fn probe(
     certificate: &Path,
     client_certificate: &Path,
     client_private_key: &Path,
+    keycode: Option<u32>,
 ) -> Result<()> {
     let endpoint = client_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
@@ -681,8 +805,8 @@ async fn probe(
         EndpointCapabilities::remote(),
     )
     .await?;
-    let (mut critical_send, _critical_receive) = network.take_lane(Lane::Critical)?.split();
-    let (_reliable_send, mut reliable_receive) = network.take_lane(Lane::Reliable)?.split();
+    let (mut critical_send, mut critical_receive) = network.take_lane(Lane::Critical)?.split();
+    let (mut reliable_send, mut reliable_receive) = network.take_lane(Lane::Reliable)?.split();
     let (_latest_send, mut latest_receive) = network.take_lane(Lane::LatestState)?.split();
     let (_frame_send, mut frame_receive) = network.take_lane(Lane::FrameResource)?.split();
 
@@ -699,6 +823,33 @@ async fn probe(
             break catalog;
         }
     };
+    reliable_send
+        .send_client_message(&ClientMessage::BackendRequest(BackendRequest {
+            id: 1,
+            operation: BackendOperation::Control {
+                argv: vec!["status".to_string()],
+            },
+        }))
+        .await?;
+    let backend_response = loop {
+        if let ServerMessage::BackendResponse(response) =
+            reliable_receive.receive_server_message().await?
+            && response.id == 1
+        {
+            break response;
+        }
+    };
+    let backend_status = match backend_response.result {
+        Ok(BackendResponseValue::Control(response)) => response,
+        Ok(BackendResponseValue::Session(_)) => {
+            bail!("remote status request returned a session response")
+        }
+        Err(error) => bail!("remote status request failed: {error}"),
+    };
+    ensure!(
+        !backend_status.trim().is_empty(),
+        "remote status response was empty"
+    );
     let (scene, packets) = loop {
         let ServerMessage::Scene(scene) = latest_receive.receive_server_message().await? else {
             continue;
@@ -726,21 +877,102 @@ async fn probe(
         break (scene, packets);
     };
     acknowledge_frame(&mut critical_send, scene.sequence).await?;
+    let (input_scene, input_frame_packets) = if let Some(keycode) = keycode {
+        let pane = scene
+            .windows
+            .first()
+            .context("non-empty scene lost its first pane")?
+            .pane;
+        let original_pixels = packets
+            .iter()
+            .find(|packet| packet.pane == pane)
+            .context("initial scene did not include its focused pane")?
+            .pixels()?;
+        critical_send
+            .send_client_message(&ClientMessage::Input(InputEvent::WindowFocus { pane }))
+            .await?;
+        for pressed in [true, false] {
+            critical_send
+                .send_client_message(&ClientMessage::Input(InputEvent::KeyboardKey {
+                    keycode,
+                    pressed,
+                }))
+                .await?;
+        }
+        let mut unchanged_scenes = 0_u8;
+        let (input_scene, input_packets) = loop {
+            let ServerMessage::Scene(next_scene) = latest_receive.receive_server_message().await?
+            else {
+                continue;
+            };
+            if next_scene.sequence <= scene.sequence || next_scene.windows.is_empty() {
+                acknowledge_frame(&mut critical_send, next_scene.sequence).await?;
+                continue;
+            }
+            let expected = next_scene
+                .windows
+                .iter()
+                .map(|window| window.resource.id())
+                .collect::<HashSet<_>>();
+            let mut next_packets = Vec::with_capacity(expected.len());
+            while next_packets.len() < expected.len() {
+                let packet = frame_receive.receive_frame().await?;
+                if packet.sequence == next_scene.sequence && expected.contains(&packet.resource) {
+                    ensure!(
+                        !packet.pixels()?.is_empty(),
+                        "input response frame decompressed empty"
+                    );
+                    next_packets.push(packet);
+                }
+            }
+            let changed = next_packets
+                .iter()
+                .find(|packet| packet.pane == pane)
+                .context("input response scene did not include the focused pane")?
+                .pixels()?
+                != original_pixels;
+            if !changed {
+                unchanged_scenes = unchanged_scenes.saturating_add(1);
+                ensure!(
+                    unchanged_scenes <= 8,
+                    "remote key transition did not change the focused pane"
+                );
+                acknowledge_frame(&mut critical_send, next_scene.sequence).await?;
+                continue;
+            }
+            break (next_scene, next_packets);
+        };
+        acknowledge_frame(&mut critical_send, input_scene.sequence).await?;
+        (input_scene.sequence, input_packets.len())
+    } else {
+        (scene.sequence, 0)
+    };
     critical_send
         .send_client_message(&ClientMessage::Lifecycle(ClientLifecycle::Disconnect))
         .await?;
+    critical_send.finish().await?;
+    ensure!(
+        critical_receive.receive_server_message().await? == ServerMessage::DisconnectAcknowledged,
+        "remote relay did not acknowledge disconnect"
+    );
+    critical_receive.wait_for_finish().await?;
     println!(
-        "OK remote transport generation={} catalog_revision={} sessions={} windows={} scene={} frame_packets={} compressed_bytes={}",
+        "OK remote transport generation={} catalog_revision={} sessions={} windows={} scene={} \
+         input_scene={} frame_packets={} input_frame_packets={} compressed_bytes={} \
+         backend_status_bytes={}",
         network.connection_generation,
         catalog.revision,
         catalog.sessions.len(),
         catalog.windows.len(),
         scene.sequence,
+        input_scene,
         packets.len(),
+        input_frame_packets,
         packets
             .iter()
             .map(|packet| packet.compressed_pixels.len())
-            .sum::<usize>()
+            .sum::<usize>(),
+        backend_status.len()
     );
     Ok(())
 }

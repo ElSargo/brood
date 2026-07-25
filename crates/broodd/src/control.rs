@@ -2934,7 +2934,9 @@ fn drain_fast_path_input(state: &mut Brood) {
                     request_redraw = true;
                 }
             }
-            ClientMessage::Actor(_) | ClientMessage::ReleaseResource { .. } => {
+            ClientMessage::Actor(_)
+            | ClientMessage::BackendRequest(_)
+            | ClientMessage::ReleaseResource { .. } => {
                 warn!("message reached the wrong local presentation lane");
             }
         }

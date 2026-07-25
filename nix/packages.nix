@@ -117,8 +117,8 @@ let
   brooddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
     // {
-      cargoBuildExtraArgs = "-p broodd -p brood-client --bins";
-      cargoCheckExtraArgs = "-p broodd -p brood-client --all-targets";
+      cargoBuildExtraArgs = "-p broodd -p brood-client -p brood-remote --bins";
+      cargoCheckExtraArgs = "-p broodd -p brood-client -p brood-remote --all-targets";
     }
   );
 
@@ -126,7 +126,7 @@ let
     craneBaseArgs
     // {
       cargoArtifacts = brooddArtifacts;
-      cargoBuildExtraArgs = "-p broodd -p brood-client --bins";
+      cargoBuildExtraArgs = "-p broodd -p brood-client -p brood-remote --bins";
       doCheck = false;
     }
   );

@@ -96,7 +96,9 @@ Each endpoint validates the other's configured certificate. Each semantic lane
 owns an independently ordered stream pair, so transport-level head-of-line
 blocking is contained to that lane. A handshake exchanges capabilities,
 selects the remote profile, and assigns the server's connection generation
-before ordinary traffic begins.
+before ordinary traffic begins. Transport keepalives preserve an otherwise
+idle static desktop. Stream readers remain owned by dedicated receive tasks so
+selecting between lanes cannot cancel a partial framed read.
 
 Network peers exchange semantic messages with length-delimited bounded
 encoding. The baseline frame-resource packet is a losslessly compressed full
@@ -109,7 +111,11 @@ presentation model.
 A relay may adapt a local session-server connection into the network carrier.
 The relay is a transport endpoint: it neither computes layout nor hosts
 presentation actors. The native remote client remains responsible for actors,
-input policy, final composition, and acknowledgements.
+input policy, final composition, and acknowledgements. Catalog and actor
+traffic retain their normal reliable ordering. Client backend and session
+operations use correlated request/response messages on that same reliable
+lane, so a remote presentation never reaches back to the server's local DBus
+address.
 
 ## Frame And Scene Lifecycle
 
@@ -119,17 +125,23 @@ path. A client may receive either first and joins them by generation, resource,
 and sequence.
 
 The client acknowledges presentation or explicitly releases superseded
-resources. Disconnect revokes all connection-owned resources. Producers retain
-the latest window content independently so a replacement client can build a
-fresh snapshot without preserving old transport handles.
+resources. Disconnect uses a bounded critical-lane handshake: the client sends
+its disconnect request and finishes that stream, the server drains it before
+acknowledging and finishing the return stream, and the client drains the
+acknowledgement before closing the connection. Completion revokes all
+connection-owned resources. Producers retain the latest window content
+independently so a replacement client can build a fresh snapshot without
+preserving old transport handles.
 
 ## Selection And Diagnostics
 
-Automatic local selection offers DMA-BUF followed by shared memory. An
+The native client selects the network carrier when configured with a remote
+endpoint and mutual-TLS identity; otherwise it performs normal local discovery
+and negotiation. Automatic local selection offers DMA-BUF followed by shared memory. An
 operator-forced local frame transport narrows that capability offer and makes
 unsupported selection fail visibly. Exact client arguments are defined by
-`FrameTransportArg` in `crates/brood-cli/src/cli.rs`; remote relay and probe
-arguments are defined in `crates/brood-remote/src/main.rs`.
+`ClientArgs` and `FrameTransportArg` in `crates/brood-cli/src/cli.rs`; remote
+relay and probe arguments are defined in `crates/brood-remote/src/main.rs`.
 
 Both endpoints report the selected carrier, frame transport, protocol version,
 connection generation, resource IDs, frame sequences, byte counts, drops,
