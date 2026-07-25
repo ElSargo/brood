@@ -255,6 +255,10 @@ to persistent raster workers, and returns without rasterizing the complete text
 surface. Raster workers retain their glyph caches across layouts. A submitted
 draw packet may therefore depend on pending glyphs; the client captures it and
 publishes the replacement scene only after all of those dependencies are ready.
+Ready glyph images are packed into renderer-wide, incrementally allocated GPU
+atlas pages with transparent padding. Text lowering emits atlas UVs, and
+adjacent glyphs on the same page and compatible blend state are coalesced into
+one indexed GPU draw.
 
 An SDK may expose a convenient `draw_text(...)` function, but that function
 creates or retrieves a cached host text layout and emits `draw-text-layout`.
