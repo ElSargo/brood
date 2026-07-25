@@ -268,9 +268,10 @@ Measurement and rendering therefore always use the same native layout result.
 selects the platform monospace family, disables discretionary shaping features
 that would destabilize a cell advance, and reports a stable `cell_width` and
 `line_height` measured by the same layout engine used for drawing. Style
-includes at least normal and bold weight plus foreground color. A terminal can
-therefore group adjacent cells into styled text runs while keeping its grid,
-parser, cursor, and cell model in guest code.
+includes normal and bold weight, normal and italic face, alpha, and foreground
+color. Decorations such as underline and strike remain ordinary guest canvas
+geometry. A terminal can therefore group adjacent cells into styled text runs
+while keeping its grid, parser, cursor, and cell model in guest code.
 
 Text calls are local to the presentation client and bounded by explicit string,
 line, and layout limits. The client may cache native layouts internally, but the

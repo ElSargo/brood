@@ -8,13 +8,13 @@ use std::{
     sync::Mutex,
 };
 
+use brood::plugin::host;
+use brood_graphics::{Color, Command, Packet, Rect};
 use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
     LocalActorMessage, PresentationActorMessage, PresentationEvent, SessionActorMessage,
     WorkerEvent, WorkerRequest,
 };
-use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
 use serde::{Deserialize, Serialize};
 
 const COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
@@ -1199,6 +1199,7 @@ fn draw_text(
             host::TextLayoutOptions {
                 font_intent: host::FontIntent::Ui,
                 font_weight: host::FontWeight::Normal,
+                font_style: host::FontStyle::Normal,
                 font_size: size,
                 max_width: width,
                 line_height: size * 1.35,

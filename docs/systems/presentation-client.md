@@ -183,6 +183,12 @@ Physical input is client-owned. Reserved recovery behavior runs first, followed
 by the current synchronous key policy, temporary input capture, and focused
 pane delivery.
 
+Before focused-pane delivery, the client normalizes named keys and modifiers
+into the stable plugin event contract. Ctrl, Alt, Shift, and Super use bits 1,
+2, 4, and 8 respectively; this is deliberately the same modifier convention as
+the actor key-policy ABI. Printable text remains a separate committed-text
+event.
+
 The policy returns a bounded decision and ordinary mailbox-message batch.
 Long-running or stateful work continues in actors. A managed target crosses the
 protocol only after client hit testing, with a pane identity and pane-local
@@ -206,6 +212,8 @@ The first-party terminal deliberately splits across that boundary. Its session
 actor owns the PTY and terminal state; its presentation actor owns input routing
 and rendering. Neither side gains compositor, platform-window, or WGPU
 internals.
+
+See [[terminal-plugin]].
 
 ### Current ownership limit
 

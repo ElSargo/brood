@@ -95,6 +95,11 @@ The client converts platform events into a stable pane-local event model and
 owns focus between panes and client chrome. Inside the pane, the SDK decides
 which component is hovered, pressed, focused, scrolled, or edited.
 
+Keyboard events use stable semantic names for navigation, editing, and function
+keys. Modifier bits are Ctrl=1, Alt=2, Shift=4, and Super=8 across key and
+pointer events. Printable insertion uses text events; a plugin must not derive
+locale-dependent text from the physical scancode.
+
 The client bridges platform text and IME input but does not own the plugin's
 editor or text-field state. The SDK combines those events with native text
 measurement and hit-testing services from [[plugin-graphics]] to implement
@@ -163,6 +168,7 @@ Related:
 - [[presentation-client]]
 - [[plugin-runtime]]
 - [[input-shortcuts]]
+- [[terminal-plugin]]
 - [[layout-actor]]
 - [[../concepts/pane]]
 - [[../experiments/session-switcher-ui]]

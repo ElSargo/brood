@@ -2532,15 +2532,29 @@ fn plugin_logical_key(key: &Key) -> String {
             NamedKey::Enter => "Enter",
             NamedKey::Escape => "Escape",
             NamedKey::Backspace => "Backspace",
+            NamedKey::Tab => "Tab",
+            NamedKey::Home => "Home",
+            NamedKey::End => "End",
+            NamedKey::PageUp => "PageUp",
+            NamedKey::PageDown => "PageDown",
+            NamedKey::Insert => "Insert",
             NamedKey::Delete => "Delete",
             NamedKey::ArrowUp => "ArrowUp",
             NamedKey::ArrowDown => "ArrowDown",
             NamedKey::ArrowLeft => "ArrowLeft",
             NamedKey::ArrowRight => "ArrowRight",
+            NamedKey::F1 => "F1",
             NamedKey::F2 => "F2",
+            NamedKey::F3 => "F3",
+            NamedKey::F4 => "F4",
+            NamedKey::F5 => "F5",
             NamedKey::F6 => "F6",
             NamedKey::F7 => "F7",
-            NamedKey::Tab => "Tab",
+            NamedKey::F8 => "F8",
+            NamedKey::F9 => "F9",
+            NamedKey::F10 => "F10",
+            NamedKey::F11 => "F11",
+            NamedKey::F12 => "F12",
             _ => "",
         }
         .to_string(),
@@ -3136,9 +3150,9 @@ const fn linux_button_code(button: MouseButton) -> Option<u32> {
 }
 
 fn modifier_bits(modifiers: ModifiersState) -> u32 {
-    u32::from(modifiers.shift_key())
-        | (u32::from(modifiers.control_key()) << 1)
-        | (u32::from(modifiers.alt_key()) << 2)
+    u32::from(modifiers.control_key())
+        | (u32::from(modifiers.alt_key()) << 1)
+        | (u32::from(modifiers.shift_key()) << 2)
         | (u32::from(modifiers.super_key()) << 3)
 }
 

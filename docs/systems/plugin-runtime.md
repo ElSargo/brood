@@ -369,14 +369,17 @@ Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
 memory. Their export names and Store layout are not the durable plugin ABI.
 
 The bundled `terminal-session` and `terminal-ui` Components are the real
-terminal vertical-slice proof. The session guest launches an allowlisted shell
+terminal product proof. The session guest launches an allowlisted shell
 in a PTY, parses escape sequences with a guest terminal parser, retains grid and
 scrollback state, and publishes coalesced revisions. The presentation guest
-accepts real pane key/text and resize events, renders styled native text runs
-through canvas packets, and can be destroyed and recreated without terminating
-the session-owned shell. The nested proof records shell, ANSI/Unicode, Helix,
-repeated resize, streaming-output, child-exit, resource-pressure, mailbox,
-packet, text-churn, key-to-present, teardown, and screenshot evidence.
+accepts real pane key, text, pointer-scroll, and resize events; negotiates
+application-cursor input; navigates scrollback; renders styled native text runs
+through canvas packets; and can be destroyed and recreated without terminating
+the session-owned shell. The nested proof records shell, ANSI/Unicode, exact
+key bytes, Helix, repeated alternate-screen resize, scrollback, streaming
+output, child exit, resource pressure, mailbox, packet, text churn,
+key-to-present, teardown, and screenshot evidence. The complete product
+boundary and remaining reusable gaps are in [[terminal-plugin]].
 
 `plugins/component-runtime-io` and the runtime-I/O worker in
 `plugins/workspace-file-log` exercise the same bounded stream and pollable
@@ -429,5 +432,6 @@ Related:
 - [[input-shortcuts]]
 - [[layout-actor]]
 - [[plugin-ui]]
+- [[terminal-plugin]]
 - [[plugin-graphics]]
 - [[plugin-advanced-graphics]]

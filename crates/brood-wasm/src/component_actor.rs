@@ -43,7 +43,7 @@ use crate::filesystem_watch::{
 use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::presentation::{
-    FontIntent, FontWeight, PresentationError, PresentationEvent, PresentationHost,
+    FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent, PresentationHost,
     SessionCommandRequest, SessionEvent, SessionOperation, TextLayoutOptions,
 };
 use crate::resource_limits::{
@@ -553,6 +553,10 @@ impl bindings::brood::plugin::host::Host for ActorStore {
                         font_weight: match options.font_weight {
                             bindings::brood::plugin::host::FontWeight::Normal => FontWeight::Normal,
                             bindings::brood::plugin::host::FontWeight::Bold => FontWeight::Bold,
+                        },
+                        font_style: match options.font_style {
+                            bindings::brood::plugin::host::FontStyle::Normal => FontStyle::Normal,
+                            bindings::brood::plugin::host::FontStyle::Italic => FontStyle::Italic,
                         },
                         font_size: options.font_size,
                         max_width: options.max_width,

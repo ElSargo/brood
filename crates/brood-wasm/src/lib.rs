@@ -94,7 +94,7 @@ pub use policy_provider::{
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
 pub use presentation::{
-    FontIntent, FontWeight, PresentationError, PresentationEvent, PresentationHost,
+    FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent, PresentationHost,
     SessionCommandCompletion, SessionCommandRequest, SessionEvent, SessionOperation,
     SessionSnapshot, SessionSummary, TextLayoutOptions, TextLayoutResult,
 };

@@ -84,9 +84,15 @@ interface host {
         bold,
     }
 
+    enum font-style {
+        normal,
+        italic,
+    }
+
     record text-layout-options {
         font-intent: font-intent,
         font-weight: font-weight,
+        font-style: font-style,
         font-size: f32,
         max-width: f32,
         line-height: f32,
@@ -444,6 +450,7 @@ interface actor {
         y: f32,
         button: u32,
         pressed: bool,
+        /// Ctrl=1, Alt=2, Shift=4, and Super=8.
         modifiers: u32,
     }
     record pointer-scroll {
@@ -452,6 +459,7 @@ interface actor {
         y: f32,
         horizontal: f32,
         vertical: f32,
+        /// Ctrl=1, Alt=2, Shift=4, and Super=8.
         modifiers: u32,
     }
     record key-event {
@@ -464,6 +472,7 @@ interface actor {
         logical-key: string,
         pressed: bool,
         repeat: bool,
+        /// Ctrl=1, Alt=2, Shift=4, and Super=8.
         modifiers: u32,
     }
     record text-event { pane: u64, text: string }

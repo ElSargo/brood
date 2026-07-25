@@ -40,6 +40,7 @@ struct SessionState {
     terminal: Option<u64>,
     pending_input: VecDeque<u8>,
     screen: Screen,
+    viewport_offset: usize,
     revision: u64,
     chunks_read: u64,
     bytes_read: u64,
@@ -63,6 +64,7 @@ impl SessionState {
             terminal: None,
             pending_input: VecDeque::new(),
             screen: Screen::new(INITIAL_ROWS, INITIAL_COLS),
+            viewport_offset: 0,
             revision: 1,
             chunks_read: 0,
             bytes_read: 0,
@@ -215,6 +217,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             state.snapshot_commands()
         }
         Some(b'I') if sender.starts_with("presentation:") => {
+            state.viewport_offset = 0;
             state.queue_input(body.get(1..).unwrap_or_default());
             state.flush_input();
             Vec::new()
@@ -232,6 +235,16 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
                 state.error = Some(format!("PTY resize failed: {error:?}"));
             }
             state.resizes = state.resizes.saturating_add(1);
+            state.mark_changed();
+            state.snapshot_commands()
+        }
+        Some(b'V') if sender.starts_with("presentation:") && body.len() == 5 => {
+            let requested = u32::from_le_bytes([body[1], body[2], body[3], body[4]]) as usize;
+            let viewport_offset = requested.min(state.screen.max_viewport_offset());
+            if state.viewport_offset == viewport_offset {
+                return Vec::new();
+            }
+            state.viewport_offset = viewport_offset;
             state.mark_changed();
             state.snapshot_commands()
         }
@@ -379,7 +392,19 @@ fn consume_terminal_bytes(parser: &mut Parser, bytes: &[u8]) -> Result<(), Strin
     let state = guard
         .as_mut()
         .ok_or_else(|| "terminal state is unavailable".to_string())?;
+    let previous_scrollback = state.screen.scrollback.len();
     parser.advance(&mut state.screen, bytes);
+    if state.viewport_offset > 0 {
+        let added = state
+            .screen
+            .scrollback
+            .len()
+            .saturating_sub(previous_scrollback);
+        state.viewport_offset = state
+            .viewport_offset
+            .saturating_add(added)
+            .min(state.screen.max_viewport_offset());
+    }
     state.chunks_read = state.chunks_read.saturating_add(1);
     state.bytes_read = state.bytes_read.saturating_add(bytes.len() as u64);
     Ok(())
@@ -457,6 +482,10 @@ struct Style {
     fg: u32,
     bg: u32,
     bold: bool,
+    faint: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
     inverse: bool,
 }
 
@@ -466,6 +495,10 @@ impl Default for Style {
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
             bold: false,
+            faint: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
             inverse: false,
         }
     }
@@ -501,6 +534,11 @@ struct Screen {
     scroll_bottom: u16,
     style: Style,
     cursor_visible: bool,
+    insert_mode: bool,
+    origin_mode: bool,
+    auto_wrap: bool,
+    application_cursor: bool,
+    bracketed_paste: bool,
     responses: Vec<u8>,
 }
 
@@ -519,6 +557,11 @@ impl Screen {
             scroll_bottom: rows.saturating_sub(1),
             style: Style::default(),
             cursor_visible: true,
+            insert_mode: false,
+            origin_mode: false,
+            auto_wrap: true,
+            application_cursor: false,
+            bracketed_paste: false,
             responses: Vec::new(),
         }
     }
@@ -528,14 +571,11 @@ impl Screen {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        let mut next = vec![Cell::blank(Style::default()); usize::from(rows) * usize::from(cols)];
-        let copy_rows = rows.min(self.rows);
-        let copy_cols = cols.min(self.cols);
-        for row in 0..copy_rows {
-            for col in 0..copy_cols {
-                next[usize::from(row) * usize::from(cols) + usize::from(col)] =
-                    self.cells[self.index(row, col)].clone();
-            }
+        let old_rows = self.rows;
+        let old_cols = self.cols;
+        let next = resize_cells(&self.cells, old_rows, old_cols, rows, cols);
+        if let Some((main, _, _)) = self.alternate.as_mut() {
+            *main = resize_cells(main, old_rows, old_cols, rows, cols);
         }
         self.rows = rows;
         self.cols = cols;
@@ -544,6 +584,129 @@ impl Screen {
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
+    }
+
+    fn max_viewport_offset(&self) -> usize {
+        if self.alternate.is_some() {
+            0
+        } else {
+            self.scrollback.len()
+        }
+    }
+
+    fn visible_row(&self, viewport_offset: usize, row: u16) -> &[Cell] {
+        let viewport_offset = viewport_offset.min(self.max_viewport_offset());
+        let history_start = self.scrollback.len().saturating_sub(viewport_offset);
+        let absolute_row = history_start.saturating_add(usize::from(row));
+        if absolute_row < self.scrollback.len() {
+            return &self.scrollback[absolute_row];
+        }
+        let live_row = absolute_row.saturating_sub(self.scrollback.len());
+        let width = usize::from(self.cols);
+        let start = live_row.min(usize::from(self.rows.saturating_sub(1))) * width;
+        &self.cells[start..start + width]
+    }
+
+    fn cursor_row_bounds(&self) -> (u16, u16) {
+        if self.origin_mode {
+            (self.scroll_top, self.scroll_bottom)
+        } else {
+            (0, self.rows.saturating_sub(1))
+        }
+    }
+
+    fn home_cursor(&mut self) {
+        self.cursor_row = if self.origin_mode { self.scroll_top } else { 0 };
+        self.cursor_col = 0;
+    }
+
+    fn normalize_row(&mut self, row: u16) {
+        for col in 0..self.cols {
+            let index = self.index(row, col);
+            let valid = col > 0 && {
+                let previous = &self.cells[self.index(row, col - 1)];
+                !previous.continuation
+                    && previous
+                        .text
+                        .chars()
+                        .map(|character| UnicodeWidthChar::width(character).unwrap_or(1))
+                        .sum::<usize>()
+                        == 2
+            };
+            if self.cells[index].continuation && !valid {
+                self.cells[index] = Cell::blank(self.style);
+            }
+        }
+    }
+
+    fn insert_blank_chars(&mut self, count: u16) {
+        let count = count.max(1).min(self.cols.saturating_sub(self.cursor_col));
+        let row_start = self.index(self.cursor_row, 0);
+        let start = row_start + usize::from(self.cursor_col);
+        let end = row_start + usize::from(self.cols);
+        let count = usize::from(count);
+        for index in (start + count..end).rev() {
+            self.cells[index] = self.cells[index - count].clone();
+        }
+        for cell in &mut self.cells[start..start + count] {
+            *cell = Cell::blank(self.style);
+        }
+        self.normalize_row(self.cursor_row);
+    }
+
+    fn delete_chars(&mut self, count: u16) {
+        let count = count.max(1).min(self.cols.saturating_sub(self.cursor_col));
+        let row_start = self.index(self.cursor_row, 0);
+        let start = row_start + usize::from(self.cursor_col);
+        let end = row_start + usize::from(self.cols);
+        let count = usize::from(count);
+        for index in start..end - count {
+            self.cells[index] = self.cells[index + count].clone();
+        }
+        for cell in &mut self.cells[end - count..end] {
+            *cell = Cell::blank(self.style);
+        }
+        self.normalize_row(self.cursor_row);
+    }
+
+    fn erase_chars(&mut self, count: u16) {
+        let end = self.cursor_col.saturating_add(count.max(1)).min(self.cols);
+        self.clear_row(self.cursor_row, self.cursor_col, end);
+        self.normalize_row(self.cursor_row);
+    }
+
+    fn insert_lines(&mut self, count: u16) {
+        if !(self.scroll_top..=self.scroll_bottom).contains(&self.cursor_row) {
+            return;
+        }
+        let width = usize::from(self.cols);
+        let start = usize::from(self.cursor_row) * width;
+        let end = (usize::from(self.scroll_bottom) + 1) * width;
+        let lines = usize::from(count.max(1).min(self.scroll_bottom - self.cursor_row + 1));
+        let shift = lines * width;
+        for index in (start + shift..end).rev() {
+            self.cells[index] = self.cells[index - shift].clone();
+        }
+        for cell in &mut self.cells[start..start + shift] {
+            *cell = Cell::blank(self.style);
+        }
+    }
+
+    fn delete_lines(&mut self, count: u16) {
+        if !(self.scroll_top..=self.scroll_bottom).contains(&self.cursor_row) {
+            return;
+        }
+        let width = usize::from(self.cols);
+        let start = usize::from(self.cursor_row) * width;
+        let end = (usize::from(self.scroll_bottom) + 1) * width;
+        let lines = usize::from(count.max(1).min(self.scroll_bottom - self.cursor_row + 1));
+        let shift = lines * width;
+        for index in start..end - shift {
+            self.cells[index] = self.cells[index + shift].clone();
+        }
+        for cell in &mut self.cells[end - shift..end] {
+            *cell = Cell::blank(self.style);
+        }
     }
 
     fn clear_row(&mut self, row: u16, start: u16, end: u16) {
@@ -624,8 +787,15 @@ impl Screen {
             return;
         }
         if self.cursor_col >= self.cols || (width == 2 && self.cursor_col + 1 >= self.cols) {
-            self.cursor_col = 0;
-            self.newline();
+            if self.auto_wrap {
+                self.cursor_col = 0;
+                self.newline();
+            } else {
+                self.cursor_col = self.cols.saturating_sub(width as u16);
+            }
+        }
+        if self.insert_mode {
+            self.insert_blank_chars(width as u16);
         }
         let index = self.index(self.cursor_row, self.cursor_col);
         self.cells[index] = Cell {
@@ -655,6 +825,8 @@ impl Screen {
         self.alternate = Some((main, self.cursor_row, self.cursor_col));
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
     fn leave_alternate(&mut self) {
@@ -662,6 +834,8 @@ impl Screen {
             self.cells = main;
             self.cursor_row = row.min(self.rows.saturating_sub(1));
             self.cursor_col = col.min(self.cols.saturating_sub(1));
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows.saturating_sub(1);
         }
     }
 
@@ -690,9 +864,19 @@ impl Screen {
             match values[index] {
                 0 => self.style = Style::default(),
                 1 => self.style.bold = true,
-                22 => self.style.bold = false,
+                2 => self.style.faint = true,
+                3 => self.style.italic = true,
+                4 | 21 => self.style.underline = true,
                 7 => self.style.inverse = true,
+                9 => self.style.strikethrough = true,
+                22 => {
+                    self.style.bold = false;
+                    self.style.faint = false;
+                }
+                23 => self.style.italic = false,
+                24 => self.style.underline = false,
                 27 => self.style.inverse = false,
+                29 => self.style.strikethrough = false,
                 30..=37 => self.style.fg = ansi_color(values[index] - 30, false),
                 39 => self.style.fg = DEFAULT_FG,
                 40..=47 => self.style.bg = ansi_color(values[index] - 40, false),
@@ -734,6 +918,19 @@ impl Screen {
     }
 }
 
+fn resize_cells(cells: &[Cell], old_rows: u16, old_cols: u16, rows: u16, cols: u16) -> Vec<Cell> {
+    let mut next = vec![Cell::blank(Style::default()); usize::from(rows) * usize::from(cols)];
+    let copy_rows = rows.min(old_rows);
+    let copy_cols = cols.min(old_cols);
+    for row in 0..copy_rows {
+        for col in 0..copy_cols {
+            next[usize::from(row) * usize::from(cols) + usize::from(col)] =
+                cells[usize::from(row) * usize::from(old_cols) + usize::from(col)].clone();
+        }
+    }
+    next
+}
+
 impl Perform for Screen {
     fn print(&mut self, character: char) {
         self.put_char(character);
@@ -766,12 +963,13 @@ impl Perform for Screen {
         let first = Self::parameter(&values, 0, 1);
         let private = intermediates.contains(&b'?');
         match action {
-            'A' => self.cursor_row = self.cursor_row.saturating_sub(first),
+            'A' => {
+                let (top, _) = self.cursor_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_sub(first).max(top);
+            }
             'B' => {
-                self.cursor_row = self
-                    .cursor_row
-                    .saturating_add(first)
-                    .min(self.rows.saturating_sub(1));
+                let (_, bottom) = self.cursor_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_add(first).min(bottom);
             }
             'C' => {
                 self.cursor_col = self
@@ -781,26 +979,45 @@ impl Perform for Screen {
             }
             'D' => self.cursor_col = self.cursor_col.saturating_sub(first),
             'E' => {
-                self.cursor_row = self
-                    .cursor_row
-                    .saturating_add(first)
-                    .min(self.rows.saturating_sub(1));
+                let (_, bottom) = self.cursor_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_add(first).min(bottom);
                 self.cursor_col = 0;
             }
             'F' => {
-                self.cursor_row = self.cursor_row.saturating_sub(first);
+                let (top, _) = self.cursor_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_sub(first).max(top);
                 self.cursor_col = 0;
             }
             'G' | '`' => self.cursor_col = first.saturating_sub(1).min(self.cols.saturating_sub(1)),
-            'd' => self.cursor_row = first.saturating_sub(1).min(self.rows.saturating_sub(1)),
+            'd' => {
+                let (top, bottom) = self.cursor_row_bounds();
+                self.cursor_row = top.saturating_add(first.saturating_sub(1)).min(bottom);
+            }
             'H' | 'f' => {
-                self.cursor_row = first.saturating_sub(1).min(self.rows.saturating_sub(1));
+                let (top, bottom) = self.cursor_row_bounds();
+                self.cursor_row = top.saturating_add(first.saturating_sub(1)).min(bottom);
                 self.cursor_col = Self::parameter(&values, 1, 1)
                     .saturating_sub(1)
                     .min(self.cols.saturating_sub(1));
             }
+            'a' => {
+                self.cursor_col = self
+                    .cursor_col
+                    .saturating_add(first)
+                    .min(self.cols.saturating_sub(1));
+            }
+            'e' => {
+                let (_, bottom) = self.cursor_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_add(first).min(bottom);
+            }
+            '@' => self.insert_blank_chars(first),
+            'P' => self.delete_chars(first),
+            'X' => self.erase_chars(first),
+            'L' => self.insert_lines(first),
+            'M' => self.delete_lines(first),
             'J' => match values.first().copied().unwrap_or(0) {
-                2 | 3 => self.clear_screen(),
+                2 => self.clear_screen(),
+                3 => self.scrollback.clear(),
                 1 => {
                     for row in 0..self.cursor_row {
                         self.clear_row(row, 0, self.cols);
@@ -823,20 +1040,41 @@ impl Perform for Screen {
             's' => self.saved_cursor = (self.cursor_row, self.cursor_col),
             'u' => (self.cursor_row, self.cursor_col) = self.saved_cursor,
             'r' => {
-                self.scroll_top = first.saturating_sub(1).min(self.rows.saturating_sub(1));
-                self.scroll_bottom = Self::parameter(&values, 1, self.rows)
+                let top = first.saturating_sub(1).min(self.rows.saturating_sub(1));
+                let bottom = Self::parameter(&values, 1, self.rows)
                     .saturating_sub(1)
                     .min(self.rows.saturating_sub(1));
-                self.cursor_row = self.scroll_top;
-                self.cursor_col = 0;
+                if top < bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                    self.home_cursor();
+                }
             }
             'S' => self.scroll_up(first),
             'T' => self.scroll_down(first),
+            'h' if !private => {
+                if values.contains(&4) {
+                    self.insert_mode = true;
+                }
+            }
+            'l' if !private => {
+                if values.contains(&4) {
+                    self.insert_mode = false;
+                }
+            }
             'h' if private => {
                 for mode in values {
                     match mode {
+                        1 => self.application_cursor = true,
+                        6 => {
+                            self.origin_mode = true;
+                            self.home_cursor();
+                        }
+                        7 => self.auto_wrap = true,
                         25 => self.cursor_visible = true,
-                        1049 => self.enter_alternate(),
+                        47 | 1047 | 1049 => self.enter_alternate(),
+                        1048 => self.saved_cursor = (self.cursor_row, self.cursor_col),
+                        2004 => self.bracketed_paste = true,
                         _ => {}
                     }
                 }
@@ -844,8 +1082,16 @@ impl Perform for Screen {
             'l' if private => {
                 for mode in values {
                     match mode {
+                        1 => self.application_cursor = false,
+                        6 => {
+                            self.origin_mode = false;
+                            self.home_cursor();
+                        }
+                        7 => self.auto_wrap = false,
                         25 => self.cursor_visible = false,
-                        1049 => self.leave_alternate(),
+                        47 | 1047 | 1049 => self.leave_alternate(),
+                        1048 => (self.cursor_row, self.cursor_col) = self.saved_cursor,
+                        2004 => self.bracketed_paste = false,
                         _ => {}
                     }
                 }
@@ -919,17 +1165,17 @@ fn indexed_color(index: u16) -> u32 {
 fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
     let mut row_blobs = Vec::with_capacity(usize::from(state.screen.rows));
     for row in 0..state.screen.rows {
-        row_blobs.push(encode_row(&state.screen, row));
+        row_blobs.push(encode_row(&state.screen, state.viewport_offset, row));
     }
     let mut groups = Vec::<(u16, Vec<Vec<u8>>)>::new();
     let mut start = 0_u16;
     let mut current = Vec::new();
-    let mut current_bytes = 56_usize;
+    let mut current_bytes = 72_usize;
     for (row, blob) in row_blobs.into_iter().enumerate() {
         if !current.is_empty() && current_bytes.saturating_add(blob.len()) > MAX_SNAPSHOT_BODY {
             groups.push((start, std::mem::take(&mut current)));
             start = row as u16;
-            current_bytes = 48;
+            current_bytes = 72;
         }
         current_bytes = current_bytes.saturating_add(blob.len());
         current.push(blob);
@@ -940,15 +1186,21 @@ fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
         .into_iter()
         .enumerate()
         .map(|(index, (row_start, rows))| {
-            let mut bytes = Vec::with_capacity(56 + rows.iter().map(Vec::len).sum::<usize>());
+            let mut bytes = Vec::with_capacity(72 + rows.iter().map(Vec::len).sum::<usize>());
             bytes.extend_from_slice(SNAPSHOT_MAGIC);
-            bytes.push(1);
+            bytes.push(2);
             bytes.extend_from_slice(&state.revision.to_le_bytes());
             bytes.extend_from_slice(&state.screen.rows.to_le_bytes());
             bytes.extend_from_slice(&state.screen.cols.to_le_bytes());
             bytes.extend_from_slice(&state.screen.cursor_row.to_le_bytes());
             bytes.extend_from_slice(&state.screen.cursor_col.to_le_bytes());
-            bytes.push(u8::from(state.screen.cursor_visible));
+            bytes.push(u8::from(
+                state.screen.cursor_visible && state.viewport_offset == 0,
+            ));
+            bytes.push(
+                u8::from(state.screen.application_cursor)
+                    | (u8::from(state.screen.bracketed_paste) << 1),
+            );
             bytes.push(u8::from(state.exited));
             bytes.extend_from_slice(&state.exit_code.unwrap_or(i32::MIN).to_le_bytes());
             bytes.extend_from_slice(&(index as u16).to_le_bytes());
@@ -958,6 +1210,16 @@ fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
             bytes.extend_from_slice(&state.chunks_read.to_le_bytes());
             bytes.extend_from_slice(&state.bytes_read.to_le_bytes());
             bytes.extend_from_slice(&state.resizes.to_le_bytes());
+            bytes.extend_from_slice(
+                &u32::try_from(state.viewport_offset)
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes(),
+            );
+            bytes.extend_from_slice(
+                &u32::try_from(state.screen.max_viewport_offset())
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes(),
+            );
             for row in rows {
                 bytes.extend_from_slice(&row);
             }
@@ -966,9 +1228,8 @@ fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn encode_row(screen: &Screen, row: u16) -> Vec<u8> {
-    let cells =
-        &screen.cells[screen.index(row, 0)..screen.index(row, 0) + usize::from(screen.cols)];
+fn encode_row(screen: &Screen, viewport_offset: usize, row: u16) -> Vec<u8> {
+    let cells = screen.visible_row(viewport_offset, row);
     let mut runs = Vec::<(u16, u16, Style, String)>::new();
     let mut start = 0_u16;
     let mut style = cells.first().map_or(Style::default(), |cell| cell.style);
@@ -996,7 +1257,13 @@ fn encode_row(screen: &Screen, row: u16) -> Vec<u8> {
         bytes.extend_from_slice(&cells.to_le_bytes());
         bytes.extend_from_slice(&fg.to_le_bytes());
         bytes.extend_from_slice(&bg.to_le_bytes());
-        bytes.push(u8::from(style.bold));
+        bytes.push(
+            u8::from(style.bold)
+                | (u8::from(style.faint) << 1)
+                | (u8::from(style.italic) << 2)
+                | (u8::from(style.underline) << 3)
+                | (u8::from(style.strikethrough) << 4),
+        );
         bytes.extend_from_slice(&(text.len().min(u16::MAX as usize) as u16).to_le_bytes());
         bytes.extend_from_slice(
             text.as_bytes()

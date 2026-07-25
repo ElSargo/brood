@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "brood-default-workspace-plugin"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde-json-core",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -26,14 +34,6 @@ dependencies = [
  "hash32",
  "serde",
  "stable_deref_trait",
-]
-
-[[package]]
-name = "brood-default-workspace-plugin"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde-json-core",
 ]
 
 [[package]]

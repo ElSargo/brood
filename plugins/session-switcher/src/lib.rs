@@ -9,8 +9,8 @@ use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect};
 use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
-    LocalActorMessage, PresentationEvent, SessionCommand, SessionCommandCompleted, SessionEvent,
-    SessionOperation, SessionSnapshot,
+    LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
+    SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +134,18 @@ struct SidebarActionMessage {
 struct CodingAgentActionMessage {
     kind: serde_json_core::heapless::String<32>,
     action: serde_json_core::heapless::String<32>,
+}
+
+#[derive(Deserialize)]
+struct TerminalActionMessage {
+    kind: serde_json_core::heapless::String<32>,
+    action: serde_json_core::heapless::String<32>,
+}
+
+#[derive(Deserialize)]
+struct TerminalLifecycleMessage {
+    kind: serde_json_core::heapless::String<32>,
+    terminal: Option<serde_json_core::heapless::String<64>>,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +377,9 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
                 handle_picker_message(&message.body)
             }
+            Event::Mailbox(message) if message.sender.starts_with("session:") => {
+                handle_terminal_lifecycle(&message.body)
+            }
             _ => Vec::new(),
         }
     }
@@ -567,6 +582,23 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
         return vec![start_coding_agent_ui(&id)];
     }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "terminal-action"
+        && message.action.as_str() == "new"
+    {
+        let Ok(state) = STATE.lock() else {
+            return Vec::new();
+        };
+        if state.session_id == 0 {
+            return Vec::new();
+        }
+        return vec![ActorCommand::SendSessionMessage(SessionActorMessage {
+            session_id: state.session_id,
+            actor: "init".to_string(),
+            body: br#"{"kind":"create-terminal"}"#.to_vec(),
+        })];
+    }
     let Ok((message, consumed)) = serde_json_core::from_slice::<SidebarActionMessage>(bytes) else {
         return Vec::new();
     };
@@ -605,6 +637,27 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         layout.focused_pane = requested_focus;
     }
     publish_layout(&state, false, requested_focus)
+}
+
+fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalLifecycleMessage>(bytes)
+    else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.kind.as_str() != "terminal-started" {
+        return Vec::new();
+    }
+    let Some(terminal) = message.terminal else {
+        return Vec::new();
+    };
+    let Some(suffix) = terminal.as_str().strip_prefix("terminal-session-") else {
+        return Vec::new();
+    };
+    vec![ActorCommand::StartActor(ActorStartRequest {
+        id: format!("terminal-ui-{suffix}"),
+        path: TERMINAL_UI_COMPONENT_FILE.to_string(),
+        capabilities: Vec::new(),
+    })]
 }
 
 fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -1274,6 +1327,7 @@ fn add_text(
         host::TextLayoutOptions {
             font_intent: host::FontIntent::Ui,
             font_weight: host::FontWeight::Normal,
+            font_style: host::FontStyle::Normal,
             font_size: size,
             max_width: max_width.max(1.0),
             line_height: size + 4.0,

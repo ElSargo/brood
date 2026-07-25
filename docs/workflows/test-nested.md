@@ -28,8 +28,9 @@ It builds the current source through the flake, starts the session service with
 offscreen presentation, then drives a real external client under isolated
 headless Sway. The output directory contains structured runtime, mailbox,
 graphics, text-resource, and key-to-present metrics plus captures for shell
-ANSI/Unicode output, presentation reconnect, Helix, repeated resize, streaming
-output, and child teardown. Exact command parsing remains defined in
+ANSI/Unicode/style output, exact modified and application-cursor key bytes,
+presentation reconnect, Helix, repeated alternate-screen resize, guest
+scrollback, streaming output, and child teardown. Exact command parsing remains defined in
 `crates/brood-cli/src/cli.rs`.
 
 Run the packaged end-to-end capture on a host with a DRM render node:
@@ -48,3 +49,4 @@ Related:
 
 - [[../systems/testing]]
 - [[../systems/wayland-compositor]]
+- [[../systems/terminal-plugin]]

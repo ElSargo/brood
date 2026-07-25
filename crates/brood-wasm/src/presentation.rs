@@ -43,10 +43,17 @@ pub enum FontWeight {
     Bold,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FontStyle {
+    Normal,
+    Italic,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextLayoutOptions {
     pub font_intent: FontIntent,
     pub font_weight: FontWeight,
+    pub font_style: FontStyle,
     pub font_size: f32,
     pub max_width: f32,
     pub line_height: f32,

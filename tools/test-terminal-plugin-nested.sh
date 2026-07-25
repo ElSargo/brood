@@ -24,14 +24,14 @@ fi
 PACKAGE="$(readlink -f "$PACKAGE")"
 
 OUT="${BROOD_TERMINAL_OUT:-$(mktemp -d /tmp/brood-terminal.XXXXXX)}"
-RUNTIME_DIR="$OUT/runtime"
+RUNTIME_DIR="$(mktemp -d /tmp/brood-terminal-runtime.XXXXXX)"
 SERVER_LOG="$OUT/server.log"
 CLIENT1_LOG="$OUT/client-before-disconnect.log"
 CLIENT2_LOG="$OUT/client-after-reconnect.log"
 COMPOSITOR_LOG="$OUT/compositor.log"
 SWAY_CONFIG="$OUT/sway.conf"
 DBUS_DESTINATION="org.brood.TerminalTest.p$$"
-mkdir -p "$OUT" "$RUNTIME_DIR"
+mkdir -p "$OUT"
 chmod 700 "$RUNTIME_DIR"
 
 CLIENT_PID=""
@@ -46,6 +46,7 @@ cleanup() {
       wait "$pid" > /dev/null 2>&1
     fi
   done
+  rm -rf -- "$RUNTIME_DIR"
   if ((result != 0)); then
     echo "client_before_log=$CLIENT1_LOG" >&2
     [[ -f "$CLIENT1_LOG" ]] && tail -n 160 "$CLIENT1_LOG" >&2
@@ -200,6 +201,12 @@ last_metric() {
   sed -n 's/^presentation plugin worker metrics actor=terminal-ui //p' "$log" | tail -1
 }
 
+last_actor_metric() {
+  local log="$1"
+  local actor="$2"
+  sed -n "s/^presentation plugin worker metrics actor=${actor} //p" "$log" | tail -1
+}
+
 metric_value() {
   local log="$1"
   local key="$2"
@@ -263,7 +270,7 @@ focus_terminal "$CLIENT1_LOG"
 capture "$OUT/terminal-initial.png"
 
 SHELL_BASELINE="$(metric_value "$CLIENT1_LOG" pty_bytes)"
-type_line 'printf "\033[31mANSI_RED\033[0m λ中 TERM=%s COLORTERM=%s\n" "$TERM" "$COLORTERM"; printf "CWD=%s\n" "$PWD"; echo __SHELL_OK__'
+type_line 'printf "\033[31mANSI_RED\033[0m \033[1mBOLD\033[22m \033[3mITALIC\033[23m \033[4mUNDERLINE\033[24m \033[9mSTRIKE\033[29m \033[7mINVERSE\033[27m λ中 TERM=%s COLORTERM=%s\n" "$TERM" "$COLORTERM"; printf "CWD=%s\n" "$PWD"; echo __SHELL_OK__'
 SHELL_PREVIOUS="$SHELL_BASELINE"
 SHELL_QUIET=0
 for _ in $(seq 1 400); do
@@ -281,6 +288,36 @@ for _ in $(seq 1 400); do
 done
 ((SHELL_BYTES > SHELL_BASELINE + 40 && SHELL_QUIET >= 8))
 capture "$OUT/terminal-shell-ansi-unicode.png"
+
+KEY_FILE="$OUT/key-sequences.bin"
+type_line "IFS= read -r key; printf %s \"\$key\" > '$KEY_FILE'; echo __KEY_SEQUENCE_OK__"
+wayland_env "$OUT/virtual-keyboard-key" --none 63
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-only 106
+wayland_env "$OUT/virtual-keyboard-key" --shift-only 15
+wayland_env "$OUT/virtual-keyboard-key" --none 28
+for _ in $(seq 1 200); do
+  [[ -s "$KEY_FILE" ]] && break
+  sleep 0.05
+done
+KEY_HEX="$(od -An -tx1 "$KEY_FILE" | tr -d ' \n')"
+[[ "$KEY_HEX" == "1b5b31357e1b5b313b35431b5b5a" ]]
+
+APPLICATION_KEY_FILE="$OUT/application-cursor-key.bin"
+type_line "printf '\\033[?1h'; IFS= read -r key; printf %s \"\$key\" > '$APPLICATION_KEY_FILE'; printf '\\033[?1l'; echo __APPLICATION_CURSOR_OK__"
+for _ in $(seq 1 200); do
+  APPLICATION_CURSOR="$(metric_value "$CLIENT1_LOG" application_cursor)"
+  [[ "$APPLICATION_CURSOR" == "true" ]] && break
+  sleep 0.05
+done
+[[ "$APPLICATION_CURSOR" == "true" ]]
+wayland_env "$OUT/virtual-keyboard-key" --none 103
+wayland_env "$OUT/virtual-keyboard-key" --none 28
+for _ in $(seq 1 200); do
+  [[ -s "$APPLICATION_KEY_FILE" ]] && break
+  sleep 0.05
+done
+APPLICATION_KEY_HEX="$(od -An -tx1 "$APPLICATION_KEY_FILE" | tr -d ' \n')"
+[[ "$APPLICATION_KEY_HEX" == "1b4f41" ]]
 
 close_frontend
 STATUS_DISCONNECTED="$(ctl status-json)"
@@ -344,6 +381,24 @@ STREAM_RENDER_MS=$(( $(date +%s%3N) - STREAM_STARTED_MS ))
 ((STREAM_BYTES > STREAM_BASELINE + 10000))
 capture "$OUT/terminal-streaming.png"
 
+MAX_VIEWPORT="$(metric_value "$CLIENT2_LOG" max_viewport_offset)"
+((MAX_VIEWPORT > 0))
+wayland_env "$OUT/virtual-keyboard-key" --shift-only 104
+for _ in $(seq 1 200); do
+  VIEWPORT="$(metric_value "$CLIENT2_LOG" viewport_offset)"
+  ((VIEWPORT > 0)) && break
+  sleep 0.05
+done
+((VIEWPORT > 0))
+capture "$OUT/terminal-scrollback.png"
+wayland_env "$OUT/virtual-keyboard-key" --shift-only 107
+for _ in $(seq 1 200); do
+  VIEWPORT="$(metric_value "$CLIENT2_LOG" viewport_offset)"
+  ((VIEWPORT == 0)) && break
+  sleep 0.05
+done
+((VIEWPORT == 0))
+
 type_line 'exit'
 for _ in $(seq 1 300); do
   EXIT_METRIC="$(last_metric "$CLIENT2_LOG")"
@@ -366,6 +421,67 @@ jq -e '
 ' <<< "$STATUS_EXITED" > /dev/null
 printf '%s\n' "$STATUS_EXITED" > "$OUT/status-shell-exited.json"
 capture "$OUT/terminal-shell-exited.png"
+
+SPAWN_STARTED_MS="$(date +%s%3N)"
+wayland_env "$OUT/virtual-keyboard-key" 20
+for _ in $(seq 1 300); do
+  STATUS_SPAWNED="$(ctl status-json)"
+  DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" terminal-ui-2)"
+  if rg -q "started presentation WASM actor id=terminal-ui-2" "$CLIENT2_LOG" \
+    && jq -e '
+      .hosted_runtime_io_children == 1
+      and .hosted_runtime_io_streams == 1
+      and .hosted_runtime_io_resources == 2
+      and any(.plugin_actors[]; .[0] | contains("terminal-session-2"))
+    ' <<< "$STATUS_SPAWNED" > /dev/null \
+    && [[ -n "$DYNAMIC_METRIC" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+SPAWN_PRESENT_MS=$(( $(date +%s%3N) - SPAWN_STARTED_MS ))
+rg -q "started presentation WASM actor id=terminal-ui-2" "$CLIENT2_LOG"
+jq -e '
+  .hosted_runtime_io_children == 1
+  and .hosted_runtime_io_streams == 1
+  and .hosted_runtime_io_resources == 2
+  and any(.plugin_actors[]; .[0] | contains("terminal-session-2"))
+' <<< "$STATUS_SPAWNED" > /dev/null
+[[ -n "$DYNAMIC_METRIC" ]]
+
+DYNAMIC_BASELINE="$(jq -r '.pty_bytes // 0' <<< "$DYNAMIC_METRIC")"
+type_line 'printf "\033[35m__CTRL_ALT_T_TERMINAL__\033[0m λ中\n"'
+for _ in $(seq 1 200); do
+  DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" terminal-ui-2)"
+  DYNAMIC_BYTES="$(jq -r '.pty_bytes // 0' <<< "$DYNAMIC_METRIC")"
+  ((DYNAMIC_BYTES > DYNAMIC_BASELINE + 16)) && break
+  sleep 0.05
+done
+((DYNAMIC_BYTES > DYNAMIC_BASELINE + 16))
+capture "$OUT/terminal-ctrl-alt-t.png"
+
+type_line 'exit'
+for _ in $(seq 1 300); do
+  DYNAMIC_EXIT_METRIC="$(last_actor_metric "$CLIENT2_LOG" terminal-ui-2)"
+  STATUS_FINAL_EXIT="$(ctl status-json)"
+  if jq -e '.exited == true' <<< "$DYNAMIC_EXIT_METRIC" > /dev/null \
+    && jq -e '
+      .hosted_runtime_io_children == 0
+      and .hosted_runtime_io_streams == 0
+      and .hosted_runtime_io_resources == 0
+    ' <<< "$STATUS_FINAL_EXIT" > /dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+jq -e '.exited == true' <<< "$DYNAMIC_EXIT_METRIC" > /dev/null
+jq -e '
+  .hosted_runtime_io_children == 0
+  and .hosted_runtime_io_streams == 0
+  and .hosted_runtime_io_resources == 0
+' <<< "$STATUS_FINAL_EXIT" > /dev/null
+printf '%s\n' "$STATUS_SPAWNED" > "$OUT/status-shortcut-shell-live.json"
+printf '%s\n' "$STATUS_FINAL_EXIT" > "$OUT/status-shortcut-shell-exited.json"
 
 close_frontend
 GRAPHICS_METRIC="$(
@@ -391,7 +507,9 @@ python3 - \
   "$OUT/terminal-shell-ansi-unicode.png" \
   "$OUT/terminal-helix.png" \
   "$OUT/terminal-helix-resized.png" \
-  "$OUT/terminal-reconnected.png" <<'PY'
+  "$OUT/terminal-reconnected.png" \
+  "$OUT/terminal-scrollback.png" \
+  "$OUT/terminal-ctrl-alt-t.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -428,21 +546,40 @@ LAST_TERMINAL_METRIC="$(last_metric "$CLIENT2_LOG")"
 jq -n \
   --argjson live "$STATUS_LIVE" \
   --argjson disconnected "$STATUS_DISCONNECTED" \
-  --argjson exited "$STATUS_EXITED" \
+  --argjson exited "$STATUS_FINAL_EXIT" \
+  --argjson shortcut_live "$STATUS_SPAWNED" \
+  --argjson shortcut_terminal "$DYNAMIC_EXIT_METRIC" \
   --argjson terminal "$LAST_TERMINAL_METRIC" \
   --argjson graphics "$GRAPHICS_METRIC" \
   --argjson input "$INPUT_METRIC" \
   --argjson stream_render_ms "$STREAM_RENDER_MS" \
+  --argjson spawn_present_ms "$SPAWN_PRESENT_MS" \
+  --arg key_hex "$KEY_HEX" \
+  --arg application_key_hex "$APPLICATION_KEY_HEX" \
   '{
     workload: {
       shell: true,
       ansi_color: true,
       unicode: true,
+      styles: ["bold", "italic", "underline", "strikethrough", "inverse"],
+      key_sequences: {
+        f5_ctrl_right_shift_tab: $key_hex,
+        application_cursor_up: $application_key_hex
+      },
       tui: "helix",
       repeated_resizes: $terminal.pty_resizes,
       streaming_bytes: $terminal.pty_bytes,
       streaming_render_ms: $stream_render_ms,
       presentation_reconnect: true,
+      ctrl_alt_t_spawn: {
+        session_actor: "terminal-session-2",
+        presentation_actor: "terminal-ui-2",
+        spawn_to_present_ms: $spawn_present_ms,
+        pty_bytes: $shortcut_terminal.pty_bytes,
+        child_exit: $shortcut_terminal.exited
+      },
+      scrollback_lines: $terminal.max_viewport_offset,
+      scrollback_navigation: true,
       child_exit: $terminal.exited
     },
     runtime_live: {
@@ -458,6 +595,11 @@ jq -n \
       presentation: $disconnected.presentation,
       shell_children: $disconnected.hosted_runtime_io_children,
       resources: $disconnected.hosted_runtime_io_resources
+    },
+    shortcut_live: {
+      resources: $shortcut_live.hosted_runtime_io_resources,
+      streams: $shortcut_live.hosted_runtime_io_streams,
+      children: $shortcut_live.hosted_runtime_io_children
     },
     runtime_after_exit: {
       resources: $exited.hosted_runtime_io_resources,
@@ -486,11 +628,14 @@ cat > "$OUT/proof.md" <<EOF
 - shell: real allowlisted sh PTY in $ROOT
 - terminal environment: xterm-256color with truecolor intent, rendered by guest-parsed ANSI runs
 - input: real Wayland key/text events through the focused external presentation client
+- product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-2 actors, focused the new pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
+- keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
+- scrollback: guest-owned history was navigated with real Shift+PageUp and Shift+End input
 - presentation ownership: the client disconnected while the session-owned shell and its two native resources remained live, then a new presentation actor reattached
 - TUI: Helix rendered full-screen and remained responsive through repeated compositor/pane resizes
 - streaming: 4,000 output lines reached a revised canvas packet in ${STREAM_RENDER_MS}ms
-- teardown: shell exit retired every PTY child and stream resource
-- screenshots: terminal-shell-ansi-unicode.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-shell-exited.png
+- teardown: both the boot shell and the shortcut-created shell retired every PTY child and stream resource
+- screenshots: terminal-shell-ansi-unicode.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
 - structured metrics: proof.json
 EOF
 

@@ -13,12 +13,12 @@ use std::{
 use anyhow::{Result, anyhow};
 use brood_graphics::{Command, Packet, PacketError};
 use brood_wasm::{
-    FontIntent, FontWeight, PresentationError, PresentationHost, TextLayoutOptions,
+    FontIntent, FontStyle, FontWeight, PresentationError, PresentationHost, TextLayoutOptions,
     TextLayoutResult,
 };
 use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping,
-    SwashCache, SwashContent, Weight, Wrap,
+    Style as CosmicStyle, SwashCache, SwashContent, Weight, Wrap,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -806,6 +806,10 @@ fn create_text_layout_plan(
         .weight(match options.font_weight {
             FontWeight::Normal => Weight::NORMAL,
             FontWeight::Bold => Weight::BOLD,
+        })
+        .style(match options.font_style {
+            FontStyle::Normal => CosmicStyle::Normal,
+            FontStyle::Italic => CosmicStyle::Italic,
         })
         .font_features(features);
     buffer.set_text(text, &attrs, Shaping::Advanced, None);
