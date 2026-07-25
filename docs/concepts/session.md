@@ -11,6 +11,9 @@ A session is a group identity and sandbox for panes, plugin state, environment,
 cwd, agents, programs, and resources. It does not decide which panes a
 presentation client maps.
 
+Every session also belongs to a [[project]]. Several sessions may share one
+project while using different Git worktrees and branches.
+
 The session environment is the unit at which Brood chooses authority. It may
 run directly on the local host, inside a container, or on a remote machine. Its
 mounts, process namespace, devices, network, credentials, and host bridges
@@ -37,6 +40,7 @@ Current user-facing operations such as `enter`, `show`, `hide`, `list`, and `swi
 Related:
 
 - [[workspace]]
+- [[project]]
 - [[pane]]
 - [[plugin]]
 - [[session-runner]]

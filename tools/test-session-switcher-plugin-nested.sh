@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm; do
+for tool in cargo cc foot git grim magick pkg-config python3 sway wayland-scanner weston-simple-egl weston-simple-shm wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the session-switcher proof" >&2
     exit 2
@@ -23,9 +23,16 @@ SERVER_LOG="$OUT/server.log"
 CLIENT_LOG="$OUT/client.log"
 CONFIG="$OUT/brood.toml"
 SWAY_CONFIG="$OUT/sway.conf"
+PROJECT="$OUT/project"
+OTHER_PROJECT="$OUT/other-project"
+DATA_HOME="$OUT/data"
 DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
-mkdir -p "$PACKAGE" "$RUNTIME_DIR"
+mkdir -p "$PACKAGE" "$RUNTIME_DIR" "$PROJECT" "$DATA_HOME"
 chmod 700 "$RUNTIME_DIR"
+git -C "$PROJECT" init --quiet
+git -C "$PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
+  commit --quiet --allow-empty -m initial
+git -C "$PROJECT" branch picker-worktree
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -65,6 +72,29 @@ cc \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
   "${WAYLAND_BUILD_FLAGS[@]}"
+VIRTUAL_POINTER_XML="$(
+  pkg-config --variable=pkgdatadir wlr-protocols
+)/unstable/wlr-virtual-pointer-unstable-v1.xml"
+[[ -n "$VIRTUAL_POINTER_XML" ]] || {
+  echo "ERR wlr-virtual-pointer protocol XML is required" >&2
+  exit 2
+}
+wayland-scanner client-header \
+  "$VIRTUAL_POINTER_XML" \
+  "$OUT/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+wayland-scanner private-code \
+  "$VIRTUAL_POINTER_XML" \
+  "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -I "$OUT" \
+  tools/virtual-pointer-click.c \
+  "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c" \
+  -o "$OUT/virtual-pointer-click" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
@@ -87,16 +117,18 @@ printf '[init]\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npa
   > "$CONFIG"
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
-env -u brood_session \
-  RUST_LOG="$RUST_LOG" \
-  target/debug/brood-sessiond \
-  --headless \
-  --no-init \
-  --no-default-modules \
-  --config "$CONFIG" \
-  --dbus-destination "$DBUS_DESTINATION" \
-  --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
-  > "$SERVER_LOG" 2>&1 &
+(
+  cd "$PROJECT"
+  env -u brood_session \
+    RUST_LOG="$RUST_LOG" \
+    "$ROOT/target/debug/brood-sessiond" \
+    --headless \
+    --no-init \
+    --no-default-modules \
+    --config "$CONFIG" \
+    --dbus-destination "$DBUS_DESTINATION" \
+    --dbus-address "$DBUS_SESSION_BUS_ADDRESS"
+) > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 ctl() {
@@ -169,6 +201,7 @@ done
 }
 
 env -u brood_session \
+  XDG_DATA_HOME="$DATA_HOME" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
@@ -248,6 +281,26 @@ send_open_terminal() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" --ctrl-only 24
+}
+
+click_at() {
+  local x="$1"
+  local y="$2"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-click" "$x" "$y" 1280 720
+}
+
+submit_text() {
+  local value="$1"
+  local primer="bcdefghijklmnopqrstuvwxyz0123"
+  local -a erase_primer=()
+  for _ in $(seq 1 "${#primer}"); do
+    erase_primer+=(-k BackSpace)
+  done
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    wtype "$primer" "${erase_primer[@]}" -s 100 "$value" -s 100 -k Return
 }
 
 capture "$OUT/sidebar-visible.png"
@@ -356,12 +409,87 @@ rg -q "total_windows=2" <<< "$(ctl status)"
 ((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE))
 ((CLOSE_LAYOUT_MS < 150))
 
+capture "$OUT/project-expanded.png"
+click_at 980 123
+sleep 0.2
+capture "$OUT/project-collapsed.png"
+
+click_at 980 123
+sleep 0.2
+
+click_at 1260 123
+submit_text picker-worktree
+for _ in $(seq 1 200); do
+  SESSION_JSON="$(ctl surface-session list-json)"
+  if rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON" \
+    && rg -q "operation=CreateWorktree success=true" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON"
+rg -q "operation=CreateWorktree success=true" "$CLIENT_LOG"
+read -r WORKTREE_SESSION_ID WORKTREE_DIRECTORY < <(
+  python3 - "$SESSION_JSON" "$PROJECT" "$DATA_HOME" <<'PY'
+import json
+import pathlib
+import sys
+
+catalog = json.loads(sys.argv[1])
+project = pathlib.Path(sys.argv[2]).resolve()
+data_home = pathlib.Path(sys.argv[3]).resolve()
+source = next(session for session in catalog["sessions"] if session["name"] == "Beta")
+created = next(
+    session for session in catalog["sessions"] if session["name"] == "picker-worktree"
+)
+assert source["project_id"] == created["project_id"]
+assert source["project_name"] == project.name
+assert created["branch"] == "picker-worktree"
+assert created["worktree"] is True
+directory = pathlib.Path(created["working_directory"]).resolve()
+directory.relative_to(data_home / "brood" / "worktrees")
+print(created["id"], directory)
+PY
+)
+[[ -d "$WORKTREE_DIRECTORY" ]]
+[[ "$(git -C "$WORKTREE_DIRECTORY" branch --show-current)" == "picker-worktree" ]]
+capture "$OUT/worktree-created.png"
+
+ctl spawn weston-simple-shm > /dev/null
+for _ in $(seq 1 100); do
+  rg -q "total_windows=3" <<< "$(ctl status)" && break
+  sleep 0.05
+done
+rg -q "total_windows=3" <<< "$(ctl status)"
+
+mkdir -p "$OTHER_PROJECT"
+git -C "$OTHER_PROJECT" init --quiet
+git -C "$OTHER_PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
+  commit --quiet --allow-empty -m initial
+ctl surface-session dir-new "$OTHER_PROJECT" default Other > /dev/null
+ctl spawn weston-simple-shm > /dev/null
+for _ in $(seq 1 100); do
+  SESSION_JSON="$(ctl surface-session list-json)"
+  if rg -q "total_windows=4" <<< "$(ctl status)" \
+    && [[ "$(python3 -c 'import json,sys; print(len({s["project_id"] for s in json.load(sys.stdin)["sessions"]}))' <<< "$SESSION_JSON")" == "2" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "total_windows=4" <<< "$(ctl status)"
+[[ "$(python3 -c 'import json,sys; print(len({s["project_id"] for s in json.load(sys.stdin)["sessions"]}))' <<< "$SESSION_JSON")" == "2" ]]
+capture "$OUT/projects.png"
+
 python3 - \
   "$OUT/sidebar-visible.png" \
   "$OUT/sidebar-hidden.png" \
   "$OUT/sidebar-restored.png" \
   "$OUT/session-beta.png" \
-  "$OUT/ctrl-o-terminal.png" <<'PY'
+  "$OUT/ctrl-o-terminal.png" \
+  "$OUT/project-expanded.png" \
+  "$OUT/project-collapsed.png" \
+  "$OUT/worktree-created.png" \
+  "$OUT/projects.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -410,6 +538,18 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
     raise SystemExit(f"layout did not visibly change after Ctrl+O: RMSE={normalized}")
 print(f"ctrl_o_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[6], sys.argv[7], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"project collapse did not visibly change the picker: RMSE={normalized}")
+print(f"project_collapse_capture_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
@@ -434,9 +574,11 @@ cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
 - backend: headless frame exporter, no presenter and no backend layout
-- input: real Ctrl+Alt+M and Ctrl+O events through the focused external Winit client
+- input: real keyboard and virtual-pointer events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
+- projects: two Git repositories rendered as distinct collapsible project lists
+- worktree: branch picker-worktree was checked out beneath $DATA_HOME/brood/worktrees and activated as a new session
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
 - transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
@@ -446,7 +588,7 @@ cat > "$OUT/proof.md" <<EOF
 - Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
 - Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
 - close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
-- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
+- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, project-expanded.png, project-collapsed.png, worktree-created.png, projects.png
 - status: $STATUS
 EOF
 
@@ -458,4 +600,6 @@ echo "beta=$OUT/session-beta.png"
 echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"
 echo "ctrl_o=$OUT/ctrl-o-terminal.png"
+echo "worktree=$OUT/worktree-created.png"
+echo "projects=$OUT/projects.png"
 echo "ctrl_o_layout_ms=$CTRL_O_LAYOUT_MS"

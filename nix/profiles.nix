@@ -115,7 +115,9 @@ let
     pkgs.mesa-demos
     pkgs.sway
     pkgs.vulkan-tools
+    pkgs.wayland-scanner
     pkgs.wayland-utils
+    pkgs.wlr-protocols
     pkgs.wtype
     westonWithSimpleClients
   ];

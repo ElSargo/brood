@@ -14,6 +14,7 @@ Use `workspace` when talking about the umbrella environment. Use [[session]] whe
 Related:
 
 - [[session]]
+- [[project]]
 - [[plugin]]
 - [[presentation-surface]]
 - [[../systems/runtime]]

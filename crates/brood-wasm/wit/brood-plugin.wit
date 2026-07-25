@@ -448,6 +448,13 @@ interface actor {
         name: string,
         active: bool,
         windows: u64,
+        working-directory: option<string>,
+        project-id: string,
+        project-name: string,
+        project-directory: string,
+        branch: option<string>,
+        worktree: bool,
+        git: bool,
     }
 
     record session-snapshot {
@@ -460,6 +467,7 @@ interface actor {
         refresh,
         activate,
         create,
+        create-worktree,
         rename,
         close,
     }

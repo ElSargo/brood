@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use brood_cli::{
     ClientArgs,
     control::{
@@ -23,6 +23,7 @@ use brood_cli::{
         dmabuf_resource, open_presentation_fast_path, rename_surface_session, request_dbus_command,
         resolve_control_target,
     },
+    project::{create_managed_worktree, discover_project},
 };
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use brood_layout::{
@@ -460,6 +461,18 @@ struct CatalogWireSession {
     name: String,
     active: bool,
     windows: u64,
+    working_directory: Option<String>,
+    project_id: String,
+    project_name: String,
+    project_directory: String,
+    branch: Option<String>,
+    worktree: bool,
+    git: bool,
+}
+
+#[derive(Deserialize)]
+struct ControlSessionList {
+    sessions: Vec<CatalogWireSession>,
 }
 
 #[derive(Deserialize)]
@@ -578,6 +591,13 @@ fn spawn_catalog_updates(
                                     name: session.name,
                                     active: session.active,
                                     windows: session.windows,
+                                    working_directory: session.working_directory,
+                                    project_id: session.project_id,
+                                    project_name: session.project_name,
+                                    project_directory: session.project_directory,
+                                    branch: session.branch,
+                                    worktree: session.worktree,
+                                    git: session.git,
                                 })
                                 .collect::<Vec<_>>();
                             let windows = decoded
@@ -1009,6 +1029,12 @@ fn execute_session_command(
         SessionOperation::Create => {
             create_surface_session(target, name.unwrap_or_default()).map(Some)
         }
+        SessionOperation::CreateWorktree => session
+            .context("create worktree request is missing a source session ID")
+            .and_then(|session| {
+                let branch = name.context("create worktree request is missing a branch name")?;
+                create_worktree_surface_session(target, session, &branch).map(Some)
+            }),
         SessionOperation::Rename => session
             .context("rename request is missing a session ID")
             .and_then(|session| {
@@ -1043,6 +1069,75 @@ fn execute_session_command(
             message: format!("{error:#}"),
         },
     }
+}
+
+fn create_worktree_surface_session(
+    target: &ControlTarget,
+    source_session: u64,
+    branch: &str,
+) -> Result<u64> {
+    let response = request_dbus_command(
+        target,
+        &["surface-session".to_string(), "list-json".to_string()],
+        false,
+    )?;
+    let catalogue: ControlSessionList =
+        serde_json::from_str(response.trim()).context("decode surface session catalogue")?;
+    let source = catalogue
+        .sessions
+        .iter()
+        .find(|session| session.id == source_session)
+        .with_context(|| format!("source session {source_session} is unavailable"))?;
+    let source_directory = source
+        .working_directory
+        .clone()
+        .filter(|directory| !directory.is_empty())
+        .unwrap_or_else(|| source.project_directory.clone());
+    ensure!(
+        !source_directory.is_empty(),
+        "source session {source_session} has no project directory"
+    );
+    let project = discover_project(std::path::Path::new(&source_directory));
+    ensure!(
+        project.is_git,
+        "project {} is not a Git repository",
+        project.name
+    );
+    let worktree = create_managed_worktree(&project, branch)?;
+    if let Some(existing) = catalogue.sessions.iter().find(|session| {
+        session
+            .working_directory
+            .as_deref()
+            .is_some_and(|directory| std::path::Path::new(directory) == worktree)
+    }) {
+        if !existing.active {
+            ensure!(
+                activate_surface_session(target, existing.id)?,
+                "managed worktree session {} is unavailable",
+                existing.id
+            );
+        }
+        return Ok(existing.id);
+    }
+    let command = vec![
+        "surface-session".to_string(),
+        "dir-new".to_string(),
+        worktree.to_string_lossy().into_owned(),
+        "default".to_string(),
+        branch.to_string(),
+    ];
+    let response = request_dbus_command(target, &command, false)
+        .with_context(|| format!("create session for managed worktree {}", worktree.display()))?;
+    ensure!(
+        response.starts_with("OK "),
+        "create managed worktree session failed: {}",
+        response.trim()
+    );
+    let session = brood_cli::control::session_marker_value(response.trim(), "active")
+        .context("managed worktree session response is missing its session ID")?;
+    session
+        .parse()
+        .with_context(|| format!("parse managed worktree session ID {session:?}"))
 }
 
 #[derive(Default)]
@@ -1927,7 +2022,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     .filter(|operation| {
                         matches!(
                             operation,
-                            SessionOperation::Activate | SessionOperation::Create
+                            SessionOperation::Activate
+                                | SessionOperation::Create
+                                | SessionOperation::CreateWorktree
                         )
                     })
                     .and(completion.session)

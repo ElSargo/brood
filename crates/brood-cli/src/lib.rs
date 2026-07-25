@@ -1,5 +1,6 @@
 mod cli;
 pub mod control;
+pub mod project;
 mod realm_init;
 
 pub use cli::*;

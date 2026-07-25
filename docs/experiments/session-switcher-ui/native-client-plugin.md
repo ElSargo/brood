@@ -4,9 +4,9 @@ The checked-in `plugins/session-switcher` package implements the session
 switcher as a client-realm Component Model plugin. Its blessed init instance
 starts one presentation child actor; the child owns the session model, query
 and rename editors, selection, scrolling, hit testing, styling, and draw-packet
-construction. `brood-client` supplies only typed session snapshots and
-operations, pane input, native text layouts, canvas validation, and final WGPU
-composition.
+construction. `brood-client` supplies only typed project/session snapshots and
+operations, pane input, native text layouts, canvas validation, managed Git
+worktree execution, and final WGPU composition.
 
 As the blessed init child, the switcher claims the client's root layout lease.
 Its layout fragment places the plugin pane as a right sidebar and delegates all
@@ -19,13 +19,16 @@ The global key policy sends an ordinary `sidebar-action` message to the
 switcher. The plugin owns its visible state and republishes its root fragment;
 the client has no switcher-specific pane toggle or visibility flag.
 
-The default config starts this artifact directly. The plugin supports session
-filtering, pointer and keyboard activation, creation, rename, close, and
-scrolling. The nested proof in
+The default config starts this artifact directly. The plugin groups sessions
+by stable project identity, owns collapsible project sections, and requests
+managed branch/worktree creation from project headings. It also supports
+session filtering, pointer and keyboard activation, creation, rename, close,
+and scrolling. The nested proof in
 `tools/test-session-switcher-plugin-nested.sh` creates three real sessions,
 switches with a real pointer click, creates and renames a session with injected
-keyboard input, closes it, hides and restores the sidebar, and captures
-client-owned visible and hidden frames.
+keyboard input, creates a real managed Git worktree session, verifies
+multi-project grouping and collapse behavior, closes a session, hides and
+restores the sidebar, and captures client-owned visible and hidden frames.
 It correlates those frames with typed command completions, backend catalogue
 snapshots, and the root-to-`rest` lease chain.
 

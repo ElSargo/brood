@@ -287,6 +287,12 @@ pub struct SurfaceSessionSummary {
     pub windows: usize,
     #[serde(default)]
     pub working_directory: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_directory: String,
+    pub branch: Option<String>,
+    pub worktree: bool,
+    pub git: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2597,9 +2603,9 @@ impl Brood {
         &self,
         session: SurfaceSessionId,
     ) -> Option<SurfaceSessionSummary> {
-        self.sessions
-            .contains(session)
-            .then(|| SurfaceSessionSummary {
+        self.sessions.contains(session).then(|| {
+            let project = self.sessions.project(session);
+            SurfaceSessionSummary {
                 id: session.raw(),
                 name: self.surface_session_name(session).to_string(),
                 active: session == self.sessions.active(),
@@ -2608,7 +2614,17 @@ impl Brood {
                     .sessions
                     .working_directory(session)
                     .map(|directory| directory.to_string_lossy().into_owned()),
-            })
+                project_id: project.map_or_else(String::new, |project| project.id.clone()),
+                project_name: project
+                    .map_or_else(|| "Project".to_string(), |project| project.name.clone()),
+                project_directory: project.map_or_else(String::new, |project| {
+                    project.source_directory.to_string_lossy().into_owned()
+                }),
+                branch: project.and_then(|project| project.branch.clone()),
+                worktree: project.is_some_and(|project| project.is_worktree),
+                git: project.is_some_and(|project| project.is_git),
+            }
+        })
     }
 
     pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: &str) -> bool {
