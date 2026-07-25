@@ -49,6 +49,7 @@ cleanup() {
   fi
   return "$result"
 }
+trap 'echo "ERR command=$BASH_COMMAND line=$LINENO" >&2' ERR
 trap cleanup EXIT
 
 cargo build -p broodd -p brood-client --bins
@@ -64,6 +65,14 @@ cc \
   -Werror \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/virtual-pointer-input.c \
+  -o "$OUT/virtual-pointer-input" \
   "${WAYLAND_BUILD_FLAGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
@@ -182,6 +191,7 @@ env -u brood_session \
   WGPU_BACKEND=vulkan \
   BROOD_DMABUF_HAPPY_PATH=1 \
   BROOD_TRACE_PLUGIN_GRAPHICS=1 \
+  BROOD_TRACE_PLUGIN_TEXT=1 \
   RUST_LOG="$RUST_LOG" \
   target/debug/brood-client \
   --config "$CONFIG" \
@@ -269,6 +279,12 @@ send_page_down() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" --plain 109
+}
+
+send_pointer() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-input" "$@"
 }
 
 capture "$OUT/sidebar-visible.png"
@@ -417,15 +433,71 @@ done
 ((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE))
 capture "$OUT/diff-open.png"
 
-SCROLL_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
-send_page_down
+read -r DIFF_WIDTH DIFF_HEIGHT < <(
+  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+    | sed -n 's/.*sent plugin pane resize pane='"$DIFF_PANE"' logical_size=\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' \
+    | tail -1
+)
+[[ -n "$DIFF_WIDTH" && -n "$DIFF_HEIGHT" ]]
+((DIFF_WIDTH >= 480))
+((DIFF_HEIGHT >= 320))
+
+DRAG_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
+DRAG_PACKETS_BEFORE="$(
+  rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+)"
+DRAG_X=$((DIFF_WIDTH - 8))
+DRAG_START_Y=70
+DRAG_END_Y=$((DIFF_HEIGHT * 2 / 3))
+send_pointer drag "$DRAG_X" "$DRAG_START_Y" "$DRAG_END_Y" 12 1280 720
 for _ in $(seq 1 100); do
-  SCROLL_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
-  ((SCROLL_PACKETS_AFTER > SCROLL_PACKETS_BEFORE)) && break
+  DRAG_PACKETS_AFTER="$(
+    rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+  )"
+  ((DRAG_PACKETS_AFTER >= DRAG_PACKETS_BEFORE + 3)) && break
   sleep 0.05
 done
-((SCROLL_PACKETS_AFTER > SCROLL_PACKETS_BEFORE))
-capture "$OUT/diff-scrolled.png"
+DRAG_PACKET_COUNT=$((DRAG_PACKETS_AFTER - DRAG_PACKETS_BEFORE))
+((DRAG_PACKET_COUNT >= 3))
+DRAG_TEXT_LAYOUTS="$(
+  tail -n "+$((DRAG_LOG_LINE + 1))" "$CLIENT_LOG" \
+    | rg -c "plugin text layout pane=${DIFF_PANE} " \
+    || true
+)"
+capture "$OUT/diff-dragged.png"
+
+TRACKPAD_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
+TRACKPAD_PACKETS_BEFORE="$(
+  rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+)"
+TRACKPAD_STARTED_MS="$(date +%s%3N)"
+send_pointer scroll 220 220 0.5 40 1280 720
+stable_samples=0
+previous_packets="$TRACKPAD_PACKETS_BEFORE"
+for _ in $(seq 1 200); do
+  TRACKPAD_PACKETS_AFTER="$(
+    rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+  )"
+  if ((TRACKPAD_PACKETS_AFTER > TRACKPAD_PACKETS_BEFORE)) \
+    && ((TRACKPAD_PACKETS_AFTER == previous_packets)); then
+    stable_samples=$((stable_samples + 1))
+    ((stable_samples >= 5)) && break
+  else
+    stable_samples=0
+  fi
+  previous_packets="$TRACKPAD_PACKETS_AFTER"
+  sleep 0.01
+done
+TRACKPAD_SETTLED_MS=$(( $(date +%s%3N) - TRACKPAD_STARTED_MS ))
+TRACKPAD_PACKET_COUNT=$((TRACKPAD_PACKETS_AFTER - TRACKPAD_PACKETS_BEFORE))
+((TRACKPAD_PACKET_COUNT >= 2))
+TRACKPAD_TEXT_LAYOUTS="$(
+  tail -n "+$((TRACKPAD_LOG_LINE + 1))" "$CLIENT_LOG" \
+    | rg -c "plugin text layout pane=${DIFF_PANE} " \
+    || true
+)"
+((TRACKPAD_TEXT_LAYOUTS < TRACKPAD_PACKET_COUNT * 40))
+((TRACKPAD_SETTLED_MS < 2000))
 
 CLOSED_LAYOUTS_BEFORE="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
 send_diff_toggle
@@ -448,7 +520,7 @@ python3 - \
   "$OUT/session-beta.png" \
   "$OUT/ctrl-o-terminal.png" \
   "$OUT/diff-open.png" \
-  "$OUT/diff-scrolled.png" \
+  "$OUT/diff-dragged.png" \
   "$OUT/diff-closed.png" <<'PY'
 import pathlib
 import subprocess
@@ -508,8 +580,8 @@ metric = subprocess.run(
 ).stderr
 normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.002:
-    raise SystemExit(f"Page Down did not visibly scroll the project diff: RMSE={normalized}")
-print(f"diff_scroll_capture_rmse={normalized:.6f}")
+    raise SystemExit(f"dragging the scrollbar did not visibly scroll the project diff: RMSE={normalized}")
+print(f"diff_drag_capture_rmse={normalized:.6f}")
 
 metric = subprocess.run(
     ["magick", "compare", "-metric", "RMSE", sys.argv[6], sys.argv[8], "null:"],
@@ -558,8 +630,10 @@ cat > "$OUT/proof.md" <<EOF
 - Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
 - Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
 - close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
-- diff viewer: Ctrl+Alt+D created and focused an ordinary split-diff pane; Page Down redrew scrolled content; the second press stopped the actor and closed its pane
-- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-scrolled.png, diff-closed.png
+- diff viewer: Ctrl+Alt+D created and focused an ordinary split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; the second press stopped the actor and closed its pane
+- diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
+- diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
+- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png
 - status: $STATUS
 EOF
 
@@ -572,6 +646,11 @@ echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"
 echo "ctrl_o=$OUT/ctrl-o-terminal.png"
 echo "diff_open=$OUT/diff-open.png"
-echo "diff_scrolled=$OUT/diff-scrolled.png"
+echo "diff_dragged=$OUT/diff-dragged.png"
 echo "diff_closed=$OUT/diff-closed.png"
+echo "diff_drag_packets=$DRAG_PACKET_COUNT"
+echo "diff_drag_text_layouts=$DRAG_TEXT_LAYOUTS"
+echo "diff_trackpad_settled_ms=$TRACKPAD_SETTLED_MS"
+echo "diff_trackpad_packets=$TRACKPAD_PACKET_COUNT"
+echo "diff_trackpad_text_layouts=$TRACKPAD_TEXT_LAYOUTS"
 echo "ctrl_o_layout_ms=$CTRL_O_LAYOUT_MS"

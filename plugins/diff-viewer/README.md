@@ -7,7 +7,14 @@ The default workspace policy binds the action to `Ctrl+Alt+D`.
 The pane follows Zed's project-diff shape: every changed file appears in one
 continuous, scrollable surface and changed lines are aligned in a split view.
 File headers and hunk headers remain in the same reading flow instead of
-opening one pane per file.
+opening one pane per file. The scrollbar has a generous pointer target: its
+thumb can be dragged, and pressing elsewhere on the track jumps to that
+position before continuing the drag.
+
+High-resolution pointer-scroll deltas are consumed as pixels so touchpads stay
+smooth and proportional. Text layouts shared by overlapping frames are reused;
+the renderer keeps only the resources referenced by the latest submitted
+frame.
 
 Diff collection runs in an actor worker through a read-only workspace grant and
 the allowlisted `git` subprocess capability. It compares tracked changes with

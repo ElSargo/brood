@@ -3,7 +3,10 @@ wit_bindgen::generate!({
     world: "brood-plugin",
 });
 
-use std::sync::Mutex;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
 use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect};
@@ -20,6 +23,10 @@ const HUNK_HEADER_HEIGHT: f32 = 28.0;
 const CODE_ROW_HEIGHT: f32 = 22.0;
 const FILE_GAP_HEIGHT: f32 = 12.0;
 const GUTTER_WIDTH: f32 = 54.0;
+const LEFT_BUTTON: u32 = 0x110;
+const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
+const SCROLLBAR_INSET: f32 = 5.0;
+const SCROLLBAR_THUMB_WIDTH: f32 = 5.0;
 const MAX_DIFF_BYTES: usize = 900 * 1024;
 const MAX_UNTRACKED_FILES: usize = 128;
 
@@ -93,6 +100,34 @@ struct DiffDocument {
     truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    pointer_offset: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarGeometry {
+    track_top: f32,
+    track_height: f32,
+    thumb_y: f32,
+    thumb_height: f32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TextLayoutKey {
+    text: String,
+    font_size: u32,
+    max_width: u32,
+    line_height: u32,
+    color: [u32; 4],
+}
+
+struct TextResources<'a> {
+    pane: u64,
+    layouts: &'a mut BTreeMap<TextLayoutKey, u64>,
+    used: &'a mut BTreeSet<u64>,
+}
+
 struct ViewerState {
     pane: u64,
     width: f32,
@@ -103,7 +138,8 @@ struct ViewerState {
     error: Option<String>,
     next_worker: u64,
     active_worker: Option<u64>,
-    text_resources: Vec<u64>,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    text_layouts: BTreeMap<TextLayoutKey, u64>,
 }
 
 impl ViewerState {
@@ -124,7 +160,8 @@ impl ViewerState {
             error: None,
             next_worker: FIRST_WORKER,
             active_worker: None,
-            text_resources: Vec::new(),
+            scrollbar_drag: None,
+            text_layouts: BTreeMap::new(),
         }
     }
 
@@ -142,6 +179,15 @@ impl ViewerState {
 
     fn clamp_scroll(&mut self) {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+    }
+
+    fn set_scroll(&mut self, scroll: f32) -> bool {
+        let next = scroll.clamp(0.0, self.max_scroll());
+        if (self.scroll - next).abs() < 0.01 {
+            return false;
+        }
+        self.scroll = next;
+        true
     }
 
     fn begin_refresh(&mut self) -> Option<ActorCommand> {
@@ -194,6 +240,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.width = created.width.max(480.0);
             state.height = created.height.max(320.0);
             state.scroll = 0.0;
+            state.scrollbar_drag = None;
             let command = state.begin_refresh();
             redraw_or_record_error(&mut state);
             let mut commands = command.into_iter().collect::<Vec<_>>();
@@ -210,18 +257,57 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             state.width = width;
             state.height = height;
+            state.scrollbar_drag = None;
             state.clamp_scroll();
             redraw_or_record_error(&mut state);
             Vec::new()
         }
-        PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
-            let delta = if scroll.vertical.abs() < 1.0 {
-                scroll.vertical.signum() * 48.0
-            } else {
-                scroll.vertical * 2.0
+        PresentationEvent::PointerMoved(moved)
+            if moved.pane == state.pane && state.scrollbar_drag.is_some() =>
+        {
+            let drag = state.scrollbar_drag.expect("drag checked above");
+            if set_scroll_from_thumb_pointer(&mut state, moved.y, drag.pointer_offset) {
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        PresentationEvent::PointerButton(button)
+            if button.pane == state.pane && button.button == LEFT_BUTTON =>
+        {
+            if !button.pressed {
+                if state.scrollbar_drag.take().is_some() {
+                    redraw_or_record_error(&mut state);
+                }
+                return Vec::new();
+            }
+            let Some(geometry) = scrollbar_geometry(&state) else {
+                return Vec::new();
             };
-            state.scroll = (state.scroll - delta).clamp(0.0, state.max_scroll());
+            let inside_hit_target = button.x >= state.width - SCROLLBAR_HIT_WIDTH
+                && button.x <= state.width
+                && button.y >= geometry.track_top
+                && button.y <= geometry.track_top + geometry.track_height;
+            if !inside_hit_target {
+                return Vec::new();
+            }
+            let pointer_offset = if button.y >= geometry.thumb_y
+                && button.y <= geometry.thumb_y + geometry.thumb_height
+            {
+                button.y - geometry.thumb_y
+            } else {
+                geometry.thumb_height * 0.5
+            };
+            state.scrollbar_drag = Some(ScrollbarDrag { pointer_offset });
+            set_scroll_from_thumb_pointer(&mut state, button.y, pointer_offset);
             redraw_or_record_error(&mut state);
+            Vec::new()
+        }
+        PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
+            // The client already converts wheel lines to pixels while preserving
+            // high-resolution touchpad deltas. Consume those pixels directly.
+            if apply_pointer_scroll(&mut state, scroll.vertical) {
+                redraw_or_record_error(&mut state);
+            }
             Vec::new()
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed && !key.repeat => {
@@ -302,8 +388,23 @@ fn redraw_or_record_error(state: &mut ViewerState) {
 }
 
 fn redraw(state: &mut ViewerState) -> Result<(), String> {
+    let mut text_layouts = std::mem::take(&mut state.text_layouts);
+    let result = redraw_with_layouts(state, &mut text_layouts);
+    state.text_layouts = text_layouts;
+    result
+}
+
+fn redraw_with_layouts(
+    state: &ViewerState,
+    text_layouts: &mut BTreeMap<TextLayoutKey, u64>,
+) -> Result<(), String> {
     let mut packet = Packet::new();
-    let mut resources = Vec::new();
+    let mut used_layouts = BTreeSet::new();
+    let mut text_resources = TextResources {
+        pane: state.pane,
+        layouts: text_layouts,
+        used: &mut used_layouts,
+    };
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: BG,
@@ -317,9 +418,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
         color: BORDER,
     });
     add_text(
-        state,
         &mut packet,
-        &mut resources,
+        &mut text_resources,
         "Project Diff",
         17.0,
         TEXT,
@@ -336,9 +436,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
         )
     };
     add_text(
-        state,
         &mut packet,
-        &mut resources,
+        &mut text_resources,
         &summary,
         13.0,
         if state.loading { MODIFIED } else { MUTED },
@@ -347,9 +446,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
         (state.width - 390.0).max(120.0),
     )?;
     add_text(
-        state,
         &mut packet,
-        &mut resources,
+        &mut text_resources,
         "R refresh   Ctrl+Alt+D close",
         12.0,
         MUTED,
@@ -382,7 +480,15 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
     for row in &state.document.rows {
         let height = row.height();
         if y + height >= content_top && y <= content_bottom {
-            draw_row(state, &mut packet, &mut resources, row, y, height, split_x)?;
+            draw_row(
+                state,
+                &mut packet,
+                &mut text_resources,
+                row,
+                y,
+                height,
+                split_x,
+            )?;
         }
         y += height;
         if y > content_bottom {
@@ -393,9 +499,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
 
     if state.document.rows.is_empty() && state.error.is_none() {
         add_text(
-            state,
             &mut packet,
-            &mut resources,
+            &mut text_resources,
             if state.loading {
                 "Loading project changes…"
             } else {
@@ -408,9 +513,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
             state.width - 48.0,
         )?;
         add_text(
-            state,
             &mut packet,
-            &mut resources,
+            &mut text_resources,
             if state.loading {
                 "Git runs in a worker; the pane remains responsive."
             } else {
@@ -430,9 +534,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
             color: DELETED_BG,
         });
         add_text(
-            state,
             &mut packet,
-            &mut resources,
+            &mut text_resources,
             "Could not load project diff",
             17.0,
             DELETED,
@@ -441,9 +544,8 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
             state.width - 60.0,
         )?;
         add_text(
-            state,
             &mut packet,
-            &mut resources,
+            &mut text_resources,
             &one_line(error, 180),
             13.0,
             FG,
@@ -466,12 +568,11 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
     let footer = if state.document.truncated {
         "Diff capped at 900 KiB · refine the change set or review from the CLI"
     } else {
-        "Scroll or use j/k, Page Up/Down, Home, and End"
+        "Scroll or drag the bar · j/k, Page Up/Down, Home, and End"
     };
     add_text(
-        state,
         &mut packet,
-        &mut resources,
+        &mut text_resources,
         footer,
         11.0,
         MUTED,
@@ -483,17 +584,25 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
     let bytes = packet.encode().map_err(|error| error.to_string())?;
     host::graphics_submit_draw_packet(state.pane, &bytes)
         .map_err(|error| format!("submit diff viewer: {error:?}"))?;
-    for handle in state.text_resources.drain(..) {
+
+    let stale = text_resources
+        .layouts
+        .iter()
+        .filter_map(|(key, handle)| (!text_resources.used.contains(handle)).then_some(key.clone()))
+        .collect::<Vec<_>>();
+    for key in stale {
+        let Some(handle) = text_resources.layouts.remove(&key) else {
+            continue;
+        };
         let _ = host::graphics_drop_resource(state.pane, handle);
     }
-    state.text_resources = resources;
     Ok(())
 }
 
 fn draw_row(
     state: &ViewerState,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    text_resources: &mut TextResources<'_>,
     row: &DisplayRow,
     y: f32,
     height: f32,
@@ -514,9 +623,8 @@ fn draw_row(
                 color: BORDER,
             });
             add_text(
-                state,
                 packet,
-                resources,
+                text_resources,
                 &one_line(path, 160),
                 14.0,
                 TEXT,
@@ -525,9 +633,8 @@ fn draw_row(
                 state.width - 160.0,
             )?;
             add_text(
-                state,
                 packet,
-                resources,
+                text_resources,
                 &format!("+{additions}  −{deletions}"),
                 12.0,
                 MUTED,
@@ -542,9 +649,8 @@ fn draw_row(
                 color: Color::rgba(ACTIVE.r, ACTIVE.g, ACTIVE.b, 0.58),
             });
             add_text(
-                state,
                 packet,
-                resources,
+                text_resources,
                 &one_line(header, 180),
                 12.0,
                 MUTED,
@@ -594,9 +700,8 @@ fn draw_row(
             });
             if let Some(line) = old_line {
                 add_text(
-                    state,
                     packet,
-                    resources,
+                    text_resources,
                     &line.to_string(),
                     11.0,
                     LINE_NUMBER,
@@ -607,9 +712,8 @@ fn draw_row(
             }
             if let Some(line) = new_line {
                 add_text(
-                    state,
                     packet,
-                    resources,
+                    text_resources,
                     &line.to_string(),
                     11.0,
                     LINE_NUMBER,
@@ -622,9 +726,8 @@ fn draw_row(
             let right_chars = ((right_width - GUTTER_WIDTH - 16.0) / 7.2).max(8.0) as usize;
             if let Some(text) = left {
                 add_text(
-                    state,
                     packet,
-                    resources,
+                    text_resources,
                     &one_line(&expand_tabs(text), left_chars),
                     12.0,
                     FG,
@@ -635,9 +738,8 @@ fn draw_row(
             }
             if let Some(text) = right {
                 add_text(
-                    state,
                     packet,
-                    resources,
+                    text_resources,
                     &one_line(&expand_tabs(text), right_chars),
                     12.0,
                     FG,
@@ -653,28 +755,75 @@ fn draw_row(
 }
 
 fn draw_scrollbar(state: &ViewerState, packet: &mut Packet) {
+    let Some(geometry) = scrollbar_geometry(state) else {
+        return;
+    };
+    let dragging = state.scrollbar_drag.is_some();
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(
+            state.width - SCROLLBAR_INSET - SCROLLBAR_THUMB_WIDTH,
+            geometry.thumb_y,
+            SCROLLBAR_THUMB_WIDTH,
+            geometry.thumb_height,
+        ),
+        radius: SCROLLBAR_THUMB_WIDTH * 0.5,
+        color: Color::rgba(FG.r, FG.g, FG.b, if dragging { 0.72 } else { 0.42 }),
+    });
+}
+
+fn scrollbar_geometry(state: &ViewerState) -> Option<ScrollbarGeometry> {
     let content_height = state.content_height();
     let viewport = state.viewport_height();
     if content_height <= viewport {
-        return;
+        return None;
     }
-    let track_height = viewport - 10.0;
-    let thumb_height = (track_height * viewport / content_height).max(28.0);
-    let thumb_y = HEADER_HEIGHT
-        + 5.0
-        + (track_height - thumb_height) * state.scroll / state.max_scroll().max(1.0);
-    packet.push(Command::FillRoundedRect {
-        rect: Rect::new(state.width - 6.0, thumb_y, 3.0, thumb_height),
-        radius: 1.5,
-        color: Color::rgba(FG.r, FG.g, FG.b, 0.35),
-    });
+    let track_top = HEADER_HEIGHT + SCROLLBAR_INSET;
+    let track_height = (viewport - SCROLLBAR_INSET * 2.0).max(1.0);
+    let thumb_height = (track_height * viewport / content_height)
+        .max(28.0)
+        .min(track_height);
+    let travel = (track_height - thumb_height).max(0.0);
+    let thumb_y = track_top + travel * state.scroll / state.max_scroll().max(1.0);
+    Some(ScrollbarGeometry {
+        track_top,
+        track_height,
+        thumb_y,
+        thumb_height,
+    })
+}
+
+fn set_scroll_from_thumb_pointer(
+    state: &mut ViewerState,
+    pointer_y: f32,
+    pointer_offset: f32,
+) -> bool {
+    if !pointer_y.is_finite() {
+        return false;
+    }
+    let Some(geometry) = scrollbar_geometry(state) else {
+        return false;
+    };
+    let travel = (geometry.track_height - geometry.thumb_height).max(0.0);
+    if travel == 0.0 {
+        return state.set_scroll(0.0);
+    }
+    let thumb_y =
+        (pointer_y - pointer_offset).clamp(geometry.track_top, geometry.track_top + travel);
+    state.set_scroll((thumb_y - geometry.track_top) / travel * state.max_scroll())
+}
+
+fn apply_pointer_scroll(state: &mut ViewerState, vertical: f32) -> bool {
+    if !vertical.is_finite() || vertical == 0.0 {
+        return false;
+    }
+    let next = state.scroll - vertical;
+    state.set_scroll(next)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    state: &ViewerState,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    resources: &mut TextResources<'_>,
     text: &str,
     size: f32,
     color: Color,
@@ -682,23 +831,43 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = host::graphics_layout_text(
-        state.pane,
-        text,
-        host::TextLayoutOptions {
-            font_size: size,
-            max_width: max_width.max(1.0),
-            line_height: size + 3.0,
-            red: color.r,
-            green: color.g,
-            blue: color.b,
-            alpha: color.a,
-        },
-    )
-    .map_err(|error| format!("layout diff text: {error:?}"))?;
-    resources.push(layout.handle);
+    let max_width = max_width.max(1.0);
+    let line_height = size + 3.0;
+    let key = TextLayoutKey {
+        text: text.to_string(),
+        font_size: size.to_bits(),
+        max_width: max_width.to_bits(),
+        line_height: line_height.to_bits(),
+        color: [
+            color.r.to_bits(),
+            color.g.to_bits(),
+            color.b.to_bits(),
+            color.a.to_bits(),
+        ],
+    };
+    let handle = if let Some(handle) = resources.layouts.get(&key) {
+        *handle
+    } else {
+        let layout = host::graphics_layout_text(
+            resources.pane,
+            text,
+            host::TextLayoutOptions {
+                font_size: size,
+                max_width,
+                line_height,
+                red: color.r,
+                green: color.g,
+                blue: color.b,
+                alpha: color.a,
+            },
+        )
+        .map_err(|error| format!("layout diff text: {error:?}"))?;
+        resources.layouts.insert(key, layout.handle);
+        layout.handle
+    };
+    resources.used.insert(handle);
     packet.push(Command::DrawTextLayout {
-        layout: layout.handle,
+        layout: handle,
         x,
         y,
     });
@@ -1268,5 +1437,57 @@ rename to new.txt
         assert!(document.rows.iter().any(
             |row| matches!(row, DisplayRow::Hunk(message) if message == "Binary file changed")
         ));
+    }
+
+    fn scrollable_state() -> ViewerState {
+        let mut state = ViewerState::new();
+        state.height = 720.0;
+        state.document.rows = (0..100)
+            .map(|line| DisplayRow::Code {
+                old_line: Some(line),
+                new_line: Some(line),
+                left: Some(format!("old {line}")),
+                right: Some(format!("new {line}")),
+                kind: ChangeKind::Context,
+            })
+            .collect();
+        state
+    }
+
+    #[test]
+    fn scrollbar_thumb_maps_the_full_scroll_range() {
+        let mut state = scrollable_state();
+        let at_top = scrollbar_geometry(&state).unwrap();
+        assert_eq!(at_top.thumb_y, at_top.track_top);
+
+        state.scroll = state.max_scroll();
+        let at_bottom = scrollbar_geometry(&state).unwrap();
+        assert!(
+            (at_bottom.thumb_y + at_bottom.thumb_height
+                - (at_bottom.track_top + at_bottom.track_height))
+                .abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn dragging_thumb_to_track_bottom_scrolls_to_end() {
+        let mut state = scrollable_state();
+        let geometry = scrollbar_geometry(&state).unwrap();
+        assert!(set_scroll_from_thumb_pointer(
+            &mut state,
+            geometry.track_top + geometry.track_height,
+            geometry.thumb_height * 0.5,
+        ));
+        assert!((state.scroll - state.max_scroll()).abs() < 0.01);
+    }
+
+    #[test]
+    fn high_resolution_scroll_deltas_are_not_inflated() {
+        let mut state = scrollable_state();
+        state.scroll = 100.0;
+        assert!(apply_pointer_scroll(&mut state, -0.25));
+        assert!((state.scroll - 100.25).abs() < f32::EPSILON);
+        assert!(!apply_pointer_scroll(&mut state, f32::NAN));
     }
 }
