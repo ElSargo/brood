@@ -17,7 +17,17 @@ remains required by the target design.
 
 The presentation endpoint should not own authoritative editor, session, app, or pane state. It owns presentation behavior such as layout, visibility, animation, dragging, and hit testing, and may save preferences back to the workspace.
 
-The client maps local plugin panes and received managed windows together with
+The client keeps a catalog of every available managed window with its session
+and application identity, independently from received frame resources. The
+server publishes that catalog atomically through a dedicated shared-memory
+lane; the client does not poll DBus to discover visibility changes. The
+default workspace maps the active session's window IDs, while layout actors may
+select any catalogued windows. Layout output is committed before frame import;
+missing frames appear as placeholders and replace those placeholders in place
+when ready. The server does not use session membership to filter export, size,
+focus, or pane-local input.
+
+The client maps local plugin panes and selected managed windows together with
 the selected flat layout. One client-owned focus target drives input: keys are
 first offered to the client-local synchronous key-policy provider with an
 immutable snapshot of that combined pane inventory. Consumed focus and

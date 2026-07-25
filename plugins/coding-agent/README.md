@@ -1,9 +1,11 @@
 # Coding agent actor workload
 
 This plugin is a vertical slice of the target Manifold agent architecture. The
-session root creates independently addressed coding-agent actors. The client
-root creates a separate canvas UI actor, which subscribes to the session
-registry and to each selected agent through ordinary actor messages.
+default session init actor preserves its terminal startup behavior while also
+creating independently addressed coding-agent actors. The default client init
+actor preserves the session switcher while also creating separate canvas UI
+actors. Each UI subscribes to the session registry and to each selected agent
+through ordinary actor messages.
 
 Each agent owns its model and reasoning configuration, turn state, subscribers,
 and event log. A private worker runs one Codex turn through the capability-

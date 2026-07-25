@@ -7,14 +7,22 @@ last-reviewed: 2026-07-24
 
 # Presentation Surface
 
-A presentation surface is one independent viewport onto one session. It owns pane visibility, placement, dragging, animation, local focus routing, hit testing, native chrome, and final input routing for what it currently shows. Two presentation surfaces may arrange the same session differently; the backend does not own one canonical viewport layout.
+A presentation surface is one independent viewport over the available window
+catalog. It owns pane visibility, placement, dragging, animation, local focus
+routing, hit testing, native chrome, and final input routing for what it
+currently shows. Session membership is metadata the client may use when
+choosing a view; it is not a backend mapping boundary. Two presentation
+surfaces may show different subsets or arrange the same windows differently.
 
 A presentation surface runs in a portable presentation client with its own
 actors, local state, recursive layout-lease tree, WGPU device, and final
-renderer. It discovers backend windows cheaply and subscribes only to the frame
-streams it needs. One presentation lease holder controls hosted Wayland sizing
-and primary application input for a session. The session server has no
-in-process presentation endpoint. See [[../systems/presentation-client]].
+renderer. It receives stable window identities with their session membership
+before frame readiness and subscribes only to the frame streams it needs. A
+layout may place an available window immediately; the client shows a
+placeholder until that window's frame is mapped. One presentation lease holder
+controls hosted Wayland sizing and primary application input. The session
+server has no in-process presentation endpoint. See
+[[../systems/presentation-client]].
 
 Presentation state is not pane state. A presentation surface may save layout or visibility preferences locally or explicitly coordinate them into session storage, but the pane remains owned by its producer or session state.
 

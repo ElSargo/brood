@@ -104,6 +104,20 @@ pub const FRAME_FOCUS_PRESENTATION: u32 = 0x103;
 /// Ask the external presentation client to close its operating-system window.
 pub const FRAME_CLOSE_PRESENTATION: u32 = 0x104;
 
+/// Begin one atomic presentation catalog snapshot.
+///
+/// The record sequence is the catalog revision. Argument zero is the encoded
+/// payload length and argument one is the number of following chunk records.
+pub const CATALOG_SNAPSHOT_BEGIN: u32 = 0x200;
+/// Carry up to 40 bytes of one catalog snapshot.
+///
+/// The low byte of `flags` is the number of valid bytes in `arguments`.
+pub const CATALOG_SNAPSHOT_CHUNK: u32 = 0x201;
+/// End and publish one atomic presentation catalog snapshot.
+pub const CATALOG_SNAPSHOT_END: u32 = 0x202;
+/// Bytes available in one catalog chunk record.
+pub const CATALOG_CHUNK_BYTES: usize = size_of::<[u64; 5]>();
+
 /// Preserve one signed 32-bit protocol value in a record argument.
 #[must_use]
 pub fn encode_i32_argument(value: i32) -> u64 {

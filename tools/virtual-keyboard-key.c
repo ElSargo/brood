@@ -147,12 +147,19 @@ static uint32_t monotonic_milliseconds(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fail("usage: virtual-keyboard-key <linux-evdev-keycode>");
+    bool ctrl_only = false;
+    const char *keycode = NULL;
+    if (argc == 2) {
+        keycode = argv[1];
+    } else if (argc == 3 && strcmp(argv[1], "--ctrl-only") == 0) {
+        ctrl_only = true;
+        keycode = argv[2];
+    } else {
+        fail("usage: virtual-keyboard-key [--ctrl-only] <linux-evdev-keycode>");
     }
     char *end = NULL;
-    unsigned long parsed = strtoul(argv[1], &end, 10);
-    if (end == argv[1] || *end != '\0' || parsed > UINT32_MAX) {
+    unsigned long parsed = strtoul(keycode, &end, 10);
+    if (end == keycode || *end != '\0' || parsed > UINT32_MAX) {
         fail("the keycode must be an unsigned 32-bit integer");
     }
 
@@ -205,10 +212,11 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         fail("the compositor rejected the virtual keyboard keymap");
     }
-    usleep(100000);
-
-    uint32_t modifiers =
-        modifier_mask(keymap, XKB_MOD_NAME_CTRL) | modifier_mask(keymap, XKB_MOD_NAME_ALT);
+    usleep(10000);
+    uint32_t modifiers = modifier_mask(keymap, XKB_MOD_NAME_CTRL);
+    if (!ctrl_only) {
+        modifiers |= modifier_mask(keymap, XKB_MOD_NAME_ALT);
+    }
     uint32_t time = monotonic_milliseconds();
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
@@ -224,7 +232,7 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         fail("the compositor rejected the virtual keyboard modifiers");
     }
-    usleep(50000);
+    usleep(10000);
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
         1,
@@ -238,7 +246,7 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         fail("the virtual keyboard key press failed");
     }
-    usleep(50000);
+    usleep(10000);
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
         1,
@@ -263,8 +271,7 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         fail("the virtual keyboard request failed");
     }
-    usleep(100000);
-
+    usleep(10000);
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
         3,

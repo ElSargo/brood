@@ -16,6 +16,7 @@ use std::{
     cell::RefCell,
     env, fmt, fs,
     io::Error as IoError,
+    mem::size_of,
     os::fd::OwnedFd,
     path::PathBuf,
     rc::Rc,
@@ -61,6 +62,28 @@ use crate::state::{Manifold, SESSION_OUTPUT_REFRESH_MILLIHZ};
 
 type ExportAllocator = DmabufAllocator<GbmAllocator<DrmDeviceFd>>;
 pub type SharedFrameExporter = Rc<RefCell<FrameExporter>>;
+
+#[derive(serde::Serialize)]
+struct CatalogSnapshot {
+    active_session: u64,
+    sessions: Vec<CatalogSession>,
+    windows: Vec<CatalogWindow>,
+}
+
+#[derive(serde::Serialize)]
+struct CatalogSession {
+    id: u64,
+    name: String,
+    active: bool,
+    windows: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CatalogWindow {
+    pane: u64,
+    session: u64,
+    app_id: String,
+}
 
 #[derive(Debug)]
 pub struct FrameExporter {
@@ -181,6 +204,9 @@ pub fn initialize(state: &mut Manifold) -> Result<()> {
 /// attached. Backpressure is represented by the fast path's in-flight and
 /// pending-redraw fields; no backend presentation target is involved.
 pub fn request_redraw(state: &mut Manifold) {
+    if let Err(failure) = publish_catalog_snapshot(state) {
+        record_failure(state, &failure);
+    }
     let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
         return;
     };
@@ -200,6 +226,114 @@ pub fn request_redraw(state: &mut Manifold) {
         Ok(()) => state.stats.record_frame(started.elapsed()),
         Err(failure) => record_failure(state, &failure),
     }
+}
+
+/// Publish the latest session and managed-window catalog over its dedicated
+/// shared-memory lane. Identical latest state is coalesced.
+pub fn publish_catalog_snapshot(
+    state: &mut Manifold,
+) -> std::result::Result<(), FrameExportFailure> {
+    if state.dmabuf.fast_path.is_none() {
+        return Ok(());
+    }
+    let payload = CatalogSnapshot {
+        active_session: state.active_surface_session().raw(),
+        sessions: state
+            .surface_session_summaries()
+            .into_iter()
+            .map(|session| CatalogSession {
+                id: session.id,
+                name: session.name,
+                active: session.active,
+                windows: u64::try_from(session.windows).unwrap_or(u64::MAX),
+            })
+            .collect(),
+        windows: state
+            .presentation_window_summaries()
+            .into_iter()
+            .map(|window| CatalogWindow {
+                pane: window.pane,
+                session: window.session,
+                app_id: window.app_id,
+            })
+            .collect(),
+    };
+    let payload = serde_json::to_vec(&payload)
+        .map_err(|error| FrameExportFailure::new("encode_catalog_snapshot", error))?;
+    let chunk_count = payload.len().div_ceil(manifold_ipc::CATALOG_CHUNK_BYTES);
+    if chunk_count.saturating_add(2) > manifold_ipc::CRITICAL_CAPACITY {
+        return Err(FrameExportFailure::new(
+            "publish_catalog_snapshot",
+            format!(
+                "encoded catalog requires {} records but the lane holds {}",
+                chunk_count.saturating_add(2),
+                manifold_ipc::CRITICAL_CAPACITY
+            ),
+        ));
+    }
+
+    let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
+        return Ok(());
+    };
+    if fast_path.last_catalog_payload == payload {
+        return Ok(());
+    }
+    let revision = fast_path.catalog_revision.wrapping_add(1);
+    let publish_result = (|| {
+        fast_path
+            .catalog
+            .try_send(manifold_ipc::CriticalRecord {
+                opcode: manifold_ipc::CATALOG_SNAPSHOT_BEGIN,
+                connection_generation: fast_path.generation,
+                sequence: revision,
+                arguments: [
+                    u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                    u64::try_from(chunk_count).unwrap_or(u64::MAX),
+                    0,
+                    0,
+                    0,
+                ],
+                ..manifold_ipc::CriticalRecord::default()
+            })
+            .map_err(|record| FrameExportFailure::new("publish_catalog_begin", record))?;
+        for chunk in payload.chunks(manifold_ipc::CATALOG_CHUNK_BYTES) {
+            let mut arguments = [0_u64; 5];
+            for (word, bytes) in arguments.iter_mut().zip(chunk.chunks(size_of::<u64>())) {
+                let mut encoded = [0_u8; size_of::<u64>()];
+                if let Some(target) = encoded.get_mut(..bytes.len()) {
+                    target.copy_from_slice(bytes);
+                }
+                *word = u64::from_ne_bytes(encoded);
+            }
+            fast_path
+                .catalog
+                .try_send(manifold_ipc::CriticalRecord {
+                    opcode: manifold_ipc::CATALOG_SNAPSHOT_CHUNK,
+                    flags: u32::try_from(chunk.len()).unwrap_or(u32::MAX),
+                    connection_generation: fast_path.generation,
+                    sequence: revision,
+                    arguments,
+                })
+                .map_err(|record| FrameExportFailure::new("publish_catalog_chunk", record))?;
+        }
+        fast_path
+            .catalog
+            .try_send(manifold_ipc::CriticalRecord {
+                opcode: manifold_ipc::CATALOG_SNAPSHOT_END,
+                connection_generation: fast_path.generation,
+                sequence: revision,
+                ..manifold_ipc::CriticalRecord::default()
+            })
+            .map_err(|record| FrameExportFailure::new("publish_catalog_end", record))
+    })();
+    fast_path
+        .catalog_notifications
+        .notify()
+        .map_err(|error| FrameExportFailure::new("notify_catalog_snapshot", error))?;
+    publish_result?;
+    fast_path.catalog_revision = revision;
+    fast_path.last_catalog_payload = payload;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -664,7 +798,7 @@ fn record_failure(state: &mut Manifold, failure: &FrameExportFailure) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FrameExportFailure {
+pub struct FrameExportFailure {
     context: &'static str,
     detail: String,
 }

@@ -270,6 +270,13 @@ let
         wasm-tools component new "$component_core" --output "$component_output"
         wasm-tools validate "$component_output"
         wasm-tools component wit "$component_output" >/dev/null
+
+        # The preserved session and presentation init actors supervise coding
+        # agent children from their own package roots.
+        install -D "$component_output" \
+          examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm
+        install -D "$component_output" \
+          plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm
       fi
 
       if [[ -f plugins/component-workspace-watch/Cargo.toml ]]; then

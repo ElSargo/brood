@@ -21,6 +21,8 @@ The compositor:
 - assigns stable pane identities and surface-session membership;
 - processes commits, subsurfaces, popups, and frame callbacks;
 - exports one atomic surface-tree frame stream per managed pane;
+- reports each managed pane's session membership without using it as a
+  visibility filter;
 - applies content-size requests and pane-local input authorized by the active
   presentation lease;
 - keeps applications and their latest state alive without a connected frontend.
@@ -44,7 +46,8 @@ the server connection.
 Physical input first enters the presentation client. After client-local key
 policy and layout hit testing, managed-pane events cross the bounded input lane
 with a pane identity and pane-local coordinates. The server resolves only that
-pane's Wayland surface tree and delivers the corresponding seat events.
+pane's Wayland surface tree and delivers the corresponding seat events. It does
+not reject a pane merely because another session is currently selected.
 
 ## Diagnostics
 

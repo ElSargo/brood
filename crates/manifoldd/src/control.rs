@@ -74,6 +74,7 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 type DbusMetadata = BTreeMap<String, String>;
 type DbusSurfaceSession = (u64, String, bool, u64);
+type DbusPresentationWindow = (u64, u64, String);
 type DbusExtension = (String, String, String, DbusMetadata);
 type DbusGrant = (String, String, String, String, bool, DbusMetadata);
 type DbusStatusItem = (String, String, String, String, DbusMetadata);
@@ -94,6 +95,9 @@ type DbusDmabufFrame = (
 );
 type DbusFastPath = (
     u64,
+    u64,
+    zvariant::OwnedFd,
+    zvariant::OwnedFd,
     zvariant::OwnedFd,
     zvariant::OwnedFd,
     zvariant::OwnedFd,
@@ -122,6 +126,7 @@ type ControlResponse = DbusResponse<String>;
 type BoolResponse = DbusResponse<bool>;
 type U64Response = DbusResponse<u64>;
 type SessionListResponse = DbusResponse<Vec<DbusSurfaceSession>>;
+type PresentationWindowListResponse = DbusResponse<Vec<DbusPresentationWindow>>;
 type ExtensionListResponse = DbusResponse<Vec<DbusExtension>>;
 type GrantListResponse = DbusResponse<Vec<DbusGrant>>;
 type StatusListResponse = DbusResponse<Vec<DbusStatusItem>>;
@@ -153,6 +158,9 @@ enum DbusStateRequest {
     },
     ListSurfaceSessions {
         response: SessionListResponse,
+    },
+    ListPresentationWindows {
+        response: PresentationWindowListResponse,
     },
     ActiveSession {
         response: U64Response,
@@ -441,6 +449,13 @@ impl SessionDbus {
     async fn list_surface_sessions(&self) -> fdo::Result<Vec<DbusSurfaceSession>> {
         request_state(&self.sender, |response| {
             DbusStateRequest::ListSurfaceSessions { response }
+        })
+        .await
+    }
+
+    async fn list_presentation_windows(&self) -> fdo::Result<Vec<DbusPresentationWindow>> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::ListPresentationWindows { response }
         })
         .await
     }
@@ -1014,6 +1029,7 @@ trait ManifoldManager {
 trait ManifoldSession {
     fn current_status(&self) -> zbus::Result<String>;
     fn list_surface_sessions(&self) -> zbus::Result<Vec<DbusSurfaceSession>>;
+    fn list_presentation_windows(&self) -> zbus::Result<Vec<DbusPresentationWindow>>;
     fn activate_surface_session(&self, id: u64) -> zbus::Result<bool>;
     fn create_surface_session(&self, name: String) -> zbus::Result<u64>;
     fn rename_surface_session(&self, id: u64, name: String) -> zbus::Result<bool>;
@@ -2308,6 +2324,15 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
             let sessions = dbus_surface_sessions(state.surface_session_summaries());
             send_response(response, Ok(sessions));
         }
+        DbusStateRequest::ListPresentationWindows { response } => {
+            state.refresh_window_state();
+            let windows = state
+                .presentation_window_summaries()
+                .into_iter()
+                .map(|window| (window.pane, window.session, window.app_id))
+                .collect();
+            send_response(response, Ok(windows));
+        }
         DbusStateRequest::ActiveSession { response } => {
             send_response(response, Ok(state.active_surface_session().raw()));
         }
@@ -2570,6 +2595,12 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Manifold) {
         } => send_response(response, state.dismiss_extension_window(&window_id)),
     }
 
+    if let Err(error) = crate::frame_export::publish_catalog_snapshot(state) {
+        warn!(
+            ?error,
+            "publish presentation catalog after DBus request failed"
+        );
+    }
     if let Err(err) = state.display_handle.flush_clients() {
         warn!(?err, "flush clients after DBus request failed");
     }
@@ -2587,18 +2618,27 @@ static FAST_PATH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     let generation = FAST_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let active_session = if state.surface_session_count() == 0 {
+        0
+    } else {
+        state.active_surface_session().raw()
+    };
     let input_file = manifold_ipc::CriticalLaneFile::create(generation)?;
     let frame_file = manifold_ipc::CriticalLaneFile::create(generation)?;
+    let catalog_file = manifold_ipc::CriticalLaneFile::create(generation)?;
     let actor_message_file = manifold_ipc::ActorMessageLaneFile::create(generation)?;
     let presentation_message_file = manifold_ipc::ActorMessageLaneFile::create(generation)?;
     let input_notifications = manifold_ipc::EventNotifier::create()?;
     let frame_notifications = manifold_ipc::EventNotifier::create()?;
+    let catalog_notifications = manifold_ipc::EventNotifier::create()?;
     let actor_message_notifications = manifold_ipc::EventNotifier::create()?;
     let presentation_message_notifications = manifold_ipc::EventNotifier::create()?;
     let input_fd = input_file.as_fd().try_clone_to_owned()?;
     let input_notify_fd = input_notifications.as_fd().try_clone_to_owned()?;
     let frame_fd = frame_file.as_fd().try_clone_to_owned()?;
     let frame_notify_fd = frame_notifications.as_fd().try_clone_to_owned()?;
+    let catalog_fd = catalog_file.as_fd().try_clone_to_owned()?;
+    let catalog_notify_fd = catalog_notifications.as_fd().try_clone_to_owned()?;
     let actor_message_fd = actor_message_file.as_fd().try_clone_to_owned()?;
     let actor_message_notify_fd = actor_message_notifications.as_fd().try_clone_to_owned()?;
     let presentation_message_fd = presentation_message_file.as_fd().try_clone_to_owned()?;
@@ -2607,6 +2647,7 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
         .try_clone_to_owned()?;
     let input = manifold_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
     let frames = manifold_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
+    let catalog = manifold_ipc::CriticalProducer::map(catalog_file.as_fd(), generation)?;
     let actor_messages =
         manifold_ipc::ActorMessageConsumer::map(actor_message_file.as_fd(), generation)?;
     let presentation_messages =
@@ -2615,9 +2656,13 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
         generation,
         input,
         frames,
+        catalog,
         actor_messages,
         presentation_messages,
         frame_notifications,
+        catalog_notifications,
+        catalog_revision: 0,
+        last_catalog_payload: Vec::new(),
         presentation_message_notifications,
         presentation_message_sequence: 0,
         deferred_presentation_messages: std::collections::VecDeque::new(),
@@ -2661,10 +2706,13 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
         .map_err(|error| anyhow::anyhow!("install actor-message notification: {error}"))?;
     Ok((
         generation,
+        active_session,
         input_fd.into(),
         input_notify_fd.into(),
         frame_fd.into(),
         frame_notify_fd.into(),
+        catalog_fd.into(),
+        catalog_notify_fd.into(),
         actor_message_fd.into(),
         actor_message_notify_fd.into(),
         presentation_message_fd.into(),

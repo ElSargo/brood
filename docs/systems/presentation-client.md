@@ -14,8 +14,9 @@ last-reviewed: 2026-07-24
 
 Manifold separates the durable session server from the software that presents
 and interacts with it. A presentation client is an independent viewport over
-one session. It owns layout, interaction state, presentation actors, GPU
-resources, and final rendering.
+the available window catalog. It owns layout, interaction state, presentation
+actors, GPU resources, and final rendering. Sessions remain grouping and
+sandbox boundaries, not pane-visibility boundaries.
 
 The normal case is zero or one interactive presentation client. A session
 continues running with no client. Additional observers are permitted, but only
@@ -31,7 +32,7 @@ The session server owns:
 - durable session actors, resources, and operations;
 - revisioned pane inventory and demand-driven per-window frame production;
 - presentation connection and lease authority;
-- validation of managed-pane focus, input, and requested content sizes.
+- validation of managed-pane identity, input, and requested content sizes.
 
 The presentation client owns:
 
@@ -42,6 +43,14 @@ The presentation client owns:
 - the recursive layout-lease tree, visibility, focus, chrome, and animation;
 - final WGPU composition, hit testing, accessibility projection, and capture;
 - managed-window subscriptions and frame import.
+
+The client receives every available managed-window identity together with its
+session membership and application identity. This catalog is independent from
+frame readiness. A session switch changes the client's default visible subset
+and immediately publishes a new layout-state revision; accepted placement is
+shown at once, with client-rendered placeholders until the selected windows'
+frames arrive. Layout actors may instead choose any authorized catalog entries,
+including windows from more than one session.
 
 No final placement rectangle, z order, clipping rule, sidebar geometry, or
 viewport hit-test result crosses the server boundary.
@@ -116,6 +125,11 @@ configuration authority.
 Window inventory describes stable producer identity, session membership,
 application identity, committed content extent, and transport capabilities.
 Snapshots are revisioned; a delta gap forces resynchronization.
+Inventory invalidation is event driven. Periodic snapshot comparison is only a
+recovery mechanism and must never determine user-visible interaction latency.
+Local clients receive atomic catalog snapshots through a dedicated
+server-to-client shared-memory lane with eventfd wakeups. DBus remains the
+descriptor bootstrap and asynchronous command path, not the catalog transport.
 
 Frame work is demand driven. Each subscription has bounded in-flight ownership
 and explicit acquire, release, cancellation, and disconnect behavior.
@@ -137,6 +151,12 @@ generation, and inventory revision. It submits a lease-local candidate through
 its ordinary host outbox. The client authenticates the holder, validates pane
 authority and revision, recursively composes the complete tree, clips child
 subtrees, canonicalizes paint order, and selects an eligible focus request.
+Catalog and session changes publish a new inventory revision without replacing
+the currently accepted actor layout. The client keeps that layout and its
+relevant window resources visible until the complete replacement layout is
+accepted, then swaps layouts atomically and releases panes the replacement no
+longer references. Native fallback is startup and failure recovery, not an
+intermediate session-switch state.
 
 The default session switcher claims the root, places its pane on the right, and
 delegates `rest` to the workspace actor. Hiding and showing are ordinary

@@ -64,6 +64,24 @@ wasm-tools component new \
   --output "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
 cargo build \
+  --manifest-path examples/wasm-init-actor/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm \
+  --output "$PACKAGE/manifold_wasm_init_actor_example.component.wasm"
+wasm-tools validate "$PACKAGE/manifold_wasm_init_actor_example.component.wasm"
+cargo build \
+  --manifest-path plugins/session-switcher/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
+  --output "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -76,8 +94,8 @@ target/debug/manifold-client \
 
 cat > "$CONFIG" <<EOF
 [init]
-session = "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
-client = "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
+session = "$PACKAGE/manifold_wasm_init_actor_example.component.wasm"
+client = "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
 
 [client.key-policy]
 provider = "workspace"

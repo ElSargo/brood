@@ -27,6 +27,14 @@ cargo build \
 cargo run --quiet -p manifold-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
   plugins/session-switcher/manifold_session_switcher_plugin.component.wasm
+cargo build \
+  --manifest-path plugins/coding-agent/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p manifold-wasm --example componentize -- \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm \
+  plugins/session-switcher/manifold_coding_agent_plugin.component.wasm
 
 target/debug/manifold-client \
   --no-server \
