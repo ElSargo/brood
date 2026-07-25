@@ -199,7 +199,7 @@ rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
 for _ in $(seq 1 200); do
   if rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG" \
@@ -209,7 +209,7 @@ for _ in $(seq 1 200); do
   sleep 0.1
 done
 rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG"
@@ -219,7 +219,6 @@ read -r SIDEBAR_WIDTH SIDEBAR_HEIGHT < <(
     | tail -1
 )
 [[ -n "$SIDEBAR_WIDTH" && -n "$SIDEBAR_HEIGHT" ]]
-FULL_WIDTH=$((SIDEBAR_WIDTH + 320))
 
 for _ in $(seq 1 100); do
   if rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
@@ -253,10 +252,10 @@ send_open_terminal() {
 
 capture "$OUT/sidebar-visible.png"
 
-accepted_before="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+accepted_before="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
 ctl surface-session switch Beta > /dev/null
 for _ in $(seq 1 100); do
-  accepted_after="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  accepted_after="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
   if rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && ((accepted_after > accepted_before)); then
     break
@@ -276,24 +275,28 @@ for _ in $(seq 1 100); do
 done
 ((gamma_snapshots_after > gamma_snapshots_before))
 
-full_width_resizes="$(rg -c "requested managed window resize .* logical_size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
-full_width_frames="$(rg -c "imported window DMA-BUF .* size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
-next_full_width_resizes="$full_width_resizes"
-next_full_width_frames="$full_width_frames"
+managed_resizes="$(rg -c "requested managed window resize .* logical_size=[0-9]+x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+HIDDEN_WIDTH="$SIDEBAR_WIDTH"
 for _ in 1 2; do
   send_toggle
   for _ in $(seq 1 40); do
-    next_full_width_resizes="$(rg -c "requested managed window resize .* logical_size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
-    next_full_width_frames="$(rg -c "imported window DMA-BUF .* size=${FULL_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
-    if ((next_full_width_resizes > full_width_resizes)) \
-      && ((next_full_width_frames > full_width_frames)); then
+    next_managed_resizes="$(rg -c "requested managed window resize .* logical_size=[0-9]+x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
+    HIDDEN_WIDTH="$(
+      sed -n 's/.*requested managed window resize .* logical_size=\([0-9][0-9]*\)x'"${SIDEBAR_HEIGHT}"'.*/\1/p' \
+        "$CLIENT_LOG" \
+        | tail -1
+    )"
+    if ((next_managed_resizes > managed_resizes)) \
+      && ((HIDDEN_WIDTH > SIDEBAR_WIDTH)) \
+      && rg -q "imported window DMA-BUF .* size=${HIDDEN_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"; then
       break 2
     fi
     sleep 0.05
   done
 done
-((next_full_width_resizes > full_width_resizes))
-((next_full_width_frames > full_width_frames))
+((next_managed_resizes > managed_resizes))
+((HIDDEN_WIDTH > SIDEBAR_WIDTH))
+rg -q "imported window DMA-BUF .* size=${HIDDEN_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
 capture "$OUT/sidebar-hidden.png"
 
 sidebar_resizes="$(rg -c "requested managed window resize .* logical_size=${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" || true)"
@@ -318,7 +321,7 @@ CTRL_O_INPUT_PID=$!
 for _ in $(seq 1 200); do
   if rg -q "total_windows=3" <<< "$(ctl status)" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"; then
     break
   fi
@@ -328,21 +331,21 @@ wait "$CTRL_O_INPUT_PID"
 CTRL_O_LAYOUT_MS=$(( $(date +%s%3N) - CTRL_O_STARTED_MS ))
 rg -q "total_windows=3" <<< "$(ctl status)"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"
 ((CTRL_O_LAYOUT_MS < 150))
 capture "$OUT/ctrl-o-terminal.png"
 
 CATALOG_TWO_BEFORE="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
-LAYOUT_TWO_BEFORE="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+LAYOUT_THREE_BEFORE="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
 CLOSE_STARTED_MS="$(date +%s%3N)"
 ctl close-pane 3 > /dev/null
 for _ in $(seq 1 200); do
   CATALOG_TWO_AFTER="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
-  LAYOUT_TWO_AFTER="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  LAYOUT_THREE_AFTER="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
   if rg -q "total_windows=2" <<< "$(ctl status)" \
     && ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE)) \
-    && ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE)); then
+    && ((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE)); then
     break
   fi
   sleep 0.01
@@ -350,7 +353,7 @@ done
 CLOSE_LAYOUT_MS=$(( $(date +%s%3N) - CLOSE_STARTED_MS ))
 rg -q "total_windows=2" <<< "$(ctl status)"
 ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
-((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE))
+((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE))
 ((CLOSE_LAYOUT_MS < 150))
 
 python3 - \
@@ -411,7 +414,7 @@ PY
 
 STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
-rg -q "accepted leased actor layout .* panes=1" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
 if rg -q "rejected actor-submitted layout" "$CLIENT_LOG"; then
   echo "ERR client rejected a recursive layout update" >&2
@@ -438,10 +441,10 @@ cat > "$OUT/proof.md" <<EOF
 - transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
-- hidden: managed pane resized to ${FULL_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment
+- hidden: managed pane resized to ${HIDDEN_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment
 - restored: managed pane returned to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}
-- Ctrl+O: spawned foot in Gamma, expanded the layout to three panes, and imported its DMA-BUF
-- Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted three-pane layout
+- Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
+- Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
 - close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
 - captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
 - status: $STATUS
