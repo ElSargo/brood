@@ -1910,11 +1910,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
                 if let Some(snapshot) = session {
                     self.latest_session_snapshot = Some(snapshot.clone());
-                    if let Some(runtime) = self.wasm_runtime.as_ref()
-                        && let Err(error) =
+                    if let Some(runtime) = self.wasm_runtime.as_mut() {
+                        runtime.bind_session(snapshot.active);
+                        if let Err(error) =
                             runtime.broadcast_session_event(&SessionEvent::Snapshot(snapshot))
-                    {
-                        self.fail(event_loop, error);
+                        {
+                            self.fail(event_loop, error);
+                        }
                     }
                 }
             }

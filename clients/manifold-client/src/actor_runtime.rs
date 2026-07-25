@@ -149,14 +149,17 @@ impl PresentationWasmRuntime {
         session_id: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<()> {
-        let artifact = WasmPluginArtifact::load(path)?;
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("resolve client init actor {}", path.display()))?;
+        let artifact = WasmPluginArtifact::load(&path)?;
         ensure!(
             matches!(artifact, WasmPluginArtifact::Component { .. }),
             "realm init actor must be a Component Model actor"
         );
         let spec = PresentationActorSpec {
             id: CLIENT_INIT_ACTOR_ID.to_string(),
-            path: path.to_path_buf(),
+            path: path.clone(),
         };
         let actor = self.executor.block_on(load_hosted_actor(
             &spec,
@@ -752,6 +755,10 @@ impl PresentationWasmRuntime {
 
     pub const fn bound_session_id(&self) -> Option<u64> {
         self.bound_session_id
+    }
+
+    pub const fn bind_session(&mut self, session_id: u64) {
+        self.bound_session_id = Some(session_id);
     }
 
     pub fn send_actor_message(

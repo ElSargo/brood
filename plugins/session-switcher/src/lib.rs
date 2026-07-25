@@ -6,8 +6,9 @@ wit_bindgen::generate!({
 use std::sync::Mutex;
 
 use exports::manifold::plugin::actor::{
-    ActorStartRequest, Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
-    SessionCommand, SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
+    ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
+    LocalActorMessage, PresentationEvent, SessionCommand, SessionCommandCompleted, SessionEvent,
+    SessionOperation, SessionSnapshot,
 };
 use manifold::plugin::host;
 use manifold_graphics::{Color, Command, Packet, Rect};
@@ -16,6 +17,8 @@ use serde::Deserialize;
 const INIT_ACTOR_ID: &str = "manifold.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
 const COMPONENT_FILE: &str = "manifold_session_switcher_plugin.component.wasm";
+const CODING_AGENT_COMPONENT_FILE: &str = "manifold_coding_agent_plugin.component.wasm";
+const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
 const HEADER_HEIGHT: f32 = 104.0;
@@ -50,6 +53,7 @@ enum EditMode {
 
 struct SwitcherState {
     pane: u64,
+    session_id: u64,
     sidebar_visible: bool,
     width: f32,
     height: f32,
@@ -62,6 +66,8 @@ struct SwitcherState {
     pending: Option<u64>,
     status: String,
     error: bool,
+    next_coding_agent_ui: u64,
+    coding_agent_uis: Vec<String>,
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
@@ -118,10 +124,17 @@ struct SidebarActionMessage {
     action: serde_json_core::heapless::String<32>,
 }
 
+#[derive(Deserialize)]
+struct CodingAgentActionMessage {
+    kind: serde_json_core::heapless::String<32>,
+    action: serde_json_core::heapless::String<32>,
+}
+
 impl SwitcherState {
     const fn new() -> Self {
         Self {
             pane: 0,
+            session_id: 0,
             sidebar_visible: true,
             width: 320.0,
             height: 720.0,
@@ -134,6 +147,8 @@ impl SwitcherState {
             pending: None,
             status: String::new(),
             error: false,
+            next_coding_agent_ui: 2,
+            coding_agent_uis: Vec::new(),
             text_resources: Vec::new(),
             layout: None,
             workspace_focus: None,
@@ -217,12 +232,16 @@ impl Guest for SessionSwitcher {
         match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 if context.instance_id == INIT_ACTOR_ID {
+                    if let Ok(mut state) = STATE.lock() {
+                        state.session_id = context.session_id.unwrap_or_default();
+                    }
                     vec![
                         ActorCommand::StartActor(ActorStartRequest {
                             id: CHILD_ACTOR_ID.to_string(),
                             path: COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
                         }),
+                        start_coding_agent_ui(CODING_AGENT_UI_ID),
                         ActorCommand::LifecycleComplete(Ok(())),
                     ]
                 } else {
@@ -231,6 +250,32 @@ impl Guest for SessionSwitcher {
             }
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
+            }
+            Event::Child(ChildEvent::Started(started))
+                if started.id == CODING_AGENT_UI_ID
+                    || started.id.starts_with("coding-agent-ui-") =>
+            {
+                let Ok(mut state) = STATE.lock() else {
+                    return Vec::new();
+                };
+                if !state.coding_agent_uis.contains(&started.id) {
+                    state.coding_agent_uis.push(started.id.clone());
+                }
+                vec![bind_coding_agent_ui(&started.id, state.session_id)]
+            }
+            Event::Child(ChildEvent::Stopped(id)) => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.coding_agent_uis.retain(|actor| actor != &id);
+                }
+                Vec::new()
+            }
+            Event::Child(ChildEvent::Failed(failed)) => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.coding_agent_uis.retain(|actor| actor != &failed.id);
+                    state.error = true;
+                    state.status = format!("Agent UI failed: {}", failed.message);
+                }
+                Vec::new()
             }
             Event::Presentation(event) => handle_presentation(event),
             Event::Session(event) => handle_session_event(event),
@@ -253,14 +298,28 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    match event {
-        SessionEvent::Snapshot(snapshot) => apply_snapshot(&mut state, snapshot),
+    let commands = match event {
+        SessionEvent::Snapshot(snapshot) => {
+            let active_changed = state.session_id != snapshot.active;
+            state.session_id = snapshot.active;
+            apply_snapshot(&mut state, snapshot);
+            if active_changed {
+                state
+                    .coding_agent_uis
+                    .iter()
+                    .map(|actor| bind_coding_agent_ui(actor, state.session_id))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
         SessionEvent::CommandCompleted(completion) => {
             apply_completion(&mut state, completion);
+            Vec::new()
         }
-    }
+    };
     redraw_or_record_error(&mut state);
-    Vec::new()
+    commands
 }
 
 fn apply_snapshot(state: &mut SwitcherState, snapshot: SessionSnapshot) {
@@ -416,6 +475,20 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
 }
 
 fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
+    {
+        if consumed == bytes.len()
+            && message.kind.as_str() == "coding-agent-action"
+            && message.action.as_str() == "new-ui"
+        {
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
+            state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
+            return vec![start_coding_agent_ui(&id)];
+        }
+    }
     let Ok((message, consumed)) = serde_json_core::from_slice::<SidebarActionMessage>(bytes) else {
         return Vec::new();
     };
@@ -455,6 +528,21 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
     publish_layout(&state, false, requested_focus)
 }
 
+fn start_coding_agent_ui(id: &str) -> ActorCommand {
+    ActorCommand::StartActor(ActorStartRequest {
+        id: id.to_string(),
+        path: CODING_AGENT_COMPONENT_FILE.to_string(),
+        capabilities: Vec::new(),
+    })
+}
+
+fn bind_coding_agent_ui(id: &str, session_id: u64) -> ActorCommand {
+    ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: id.to_string(),
+        body: format!(r#"{{"kind":"bind","session_id":{session_id}}}"#).into_bytes(),
+    })
+}
+
 fn publish_layout(
     state: &SwitcherState,
     allow_delegation: bool,
@@ -469,12 +557,7 @@ fn publish_layout(
         .iter()
         .copied()
         .filter(|visible| *visible != pane)
-        .chain(
-            message
-                .available_windows
-                .iter()
-                .map(|window| window.pane),
-        )
+        .chain(message.available_windows.iter().map(|window| window.pane))
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
                 panes.push(candidate);

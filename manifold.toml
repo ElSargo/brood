@@ -1,6 +1,6 @@
 [init]
-session = "plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm"
-client = "plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm"
+session = "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.component.wasm"
+client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.component.wasm"
 
 [client.key-policy]
 provider = "workspace"
@@ -19,7 +19,7 @@ capabilities = [
 ]
 
 [startup.agent]
-enabled = false
+enabled = true
 argv = ["foot", "--app-id", "pi-foot", "pi"]
 
 [session.runner]

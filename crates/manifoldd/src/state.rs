@@ -3554,7 +3554,10 @@ impl Manifold {
             self.session_init_actor.is_none(),
             "session init actor is already configured"
         );
-        let artifact = manifold_wasm::WasmPluginArtifact::load(path)?;
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("resolve session init actor {}", path.display()))?;
+        let artifact = manifold_wasm::WasmPluginArtifact::load(&path)?;
         ensure!(
             matches!(
                 artifact,
@@ -3562,7 +3565,7 @@ impl Manifold {
             ),
             "realm init actor must be a Component Model actor"
         );
-        self.session_init_actor = Some(path.to_path_buf());
+        self.session_init_actor = Some(path);
         let sessions = self.sessions.sessions().to_vec();
         for session in sessions {
             self.start_session_init_actor(session)?;

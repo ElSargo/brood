@@ -73,11 +73,14 @@ generation, lease, revision, and pane ownership before composing the complete
 tree. It then canonicalizes transforms and z order, clips children, selects
 focus, builds hit-test regions, and derives managed-pane size requests.
 
-The default client init actor starts the session switcher. The switcher claims
-the root, places its pane on the right, and delegates `rest` to the workspace
-actor. Its visible state belongs to the plugin. The key policy sends an
-ordinary sidebar action; the plugin republishes its root fragment to focus,
-hide, or restore itself.
+The default client init actor starts the session switcher and the initial
+coding-agent UI as independently addressed children. The switcher claims the
+root, places its pane on the right, and delegates `rest` to the workspace
+actor, where the agent UI and session windows are composed. Its visible state
+belongs to the plugin. The key policy sends ordinary sidebar and new-agent-UI
+actions to the init actor; the relevant actor updates its child graph or
+republishes its layout fragment. Session-catalogue changes rebind each agent UI
+to the active session's agent registry.
 
 ## Input
 

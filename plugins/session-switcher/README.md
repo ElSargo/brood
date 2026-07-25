@@ -2,10 +2,15 @@
 
 This is the default presentation-local Manifold shell plugin. The same
 Component Model artifact runs first as the blessed client init actor and starts
-one child actor which owns a native plugin pane. The child receives typed
+the child actor which owns the native session-switcher pane. The init actor
+also starts and supervises coding-agent UI children, so adding the agent
+workload does not replace the default shell. The switcher child receives typed
 session snapshots from `manifold-client`, renders them through canvas packets,
 and requests typed session operations without DBus, subprocesses, or a native
 toolkit inside the plugin.
+
+When the active surface session changes, the init actor rebinds every coding
+agent UI child to that session's independently supervised agent registry.
 
 The child claims the root layout lease, keeps its own pane in a right sidebar,
 and asks the host to delegate every other pane through its `rest` slot to the
