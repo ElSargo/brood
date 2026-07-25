@@ -159,7 +159,7 @@ struct ReferencedResources {
 impl PluginGraphicsBridge {
     pub fn new(proxy: EventLoopProxy<ClientEvent>) -> Self {
         let shared = Arc::new(Mutex::new(GraphicsState::default()));
-        let glyph_raster_tx = start_glyph_raster_worker(shared.clone(), proxy.clone());
+        let glyph_raster_tx = start_glyph_raster_worker(Arc::clone(&shared), proxy.clone());
         Self {
             shared,
             text_layout: Arc::new(Mutex::new(FontSystem::new())),
@@ -225,10 +225,14 @@ fn start_glyph_raster_worker(
                             if plan.width != request.width || plan.height != request.height {
                                 return Err(PresentationError::HostFailure);
                             }
-                            rasterize_text_layout(&mut text_system, plan, request.options)
+                            Ok(rasterize_text_layout(
+                                &mut text_system,
+                                &plan,
+                                request.options,
+                            ))
                         });
                 let elapsed = started.elapsed();
-                finish_glyph_raster(&shared, &proxy, request, result);
+                finish_glyph_raster(&shared, &proxy, &request, result);
                 if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8
                 {
                     eprintln!(
@@ -247,7 +251,7 @@ fn start_glyph_raster_worker(
 fn finish_glyph_raster(
     shared: &Mutex<GraphicsState>,
     proxy: &EventLoopProxy<ClientEvent>,
-    request: GlyphRasterRequest,
+    request: &GlyphRasterRequest,
     result: Result<TextLayoutResource, PresentationError>,
 ) {
     let notification = {
@@ -779,9 +783,9 @@ fn create_text_layout_plan(
 
 fn rasterize_text_layout(
     text_system: &mut TextSystem,
-    plan: TextLayoutPlan,
+    plan: &TextLayoutPlan,
     options: TextLayoutOptions,
-) -> Result<TextLayoutResource, PresentationError> {
+) -> TextLayoutResource {
     let requested_color = options.color.map(unit_to_u8);
     let positioned = plan
         .buffer
@@ -818,12 +822,12 @@ fn rasterize_text_layout(
         });
         glyph_images.insert(key, image);
     }
-    Ok(TextLayoutResource {
+    TextLayoutResource {
         width: plan.width,
         height: plan.height,
         glyphs: sprites.into(),
         glyph_images,
-    })
+    }
 }
 
 fn glyph_image_resource(
@@ -867,7 +871,7 @@ fn glyph_image_resource(
                 return None;
             }
             for source in image.data.chunks_exact(4) {
-                let coverage = source[..3].iter().copied().max().unwrap_or(0);
+                let coverage = source.iter().take(3).copied().max().unwrap_or(0);
                 pixels.extend_from_slice(&premultiplied_glyph_color(requested_color, coverage));
             }
         }
@@ -945,26 +949,39 @@ mod tests {
     }
 
     #[test]
-    fn pending_text_dependencies_hold_a_scene_until_all_are_ready() {
+    fn pending_text_dependencies_hold_a_scene_until_all_are_ready() -> Result<()> {
         let mut state = GraphicsState::default();
         state.text_layouts.insert(1, pending_text_entry());
         state.text_layouts.insert(2, pending_text_entry());
         let packet = text_packet(&[1, 2]);
 
-        let pending =
-            referenced_resources(&state, 7, 11, &packet).expect("pending handles resolve");
-        assert!(!pending.ready);
+        let pending = referenced_resources(&state, 7, 11, &packet)?;
+        anyhow::ensure!(!pending.ready, "pending dependencies reported ready");
 
-        state.text_layouts.get_mut(&1).unwrap().state = TextLayoutState::Ready(ready_text_layout());
-        let partly_ready =
-            referenced_resources(&state, 7, 11, &packet).expect("ready handle resolves");
-        assert!(!partly_ready.ready);
+        state
+            .text_layouts
+            .get_mut(&1)
+            .ok_or_else(|| anyhow!("first pending text layout is missing"))?
+            .state = TextLayoutState::Ready(ready_text_layout());
+        let partly_ready = referenced_resources(&state, 7, 11, &packet)?;
+        anyhow::ensure!(
+            !partly_ready.ready,
+            "partly ready dependencies reported ready"
+        );
 
-        state.text_layouts.get_mut(&2).unwrap().state = TextLayoutState::Ready(ready_text_layout());
-        let ready = referenced_resources(&state, 7, 11, &packet).expect("all handles resolve");
-        assert!(ready.ready);
-        assert_eq!(ready.text_layouts.len(), 2);
-        assert!(ready.glyphs.is_empty());
+        state
+            .text_layouts
+            .get_mut(&2)
+            .ok_or_else(|| anyhow!("second pending text layout is missing"))?
+            .state = TextLayoutState::Ready(ready_text_layout());
+        let ready = referenced_resources(&state, 7, 11, &packet)?;
+        anyhow::ensure!(ready.ready, "ready dependencies remained pending");
+        anyhow::ensure!(
+            ready.text_layouts.len() == 2,
+            "ready dependency count changed"
+        );
+        anyhow::ensure!(ready.glyphs.is_empty(), "unexpected glyph dependencies");
+        Ok(())
     }
 
     #[test]

@@ -265,27 +265,26 @@ impl GpuGlyphAtlas {
                 .allocate(padded_width, padded_height)
                 .map(|origin| (page, origin))
         });
-        let (page, (outer_x, outer_y)) = match allocation {
-            Some(allocation) => allocation,
-            None => {
-                let page = self.pages.len();
-                let mut atlas_page = GlyphAtlasPage {
-                    texture: create_empty_texture(
-                        device,
-                        layout,
-                        sampler,
-                        (GLYPH_ATLAS_PAGE_SIZE, GLYPH_ATLAS_PAGE_SIZE),
-                        &format!("plugin GPU glyph atlas page {page}"),
-                    ),
-                    allocator: GlyphAtlasPageAllocator::default(),
-                };
-                let origin = atlas_page
-                    .allocator
-                    .allocate(padded_width, padded_height)
-                    .ok_or_else(|| anyhow!("glyph is too large for an atlas page"))?;
-                self.pages.push(atlas_page);
-                (page, origin)
-            }
+        let (page, (outer_x, outer_y)) = if let Some(allocation) = allocation {
+            allocation
+        } else {
+            let page = self.pages.len();
+            let mut atlas_page = GlyphAtlasPage {
+                texture: create_empty_texture(
+                    device,
+                    layout,
+                    sampler,
+                    (GLYPH_ATLAS_PAGE_SIZE, GLYPH_ATLAS_PAGE_SIZE),
+                    &format!("plugin GPU glyph atlas page {page}"),
+                ),
+                allocator: GlyphAtlasPageAllocator::default(),
+            };
+            let origin = atlas_page
+                .allocator
+                .allocate(padded_width, padded_height)
+                .ok_or_else(|| anyhow!("glyph is too large for an atlas page"))?;
+            self.pages.push(atlas_page);
+            (page, origin)
         };
         let padded_bytes = usize::try_from(padded_width)
             .ok()
@@ -314,13 +313,30 @@ impl GpuGlyphAtlas {
                 .and_then(|row| row.checked_mul(destination_stride))
                 .and_then(|offset| offset.checked_add(GLYPH_ATLAS_PADDING as usize * 4))
                 .context("glyph atlas offset overflow")?;
-            pixels[destination_start..destination_start + source_stride].copy_from_slice(
-                &resource.linear_premultiplied_rgba8[source_start..source_start + source_stride],
-            );
+            let source_end = source_start
+                .checked_add(source_stride)
+                .context("glyph source range overflow")?;
+            let destination_end = destination_start
+                .checked_add(source_stride)
+                .context("glyph atlas range overflow")?;
+            let source = resource
+                .linear_premultiplied_rgba8
+                .get(source_start..source_end)
+                .context("glyph source row is out of bounds")?;
+            let destination = pixels
+                .get_mut(destination_start..destination_end)
+                .context("glyph atlas row is out of bounds")?;
+            destination.copy_from_slice(source);
         }
+        let page_texture = &self
+            .pages
+            .get(page)
+            .context("allocated glyph atlas page is missing")?
+            .texture
+            .texture;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.pages[page].texture.texture,
+                texture: page_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: outer_x,
@@ -1783,74 +1799,6 @@ const fn plus_blend() -> wgpu::BlendState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn glyph_atlas_allocator_wraps_rows_without_overlap() {
-        let mut allocator = GlyphAtlasPageAllocator::default();
-        assert_eq!(allocator.allocate(600, 10), Some((0, 0)));
-        assert_eq!(allocator.allocate(600, 20), Some((0, 10)));
-        assert_eq!(allocator.allocate(400, 5), Some((600, 10)));
-        assert_eq!(allocator.allocate(GLYPH_ATLAS_PAGE_SIZE + 1, 1), None);
-    }
-
-    #[test]
-    fn adjacent_atlas_glyphs_share_one_draw() {
-        let mut compiler = SceneCompiler::new(100, 100, 1.0);
-        let state = CompileState::default();
-        for x in [0.0, 10.0] {
-            let geometry = compiler
-                .quad_geometry_with_uv(
-                    Rect::new(x, 0.0, 8.0, 12.0),
-                    Transform::IDENTITY,
-                    [1.0; 4],
-                    [0.0, 0.0, 0.1, 0.1],
-                )
-                .expect("glyph quad");
-            compiler.push_draw(geometry, DrawSource::GlyphAtlas(0), &state);
-        }
-        assert_eq!(compiler.ops.len(), 1);
-        let CanvasOp::Draw(draw) = &compiler.ops[0] else {
-            panic!("expected a merged draw");
-        };
-        assert_eq!(draw.geometry.indices, 0..12);
-
-        let geometry = compiler
-            .quad_geometry_with_uv(
-                Rect::new(20.0, 0.0, 8.0, 12.0),
-                Transform::IDENTITY,
-                [1.0; 4],
-                [0.0, 0.0, 0.1, 0.1],
-            )
-            .expect("second-page glyph quad");
-        compiler.push_draw(geometry, DrawSource::GlyphAtlas(1), &state);
-        assert_eq!(compiler.ops.len(), 2);
-    }
-
-    #[test]
-    fn advanced_blend_draws_are_not_coalesced() {
-        let mut compiler = SceneCompiler::new(100, 100, 1.0);
-        let state = CompileState {
-            blend_mode: BlendMode::Multiply,
-            ..CompileState::default()
-        };
-        for x in [0.0, 10.0] {
-            let geometry = compiler
-                .quad_geometry_with_uv(
-                    Rect::new(x, 0.0, 8.0, 12.0),
-                    Transform::IDENTITY,
-                    [1.0; 4],
-                    [0.0, 0.0, 0.1, 0.1],
-                )
-                .expect("glyph quad");
-            compiler.push_draw(geometry, DrawSource::GlyphAtlas(0), &state);
-        }
-        assert_eq!(compiler.ops.len(), 2);
-    }
-}
-
 const CANVAS_SHADER: &str = r"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -1946,3 +1894,76 @@ fn composite_blend(input: VertexOutput, blended: vec3<f32>) -> vec4<f32> {
     return composite_blend(input, abs(straight(dst.rgb, dst.a) - straight(src.rgb, src.a)));
 }
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_atlas_allocator_wraps_rows_without_overlap() {
+        let mut allocator = GlyphAtlasPageAllocator::default();
+        assert_eq!(allocator.allocate(600, 10), Some((0, 0)));
+        assert_eq!(allocator.allocate(600, 20), Some((0, 10)));
+        assert_eq!(allocator.allocate(400, 5), Some((600, 10)));
+        assert_eq!(allocator.allocate(GLYPH_ATLAS_PAGE_SIZE + 1, 1), None);
+    }
+
+    #[test]
+    fn adjacent_atlas_glyphs_share_one_draw() -> Result<()> {
+        let mut compiler = SceneCompiler::new(100, 100, 1.0);
+        let state = CompileState::default();
+        for x in [0.0, 10.0] {
+            let geometry = compiler.quad_geometry_with_uv(
+                Rect::new(x, 0.0, 8.0, 12.0),
+                Transform::IDENTITY,
+                [1.0; 4],
+                [0.0, 0.0, 0.1, 0.1],
+            )?;
+            compiler.push_draw(geometry, DrawSource::GlyphAtlas(0), &state);
+        }
+        anyhow::ensure!(compiler.ops.len() == 1, "adjacent glyphs did not merge");
+        let Some(CanvasOp::Draw(draw)) = compiler.ops.first() else {
+            return Err(anyhow!("expected a merged draw"));
+        };
+        anyhow::ensure!(
+            draw.geometry.indices == (0..12),
+            "merged draw has the wrong index range"
+        );
+
+        let geometry = compiler.quad_geometry_with_uv(
+            Rect::new(20.0, 0.0, 8.0, 12.0),
+            Transform::IDENTITY,
+            [1.0; 4],
+            [0.0, 0.0, 0.1, 0.1],
+        )?;
+        compiler.push_draw(geometry, DrawSource::GlyphAtlas(1), &state);
+        anyhow::ensure!(
+            compiler.ops.len() == 2,
+            "glyphs from different atlas pages merged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn advanced_blend_draws_are_not_coalesced() -> Result<()> {
+        let mut compiler = SceneCompiler::new(100, 100, 1.0);
+        let state = CompileState {
+            blend_mode: BlendMode::Multiply,
+            ..CompileState::default()
+        };
+        for x in [0.0, 10.0] {
+            let geometry = compiler.quad_geometry_with_uv(
+                Rect::new(x, 0.0, 8.0, 12.0),
+                Transform::IDENTITY,
+                [1.0; 4],
+                [0.0, 0.0, 0.1, 0.1],
+            )?;
+            compiler.push_draw(geometry, DrawSource::GlyphAtlas(0), &state);
+        }
+        anyhow::ensure!(
+            compiler.ops.len() == 2,
+            "advanced blend draws were coalesced"
+        );
+        Ok(())
+    }
+}

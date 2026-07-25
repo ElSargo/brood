@@ -66,11 +66,7 @@ export WGPU_BACKEND=gl
 unset DISPLAY WAYLAND_DISPLAY brood_session BROOD_SURFACE_SESSION_ID
 unset BROODD_DBUS_ADDRESS BROODD_DBUS_DESTINATION
 
-dbus_args=(--session)
-if [[ -n "${DBUS_SESSION_BUS_CONFIG:-}" ]]; then
-  dbus_args=(--config-file "$DBUS_SESSION_BUS_CONFIG")
-fi
-dbus_info="$(dbus-daemon "${dbus_args[@]}" --fork --print-address=1 --print-pid=1)"
+dbus_info="$(dbus-daemon --session --fork --print-address=1 --print-pid=1)"
 DBUS_SESSION_BUS_ADDRESS="$(sed -n '1p' <<< "$dbus_info")"
 DBUS_SESSION_BUS_PID="$(sed -n '2p' <<< "$dbus_info")"
 export DBUS_SESSION_BUS_ADDRESS

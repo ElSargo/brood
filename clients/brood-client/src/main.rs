@@ -3824,12 +3824,11 @@ impl Renderer {
     }
 
     fn clear_fulfilled_pending_focus(&mut self, requested: Option<u64>) {
-        if requested.is_some() && requested == self.focused_pane_id() {
+        if let Some(requested) = requested
+            && Some(requested) == self.focused_pane_id()
+        {
             self.pending_focus_pane = None;
-            eprintln!(
-                "fulfilled deferred pane focus pane={}",
-                requested.expect("checked pending pane")
-            );
+            eprintln!("fulfilled deferred pane focus pane={requested}");
         }
     }
 
