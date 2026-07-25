@@ -26,6 +26,7 @@ The session server:
 
 - creates the nested Wayland display and session catalogue;
 - starts the control endpoint and publishes its connection environment;
+- starts the daemon actor realm independently of the session catalogue;
 - starts session init actors and configured durable applications;
 - accepts presentation-client handshakes and grants bounded protocol lanes;
 - publishes revisioned pane inventory and per-window frame streams;

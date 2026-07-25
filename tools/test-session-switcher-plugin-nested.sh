@@ -58,11 +58,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p broodd -p brood-client --bins
+cargo build -p broodd -p brood-client --bins --locked
 cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
-  --release
+  --release \
+  --locked
 read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
 cc \
   -std=c11 \
@@ -99,6 +100,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/worktree-manager/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.wasm \
+  "$PACKAGE/brood_worktree_manager_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -109,9 +118,11 @@ cargo run --quiet -p brood-wasm --example componentize -- \
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
-  --release
+  --release \
+  --locked
 
-printf '[init]\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
+printf '[init]\nbackend = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
+  "$PACKAGE/brood_worktree_manager_plugin.component.wasm" \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm" \
   "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm" \
   > "$CONFIG"
@@ -120,10 +131,10 @@ RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,
 (
   cd "$PROJECT"
   env -u brood_session \
+    XDG_DATA_HOME="$DATA_HOME" \
     RUST_LOG="$RUST_LOG" \
     "$ROOT/target/debug/brood-sessiond" \
     --headless \
-    --no-init \
     --no-default-modules \
     --config "$CONFIG" \
     --dbus-destination "$DBUS_DESTINATION" \
@@ -453,7 +464,59 @@ PY
 )
 [[ -d "$WORKTREE_DIRECTORY" ]]
 [[ "$(git -C "$WORKTREE_DIRECTORY" branch --show-current)" == "picker-worktree" ]]
+WORKTREE_PARENT="${WORKTREE_DIRECTORY%/*}"
+WORKTREE_NAME="${WORKTREE_DIRECTORY##*/}"
+WORKTREE_METADATA="$WORKTREE_PARENT/$WORKTREE_NAME.brood-worktree.json"
+for _ in $(seq 1 100); do
+  if python3 - "$WORKTREE_METADATA" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(0 if metadata["session"] == int(sys.argv[2]) else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+python3 - "$WORKTREE_METADATA" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert metadata["session"] == int(sys.argv[2])
+assert metadata["branch"] == "picker-worktree"
+assert pathlib.Path(metadata["path"]).resolve().parent == pathlib.Path(sys.argv[1]).parent.resolve()
+PY
+rg -q "actor=brood.backend-init" "$SERVER_LOG"
+rg -q "attached managed worktree session" "$SERVER_LOG"
 capture "$OUT/worktree-created.png"
+
+WORKTREE_COMPLETIONS_BEFORE="$(
+  rg -c "operation=CreateWorktree success=true" "$CLIENT_LOG"
+)"
+click_at 1260 123
+submit_text picker-worktree
+for _ in $(seq 1 100); do
+  WORKTREE_COMPLETIONS_AFTER="$(
+    rg -c "operation=CreateWorktree success=true" "$CLIENT_LOG"
+  )"
+  SESSION_JSON="$(ctl surface-session list-json)"
+  MATCHING_WORKTREE_SESSIONS="$(
+    python3 -c 'import json,sys; print(sum(s["name"] == "picker-worktree" for s in json.load(sys.stdin)["sessions"]))' \
+      <<< "$SESSION_JSON"
+  )"
+  if ((WORKTREE_COMPLETIONS_AFTER > WORKTREE_COMPLETIONS_BEFORE)) \
+    && [[ "$MATCHING_WORKTREE_SESSIONS" == "1" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+((WORKTREE_COMPLETIONS_AFTER > WORKTREE_COMPLETIONS_BEFORE))
+[[ "$MATCHING_WORKTREE_SESSIONS" == "1" ]]
 
 ctl spawn weston-simple-shm > /dev/null
 for _ in $(seq 1 100); do
@@ -570,6 +633,30 @@ if sed -n '/presentation layout source changed source=actor/,$p' "$CLIENT_LOG" \
   exit 1
 fi
 
+ctl close-session "$WORKTREE_SESSION_ID" > /dev/null
+for _ in $(seq 1 100); do
+  if python3 - "$WORKTREE_METADATA" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(0 if metadata["session"] is None else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+python3 - "$WORKTREE_METADATA" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert metadata["session"] is None
+PY
+
 cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
@@ -579,6 +666,8 @@ cat > "$OUT/proof.md" <<EOF
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
 - projects: two Git repositories rendered as distinct collapsible project lists
 - worktree: branch picker-worktree was checked out beneath $DATA_HOME/brood/worktrees and activated as a new session
+- retry: requesting the same branch reused the checkout and existing session
+- occupation: closing that session persisted an unoccupied worktree record
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
 - transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}

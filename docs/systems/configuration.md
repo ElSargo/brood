@@ -27,7 +27,7 @@ Current discovery order:
 
 Current section families:
 
-- `[init]` for the session and client realm root actors
+- `[init]` for the daemon, session, and client realm root actors
 - `[client.key-policy]` for the presentation client's synchronous policy provider
 - `[module.<id>]` for startup modules
 - `[startup.<id>]` for startup hosted apps
@@ -38,12 +38,13 @@ Current supported module kinds load self-contained WASM plugin artifacts:
 - `plugin`
 - `wasm-plugin`
 
-`[init]` selects `session` and `client` Component Model artifacts. Relative
-paths resolve from the config directory. The session artifact is instantiated
-once for every surface session, while the client artifact is instantiated once
-for the presentation process. Once a root is selected, it owns that realm's
-actor startup policy and, for a session root, app startup policy through the
-actor lifecycle protocol; legacy
+`[init]` selects `backend`, `session`, and `client` Component Model artifacts.
+Relative paths resolve from the config directory. The backend artifact is
+instantiated once for the daemon even when there are no surface sessions. The
+session artifact is instantiated once for every surface session, while the
+client artifact is instantiated once for the presentation process. Once a root
+is selected, it owns that realm's actor startup policy and, for a session root,
+app startup policy through the actor lifecycle protocol; legacy
 module and startup-app loading remains a compatibility fallback only for realms
 without a configured root. Exact recovery and override flags remain in the CLI
 definitions.

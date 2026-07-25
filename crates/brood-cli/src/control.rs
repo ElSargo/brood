@@ -73,6 +73,11 @@ trait BroodSession {
     fn list_presentation_windows(&self) -> zbus::Result<Vec<DbusPresentationWindow>>;
     fn activate_surface_session(&self, id: u64) -> zbus::Result<bool>;
     fn create_surface_session(&self, name: String) -> zbus::Result<u64>;
+    fn create_managed_worktree_session(
+        &self,
+        source_session: u64,
+        branch: String,
+    ) -> zbus::Result<u64>;
     fn rename_surface_session(&self, id: u64, name: String) -> zbus::Result<bool>;
     fn close_surface_session(&self, id: u64) -> zbus::Result<bool>;
 }
@@ -292,6 +297,17 @@ pub fn create_surface_session(target: &ControlTarget, name: String) -> Result<u6
     session_proxy(&connection, target)?
         .create_surface_session(name)
         .context("create Brood surface session")
+}
+
+pub fn create_managed_worktree_session(
+    target: &ControlTarget,
+    source_session: u64,
+    branch: String,
+) -> Result<u64> {
+    let connection = connection(target)?;
+    session_proxy(&connection, target)?
+        .create_managed_worktree_session(source_session, branch)
+        .context("create managed worktree session")
 }
 
 pub fn rename_surface_session(target: &ControlTarget, id: u64, name: String) -> Result<bool> {

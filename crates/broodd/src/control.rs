@@ -177,6 +177,11 @@ enum DbusStateRequest {
         name: String,
         response: U64Response,
     },
+    CreateManagedWorktreeSession {
+        source_session: u64,
+        branch: String,
+        response: U64Response,
+    },
     RenameSurfaceSession {
         id: u64,
         name: String,
@@ -470,6 +475,21 @@ impl SessionDbus {
     async fn create_surface_session(&self, name: String) -> fdo::Result<u64> {
         request_state(&self.sender, |response| {
             DbusStateRequest::CreateSurfaceSession { name, response }
+        })
+        .await
+    }
+
+    async fn create_managed_worktree_session(
+        &self,
+        source_session: u64,
+        branch: String,
+    ) -> fdo::Result<u64> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::CreateManagedWorktreeSession {
+                source_session,
+                branch,
+                response,
+            }
         })
         .await
     }
@@ -2328,6 +2348,17 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
                     .map(SurfaceSessionId::raw)
             };
             send_response(response, result);
+        }
+        DbusStateRequest::CreateManagedWorktreeSession {
+            source_session,
+            branch,
+            response,
+        } => {
+            state.request_managed_worktree_session(
+                SurfaceSessionId::from_raw(source_session),
+                &branch,
+                response,
+            );
         }
         DbusStateRequest::RenameSurfaceSession { id, name, response } => {
             let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), &name);

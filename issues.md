@@ -4,6 +4,16 @@ These are lint findings that point at design debt rather than a local cleanup.
 The current code carries TODO-backed `allow` annotations so CI can enforce new
 warnings without pretending these areas are already structurally clean.
 
+## Open
+
+- The session picker currently reaches the daemon-scoped worktree manager
+  through the DBus control endpoint. This is an accepted temporary bridge while
+  the actor messaging system only addresses actors in the presentation's bound
+  surface session. Once daemon-realm actor addressing and correlated replies
+  are available, route picker requests and completions through ordinary actor
+  messages. Keep DBus only as an external control adapter over that same actor
+  protocol.
+
 ## Resolved
 
 - Core-module actor generations now own their declarations, mailbox identities,

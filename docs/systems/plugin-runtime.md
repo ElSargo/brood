@@ -58,10 +58,11 @@ one environment are trusted peers. See [[../concepts/session]].
 
 ```text
 Session backend                         Presentation client
-├── session actor                       ├── presentation actor
-│   ├── worker                          │   ├── worker
-│   └── worker                          │   └── worker
-├── backend policy/service lanes        ├── local key decision + layout actor
+├── daemon actor                        ├── presentation actor
+│   └── worker                          │   ├── worker
+├── session actor                       │   └── worker
+│   └── worker                          ├── local key decision + layout actor
+├── backend policy/service lanes
 └── immutable publications              └── local UI and graphics publications
                  bounded addressed messages
 ```
@@ -79,12 +80,18 @@ or from a native subprocess launched by that plugin.
 
 ## Realm Init Actors
 
-Every surface session and presentation client may have one blessed init actor.
-It is an ordinary Component Model actor with an ordinary Store, mailbox,
-lifecycle, resource table, and failure boundary. The host creates it as part of
-realm creation and delivers its normal start lifecycle event before admitting
-the rest of the realm's actor topology. A server with no surface sessions has no
-session init actor; creating a session creates its root.
+The daemon, every surface session, and every presentation client may have one
+blessed init actor. Each is an ordinary Component Model actor with an ordinary
+Store, mailbox, lifecycle, resource table, and failure boundary. The host
+creates it as part of realm creation and delivers its normal start lifecycle
+event before admitting the rest of that realm's actor topology.
+
+The daemon realm exists once per server process and is not attached to an
+active surface session. It owns backend policy and services whose identity must
+survive session creation, activation, and closure. A server with no surface
+sessions may therefore still run its daemon init actor. Session roots are
+created and destroyed with their individual surface sessions; the presentation
+root is created and destroyed with its client process.
 
 The blessing adds one capability: the init actor may request that the local host
 start, replace, or stop a named child actor. Child paths are capability-rooted
@@ -108,7 +115,15 @@ Only the realm's root receives actor management, and only a surface-session
 root receives app launch. A child cannot replace the root or stop an actor it
 does not own, and actors in one placement cannot use init authority in another
 placement. A client init actor creates client-local actors; a session init actor
-creates backend actors and apps in its own surface session.
+creates actors and apps in its own surface session; a daemon init actor creates
+backend actors whose lifecycle is independent of every session.
+
+The default daemon root is the worktree manager. It serializes managed
+worktree acquisition, records occupation, and decides which idle worktrees are
+eligible for cleanup. Its workers perform allow-listed Git operations and
+persist metadata under the managed XDG data root. The host remains responsible
+for validating actor results and attaching or activating surface sessions; it
+does not absorb worktree policy into the session picker.
 
 The host retains mechanism and recovery responsibility. It validates identities
 and package-root paths and enforces generation and resource limits. Scheduler

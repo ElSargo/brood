@@ -1,10 +1,8 @@
 use std::{
-    env, fs,
+    env,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Command,
 };
-
-use anyhow::{Context, Result, bail, ensure};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectContext {
@@ -21,61 +19,6 @@ pub struct ProjectContext {
 pub fn discover_project(directory: &Path) -> ProjectContext {
     let directory = canonical_or_original(directory);
     discover_git_project(&directory).unwrap_or_else(|| fallback_project(directory))
-}
-
-pub fn create_managed_worktree(project: &ProjectContext, branch: &str) -> Result<PathBuf> {
-    ensure!(project.is_git, "project is not a Git repository");
-    let branch = branch.trim();
-    ensure!(!branch.is_empty(), "branch name cannot be empty");
-    let checked = Command::new("git")
-        .args(["check-ref-format", "--branch"])
-        .arg(branch)
-        .output()
-        .context("validate Git branch name")?;
-    ensure_command_succeeded(&checked, "validate Git branch name")?;
-
-    let target = managed_worktree_directory(project, branch);
-    if target.exists() {
-        let existing = discover_git_project(&target);
-        ensure!(
-            existing.as_ref().is_some_and(|existing| {
-                existing.id == project.id && existing.branch.as_deref() == Some(branch)
-            }),
-            "managed worktree path exists but is not branch {branch:?} of project {}: {}",
-            project.name,
-            target.display()
-        );
-        return Ok(target);
-    }
-    let parent = target
-        .parent()
-        .context("managed worktree path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create managed worktree directory {}", parent.display()))?;
-
-    let branch_exists = git_command_succeeds(
-        &project.source_directory,
-        &["show-ref", "--verify", "--quiet"],
-        Some(&format!("refs/heads/{branch}")),
-    );
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(&project.source_directory)
-        .args(["worktree", "add"]);
-    if branch_exists {
-        command.arg(&target).arg(branch);
-    } else {
-        command.arg("-b").arg(branch).arg(&target).arg("HEAD");
-    }
-    let output = command.output().with_context(|| {
-        format!(
-            "create managed worktree for branch {branch:?} at {}",
-            target.display()
-        )
-    })?;
-    ensure_command_succeeded(&output, "create managed Git worktree")?;
-    Ok(target)
 }
 
 #[must_use]
@@ -160,28 +103,8 @@ fn git_text(directory: &Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn git_command_succeeds(directory: &Path, args: &[&str], trailing: Option<&str>) -> bool {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(directory).args(args);
-    if let Some(trailing) = trailing {
-        command.arg(trailing);
-    }
-    command.status().is_ok_and(|status| status.success())
-}
-
-fn ensure_command_succeeded(output: &Output, action: &str) -> Result<()> {
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let message = stderr.trim();
-    if message.is_empty() {
-        bail!("{action} failed with {}", output.status);
-    }
-    bail!("{action} failed: {message}")
-}
-
-fn managed_worktree_root() -> PathBuf {
+#[must_use]
+pub fn managed_worktree_root() -> PathBuf {
     env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| {

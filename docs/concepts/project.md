@@ -25,6 +25,13 @@ recreated. Filesystem-safe managed directory names are an internal storage
 detail. Retrying an interrupted creation reuses the valid managed checkout and
 activates its existing session when present.
 
+The picker submits this operation to the daemon-scoped worktree manager rather
+than performing Git operations itself. The manager owns acquisition and
+occupation policy, stores a metadata record beside each managed checkout, and
+releases occupation when its session closes. A periodic worker removes only
+unoccupied worktrees older than the retention window and only when Git reports
+them clean; branches and worktrees with local changes are preserved.
+
 Directories outside Git still form path-identified project groups, but do not
 offer Git worktree creation.
 

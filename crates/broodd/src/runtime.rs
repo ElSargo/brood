@@ -113,6 +113,17 @@ fn configure_session(
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
     control::listen(event_loop, control_target.clone(), runtime)?;
     configure_control_environment(state, &control_target);
+    let backend_init_actor = if args.no_init {
+        None
+    } else {
+        brood_cli::realm_init_actor_path(&config_path, brood_cli::RealmKind::Backend)?
+    };
+    if let Some(path) = backend_init_actor.as_deref() {
+        state
+            .configure_backend_init_actor(path)
+            .with_context(|| format!("configure backend init actor {}", path.display()))?;
+        info!(path = %path.display(), "configured blessed backend init actor");
+    }
     let init_actor = if args.no_init {
         None
     } else if let Some(path) = args.init_actor.clone() {

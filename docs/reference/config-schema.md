@@ -21,6 +21,10 @@ Current top-level config families:
 - `module`
 - `startup`
 
+The `init` family selects independent backend, surface-session, and client
+Component Model roots. Parser fields and path resolution are defined in
+[`realm_init.rs`](../../crates/brood-cli/src/realm_init.rs).
+
 Current supported module kinds load self-contained WASM plugin artifacts:
 
 - `plugin`
