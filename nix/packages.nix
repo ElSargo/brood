@@ -43,21 +43,25 @@ let
   # files explicitly so the derivation remains network-free in the Nix
   # sandbox. The conditional entries keep older source snapshots evaluable
   # before the new examples exist in the tree.
-  wasmCargoVendorDir = craneLib.vendorMultipleCargoDeps {
-    cargoLockList = builtins.filter builtins.pathExists [
-      "${src}/examples/wasm-component-actor/Cargo.lock"
-      "${src}/examples/wasm-init-actor/Cargo.lock"
-      "${src}/examples/wasm-init-child/Cargo.lock"
-      "${src}/examples/wasm-plugin-graphics/Cargo.lock"
-      "${src}/examples/wasm-preview1-worker/Cargo.lock"
-      "${src}/plugins/component-workspace-watch/Cargo.lock"
-      "${src}/plugins/component-runtime-io/Cargo.lock"
-      "${src}/plugins/coding-agent/Cargo.lock"
-      "${src}/plugins/default-workspace/Cargo.lock"
-      "${src}/plugins/session-switcher/Cargo.lock"
-      "${src}/plugins/workspace-file-log/Cargo.lock"
-    ];
-  };
+  wasmCargoVendorDir =
+    assert lib.assertMsg (builtins.pathExists "${src}/plugins/picker/Cargo.lock")
+      "plugins/picker/Cargo.lock is required by the default client init package";
+    craneLib.vendorMultipleCargoDeps {
+      cargoLockList = builtins.filter builtins.pathExists [
+        "${src}/examples/wasm-component-actor/Cargo.lock"
+        "${src}/examples/wasm-init-actor/Cargo.lock"
+        "${src}/examples/wasm-init-child/Cargo.lock"
+        "${src}/examples/wasm-plugin-graphics/Cargo.lock"
+        "${src}/examples/wasm-preview1-worker/Cargo.lock"
+        "${src}/plugins/component-workspace-watch/Cargo.lock"
+        "${src}/plugins/component-runtime-io/Cargo.lock"
+        "${src}/plugins/coding-agent/Cargo.lock"
+        "${src}/plugins/default-workspace/Cargo.lock"
+        "${src}/plugins/picker/Cargo.lock"
+        "${src}/plugins/session-switcher/Cargo.lock"
+        "${src}/plugins/workspace-file-log/Cargo.lock"
+      ];
+    };
 
   craneBaseArgs = {
     pname = "brood";
@@ -259,6 +263,22 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      component_core="plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm"
+      component_output="plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.component.wasm"
+      if [[ ! -s "$component_core" ]]; then
+        echo "ERR picker core module was not built at $component_core" >&2
+        exit 2
+      fi
+      echo "componentizing_wasm=$component_core output=$component_output"
+      wasm-tools component new "$component_core" --output "$component_output"
+      wasm-tools validate "$component_output"
+      wasm-tools component wit "$component_output" >/dev/null
+
+      # The default client init actor supervises the picker from its own
+      # package root.
+      install -D "$component_output" \
+        plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_picker_plugin.component.wasm
+
       if [[ -f plugins/coding-agent/Cargo.toml ]]; then
         component_core="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm"
         component_output="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm"
@@ -334,6 +354,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"

@@ -48,13 +48,16 @@ must demonstrate:
 - the key policy sends an ordinary action to the switcher actor;
 - hiding republishes the root fragment with a full-viewport `rest`;
 - showing restores the same plugin pane and focuses it;
+- `Ctrl+Alt+P` opens the reusable picker above the retained recursive
+  composition, real fuzzy text selects a result, and completion removes the
+  floating pane without a native-layout fallback;
 - the plugin canvas target and resize event converge to the sidebar's own
   extent, rather than the full presentation extent;
 - no switcher-specific host visibility mutation or backend placement occurs.
 
-Screenshots should cover visible, hidden, and restored states. Logs should
-record lease generations, revisions, accepted recursive composition, and
-managed-pane size convergence.
+Screenshots should cover visible, picker-overlay, hidden, and restored states.
+Logs should record lease generations, revisions, accepted recursive
+composition, picker focus and sizing, and managed-pane size convergence.
 
 ## Lifecycle Proof
 

@@ -152,6 +152,7 @@ shortcuts or wrapper arguments:
 - `Ctrl+Alt+M` focuses the visible session switcher, hides it when invoked
   again while focused, and restores it on the next invocation;
 - `Ctrl+Alt+A` creates and focuses another coding-agent UI actor;
+- `Ctrl+Alt+P` opens the reusable fuzzy session picker;
 - `Ctrl+J` and `Ctrl+K` cycle focus through the presentation's managed
   windows;
 - `Ctrl+O` queues a new `foot` window in the active surface session.

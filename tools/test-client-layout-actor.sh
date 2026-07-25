@@ -28,6 +28,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   plugins/session-switcher/brood_session_switcher_plugin.component.wasm
 cargo build \
+  --manifest-path plugins/picker/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
+  plugins/session-switcher/brood_picker_plugin.component.wasm
+cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \

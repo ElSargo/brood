@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm; do
+for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the session-switcher proof" >&2
     exit 2
@@ -68,6 +68,14 @@ cc \
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
+cargo build \
+  --manifest-path plugins/picker/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
+  "$PACKAGE/brood_picker_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -173,6 +181,7 @@ env -u brood_session \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
   BROOD_DMABUF_HAPPY_PATH=1 \
+  BROOD_TRACE_PLUGIN_INPUT=1 \
   RUST_LOG="$RUST_LOG" \
   target/debug/brood-client \
   --config "$CONFIG" \
@@ -250,10 +259,32 @@ send_open_terminal() {
     "$OUT/virtual-keyboard-key" --ctrl-only 24
 }
 
+send_picker() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" 25
+}
+
 capture "$OUT/sidebar-visible.png"
 
 accepted_before="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
-ctl surface-session switch Beta > /dev/null
+send_picker
+for _ in $(seq 1 100); do
+  if rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG" \
+    && rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG"
+rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
+capture "$OUT/picker-visible.png"
+
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype "Bt" -s 100 -k Return
 for _ in $(seq 1 100); do
   accepted_after="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
   if rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG" \
@@ -361,7 +392,8 @@ python3 - \
   "$OUT/sidebar-hidden.png" \
   "$OUT/sidebar-restored.png" \
   "$OUT/session-beta.png" \
-  "$OUT/ctrl-o-terminal.png" <<'PY'
+  "$OUT/ctrl-o-terminal.png" \
+  "$OUT/picker-visible.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -410,6 +442,18 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
     raise SystemExit(f"layout did not visibly change after Ctrl+O: RMSE={normalized}")
 print(f"ctrl_o_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[6], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"picker did not visibly float above the workspace: RMSE={normalized}")
+print(f"picker_capture_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
@@ -434,10 +478,11 @@ cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
 - backend: headless frame exporter, no presenter and no backend layout
-- input: real Ctrl+Alt+M and Ctrl+O events through the focused external Winit client
+- input: real Ctrl+Alt+M, Ctrl+Alt+P, fuzzy text, Enter, and Ctrl+O events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
+- picker: Ctrl+Alt+P opened the reusable actor as a 720px floating pane; Bt fuzzy-matched Beta and Enter returned the original session result
 - transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
@@ -446,7 +491,7 @@ cat > "$OUT/proof.md" <<EOF
 - Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
 - Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
 - close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
-- captures: sidebar-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
+- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
 - status: $STATUS
 EOF
 
@@ -454,6 +499,7 @@ ctl quit > /dev/null 2>&1 || true
 echo "session_switcher_recursive=verified"
 echo "proof=$OUT/proof.md"
 echo "visible=$OUT/sidebar-visible.png"
+echo "picker=$OUT/picker-visible.png"
 echo "beta=$OUT/session-beta.png"
 echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"

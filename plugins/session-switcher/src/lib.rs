@@ -5,18 +5,20 @@ wit_bindgen::generate!({
 
 use std::sync::Mutex;
 
+use brood::plugin::host;
+use brood_graphics::{Color, Command, Packet, Rect};
 use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
     LocalActorMessage, PresentationEvent, SessionCommand, SessionCommandCompleted, SessionEvent,
     SessionOperation, SessionSnapshot,
 };
-use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
+const PICKER_ACTOR_ID: &str = "picker";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
+const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
 const LEFT_BUTTON: u32 = 0x110;
@@ -71,6 +73,8 @@ struct SwitcherState {
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
+    picker_pane: Option<u64>,
+    picker_visible: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -103,7 +107,7 @@ struct LayoutLeaseToken {
 struct LayoutStateSize {
     w: i32,
     #[serde(rename = "h")]
-    _height: i32,
+    height: i32,
 }
 
 #[derive(Clone)]
@@ -130,6 +134,65 @@ struct CodingAgentActionMessage {
     action: serde_json_core::heapless::String<32>,
 }
 
+#[derive(Deserialize)]
+struct PickerLayoutMessage {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+    pane: u64,
+    visible: bool,
+}
+
+#[derive(Deserialize)]
+struct PickerReplyKind {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+}
+
+#[derive(Deserialize)]
+struct PickerSelection {
+    #[serde(rename = "type")]
+    _message_type: serde_json_core::heapless::String<32>,
+    result: SessionPickerResult,
+}
+
+#[derive(Deserialize)]
+struct SessionPickerResult {
+    value: SessionPickerValue,
+}
+
+#[derive(Deserialize)]
+struct SessionPickerValue {
+    session: u64,
+}
+
+#[derive(Deserialize)]
+struct PickerErrorMessage {
+    #[serde(rename = "type")]
+    _message_type: serde_json_core::heapless::String<32>,
+    message: serde_json_core::heapless::String<256>,
+}
+
+#[derive(Serialize)]
+struct SessionPickerRequest<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    title: &'static str,
+    placeholder: &'static str,
+    items: Vec<SessionPickerItem<'a>>,
+}
+
+#[derive(Serialize)]
+struct SessionPickerItem<'a> {
+    label: &'a str,
+    detail: String,
+    value: SessionPickerValueWire,
+}
+
+#[derive(Serialize)]
+struct SessionPickerValueWire {
+    session: u64,
+}
+
 impl SwitcherState {
     const fn new() -> Self {
         Self {
@@ -152,6 +215,8 @@ impl SwitcherState {
             text_resources: Vec::new(),
             layout: None,
             workspace_focus: None,
+            picker_pane: None,
+            picker_visible: false,
         }
     }
 
@@ -241,6 +306,11 @@ impl Guest for SessionSwitcher {
                             path: COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
                         }),
+                        ActorCommand::StartActor(ActorStartRequest {
+                            id: PICKER_ACTOR_ID.to_string(),
+                            path: PICKER_COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
+                        }),
                         start_coding_agent_ui(CODING_AGENT_UI_ID),
                         ActorCommand::LifecycleComplete(Ok(())),
                     ]
@@ -284,6 +354,9 @@ impl Guest for SessionSwitcher {
             }
             Event::Mailbox(message) if message.sender == "key-policy" => {
                 handle_sidebar_action(&message.body)
+            }
+            Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
+                handle_picker_message(&message.body)
             }
             _ => Vec::new(),
         }
@@ -459,7 +532,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if state.pane == 0 {
         return Vec::new();
     }
-    if message.focused_pane != Some(state.pane) {
+    if message.focused_pane != Some(state.pane) && message.focused_pane != state.picker_pane {
         state.workspace_focus = message.focused_pane;
     }
     state.layout = Some(LayoutContext {
@@ -476,18 +549,16 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
 
 fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "coding-agent-action"
+        && message.action.as_str() == "new-ui"
     {
-        if consumed == bytes.len()
-            && message.kind.as_str() == "coding-agent-action"
-            && message.action.as_str() == "new-ui"
-        {
-            let Ok(mut state) = STATE.lock() else {
-                return Vec::new();
-            };
-            let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
-            state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
-            return vec![start_coding_agent_ui(&id)];
-        }
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
+        state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
+        return vec![start_coding_agent_ui(&id)];
     }
     let Ok((message, consumed)) = serde_json_core::from_slice::<SidebarActionMessage>(bytes) else {
         return Vec::new();
@@ -504,6 +575,7 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let requested_focus = match message.action.as_str() {
+        "picker" => return open_session_picker(&mut state),
         "show" => {
             state.sidebar_visible = true;
             Some(pane)
@@ -526,6 +598,122 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         layout.focused_pane = requested_focus;
     }
     publish_layout(&state, false, requested_focus)
+}
+
+fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((kind, consumed)) = serde_json_core::from_slice::<PickerReplyKind>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() {
+        return Vec::new();
+    }
+    match kind.message_type.as_str() {
+        "picker-pane" => handle_picker_layout_message(bytes),
+        "picker-created" => {
+            if let Ok(mut state) = STATE.lock() {
+                state.status = "Session picker opened".to_string();
+                state.error = false;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        "picker-selected" => handle_picker_selection(bytes),
+        "picker-error" => {
+            if let Ok((message, consumed)) =
+                serde_json_core::from_slice::<PickerErrorMessage>(bytes)
+                && consumed == bytes.len()
+                && let Ok(mut state) = STATE.lock()
+            {
+                state.status = message.message.as_str().to_string();
+                state.error = true;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        "picker-cancelled" => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<PickerLayoutMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.message_type.as_str() != "picker-pane" {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if message.pane == 0 {
+        return Vec::new();
+    }
+    state.picker_pane = Some(message.pane);
+    state.picker_visible = message.visible;
+    let focus = if message.visible {
+        Some(message.pane)
+    } else {
+        state
+            .workspace_focus
+            .or_else(|| state.sidebar_visible.then_some(state.pane))
+    };
+    if let Some(layout) = state.layout.as_mut() {
+        layout.focused_pane = focus;
+    }
+    publish_layout(&state, false, focus)
+}
+
+fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<PickerSelection>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let request = state.next_request();
+    vec![session_command(
+        request,
+        SessionOperation::Activate,
+        Some(message.result.value.session),
+        None,
+    )]
+}
+
+fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    let items = state
+        .sessions
+        .iter()
+        .map(|session| SessionPickerItem {
+            label: &session.name,
+            detail: if session.windows == 1 {
+                "1 window".to_string()
+            } else {
+                format!("{} windows", session.windows)
+            },
+            value: SessionPickerValueWire {
+                session: session.id,
+            },
+        })
+        .collect::<Vec<_>>();
+    let request = SessionPickerRequest {
+        message_type: "picker-create",
+        title: "Switch session",
+        placeholder: "Type to fuzzy-match sessions…",
+        items,
+    };
+    let Ok(body) = serde_json::to_vec(&request) else {
+        state.error = true;
+        state.status = "Could not encode the session picker".to_string();
+        redraw_or_record_error(state);
+        return Vec::new();
+    };
+    vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body,
+    })]
 }
 
 fn start_coding_agent_ui(id: &str) -> ActorCommand {
@@ -552,11 +740,12 @@ fn publish_layout(
         return Vec::new();
     };
     let pane = state.pane;
+    let picker_pane = state.picker_pane;
     let delegated = message
         .visible_panes
         .iter()
         .copied()
-        .filter(|visible| *visible != pane)
+        .filter(|visible| *visible != pane && Some(*visible) != picker_pane)
         .chain(message.available_windows.iter().map(|window| window.pane))
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
@@ -567,6 +756,8 @@ fn publish_layout(
     let needs_rest = allow_delegation && !message.rest && !delegated.is_empty();
     let has_rest = message.rest || !delegated.is_empty();
     let pane_visible = state.sidebar_visible && message.visible_panes.contains(&pane);
+    let picker_visible = state.picker_visible
+        && picker_pane.is_some_and(|picker| message.visible_panes.contains(&picker));
     let width = f64::from(message.size.w.max(1));
     let sidebar_fraction = if has_rest && pane_visible {
         (SIDEBAR_WIDTH / width).clamp(0.2, 0.45)
@@ -595,14 +786,28 @@ fn publish_layout(
         ));
     }
 
-    let layout_item = if pane_visible {
-        format!(
+    let mut layout_items = Vec::new();
+    if pane_visible {
+        layout_items.push(format!(
             "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
             pane, pane, sidebar_offset, sidebar_size
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
+    if picker_visible && let Some(picker) = picker_pane {
+        let height = f64::from(message.size.height.max(1));
+        let picker_width = (720.0 / width).clamp(0.45, 0.88);
+        let picker_height = (480.0 / height).clamp(0.40, 0.82);
+        layout_items.push(format!(
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":100,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            picker,
+            picker,
+            -picker_width,
+            -picker_height,
+            picker_width * 2.0,
+            picker_height * 2.0
+        ));
+    }
+    let layout_items = layout_items.join(",");
     let rest = if has_rest {
         format!(
             ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}}}}",
@@ -618,7 +823,7 @@ fn publish_layout(
             message.lease.id,
             message.lease.generation,
             message.revision,
-            layout_item,
+            layout_items,
             rest,
             focus
         )

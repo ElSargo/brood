@@ -222,6 +222,15 @@ pub extern "C" fn brood_policy_provider_key_workspace(
         };
     }
 
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_P
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::SessionSwitcherAction("picker")])
+        };
+    }
+
     let workspace_input_mode = workspace_input_mode();
 
     if input.modifiers & MOD_ALT != 0
