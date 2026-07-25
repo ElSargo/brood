@@ -852,6 +852,9 @@ fn add_text(
             resources.pane,
             text,
             host::TextLayoutOptions {
+                font_intent: host::FontIntent::Ui,
+                font_weight: host::FontWeight::Normal,
+                font_style: host::FontStyle::Normal,
                 font_size: size,
                 max_width,
                 line_height,
