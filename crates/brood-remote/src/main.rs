@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     mem::size_of,
     net::{Ipv4Addr, SocketAddr},
@@ -15,14 +15,15 @@ use brood_cli::control::{
     resolve_control_target, shared_memory_resource,
 };
 use brood_protocol::{
-    ActorMessage, BackendOperation, BackendRequest, BackendResponse, BackendResponseValue,
-    CatalogSession, CatalogSnapshot, CatalogWindow, ClientLifecycle, ClientMessage,
-    EndpointCapabilities, FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane,
-    ServerMessage, SessionOperation, WindowFrame,
+    ActorMessage, ArtifactMessage, ArtifactRealm, BackendOperation, BackendRequest,
+    BackendResponse, BackendResponseValue, CatalogSession, CatalogSnapshot, CatalogWindow,
+    ClientLifecycle, ClientMessage, EndpointCapabilities, FrameResourceRef, FrameScene,
+    FrameTransportKind, InputEvent, Lane, ServerMessage, SessionOperation, WindowFrame,
 };
 use brood_transport::{
-    NetworkFramePacket, NetworkSendLane, accept_network_connection, client_endpoint,
-    connect_network, server_endpoint,
+    ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, NetworkFramePacket, NetworkReceiveLane,
+    NetworkSendLane, accept_network_connection, client_endpoint, connect_network,
+    default_artifact_cache, digest_hex, server_endpoint,
 };
 use clap::{Parser, Subcommand};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -61,6 +62,15 @@ enum Command {
         dbus_name: Option<String>,
         #[arg(long = "dbus-address")]
         dbus_address: Option<String>,
+        /// Offer a WASM actor to the authenticated presentation client.
+        #[arg(long = "offer-client-artifact", value_name = "ID=PATH")]
+        offer_client_artifacts: Vec<String>,
+        /// Authorize a client-offered session-realm artifact by stable ID.
+        #[arg(long = "allow-session-artifact", value_name = "ID")]
+        allow_session_artifacts: Vec<String>,
+        /// Override the verified content-addressed artifact cache.
+        #[arg(long = "artifact-cache", value_name = "PATH")]
+        artifact_cache: Option<PathBuf>,
     },
     /// Verify a remote catalog, real frame, and critical acknowledgement.
     Probe {
@@ -77,6 +87,15 @@ enum Command {
         /// Optional XKB keycode whose focused-pane pixel effect must be observed.
         #[arg(long)]
         keycode: Option<u32>,
+        /// Offer a WASM actor to the remote session as ID from PATH.
+        #[arg(long = "offer-session-artifact", value_name = "ID=PATH")]
+        offer_session_artifacts: Vec<String>,
+        /// Authorize a relay-offered client-realm artifact by stable ID.
+        #[arg(long = "allow-client-artifact", value_name = "ID")]
+        allow_client_artifacts: Vec<String>,
+        /// Override the verified content-addressed artifact cache.
+        #[arg(long = "artifact-cache", value_name = "PATH")]
+        artifact_cache: Option<PathBuf>,
     },
 }
 
@@ -129,6 +148,9 @@ async fn main() -> Result<()> {
             trusted_client_certificate,
             dbus_name,
             dbus_address,
+            offer_client_artifacts,
+            allow_session_artifacts,
+            artifact_cache,
         } => {
             relay(
                 listen,
@@ -136,6 +158,9 @@ async fn main() -> Result<()> {
                 &private_key,
                 &trusted_client_certificate,
                 resolve_control_target(dbus_name, dbus_address),
+                &offer_client_artifacts,
+                allow_session_artifacts,
+                artifact_cache,
             )
             .await
         }
@@ -146,6 +171,9 @@ async fn main() -> Result<()> {
             client_certificate,
             client_private_key,
             keycode,
+            offer_session_artifacts,
+            allow_client_artifacts,
+            artifact_cache,
         } => {
             probe(
                 connect,
@@ -154,6 +182,9 @@ async fn main() -> Result<()> {
                 &client_certificate,
                 &client_private_key,
                 keycode,
+                &offer_session_artifacts,
+                allow_client_artifacts,
+                artifact_cache,
             )
             .await
         }
@@ -175,13 +206,30 @@ fn generate_certificate(server_name: &str, certificate: &Path, key: &Path) -> Re
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the relay CLI boundary combines network identity, local control, and artifact policy"
+)]
 async fn relay(
     listen: SocketAddr,
     certificate: &Path,
     private_key: &Path,
     trusted_client_certificate: &Path,
     target: ControlTarget,
+    offer_specs: &[String],
+    allowed_session_artifacts: Vec<String>,
+    artifact_cache: Option<PathBuf>,
 ) -> Result<()> {
+    let artifact_offers = offer_specs
+        .iter()
+        .map(|spec| ArtifactOffer::parse(spec, ArtifactRealm::Client))
+        .collect::<Result<Vec<_>>>()?;
+    let artifact_exchange = ArtifactExchange::new(
+        ArtifactRealm::Session,
+        allowed_session_artifacts,
+        artifact_cache.unwrap_or_else(default_artifact_cache),
+        artifact_offers,
+    )?;
     let bootstrap_target = target.clone();
     let (handshake, fast_path) = tokio::task::spawn_blocking(move || {
         let handshake =
@@ -285,6 +333,7 @@ async fn relay(
     let (critical_send, mut critical_receive) = network.take_lane(Lane::Critical)?.split();
     let (reliable_send, reliable_receive) = network.take_lane(Lane::Reliable)?.split();
     let (latest_send, latest_receive) = network.take_lane(Lane::LatestState)?.split();
+    let (bulk_send, bulk_receive) = network.take_lane(Lane::Bulk)?.split();
     let (frame_send, _frame_receive) = network.take_lane(Lane::FrameResource)?.split();
 
     tokio::spawn(send_critical_messages(critical_send, critical_rx));
@@ -320,14 +369,126 @@ async fn relay(
     tokio::spawn(receive_reliable_input(
         reliable_receive,
         local_actor_tx,
-        target,
+        target.clone(),
         outbound,
     ));
+    let artifact_task = tokio::spawn(exchange_session_artifacts(
+        bulk_send,
+        bulk_receive,
+        artifact_exchange,
+        target,
+    ));
 
-    disconnect_rx
+    let result = disconnect_rx
         .await
-        .context("remote client disconnected without a lifecycle message")?;
+        .context("remote client disconnected without a lifecycle message");
+    artifact_task.abort();
+    result
+}
+
+async fn exchange_session_artifacts(
+    mut send: NetworkSendLane,
+    mut receive: NetworkReceiveLane,
+    mut exchange: ArtifactExchange,
+    target: ControlTarget,
+) -> Result<()> {
+    let mut outbound = VecDeque::from(exchange.initial_messages());
+    loop {
+        while let Some(message) = outbound.pop_front() {
+            send.send_server_message(&ServerMessage::Artifact(message))
+                .await?;
+        }
+        let message = receive_client_artifact(&mut receive).await?;
+        let update = exchange.handle(message)?;
+        for event in update.events {
+            match event {
+                ArtifactExchangeEvent::Installed(artifact) => {
+                    let digest = artifact.manifest.digest;
+                    let install_result = install_session_artifact(&target, &artifact).await;
+                    let completion = match &install_result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(format!("{error:#}")),
+                    };
+                    outbound.push_back(exchange.finish_installation(digest, completion)?);
+                    match install_result {
+                        Ok(()) => eprintln!(
+                            "installed remote session artifact id={} digest={}",
+                            artifact.manifest.id,
+                            digest_hex(digest)
+                        ),
+                        Err(error) => eprintln!(
+                            "rejected remote session artifact id={} digest={} reason={error:#}",
+                            artifact.manifest.id,
+                            digest_hex(digest)
+                        ),
+                    }
+                }
+                ArtifactExchangeEvent::PeerAccepted(manifest) => {
+                    eprintln!(
+                        "remote client accepted artifact id={} digest={}",
+                        manifest.id,
+                        digest_hex(manifest.digest)
+                    );
+                }
+                ArtifactExchangeEvent::PeerRejected {
+                    manifest,
+                    digest,
+                    reason,
+                } => {
+                    eprintln!(
+                        "remote client rejected artifact id={} digest={} reason={reason}",
+                        manifest
+                            .as_ref()
+                            .map_or("<unknown>", |value| value.id.as_str()),
+                        digest_hex(digest)
+                    );
+                }
+            }
+        }
+        outbound.extend(update.outbound);
+    }
+}
+
+async fn install_session_artifact(
+    target: &ControlTarget,
+    artifact: &brood_transport::InstalledArtifact,
+) -> Result<()> {
+    ensure!(
+        artifact.manifest.realm == ArtifactRealm::Session,
+        "remote artifact {:?} targets the wrong realm",
+        artifact.manifest.id
+    );
+    let install_target = target.clone();
+    let id = artifact.manifest.id.clone();
+    let path = artifact.path.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        request_dbus_command(
+            &install_target,
+            &[
+                "plug".to_string(),
+                "--id".to_string(),
+                id,
+                path.display().to_string(),
+            ],
+            false,
+        )
+    })
+    .await
+    .context("join session artifact installation")??;
+    ensure!(
+        response.starts_with("OK "),
+        "session rejected remote artifact installation: {}",
+        response.trim()
+    );
     Ok(())
+}
+
+async fn receive_client_artifact(lane: &mut NetworkReceiveLane) -> Result<ArtifactMessage> {
+    let message = lane.receive_client_message().await?;
+    let ClientMessage::Artifact(message) = message else {
+        bail!("non-artifact client message reached the artifact lane");
+    };
+    Ok(message)
 }
 
 async fn receive_latest_input(
@@ -366,7 +527,7 @@ async fn receive_reliable_input(
                     .map_err(|_error| anyhow!("remote reliable sender stopped"))?;
             }
             ClientMessage::ReleaseResource { .. } => {}
-            ClientMessage::Input(_) | ClientMessage::Lifecycle(_) => {
+            ClientMessage::Input(_) | ClientMessage::Lifecycle(_) | ClientMessage::Artifact(_) => {
                 bail!("critical client message reached the reliable lane");
             }
         }
@@ -781,6 +942,10 @@ fn spawn_actor_forwarder(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the probe CLI boundary combines network identity, behavior checks, and artifact policy"
+)]
 async fn probe(
     connect: SocketAddr,
     server_name: &str,
@@ -788,7 +953,22 @@ async fn probe(
     client_certificate: &Path,
     client_private_key: &Path,
     keycode: Option<u32>,
+    offer_specs: &[String],
+    allowed_client_artifacts: Vec<String>,
+    artifact_cache: Option<PathBuf>,
 ) -> Result<()> {
+    let artifact_offers = offer_specs
+        .iter()
+        .map(|spec| ArtifactOffer::parse(spec, ArtifactRealm::Session))
+        .collect::<Result<Vec<_>>>()?;
+    let offered_artifacts = artifact_offers.len();
+    let expected_client_artifacts = allowed_client_artifacts.len();
+    let artifact_exchange = ArtifactExchange::new(
+        ArtifactRealm::Client,
+        allowed_client_artifacts,
+        artifact_cache.unwrap_or_else(default_artifact_cache),
+        artifact_offers,
+    )?;
     let endpoint = client_endpoint(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         fs::read(certificate)
@@ -808,7 +988,17 @@ async fn probe(
     let (mut critical_send, mut critical_receive) = network.take_lane(Lane::Critical)?.split();
     let (mut reliable_send, mut reliable_receive) = network.take_lane(Lane::Reliable)?.split();
     let (_latest_send, mut latest_receive) = network.take_lane(Lane::LatestState)?.split();
+    let (mut bulk_send, mut bulk_receive) = network.take_lane(Lane::Bulk)?.split();
     let (_frame_send, mut frame_receive) = network.take_lane(Lane::FrameResource)?.split();
+
+    let (artifacts_sent, artifacts_received) = probe_artifacts(
+        &mut bulk_send,
+        &mut bulk_receive,
+        artifact_exchange,
+        offered_artifacts,
+        expected_client_artifacts,
+    )
+    .await?;
 
     critical_send
         .send_client_message(&ClientMessage::Input(InputEvent::PresentationSize {
@@ -959,7 +1149,7 @@ async fn probe(
     println!(
         "OK remote transport generation={} catalog_revision={} sessions={} windows={} scene={} \
          input_scene={} frame_packets={} input_frame_packets={} compressed_bytes={} \
-         backend_status_bytes={}",
+         backend_status_bytes={} artifacts_sent={} artifacts_received={}",
         network.connection_generation,
         catalog.revision,
         catalog.sessions.len(),
@@ -972,9 +1162,80 @@ async fn probe(
             .iter()
             .map(|packet| packet.compressed_pixels.len())
             .sum::<usize>(),
-        backend_status.len()
+        backend_status.len(),
+        artifacts_sent,
+        artifacts_received
     );
     Ok(())
+}
+
+async fn probe_artifacts(
+    send: &mut NetworkSendLane,
+    receive: &mut NetworkReceiveLane,
+    mut exchange: ArtifactExchange,
+    expected_sent: usize,
+    expected_received: usize,
+) -> Result<(usize, usize)> {
+    let mut outbound = VecDeque::from(exchange.initial_messages());
+    let mut accepted = HashSet::new();
+    let mut installed = HashSet::new();
+    while accepted.len() < expected_sent || installed.len() < expected_received {
+        while let Some(message) = outbound.pop_front() {
+            send.send_client_message(&ClientMessage::Artifact(message))
+                .await?;
+        }
+        let message = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            receive.receive_server_message(),
+        )
+        .await
+        .context("timed out waiting for remote artifact exchange")??;
+        let ServerMessage::Artifact(message) = message else {
+            bail!("non-artifact server message reached the probe artifact lane");
+        };
+        let update = exchange.handle(message)?;
+        for event in update.events {
+            match event {
+                ArtifactExchangeEvent::Installed(artifact) => {
+                    outbound
+                        .push_back(exchange.finish_installation(artifact.manifest.digest, Ok(()))?);
+                    installed.insert(artifact.manifest.digest);
+                    eprintln!(
+                        "probe received client artifact id={} digest={}",
+                        artifact.manifest.id,
+                        digest_hex(artifact.manifest.digest)
+                    );
+                }
+                ArtifactExchangeEvent::PeerAccepted(manifest) => {
+                    accepted.insert(manifest.digest);
+                    eprintln!(
+                        "remote session accepted probe artifact id={} digest={}",
+                        manifest.id,
+                        digest_hex(manifest.digest)
+                    );
+                }
+                ArtifactExchangeEvent::PeerRejected {
+                    manifest,
+                    digest,
+                    reason,
+                } => {
+                    bail!(
+                        "remote session rejected probe artifact id={} digest={} reason={reason}",
+                        manifest
+                            .as_ref()
+                            .map_or("<unknown>", |value| value.id.as_str()),
+                        digest_hex(digest)
+                    );
+                }
+            }
+        }
+        outbound.extend(update.outbound);
+    }
+    while let Some(message) = outbound.pop_front() {
+        send.send_client_message(&ClientMessage::Artifact(message))
+            .await?;
+    }
+    Ok((accepted.len(), installed.len()))
 }
 
 async fn acknowledge_frame(lane: &mut NetworkSendLane, sequence: u64) -> Result<()> {

@@ -13,12 +13,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_protocol::{
-    ActorMessage, BackendOperation, BackendRequest, BackendResponseValue, ClientLifecycle,
-    ClientMessage, EndpointCapabilities, FramePixelFormat, FrameScene, InputEvent, Lane,
-    ServerMessage,
+    ActorMessage, ArtifactMessage, ArtifactRealm, BackendOperation, BackendRequest,
+    BackendResponseValue, ClientLifecycle, ClientMessage, EndpointCapabilities, FramePixelFormat,
+    FrameScene, InputEvent, Lane, ServerMessage,
 };
 use brood_transport::{
-    NetworkFramePacket, NetworkReceiveLane, NetworkSendLane, client_endpoint, connect_network,
+    ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, NetworkFramePacket, NetworkReceiveLane,
+    NetworkSendLane, client_endpoint, connect_network, digest_hex,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use winit::event_loop::EventLoopProxy;
@@ -42,6 +43,9 @@ pub struct RemoteConfig {
     pub server_certificate: PathBuf,
     pub client_certificate: PathBuf,
     pub client_private_key: PathBuf,
+    pub artifact_offers: Vec<ArtifactOffer>,
+    pub allowed_client_artifacts: Vec<String>,
+    pub artifact_cache: PathBuf,
 }
 
 pub struct RemoteConnection {
@@ -159,7 +163,7 @@ async fn run_connection(
     let (critical_send, critical_receive) = network.take_lane(Lane::Critical)?.split();
     let (reliable_send, reliable_receive) = network.take_lane(Lane::Reliable)?.split();
     let (latest_send, latest_receive) = network.take_lane(Lane::LatestState)?.split();
-    let (_bulk_send, _bulk_receive) = network.take_lane(Lane::Bulk)?.split();
+    let (bulk_send, bulk_receive) = network.take_lane(Lane::Bulk)?.split();
     let (_frame_send, frame_receive) = network.take_lane(Lane::FrameResource)?.split();
     ready_sender
         .send(Ok(RemoteReady {
@@ -186,7 +190,19 @@ async fn run_connection(
         reliable_receiver,
         proxy.clone(),
     ));
-    let mut frame_task = tokio::spawn(receive_scenes(latest_receive, frame_receive, proxy));
+    let mut frame_task = tokio::spawn(receive_scenes(latest_receive, frame_receive, proxy.clone()));
+    let artifact_exchange = ArtifactExchange::new(
+        ArtifactRealm::Client,
+        config.allowed_client_artifacts,
+        config.artifact_cache,
+        config.artifact_offers,
+    )?;
+    let mut artifact_task = tokio::spawn(exchange_artifacts(
+        bulk_send,
+        bulk_receive,
+        artifact_exchange,
+        proxy,
+    ));
 
     let result = tokio::select! {
         biased;
@@ -194,11 +210,13 @@ async fn run_connection(
         result = &mut critical_task => join_transport_task("critical", result),
         result = &mut reliable_task => join_transport_task("reliable", result),
         result = &mut frame_task => join_transport_task("frame", result),
+        result = &mut artifact_task => join_transport_task("artifact", result),
     };
     input_task.abort();
     critical_task.abort();
     reliable_task.abort();
     frame_task.abort();
+    artifact_task.abort();
     drop(network);
     drop(endpoint);
     result
@@ -264,6 +282,7 @@ async fn send_input_messages(
             }
             ClientMessage::Actor(_)
             | ClientMessage::BackendRequest(_)
+            | ClientMessage::Artifact(_)
             | ClientMessage::ReleaseResource { .. } => {
                 bail!("reliable client message reached the input sender");
             }
@@ -294,7 +313,8 @@ async fn receive_critical_messages(
             ServerMessage::Catalog(_)
             | ServerMessage::Scene(_)
             | ServerMessage::Actor(_)
-            | ServerMessage::BackendResponse(_) => {
+            | ServerMessage::BackendResponse(_)
+            | ServerMessage::Artifact(_) => {
                 bail!("non-critical server message reached the critical lane");
             }
         };
@@ -471,6 +491,7 @@ fn handle_reliable_message(
             }
         }
         ServerMessage::Scene(_)
+        | ServerMessage::Artifact(_)
         | ServerMessage::FocusPresentation
         | ServerMessage::ClosePresentation
         | ServerMessage::DisconnectAcknowledged => {
@@ -480,6 +501,71 @@ fn handle_reliable_message(
     proxy
         .send_event(event)
         .map_err(|_error| anyhow!("presentation event loop stopped"))
+}
+
+async fn exchange_artifacts(
+    mut send: NetworkSendLane,
+    mut receive: NetworkReceiveLane,
+    mut exchange: ArtifactExchange,
+    proxy: EventLoopProxy<ClientEvent>,
+) -> Result<()> {
+    let mut outbound = VecDeque::from(exchange.initial_messages());
+    loop {
+        while let Some(message) = outbound.pop_front() {
+            send.send_client_message(&ClientMessage::Artifact(message))
+                .await?;
+        }
+        let message = receive_server_artifact(&mut receive).await?;
+        let update = exchange.handle(message)?;
+        outbound.extend(update.outbound);
+        for event in update.events {
+            match event {
+                ArtifactExchangeEvent::Installed(artifact) => {
+                    let digest = artifact.manifest.digest;
+                    let (completion, installed) = tokio::sync::oneshot::channel();
+                    proxy
+                        .send_event(ClientEvent::RemoteArtifactInstalled {
+                            manifest: artifact.manifest,
+                            path: artifact.path,
+                            completion,
+                        })
+                        .map_err(|_error| anyhow!("presentation event loop stopped"))?;
+                    let result = installed
+                        .await
+                        .context("presentation event loop dropped artifact installation")?;
+                    outbound.push_back(exchange.finish_installation(digest, result)?);
+                }
+                ArtifactExchangeEvent::PeerAccepted(manifest) => {
+                    eprintln!(
+                        "remote session accepted artifact id={} digest={}",
+                        manifest.id,
+                        digest_hex(manifest.digest)
+                    );
+                }
+                ArtifactExchangeEvent::PeerRejected {
+                    manifest,
+                    digest,
+                    reason,
+                } => {
+                    eprintln!(
+                        "remote session rejected artifact id={} digest={} reason={reason}",
+                        manifest
+                            .as_ref()
+                            .map_or("<unknown>", |value| value.id.as_str()),
+                        digest_hex(digest)
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn receive_server_artifact(lane: &mut NetworkReceiveLane) -> Result<ArtifactMessage> {
+    let message = lane.receive_server_message().await?;
+    let ServerMessage::Artifact(message) = message else {
+        bail!("non-artifact server message reached the artifact lane");
+    };
+    Ok(message)
 }
 
 async fn receive_scenes(

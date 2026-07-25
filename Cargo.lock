@@ -575,6 +575,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "sha2",
  "tokio",
  "zstd",
 ]

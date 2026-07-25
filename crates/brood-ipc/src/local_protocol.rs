@@ -36,6 +36,7 @@ pub fn encode_client_record(
         ClientMessage::Lifecycle(ClientLifecycle::Disconnect) => (INPUT_CLIENT_DISCONNECT, [0; 5]),
         ClientMessage::Actor(_)
         | ClientMessage::BackendRequest(_)
+        | ClientMessage::Artifact(_)
         | ClientMessage::ReleaseResource { .. } => {
             return Err(LocalProtocolError::WrongLane);
         }

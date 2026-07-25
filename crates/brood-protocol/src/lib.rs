@@ -8,10 +8,31 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 15;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 16;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
+
+/// Version of the content-addressed artifact manifest contract.
+pub const ARTIFACT_ABI_VERSION: u32 = 1;
+
+/// Maximum accepted size of one transferred executable artifact.
+pub const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum payload carried by one artifact chunk.
+pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 60 * 1024;
+
+/// Maximum stable artifact identity length.
+pub const MAX_ARTIFACT_ID_BYTES: usize = 128;
+
+/// Maximum number of requested capability names in one artifact manifest.
+pub const MAX_ARTIFACT_CAPABILITIES: usize = 32;
+
+/// Maximum capability-name length.
+pub const MAX_ARTIFACT_CAPABILITY_BYTES: usize = 128;
+
+/// Maximum peer-facing artifact rejection detail.
+pub const MAX_ARTIFACT_REJECTION_BYTES: usize = 512;
 
 /// One logical traffic class independently mapped by each carrier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -373,6 +394,127 @@ pub enum ClientLifecycle {
     Disconnect,
 }
 
+/// Content digest used as an artifact's immutable network identity.
+pub type ArtifactDigest = [u8; 32];
+
+/// Runtime realm in which an artifact requests installation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactRealm {
+    Client,
+    Session,
+}
+
+/// Executable artifact shape supported by the baseline exchange.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactKind {
+    WasmActor,
+}
+
+/// Immutable content-addressed artifact declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactManifest {
+    pub id: String,
+    pub realm: ArtifactRealm,
+    pub kind: ArtifactKind,
+    pub digest: ArtifactDigest,
+    pub bytes: u64,
+    pub abi_version: u32,
+    pub capabilities: Vec<String>,
+}
+
+impl ArtifactManifest {
+    /// Validate all peer-controlled manifest bounds and identifiers.
+    pub fn validate(&self) -> Result<(), ArtifactValidationError> {
+        if self.id.is_empty()
+            || self.id.len() > MAX_ARTIFACT_ID_BYTES
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(ArtifactValidationError::Id);
+        }
+        if self.bytes == 0 || self.bytes > MAX_ARTIFACT_BYTES {
+            return Err(ArtifactValidationError::Size(self.bytes));
+        }
+        if self.abi_version != ARTIFACT_ABI_VERSION {
+            return Err(ArtifactValidationError::Abi(self.abi_version));
+        }
+        if self.capabilities.len() > MAX_ARTIFACT_CAPABILITIES
+            || self.capabilities.iter().any(|capability| {
+                capability.is_empty() || capability.len() > MAX_ARTIFACT_CAPABILITY_BYTES
+            })
+        {
+            return Err(ArtifactValidationError::Capabilities);
+        }
+        Ok(())
+    }
+}
+
+/// One symmetric artifact-plane message.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactMessage {
+    Offer(ArtifactManifest),
+    Request {
+        digest: ArtifactDigest,
+    },
+    Chunk {
+        digest: ArtifactDigest,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    Complete {
+        digest: ArtifactDigest,
+    },
+    Accepted {
+        digest: ArtifactDigest,
+    },
+    Rejected {
+        digest: ArtifactDigest,
+        reason: String,
+    },
+}
+
+impl ArtifactMessage {
+    /// Validate bounded peer-controlled artifact message fields.
+    pub fn validate(&self) -> Result<(), ArtifactValidationError> {
+        match self {
+            Self::Offer(manifest) => manifest.validate(),
+            Self::Chunk { bytes, .. } if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES => {
+                Err(ArtifactValidationError::Chunk(bytes.len()))
+            }
+            Self::Rejected { reason, .. } if reason.len() > MAX_ARTIFACT_REJECTION_BYTES => {
+                Err(ArtifactValidationError::Rejection(reason.len()))
+            }
+            Self::Request { .. }
+            | Self::Chunk { .. }
+            | Self::Complete { .. }
+            | Self::Accepted { .. }
+            | Self::Rejected { .. } => Ok(()),
+        }
+    }
+}
+
+/// Invalid peer-controlled artifact metadata.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ArtifactValidationError {
+    #[error("artifact id is empty, oversized, or contains unsupported characters")]
+    Id,
+    #[error("artifact size {0} is outside the supported bounds")]
+    Size(u64),
+    #[error("artifact ABI version {0} is unsupported")]
+    Abi(u32),
+    #[error("artifact capability declarations exceed the supported bounds")]
+    Capabilities,
+    #[error("artifact chunk size {0} exceeds the supported bound")]
+    Chunk(usize),
+    #[error("artifact rejection detail size {0} exceeds the supported bound")]
+    Rejection(usize),
+}
+
 /// Message sent from a presentation client to its session server.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -381,6 +523,7 @@ pub enum ClientMessage {
     Lifecycle(ClientLifecycle),
     Actor(ActorMessage),
     BackendRequest(BackendRequest),
+    Artifact(ArtifactMessage),
     ReleaseResource { resource: u64 },
 }
 
@@ -486,6 +629,7 @@ pub enum ServerMessage {
     Scene(FrameScene),
     Actor(ActorMessage),
     BackendResponse(BackendResponse),
+    Artifact(ArtifactMessage),
     FocusPresentation,
     ClosePresentation,
     DisconnectAcknowledged,
@@ -494,8 +638,10 @@ pub enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        CarrierKind, EndpointCapabilities, FrameTransportKind, NegotiationError,
-        PRESENTATION_PROTOCOL_VERSION, TransportProfile, negotiate_profile,
+        ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
+        ArtifactValidationError, CarrierKind, EndpointCapabilities, FrameTransportKind,
+        MAX_ARTIFACT_CHUNK_BYTES, NegotiationError, PRESENTATION_PROTOCOL_VERSION,
+        TransportProfile, negotiate_profile,
     };
 
     #[test]
@@ -543,6 +689,33 @@ mod tests {
         assert_eq!(
             negotiate_profile(&client, &server),
             Err(NegotiationError::ProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn artifact_metadata_and_chunks_are_bounded_before_exchange() {
+        let manifest = ArtifactManifest {
+            id: "workspace.ui".to_string(),
+            realm: ArtifactRealm::Client,
+            kind: ArtifactKind::WasmActor,
+            digest: [7; 32],
+            bytes: 42,
+            abi_version: ARTIFACT_ABI_VERSION,
+            capabilities: Vec::new(),
+        };
+        assert_eq!(manifest.validate(), Ok(()));
+
+        let mut invalid = manifest;
+        invalid.id = "../escape".to_string();
+        assert_eq!(invalid.validate(), Err(ArtifactValidationError::Id));
+        assert_eq!(
+            ArtifactMessage::Chunk {
+                digest: [7; 32],
+                offset: 0,
+                bytes: vec![0; MAX_ARTIFACT_CHUNK_BYTES + 1],
+            }
+            .validate(),
+            Err(ArtifactValidationError::Chunk(MAX_ARTIFACT_CHUNK_BYTES + 1))
         );
     }
 }

@@ -597,6 +597,7 @@ const fn client_message_lane(message: &ClientMessage) -> Lane {
     match message {
         ClientMessage::Input(input) => input.lane(),
         ClientMessage::Lifecycle(_) => Lane::Critical,
+        ClientMessage::Artifact(_) => Lane::Bulk,
         ClientMessage::Actor(_)
         | ClientMessage::BackendRequest(_)
         | ClientMessage::ReleaseResource { .. } => Lane::Reliable,
@@ -609,6 +610,7 @@ const fn server_message_lane(message: &ServerMessage) -> Lane {
             Lane::Reliable
         }
         ServerMessage::Scene(_) => Lane::LatestState,
+        ServerMessage::Artifact(_) => Lane::Bulk,
         ServerMessage::FocusPresentation
         | ServerMessage::ClosePresentation
         | ServerMessage::DisconnectAcknowledged => Lane::Critical,
@@ -706,6 +708,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use brood_protocol::{
+        ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
         BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, ClientMessage,
         EndpointCapabilities, FrameColorSpace, FramePixelFormat, InputEvent, Lane, PanePosition,
         ServerMessage,
@@ -784,6 +787,19 @@ mod tests {
                     },
                 })
             );
+            let artifact = connection
+                .receive_client_message(Lane::Bulk)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            let ClientMessage::Artifact(ArtifactMessage::Offer(manifest)) = artifact else {
+                unreachable!("bulk lane did not preserve the artifact offer");
+            };
+            connection
+                .send_server_message(&ServerMessage::Artifact(ArtifactMessage::Accepted {
+                    digest: manifest.digest,
+                }))
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
             connection
                 .send_server_message(&ServerMessage::BackendResponse(BackendResponse {
                     id: 9,
@@ -848,6 +864,20 @@ mod tests {
             }))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
+        client
+            .send_client_message(&ClientMessage::Artifact(ArtifactMessage::Offer(
+                ArtifactManifest {
+                    id: "workspace.ui".to_string(),
+                    realm: ArtifactRealm::Session,
+                    kind: ArtifactKind::WasmActor,
+                    digest: [9; 32],
+                    bytes: 42,
+                    abi_version: ARTIFACT_ABI_VERSION,
+                    capabilities: Vec::new(),
+                },
+            )))
+            .await
+            .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(
             client
                 .receive_server_message(Lane::Reliable)
@@ -864,6 +894,13 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}")),
             ServerMessage::FocusPresentation
+        );
+        assert_eq!(
+            client
+                .receive_server_message(Lane::Bulk)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            ServerMessage::Artifact(ArtifactMessage::Accepted { digest: [9; 32] })
         );
         let frame = client
             .receive_frame()

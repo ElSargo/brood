@@ -12,8 +12,9 @@ execution environment. Actors may run in the session backend or in a
 presentation client according to explicit package placement. The runtime
 provides fault isolation, scheduling, lifecycle, and a portable I/O environment;
 it does not claim that a useful coding plugin is an adversarial security sandbox.
-A remote backend cannot authorize code execution on a client merely by sending
-it a WASM artifact; see [[presentation-client]].
+A remote peer cannot authorize code execution merely by sending a WASM
+artifact. The destination realm owns installation policy and capabilities; see
+[[artifact-distribution]].
 
 The complete model has three execution roles:
 

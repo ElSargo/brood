@@ -11,6 +11,7 @@ code-links:
   - crates/brood-ipc/src/local_protocol.rs
   - crates/brood-ipc/src/shared_image.rs
   - crates/brood-transport/src/network.rs
+  - crates/brood-transport/src/artifact.rs
   - crates/broodd/src/control.rs
   - crates/broodd/src/frame_export.rs
   - clients/brood-client/src/main.rs
@@ -49,7 +50,7 @@ Traffic is assigned to semantic lanes:
 - `Critical` carries lossless latency-sensitive transitions and lifecycle.
 - `Reliable` carries ordered catalog, actor, and resource transitions.
 - `LatestState` carries supersedable pointer, viewport, resize, and scene state.
-- `Bulk` is reserved for bounded large non-frame payloads.
+- `Bulk` carries bounded content-addressed artifact exchange.
 - `FrameResource` carries frame content independently from scene publication.
 
 Independent flow control is required. A large or stalled frame may reduce
@@ -110,12 +111,17 @@ presentation model.
 
 A relay may adapt a local session-server connection into the network carrier.
 The relay is a transport endpoint: it neither computes layout nor hosts
-presentation actors. The native remote client remains responsible for actors,
-input policy, final composition, and acknowledgements. Catalog and actor
-traffic retain their normal reliable ordering. Client backend and session
-operations use correlated request/response messages on that same reliable
-lane, so a remote presentation never reaches back to the server's local DBus
-address.
+presentation actors. It may verify and stage an authorized session-realm
+artifact before asking the local backend to instantiate it. The native remote
+client remains responsible for client actors, input policy, final composition,
+and acknowledgements. Catalog and actor traffic retain their normal reliable
+ordering. Client backend and session operations use correlated request/response
+messages on that same reliable lane, so a remote presentation never reaches
+back to the server's local DBus address.
+
+Either endpoint may offer a content-addressed WASM artifact on the independent
+bulk lane. Destination realm, allowlist, digest verification, caching, and
+runtime authority are defined by [[artifact-distribution]].
 
 ## Frame And Scene Lifecycle
 
@@ -159,6 +165,8 @@ Acceptance covers the complete profile matrix:
   managed-window scene and pixels, decompresses and validates the frame,
   acknowledges presentation, and disconnects cleanly;
 - carrier unit tests reject version, lane, bounds, and frame-metadata errors;
+- a real WASM artifact transfers in each direction and is accepted only by its
+  destination realm;
 - critical traffic remains deliverable while latest-state and frame traffic
   are saturated.
 
@@ -168,6 +176,7 @@ not only successful serialization or socket connection.
 ## Related Pages
 
 - [[presentation-client]]
+- [[artifact-distribution]]
 - [[wayland-compositor]]
 - [[testing]]
 - [[../decisions/0007-presentation-transports-and-client-actors]]

@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     mem::size_of,
     os::fd::AsFd,
+    path::PathBuf,
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
@@ -29,7 +30,9 @@ use brood_layout::{
     LayoutAction, LayoutItemKind, LayoutLeaseId, LayoutLeaseTree, LayoutRect, LayoutSize,
     LocalPoint, ResolvedLayout,
 };
-use brood_protocol::{ClientLifecycle, ClientMessage, InputEvent, PanePosition};
+use brood_protocol::{
+    ArtifactManifest, ArtifactRealm, ClientLifecycle, ClientMessage, InputEvent, PanePosition,
+};
 use clap::Parser;
 use num_traits::ToPrimitive;
 use serde::Deserialize;
@@ -252,6 +255,11 @@ fn main() -> Result<()> {
         eprintln!("starting Brood presentation without a backend");
         (None, None, None, false, false, None, None)
     } else if let Some(connect) = args.remote_connect {
+        let artifact_offers = args
+            .remote_offer_session_artifacts
+            .iter()
+            .map(|spec| brood_transport::ArtifactOffer::parse(spec, ArtifactRealm::Session))
+            .collect::<Result<Vec<_>>>()?;
         let mut connection = remote::RemoteConnection::start(
             remote::RemoteConfig {
                 connect,
@@ -268,6 +276,12 @@ fn main() -> Result<()> {
                     .remote_client_private_key
                     .clone()
                     .context("--remote-client-private-key is required for remote transport")?,
+                artifact_offers,
+                allowed_client_artifacts: args.remote_allow_client_artifacts.clone(),
+                artifact_cache: args
+                    .remote_artifact_cache
+                    .clone()
+                    .unwrap_or_else(brood_transport::default_artifact_cache),
             },
             &event_proxy,
         )?;
@@ -453,6 +467,11 @@ enum ClientEvent {
     FocusPresentation,
     ClosePresentation,
     TransportError(String),
+    RemoteArtifactInstalled {
+        manifest: ArtifactManifest,
+        path: PathBuf,
+        completion: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     PluginGraphicsChanged {
         pane: u64,
         sequence: u64,
@@ -1319,6 +1338,11 @@ impl Application {
                 windows,
             } => (sequence, width, height, windows),
             ClientEvent::TransportError(message) => return Err(anyhow!(message)),
+            ClientEvent::RemoteArtifactInstalled { .. } => {
+                return Err(anyhow!(
+                    "remote artifact event reached scene transport path"
+                ));
+            }
             ClientEvent::FocusPresentation => {
                 return Err(anyhow!(
                     "presentation focus event reached scene transport path"
@@ -2046,6 +2070,39 @@ impl ApplicationHandler<ClientEvent> for Application {
             return;
         }
         match event {
+            ClientEvent::RemoteArtifactInstalled {
+                manifest,
+                path,
+                completion,
+            } => {
+                let result = (|| {
+                    anyhow::ensure!(
+                        manifest.realm == ArtifactRealm::Client,
+                        "remote artifact {:?} targets the wrong realm",
+                        manifest.id
+                    );
+                    let pane = self
+                        .wasm_runtime
+                        .as_mut()
+                        .context("client WASM runtime is unavailable")?
+                        .install_artifact_actor(&manifest.id, &path)?;
+                    eprintln!(
+                        "installed remote client artifact id={} pane={} digest={}",
+                        manifest.id,
+                        pane,
+                        brood_transport::digest_hex(manifest.digest)
+                    );
+                    Ok::<(), anyhow::Error>(())
+                })();
+                let completion_result = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                drop(completion.send(completion_result));
+                if let Err(error) = result {
+                    eprintln!("rejected remote client artifact: {error:#}");
+                }
+            }
             ClientEvent::FocusPresentation => {
                 if let Some(renderer) = self.renderer.as_ref() {
                     renderer

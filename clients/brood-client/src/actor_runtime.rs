@@ -139,6 +139,27 @@ impl PresentationWasmRuntime {
         Ok(pane)
     }
 
+    /// Install one verified network artifact without granting management or
+    /// runtime-I/O capabilities.
+    pub fn install_artifact_actor(&mut self, id: &str, path: &Path) -> Result<u64> {
+        ensure!(
+            !id.trim().is_empty() && id != CLIENT_INIT_ACTOR_ID,
+            "remote presentation actor id is unavailable"
+        );
+        let pane = self.allocate_actor_pane()?;
+        self.load_actor(
+            PresentationActorSpec {
+                id: id.to_string(),
+                path: path.to_path_buf(),
+            },
+            pane,
+            self.graphics.clone().as_ref(),
+        )?;
+        self.pending_pane_creations.push_back(pane);
+        self.drain_events()?;
+        Ok(pane)
+    }
+
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the initialized root actor is transferred into the long-lived client realm"

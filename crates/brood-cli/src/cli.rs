@@ -318,6 +318,27 @@ pub struct ClientArgs {
         requires = "remote_connect"
     )]
     pub remote_client_private_key: Option<PathBuf>,
+    /// Offer a WASM actor to the authenticated remote session as ID from PATH.
+    #[arg(
+        long = "remote-offer-session-artifact",
+        value_name = "ID=PATH",
+        requires = "remote_connect"
+    )]
+    pub remote_offer_session_artifacts: Vec<String>,
+    /// Authorize a server-offered client-realm artifact by stable ID.
+    #[arg(
+        long = "remote-allow-client-artifact",
+        value_name = "ID",
+        requires = "remote_connect"
+    )]
+    pub remote_allow_client_artifacts: Vec<String>,
+    /// Override the verified content-addressed artifact cache.
+    #[arg(
+        long = "remote-artifact-cache",
+        value_name = "PATH",
+        requires = "remote_connect"
+    )]
+    pub remote_artifact_cache: Option<PathBuf>,
     /// Config file used to select the blessed client init actor.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,

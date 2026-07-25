@@ -15,7 +15,12 @@ for tool in weston-simple-egl; do
   fi
 done
 
-cargo build -p brood-remote -p broodd --bins
+cargo build -p brood-remote -p broodd -p brood-client --bins
+cargo build \
+  --manifest-path examples/wasm-component-actor/Cargo.toml \
+  --locked \
+  --target wasm32-unknown-unknown \
+  --release
 
 TEST_TMP="$(mktemp -d /tmp/brood-network-transport.XXXXXX)"
 RUNTIME_DIR="$TEST_TMP/runtime"
@@ -26,13 +31,20 @@ SERVER_CERTIFICATE="$TEST_TMP/server.der"
 SERVER_PRIVATE_KEY="$TEST_TMP/server-key.der"
 CLIENT_CERTIFICATE="$TEST_TMP/client.der"
 CLIENT_PRIVATE_KEY="$TEST_TMP/client-key.der"
+ARTIFACT="$TEST_TMP/component-actor.component.wasm"
+RELAY_ARTIFACT_CACHE="$TEST_TMP/relay-artifacts"
+CLIENT_ARTIFACT_CACHE="$TEST_TMP/client-artifacts"
 DBUS_DESTINATION="org.brood.NetworkTransportTest.p$$"
 mkdir -m 700 "$RUNTIME_DIR"
+
+cargo run --quiet -p brood-wasm --example componentize -- \
+  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm \
+  "$ARTIFACT"
 
 cleanup() {
   local result=$?
 
-  for pid in "${RELAY_PID:-}" "${SERVER_PID:-}"; do
+  for pid in "${PROBE_PID:-}" "${RELAY_PID:-}" "${SERVER_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
       kill "$pid" > /dev/null 2>&1 || true
     fi
@@ -99,6 +111,9 @@ target/debug/brood-remote relay \
   --trusted-client-certificate "$CLIENT_CERTIFICATE" \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+  --offer-client-artifact "network-client-proof=$ARTIFACT" \
+  --allow-session-artifact network-session-proof \
+  --artifact-cache "$RELAY_ARTIFACT_CACHE" \
   > "$RELAY_LOG" 2>&1 &
 RELAY_PID=$!
 
@@ -119,6 +134,31 @@ CONNECT="$(
   exit 1
 }
 
+target/debug/brood-remote probe \
+  --connect "$CONNECT" \
+  --server-name localhost \
+  --certificate "$SERVER_CERTIFICATE" \
+  --client-certificate "$CLIENT_CERTIFICATE" \
+  --client-private-key "$CLIENT_PRIVATE_KEY" \
+  --offer-session-artifact "network-session-proof=$ARTIFACT" \
+  --allow-client-artifact network-client-proof \
+  --artifact-cache "$CLIENT_ARTIFACT_CACHE" \
+  > "$PROBE_LOG" 2>&1 &
+PROBE_PID=$!
+
+for _ in $(seq 1 100); do
+  rg -q 'installed remote session artifact id=network-session-proof' "$RELAY_LOG" && break
+  kill -0 "$PROBE_PID" 2> /dev/null || {
+    echo "ERR remote probe exited before the relay attached" >&2
+    exit 1
+  }
+  sleep 0.1
+done
+rg -q 'installed remote session artifact id=network-session-proof' "$RELAY_LOG" || {
+  echo "ERR timed out waiting for the connected artifact exchange" >&2
+  exit 1
+}
+
 ctl spawn weston-simple-egl > /dev/null
 for _ in $(seq 1 100); do
   if ctl status | rg -q 'windows=[1-9]'; then
@@ -131,16 +171,34 @@ ctl status | rg -q 'windows=[1-9]' || {
   exit 1
 }
 
-target/debug/brood-remote probe \
-  --connect "$CONNECT" \
-  --server-name localhost \
-  --certificate "$SERVER_CERTIFICATE" \
-  --client-certificate "$CLIENT_CERTIFICATE" \
-  --client-private-key "$CLIENT_PRIVATE_KEY" \
-  > "$PROBE_LOG" 2>&1
+wait "$PROBE_PID"
+PROBE_PID=""
 
 rg -q '^OK remote transport ' "$PROBE_LOG" || {
   echo "ERR remote probe did not complete the transport workflow" >&2
+  exit 1
+}
+rg -q 'artifacts_sent=1 artifacts_received=1' "$PROBE_LOG" || {
+  echo "ERR remote probe did not verify both artifact directions" >&2
+  exit 1
+}
+ctl actors list | rg -q 'network-session-proof' || {
+  echo "ERR client-offered artifact did not become a live session actor" >&2
+  exit 1
+}
+mapfile -t RECEIVED_ARTIFACTS < <(find "$CLIENT_ARTIFACT_CACHE" -type f -name artifact.wasm)
+[[ "${#RECEIVED_ARTIFACTS[@]}" -eq 1 ]] || {
+  echo "ERR expected one verified client artifact cache entry" >&2
+  exit 1
+}
+target/debug/brood-client \
+  --no-server \
+  --no-init \
+  --wasm-actor "network-client-proof=${RECEIVED_ARTIFACTS[0]}" \
+  --check-wasm-actors \
+  >> "$PROBE_LOG" 2>&1
+rg -q 'presentation WASM actor check passed' "$PROBE_LOG" || {
+  echo "ERR server-offered artifact did not load in the client runtime" >&2
   exit 1
 }
 wait "$RELAY_PID"
