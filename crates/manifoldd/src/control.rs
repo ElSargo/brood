@@ -100,6 +100,8 @@ type DbusFastPath = (
     zvariant::OwnedFd,
     zvariant::OwnedFd,
     zvariant::OwnedFd,
+    zvariant::OwnedFd,
+    zvariant::OwnedFd,
 );
 type DbusAgent = (
     String,
@@ -2588,25 +2590,37 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
     let input_file = manifold_ipc::CriticalLaneFile::create(generation)?;
     let frame_file = manifold_ipc::CriticalLaneFile::create(generation)?;
     let actor_message_file = manifold_ipc::ActorMessageLaneFile::create(generation)?;
+    let presentation_message_file = manifold_ipc::ActorMessageLaneFile::create(generation)?;
     let input_notifications = manifold_ipc::EventNotifier::create()?;
     let frame_notifications = manifold_ipc::EventNotifier::create()?;
     let actor_message_notifications = manifold_ipc::EventNotifier::create()?;
+    let presentation_message_notifications = manifold_ipc::EventNotifier::create()?;
     let input_fd = input_file.as_fd().try_clone_to_owned()?;
     let input_notify_fd = input_notifications.as_fd().try_clone_to_owned()?;
     let frame_fd = frame_file.as_fd().try_clone_to_owned()?;
     let frame_notify_fd = frame_notifications.as_fd().try_clone_to_owned()?;
     let actor_message_fd = actor_message_file.as_fd().try_clone_to_owned()?;
     let actor_message_notify_fd = actor_message_notifications.as_fd().try_clone_to_owned()?;
+    let presentation_message_fd = presentation_message_file.as_fd().try_clone_to_owned()?;
+    let presentation_message_notify_fd = presentation_message_notifications
+        .as_fd()
+        .try_clone_to_owned()?;
     let input = manifold_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
     let frames = manifold_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
     let actor_messages =
         manifold_ipc::ActorMessageConsumer::map(actor_message_file.as_fd(), generation)?;
+    let presentation_messages =
+        manifold_ipc::ActorMessageProducer::map(presentation_message_file.as_fd(), generation)?;
     let fast_path = crate::state::PresentationFastPath {
         generation,
         input,
         frames,
         actor_messages,
+        presentation_messages,
         frame_notifications,
+        presentation_message_notifications,
+        presentation_message_sequence: 0,
+        deferred_presentation_messages: std::collections::VecDeque::new(),
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
         resource_app_ids: std::collections::HashMap::new(),
@@ -2653,6 +2667,8 @@ fn open_presentation_fast_path(state: &mut Manifold) -> Result<DbusFastPath> {
         frame_notify_fd.into(),
         actor_message_fd.into(),
         actor_message_notify_fd.into(),
+        presentation_message_fd.into(),
+        presentation_message_notify_fd.into(),
     ))
 }
 
@@ -2660,6 +2676,7 @@ fn drain_fast_path_actor_messages(state: &mut Manifold) {
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
     };
+    let mut messages = Vec::new();
     while let Some(message) = fast_path.actor_messages.try_recv() {
         if message.connection_generation() != fast_path.generation {
             continue;
@@ -2672,6 +2689,10 @@ fn drain_fast_path_actor_messages(state: &mut Manifold) {
         })();
         let session = SurfaceSessionId::from_raw(message.session_id());
         drop(message);
+        messages.push((session, decoded));
+    }
+    state.dmabuf.fast_path = Some(fast_path);
+    for (session, decoded) in messages {
         match decoded {
             Ok((sender, recipient, body)) => {
                 if let Err(error) =
@@ -2688,7 +2709,6 @@ fn drain_fast_path_actor_messages(state: &mut Manifold) {
             Err(error) => warn!(error = %error, "rejected malformed actor-message record"),
         }
     }
-    state.dmabuf.fast_path = Some(fast_path);
 }
 
 fn drain_fast_path_input(state: &mut Manifold) {

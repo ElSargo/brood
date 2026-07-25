@@ -39,7 +39,8 @@ Isolation still matters:
 - each actor has its own address space and failure state;
 - workers share memory only with their owning actor;
 - queues, operations, handles, and resources are bounded and generation scoped;
-- a plugin crash or runaway worker must not tear down the session;
+- a plugin crash or runaway actor or worker must not tear down the session or
+  starve its peers;
 - the host validates ABI data and owns compositor, renderer, and lifecycle
   invariants.
 
@@ -92,6 +93,12 @@ started, stopped, and failed child events back to the init actor. Restart
 policy, backoff, dependency order, optional services, and topology therefore
 remain guest behavior rather than a host-owned desired-graph format.
 
+A child start request selects a package-declared capability profile. The host
+resolves that profile against the package grant and enclosing session before
+constructing the child runtime. The root may choose among declared profiles but
+cannot mint filesystem, process, PTY, network, credential, or presentation
+authority by spelling an undeclared capability in a message.
+
 A surface-session root may also request a named Wayland app with an argv. The
 host binds that process and its pane to the root's session and reports typed
 started, stopped, and failed events. Choosing `foot` as the default terminal is
@@ -104,11 +111,12 @@ placement. A client init actor creates client-local actors; a session init actor
 creates backend actors and apps in its own surface session.
 
 The host retains mechanism and recovery responsibility. It validates identities
-and package-root paths, enforces generation and resource limits, and hard-stops
-Stores, workers, operations, native children, streams, mailboxes, and stale
-generations when a realm exits or an actor cannot cooperate. Recovery startup
-may explicitly omit the init actor so a broken root cannot make the realm
-uninspectable.
+and package-root paths and enforces generation and resource limits. Scheduler
+budgets are cooperative yield points, never actor termination conditions. The
+host hard-stops Stores, workers, operations, native children, streams,
+mailboxes, and stale generations only for an explicit stop, replacement, or
+realm exit. Recovery startup may explicitly omit the init actor so a broken
+root cannot make the realm uninspectable.
 
 ## Actors
 
@@ -128,6 +136,9 @@ operations, send messages, publish state, and request host actions.
 
 This rule is about scheduler responsiveness, not security. It keeps lifecycle,
 input, cancellation, and mailbox traffic moving while background work waits.
+The host enforces peer fairness by yielding CPU-bound guest execution.
+Exhausting an epoch or fuel quantum does not fail or restart the actor;
+execution resumes on a later scheduler turn.
 
 Use another actor when work needs an independent address, memory space, failure
 domain, or lifecycle.
@@ -219,6 +230,14 @@ Mailboxes are the durable communication path between actors, host services,
 panes, and agents. Mailboxes are bounded, reject or expose backpressure, and
 carry sender, target, slot, generation, and causal identity. Workers report
 through their owning actor rather than adding another public addressing layer.
+
+Cross-placement delivery is bidirectional and connection-scoped. A
+presentation actor may address a session actor in the attached surface session,
+and a session actor may address a presentation actor on a subscribed
+connection. Disconnecting a presentation removes its return route without
+changing the session actor's identity or lifecycle. Subscription, replay,
+snapshot, and unsubscription remain application protocols carried in mailbox
+messages; the host does not impose a special observer API.
 
 An actor may also place a bounded message in its local host outbox. The host
 attaches the actor generation as authenticated origin before interpreting the

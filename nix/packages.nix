@@ -52,6 +52,7 @@ let
       "${src}/examples/wasm-preview1-worker/Cargo.lock"
       "${src}/plugins/component-workspace-watch/Cargo.lock"
       "${src}/plugins/component-runtime-io/Cargo.lock"
+      "${src}/plugins/coding-agent/Cargo.lock"
       "${src}/plugins/default-workspace/Cargo.lock"
       "${src}/plugins/session-switcher/Cargo.lock"
       "${src}/plugins/workspace-file-log/Cargo.lock"
@@ -258,6 +259,19 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/coding-agent/Cargo.toml ]]; then
+        component_core="plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm"
+        component_output="plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR coding agent core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       if [[ -f plugins/component-workspace-watch/Cargo.toml ]]; then
         component_core="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.wasm"
         component_output="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.component.wasm"
@@ -310,6 +324,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"

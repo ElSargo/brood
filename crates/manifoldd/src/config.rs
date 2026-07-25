@@ -264,7 +264,7 @@ pub fn load_startup_modules(state: &mut Manifold, config_path: &Path) -> Result<
     Ok(())
 }
 
-fn workspace_filesystem_capability(capabilities: &[String]) -> Option<bool> {
+pub fn workspace_filesystem_capability(capabilities: &[String]) -> Option<bool> {
     if capabilities
         .iter()
         .any(|capability| capability == "filesystem:workspace-write")
@@ -280,7 +280,7 @@ fn workspace_filesystem_capability(capabilities: &[String]) -> Option<bool> {
     }
 }
 
-fn runtime_io_capabilities(
+pub fn runtime_io_capabilities(
     capabilities: &[String],
 ) -> Result<manifold_wasm::RuntimeIoCapabilities> {
     let mut commands = capabilities

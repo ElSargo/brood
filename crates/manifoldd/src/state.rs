@@ -933,6 +933,108 @@ impl Manifold {
         Ok(())
     }
 
+    fn send_local_realm_actor_message(
+        &mut self,
+        session: SurfaceSessionId,
+        actor: &str,
+        sender: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        let actor_id = self.resolve_realm_actor_id(session, actor)?;
+        self.try_route_wasm_actor_message(&actor_id, sender.to_string(), body)?;
+        self.plugin_actor_messages = self.plugin_actor_messages.saturating_add(1);
+        self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+        Ok(())
+    }
+
+    fn resolve_realm_actor_id(&self, session: SurfaceSessionId, actor: &str) -> Result<String> {
+        ensure!(
+            self.sessions.contains(session),
+            "unknown surface session {}",
+            session.raw()
+        );
+        let init = self
+            .realm_inits
+            .get(&session)
+            .context("surface session has no actor realm")?;
+        if actor == "init" || actor == init.actor_id {
+            Ok(init.actor_id.clone())
+        } else if let Some(actor_id) = init.children.get(actor) {
+            Ok(actor_id.clone())
+        } else if init.children.values().any(|actor_id| actor_id == actor) {
+            Ok(actor.to_string())
+        } else {
+            anyhow::bail!(
+                "actor {actor:?} does not belong to surface session {}",
+                session.raw()
+            )
+        }
+    }
+
+    fn send_presentation_actor_message(
+        &mut self,
+        session: SurfaceSessionId,
+        sender: &str,
+        actor: &str,
+        body: &[u8],
+    ) -> Result<()> {
+        ensure!(
+            session == self.sessions.active(),
+            "surface session {} is not attached to the current presentation",
+            session.raw()
+        );
+        let fast_path = self
+            .dmabuf
+            .fast_path
+            .as_mut()
+            .context("no presentation fast path is attached")?;
+        fast_path.presentation_message_sequence =
+            fast_path.presentation_message_sequence.wrapping_add(1);
+        let record = manifold_ipc::ActorMessageRecord::new(
+            fast_path.generation,
+            fast_path.presentation_message_sequence,
+            session.raw(),
+            sender,
+            actor,
+            body,
+        )?;
+        if !fast_path.deferred_presentation_messages.is_empty() {
+            ensure!(
+                fast_path.deferred_presentation_messages.len() < 64,
+                "session-to-presentation actor message backlog is full"
+            );
+            fast_path.deferred_presentation_messages.push_back(record);
+            return Ok(());
+        }
+        if let Err(record) = fast_path.presentation_messages.try_send(record) {
+            fast_path.deferred_presentation_messages.push_back(record);
+        } else {
+            fast_path.presentation_message_notifications.notify()?;
+        }
+        info!(
+            surface_session = session.raw(),
+            sender, actor, "queued session-to-presentation actor message"
+        );
+        Ok(())
+    }
+
+    fn flush_presentation_actor_messages(&mut self) {
+        let Some(fast_path) = self.dmabuf.fast_path.as_mut() else {
+            return;
+        };
+        let mut published = false;
+        while let Some(record) = fast_path.deferred_presentation_messages.pop_front() {
+            if let Err(record) = fast_path.presentation_messages.try_send(record) {
+                fast_path.deferred_presentation_messages.push_front(record);
+                break;
+            }
+            published = true;
+        }
+        if published {
+            let _ = fast_path.presentation_message_notifications.notify();
+        }
+    }
+
     pub fn send_plugin_actor_message_to_slot(
         &mut self,
         actor_id: &str,
@@ -1251,13 +1353,15 @@ impl Manifold {
 
     fn drain_hosted_actor_events(&mut self) {
         enum InitRequest {
-            StartActor(SurfaceSessionId, String, String),
+            StartActor(SurfaceSessionId, String, String, Vec<String>),
             StopActor(SurfaceSessionId, String),
             StartApp(SurfaceSessionId, String, Vec<String>),
         }
 
         let mut events = Vec::new();
         let mut init_requests = Vec::new();
+        let mut local_messages = Vec::new();
+        let mut presentation_messages = Vec::new();
         for (actor_name, actor) in &mut self.wasm_io_actors {
             match actor {
                 manifold_wasm::HostedWasmActor::Component(actor) => {
@@ -1307,11 +1411,29 @@ impl Manifold {
                         );
                     }
                 }
+                manifold_wasm::ComponentActorEvent::WorkerFinished { worker, .. } => {
+                    self.plugin_actor_last_status =
+                        Some(format!("{actor_name}:worker_{}_finished", worker.raw()));
+                    info!(
+                        actor = %actor_name,
+                        worker = worker.raw(),
+                        "component actor worker finished"
+                    );
+                }
                 manifold_wasm::ComponentActorEvent::WorkerFailed { worker, message } => {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                     self.plugin_actor_last_status =
                         Some(format!("{actor_name}:worker_{}_failed", worker.raw()));
                     warn!(actor = %actor_name, worker = worker.raw(), error = %message, "component actor worker failed");
+                }
+                manifold_wasm::ComponentActorEvent::WorkerCancelled { worker } => {
+                    self.plugin_actor_last_status =
+                        Some(format!("{actor_name}:worker_{}_cancelled", worker.raw()));
+                    info!(
+                        actor = %actor_name,
+                        worker = worker.raw(),
+                        "component actor worker cancelled"
+                    );
                 }
                 manifold_wasm::ComponentActorEvent::Stopped => {
                     self.plugin_actor_last_status = Some(format!("{actor_name}:stopped"));
@@ -1323,9 +1445,18 @@ impl Manifold {
                         );
                     }
                 }
-                manifold_wasm::ComponentActorEvent::ActorStartRequested { id, path } => {
+                manifold_wasm::ComponentActorEvent::ActorStartRequested {
+                    id,
+                    path,
+                    capabilities,
+                } => {
                     if let Some(session) = self.realm_init_root_session(&actor_name) {
-                        init_requests.push(InitRequest::StartActor(session, id, path));
+                        init_requests.push(InitRequest::StartActor(
+                            session,
+                            id,
+                            path,
+                            capabilities,
+                        ));
                     }
                 }
                 manifold_wasm::ComponentActorEvent::ActorStopRequested { id } => {
@@ -1338,13 +1469,62 @@ impl Manifold {
                         init_requests.push(InitRequest::StartApp(session, id, argv));
                     }
                 }
+                manifold_wasm::ComponentActorEvent::LocalMessageRequested { actor, body } => {
+                    local_messages.push((actor_name, actor, body));
+                }
+                manifold_wasm::ComponentActorEvent::PresentationMessageRequested {
+                    actor,
+                    body,
+                } => {
+                    presentation_messages.push((actor_name, actor, body));
+                }
                 _ => {}
+            }
+        }
+        for (sender_actor, recipient, body) in local_messages {
+            let owner = self
+                .realm_init_root_session(&sender_actor)
+                .map(|session| (session, "init".to_string()))
+                .or_else(|| self.realm_init_child_owner(&sender_actor));
+            let Some((session, sender)) = owner else {
+                warn!(actor = %sender_actor, "rejected local message from actor outside a session realm");
+                continue;
+            };
+            if let Err(error) =
+                self.send_local_realm_actor_message(session, &recipient, &sender, body)
+            {
+                warn!(
+                    actor = %sender_actor,
+                    recipient = %recipient,
+                    error = %error,
+                    "rejected local session actor message"
+                );
+            }
+        }
+        for (sender_actor, recipient, body) in presentation_messages {
+            let owner = self
+                .realm_init_root_session(&sender_actor)
+                .map(|session| (session, "init".to_string()))
+                .or_else(|| self.realm_init_child_owner(&sender_actor));
+            let Some((session, sender)) = owner else {
+                warn!(actor = %sender_actor, "rejected presentation message from actor outside a session realm");
+                continue;
+            };
+            if let Err(error) =
+                self.send_presentation_actor_message(session, &sender, &recipient, &body)
+            {
+                warn!(
+                    actor = %sender_actor,
+                    recipient = %recipient,
+                    error = %error,
+                    "rejected session-to-presentation actor message"
+                );
             }
         }
         for request in init_requests {
             match request {
-                InitRequest::StartActor(session, id, path) => {
-                    self.handle_realm_init_start(session, id, &path);
+                InitRequest::StartActor(session, id, path, capabilities) => {
+                    self.handle_realm_init_start(session, id, &path, &capabilities);
                 }
                 InitRequest::StopActor(session, id) => {
                     self.handle_realm_init_stop(session, id);
@@ -3446,6 +3626,7 @@ impl Manifold {
     /// Service lifecycle requests and failure feedback for the session init
     /// actor. This is safe to call on every compositor turn.
     pub(crate) fn service_realm_init_actor(&mut self) {
+        self.flush_presentation_actor_messages();
         self.drain_hosted_actor_events();
         let completed = self
             .realm_inits
@@ -3479,8 +3660,14 @@ impl Manifold {
         }
     }
 
-    fn handle_realm_init_start(&mut self, session: SurfaceSessionId, id: String, guest_path: &str) {
-        let result = self.start_realm_init_child(session, &id, guest_path);
+    fn handle_realm_init_start(
+        &mut self,
+        session: SurfaceSessionId,
+        id: String,
+        guest_path: &str,
+        capabilities: &[String],
+    ) {
+        let result = self.start_realm_init_child(session, &id, guest_path, capabilities);
         match result {
             Ok(generation) => {
                 self.send_realm_init_child_event(
@@ -3507,6 +3694,7 @@ impl Manifold {
         session: SurfaceSessionId,
         id: &str,
         guest_path: &str,
+        capabilities: &[String],
     ) -> Result<u64> {
         ensure!(
             !id.trim().is_empty(),
@@ -3553,14 +3741,45 @@ impl Manifold {
             path.starts_with(&canonical_root),
             "init child actor path must stay inside the init package root"
         );
-        self.replace_wasm_plugin_with_instance_id(
-            Some(&actor_id),
-            false,
+        ensure!(
+            capabilities.iter().all(|capability| {
+                matches!(
+                    capability.as_str(),
+                    "filesystem:workspace-read"
+                        | "filesystem:workspace-write"
+                        | "pty"
+                        | "network:loopback"
+                ) || capability
+                    .strip_prefix("subprocess:")
+                    .is_some_and(|command| !command.trim().is_empty())
+            }),
+            "init child requested an unknown capability"
+        );
+        let filesystem =
+            if let Some(writable) = crate::config::workspace_filesystem_capability(capabilities) {
+                let host_path = self
+                    .sessions
+                    .working_directory(session)
+                    .map(PathBuf::from)
+                    .context("surface session has no working directory")?;
+                Some(HostedPluginFilesystem {
+                    host_path,
+                    writable,
+                })
+            } else {
+                None
+            };
+        let runtime_io = crate::config::runtime_io_capabilities(capabilities)?;
+        self.replace_wasm_component_actor(
+            &actor_id,
             &path,
-            None,
+            filesystem.as_ref(),
             None,
             ConfiguredPluginResources::default(),
-            manifold_wasm::RuntimeIoCapabilities::default(),
+            runtime_io,
+            false,
+            false,
+            Some(session),
         )?;
         let generation = self
             .wasm_io_actors
@@ -4065,10 +4284,12 @@ impl Manifold {
                 max_filesystem_watch_events: resources.filesystem_watch_events,
                 runtime_io: manifold_wasm::RuntimeIoConfig {
                     capabilities: runtime_io,
+                    working_directory: filesystem.map(|grant| grant.host_path.clone()),
                     ..manifold_wasm::RuntimeIoConfig::default()
                 },
                 actor_management,
                 app_management,
+                presentation_messaging: lifecycle_session.is_some(),
                 ..manifold_wasm::ComponentActorConfig::default()
             },
         ))?;
@@ -5471,7 +5692,11 @@ pub struct PresentationFastPath {
     pub input: manifold_ipc::CriticalConsumer,
     pub frames: manifold_ipc::CriticalProducer,
     pub actor_messages: manifold_ipc::ActorMessageConsumer,
+    pub presentation_messages: manifold_ipc::ActorMessageProducer,
     pub frame_notifications: manifold_ipc::EventNotifier,
+    pub presentation_message_notifications: manifold_ipc::EventNotifier,
+    pub presentation_message_sequence: u64,
+    pub deferred_presentation_messages: VecDeque<Box<manifold_ipc::ActorMessageRecord>>,
     pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,
     pub resource_app_ids: HashMap<u64, String>,

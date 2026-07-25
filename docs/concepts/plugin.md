@@ -38,10 +38,12 @@ independent address, address space, failure domain, or lifecycle.
 ## Communication And I/O
 
 Actors communicate through bounded host mailboxes. Same-runtime messages remain
-local; explicitly addressed presentation-to-session messages cross the
-presentation connection. Actors submit I/O and later receive typed completion
-events. Workers may use the same operations through ordinary WASI calls and
-worker `select!`; only the calling worker waits.
+local; explicitly addressed session-to-presentation and
+presentation-to-session messages cross the presentation connection. The
+connection authenticates the sender placement and actor identity rather than
+trusting identity fields in the message body. Actors submit I/O and later
+receive typed completion events. Workers may use the same operations through
+ordinary WASI calls and worker `select!`; only the calling worker waits.
 
 Workers coordinate through guest-owned shared-memory structures plus host
 notifications. The host schedules wakeups but does not define plugin mutex,

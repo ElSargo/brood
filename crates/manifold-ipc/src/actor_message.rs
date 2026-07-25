@@ -1,4 +1,4 @@
-//! Bounded client-to-session actor mailbox transport.
+//! Bounded actor mailbox transport between one presentation and session realm.
 
 use std::{
     cell::UnsafeCell,
@@ -358,7 +358,7 @@ impl Drop for Mapping {
 // protocol synchronizes access with the endpoint in the other process.
 unsafe impl Send for Mapping {}
 
-/// Producer endpoint for client-to-session actor messages.
+/// Producer endpoint for one direction of actor messages.
 pub struct ActorMessageProducer {
     mapping: Mapping,
     position: u64,
@@ -400,7 +400,7 @@ impl ActorMessageProducer {
     }
 }
 
-/// Consumer endpoint for client-to-session actor messages.
+/// Consumer endpoint for one direction of actor messages.
 pub struct ActorMessageConsumer {
     mapping: Mapping,
     position: u64,

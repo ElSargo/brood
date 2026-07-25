@@ -27,8 +27,8 @@ impl Guest for ExampleActor {
             &event,
             Event::Mailbox(message) if message.body == b"spin-dispatch"
         ) {
-            // The host's epoch scheduler must yield this otherwise
-            // non-cooperative dispatcher so its wall-clock deadline can fire.
+            // The host's epoch scheduler must keep yielding this otherwise
+            // non-cooperative dispatcher without terminating its actor.
             loop {
                 core::hint::spin_loop();
             }
