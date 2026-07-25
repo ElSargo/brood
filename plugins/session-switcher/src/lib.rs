@@ -20,7 +20,9 @@ const PICKER_ACTOR_ID: &str = "picker";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
 const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
+const DIFF_VIEWER_COMPONENT_FILE: &str = "brood_diff_viewer_plugin.component.wasm";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
+const DIFF_VIEWER_ID: &str = "diff-viewer";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
 const HEADER_HEIGHT: f32 = 104.0;
@@ -70,6 +72,7 @@ struct SwitcherState {
     error: bool,
     next_coding_agent_ui: u64,
     coding_agent_uis: Vec<String>,
+    diff_viewer_running: bool,
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
@@ -212,6 +215,7 @@ impl SwitcherState {
             error: false,
             next_coding_agent_ui: 2,
             coding_agent_uis: Vec::new(),
+            diff_viewer_running: false,
             text_resources: Vec::new(),
             layout: None,
             workspace_focus: None,
@@ -321,6 +325,12 @@ impl Guest for SessionSwitcher {
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
+            Event::Child(ChildEvent::Started(started)) if started.id == DIFF_VIEWER_ID => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.diff_viewer_running = true;
+                }
+                Vec::new()
+            }
             Event::Child(ChildEvent::Started(started))
                 if started.id == CODING_AGENT_UI_ID
                     || started.id.starts_with("coding-agent-ui-") =>
@@ -336,12 +346,18 @@ impl Guest for SessionSwitcher {
             Event::Child(ChildEvent::Stopped(id)) => {
                 if let Ok(mut state) = STATE.lock() {
                     state.coding_agent_uis.retain(|actor| actor != &id);
+                    if id == DIFF_VIEWER_ID {
+                        state.diff_viewer_running = false;
+                    }
                 }
                 Vec::new()
             }
             Event::Child(ChildEvent::Failed(failed)) => {
                 if let Ok(mut state) = STATE.lock() {
                     state.coding_agent_uis.retain(|actor| actor != &failed.id);
+                    if failed.id == DIFF_VIEWER_ID {
+                        state.diff_viewer_running = false;
+                    }
                     state.error = true;
                     state.status = format!("Agent UI failed: {}", failed.message);
                 }
@@ -353,7 +369,7 @@ impl Guest for SessionSwitcher {
                 handle_layout_message(&message.body)
             }
             Event::Mailbox(message) if message.sender == "key-policy" => {
-                handle_sidebar_action(&message.body)
+                handle_key_policy_action(&message.body)
             }
             Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
                 handle_picker_message(&message.body)
@@ -547,7 +563,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     publish_layout(&state, true, message.focused_pane)
 }
 
-fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
+fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
         && consumed == bytes.len()
         && message.kind.as_str() == "coding-agent-action"
@@ -559,6 +575,21 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
         state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
         return vec![start_coding_agent_ui(&id)];
+    }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "diff-viewer-action"
+        && message.action.as_str() == "toggle"
+    {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        state.diff_viewer_running = !state.diff_viewer_running;
+        return if state.diff_viewer_running {
+            vec![start_diff_viewer()]
+        } else {
+            vec![ActorCommand::StopActor(DIFF_VIEWER_ID.to_string())]
+        };
     }
     let Ok((message, consumed)) = serde_json_core::from_slice::<SidebarActionMessage>(bytes) else {
         return Vec::new();
@@ -714,6 +745,17 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
         actor: PICKER_ACTOR_ID.to_string(),
         body,
     })]
+}
+
+fn start_diff_viewer() -> ActorCommand {
+    ActorCommand::StartActor(ActorStartRequest {
+        id: DIFF_VIEWER_ID.to_string(),
+        path: DIFF_VIEWER_COMPONENT_FILE.to_string(),
+        capabilities: vec![
+            "filesystem:workspace-read".to_string(),
+            "subprocess:git".to_string(),
+        ],
+    })
 }
 
 fn start_coding_agent_ui(id: &str) -> ActorCommand {

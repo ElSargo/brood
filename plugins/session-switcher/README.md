@@ -28,6 +28,12 @@ request on the reusable picker actor and activates the session returned in the
 selection reply. The picker pane is a centered overlay in this actor's root
 layout and is never delegated into the workspace subtree.
 
+The init actor also owns the diff viewer's pane lifecycle. `Ctrl+Alt+D` starts
+the diff actor with narrow read-only workspace and `subprocess:git`
+capabilities; the next press stops the actor and therefore closes the pane. The
+diff viewer stays an ordinary workspace pane and does not participate in the
+switcher's root layout policy.
+
 The pane supports:
 
 - pointer or keyboard session selection and activation;

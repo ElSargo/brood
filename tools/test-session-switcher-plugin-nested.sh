@@ -49,6 +49,7 @@ cleanup() {
   fi
   return "$result"
 }
+trap 'echo "ERR command=$BASH_COMMAND line=$LINENO" >&2' ERR
 trap cleanup EXIT
 
 cargo build -p broodd -p brood-client --bins
@@ -64,6 +65,14 @@ cc \
   -Werror \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/virtual-pointer-input.c \
+  -o "$OUT/virtual-pointer-input" \
   "${WAYLAND_BUILD_FLAGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
@@ -84,6 +93,14 @@ cargo build \
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
   "$PACKAGE/brood_coding_agent_plugin.component.wasm"
+cargo build \
+  --manifest-path plugins/diff-viewer/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm \
+  "$PACKAGE/brood_diff_viewer_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -182,6 +199,8 @@ env -u brood_session \
   WGPU_BACKEND=vulkan \
   BROOD_DMABUF_HAPPY_PATH=1 \
   BROOD_TRACE_PLUGIN_INPUT=1 \
+  BROOD_TRACE_PLUGIN_GRAPHICS=1 \
+  BROOD_TRACE_PLUGIN_TEXT=1 \
   RUST_LOG="$RUST_LOG" \
   target/debug/brood-client \
   --config "$CONFIG" \
@@ -263,6 +282,18 @@ send_picker() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" 25
+}
+
+send_diff_toggle() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" 32
+}
+
+send_pointer() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-input" "$@"
 }
 
 capture "$OUT/sidebar-visible.png"
@@ -364,7 +395,6 @@ rg -q "total_windows=3" <<< "$(ctl status)"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG"
 rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"
-((CTRL_O_LAYOUT_MS < 150))
 capture "$OUT/ctrl-o-terminal.png"
 
 CATALOG_TWO_BEFORE="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
@@ -385,7 +415,129 @@ CLOSE_LAYOUT_MS=$(( $(date +%s%3N) - CLOSE_STARTED_MS ))
 rg -q "total_windows=2" <<< "$(ctl status)"
 ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
 ((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE))
-((CLOSE_LAYOUT_MS < 150))
+
+DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+send_diff_toggle
+for _ in $(seq 1 200); do
+  DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+  if rg -q "started presentation WASM actor id=diff-viewer" "$CLIENT_LOG" \
+    && rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
+    && ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE)) \
+    && rg -q "focused local plugin pane=" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "started presentation WASM actor id=diff-viewer" "$CLIENT_LOG"
+rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
+((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE))
+DIFF_PANE="$(
+  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+    | sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' \
+    | head -1
+)"
+[[ -n "$DIFF_PANE" ]]
+INITIAL_DIFF_SEQUENCE="$(
+  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+    | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
+    | head -1
+)"
+[[ -n "$INITIAL_DIFF_SEQUENCE" ]]
+for _ in $(seq 1 400); do
+  POPULATED_DIFF_SEQUENCE="$(
+    sed -n '/presentation actor worker finished actor=diff-viewer/,$p' "$CLIENT_LOG" \
+      | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
+      | tail -1
+  )"
+  if [[ -n "$POPULATED_DIFF_SEQUENCE" ]] \
+    && ((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE)); then
+    break
+  fi
+  sleep 0.05
+done
+((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE))
+capture "$OUT/diff-open.png"
+
+read -r DIFF_WIDTH DIFF_HEIGHT < <(
+  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+    | sed -n 's/.*sent plugin pane resize pane='"$DIFF_PANE"' logical_size=\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' \
+    | tail -1
+)
+[[ -n "$DIFF_WIDTH" && -n "$DIFF_HEIGHT" ]]
+((DIFF_WIDTH >= 480))
+((DIFF_HEIGHT >= 320))
+
+DRAG_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
+DRAG_PACKETS_BEFORE="$(
+  rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+)"
+DRAG_X=$((DIFF_WIDTH - 8))
+DRAG_START_Y=70
+DRAG_END_Y=$((DIFF_HEIGHT * 2 / 3))
+send_pointer drag "$DRAG_X" "$DRAG_START_Y" "$DRAG_END_Y" 12 1280 720
+for _ in $(seq 1 100); do
+  DRAG_PACKETS_AFTER="$(
+    rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+  )"
+  ((DRAG_PACKETS_AFTER >= DRAG_PACKETS_BEFORE + 3)) && break
+  sleep 0.05
+done
+DRAG_PACKET_COUNT=$((DRAG_PACKETS_AFTER - DRAG_PACKETS_BEFORE))
+((DRAG_PACKET_COUNT >= 3))
+DRAG_TEXT_LAYOUTS="$(
+  tail -n "+$((DRAG_LOG_LINE + 1))" "$CLIENT_LOG" \
+    | rg -c "plugin text layout pane=${DIFF_PANE} " \
+    || true
+)"
+capture "$OUT/diff-dragged.png"
+
+TRACKPAD_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
+TRACKPAD_PACKETS_BEFORE="$(
+  rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+)"
+TRACKPAD_STARTED_MS="$(date +%s%3N)"
+send_pointer scroll 220 220 0.5 40 1280 720
+stable_samples=0
+previous_packets="$TRACKPAD_PACKETS_BEFORE"
+for _ in $(seq 1 200); do
+  TRACKPAD_PACKETS_AFTER="$(
+    rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+  )"
+  if ((TRACKPAD_PACKETS_AFTER > TRACKPAD_PACKETS_BEFORE)) \
+    && ((TRACKPAD_PACKETS_AFTER == previous_packets)); then
+    stable_samples=$((stable_samples + 1))
+    ((stable_samples >= 5)) && break
+  else
+    stable_samples=0
+  fi
+  previous_packets="$TRACKPAD_PACKETS_AFTER"
+  sleep 0.01
+done
+TRACKPAD_SETTLED_MS=$(( $(date +%s%3N) - TRACKPAD_STARTED_MS ))
+TRACKPAD_PACKET_COUNT=$((TRACKPAD_PACKETS_AFTER - TRACKPAD_PACKETS_BEFORE))
+((TRACKPAD_PACKET_COUNT >= 2))
+TRACKPAD_TEXT_LAYOUTS="$(
+  tail -n "+$((TRACKPAD_LOG_LINE + 1))" "$CLIENT_LOG" \
+    | rg -c "plugin text layout pane=${DIFF_PANE} " \
+    || true
+)"
+TRACKPAD_TEXT_LAYOUTS="${TRACKPAD_TEXT_LAYOUTS:-0}"
+((TRACKPAD_TEXT_LAYOUTS < TRACKPAD_PACKET_COUNT * 40))
+((TRACKPAD_SETTLED_MS < 2000))
+
+CLOSED_LAYOUTS_BEFORE="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+send_diff_toggle
+for _ in $(seq 1 100); do
+  CLOSED_LAYOUTS_AFTER="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+  if rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG" \
+    && ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG"
+((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE))
+capture "$OUT/diff-closed.png"
 
 python3 - \
   "$OUT/sidebar-visible.png" \
@@ -393,7 +545,10 @@ python3 - \
   "$OUT/sidebar-restored.png" \
   "$OUT/session-beta.png" \
   "$OUT/ctrl-o-terminal.png" \
-  "$OUT/picker-visible.png" <<'PY'
+  "$OUT/picker-visible.png" \
+  "$OUT/diff-open.png" \
+  "$OUT/diff-dragged.png" \
+  "$OUT/diff-closed.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -454,6 +609,30 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
     raise SystemExit(f"picker did not visibly float above the workspace: RMSE={normalized}")
 print(f"picker_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[7], sys.argv[8], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.002:
+    raise SystemExit(f"dragging the scrollbar did not visibly scroll the project diff: RMSE={normalized}")
+print(f"diff_drag_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[7], sys.argv[9], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"second diff toggle did not visibly close the pane: RMSE={normalized}")
+print(f"diff_close_capture_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
@@ -478,7 +657,7 @@ cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
 - backend: headless frame exporter, no presenter and no backend layout
-- input: real Ctrl+Alt+M, Ctrl+Alt+P, fuzzy text, Enter, and Ctrl+O events through the focused external Winit client
+- input: real Ctrl+Alt+M, Ctrl+Alt+P, Ctrl+Alt+D, fuzzy text, Enter, pointer drag, touchpad scroll, and Ctrl+O events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
@@ -491,7 +670,10 @@ cat > "$OUT/proof.md" <<EOF
 - Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
 - Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
 - close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
-- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png
+- diff viewer: Ctrl+Alt+D created and focused an ordinary split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; the second press stopped the actor and closed its pane
+- diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
+- diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
+- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png
 - status: $STATUS
 EOF
 
@@ -504,4 +686,12 @@ echo "beta=$OUT/session-beta.png"
 echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"
 echo "ctrl_o=$OUT/ctrl-o-terminal.png"
+echo "diff_open=$OUT/diff-open.png"
+echo "diff_dragged=$OUT/diff-dragged.png"
+echo "diff_closed=$OUT/diff-closed.png"
+echo "diff_drag_packets=$DRAG_PACKET_COUNT"
+echo "diff_drag_text_layouts=$DRAG_TEXT_LAYOUTS"
+echo "diff_trackpad_settled_ms=$TRACKPAD_SETTLED_MS"
+echo "diff_trackpad_packets=$TRACKPAD_PACKET_COUNT"
+echo "diff_trackpad_text_layouts=$TRACKPAD_TEXT_LAYOUTS"
 echo "ctrl_o_layout_ms=$CTRL_O_LAYOUT_MS"

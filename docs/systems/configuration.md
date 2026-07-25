@@ -60,10 +60,11 @@ artifact independently. Replacement and shutdown are per ID; one actor's
 workers and resources are joined without removing its peers.
 
 Configured hosted actors may request `filesystem:workspace-read` or
-`filesystem:workspace-write` in `capabilities`. The daemon preopens the active
-session's working directory at guest `.` with the requested access. Without one
-of those grants, the hosted actor keeps the narrow package-directory,
-read-only default.
+`filesystem:workspace-write` in `capabilities`. The realm host preopens its
+workspace at guest `.` with the requested access. Client-init children use the
+presentation client's launch directory; session actors use the active
+session's working directory. Without one of those grants, a hosted actor keeps
+the narrow package-directory, read-only default.
 
 Runtime I/O authority is also explicit. `subprocess:<name>` admits one
 PATH-resolved command name, `pty` admits real pseudoterminal attachment for an
