@@ -325,6 +325,13 @@ pub struct ClientArgs {
         requires = "remote_connect"
     )]
     pub remote_offer_session_artifacts: Vec<String>,
+    /// Offer a lazily hydrated WASM package rooted at PATH under stable package ID.
+    #[arg(
+        long = "remote-offer-session-package",
+        value_name = "ID=ROOT_WASM_PATH",
+        requires = "remote_connect"
+    )]
+    pub remote_offer_session_packages: Vec<String>,
     /// Authorize a server-offered client-realm artifact by stable ID.
     #[arg(
         long = "remote-allow-client-artifact",

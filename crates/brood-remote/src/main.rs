@@ -10,12 +10,14 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_cli::control::{
-    ControlTarget, activate_surface_session, close_surface_session, create_surface_session,
-    handshake, open_presentation_fast_path, rename_surface_session, request_dbus_command,
-    resolve_control_target, shared_memory_resource,
+    ControlTarget, activate_surface_session, close_surface_session,
+    complete_realm_artifact_request, create_surface_session, handshake,
+    install_session_init_artifact, open_presentation_fast_path, rename_surface_session,
+    request_dbus_command, resolve_control_target, shared_memory_resource,
+    take_realm_artifact_requests,
 };
 use brood_protocol::{
-    ActorMessage, ArtifactMessage, ArtifactRealm, BackendOperation, BackendRequest,
+    ActorMessage, ArtifactDigest, ArtifactMessage, ArtifactRealm, BackendOperation, BackendRequest,
     BackendResponse, BackendResponseValue, CatalogSession, CatalogSnapshot, CatalogWindow,
     ClientLifecycle, ClientMessage, EndpointCapabilities, FrameResourceRef, FrameScene,
     FrameTransportKind, InputEvent, Lane, ServerMessage, SessionOperation, WindowFrame,
@@ -23,12 +25,14 @@ use brood_protocol::{
 use brood_transport::{
     ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, NetworkFramePacket, NetworkReceiveLane,
     NetworkSendLane, accept_network_connection, client_endpoint, connect_network,
-    default_artifact_cache, digest_hex, server_endpoint,
+    default_artifact_cache, digest_file, digest_hex, package_offers, server_endpoint,
 };
 use clap::{Parser, Subcommand};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
+
+mod ssh;
 
 #[derive(Debug, Parser)]
 #[command(about = "Brood remote presentation transport")]
@@ -48,6 +52,8 @@ enum Command {
         #[arg(long)]
         private_key: PathBuf,
     },
+    /// Build, copy, and start a backend over SSH, then launch the local client.
+    Ssh(ssh::SshArgs),
     /// Relay one local session connection over authenticated QUIC.
     Relay {
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -68,6 +74,9 @@ enum Command {
         /// Authorize a client-offered session-realm artifact by stable ID.
         #[arg(long = "allow-session-artifact", value_name = "ID")]
         allow_session_artifacts: Vec<String>,
+        /// Authorize one lazily hydrated session-init package by stable package ID.
+        #[arg(long = "allow-session-package", value_name = "ID")]
+        allow_session_packages: Vec<String>,
         /// Override the verified content-addressed artifact cache.
         #[arg(long = "artifact-cache", value_name = "PATH")]
         artifact_cache: Option<PathBuf>,
@@ -90,6 +99,9 @@ enum Command {
         /// Offer a WASM actor to the remote session as ID from PATH.
         #[arg(long = "offer-session-artifact", value_name = "ID=PATH")]
         offer_session_artifacts: Vec<String>,
+        /// Offer a lazily hydrated WASM package rooted at PATH under stable package ID.
+        #[arg(long = "offer-session-package", value_name = "ID=ROOT_WASM_PATH")]
+        offer_session_packages: Vec<String>,
         /// Authorize a relay-offered client-realm artifact by stable ID.
         #[arg(long = "allow-client-artifact", value_name = "ID")]
         allow_client_artifacts: Vec<String>,
@@ -141,6 +153,7 @@ async fn main() -> Result<()> {
             certificate,
             private_key,
         } => generate_certificate(&server_name, &certificate, &private_key),
+        Command::Ssh(args) => ssh::deploy(&args),
         Command::Relay {
             listen,
             certificate,
@@ -150,6 +163,7 @@ async fn main() -> Result<()> {
             dbus_address,
             offer_client_artifacts,
             allow_session_artifacts,
+            allow_session_packages,
             artifact_cache,
         } => {
             relay(
@@ -160,6 +174,7 @@ async fn main() -> Result<()> {
                 resolve_control_target(dbus_name, dbus_address),
                 &offer_client_artifacts,
                 allow_session_artifacts,
+                allow_session_packages,
                 artifact_cache,
             )
             .await
@@ -172,6 +187,7 @@ async fn main() -> Result<()> {
             client_private_key,
             keycode,
             offer_session_artifacts,
+            offer_session_packages,
             allow_client_artifacts,
             artifact_cache,
         } => {
@@ -183,6 +199,7 @@ async fn main() -> Result<()> {
                 &client_private_key,
                 keycode,
                 &offer_session_artifacts,
+                &offer_session_packages,
                 allow_client_artifacts,
                 artifact_cache,
             )
@@ -218,18 +235,27 @@ async fn relay(
     target: ControlTarget,
     offer_specs: &[String],
     allowed_session_artifacts: Vec<String>,
+    allowed_session_packages: Vec<String>,
     artifact_cache: Option<PathBuf>,
 ) -> Result<()> {
+    ensure!(
+        allowed_session_packages.len() <= 1,
+        "a relay can hydrate at most one session-init package"
+    );
     let artifact_offers = offer_specs
         .iter()
         .map(|spec| ArtifactOffer::parse(spec, ArtifactRealm::Client))
         .collect::<Result<Vec<_>>>()?;
+    let artifact_cache = artifact_cache.unwrap_or_else(default_artifact_cache);
+    let package_cache = artifact_cache.join("packages");
     let artifact_exchange = ArtifactExchange::new(
         ArtifactRealm::Session,
         allowed_session_artifacts,
-        artifact_cache.unwrap_or_else(default_artifact_cache),
+        artifact_cache,
         artifact_offers,
-    )?;
+    )?
+    .with_allowed_packages(allowed_session_packages.clone());
+    let session_package = allowed_session_packages.into_iter().next();
     let bootstrap_target = target.clone();
     let (handshake, fast_path) = tokio::task::spawn_blocking(move || {
         let handshake =
@@ -372,16 +398,26 @@ async fn relay(
         target.clone(),
         outbound,
     ));
-    let artifact_task = tokio::spawn(exchange_session_artifacts(
+    let mut artifact_task = tokio::spawn(exchange_session_artifacts(
         bulk_send,
         bulk_receive,
         artifact_exchange,
         target,
+        session_package,
+        package_cache,
     ));
 
-    let result = disconnect_rx
-        .await
-        .context("remote client disconnected without a lifecycle message");
+    let result = tokio::select! {
+        disconnect = disconnect_rx => {
+            disconnect.context("remote client disconnected without a lifecycle message")
+        }
+        artifact = &mut artifact_task => {
+            match artifact.context("join remote artifact exchange")? {
+                Ok(()) => Err(anyhow!("remote artifact exchange stopped unexpectedly")),
+                Err(error) => Err(error.context("remote artifact exchange failed")),
+            }
+        }
+    };
     artifact_task.abort();
     result
 }
@@ -391,73 +427,234 @@ async fn exchange_session_artifacts(
     mut receive: NetworkReceiveLane,
     mut exchange: ArtifactExchange,
     target: ControlTarget,
+    session_package: Option<String>,
+    package_cache: PathBuf,
 ) -> Result<()> {
     let mut outbound = VecDeque::from(exchange.initial_messages());
+    let mut waiting_by_digest = HashMap::<ArtifactDigest, Vec<u64>>::new();
+    let mut active_package_roots = HashMap::<String, PathBuf>::new();
+    let mut unresolved = VecDeque::<(u64, String, std::time::Instant)>::new();
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         while let Some(message) = outbound.pop_front() {
             send.send_server_message(&ServerMessage::Artifact(message))
                 .await?;
         }
-        let message = receive_client_artifact(&mut receive).await?;
-        let update = exchange.handle(message)?;
-        for event in update.events {
-            match event {
-                ArtifactExchangeEvent::Installed(artifact) => {
-                    let digest = artifact.manifest.digest;
-                    let install_result = install_session_artifact(&target, &artifact).await;
-                    let completion = match &install_result {
-                        Ok(()) => Ok(()),
-                        Err(error) => Err(format!("{error:#}")),
+
+        tokio::select! {
+            message = receive_client_artifact(&mut receive) => {
+                let update = exchange.handle(message?)?;
+                apply_session_artifact_update(
+                    update,
+                    &mut exchange,
+                    &mut outbound,
+                    &target,
+                    &package_cache,
+                    &mut waiting_by_digest,
+                    &mut active_package_roots,
+                ).await?;
+            }
+            _ = poll.tick() => {
+                let poll_target = target.clone();
+                let requests = tokio::task::spawn_blocking(move || {
+                    take_realm_artifact_requests(&poll_target)
+                })
+                .await
+                .context("join realm artifact request poll")??;
+                let now = std::time::Instant::now();
+                unresolved.extend(
+                    requests
+                        .into_iter()
+                        .map(|(request, path)| (request, path, now)),
+                );
+
+                let pending = unresolved.len();
+                for _ in 0..pending {
+                    let Some((request, path, first_seen)) = unresolved.pop_front() else {
+                        break;
                     };
-                    outbound.push_back(exchange.finish_installation(digest, completion)?);
-                    match install_result {
-                        Ok(()) => eprintln!(
-                            "installed remote session artifact id={} digest={}",
-                            artifact.manifest.id,
-                            digest_hex(digest)
-                        ),
-                        Err(error) => eprintln!(
-                            "rejected remote session artifact id={} digest={} reason={error:#}",
-                            artifact.manifest.id,
-                            digest_hex(digest)
-                        ),
-                    }
-                }
-                ArtifactExchangeEvent::PeerAccepted(manifest) => {
+                    let Some(package) = session_package.as_deref() else {
+                        complete_missing_member(
+                            &target,
+                            request,
+                            false,
+                            "relay has no authorized session package".to_string(),
+                        ).await?;
+                        continue;
+                    };
+                    let Some(digest) = exchange.package_member_digest(package, &path) else {
+                        if first_seen.elapsed() < std::time::Duration::from_secs(10) {
+                            unresolved.push_back((request, path, first_seen));
+                        } else {
+                            complete_missing_member(
+                                &target,
+                                request,
+                                false,
+                                format!("client did not advertise package member {package:?}:{path:?}"),
+                            ).await?;
+                        }
+                        continue;
+                    };
                     eprintln!(
-                        "remote client accepted artifact id={} digest={}",
-                        manifest.id,
-                        digest_hex(manifest.digest)
-                    );
-                }
-                ArtifactExchangeEvent::PeerRejected {
-                    manifest,
-                    digest,
-                    reason,
-                } => {
-                    eprintln!(
-                        "remote client rejected artifact id={} digest={} reason={reason}",
-                        manifest
-                            .as_ref()
-                            .map_or("<unknown>", |value| value.id.as_str()),
+                        "requesting missing session package member package={} path={} digest={}",
+                        package,
+                        path,
                         digest_hex(digest)
                     );
+                    waiting_by_digest.entry(digest).or_default().push(request);
+                    let update = exchange.request_package_member(package, &path)?;
+                    apply_session_artifact_update(
+                        update,
+                        &mut exchange,
+                        &mut outbound,
+                        &target,
+                        &package_cache,
+                        &mut waiting_by_digest,
+                        &mut active_package_roots,
+                    ).await?;
                 }
             }
         }
-        outbound.extend(update.outbound);
     }
+}
+
+async fn apply_session_artifact_update(
+    update: brood_transport::ArtifactExchangeUpdate,
+    exchange: &mut ArtifactExchange,
+    outbound: &mut VecDeque<ArtifactMessage>,
+    target: &ControlTarget,
+    package_cache: &Path,
+    waiting_by_digest: &mut HashMap<ArtifactDigest, Vec<u64>>,
+    active_package_roots: &mut HashMap<String, PathBuf>,
+) -> Result<()> {
+    outbound.extend(update.outbound);
+    for event in update.events {
+        match event {
+            ArtifactExchangeEvent::Installed(artifact) => {
+                let digest = artifact.manifest.digest;
+                let waiting = waiting_by_digest.remove(&digest).unwrap_or_default();
+                let install_result = install_session_artifact(
+                    target,
+                    &artifact,
+                    package_cache,
+                    &waiting,
+                    active_package_roots,
+                )
+                .await;
+                if let Err(error) = &install_result
+                    && artifact
+                        .manifest
+                        .package
+                        .as_ref()
+                        .is_some_and(|member| !member.root)
+                {
+                    for request in waiting {
+                        if let Err(completion_error) =
+                            complete_missing_member(target, request, false, format!("{error:#}"))
+                                .await
+                        {
+                            eprintln!(
+                                "failed to reject realm artifact request {request}: {completion_error:#}"
+                            );
+                        }
+                    }
+                }
+                let completion = match &install_result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                outbound.push_back(exchange.finish_installation(digest, completion)?);
+                match install_result {
+                    Ok(()) => eprintln!(
+                        "installed remote session artifact id={} digest={}",
+                        artifact.manifest.id,
+                        digest_hex(digest)
+                    ),
+                    Err(error) => eprintln!(
+                        "rejected remote session artifact id={} digest={} reason={error:#}",
+                        artifact.manifest.id,
+                        digest_hex(digest)
+                    ),
+                }
+            }
+            ArtifactExchangeEvent::PeerAccepted(manifest) => {
+                eprintln!(
+                    "remote client accepted artifact id={} digest={}",
+                    manifest.id,
+                    digest_hex(manifest.digest)
+                );
+            }
+            ArtifactExchangeEvent::PeerRejected {
+                manifest,
+                digest,
+                reason,
+            } => {
+                eprintln!(
+                    "remote client rejected artifact id={} digest={} reason={reason}",
+                    manifest
+                        .as_ref()
+                        .map_or("<unknown>", |value| value.id.as_str()),
+                    digest_hex(digest)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn install_session_artifact(
     target: &ControlTarget,
     artifact: &brood_transport::InstalledArtifact,
+    package_cache: &Path,
+    waiting: &[u64],
+    active_package_roots: &mut HashMap<String, PathBuf>,
 ) -> Result<()> {
     ensure!(
         artifact.manifest.realm == ArtifactRealm::Session,
         "remote artifact {:?} targets the wrong realm",
         artifact.manifest.id
     );
+    if let Some(member) = &artifact.manifest.package {
+        if member.root {
+            ensure!(
+                waiting.is_empty(),
+                "session package root unexpectedly satisfied a child request"
+            );
+            let package_root = package_cache
+                .join(&member.package)
+                .join(digest_hex(artifact.manifest.digest));
+            let path = materialize_package_member(&package_root, artifact)?;
+            let install_target = target.clone();
+            let installed = tokio::task::spawn_blocking(move || {
+                install_session_init_artifact(&install_target, &path)
+            })
+            .await
+            .context("join session init artifact installation")??;
+            ensure!(
+                installed,
+                "backend did not install the session init artifact"
+            );
+            active_package_roots.insert(member.package.clone(), package_root);
+        } else {
+            ensure!(
+                !waiting.is_empty(),
+                "package member was received without a backend request"
+            );
+            let package_root = active_package_roots.get(&member.package).with_context(|| {
+                format!(
+                    "package member {:?} arrived before its init root",
+                    member.package
+                )
+            })?;
+            materialize_package_member(package_root, artifact)?;
+            for request in waiting {
+                complete_missing_member(target, *request, true, String::new()).await?;
+            }
+        }
+        return Ok(());
+    }
+
     let install_target = target.clone();
     let id = artifact.manifest.id.clone();
     let path = artifact.path.clone();
@@ -479,6 +676,83 @@ async fn install_session_artifact(
         response.starts_with("OK "),
         "session rejected remote artifact installation: {}",
         response.trim()
+    );
+    Ok(())
+}
+
+fn materialize_package_member(
+    package_root: &Path,
+    artifact: &brood_transport::InstalledArtifact,
+) -> Result<PathBuf> {
+    let member = artifact
+        .manifest
+        .package
+        .as_ref()
+        .context("artifact is not a package member")?;
+    let destination = package_root.join(&member.path);
+    ensure!(
+        destination.starts_with(package_root),
+        "package member escaped its materialization root"
+    );
+    if destination.is_file()
+        && fs::metadata(&destination)?.len() == artifact.manifest.bytes
+        && digest_file(&destination)? == artifact.manifest.digest
+    {
+        return Ok(destination);
+    }
+    let parent = destination
+        .parent()
+        .context("package member has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create package materialization root {}", parent.display()))?;
+    let temporary = parent.join(format!(
+        ".artifact-{}-{}.part",
+        std::process::id(),
+        digest_hex(artifact.manifest.digest)
+    ));
+    let result = (|| {
+        fs::copy(&artifact.path, &temporary).with_context(|| {
+            format!(
+                "copy package member {} to {}",
+                artifact.path.display(),
+                temporary.display()
+            )
+        })?;
+        ensure!(
+            fs::metadata(&temporary)?.len() == artifact.manifest.bytes
+                && digest_file(&temporary)? == artifact.manifest.digest,
+            "materialized package member failed content verification"
+        );
+        fs::rename(&temporary, &destination).with_context(|| {
+            format!(
+                "publish package member {} as {}",
+                temporary.display(),
+                destination.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        drop(fs::remove_file(&temporary));
+    }
+    result?;
+    Ok(destination)
+}
+
+async fn complete_missing_member(
+    target: &ControlTarget,
+    request: u64,
+    success: bool,
+    message: String,
+) -> Result<()> {
+    let completion_target = target.clone();
+    let completed = tokio::task::spawn_blocking(move || {
+        complete_realm_artifact_request(&completion_target, request, success, message)
+    })
+    .await
+    .context("join realm artifact request completion")??;
+    ensure!(
+        completed,
+        "backend no longer has realm artifact request {request}"
     );
     Ok(())
 }
@@ -954,13 +1228,17 @@ async fn probe(
     client_private_key: &Path,
     keycode: Option<u32>,
     offer_specs: &[String],
+    package_specs: &[String],
     allowed_client_artifacts: Vec<String>,
     artifact_cache: Option<PathBuf>,
 ) -> Result<()> {
-    let artifact_offers = offer_specs
+    let mut artifact_offers = offer_specs
         .iter()
         .map(|spec| ArtifactOffer::parse(spec, ArtifactRealm::Session))
         .collect::<Result<Vec<_>>>()?;
+    for spec in package_specs {
+        artifact_offers.extend(package_offers(spec, ArtifactRealm::Session)?);
+    }
     let offered_artifacts = artifact_offers.len();
     let expected_client_artifacts = allowed_client_artifacts.len();
     let artifact_exchange = ArtifactExchange::new(

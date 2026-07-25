@@ -8,16 +8,24 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in weston-simple-egl; do
-  if ! command -v "$tool" > /dev/null 2>&1; then
-    echo "ERR $tool is required for the network transport proof" >&2
-    exit 2
-  fi
-done
+if ! command -v weston-simple-egl >/dev/null 2>&1; then
+  echo "ERR weston-simple-egl is required for the network transport proof" >&2
+  exit 2
+fi
 
 cargo build -p brood-remote -p broodd -p brood-client --bins
 cargo build \
   --manifest-path examples/wasm-component-actor/Cargo.toml \
+  --locked \
+  --target wasm32-unknown-unknown \
+  --release
+cargo build \
+  --manifest-path examples/wasm-init-actor/Cargo.toml \
+  --locked \
+  --target wasm32-unknown-unknown \
+  --release
+cargo build \
+  --manifest-path plugins/coding-agent/Cargo.toml \
   --locked \
   --target wasm32-unknown-unknown \
   --release
@@ -32,14 +40,22 @@ SERVER_PRIVATE_KEY="$TEST_TMP/server-key.der"
 CLIENT_CERTIFICATE="$TEST_TMP/client.der"
 CLIENT_PRIVATE_KEY="$TEST_TMP/client-key.der"
 ARTIFACT="$TEST_TMP/component-actor.component.wasm"
+SESSION_PACKAGE="$TEST_TMP/session-package"
+SESSION_INIT="$SESSION_PACKAGE/brood_wasm_init_actor_example.component.wasm"
 RELAY_ARTIFACT_CACHE="$TEST_TMP/relay-artifacts"
 CLIENT_ARTIFACT_CACHE="$TEST_TMP/client-artifacts"
 DBUS_DESTINATION="org.brood.NetworkTransportTest.p$$"
-mkdir -m 700 "$RUNTIME_DIR"
+mkdir -m 700 "$RUNTIME_DIR" "$SESSION_PACKAGE"
 
 cargo run --quiet -p brood-wasm --example componentize -- \
   examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm \
   "$ARTIFACT"
+cargo run --quiet -p brood-wasm --example componentize -- \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.wasm \
+  "$SESSION_INIT"
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
+  "$SESSION_PACKAGE/brood_coding_agent_plugin.component.wasm"
 
 cleanup() {
   local result=$?
@@ -112,7 +128,7 @@ target/debug/brood-remote relay \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
   --offer-client-artifact "network-client-proof=$ARTIFACT" \
-  --allow-session-artifact network-session-proof \
+  --allow-session-package network-session-package \
   --artifact-cache "$RELAY_ARTIFACT_CACHE" \
   > "$RELAY_LOG" 2>&1 &
 RELAY_PID=$!
@@ -140,22 +156,29 @@ target/debug/brood-remote probe \
   --certificate "$SERVER_CERTIFICATE" \
   --client-certificate "$CLIENT_CERTIFICATE" \
   --client-private-key "$CLIENT_PRIVATE_KEY" \
-  --offer-session-artifact "network-session-proof=$ARTIFACT" \
+  --offer-session-package "network-session-package=$SESSION_INIT" \
   --allow-client-artifact network-client-proof \
   --artifact-cache "$CLIENT_ARTIFACT_CACHE" \
   > "$PROBE_LOG" 2>&1 &
 PROBE_PID=$!
 
 for _ in $(seq 1 100); do
-  rg -q 'installed remote session artifact id=network-session-proof' "$RELAY_LOG" && break
+  if rg -q 'requesting missing session package member package=network-session-package path=brood_coding_agent_plugin.component.wasm' "$RELAY_LOG" \
+    && ctl actors list | rg -q 'brood.session.1.coding-agent-1'; then
+    break
+  fi
   kill -0 "$PROBE_PID" 2> /dev/null || {
-    echo "ERR remote probe exited before the relay attached" >&2
+    echo "ERR remote probe exited before lazy package hydration completed" >&2
     exit 1
   }
   sleep 0.1
 done
-rg -q 'installed remote session artifact id=network-session-proof' "$RELAY_LOG" || {
-  echo "ERR timed out waiting for the connected artifact exchange" >&2
+rg -q 'requesting missing session package member package=network-session-package path=brood_coding_agent_plugin.component.wasm' "$RELAY_LOG" || {
+  echo "ERR backend did not request the missing init package member" >&2
+  exit 1
+}
+ctl actors list | rg -q 'brood.session.1.coding-agent-1' || {
+  echo "ERR lazily hydrated init child did not become a live session actor" >&2
   exit 1
 }
 
@@ -178,12 +201,8 @@ rg -q '^OK remote transport ' "$PROBE_LOG" || {
   echo "ERR remote probe did not complete the transport workflow" >&2
   exit 1
 }
-rg -q 'artifacts_sent=1 artifacts_received=1' "$PROBE_LOG" || {
+rg -q 'artifacts_sent=2 artifacts_received=1' "$PROBE_LOG" || {
   echo "ERR remote probe did not verify both artifact directions" >&2
-  exit 1
-}
-ctl actors list | rg -q 'network-session-proof' || {
-  echo "ERR client-offered artifact did not become a live session actor" >&2
   exit 1
 }
 mapfile -t RECEIVED_ARTIFACTS < <(find "$CLIENT_ARTIFACT_CACHE" -type f -name artifact.wasm)

@@ -5,7 +5,7 @@ mod network;
 
 pub use artifact::{
     ArtifactExchange, ArtifactExchangeEvent, ArtifactExchangeUpdate, ArtifactOffer,
-    InstalledArtifact, default_artifact_cache, digest_file, digest_hex,
+    InstalledArtifact, default_artifact_cache, digest_file, digest_hex, package_offers,
 };
 pub use network::{
     ClientHello, NetworkConnection, NetworkFramePacket, NetworkLane, NetworkReceiveLane,

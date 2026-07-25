@@ -587,6 +587,19 @@ struct RealmInitState {
     apps: BTreeMap<String, HostedChildToken>,
 }
 
+struct PendingRealmArtifact {
+    session: SurfaceSessionId,
+    id: String,
+    path: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("realm package member is missing: {path}")]
+struct MissingRealmArtifact {
+    path: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfiguredWorkspacePlugin {
     path: PathBuf,
@@ -706,6 +719,9 @@ pub struct Brood {
     wasm_io_actors: BTreeMap<String, brood_wasm::HostedWasmActor>,
     session_init_actor: Option<PathBuf>,
     realm_inits: BTreeMap<SurfaceSessionId, RealmInitState>,
+    pending_realm_artifacts: BTreeMap<u64, PendingRealmArtifact>,
+    queued_realm_artifacts: VecDeque<(u64, String)>,
+    next_realm_artifact_request: u64,
     configured_workspace_plugins: BTreeMap<String, ConfiguredWorkspacePlugin>,
     configured_plugin_lifecycles: BTreeMap<String, ConfiguredPluginLifecycle>,
     configured_plugin_resources: BTreeMap<String, ConfiguredPluginResources>,
@@ -828,6 +844,9 @@ impl Brood {
             wasm_io_actors: BTreeMap::new(),
             session_init_actor: None,
             realm_inits: BTreeMap::new(),
+            pending_realm_artifacts: BTreeMap::new(),
+            queued_realm_artifacts: VecDeque::new(),
+            next_realm_artifact_request: 1,
             configured_workspace_plugins: BTreeMap::new(),
             configured_plugin_lifecycles: BTreeMap::new(),
             configured_plugin_resources: BTreeMap::new(),
@@ -3567,6 +3586,48 @@ impl Brood {
         Ok(())
     }
 
+    pub(crate) fn install_remote_session_init_actor(&mut self, path: &Path) -> Result<()> {
+        let sessions = self.sessions.sessions().to_vec();
+        for session in &sessions {
+            self.stop_session_init_actor(*session)?;
+        }
+        self.session_init_actor = None;
+        self.configure_session_init_actor(path)
+    }
+
+    pub(crate) fn take_realm_artifact_requests(&mut self) -> Vec<(u64, String)> {
+        self.queued_realm_artifacts.drain(..).collect()
+    }
+
+    pub(crate) fn complete_realm_artifact_request(
+        &mut self,
+        request: u64,
+        success: bool,
+        message: String,
+    ) -> bool {
+        let Some(pending) = self.pending_realm_artifacts.remove(&request) else {
+            return false;
+        };
+        if success {
+            self.handle_realm_init_start(
+                pending.session,
+                pending.id,
+                &pending.path,
+                &pending.capabilities,
+            );
+        } else {
+            self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
+            self.send_realm_init_child_event(
+                pending.session,
+                brood_wasm::ComponentChildEvent::Failed {
+                    id: pending.id,
+                    message,
+                },
+            );
+        }
+        true
+    }
+
     fn start_session_init_actor(&mut self, session: SurfaceSessionId) -> Result<()> {
         ensure!(
             self.sessions.contains(session),
@@ -3618,6 +3679,15 @@ impl Brood {
     }
 
     fn stop_session_init_actor(&mut self, session: SurfaceSessionId) -> Result<()> {
+        let stale_requests = self
+            .pending_realm_artifacts
+            .iter()
+            .filter_map(|(request, pending)| (pending.session == session).then_some(*request))
+            .collect::<BTreeSet<_>>();
+        self.pending_realm_artifacts
+            .retain(|request, _pending| !stale_requests.contains(request));
+        self.queued_realm_artifacts
+            .retain(|(request, _path)| !stale_requests.contains(request));
         let Some(init) = self.realm_inits.remove(&session) else {
             return Ok(());
         };
@@ -3698,6 +3768,22 @@ impl Brood {
                     brood_wasm::ComponentChildEvent::Started { id, generation },
                 );
             }
+            Err(error) if error.downcast_ref::<MissingRealmArtifact>().is_some() => {
+                let request = self.next_realm_artifact_request;
+                self.next_realm_artifact_request =
+                    self.next_realm_artifact_request.saturating_add(1);
+                self.pending_realm_artifacts.insert(
+                    request,
+                    PendingRealmArtifact {
+                        session,
+                        id,
+                        path: guest_path.to_string(),
+                        capabilities: capabilities.to_vec(),
+                    },
+                );
+                self.queued_realm_artifacts
+                    .push_back((request, guest_path.to_string()));
+            }
             Err(error) => {
                 self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                 warn!(actor = %id, path = %guest_path, error = %error, "realm init failed to start child actor");
@@ -3757,7 +3843,14 @@ impl Brood {
         let canonical_root = root
             .canonicalize()
             .with_context(|| format!("resolve init package root {}", root.display()))?;
-        let path = root.join(relative).canonicalize().with_context(|| {
+        let unresolved = root.join(relative);
+        if !unresolved.exists() {
+            return Err(MissingRealmArtifact {
+                path: guest_path.to_string(),
+            }
+            .into());
+        }
+        let path = unresolved.canonicalize().with_context(|| {
             format!("resolve init child actor {}", root.join(relative).display())
         })?;
         ensure!(

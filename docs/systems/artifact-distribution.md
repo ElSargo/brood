@@ -12,6 +12,8 @@ code-links:
   - clients/brood-client/src/remote.rs
   - clients/brood-client/src/actor_runtime.rs
   - crates/brood-remote/src/main.rs
+  - crates/broodd/src/control.rs
+  - crates/broodd/src/state.rs
 ---
 
 # Artifact Distribution
@@ -50,9 +52,31 @@ operator policy around that state machine, not distinct client-push and
 server-push protocols.
 
 The cache is content addressed and immutable. Each digest has a separate
-package directory, so the runtime's default read-only package view contains
-only that artifact. Cache hits are rehashed before use. In-flight artifact
-count, aggregate bytes, manifest fields, chunks, and diagnostics are bounded.
+cache entry. Cache hits are rehashed before use. In-flight artifact count,
+aggregate bytes, package membership, manifest fields, chunks, and diagnostics
+are bounded.
+
+## Lazy Init Packages
+
+A session package offer is a catalogue of content-addressed WASM members. Every
+member names its package-relative path and exactly one member is the init root.
+The client advertises the catalogue when the connection opens, but the relay
+requests only the root bytes initially.
+
+The relay materializes the verified root in a package directory and installs it
+as the backend's blessed session init actor. Actor management remains a backend
+operation. When the init actor asks to start a relative path which is not
+present, the backend suspends that start and emits a package-member request. The
+relay resolves the path against the authenticated client's catalogue, fetches
+the corresponding digest over the bulk lane, atomically materializes it under
+the same package root, and completes the suspended request. The backend then
+revalidates the path and requested capabilities before starting the child.
+
+Init actors therefore use the same relative-path actor API whether their package
+was preinstalled, eagerly copied over SSH, or hydrated on demand. They do not
+gain access to transport handles, peer identities, cache paths, or network
+credentials. A destination may prefetch advertised members as an optimization;
+it does not change this resolution contract.
 
 ## Authorization And Capabilities
 
@@ -67,8 +91,9 @@ After verification, the destination selects the local runtime and policy:
   runtime without actor-management or runtime-I/O capabilities;
 - a session-realm actor is installed through the backend's normal plugin
   control path;
-- a future package manifest may name a destination-owned capability profile,
-  but the sender cannot mint authority by including capability strings.
+- a session-init package root is installed through the backend's blessed init
+  path, while each child receives only capabilities requested by that init actor
+  and approved by the backend.
 
 Executable identity is the pair of stable installation ID and verified content
 digest. Replacement policy belongs to the destination realm. Actor messages,
@@ -82,12 +107,13 @@ SSH hydration is a bootstrap workflow built on this mechanism:
 1. connect to the target and place or select a compatible Brood bootstrap;
 2. start a minimal authenticated backend and relay;
 3. connect the workstation client;
-4. offer the selected session package and wait for verified installation;
+4. advertise the selected session package and wait for the init root and each
+   demanded member to be verified and installed;
 5. run the normal presentation session.
 
 The copied bootstrap is replaceable infrastructure, not the source of plugin
 authority. Once connected, content-addressed transfer avoids resending cached
-artifacts.
+artifacts. The implemented operator workflow is [[../workflows/ssh-deploy]].
 
 Browser hydration uses the opposite placement: the backend offers approved
 client-realm WASM to a blank browser runtime. Native, browser, SSH, container,
@@ -116,6 +142,8 @@ Acceptance requires:
 - rejection of unauthorized, wrong-realm, oversized, and malformed offers;
 - a client-realm artifact loading in the presentation runtime;
 - a session-realm artifact appearing as a live backend actor;
+- an init actor requesting a missing relative module, followed by that module
+  becoming a live child actor;
 - artifact traffic remaining isolated from critical input and frame streams.
 
 Tests should transfer and execute real WASM artifacts. Serialization-only tests

@@ -380,7 +380,7 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in brood brood-client brood-sessiond brood-runner-exec brood-runner-nix-develop; do
+      for program in brood brood-client brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
@@ -391,6 +391,34 @@ let
       done
     '';
   };
+
+  sshBackend =
+    let
+      dynamicLinker =
+        if pkgs.stdenv.hostPlatform.isx86_64 then
+          "/lib64/ld-linux-x86-64.so.2"
+        else if pkgs.stdenv.hostPlatform.isAarch64 then
+          "/lib/ld-linux-aarch64.so.1"
+        else
+          throw "Brood SSH deployment does not support ${pkgs.stdenv.hostPlatform.system}";
+    in
+    pkgs.runCommand "brood-ssh-backend"
+      {
+        nativeBuildInputs = [ pkgs.patchelf ];
+      }
+      ''
+        mkdir -p "$out/bin"
+        for program in brood brood-remote brood-sessiond brood-runner-exec; do
+          cp ${broodd}/bin/"$program" "$out/bin/$program"
+          chmod u+w "$out/bin/$program"
+          patchelf \
+            --set-interpreter ${lib.escapeShellArg dynamicLinker} \
+            --remove-rpath \
+            "$out/bin/$program"
+        done
+        install -m 0755 ${../tools/brood-ssh-backend-session.sh} \
+          "$out/bin/brood-ssh-backend-session"
+      '';
 
   desktopActions = pkgs.writeShellApplication {
     name = "brood-desktop";
@@ -868,6 +896,7 @@ in
   lint = linter;
   "prime-cargo-target" = primeCargoTarget;
   "software-e2e-capture" = softwareE2eCapture;
+  "ssh-backend" = sshBackend;
   "runtime-files" = runtimeFiles;
   "wasm-modules" = wasmModules;
   "wasm-examples" = wasmModules;
@@ -896,6 +925,7 @@ in
     runtimeFiles
     shellCheck
     softwareE2eCapture
+    sshBackend
     wasmModules
     ;
 }

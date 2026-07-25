@@ -15,12 +15,13 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 use brood_protocol::{
     ARTIFACT_ABI_VERSION, ArtifactDigest, ArtifactKind, ArtifactManifest, ArtifactMessage,
-    ArtifactRealm, MAX_ARTIFACT_CHUNK_BYTES,
+    ArtifactPackageMember, ArtifactRealm, MAX_ARTIFACT_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
 
 const MAX_INCOMING_ARTIFACTS: usize = 4;
 const MAX_INCOMING_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PACKAGE_MEMBERS: usize = 256;
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// One locally available artifact offered to a peer.
@@ -28,6 +29,74 @@ static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct ArtifactOffer {
     pub manifest: ArtifactManifest,
     path: PathBuf,
+}
+
+/// Build offers for every WASM member beneath one package root directory.
+pub fn package_offers(spec: &str, realm: ArtifactRealm) -> Result<Vec<ArtifactOffer>> {
+    let (package, root_path) = spec
+        .split_once('=')
+        .context("artifact package must use ID=ROOT_WASM_PATH")?;
+    let root_path = Path::new(root_path)
+        .canonicalize()
+        .with_context(|| format!("resolve artifact package root {root_path}"))?;
+    let package_root = root_path
+        .parent()
+        .context("artifact package root file has no parent")?
+        .to_path_buf();
+    let mut files = Vec::new();
+    collect_wasm_files(&package_root, &mut files)?;
+    files.sort();
+    ensure!(
+        files.len() <= MAX_PACKAGE_MEMBERS,
+        "artifact package contains more than {MAX_PACKAGE_MEMBERS} WASM members"
+    );
+    ensure!(
+        files.iter().any(|path| path == &root_path),
+        "artifact package root is not a WASM file beneath its package directory"
+    );
+    let mut offers = Vec::with_capacity(files.len());
+    for path in files {
+        let relative = path
+            .strip_prefix(&package_root)
+            .context("artifact package member escaped its root")?
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let digest = digest_file(&path)?;
+        let digest_prefix = digest_hex(digest).chars().take(32).collect::<String>();
+        let id = format!("member-{digest_prefix}");
+        offers.push(
+            ArtifactOffer::from_path(&id, realm, &path, Vec::new())?.in_package(
+                package,
+                &relative,
+                path == root_path,
+            )?,
+        );
+    }
+    Ok(offers)
+}
+
+fn collect_wasm_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        fs::read_dir(root).with_context(|| format!("read artifact package {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("read artifact package {}", root.display()))?;
+        let file_type = entry.file_type().with_context(|| {
+            format!("inspect artifact package member {}", entry.path().display())
+        })?;
+        if file_type.is_dir() {
+            collect_wasm_files(&entry.path(), files)?;
+        } else if file_type.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "wasm")
+        {
+            files.push(entry.path().canonicalize().with_context(|| {
+                format!("resolve artifact package member {}", entry.path().display())
+            })?);
+        }
+    }
+    Ok(())
 }
 
 impl ArtifactOffer {
@@ -60,11 +129,23 @@ impl ArtifactOffer {
             bytes,
             abi_version: ARTIFACT_ABI_VERSION,
             capabilities,
+            package: None,
         };
         manifest
             .validate()
             .context("validate offered artifact manifest")?;
         Ok(Self { manifest, path })
+    }
+
+    /// Declare this offer as one member of a lazily hydrated package.
+    pub fn in_package(mut self, package: &str, path: &str, root: bool) -> Result<Self> {
+        self.manifest.package = Some(ArtifactPackageMember {
+            package: package.to_string(),
+            path: path.to_string(),
+            root,
+        });
+        self.manifest.validate()?;
+        Ok(self)
     }
 }
 
@@ -98,6 +179,7 @@ pub struct ArtifactExchangeUpdate {
 pub struct ArtifactExchange {
     accepted_realm: ArtifactRealm,
     allowed_ids: HashSet<String>,
+    allowed_packages: HashSet<String>,
     cache: ArtifactCache,
     offers: HashMap<ArtifactDigest, ArtifactOffer>,
     served: HashSet<ArtifactDigest>,
@@ -105,6 +187,9 @@ pub struct ArtifactExchange {
     incoming_bytes: u64,
     ready: HashSet<ArtifactDigest>,
     accepted: HashSet<ArtifactDigest>,
+    available: HashMap<ArtifactDigest, ArtifactManifest>,
+    package_members: HashMap<(String, String), ArtifactDigest>,
+    package_roots: HashMap<String, ArtifactDigest>,
 }
 
 impl ArtifactExchange {
@@ -135,6 +220,7 @@ impl ArtifactExchange {
         Ok(Self {
             accepted_realm,
             allowed_ids: allowed_ids.into_iter().collect(),
+            allowed_packages: HashSet::new(),
             cache: ArtifactCache::new(cache_root),
             offers: offer_map,
             served: HashSet::new(),
@@ -142,7 +228,17 @@ impl ArtifactExchange {
             incoming_bytes: 0,
             ready: HashSet::new(),
             accepted: HashSet::new(),
+            available: HashMap::new(),
+            package_members: HashMap::new(),
+            package_roots: HashMap::new(),
         })
+    }
+
+    /// Authorize package members offered by the authenticated peer.
+    #[must_use]
+    pub fn with_allowed_packages(mut self, packages: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_packages.extend(packages);
+        self
     }
 
     /// Advertise every local offer after the network lane is established.
@@ -201,6 +297,36 @@ impl ArtifactExchange {
         })
     }
 
+    /// Request a previously advertised member when the destination package
+    /// resolver discovers that its local file is absent.
+    pub fn request_package_member(
+        &mut self,
+        package: &str,
+        path: &str,
+    ) -> Result<ArtifactExchangeUpdate> {
+        let digest = self
+            .package_members
+            .get(&(package.to_string(), path.to_string()))
+            .copied()
+            .with_context(|| {
+                format!("peer did not advertise package member {package:?}:{path:?}")
+            })?;
+        let manifest = self
+            .available
+            .get(&digest)
+            .cloned()
+            .context("advertised package member lost its manifest")?;
+        self.begin_receive(manifest)
+    }
+
+    /// Resolve a package path to its advertised content digest.
+    #[must_use]
+    pub fn package_member_digest(&self, package: &str, path: &str) -> Option<ArtifactDigest> {
+        self.package_members
+            .get(&(package.to_string(), path.to_string()))
+            .copied()
+    }
+
     fn handle_offer(&mut self, manifest: ArtifactManifest) -> Result<ArtifactExchangeUpdate> {
         if manifest.realm != self.accepted_realm {
             return Ok(rejection(
@@ -211,7 +337,11 @@ impl ArtifactExchange {
                 ),
             ));
         }
-        if !self.allowed_ids.contains(&manifest.id) {
+        let package_allowed = manifest
+            .package
+            .as_ref()
+            .is_some_and(|member| self.allowed_packages.contains(&member.package));
+        if !self.allowed_ids.contains(&manifest.id) && !package_allowed {
             return Ok(rejection(
                 manifest.digest,
                 format!("artifact id {:?} is not authorized", manifest.id),
@@ -223,6 +353,43 @@ impl ArtifactExchange {
                 "network artifact capability grants are not configured".to_string(),
             ));
         }
+        if let Some(existing) = self.available.get(&manifest.digest) {
+            if existing != &manifest {
+                return Ok(rejection(
+                    manifest.digest,
+                    "artifact digest was offered with conflicting metadata".to_string(),
+                ));
+            }
+            return Ok(ArtifactExchangeUpdate::default());
+        }
+        if let Some(member) = &manifest.package {
+            let key = (member.package.clone(), member.path.clone());
+            if self.package_members.contains_key(&key) {
+                return Ok(rejection(
+                    manifest.digest,
+                    "package path was advertised more than once".to_string(),
+                ));
+            }
+            if member.root && self.package_roots.contains_key(&member.package) {
+                return Ok(rejection(
+                    manifest.digest,
+                    "package advertised more than one init root".to_string(),
+                ));
+            }
+            self.package_members.insert(key, manifest.digest);
+            if member.root {
+                self.package_roots
+                    .insert(member.package.clone(), manifest.digest);
+            }
+        }
+        self.available.insert(manifest.digest, manifest.clone());
+        if manifest.package.as_ref().is_some_and(|member| !member.root) {
+            return Ok(ArtifactExchangeUpdate::default());
+        }
+        self.begin_receive(manifest)
+    }
+
+    fn begin_receive(&mut self, manifest: ArtifactManifest) -> Result<ArtifactExchangeUpdate> {
         if self.accepted.contains(&manifest.digest) {
             return Ok(ArtifactExchangeUpdate {
                 outbound: vec![ArtifactMessage::Accepted {
@@ -560,7 +727,7 @@ mod tests {
 
     use brood_protocol::{ArtifactMessage, ArtifactRealm};
 
-    use super::{ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer};
+    use super::{ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, package_offers};
 
     #[test]
     fn bidirectional_state_machine_transfers_only_authorized_content() {
@@ -670,6 +837,71 @@ mod tests {
                 .as_slice(),
             [ArtifactMessage::Rejected { .. }]
         ));
+        drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn package_catalog_fetches_root_eagerly_and_child_on_demand() {
+        let root = test_root("package");
+        fs::create_dir_all(&root).unwrap_or_else(|error| unreachable!("{error}"));
+        let init_path = root.join("init.wasm");
+        let child_path = root.join("child.wasm");
+        fs::write(&init_path, b"\0asm init").unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(&child_path, b"\0asm child").unwrap_or_else(|error| unreachable!("{error}"));
+        let offers = package_offers(
+            &format!("workspace={}", init_path.display()),
+            ArtifactRealm::Session,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let sender = ArtifactExchange::new(
+            ArtifactRealm::Client,
+            Vec::<String>::new(),
+            root.join("sender-cache"),
+            offers,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut receiver = ArtifactExchange::new(
+            ArtifactRealm::Session,
+            Vec::<String>::new(),
+            root.join("receiver-cache"),
+            Vec::new(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"))
+        .with_allowed_packages(["workspace".to_string()]);
+
+        let mut root_requested = false;
+        for message in sender.initial_messages() {
+            let is_root = matches!(
+                &message,
+                ArtifactMessage::Offer(manifest)
+                    if manifest.package.as_ref().is_some_and(|member| member.root)
+            );
+            let update = receiver
+                .handle(message)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            if is_root {
+                root_requested = matches!(
+                    update.outbound.as_slice(),
+                    [ArtifactMessage::Request { .. }]
+                );
+            } else {
+                assert!(update.outbound.is_empty());
+            }
+        }
+        assert!(root_requested);
+
+        let child_digest = receiver
+            .package_member_digest("workspace", "child.wasm")
+            .unwrap_or_else(|| unreachable!("child was not catalogued"));
+        let update = receiver
+            .request_package_member("workspace", "child.wasm")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            update.outbound,
+            vec![ArtifactMessage::Request {
+                digest: child_digest
+            }]
+        );
         drop(fs::remove_dir_all(root));
     }
 

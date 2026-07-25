@@ -710,8 +710,8 @@ mod tests {
     use brood_protocol::{
         ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
         BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, ClientMessage,
-        EndpointCapabilities, FrameColorSpace, FramePixelFormat, InputEvent, Lane, PanePosition,
-        ServerMessage,
+        EndpointCapabilities, FrameColorSpace, FramePixelFormat, InputEvent, Lane,
+        MAX_ARTIFACT_CHUNK_BYTES, PanePosition, ServerMessage,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -794,6 +794,18 @@ mod tests {
             let ClientMessage::Artifact(ArtifactMessage::Offer(manifest)) = artifact else {
                 unreachable!("bulk lane did not preserve the artifact offer");
             };
+            let chunk = connection
+                .receive_client_message(Lane::Bulk)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(
+                chunk,
+                ClientMessage::Artifact(ArtifactMessage::Chunk {
+                    digest: manifest.digest,
+                    offset: 0,
+                    bytes: vec![0x70; MAX_ARTIFACT_CHUNK_BYTES],
+                })
+            );
             connection
                 .send_server_message(&ServerMessage::Artifact(ArtifactMessage::Accepted {
                     digest: manifest.digest,
@@ -874,8 +886,17 @@ mod tests {
                     bytes: 42,
                     abi_version: ARTIFACT_ABI_VERSION,
                     capabilities: Vec::new(),
+                    package: None,
                 },
             )))
+            .await
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        client
+            .send_client_message(&ClientMessage::Artifact(ArtifactMessage::Chunk {
+                digest: [9; 32],
+                offset: 0,
+                bytes: vec![0x70; MAX_ARTIFACT_CHUNK_BYTES],
+            }))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(

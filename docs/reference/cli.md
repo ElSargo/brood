@@ -6,6 +6,8 @@ last-reviewed: 2026-07-03
 code-links:
   - crates/broodd/src/lib.rs
   - crates/broodd/src/control.rs
+  - crates/brood-remote/src/main.rs
+  - crates/brood-remote/src/ssh.rs
 ---
 
 # CLI Reference Pointers
@@ -26,6 +28,10 @@ Current top-level commands:
 - `ctl`
 
 Use this page as an orientation map only. Do not duplicate full parser behavior in prose.
+
+Remote relay, probe, certificate, and one-command SSH deployment behavior is
+defined by the `brood-remote` parser. See [[../workflows/ssh-deploy]] for the
+operator workflow.
 
 Related:
 

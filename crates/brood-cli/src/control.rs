@@ -2,7 +2,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     os::fd::{AsFd, OwnedFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::Duration,
@@ -64,6 +64,14 @@ type DbusSharedMemoryFrame = (String, zbus::zvariant::OwnedFd);
 )]
 trait BroodControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
+    fn install_session_init_artifact(&self, path: String) -> zbus::Result<bool>;
+    fn take_realm_artifact_requests(&self) -> zbus::Result<Vec<(u64, String)>>;
+    fn complete_realm_artifact_request(
+        &self,
+        request: u64,
+        success: bool,
+        message: String,
+    ) -> zbus::Result<bool>;
     fn latest_dmabuf_frame(&self) -> zbus::Result<DbusDmabufFrame>;
     fn open_presentation_fast_path(&self, frame_transports: Vec<u32>)
     -> zbus::Result<DbusFastPath>;
@@ -243,6 +251,42 @@ pub fn request_dbus_command(
     proxy
         .command(command.to_vec(), json)
         .with_context(|| format!("call Brood DBus control command on {}", target.destination))
+}
+
+pub fn install_session_init_artifact(target: &ControlTarget, path: &Path) -> Result<bool> {
+    let connection = connection(target)?;
+    presentation_proxy(&connection, target)?
+        .install_session_init_artifact(path.display().to_string())
+        .with_context(|| {
+            format!(
+                "install remote session init artifact on {}",
+                target.destination
+            )
+        })
+}
+
+pub fn take_realm_artifact_requests(target: &ControlTarget) -> Result<Vec<(u64, String)>> {
+    let connection = connection(target)?;
+    presentation_proxy(&connection, target)?
+        .take_realm_artifact_requests()
+        .with_context(|| format!("take realm artifact requests from {}", target.destination))
+}
+
+pub fn complete_realm_artifact_request(
+    target: &ControlTarget,
+    request: u64,
+    success: bool,
+    message: String,
+) -> Result<bool> {
+    let connection = connection(target)?;
+    presentation_proxy(&connection, target)?
+        .complete_realm_artifact_request(request, success, message)
+        .with_context(|| {
+            format!(
+                "complete realm artifact request {request} on {}",
+                target.destination
+            )
+        })
 }
 
 fn session_proxy<'a>(

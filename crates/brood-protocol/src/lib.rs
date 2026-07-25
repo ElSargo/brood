@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 16;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 17;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
@@ -20,10 +20,13 @@ pub const ARTIFACT_ABI_VERSION: u32 = 1;
 pub const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Maximum payload carried by one artifact chunk.
-pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 60 * 1024;
+pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Maximum stable artifact identity length.
 pub const MAX_ARTIFACT_ID_BYTES: usize = 128;
+
+/// Maximum package-relative artifact path length.
+pub const MAX_ARTIFACT_PACKAGE_PATH_BYTES: usize = 512;
 
 /// Maximum number of requested capability names in one artifact manifest.
 pub const MAX_ARTIFACT_CAPABILITIES: usize = 32;
@@ -412,6 +415,38 @@ pub enum ArtifactKind {
     WasmActor,
 }
 
+/// Placement of one artifact inside a lazily hydrated package.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPackageMember {
+    pub package: String,
+    pub path: String,
+    pub root: bool,
+}
+
+impl ArtifactPackageMember {
+    fn validate(&self) -> Result<(), ArtifactValidationError> {
+        if !valid_artifact_id(&self.package) {
+            return Err(ArtifactValidationError::Id);
+        }
+        let path = std::path::Path::new(&self.path);
+        if self.path.is_empty()
+            || self.path.len() > MAX_ARTIFACT_PACKAGE_PATH_BYTES
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ArtifactValidationError::PackagePath);
+        }
+        Ok(())
+    }
+}
+
 /// Immutable content-addressed artifact declaration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactManifest {
@@ -422,18 +457,13 @@ pub struct ArtifactManifest {
     pub bytes: u64,
     pub abi_version: u32,
     pub capabilities: Vec<String>,
+    pub package: Option<ArtifactPackageMember>,
 }
 
 impl ArtifactManifest {
     /// Validate all peer-controlled manifest bounds and identifiers.
     pub fn validate(&self) -> Result<(), ArtifactValidationError> {
-        if self.id.is_empty()
-            || self.id.len() > MAX_ARTIFACT_ID_BYTES
-            || !self
-                .id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
+        if !valid_artifact_id(&self.id) {
             return Err(ArtifactValidationError::Id);
         }
         if self.bytes == 0 || self.bytes > MAX_ARTIFACT_BYTES {
@@ -449,8 +479,19 @@ impl ArtifactManifest {
         {
             return Err(ArtifactValidationError::Capabilities);
         }
+        if let Some(package) = &self.package {
+            package.validate()?;
+        }
         Ok(())
     }
+}
+
+fn valid_artifact_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ARTIFACT_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// One symmetric artifact-plane message.
@@ -509,6 +550,8 @@ pub enum ArtifactValidationError {
     Abi(u32),
     #[error("artifact capability declarations exceed the supported bounds")]
     Capabilities,
+    #[error("artifact package path is empty, oversized, absolute, or escapes its package")]
+    PackagePath,
     #[error("artifact chunk size {0} exceeds the supported bound")]
     Chunk(usize),
     #[error("artifact rejection detail size {0} exceeds the supported bound")]
@@ -702,6 +745,7 @@ mod tests {
             bytes: 42,
             abi_version: ARTIFACT_ABI_VERSION,
             capabilities: Vec::new(),
+            package: None,
         };
         assert_eq!(manifest.validate(), Ok(()));
 

@@ -140,6 +140,7 @@ type OptionalControlResponse = DbusResponse<Option<String>>;
 type DmabufFrameResponse = DbusResponse<DbusDmabufFrame>;
 type FastPathResponse = DbusResponse<DbusFastPath>;
 type SharedMemoryFrameResponse = DbusResponse<DbusSharedMemoryFrame>;
+type RealmArtifactRequestListResponse = DbusResponse<Vec<(u64, String)>>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -149,6 +150,19 @@ enum DbusStateRequest {
     },
     CurrentStatus {
         response: ControlResponse,
+    },
+    InstallSessionInitArtifact {
+        path: String,
+        response: BoolResponse,
+    },
+    TakeRealmArtifactRequests {
+        response: RealmArtifactRequestListResponse,
+    },
+    CompleteRealmArtifactRequest {
+        request: u64,
+        success: bool,
+        message: String,
+        response: BoolResponse,
     },
     LatestDmabufFrame {
         response: DmabufFrameResponse,
@@ -387,6 +401,37 @@ impl ControlDbus {
             command: argv,
             json,
             response,
+        })
+        .await
+    }
+
+    async fn install_session_init_artifact(&self, path: String) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::InstallSessionInitArtifact { path, response }
+        })
+        .await
+    }
+
+    async fn take_realm_artifact_requests(&self) -> fdo::Result<Vec<(u64, String)>> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::TakeRealmArtifactRequests { response }
+        })
+        .await
+    }
+
+    async fn complete_realm_artifact_request(
+        &self,
+        request: u64,
+        success: bool,
+        message: String,
+    ) -> fdo::Result<bool> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::CompleteRealmArtifactRequest {
+                request,
+                success,
+                message,
+                response,
+            }
         })
         .await
     }
@@ -1034,6 +1079,14 @@ fn header_sender(header: &Header<'_>) -> String {
 )]
 trait BroodControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
+    fn install_session_init_artifact(&self, path: String) -> zbus::Result<bool>;
+    fn take_realm_artifact_requests(&self) -> zbus::Result<Vec<(u64, String)>>;
+    fn complete_realm_artifact_request(
+        &self,
+        request: u64,
+        success: bool,
+        message: String,
+    ) -> zbus::Result<bool>;
 }
 
 #[proxy(interface = "org.brood.Manager", default_path = "/org/brood/Manager")]
@@ -2301,6 +2354,24 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
         DbusStateRequest::CurrentStatus { response } => {
             send_response(response, status_json_string(state));
         }
+        DbusStateRequest::InstallSessionInitArtifact { path, response } => {
+            let result = state
+                .install_remote_session_init_actor(Path::new(&path))
+                .map(|()| true);
+            send_response(response, result);
+        }
+        DbusStateRequest::TakeRealmArtifactRequests { response } => {
+            send_response(response, Ok(state.take_realm_artifact_requests()));
+        }
+        DbusStateRequest::CompleteRealmArtifactRequest {
+            request,
+            success,
+            message,
+            response,
+        } => send_response(
+            response,
+            Ok(state.complete_realm_artifact_request(request, success, message)),
+        ),
         DbusStateRequest::LatestDmabufFrame { response } => {
             send_response(response, latest_dmabuf_frame(state));
         }

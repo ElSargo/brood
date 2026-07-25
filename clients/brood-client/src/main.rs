@@ -255,11 +255,17 @@ fn main() -> Result<()> {
         eprintln!("starting Brood presentation without a backend");
         (None, None, None, false, false, None, None)
     } else if let Some(connect) = args.remote_connect {
-        let artifact_offers = args
+        let mut artifact_offers = args
             .remote_offer_session_artifacts
             .iter()
             .map(|spec| brood_transport::ArtifactOffer::parse(spec, ArtifactRealm::Session))
             .collect::<Result<Vec<_>>>()?;
+        for spec in &args.remote_offer_session_packages {
+            artifact_offers.extend(brood_transport::package_offers(
+                spec,
+                ArtifactRealm::Session,
+            )?);
+        }
         let mut connection = remote::RemoteConnection::start(
             remote::RemoteConfig {
                 connect,

@@ -13,6 +13,7 @@ clap.workspace = true
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

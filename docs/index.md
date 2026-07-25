@@ -55,6 +55,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 ## Workflows
 
 - [[workflows/run-brood]]
+- [[workflows/ssh-deploy]]
 - [[workflows/enter-session]]
 - [[workflows/test-nested]]
 - [[workflows/develop-with-nix]]
