@@ -15,3 +15,8 @@ Rules:
 - Prefer links to canonical concepts for shared terminology.
 - Move abandoned experiments to `docs/archive/`.
 - Promote accepted design into canonical or current system pages.
+
+Active experiments:
+
+- [[coding-agent-actors]] — independently addressed coding agents with a
+  separate subscribing presentation UI.

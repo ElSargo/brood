@@ -174,6 +174,20 @@ fn main() -> Result<()> {
             false,
             &snapshot,
         )?;
+        let new_agent_ui = key_policy.evaluate(
+            38,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL | manifold_wasm::ABI_MOD_ALT,
+            false,
+            &snapshot,
+        )?;
+        let repeated_new_agent_ui = key_policy.evaluate(
+            38,
+            manifold_wasm::ABI_KEY_PRESSED,
+            manifold_wasm::ABI_MOD_CTRL | manifold_wasm::ABI_MOD_ALT,
+            true,
+            &snapshot,
+        )?;
         let repeated_toggle_switcher = key_policy.evaluate(
             58,
             manifold_wasm::ABI_KEY_PRESSED,
@@ -201,6 +215,11 @@ fn main() -> Result<()> {
                 message.actor == "session-switcher"
                     && message.payload == br#"{"type":"sidebar-action","action":"toggle"}"#
             })
+            || !new_agent_ui.actor_messages.iter().any(|message| {
+                message.actor == "manifold.client-init"
+                    && message.payload == br#"{"kind":"coding-agent-action","action":"new-ui"}"#
+            })
+            || !repeated_new_agent_ui.actor_messages.is_empty()
             || !repeated_toggle_switcher.actor_messages.is_empty()
             || !focus_existing
                 .host_messages
@@ -279,6 +298,16 @@ fn main() -> Result<()> {
                 event_loop.create_proxy(),
             )?;
             spawn_catalog_updates(catalog, catalog_notifications, event_loop.create_proxy())?;
+            spawn_actor_message_updates(
+                manifold_ipc::ActorMessageConsumer::map(
+                    fast_path.presentation_message_fd.as_fd(),
+                    fast_path.generation,
+                )?,
+                manifold_ipc::EventNotifier::from_owned_fd(
+                    fast_path.presentation_message_notify_fd,
+                ),
+                event_loop.create_proxy(),
+            )?;
             let input_sender = InputLane {
                 producer: input,
                 notifications: manifold_ipc::EventNotifier::from_owned_fd(
@@ -405,6 +434,12 @@ enum ClientEvent {
         completion: SessionCommandCompletion,
     },
     ActorHostMessagesReady,
+    SessionActorMessage {
+        session_id: u64,
+        sender: String,
+        recipient: String,
+        body: Vec<u8>,
+    },
 }
 
 #[derive(Debug)]
@@ -701,6 +736,54 @@ fn spawn_frame_updates(
             }
         })
         .context("spawn DMA-BUF frame update worker")?;
+    Ok(())
+}
+
+fn spawn_actor_message_updates(
+    mut messages: manifold_ipc::ActorMessageConsumer,
+    notifications: manifold_ipc::EventNotifier,
+    proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
+) -> Result<()> {
+    let _worker = thread::Builder::new()
+        .name("manifold-actor-message-updates".to_string())
+        .spawn(move || {
+            loop {
+                if notifications.wait().is_err() {
+                    return;
+                }
+                while let Some(message) = messages.try_recv() {
+                    let decoded = (|| {
+                        Ok::<_, manifold_ipc::ActorMessageLaneError>(
+                            ClientEvent::SessionActorMessage {
+                                session_id: message.session_id(),
+                                sender: message.sender()?.to_string(),
+                                recipient: message.recipient()?.to_string(),
+                                body: message.body()?.to_vec(),
+                            },
+                        )
+                    })();
+                    drop(message);
+                    match decoded {
+                        Ok(event) => {
+                            if proxy.send_event(event).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            if proxy
+                                .send_event(ClientEvent::TransportError(format!(
+                                    "decode session actor message: {error}"
+                                )))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .context("spawn actor-message update worker")?;
     Ok(())
 }
 
@@ -1046,6 +1129,11 @@ impl Application {
             }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
+            }
+            ClientEvent::SessionActorMessage { .. } => {
+                return Err(anyhow!(
+                    "session actor message reached scene transport path"
+                ));
             }
         };
         let Some(renderer) = self.renderer.as_mut() else {
@@ -1521,6 +1609,18 @@ impl Application {
                     return Ok(());
                 };
                 runtime.drain_events()?;
+                if let Some(renderer) = self.renderer.as_ref() {
+                    let (width, height, scale) = renderer.logical_extent();
+                    let panes = runtime.drain_pending_pane_creations().collect::<Vec<_>>();
+                    for pane in panes {
+                        runtime.send_presentation_event(PresentationEvent::PaneCreated {
+                            pane,
+                            width,
+                            height,
+                            scale,
+                        })?;
+                    }
+                }
                 let messages = runtime.drain_session_messages();
                 let commands = runtime.drain_session_commands();
                 if !commands.is_empty() {
@@ -1536,6 +1636,14 @@ impl Application {
                         "presentation actor requested a session message without a backend",
                     )?;
                     for message in &messages {
+                        if std::env::var_os("MANIFOLD_TRACE_PLUGIN_INPUT").is_some() {
+                            eprintln!(
+                                "presentation actor message sender={} recipient={} body={}",
+                                message.sender,
+                                message.actor,
+                                String::from_utf8_lossy(&message.body)
+                            );
+                        }
                         lane.send(message)?;
                     }
                 }
@@ -1699,6 +1807,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                         })
                     {
                         self.fail(event_loop, error);
+                        return;
+                    }
+                    if let Some(runtime) = self.wasm_runtime.as_mut() {
+                        drop(runtime.drain_pending_pane_creations());
                     }
                 }
             }
@@ -1865,6 +1977,37 @@ impl ApplicationHandler<ClientEvent> for Application {
             ClientEvent::ActorHostMessagesReady => {
                 if let Err(error) = self.apply_actor_host_messages() {
                     self.fail(event_loop, error);
+                }
+            }
+            ClientEvent::SessionActorMessage {
+                session_id,
+                sender,
+                recipient,
+                body,
+            } => {
+                if std::env::var_os("MANIFOLD_TRACE_PLUGIN_INPUT").is_some() {
+                    eprintln!(
+                        "session actor message sender={sender} recipient={recipient} body={}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                let expected_session = self
+                    .wasm_runtime
+                    .as_ref()
+                    .and_then(PresentationWasmRuntime::bound_session_id);
+                if expected_session != Some(session_id) {
+                    eprintln!(
+                        "dropped session actor message for session {session_id}; \
+                         presentation is attached to {expected_session:?}"
+                    );
+                } else if let Some(runtime) = self.wasm_runtime.as_ref()
+                    && let Err(error) =
+                        runtime.send_actor_message(&recipient, format!("session:{sender}"), body)
+                {
+                    eprintln!(
+                        "dropped session actor message for unavailable presentation actor \
+                         {recipient:?}: {error:#}"
+                    );
                 }
             }
             event => {
@@ -2178,7 +2321,15 @@ impl ApplicationHandler<ClientEvent> for Application {
                 event,
                 is_synthetic,
                 ..
-            } if !is_synthetic => {
+            } => {
+                let logical_key = plugin_logical_key(&event.logical_key);
+                if std::env::var_os("MANIFOLD_TRACE_PLUGIN_INPUT").is_some() {
+                    eprintln!(
+                        "plugin keyboard input logical={logical_key:?} physical={:?} \
+                         state={:?} synthetic={is_synthetic}",
+                        event.physical_key, event.state
+                    );
+                }
                 let policy_evaluation = event.physical_key.to_scancode().and_then(|scancode| {
                     let snapshot = renderer.key_policy_snapshot();
                     self.key_policy.as_mut().and_then(|policy| {
@@ -2213,7 +2364,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                     for message in evaluation.actor_messages {
                         if let Some(runtime) = self.wasm_runtime.as_ref() {
-                            match runtime.send_actor_message(&message.actor, message.payload) {
+                            match runtime.send_key_policy_message(&message.actor, message.payload) {
                                 Ok(()) => eprintln!(
                                     "sent key-policy actor message actor={}",
                                     message.actor
@@ -2245,33 +2396,36 @@ impl ApplicationHandler<ClientEvent> for Application {
 
                 let modifiers = modifier_bits(self.modifiers);
                 if let Some(pane) = renderer.focused_plugin_pane() {
-                    if let Some(physical_key) = event.physical_key.to_scancode()
-                        && let Err(error) = send_presentation_event(
-                            self.wasm_runtime.as_ref(),
-                            PresentationEvent::Key {
-                                pane,
-                                physical_key,
-                                logical_key: plugin_logical_key(&event.logical_key),
-                                pressed: event.state == ElementState::Pressed,
-                                repeat: event.repeat,
-                                modifiers,
-                            },
-                        )
-                    {
+                    let physical_key = event.physical_key.to_scancode().unwrap_or_default();
+                    if let Err(error) = send_presentation_event(
+                        self.wasm_runtime.as_ref(),
+                        PresentationEvent::Key {
+                            pane,
+                            physical_key,
+                            logical_key,
+                            pressed: event.state == ElementState::Pressed,
+                            repeat: event.repeat,
+                            modifiers,
+                        },
+                    ) {
                         eprintln!("dropped plugin key event: {error:#}");
                     }
                     if event.state == ElementState::Pressed
                         && let Some(text) = event.text.as_ref()
                         && !text.is_empty()
-                        && let Err(error) = send_presentation_event(
+                    {
+                        if std::env::var_os("MANIFOLD_TRACE_PLUGIN_INPUT").is_some() {
+                            eprintln!("plugin text input text={text:?}");
+                        }
+                        if let Err(error) = send_presentation_event(
                             self.wasm_runtime.as_ref(),
                             PresentationEvent::Text {
                                 pane,
                                 text: text.to_string(),
                             },
-                        )
-                    {
-                        eprintln!("dropped plugin text event: {error:#}");
+                        ) {
+                            eprintln!("dropped plugin text event: {error:#}");
+                        }
                     }
                 } else if renderer.focused_managed_window().is_some()
                     && let (Some(sender), Some(scancode)) =
@@ -2341,6 +2495,9 @@ fn plugin_logical_key(key: &Key) -> String {
             NamedKey::ArrowLeft => "ArrowLeft",
             NamedKey::ArrowRight => "ArrowRight",
             NamedKey::F2 => "F2",
+            NamedKey::F6 => "F6",
+            NamedKey::F7 => "F7",
+            NamedKey::Tab => "Tab",
             _ => "",
         }
         .to_string(),

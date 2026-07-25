@@ -41,6 +41,7 @@ pub struct PresentationWasmRuntime {
     outbound_session_messages: VecDeque<SessionActorMessageRequest>,
     outbound_session_commands: VecDeque<SessionCommandEnvelope>,
     outbound_host_messages: VecDeque<HostActorMessage>,
+    pending_pane_creations: VecDeque<u64>,
     bound_session_id: Option<u64>,
     next_actor_pane: u64,
 }
@@ -117,6 +118,7 @@ impl PresentationWasmRuntime {
             outbound_session_messages: VecDeque::new(),
             outbound_session_commands: VecDeque::new(),
             outbound_host_messages: VecDeque::new(),
+            pending_pane_creations: VecDeque::new(),
             bound_session_id: session_id,
             next_actor_pane: u64::MAX,
         };
@@ -348,6 +350,9 @@ impl PresentationWasmRuntime {
             let event = match event {
                 Ok(event) => event,
                 Err(message) if self.is_init_child(&actor_id) => {
+                    eprintln!(
+                        "presentation init child actor failed id={actor_id} message={message}"
+                    );
                     self.send_init_child_event(ComponentChildEvent::Failed {
                         id: actor_id,
                         message,
@@ -359,10 +364,12 @@ impl PresentationWasmRuntime {
                 }
             };
             match event {
-                ComponentActorEvent::ActorStartRequested { id, path }
-                    if actor_id == CLIENT_INIT_ACTOR_ID =>
-                {
-                    self.handle_init_start(id, &path, graphics);
+                ComponentActorEvent::ActorStartRequested {
+                    id,
+                    path,
+                    capabilities,
+                } if actor_id == CLIENT_INIT_ACTOR_ID => {
+                    self.handle_init_start(id, &path, &capabilities, graphics);
                 }
                 ComponentActorEvent::ActorStopRequested { id }
                     if actor_id == CLIENT_INIT_ACTOR_ID =>
@@ -372,6 +379,9 @@ impl PresentationWasmRuntime {
                 ComponentActorEvent::DispatcherFailed { message }
                     if self.is_init_child(&actor_id) =>
                 {
+                    eprintln!(
+                        "presentation init child actor failed id={actor_id} message={message}"
+                    );
                     self.send_init_child_event(ComponentChildEvent::Failed {
                         id: actor_id,
                         message,
@@ -410,6 +420,9 @@ impl PresentationWasmRuntime {
                             actor,
                             body,
                         });
+                }
+                ComponentActorEvent::LocalMessageRequested { actor, body } => {
+                    self.send_actor_message(&actor, actor_id, body)?;
                 }
                 ComponentActorEvent::SessionCommandRequested(request) => {
                     ensure!(
@@ -455,9 +468,10 @@ impl PresentationWasmRuntime {
         &mut self,
         id: String,
         guest_path: &str,
+        capabilities: &[String],
         graphics: Option<&PluginGraphicsBridge>,
     ) {
-        let result = self.start_init_child(&id, guest_path, graphics);
+        let result = self.start_init_child(&id, guest_path, capabilities, graphics);
         match result {
             Ok(generation) => {
                 self.send_init_child_event(ComponentChildEvent::Started { id, generation });
@@ -473,8 +487,13 @@ impl PresentationWasmRuntime {
         &mut self,
         id: &str,
         guest_path: &str,
+        capabilities: &[String],
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<u64> {
+        ensure!(
+            capabilities.is_empty(),
+            "presentation init children cannot request backend capabilities"
+        );
         ensure!(
             !id.trim().is_empty(),
             "init child actor id must not be empty"
@@ -537,6 +556,7 @@ impl PresentationWasmRuntime {
         if let Some(init) = self.init.as_mut() {
             init.children.insert(id.to_string());
         }
+        self.pending_pane_creations.push_back(pane);
         Ok(generation)
     }
 
@@ -649,6 +669,10 @@ impl PresentationWasmRuntime {
             .map(|actor| actor.pane)
     }
 
+    pub fn drain_pending_pane_creations(&mut self) -> impl Iterator<Item = u64> + '_ {
+        self.pending_pane_creations.drain(..)
+    }
+
     pub fn send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
         let pane = presentation_event_pane(&event);
         let actor = self
@@ -664,7 +688,7 @@ impl PresentationWasmRuntime {
         }
     }
 
-    pub fn send_actor_message(&self, actor_id: &str, payload: Vec<u8>) -> Result<()> {
+    pub fn send_key_policy_message(&self, actor_id: &str, payload: Vec<u8>) -> Result<()> {
         if let Some(actor) = self.actors.get(actor_id) {
             return actor
                 .actor
@@ -724,6 +748,30 @@ impl PresentationWasmRuntime {
             .chain(self.legacy_actors.keys())
             .filter_map(|name| self.actor_identity(name))
             .collect()
+    }
+
+    pub const fn bound_session_id(&self) -> Option<u64> {
+        self.bound_session_id
+    }
+
+    pub fn send_actor_message(
+        &self,
+        actor_id: &str,
+        sender: String,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        if let Some(actor) = self.actors.get(actor_id) {
+            return actor
+                .actor
+                .try_send_message(sender, payload)
+                .with_context(|| {
+                    format!("deliver mailbox message to presentation actor {actor_id:?}")
+                });
+        }
+        if self.legacy_actors.contains_key(actor_id) {
+            return self.send_legacy_message(actor_id, payload);
+        }
+        anyhow::bail!("presentation actor {actor_id:?} is unavailable")
     }
 
     pub fn pane_for_actor(&self, actor: &ActorIdentity) -> Option<u64> {

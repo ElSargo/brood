@@ -209,7 +209,11 @@ fn dispatch_mailbox() {
         return;
     };
     COMPAT_FLAGS.fetch_or(FLAG_MAILBOX, Ordering::Release);
-    if payload.starts_with(RUBE_MESSAGE_MAGIC) {
+    if payload == b"spin-dispatch" {
+        loop {
+            SPINNERS_ENTERED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if payload.starts_with(RUBE_MESSAGE_MAGIC) {
         dispatch_rube_message(&payload);
     } else if payload == b"start-notify" {
         start_notification_workers();

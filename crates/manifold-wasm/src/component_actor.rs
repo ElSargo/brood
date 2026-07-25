@@ -66,7 +66,6 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
-    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -151,6 +150,7 @@ pub enum ComponentActorEvent {
     ActorStartRequested {
         id: String,
         path: String,
+        capabilities: Vec<String>,
     },
     ActorStopRequested {
         id: String,
@@ -161,6 +161,14 @@ pub enum ComponentActorEvent {
     },
     SessionMessageRequested {
         session_id: u64,
+        actor: String,
+        body: Vec<u8>,
+    },
+    LocalMessageRequested {
+        actor: String,
+        body: Vec<u8>,
+    },
+    PresentationMessageRequested {
         actor: String,
         body: Vec<u8>,
     },
@@ -188,6 +196,10 @@ pub struct ComponentActorConfig {
     pub max_filesystem_watches: usize,
     pub max_filesystem_watch_events: usize,
     pub command_capacity: usize,
+    /// Bounded queue for pane input and presentation lifecycle events.
+    /// Pointer motion may coalesce; key, text, button, focus, and resize
+    /// events are never silently discarded.
+    pub presentation_backlog: usize,
     pub mailbox_backlog: usize,
     pub max_workers: usize,
     pub max_outstanding_io: usize,
@@ -208,10 +220,12 @@ pub struct ComponentActorConfig {
     /// Admit explicitly addressed presentation-to-session actor messages.
     /// Backend actors never receive this cross-placement capability.
     pub session_messaging: bool,
+    /// Admit explicitly addressed session-to-presentation actor messages.
+    /// Presentation actors never receive this cross-placement capability.
+    pub presentation_messaging: bool,
     /// Admit typed session catalogue commands. Presentation clients set this
     /// for client-realm Component actors only.
     pub session_control: bool,
-    pub dispatcher_deadline: Duration,
     /// Wall-clock cadence for guest interruption checks. Epoch yields keep the
     /// executor responsive; cross-call worker fairness uses `worker-yield`.
     pub epoch_tick_interval: Duration,
@@ -229,6 +243,7 @@ impl Default for ComponentActorConfig {
             max_filesystem_watches: 16,
             max_filesystem_watch_events: 4096,
             command_capacity: 64,
+            presentation_backlog: 512,
             mailbox_backlog: 64,
             max_workers: 64,
             max_outstanding_io: 64,
@@ -241,8 +256,8 @@ impl Default for ComponentActorConfig {
             actor_management: false,
             app_management: false,
             session_messaging: false,
+            presentation_messaging: false,
             session_control: false,
-            dispatcher_deadline: Duration::from_millis(25),
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
             limits: WasmResourceLimits::default(),
@@ -321,14 +336,8 @@ struct ActorStore {
     worker_cancellations: WorkerCancellationRegistry,
     blocking_io: BlockingIoTracker,
     event_observer: mpsc::Sender<ComponentActorEvent>,
-    dispatcher: Option<DispatcherCallState>,
+    shutdown_requested: Arc<AtomicBool>,
     limits: GenerationStoreLimits,
-}
-
-#[derive(Clone, Copy)]
-struct DispatcherCallState {
-    task: GuestTaskId,
-    deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -1532,6 +1541,7 @@ pub struct ComponentActor {
     runtime_task: Option<JoinHandle<Result<()>>>,
     io_task: Option<JoinHandle<()>>,
     epoch_ticker: Option<EpochTicker>,
+    shutdown_requested: Arc<AtomicBool>,
     limits: WasmResourceLimits,
     byte_budget: GenerationByteBudget,
     observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
@@ -1543,6 +1553,10 @@ impl ComponentActor {
         ensure!(
             config.command_capacity > 0,
             "command capacity must be non-zero"
+        );
+        ensure!(
+            config.presentation_backlog > 0,
+            "presentation backlog must be non-zero"
         );
         ensure!(
             config.mailbox_backlog > 0,
@@ -1565,10 +1579,6 @@ impl ComponentActor {
         ensure!(
             config.max_wait_set > 0 && config.max_wait_set <= config.max_pollables,
             "wait-set limit must be non-zero and no greater than the pollable limit"
-        );
-        ensure!(
-            !config.dispatcher_deadline.is_zero(),
-            "dispatcher deadline must be non-zero"
         );
         ensure!(
             !config.epoch_tick_interval.is_zero(),
@@ -1620,6 +1630,7 @@ impl ComponentActor {
         let mailbox_capacity = config.mailbox_backlog;
         let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
         let observer_result_bytes = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel(config.command_capacity);
         let actor_filesystem_watches = filesystem_watches.clone();
         let mut store = Store::new(
@@ -1635,7 +1646,7 @@ impl ComponentActor {
                 worker_cancellations: WorkerCancellationRegistry::default(),
                 blocking_io: BlockingIoTracker::default(),
                 event_observer: event_tx.clone(),
-                dispatcher: None,
+                shutdown_requested: Arc::clone(&shutdown_requested),
                 limits: config.limits.store_limits(),
             },
         );
@@ -1643,12 +1654,9 @@ impl ComponentActor {
         store.set_epoch_deadline(config.epoch_yield_ticks);
         store.epoch_deadline_async_yield_and_update(config.epoch_yield_ticks);
         let epoch_yield_ticks = config.epoch_yield_ticks;
-        store.epoch_deadline_callback(move |mut store| {
-            let stack = store.async_call_stack().collect::<Vec<_>>();
-            if store.data().dispatcher.is_some_and(|dispatcher| {
-                stack.contains(&dispatcher.task) && Instant::now() >= dispatcher.deadline
-            }) {
-                return Err(wasmtime::Error::msg("actor dispatcher deadline exceeded"));
+        store.epoch_deadline_callback(move |store| {
+            if store.data().shutdown_requested.load(Ordering::Acquire) {
+                return Err(wasmtime::Error::msg("actor explicitly stopped"));
             }
             Ok(wasmtime::UpdateDeadline::Yield(epoch_yield_ticks))
         });
@@ -1705,6 +1713,7 @@ impl ComponentActor {
             runtime_task: Some(runtime_task),
             io_task: Some(io_task),
             epoch_ticker: Some(epoch_ticker),
+            shutdown_requested,
             limits,
             byte_budget,
             observer_result_bytes,
@@ -1863,6 +1872,7 @@ impl ComponentActor {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        self.shutdown_requested.store(true, Ordering::Release);
         self.completion_io.stop();
         self.runtime_io.teardown().await;
         self.coordination.stop();
@@ -1934,6 +1944,7 @@ fn try_enqueue_mailbox(
 
 impl Drop for ComponentActor {
     fn drop(&mut self) {
+        self.shutdown_requested.store(true, Ordering::Release);
         self.completion_io.stop();
         self.coordination.stop();
         if let Some(task) = self.runtime_task.take() {
@@ -2070,8 +2081,10 @@ async fn run_component_actor(
     // operation already delegated to the blocking pool remains owned by this
     // actor generation. Join those operations before reporting termination.
     blocking_io.wait_idle().await;
+    let explicitly_stopped = store.data().shutdown_requested.load(Ordering::Acquire);
     let result = match concurrent_result {
         Ok(result) => result,
+        Err(_error) if explicitly_stopped => Ok(()),
         Err(error) => {
             let message = format!("{error:#}");
             let _ = stopped_observer.try_send(ComponentActorEvent::DispatcherFailed {
@@ -2130,17 +2143,8 @@ async fn run_component_event_loop(
             )?;
             if let Some((event, mailbox_permit, byte_permit)) = event {
                 dispatcher_busy = true;
-                let deadline = Instant::now()
-                    .checked_add(config.dispatcher_deadline)
-                    .context("actor dispatcher deadline overflowed")?;
-                let call = accessor.with(|mut access| {
-                    let call = dispatch.start_call_concurrent(&mut access, (event,))?;
-                    access.get().dispatcher = Some(DispatcherCallState {
-                        task: call.task(),
-                        deadline,
-                    });
-                    Ok::<_, wasmtime::Error>(call)
-                })?;
+                let call = accessor
+                    .with(|mut access| dispatch.start_call_concurrent(&mut access, (event,)))?;
                 calls.push(
                     async move {
                         // Admission remains held until the accepted mailbox
@@ -2221,9 +2225,9 @@ async fn run_component_event_loop(
                 Some(RuntimeCommand::Presentation(event)) => {
                     enqueue_presentation_dispatch(
                         &mut presentation_queue,
-                        config.command_capacity,
+                        config.presentation_backlog,
                         event,
-                    );
+                    )?;
                 }
                 Some(RuntimeCommand::Session(event)) => {
                     enqueue_dispatch(
@@ -2252,9 +2256,6 @@ async fn run_component_event_loop(
                 let Some(outcome) = outcome else { continue; };
                 match outcome {
                     GuestCallOutcome::Dispatch(result) => {
-                        accessor.with(|mut access| {
-                            access.get().dispatcher = None;
-                        });
                         dispatcher_busy = false;
                         match result {
                             Ok(returned) => {
@@ -2321,6 +2322,7 @@ async fn run_component_event_loop(
                                                 .try_send(ComponentActorEvent::ActorStartRequested {
                                                     id: request.id,
                                                     path: request.path,
+                                                    capabilities: request.capabilities,
                                                 })
                                                 .context("realm init actor request queue is full")?;
                                         }
@@ -2362,6 +2364,34 @@ async fn run_component_event_loop(
                                                 })
                                                 .context("session actor message request queue is full")?;
                                         }
+                                        abi::Command::SendLocalMessage(request) => {
+                                            ensure!(
+                                                !request.actor.trim().is_empty(),
+                                                "local actor address is invalid"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::LocalMessageRequested {
+                                                    actor: request.actor,
+                                                    body: request.body,
+                                                })
+                                                .context("local actor message request queue is full")?;
+                                        }
+                                        abi::Command::SendPresentationMessage(request) => {
+                                            ensure!(
+                                                config.presentation_messaging,
+                                                "presentation message requested outside a session realm"
+                                            );
+                                            ensure!(
+                                                !request.actor.trim().is_empty(),
+                                                "presentation actor address is invalid"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::PresentationMessageRequested {
+                                                    actor: request.actor,
+                                                    body: request.body,
+                                                })
+                                                .context("presentation actor message request queue is full")?;
+                                        }
                                         abi::Command::SessionCommand(request) => {
                                             ensure!(
                                                 config.session_control,
@@ -2388,6 +2418,17 @@ async fn run_component_event_loop(
                                 }
                             }
                             Err(error) => {
+                                let explicitly_stopped = accessor.with(|mut access| {
+                                    Ok::<_, wasmtime::Error>(
+                                        access
+                                            .get()
+                                            .shutdown_requested
+                                            .load(Ordering::Acquire),
+                                    )
+                                })?;
+                                if explicitly_stopped {
+                                    return Ok(());
+                                }
                                 let message = error.to_string();
                                 let _ = event_observer.try_send(ComponentActorEvent::DispatcherFailed { message: message.clone() });
                                 anyhow::bail!("component actor dispatcher failed: {message}");
@@ -2840,18 +2881,18 @@ fn enqueue_presentation_dispatch(
     queue: &mut VecDeque<PresentationEvent>,
     capacity: usize,
     event: PresentationEvent,
-) {
+) -> Result<()> {
     if let PresentationEvent::PointerMoved { pane, .. } = &event {
         if let Some(queued) = queue.back_mut()
             && matches!(queued, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
         {
             *queued = event;
-            return;
+            return Ok(());
         }
         if queue.len() < capacity {
             queue.push_back(event);
         }
-        return;
+        return Ok(());
     }
 
     if queue.len() >= capacity {
@@ -2861,10 +2902,11 @@ fn enqueue_presentation_dispatch(
         {
             queue.remove(index);
         } else {
-            queue.pop_front();
+            anyhow::bail!("actor presentation dispatch backlog is full");
         }
     }
     queue.push_back(event);
+    Ok(())
 }
 
 fn enqueue_dispatch(
@@ -3057,4 +3099,102 @@ fn completion_to_guest(completion: &ActorCompletion) -> GuestEvent {
         }),
     };
     abi::Event::Completion(completion)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_backlog_never_discards_text() {
+        let mut queue = VecDeque::new();
+        assert!(
+            enqueue_presentation_dispatch(
+                &mut queue,
+                2,
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "a".to_string(),
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            enqueue_presentation_dispatch(
+                &mut queue,
+                2,
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "b".to_string(),
+                },
+            )
+            .is_ok()
+        );
+
+        assert!(
+            enqueue_presentation_dispatch(
+                &mut queue,
+                2,
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "c".to_string(),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "a".to_string(),
+                },
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "b".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn presentation_backlog_evicts_motion_before_text() {
+        let mut queue = VecDeque::from([
+            PresentationEvent::PointerMoved {
+                pane: 1,
+                x: 1.0,
+                y: 2.0,
+            },
+            PresentationEvent::Text {
+                pane: 1,
+                text: "a".to_string(),
+            },
+        ]);
+
+        assert!(
+            enqueue_presentation_dispatch(
+                &mut queue,
+                2,
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "b".to_string(),
+                },
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "a".to_string(),
+                },
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "b".to_string(),
+                },
+            ]
+        );
+    }
 }

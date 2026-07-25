@@ -221,6 +221,7 @@ impl Guest for SessionSwitcher {
                         ActorCommand::StartActor(ActorStartRequest {
                             id: CHILD_ACTOR_ID.to_string(),
                             path: COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
                         }),
                         ActorCommand::LifecycleComplete(Ok(())),
                     ]

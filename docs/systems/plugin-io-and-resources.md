@@ -186,7 +186,7 @@ as for `rescan`. A reconciliation scan is published atomically as the new model
 before the consumer reports that reconciliation completed.
 
 Recursive native registration runs as host-owned background work so a large
-existing tree cannot consume an actor dispatch deadline. Registration
+existing tree cannot monopolize actor dispatch. Registration
 completion produces the first `rescan` marker because changes may race setup.
 
 The host uses one daemon watcher service, deduplicates canonical native path

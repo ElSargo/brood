@@ -22,7 +22,7 @@ use crate::{
 
 pub const CONTROL_OBJECT_PATH: &str = "/org/manifold/Session";
 pub const CONTROL_INTERFACE: &str = "org.manifold.Session.Control";
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 11;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 12;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -44,6 +44,8 @@ type DbusPresentationWindow = (u64, u64, String);
 type DbusFastPath = (
     u64,
     u64,
+    zbus::zvariant::OwnedFd,
+    zbus::zvariant::OwnedFd,
     zbus::zvariant::OwnedFd,
     zbus::zvariant::OwnedFd,
     zbus::zvariant::OwnedFd,
@@ -146,6 +148,8 @@ pub struct PresentationFastPath {
     pub catalog_notify_fd: OwnedFd,
     pub actor_message_fd: OwnedFd,
     pub actor_message_notify_fd: OwnedFd,
+    pub presentation_message_fd: OwnedFd,
+    pub presentation_message_notify_fd: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -335,6 +339,8 @@ pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<Presentatio
         catalog_notify_fd,
         actor_message_fd,
         actor_message_notify_fd,
+        presentation_message_fd,
+        presentation_message_notify_fd,
     ) = presentation_proxy(&connection, target)?
         .open_presentation_fast_path()
         .context("open local presentation fast path")?;
@@ -349,6 +355,8 @@ pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<Presentatio
         catalog_notify_fd: catalog_notify_fd.into(),
         actor_message_fd: actor_message_fd.into(),
         actor_message_notify_fd: actor_message_notify_fd.into(),
+        presentation_message_fd: presentation_message_fd.into(),
+        presentation_message_notify_fd: presentation_message_notify_fd.into(),
     })
 }
 

@@ -286,6 +286,19 @@ interface actor {
         body: list<u8>,
     }
 
+    /// Explicit address for another actor in the sender's current realm.
+    record local-actor-message {
+        actor: string,
+        body: list<u8>,
+    }
+
+    /// Explicit address for an actor in the presentation realm currently
+    /// attached to the sender's surface session.
+    record presentation-actor-message {
+        actor: string,
+        body: list<u8>,
+    }
+
     record read-completed {
         operation: operation-id,
         bytes: list<u8>,
@@ -352,6 +365,9 @@ interface actor {
         id: string,
         /// Path relative to the init actor's capability root.
         path: string,
+        /// Authority requested for the child actor. The realm host validates
+        /// these declarations before constructing the child generation.
+        capabilities: list<string>,
     }
     record actor-started { id: string, generation: u64 }
     record actor-failed { id: string, message: string }
@@ -415,6 +431,8 @@ interface actor {
     }
     record key-event {
         pane: u64,
+        /// Linux input scancode, or zero when the input source does not expose
+        /// a physical key (for example a virtual keyboard).
         physical-key: u32,
         /// Stable semantic name for non-text keys and the logical character
         /// for printable keys. Text insertion still uses `text-event`.
@@ -512,6 +530,12 @@ interface actor {
         /// in a connected surface-session realm. Only presentation actors have
         /// this cross-placement capability.
         send-session-message(session-actor-message),
+        /// Asynchronously enqueue a message for another actor in this realm.
+        send-local-message(local-actor-message),
+        /// Asynchronously enqueue a message for an actor in the presentation
+        /// realm attached to this session. Only session-realm actors have this
+        /// cross-placement capability.
+        send-presentation-message(presentation-actor-message),
         /// Request a typed session catalogue operation from the presentation
         /// client. Completion and the resulting snapshot arrive as events.
         session-command(session-command),

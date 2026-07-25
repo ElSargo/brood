@@ -184,12 +184,11 @@ pub struct Preview1WorkerConfig {
     pub worker_stack_bytes: u32,
     /// Wall-clock cadence of the Wasmtime engine epoch ticker.
     pub epoch_tick_interval: Duration,
-    /// Epochs an actor or internal allocator call may run before trapping.
-    pub actor_deadline_ticks: u64,
+    /// Epochs a CPU-running actor or internal allocator call may run before
+    /// cooperatively yielding.
+    pub actor_yield_ticks: u64,
     /// Epochs a CPU-running worker may run before cooperatively yielding.
     pub worker_yield_ticks: u64,
-    /// Wall-clock bound around every actor export call.
-    pub actor_wall_timeout: Duration,
     /// Host and guest byte ceilings for one actor generation.
     pub limits: WasmResourceLimits,
 }
@@ -213,9 +212,8 @@ impl Default for Preview1WorkerConfig {
             worker_input_backlog: 16,
             worker_stack_bytes: 1024 * 1024,
             epoch_tick_interval: Duration::from_millis(2),
-            actor_deadline_ticks: 50,
+            actor_yield_ticks: 1,
             worker_yield_ticks: 1,
-            actor_wall_timeout: Duration::from_millis(100),
             limits: WasmResourceLimits::default(),
         }
     }
@@ -1765,7 +1763,7 @@ impl Preview1WorkerRuntime {
                 },
             );
             actor_store.limiter(|data| &mut data.limits);
-            configure_actor_deadline(&mut actor_store, config.actor_deadline_ticks);
+            configure_actor_yield(&mut actor_store, config.actor_yield_ticks);
             let actor_instance = instantiate(&engine, &module, &memory, &mut actor_store).await?;
             validate_actor_exports(&mut actor_store, actor_instance).await?;
             Ok((actor_store, actor_instance, epoch_ticker))
@@ -2497,8 +2495,7 @@ async fn parent_loop(
                 memory.clone(),
                 capabilities.clone(),
                 config.worker_stack_bytes,
-                config.actor_deadline_ticks,
-                config.actor_wall_timeout,
+                config.actor_yield_ticks,
                 config.worker_yield_ticks,
                 reservations.values().copied().collect(),
                 config.limits,
@@ -2911,8 +2908,7 @@ fn start_dispatch_operation(
     actor_instance: Instance,
     event: CompatEvent,
     mailbox_permit: Option<(OwnedSemaphorePermit, GenerationBytePermit)>,
-    actor_deadline_ticks: u64,
-    actor_wall_timeout: Duration,
+    actor_yield_ticks: u64,
 ) -> GuestCall {
     Box::pin(async move {
         // Keep mailbox admission until the accepted event has a terminal guest
@@ -2925,24 +2921,17 @@ fn start_dispatch_operation(
                 "delivering Preview 1 worker failure to its actor"
             );
         }
-        configure_actor_deadline(&mut actor_store, actor_deadline_ticks);
+        configure_actor_yield(&mut actor_store, actor_yield_ticks);
         let kind = event.kind();
         actor_store.data_mut().host.event = Some(event);
         let result = async {
             let function = actor_instance
                 .get_typed_func::<u32, u32>(&mut actor_store, COMPAT_DISPATCH_EXPORT)
                 .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
-            let status = tokio::time::timeout(
-                actor_wall_timeout,
-                function.call_async(&mut actor_store, kind),
-            )
-            .await
-            .map_err(|_elapsed| {
-                Preview1WorkerError::Guest(
-                    "actor dispatcher wall-clock deadline elapsed".to_string(),
-                )
-            })?
-            .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
+            let status = function
+                .call_async(&mut actor_store, kind)
+                .await
+                .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
             if status != 0 {
                 return Err(Preview1WorkerError::Guest(format!(
                     "{COMPAT_DISPATCH_EXPORT} returned status {status}"
@@ -2973,21 +2962,15 @@ fn start_actor_operation(
     memory: SharedMemory,
     capabilities: Preview1ActorCapabilities,
     stack_bytes: u32,
-    actor_deadline_ticks: u64,
-    actor_wall_timeout: Duration,
+    actor_yield_ticks: u64,
     worker_yield_ticks: u64,
     existing_reservations: Vec<WorkerReservation>,
     limits: WasmResourceLimits,
 ) -> GuestCall {
     match operation {
-        ActorOperation::Dispatch(event) => start_dispatch_operation(
-            actor_store,
-            actor_instance,
-            event,
-            None,
-            actor_deadline_ticks,
-            actor_wall_timeout,
-        ),
+        ActorOperation::Dispatch(event) => {
+            start_dispatch_operation(actor_store, actor_instance, event, None, actor_yield_ticks)
+        }
         ActorOperation::Mailbox {
             event,
             permit,
@@ -2997,28 +2980,22 @@ fn start_actor_operation(
             actor_instance,
             event,
             Some((permit, byte_permit)),
-            actor_deadline_ticks,
-            actor_wall_timeout,
+            actor_yield_ticks,
         ),
         ActorOperation::Call {
             export,
             argument,
             reply,
         } => Box::pin(async move {
-            configure_actor_deadline(&mut actor_store, actor_deadline_ticks);
+            configure_actor_yield(&mut actor_store, actor_yield_ticks);
             let result = async {
                 let function = actor_instance
                     .get_typed_func::<u32, u32>(&mut actor_store, &export)
                     .map_err(|error| Preview1WorkerError::Guest(error.to_string()))?;
-                tokio::time::timeout(
-                    actor_wall_timeout,
-                    function.call_async(&mut actor_store, argument),
-                )
-                .await
-                .map_err(|_elapsed| {
-                    Preview1WorkerError::Guest("actor call wall-clock deadline elapsed".to_string())
-                })?
-                .map_err(|error| Preview1WorkerError::Guest(error.to_string()))
+                function
+                    .call_async(&mut actor_store, argument)
+                    .await
+                    .map_err(|error| Preview1WorkerError::Guest(error.to_string()))
             }
             .await;
             CallDone::ActorCall {
@@ -3034,32 +3011,23 @@ fn start_actor_operation(
             stdin,
             reply,
         } => Box::pin(async move {
-            configure_actor_deadline(&mut actor_store, actor_deadline_ticks);
-            let result = tokio::time::timeout(
-                actor_wall_timeout,
-                prepare_worker(
-                    &engine,
-                    &module,
-                    &memory,
-                    &mut actor_store,
-                    actor_instance,
-                    &capabilities,
-                    stdin,
-                    export,
-                    argument,
-                    stack_bytes,
-                    worker_yield_ticks,
-                    &existing_reservations,
-                    limits,
-                ),
+            configure_actor_yield(&mut actor_store, actor_yield_ticks);
+            let result = prepare_worker(
+                &engine,
+                &module,
+                &memory,
+                &mut actor_store,
+                actor_instance,
+                &capabilities,
+                stdin,
+                export,
+                argument,
+                stack_bytes,
+                worker_yield_ticks,
+                &existing_reservations,
+                limits,
             )
-            .await
-            .map_err(|_elapsed| {
-                Preview1WorkerError::Guest(
-                    "worker preparation wall-clock deadline elapsed".to_string(),
-                )
-            })
-            .and_then(std::convert::identity);
+            .await;
             CallDone::WorkerPrepared {
                 actor_store,
                 worker,
@@ -3071,16 +3039,8 @@ fn start_actor_operation(
             worker,
             reservation,
         } => Box::pin(async move {
-            configure_actor_deadline(&mut actor_store, actor_deadline_ticks);
-            let result = tokio::time::timeout(
-                actor_wall_timeout,
-                release_worker(&mut actor_store, actor_instance, reservation),
-            )
-            .await
-            .map_err(|_elapsed| {
-                Preview1WorkerError::Guest("worker release wall-clock deadline elapsed".to_string())
-            })
-            .and_then(std::convert::identity);
+            configure_actor_yield(&mut actor_store, actor_yield_ticks);
+            let result = release_worker(&mut actor_store, actor_instance, reservation).await;
             CallDone::WorkerReleased {
                 actor_store,
                 worker,
@@ -3518,9 +3478,9 @@ const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1Wor
             "epoch_tick_interval must be non-zero",
         ));
     }
-    if config.actor_deadline_ticks == 0 {
+    if config.actor_yield_ticks == 0 {
         return Err(Preview1WorkerError::InvalidConfig(
-            "actor_deadline_ticks must be non-zero",
+            "actor_yield_ticks must be non-zero",
         ));
     }
     if config.worker_yield_ticks == 0 {
@@ -3528,17 +3488,12 @@ const fn validate_config(config: Preview1WorkerConfig) -> Result<(), Preview1Wor
             "worker_yield_ticks must be non-zero",
         ));
     }
-    if config.actor_wall_timeout.is_zero() {
-        return Err(Preview1WorkerError::InvalidConfig(
-            "actor_wall_timeout must be non-zero",
-        ));
-    }
     Ok(())
 }
 
-fn configure_actor_deadline(store: &mut Store<Preview1Store>, ticks: u64) {
+fn configure_actor_yield(store: &mut Store<Preview1Store>, ticks: u64) {
     store.set_epoch_deadline(ticks);
-    store.epoch_deadline_trap();
+    store.epoch_deadline_async_yield_and_update(ticks);
 }
 
 async fn validate_actor_exports(

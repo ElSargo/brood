@@ -46,6 +46,8 @@ pub struct RuntimeIoCapabilities {
 pub struct RuntimeIoConfig {
     /// Granted runtime authority.
     pub capabilities: RuntimeIoCapabilities,
+    /// Host working directory inherited by admitted subprocesses.
+    pub working_directory: Option<PathBuf>,
     /// Maximum streams, children, and timers owned at once.
     pub max_resources: usize,
     /// Maximum live child processes.
@@ -62,6 +64,7 @@ impl Default for RuntimeIoConfig {
     fn default() -> Self {
         Self {
             capabilities: RuntimeIoCapabilities::default(),
+            working_directory: None,
             max_resources: 64,
             max_children: 8,
             max_timers: 32,
@@ -326,6 +329,13 @@ impl RuntimeIoHub {
         {
             return Err(RuntimeIoError::InvalidArgument);
         }
+        if config
+            .working_directory
+            .as_ref()
+            .is_some_and(|directory| !directory.is_dir())
+        {
+            return Err(RuntimeIoError::InvalidArgument);
+        }
         let allowed_commands = config.capabilities.commands.iter().cloned().collect();
         let (connect_shutdown, _receiver) = watch::channel(false);
         Ok(Self {
@@ -397,12 +407,16 @@ impl RuntimeIoHub {
                 return Err(error);
             }
         };
-        let spawned = Command::new(&resolved)
+        let mut command = Command::new(&resolved);
+        command
             .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        if let Some(directory) = &self.inner.config.working_directory {
+            command.current_dir(directory);
+        }
+        let spawned = command.spawn();
         let mut child = match spawned {
             Ok(child) => child,
             Err(_error) => {
@@ -456,7 +470,10 @@ impl RuntimeIoHub {
             return Err(RuntimeIoError::InvalidArgument);
         }
         let resolved = self.resolve_command(command)?;
-        let cwd = env::current_dir().map_err(|_error| RuntimeIoError::HostFailure)?;
+        let cwd = self.inner.config.working_directory.clone().map_or_else(
+            || env::current_dir().map_err(|_error| RuntimeIoError::HostFailure),
+            Ok,
+        )?;
         self.reserve_child()?;
         let child_state = match self.create_child(resolved.clone()) {
             Ok(state) => state,

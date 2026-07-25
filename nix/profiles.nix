@@ -116,6 +116,7 @@ let
     pkgs.sway
     pkgs.vulkan-tools
     pkgs.wayland-utils
+    pkgs.wtype
     westonWithSimpleClients
   ];
 in

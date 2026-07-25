@@ -32,6 +32,7 @@ const KEY_3: i32 = 12;
 const KEY_4: i32 = 13;
 const KEY_5: i32 = 14;
 const KEY_ENTER: i32 = 36;
+const KEY_A: i32 = 38;
 const KEY_O: i32 = 32;
 const KEY_B: i32 = 56;
 const KEY_M: i32 = 58;
@@ -201,6 +202,15 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
             toggle_workspace_input_mode();
         }
         return write_consume(output, &[]);
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_A
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::CodingAgentAction("new-ui")])
+        };
     }
 
     if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_M
@@ -525,6 +535,7 @@ enum Message<'a> {
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
     SessionSwitcherAction(&'a str),
+    CodingAgentAction(&'a str),
 }
 
 fn write_layout_actor_outbox(
@@ -813,6 +824,7 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::LayoutAction("close-active-pane") => "host",
             Message::LayoutAction(_) => "workspace",
             Message::SessionSwitcherAction(_) => "session-switcher",
+            Message::CodingAgentAction(_) => "manifold.client-init",
             _ => "host",
         };
         writer.bytes(br#"{"actor":""#);
@@ -856,6 +868,12 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             }
             Message::SessionSwitcherAction(action) => {
                 payload.bytes(br#"{"type":"sidebar-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
+            Message::CodingAgentAction(action) => {
+                payload.bytes(br#"{"kind":"coding-agent-action","action":"#);
                 payload.byte(b'"');
                 payload.quoted_body(action.as_bytes());
                 payload.bytes(br#""}"#);
