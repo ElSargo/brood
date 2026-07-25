@@ -413,6 +413,11 @@ if rg -q "presentation backend snapshot" "$CLIENT_LOG"; then
   echo "ERR client used the retired Zbus catalog refresh path" >&2
   exit 1
 fi
+if sed -n '/presentation layout source changed source=actor/,$p' "$CLIENT_LOG" \
+  | rg -q "presentation layout source changed source=native-fallback"; then
+  echo "ERR client flashed through native fallback after accepting actor layout" >&2
+  exit 1
+fi
 
 cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
@@ -422,6 +427,7 @@ cat > "$OUT/proof.md" <<EOF
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
+- transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
 - hidden: managed pane resized to ${FULL_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment

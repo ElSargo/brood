@@ -151,6 +151,12 @@ generation, and inventory revision. It submits a lease-local candidate through
 its ordinary host outbox. The client authenticates the holder, validates pane
 authority and revision, recursively composes the complete tree, clips child
 subtrees, canonicalizes paint order, and selects an eligible focus request.
+Catalog and session changes publish a new inventory revision without replacing
+the currently accepted actor layout. The client keeps that layout and its
+relevant window resources visible until the complete replacement layout is
+accepted, then swaps layouts atomically and releases panes the replacement no
+longer references. Native fallback is startup and failure recovery, not an
+intermediate session-switch state.
 
 The default session switcher claims the root, places its pane on the right, and
 delegates `rest` to the workspace actor. Hiding and showing are ordinary

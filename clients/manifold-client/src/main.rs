@@ -3376,7 +3376,6 @@ impl Renderer {
         active_session: u64,
         windows: Vec<PresentationWindowSummary>,
     ) -> Option<FocusChange> {
-        let previous_visible = self.default_visible_pane_inventory();
         let previous_inventory = self
             .available_windows
             .iter()
@@ -3401,22 +3400,24 @@ impl Renderer {
         }
 
         self.available_windows = available_windows;
-        let visible_changed = previous_visible
-            != default_visible_panes(
-                self.plugin_panes.keys().copied(),
-                &self.available_windows,
-                active_session,
-            );
-        if previous_active != active_session || visible_changed {
+        self.active_session = active_session;
+        self.layout_state_dirty = true;
+        if self.layout_source == LayoutSource::NativeFallback {
             return self.apply_default_session_layout(active_session);
         }
-        self.layout_state_dirty = true;
+        self.window.request_redraw();
         self.reconcile_layout()
     }
 
     fn select_active_session(&mut self, active_session: u64) -> Option<FocusChange> {
         if self.active_session == active_session {
             return None;
+        }
+        if self.layout_source == LayoutSource::Actor {
+            self.active_session = active_session;
+            self.layout_state_dirty = true;
+            self.window.request_redraw();
+            return self.reconcile_layout();
         }
         self.apply_default_session_layout(active_session)
     }
@@ -3652,13 +3653,19 @@ impl Renderer {
             .clone()
             .validate_for_panes(&panes)
             .is_ok();
-        if self.layout_source == LayoutSource::NativeFallback || !valid {
+        if self.layout_source == LayoutSource::NativeFallback {
             let extent = self.layout_extent();
             let focus = self.focused_pane_id();
             return self.commit_layout(
                 native_flat_layout(&self.default_visible_pane_inventory(), extent),
                 focus,
                 LayoutSource::NativeFallback,
+            );
+        }
+        if !valid {
+            eprintln!(
+                "retaining accepted actor layout until its replacement is ready inventory_panes={}",
+                panes.len()
             );
         }
         self.project_accepted_layout(None)
@@ -3680,6 +3687,10 @@ impl Renderer {
         &mut self,
         error: &dyn std::fmt::Display,
     ) -> (Option<FocusChange>, bool) {
+        if self.layout_source == LayoutSource::Actor {
+            eprintln!("rejected actor-submitted layout; retaining last accepted layout: {error}");
+            return (self.project_accepted_layout(None), false);
+        }
         eprintln!("rejected actor-submitted layout; using native fallback: {error}");
         let visible = self.default_visible_pane_inventory();
         let extent = self.layout_extent();
