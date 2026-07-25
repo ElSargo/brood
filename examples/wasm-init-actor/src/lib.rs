@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 const CROSS_REALM_PROOF: &[u8] = b"client-to-session-actor-proof";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
+const TERMINAL_SESSION_COMPONENT_FILE: &str = "brood_terminal_session_plugin.component.wasm";
 const FIRST_AGENT: &str = "coding-agent-1";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -74,9 +75,13 @@ impl Guest for ExampleInitActor {
                 ]
             }
             Event::Lifecycle(LifecycleEvent::Start(_)) => vec![
-                Command::StartApp(AppStartRequest {
-                    id: "terminal".to_string(),
-                    argv: vec!["foot".to_string()],
+                Command::StartActor(ActorStartRequest {
+                    id: "terminal-session".to_string(),
+                    path: TERMINAL_SESSION_COMPONENT_FILE.to_string(),
+                    capabilities: vec![
+                        "pty".to_string(),
+                        "subprocess:sh".to_string(),
+                    ],
                 }),
                 start_agent(FIRST_AGENT),
                 Command::LifecycleComplete(Ok(())),

@@ -74,7 +74,19 @@ interface host {
         host-failure,
     }
 
+    enum font-intent {
+        ui,
+        monospace,
+    }
+
+    enum font-weight {
+        normal,
+        bold,
+    }
+
     record text-layout-options {
+        font-intent: font-intent,
+        font-weight: font-weight,
         font-size: f32,
         max-width: f32,
         line-height: f32,
@@ -90,6 +102,8 @@ interface host {
         height: f32,
         first-baseline: f32,
         line-count: u32,
+        cell-width: f32,
+        line-height: f32,
     }
 
     graphics-submit-draw-packet: func(
@@ -136,11 +150,22 @@ interface host {
         resolved-command: string,
     }
 
+    enum terminal-profile {
+        xterm-256color,
+    }
+
+    record pty-spawn-options {
+        rows: u16,
+        cols: u16,
+        terminal-profile: terminal-profile,
+    }
+
     enum child-state { running, exited, signalled }
     enum timer-state { pending, expired }
 
     subprocess-spawn: func(command: string, arguments: list<string>) -> result<process-io, runtime-io-error>;
-    pty-spawn: func(command: string, arguments: list<string>, rows: u16, cols: u16) -> result<pty-io, runtime-io-error>;
+    pty-spawn: func(command: string, arguments: list<string>, options: pty-spawn-options) -> result<pty-io, runtime-io-error>;
+    pty-resize: func(child: u64, rows: u16, cols: u16) -> result<_, runtime-io-error>;
     worker-loopback-connect: async func(address: string) -> result<u64, runtime-io-error>;
     stream-notification: func(handle: u64) -> result<notification-id, runtime-io-error>;
     stream-read: func(handle: u64, max-bytes: u32) -> result<stream-read-result, runtime-io-error>;

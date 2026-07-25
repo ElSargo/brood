@@ -20,6 +20,8 @@ const PICKER_ACTOR_ID: &str = "picker";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
 const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
+const TERMINAL_UI_COMPONENT_FILE: &str = "brood_terminal_ui_plugin.component.wasm";
+const TERMINAL_UI_ID: &str = "terminal-ui";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
@@ -312,6 +314,11 @@ impl Guest for SessionSwitcher {
                             capabilities: Vec::new(),
                         }),
                         start_coding_agent_ui(CODING_AGENT_UI_ID),
+                        ActorCommand::StartActor(ActorStartRequest {
+                            id: TERMINAL_UI_ID.to_string(),
+                            path: TERMINAL_UI_COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
+                        }),
                         ActorCommand::LifecycleComplete(Ok(())),
                     ]
                 } else {
@@ -1265,6 +1272,8 @@ fn add_text(
         state.pane,
         text,
         host::TextLayoutOptions {
+            font_intent: host::FontIntent::Ui,
+            font_weight: host::FontWeight::Normal,
             font_size: size,
             max_width: max_width.max(1.0),
             line_height: size + 4.0,

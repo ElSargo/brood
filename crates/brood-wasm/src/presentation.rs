@@ -31,8 +31,22 @@ impl fmt::Display for PresentationError {
 
 impl Error for PresentationError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FontIntent {
+    Ui,
+    Monospace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FontWeight {
+    Normal,
+    Bold,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextLayoutOptions {
+    pub font_intent: FontIntent,
+    pub font_weight: FontWeight,
     pub font_size: f32,
     pub max_width: f32,
     pub line_height: f32,
@@ -47,6 +61,10 @@ pub struct TextLayoutResult {
     pub height: f32,
     pub first_baseline: f32,
     pub line_count: u32,
+    /// Stable advance of one cell for monospace intent, otherwise zero.
+    pub cell_width: f32,
+    /// Resolved line height shared by measurement and rendering.
+    pub line_height: f32,
 }
 
 /// Client-supplied presentation capability installed into one actor Store.

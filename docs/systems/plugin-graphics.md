@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-25
 ---
 
 # Plugin Graphics
@@ -241,7 +241,7 @@ Text layout is a presentation-client host function outside the draw packet:
 
 ```text
 layout_text(text, font_intent, bounds, wrapping, alignment, style)
-  -> text_layout_handle + metrics
+  -> text_layout_handle + width, height, cell_width, line_height
 ```
 
 Position-to-text, text-to-position, selection, and caret queries are also host
@@ -263,6 +263,14 @@ one indexed GPU draw.
 An SDK may expose a convenient `draw_text(...)` function, but that function
 creates or retrieves a cached host text layout and emits `draw-text-layout`.
 Measurement and rendering therefore always use the same native layout result.
+
+`font_intent` includes an explicit monospace choice. For that intent the client
+selects the platform monospace family, disables discretionary shaping features
+that would destabilize a cell advance, and reports a stable `cell_width` and
+`line_height` measured by the same layout engine used for drawing. Style
+includes at least normal and bold weight plus foreground color. A terminal can
+therefore group adjacent cells into styled text runs while keeping its grid,
+parser, cursor, and cell model in guest code.
 
 Text calls are local to the presentation client and bounded by explicit string,
 line, and layout limits. The client may cache native layouts internally, but the
@@ -319,6 +327,11 @@ Diagnostics correlate actor view revisions with accepted, rejected,
 superseded, replayed, and presented host sequences. They report validation and
 render timing, packet and resource sizes, fallback/recovery state, and text or
 resource errors in SDK-facing terms.
+
+Text diagnostics include layouts created, dropped, currently live, and peak
+live, alongside maximum packet bytes and command count. Run caches must release
+obsolete layout handles as revisions change; churn is measured directly rather
+than hidden behind an unbounded host cache.
 
 ## Proof Before Freezing
 

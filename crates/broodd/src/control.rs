@@ -3585,6 +3585,16 @@ struct StatusSnapshot {
     hosted_filesystem_watch_event_capacity: usize,
     hosted_filesystem_watch_overflows: u64,
     hosted_filesystem_watch_rescans: u64,
+    hosted_runtime_io_resources: usize,
+    hosted_runtime_io_streams: usize,
+    hosted_runtime_io_children: usize,
+    hosted_runtime_io_timers: usize,
+    hosted_runtime_io_buffered_incoming_bytes: usize,
+    hosted_runtime_io_buffered_outgoing_bytes: usize,
+    hosted_runtime_io_max_stream_incoming_bytes: usize,
+    hosted_runtime_io_max_stream_outgoing_bytes: usize,
+    hosted_runtime_io_stream_read_would_block: u64,
+    hosted_runtime_io_stream_write_would_block: u64,
     hosted_children: usize,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
@@ -3688,6 +3698,7 @@ impl StatusSnapshot {
         let preview1_compat_stats = state.preview1_compat_stats();
         let filesystem_watcher_stats = state.filesystem_watcher_stats();
         let hosted_filesystem_watch_stats = state.hosted_filesystem_watch_stats();
+        let hosted_runtime_io_stats = state.hosted_runtime_io_stats();
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
@@ -3771,6 +3782,22 @@ impl StatusSnapshot {
             hosted_filesystem_watch_event_capacity: hosted_filesystem_watch_stats.max_events,
             hosted_filesystem_watch_overflows: hosted_filesystem_watch_stats.overflows,
             hosted_filesystem_watch_rescans: hosted_filesystem_watch_stats.rescans,
+            hosted_runtime_io_resources: hosted_runtime_io_stats.resources,
+            hosted_runtime_io_streams: hosted_runtime_io_stats.streams,
+            hosted_runtime_io_children: hosted_runtime_io_stats.children,
+            hosted_runtime_io_timers: hosted_runtime_io_stats.timers,
+            hosted_runtime_io_buffered_incoming_bytes: hosted_runtime_io_stats
+                .buffered_incoming_bytes,
+            hosted_runtime_io_buffered_outgoing_bytes: hosted_runtime_io_stats
+                .buffered_outgoing_bytes,
+            hosted_runtime_io_max_stream_incoming_bytes: hosted_runtime_io_stats
+                .max_stream_incoming_bytes,
+            hosted_runtime_io_max_stream_outgoing_bytes: hosted_runtime_io_stats
+                .max_stream_outgoing_bytes,
+            hosted_runtime_io_stream_read_would_block: hosted_runtime_io_stats
+                .stream_read_would_block,
+            hosted_runtime_io_stream_write_would_block: hosted_runtime_io_stats
+                .stream_write_would_block,
             hosted_children: state.hosted_child_count(),
             hosted_child_exits: state.hosted_child_exits(),
             hosted_child_failures: state.hosted_child_failures(),

@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-25
 ---
 
 # Plugin Runtime
@@ -224,6 +224,27 @@ streams and sockets, kills live children, cancels timers and pumps, and joins
 all host work before replacement can be published. Count, buffered-byte, and
 write-chunk ceilings apply uniformly to Component and Preview 1 guests.
 
+### Terminal plugin composition
+
+The first-party terminal is an ordinary bundled Component plugin, not a host
+subsystem. Its session actor owns the allowlisted shell PTY, parser, terminal
+state, and scrollback. Its presentation actor owns pane-local input, native text
+layout handles, and canvas packets. The host supplies only the same bounded
+PTY/process, stream readiness, presentation input, text, graphics, and
+diagnostic facilities available to other plugins.
+
+The session actor parses output in a worker and publishes revisioned snapshots.
+It coalesces a short burst of PTY reads before publishing and chunks a snapshot
+to stay below mailbox limits; it does not forward one actor message per native
+read. The presentation actor assembles a complete revision, supersedes stale
+render work, and emits a retained canvas packet. Input dispatch only enqueues
+bounded writes or work and never waits for the PTY or renderer.
+
+Terminal escape handling, the screen grid, scrollback, selection, and
+keybindings remain guest code. The runtime does not expose descriptors,
+arbitrary `ioctl`, signal numbers, termios internals, compositor objects, or GPU
+objects to support it.
+
 ## Messaging, Policy, And Publications
 
 Mailboxes are the durable communication path between actors, host services,
@@ -346,6 +367,16 @@ The Component and Preview 1 runtimes are implementation proofs of this target.
 The Component path demonstrates completion I/O and cooperative workers; the
 Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
 memory. Their export names and Store layout are not the durable plugin ABI.
+
+The bundled `terminal-session` and `terminal-ui` Components are the real
+terminal vertical-slice proof. The session guest launches an allowlisted shell
+in a PTY, parses escape sequences with a guest terminal parser, retains grid and
+scrollback state, and publishes coalesced revisions. The presentation guest
+accepts real pane key/text and resize events, renders styled native text runs
+through canvas packets, and can be destroyed and recreated without terminating
+the session-owned shell. The nested proof records shell, ANSI/Unicode, Helix,
+repeated resize, streaming-output, child-exit, resource-pressure, mailbox,
+packet, text-churn, key-to-present, teardown, and screenshot evidence.
 
 `plugins/component-runtime-io` and the runtime-I/O worker in
 `plugins/workspace-file-log` exercise the same bounded stream and pollable

@@ -1,0 +1,19 @@
+[package]
+name = "brood-terminal-session-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+unicode-width = "0.2"
+vte = "0.15"
+wit-bindgen = "0.57.1"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[workspace]

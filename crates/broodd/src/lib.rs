@@ -15,6 +15,7 @@ mod frame_export;
 mod geometry;
 mod input;
 pub mod launch_context;
+mod nested_test;
 mod plugin_runtime;
 mod runtime;
 mod session_bus;
@@ -29,7 +30,7 @@ use brood_cli::{Args, Command};
 pub use brood_cli::{
     BROOD_HOST_DBUS_ADDRESS_ENV, BROOD_PANE_ID_ENV, BROOD_SESSION_ENV, BROODD_DBUS_ADDRESS_ENV,
     BROODD_DBUS_DESTINATION_ENV, CommandOutcome, CtlArgs, DEFAULT_BROOD_DBUS_NAME, EnterArgs,
-    HideArgs, ListArgs, PlugArgs, RunArgs, SessionArgs, ShowArgs, ShowTarget, SwitchArgs,
+    HideArgs, ListArgs, PlugArgs, RunArgs, SessionArgs, ShowArgs, ShowTarget, SwitchArgs, TestArgs,
 };
 use clap::Parser;
 use tracing::info;
@@ -76,6 +77,9 @@ pub fn run_cli() -> Result<CommandOutcome> {
             .map(|()| CommandOutcome::Completed),
         Command::Ctl(args) => control::send(args)
             .context("send control command")
+            .map(|()| CommandOutcome::Completed),
+        Command::Test(args) => nested_test::run(args)
+            .context("run nested behavior proof")
             .map(|()| CommandOutcome::Completed),
     }
 }

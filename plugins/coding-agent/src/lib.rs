@@ -232,6 +232,20 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
                 ActorCommand::LifecycleComplete(Ok(())),
             ]
         }
+        LifecycleEvent::Start(context) if context.instance_id.starts_with("coding-agent-ui") => {
+            let mut ui = UiState::new();
+            ui.session_id = context.session_id.unwrap_or_default();
+            if let Ok(mut state) = STATE.lock() {
+                *state = RoleState::Ui(ui);
+            }
+            vec![ActorCommand::LifecycleComplete(Ok(()))]
+        }
+        LifecycleEvent::Start(context) if context.instance_id.contains(".coding-agent-") => {
+            if let Ok(mut state) = STATE.lock() {
+                *state = RoleState::Agent(AgentState::new());
+            }
+            vec![ActorCommand::LifecycleComplete(Ok(()))]
+        }
         LifecycleEvent::Start(context) => {
             let session_id = context.session_id.unwrap_or_default();
             set_root_state(false, session_id);
@@ -1183,6 +1197,8 @@ fn draw_text(
             ui.pane,
             text,
             host::TextLayoutOptions {
+                font_intent: host::FontIntent::Ui,
+                font_weight: host::FontWeight::Normal,
                 font_size: size,
                 max_width: width,
                 line_height: size * 1.35,

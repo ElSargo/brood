@@ -36,6 +36,27 @@ pub enum Command {
     Switch(SwitchArgs),
     /// Send a command to a Brood `DBus` control endpoint.
     Ctl(CtlArgs),
+    /// Run a checked-in behavior proof.
+    Test(TestArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct TestArgs {
+    #[command(subcommand)]
+    pub command: Option<TestCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TestCommand {
+    /// Run the external-client nested terminal workload.
+    Nested(NestedTestArgs),
+}
+
+#[derive(Debug, Clone, Parser, Default)]
+pub struct NestedTestArgs {
+    /// Directory which receives screenshots, logs, and structured metrics.
+    #[arg(long = "out-dir", value_name = "DIR")]
+    pub out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Parser, Default)]

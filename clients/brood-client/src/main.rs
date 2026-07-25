@@ -372,6 +372,26 @@ fn main() -> Result<()> {
         .as_mut()
         .map_or(Ok(()), PresentationWasmRuntime::shutdown)
         .context("stop presentation WASM runtime");
+    if let Some(graphics) = application.plugin_graphics.as_ref()
+        && let Ok(metrics) = graphics.diagnostics()
+    {
+        eprintln!(
+            "plugin graphics diagnostics {{\"accepted_packets\":{},\"max_packet_bytes\":{},\"max_packet_commands\":{},\"text_layouts_created\":{},\"text_layouts_dropped\":{},\"live_text_layouts\":{},\"peak_text_layouts\":{}}}",
+            metrics.accepted_packets,
+            metrics.max_packet_bytes,
+            metrics.max_packet_commands,
+            metrics.text_layouts_created,
+            metrics.text_layouts_dropped,
+            metrics.live_text_layouts,
+            metrics.peak_text_layouts,
+        );
+    }
+    eprintln!(
+        "plugin input diagnostics {{\"key_to_present_samples\":{},\"last_key_to_present_us\":{},\"max_key_to_present_us\":{}}}",
+        application.plugin_key_to_present_samples,
+        application.plugin_last_key_to_present_us,
+        application.plugin_max_key_to_present_us,
+    );
     let backend_shutdown_result = application
         .backend_commands
         .as_mut()
@@ -1075,6 +1095,11 @@ struct Application {
     root_layout_actor: Option<ActorIdentity>,
     layout_holders: BTreeMap<LayoutLeaseId, ActorIdentity>,
     layout_publications: BTreeMap<LayoutLeaseId, u64>,
+    pending_plugin_input: Option<Instant>,
+    pending_plugin_scene: bool,
+    plugin_key_to_present_samples: u64,
+    plugin_last_key_to_present_us: u128,
+    plugin_max_key_to_present_us: u128,
 }
 
 impl Application {
@@ -1827,17 +1852,21 @@ impl ApplicationHandler<ClientEvent> for Application {
                 let mut failure = None;
                 if let Some(renderer) = self.renderer.as_mut() {
                     match renderer.refresh_plugin_graphics(pane, sequence) {
-                        Ok(Some(change)) => {
-                            if let Err(error) = dispatch_focus_change(
-                                self.wasm_runtime.as_ref(),
-                                self.input_sender.as_mut(),
-                                change,
-                                self.window_focused,
-                            ) {
+                        Ok(change) => {
+                            if self.pending_plugin_input.is_some() {
+                                self.pending_plugin_scene = true;
+                            }
+                            if let Some(change) = change
+                                && let Err(error) = dispatch_focus_change(
+                                    self.wasm_runtime.as_ref(),
+                                    self.input_sender.as_mut(),
+                                    change,
+                                    self.window_focused,
+                                )
+                            {
                                 failure = Some(error);
                             }
                         }
-                        Ok(None) => {}
                         Err(error) => failure = Some(error),
                     }
                     flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
@@ -1976,10 +2005,17 @@ impl ApplicationHandler<ClientEvent> for Application {
                 body,
             } => {
                 if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
-                    eprintln!(
-                        "session actor message sender={sender} recipient={recipient} body={}",
-                        String::from_utf8_lossy(&body)
-                    );
+                    if body.starts_with(b"BTRM") {
+                        eprintln!(
+                            "session actor message sender={sender} recipient={recipient} terminal_snapshot_bytes={}",
+                            body.len()
+                        );
+                    } else {
+                        eprintln!(
+                            "session actor message sender={sender} recipient={recipient} body={}",
+                            String::from_utf8_lossy(&body)
+                        );
+                    }
                 }
                 let expected_session = self
                     .wasm_runtime
@@ -2387,7 +2423,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 let modifiers = modifier_bits(self.modifiers);
                 if let Some(pane) = renderer.focused_plugin_pane() {
                     let physical_key = event.physical_key.to_scancode().unwrap_or_default();
-                    if let Err(error) = send_presentation_event(
+                    let sent = send_presentation_event(
                         self.wasm_runtime.as_ref(),
                         PresentationEvent::Key {
                             pane,
@@ -2397,8 +2433,14 @@ impl ApplicationHandler<ClientEvent> for Application {
                             repeat: event.repeat,
                             modifiers,
                         },
-                    ) {
+                    );
+                    if let Err(error) = sent {
                         eprintln!("dropped plugin key event: {error:#}");
+                    } else if event.state == ElementState::Pressed
+                        && self.pending_plugin_input.is_none()
+                    {
+                        self.pending_plugin_input = Some(Instant::now());
+                        self.pending_plugin_scene = false;
                     }
                     if event.state == ElementState::Pressed
                         && let Some(text) = event.text.as_ref()
@@ -2440,6 +2482,17 @@ impl ApplicationHandler<ClientEvent> for Application {
                     reconfigure,
                 } => {
                     self.renderer_recoveries = 0;
+                    if self.pending_plugin_scene
+                        && let Some(started) = self.pending_plugin_input.take()
+                    {
+                        let elapsed = started.elapsed().as_micros();
+                        self.plugin_key_to_present_samples =
+                            self.plugin_key_to_present_samples.saturating_add(1);
+                        self.plugin_last_key_to_present_us = elapsed;
+                        self.plugin_max_key_to_present_us =
+                            self.plugin_max_key_to_present_us.max(elapsed);
+                        self.pending_plugin_scene = false;
+                    }
                     if reconfigure {
                         renderer.reconfigure();
                     }

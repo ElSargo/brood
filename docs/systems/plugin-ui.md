@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-25
 ---
 
 # Plugin UI And Pane Rendering
@@ -82,6 +82,13 @@ The actor returns from each dispatch without waiting for I/O, a worker, or GPU
 execution. It may delegate unrelated work and update the pane when a completion
 arrives. Drawing is normal actor output, not a synchronous key decision lane.
 
+The bundled terminal presentation actor follows this lifecycle without a
+terminal-specific pane API. It converts pane size to rows and columns using the
+native monospace cell metrics, sends coalescible resize messages to its session
+actor, maps pane key and text events to terminal input bytes, and renders the
+latest complete terminal revision with ordinary canvas commands and text
+layout handles. The session actor, not the presentation actor, owns the shell.
+
 ## Input And Text Editing
 
 The client converts platform events into a stable pane-local event model and
@@ -138,6 +145,11 @@ The client validates packet bounds, resource ownership, pane authority, input
 revisions, and optional semantic metadata. Diagnostics report rejected or
 superseded UI updates, actor latency, frame/update counters, text failures,
 resource use, and recovery state.
+
+For input-driven panes, diagnostics correlate the first admitted key event with
+the first subsequently refreshed plugin scene that is actually presented. This
+key-to-present measurement covers the asynchronous actor, text-layout, packet,
+and renderer path rather than stopping at mailbox admission.
 
 SDK component correctness is tested at the SDK and workload level rather than by
 adding component rules to the runtime. Real behavior tests should drive pointer,

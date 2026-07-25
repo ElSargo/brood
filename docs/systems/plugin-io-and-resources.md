@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-25
 ---
 
 # Plugin I/O And Resources
@@ -245,10 +245,22 @@ actor. Detached unsupervised daemons are outside the model.
 
 ### PTYs
 
-A PTY spawn adds a master stream, rows and columns, resize, terminal-safe
-interrupt/terminate/kill, exit status, and optional session-scoped reattachment.
-PTY output participates in worker `select!`. The API exposes terminal operations
-rather than arbitrary `ioctl` or unrestricted Unix signal numbers.
+A PTY spawn adds one duplex bounded stream, a child lifecycle handle, validated
+initial rows and columns, and an explicit terminal profile. The standard
+`xterm-256color` profile deterministically supplies `TERM=xterm-256color` and
+`COLORTERM=truecolor`; the child still starts in the actor's resolved session
+working directory. Executable selection remains capability-scoped and
+allowlisted.
+
+Resize is a resource operation on the child handle. The host validates nonzero
+dimensions against its PTY limit, retains only the native master control object
+needed to apply the size, and releases it with the generation-owned child.
+Component and Preview 1 guests have equivalent spawn-profile and resize
+behavior wherever the compatibility contract exposes PTYs.
+
+PTY output participates in worker `select!`. The public surface does not expose
+arbitrary `ioctl`, termios state, descriptors, or unrestricted Unix signal
+numbers.
 
 ### Networking
 
@@ -330,12 +342,17 @@ At minimum, diagnostics expose:
 - outstanding operations and completion depth;
 - notification, pollable, and active wait counts;
 - stream buffers, watch overflows, process state, and resource counts by scope;
+- stream high-water marks and readiness polls that found no data or capacity;
 - rejected, cancelled, stale, coalesced, and dropped work;
 - causal actor generation, worker, operation, and message identity.
 
 Backpressure is explicit. A full queue rejects admission or suspends a worker
 through a pollable; it never silently loses an admitted mailbox message or
 terminal completion.
+
+Retired stream pressure remains visible for the actor generation after the
+stream handle is dropped. This permits shutdown diagnostics to show both zero
+live resources and the high-water/readiness behavior that preceded teardown.
 
 ## SDK Shape
 

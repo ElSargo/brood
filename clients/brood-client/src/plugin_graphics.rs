@@ -12,9 +12,13 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use brood_graphics::{Command, Packet, PacketError};
-use brood_wasm::{PresentationError, PresentationHost, TextLayoutOptions, TextLayoutResult};
+use brood_wasm::{
+    FontIntent, FontWeight, PresentationError, PresentationHost, TextLayoutOptions,
+    TextLayoutResult,
+};
 use cosmic_text::{
-    Attrs, Buffer, CacheKey, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
+    Attrs, Buffer, CacheKey, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping,
+    SwashCache, SwashContent, Weight, Wrap,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -58,6 +62,17 @@ pub struct GraphicsSnapshot {
     pub images: BTreeMap<u64, ImageResource>,
     pub text_layouts: BTreeMap<u64, TextLayoutResource>,
     pub glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GraphicsDiagnostics {
+    pub accepted_packets: u64,
+    pub max_packet_bytes: usize,
+    pub max_packet_commands: usize,
+    pub text_layouts_created: u64,
+    pub text_layouts_dropped: u64,
+    pub live_text_layouts: usize,
+    pub peak_text_layouts: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +162,12 @@ struct GraphicsState {
     panes: BTreeMap<u64, PaneScene>,
     images: BTreeMap<u64, ImageResource>,
     text_layouts: BTreeMap<u64, TextLayoutEntry>,
+    accepted_packets: u64,
+    max_packet_bytes: usize,
+    max_packet_commands: usize,
+    text_layouts_created: u64,
+    text_layouts_dropped: u64,
+    peak_text_layouts: usize,
 }
 
 struct ReferencedResources {
@@ -199,6 +220,22 @@ impl PluginGraphicsBridge {
         };
         drop(state);
         Ok(Some(snapshot))
+    }
+
+    pub fn diagnostics(&self) -> Result<GraphicsDiagnostics> {
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        Ok(GraphicsDiagnostics {
+            accepted_packets: state.accepted_packets,
+            max_packet_bytes: state.max_packet_bytes,
+            max_packet_commands: state.max_packet_commands,
+            text_layouts_created: state.text_layouts_created,
+            text_layouts_dropped: state.text_layouts_dropped,
+            live_text_layouts: state.text_layouts.len(),
+            peak_text_layouts: state.peak_text_layouts,
+        })
     }
 }
 
@@ -318,9 +355,14 @@ impl ActorPresentationHost {
             state
                 .images
                 .retain(|_, resource| resource.pane != self.pane);
+            let previous_text_layouts = state.text_layouts.len();
             state
                 .text_layouts
                 .retain(|_, resource| resource.pane != self.pane);
+            state.text_layouts_dropped = state.text_layouts_dropped.saturating_add(
+                u64::try_from(previous_text_layouts.saturating_sub(state.text_layouts.len()))
+                    .unwrap_or(u64::MAX),
+            );
             state.panes.remove(&self.pane);
         }
     }
@@ -333,6 +375,25 @@ impl ActorPresentationHost {
     }
 }
 
+impl Drop for ActorPresentationHost {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.bridge.shared.lock() {
+            state
+                .images
+                .retain(|_, resource| resource.pane != self.pane);
+            let previous_text_layouts = state.text_layouts.len();
+            state
+                .text_layouts
+                .retain(|_, resource| resource.pane != self.pane);
+            let removed = previous_text_layouts.saturating_sub(state.text_layouts.len());
+            state.text_layouts_dropped = state
+                .text_layouts_dropped
+                .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
+            state.panes.remove(&self.pane);
+        }
+    }
+}
+
 impl PresentationHost for ActorPresentationHost {
     fn submit_draw_packet(
         &self,
@@ -341,6 +402,7 @@ impl PresentationHost for ActorPresentationHost {
         packet: Vec<u8>,
     ) -> Result<u64, PresentationError> {
         self.authorize(actor_generation, pane)?;
+        let packet_bytes = packet.len();
         let packet = Packet::decode(&packet).map_err(|error| match error {
             PacketError::Limit(_) => PresentationError::LimitReached,
             PacketError::Invalid(_) => PresentationError::InvalidPacket,
@@ -376,6 +438,9 @@ impl PresentationHost for ActorPresentationHost {
                 return Err(PresentationError::InvalidPane);
             }
             let resources = referenced_resources(&state, pane, actor_generation, &packet)?;
+            state.accepted_packets = state.accepted_packets.saturating_add(1);
+            state.max_packet_bytes = state.max_packet_bytes.max(packet_bytes);
+            state.max_packet_commands = state.max_packet_commands.max(packet.commands.len());
             state.next_sequence = state
                 .next_sequence
                 .checked_add(1)
@@ -511,6 +576,8 @@ impl PresentationHost for ActorPresentationHost {
                 state: TextLayoutState::Pending,
             },
         );
+        state.text_layouts_created = state.text_layouts_created.saturating_add(1);
+        state.peak_text_layouts = state.peak_text_layouts.max(state.text_layouts.len());
         drop(state);
         let request = GlyphRasterRequest {
             handle,
@@ -575,6 +642,7 @@ impl PresentationHost for ActorPresentationHost {
             state.images.remove(&resource);
         } else if owned_text {
             state.text_layouts.remove(&resource);
+            state.text_layouts_dropped = state.text_layouts_dropped.saturating_add(1);
         } else {
             return Err(PresentationError::InvalidResource);
         }
@@ -636,20 +704,6 @@ fn referenced_resources(
         glyphs,
         ready,
     })
-}
-
-impl Drop for ActorPresentationHost {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.bridge.shared.lock() {
-            state
-                .images
-                .retain(|_, resource| resource.pane != self.pane);
-            state
-                .text_layouts
-                .retain(|_, resource| resource.pane != self.pane);
-            state.panes.remove(&self.pane);
-        }
-    }
 }
 
 fn allocate_resource_handle(
@@ -734,13 +788,34 @@ fn create_text_layout_plan(
 ) -> Result<TextLayoutPlan, PresentationError> {
     let mut buffer = Buffer::new(fonts, Metrics::new(options.font_size, options.line_height));
     buffer.set_size(Some(options.max_width), None);
-    buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
+    let mut features = FontFeatures::new();
+    if options.font_intent == FontIntent::Monospace {
+        features
+            .disable(FeatureTag::KERNING)
+            .disable(FeatureTag::STANDARD_LIGATURES)
+            .disable(FeatureTag::CONTEXTUAL_LIGATURES)
+            .disable(FeatureTag::CONTEXTUAL_ALTERNATES)
+            .disable(FeatureTag::DISCRETIONARY_LIGATURES);
+        buffer.set_wrap(Wrap::None);
+    }
+    let attrs = Attrs::new()
+        .family(match options.font_intent {
+            FontIntent::Ui => Family::SansSerif,
+            FontIntent::Monospace => Family::Monospace,
+        })
+        .weight(match options.font_weight {
+            FontWeight::Normal => Weight::NORMAL,
+            FontWeight::Bold => Weight::BOLD,
+        })
+        .font_features(features);
+    buffer.set_text(text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(fonts, false);
 
     let mut measured_width = 0.0_f32;
     let mut measured_height = 0.0_f32;
     let mut first_baseline = 0.0_f32;
     let mut line_count = 0_u32;
+    let mut cell_width = 0.0_f32;
     for run in buffer.layout_runs() {
         if line_count == 0 {
             first_baseline = run.line_y;
@@ -748,6 +823,9 @@ fn create_text_layout_plan(
         measured_width = measured_width.max(run.line_w);
         measured_height = measured_height.max(run.line_top + run.line_height);
         line_count = line_count.saturating_add(1);
+        if options.font_intent == FontIntent::Monospace && cell_width == 0.0 {
+            cell_width = run.glyphs.first().map_or(0.0, |glyph| glyph.w);
+        }
     }
     let width = measured_width.ceil().max(1.0) as u32;
     let height = measured_height.ceil().max(options.line_height).max(1.0) as u32;
@@ -774,6 +852,8 @@ fn create_text_layout_plan(
             height: measured_height.max(options.line_height),
             first_baseline,
             line_count,
+            cell_width,
+            line_height: options.line_height,
         },
         width,
         height,

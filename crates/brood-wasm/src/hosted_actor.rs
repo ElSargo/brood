@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::{
     ComponentActor, FilesystemWatchStats, PluginLifecycleEvent, Preview1CompatActor,
-    Preview1CompatStats,
+    Preview1CompatStats, RuntimeIoStats,
 };
 
 /// One hosted actor generation, independent of the daemon embedding it.
@@ -41,6 +41,13 @@ impl HostedWasmActor {
         match self {
             Self::Component(actor) => actor.filesystem_watch_stats(),
             Self::Preview1(actor) => actor.filesystem_watch_stats(),
+        }
+    }
+
+    pub fn runtime_io_stats(&self) -> RuntimeIoStats {
+        match self {
+            Self::Component(actor) => actor.runtime_io_stats(),
+            Self::Preview1(actor) => actor.runtime_io_stats(),
         }
     }
 
