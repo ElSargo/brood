@@ -1221,6 +1221,38 @@ impl Brood {
         )
     }
 
+    pub fn hosted_runtime_io_stats(&self) -> brood_wasm::RuntimeIoStats {
+        self.wasm_io_actors.values().fold(
+            brood_wasm::RuntimeIoStats::default(),
+            |mut aggregate, actor| {
+                let next = actor.runtime_io_stats();
+                aggregate.resources = aggregate.resources.saturating_add(next.resources);
+                aggregate.streams = aggregate.streams.saturating_add(next.streams);
+                aggregate.children = aggregate.children.saturating_add(next.children);
+                aggregate.timers = aggregate.timers.saturating_add(next.timers);
+                aggregate.buffered_incoming_bytes = aggregate
+                    .buffered_incoming_bytes
+                    .saturating_add(next.buffered_incoming_bytes);
+                aggregate.buffered_outgoing_bytes = aggregate
+                    .buffered_outgoing_bytes
+                    .saturating_add(next.buffered_outgoing_bytes);
+                aggregate.max_stream_incoming_bytes = aggregate
+                    .max_stream_incoming_bytes
+                    .max(next.max_stream_incoming_bytes);
+                aggregate.max_stream_outgoing_bytes = aggregate
+                    .max_stream_outgoing_bytes
+                    .max(next.max_stream_outgoing_bytes);
+                aggregate.stream_read_would_block = aggregate
+                    .stream_read_would_block
+                    .saturating_add(next.stream_read_would_block);
+                aggregate.stream_write_would_block = aggregate
+                    .stream_write_would_block
+                    .saturating_add(next.stream_write_would_block);
+                aggregate
+            },
+        )
+    }
+
     /// Route a byte-oriented policy message through the shared public actor
     /// namespace. Hosted Component/Preview actors carry sender metadata in
     /// their mailbox ABI; legacy actors retain their older byte-only mailbox.
@@ -2138,18 +2170,40 @@ impl Brood {
     }
 
     fn apply_control_environment(&mut self, child: &mut Command, session: SurfaceSessionId) {
+        child.envs(self.session_process_environment(session));
+    }
+
+    fn session_process_environment(
+        &mut self,
+        session: SurfaceSessionId,
+    ) -> BTreeMap<OsString, OsString> {
+        let mut environment = BTreeMap::from([
+            (OsString::from("WAYLAND_DISPLAY"), self.socket_name.clone()),
+            (
+                OsString::from(BROOD_SURFACE_SESSION_ID_ENV),
+                OsString::from(session.raw().to_string()),
+            ),
+        ]);
         if let Some(session) = self.brood_session.as_deref() {
-            child.env(BROOD_SESSION_ENV, session);
+            environment.insert(OsString::from(BROOD_SESSION_ENV), OsString::from(session));
         }
         if let Some(destination) = self.brood_dbus_destination.as_deref() {
-            child.env(BROODD_DBUS_DESTINATION_ENV, destination);
+            environment.insert(
+                OsString::from(BROODD_DBUS_DESTINATION_ENV),
+                OsString::from(destination),
+            );
         }
         if let Some(address) = self.brood_dbus_address.clone() {
-            child.env(BROODD_DBUS_ADDRESS_ENV, &address);
+            environment.insert(
+                OsString::from(BROODD_DBUS_ADDRESS_ENV),
+                OsString::from(&address),
+            );
             match self.ensure_session_dbus_bus(session) {
                 Ok(session_bus_address) => {
-                    child.env("DBUS_SESSION_BUS_ADDRESS", session_bus_address);
-                    child.env(BROOD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+                    environment.insert(
+                        OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                        OsString::from(session_bus_address),
+                    );
                 }
                 Err(err) => {
                     warn!(
@@ -2157,7 +2211,10 @@ impl Brood {
                         session = session.raw(),
                         "failed to start session DBus bus; managed client inherits Brood control bus"
                     );
-                    child.env("DBUS_SESSION_BUS_ADDRESS", &address);
+                    environment.insert(
+                        OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                        OsString::from(address),
+                    );
                 }
             }
         } else {
@@ -2165,6 +2222,7 @@ impl Brood {
                 "managed client inherits host DBUS_SESSION_BUS_ADDRESS; DBus policy modes off/proxy/private are not enforced yet"
             );
         }
+        environment
     }
 
     fn apply_session_working_directory(&self, child: &mut Command, session: SurfaceSessionId) {
@@ -4166,11 +4224,17 @@ impl Brood {
                 None
             };
         let runtime_io = crate::config::runtime_io_capabilities(capabilities)?;
+        let lifecycle = ConfiguredPluginLifecycle {
+            start_timeout: Duration::from_secs(2),
+            stop_timeout: Duration::from_secs(2),
+            data: BTreeMap::new(),
+        };
+        let lifecycle_request = (lifecycle.clone(), brood_wasm::PluginStartReason::Initial);
         self.replace_wasm_component_actor(
             &actor_id,
             &path,
             filesystem.as_ref(),
-            None,
+            Some(&lifecycle_request),
             ConfiguredPluginResources::default(),
             runtime_io,
             false,
@@ -4184,8 +4248,10 @@ impl Brood {
             .context("init child did not produce a hosted actor")?
             .generation();
         if let Some(init) = self.realm_inits.get_mut(&session) {
-            init.children.insert(id.to_string(), actor_id);
+            init.children.insert(id.to_string(), actor_id.clone());
         }
+        self.configured_plugin_lifecycles
+            .insert(actor_id, lifecycle);
         Ok(generation)
     }
 
@@ -4205,7 +4271,14 @@ impl Brood {
             );
             return;
         };
-        let result = self.stop_hosted_io_actor(&actor_id);
+        let lifecycle_result = self.stop_hosted_io_actor_lifecycle(
+            &actor_id,
+            brood_wasm::PluginStopReason::Shutdown,
+            None,
+        );
+        let stop_result = self.stop_hosted_io_actor(&actor_id);
+        self.configured_plugin_lifecycles.remove(&actor_id);
+        let result = lifecycle_result.and(stop_result);
         if let Some(init) = self.realm_inits.get_mut(&session) {
             init.children.remove(&id);
         }
@@ -4678,6 +4751,13 @@ impl Brood {
             |grant| grant.host_path.clone(),
         );
         let writable = filesystem.is_some_and(|grant| grant.writable);
+        let working_directory = lifecycle_session
+            .and_then(|session| self.sessions.working_directory(session))
+            .map(PathBuf::from)
+            .or_else(|| filesystem.map(|grant| grant.host_path.clone()));
+        let environment = lifecycle_session
+            .map(|session| self.session_process_environment(session))
+            .unwrap_or_default();
         let actor = runtime.block_on(brood_wasm::ComponentActor::load(
             path,
             brood_wasm::ComponentActorConfig {
@@ -4693,7 +4773,8 @@ impl Brood {
                 max_filesystem_watch_events: resources.filesystem_watch_events,
                 runtime_io: brood_wasm::RuntimeIoConfig {
                     capabilities: runtime_io,
-                    working_directory: filesystem.map(|grant| grant.host_path.clone()),
+                    working_directory,
+                    environment,
                     ..brood_wasm::RuntimeIoConfig::default()
                 },
                 actor_management,

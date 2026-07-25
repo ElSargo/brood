@@ -147,6 +147,9 @@ fn create_title_layout(pane: u64, width: f32) -> Result<u64, String> {
         pane,
         "Canvas packets, native text — ffi العربية 日本語\nMove, click, scroll, or type to redraw",
         host::TextLayoutOptions {
+            font_intent: host::FontIntent::Ui,
+            font_weight: host::FontWeight::Normal,
+            font_style: host::FontStyle::Normal,
             font_size: 22.0,
             max_width: (width - 48.0).max(120.0),
             line_height: 30.0,

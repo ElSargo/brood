@@ -5,7 +5,7 @@ security-boundary: mixed
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-07-25
 ---
 
 # Presentation Client Architecture
@@ -117,6 +117,11 @@ subscriptions and transport resources. It does not close window producers. A
 replacement client receives a complete inventory snapshot and current window
 content, then creates fresh presentation-actor and layout-lease generations.
 
+The same rule applies to a terminal presentation: disconnect destroys its
+client-local canvas, text resources, and presentation actor, but not the shell
+PTY owned by the session actor. A replacement terminal presentation attaches to
+that actor and receives a current revision before accepting pane input.
+
 Observers may mirror inventory and subscribe to frames without gaining input or
 configuration authority.
 
@@ -178,6 +183,12 @@ Physical input is client-owned. Reserved recovery behavior runs first, followed
 by the current synchronous key policy, temporary input capture, and focused
 pane delivery.
 
+Before focused-pane delivery, the client normalizes named keys and modifiers
+into the stable plugin event contract. Ctrl, Alt, Shift, and Super use bits 1,
+2, 4, and 8 respectively; this is deliberately the same modifier convention as
+the actor key-policy ABI. Printable text remains a separate committed-text
+event.
+
 The policy returns a bounded decision and ordinary mailbox-message batch.
 Long-running or stateful work continues in actors. A managed target crosses the
 protocol only after client hit testing, with a pane identity and pane-local
@@ -196,6 +207,24 @@ lifecycle are local to the client.
 Backend file, process, network, PTY, timer, stream, and durable actor operations
 are asynchronous remote capabilities. Client-local UI and rendering do not
 require a backend round trip.
+
+The first-party terminal deliberately splits across that boundary. Its session
+actor owns the PTY and terminal state; its presentation actor owns input routing
+and rendering. Neither side gains compositor, platform-window, or WGPU
+internals.
+
+See [[terminal-plugin]].
+
+### Current ownership limit
+
+The bundled vertical slice survives presentation disconnect and replacement,
+because the PTY belongs to the session-side actor generation. PTY resources are
+not yet promoted to a separately supervised session-scoped owner, so replacing
+or stopping that session actor generation still tears down its shell. Durable
+reattachment across session-actor replacement requires the explicit
+session-resource promotion described in [[plugin-io-and-resources]]; the public
+PTY and snapshot interfaces are shaped so that promotion does not move terminal
+emulation into the host.
 
 ## Rendering
 

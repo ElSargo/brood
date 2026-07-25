@@ -974,6 +974,9 @@ fn add_text(
         state.pane,
         text,
         host::TextLayoutOptions {
+            font_intent: host::FontIntent::Ui,
+            font_weight: host::FontWeight::Normal,
+            font_style: host::FontStyle::Normal,
             font_size: size,
             max_width: max_width.max(1.0),
             line_height: size + 4.0,

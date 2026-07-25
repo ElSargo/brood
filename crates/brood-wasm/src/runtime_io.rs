@@ -5,8 +5,9 @@
 //! while workers project the notification into their ordinary poll path.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
+    ffi::OsString,
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -29,6 +30,37 @@ use tokio::{
 use crate::{CoordinationHub, NotificationError, NotificationId};
 
 static NEXT_RESOURCE_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_PTY_DIMENSION: u16 = 4_096;
+
+/// Host-controlled terminal environment selected for one PTY child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalProfile {
+    /// A true-color terminal compatible with the common xterm-256color terminfo.
+    Xterm256Color,
+}
+
+/// Validated terminal creation parameters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtySpawnOptions {
+    pub rows: u16,
+    pub cols: u16,
+    pub terminal_profile: TerminalProfile,
+}
+
+/// Read-only diagnostics for one actor generation's native runtime resources.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeIoStats {
+    pub resources: usize,
+    pub streams: usize,
+    pub children: usize,
+    pub timers: usize,
+    pub buffered_incoming_bytes: usize,
+    pub buffered_outgoing_bytes: usize,
+    pub max_stream_incoming_bytes: usize,
+    pub max_stream_outgoing_bytes: usize,
+    pub stream_read_would_block: u64,
+    pub stream_write_would_block: u64,
+}
 
 /// Runtime authority granted to one actor generation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -48,6 +80,9 @@ pub struct RuntimeIoConfig {
     pub capabilities: RuntimeIoCapabilities,
     /// Host working directory inherited by admitted subprocesses.
     pub working_directory: Option<PathBuf>,
+    /// Host-controlled session environment overrides inherited by admitted
+    /// subprocesses. Guests cannot add or replace entries at spawn time.
+    pub environment: BTreeMap<OsString, OsString>,
     /// Maximum streams, children, and timers owned at once.
     pub max_resources: usize,
     /// Maximum live child processes.
@@ -65,6 +100,7 @@ impl Default for RuntimeIoConfig {
         Self {
             capabilities: RuntimeIoCapabilities::default(),
             working_directory: None,
+            environment: BTreeMap::new(),
             max_resources: 64,
             max_children: 8,
             max_timers: 32,
@@ -166,6 +202,10 @@ struct StreamInner {
     max_write_bytes: usize,
     alive: AtomicBool,
     signal_generation: AtomicU64,
+    max_incoming_bytes: AtomicUsize,
+    max_outgoing_bytes: AtomicUsize,
+    read_would_block: AtomicU64,
+    write_would_block: AtomicU64,
     state: Mutex<StreamState>,
     changed: Condvar,
     async_changed: Notify,
@@ -197,6 +237,9 @@ struct ChildInner {
     shutdown: Notify,
     exited: Notify,
     status: Mutex<ChildStatus>,
+    /// The minimum native object required for safe PTY resize. It remains
+    /// generation-owned and is released with the child handle.
+    pty_control: Mutex<Option<Box<dyn MasterPty + Send>>>,
 }
 
 /// Generation-owned timer handle.
@@ -235,6 +278,10 @@ struct HubInner {
     resources: AtomicUsize,
     children_count: AtomicUsize,
     timers_count: AtomicUsize,
+    retired_max_stream_incoming_bytes: AtomicUsize,
+    retired_max_stream_outgoing_bytes: AtomicUsize,
+    retired_stream_read_would_block: AtomicU64,
+    retired_stream_write_would_block: AtomicU64,
     streams: Mutex<HashMap<u64, Arc<StreamInner>>>,
     children: Mutex<HashMap<u64, Arc<ChildInner>>>,
     timers: Mutex<HashMap<u64, Arc<TimerInner>>>,
@@ -354,12 +401,69 @@ impl RuntimeIoHub {
                 resources: AtomicUsize::new(0),
                 children_count: AtomicUsize::new(0),
                 timers_count: AtomicUsize::new(0),
+                retired_max_stream_incoming_bytes: AtomicUsize::new(0),
+                retired_max_stream_outgoing_bytes: AtomicUsize::new(0),
+                retired_stream_read_would_block: AtomicU64::new(0),
+                retired_stream_write_would_block: AtomicU64::new(0),
                 streams: Mutex::new(HashMap::new()),
                 children: Mutex::new(HashMap::new()),
                 timers: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Snapshot native resource use and bounded-stream pressure.
+    pub fn stats(&self) -> RuntimeIoStats {
+        let mut stats = RuntimeIoStats {
+            resources: self.inner.resources.load(Ordering::Acquire),
+            children: self.inner.children_count.load(Ordering::Acquire),
+            timers: self.inner.timers_count.load(Ordering::Acquire),
+            max_stream_incoming_bytes: self
+                .inner
+                .retired_max_stream_incoming_bytes
+                .load(Ordering::Acquire),
+            max_stream_outgoing_bytes: self
+                .inner
+                .retired_max_stream_outgoing_bytes
+                .load(Ordering::Acquire),
+            stream_read_would_block: self
+                .inner
+                .retired_stream_read_would_block
+                .load(Ordering::Acquire),
+            stream_write_would_block: self
+                .inner
+                .retired_stream_write_would_block
+                .load(Ordering::Acquire),
+            ..RuntimeIoStats::default()
+        };
+        let Ok(streams) = self.inner.streams.lock() else {
+            return stats;
+        };
+        stats.streams = streams.len();
+        for stream in streams.values() {
+            stats.max_stream_incoming_bytes = stats
+                .max_stream_incoming_bytes
+                .max(stream.max_incoming_bytes.load(Ordering::Acquire));
+            stats.max_stream_outgoing_bytes = stats
+                .max_stream_outgoing_bytes
+                .max(stream.max_outgoing_bytes.load(Ordering::Acquire));
+            stats.stream_read_would_block = stats
+                .stream_read_would_block
+                .saturating_add(stream.read_would_block.load(Ordering::Acquire));
+            stats.stream_write_would_block = stats
+                .stream_write_would_block
+                .saturating_add(stream.write_would_block.load(Ordering::Acquire));
+            if let Ok(state) = stream.state.lock() {
+                stats.buffered_incoming_bytes = stats
+                    .buffered_incoming_bytes
+                    .saturating_add(state.incoming.len());
+                stats.buffered_outgoing_bytes = stats
+                    .buffered_outgoing_bytes
+                    .saturating_add(state.outgoing.len());
+            }
+        }
+        stats
     }
 
     /// Spawn an allowlisted command with bounded pipe streams.
@@ -413,6 +517,7 @@ impl RuntimeIoHub {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.envs(&self.inner.config.environment);
         if let Some(directory) = &self.inner.config.working_directory {
             command.current_dir(directory);
         }
@@ -454,8 +559,7 @@ impl RuntimeIoHub {
         &self,
         command: &str,
         arguments: &[String],
-        rows: u16,
-        cols: u16,
+        options: PtySpawnOptions,
     ) -> Result<PtyIo, RuntimeIoError> {
         let _admission = self
             .inner
@@ -466,9 +570,7 @@ impl RuntimeIoHub {
         if !self.inner.config.capabilities.allow_pty {
             return Err(RuntimeIoError::NotPermitted);
         }
-        if rows == 0 || cols == 0 {
-            return Err(RuntimeIoError::InvalidArgument);
-        }
+        validate_pty_dimensions(options.rows, options.cols)?;
         let resolved = self.resolve_command(command)?;
         let cwd = self.inner.config.working_directory.clone().map_or_else(
             || env::current_dir().map_err(|_error| RuntimeIoError::HostFailure),
@@ -490,8 +592,8 @@ impl RuntimeIoHub {
             }
         };
         let pair = match native_pty_system().openpty(PtySize {
-            rows,
-            cols,
+            rows: options.rows,
+            cols: options.cols,
             pixel_width: 0,
             pixel_height: 0,
         }) {
@@ -506,6 +608,21 @@ impl RuntimeIoHub {
         // `portable-pty` otherwise falls back to `$HOME`, unlike
         // `std::process::Command`, which inherits the caller's cwd.
         builder.cwd(cwd);
+        for (key, value) in &self.inner.config.environment {
+            builder.env(key, value);
+        }
+        match options.terminal_profile {
+            TerminalProfile::Xterm256Color => {
+                // A terminal profile must not inherit process-wide color
+                // suppression from the service manager or launcher. Programs
+                // such as lazygit honor NO_COLOR even when stdout is a PTY.
+                for variable in ["NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"] {
+                    builder.env_remove(variable);
+                }
+                builder.env("TERM", "xterm-256color");
+                builder.env("COLORTERM", "truecolor");
+            }
+        }
         for argument in arguments {
             builder.arg(argument);
         }
@@ -543,11 +660,41 @@ impl RuntimeIoHub {
         if let Ok(mut linked_child) = terminal.inner.linked_child.lock() {
             *linked_child = Some(Arc::downgrade(&child_state));
         }
-        let child_handle = self.monitor_pty_child(child, pair.master, child_state)?;
+        child_state
+            .pty_control
+            .lock()
+            .map_err(|_poisoned| RuntimeIoError::HostFailure)?
+            .replace(pair.master);
+        let child_handle = self.monitor_pty_child(child, child_state)?;
         Ok(PtyIo {
             child: child_handle,
             terminal,
         })
+    }
+
+    /// Resize one live PTY without exposing arbitrary ioctl access.
+    pub fn resize_pty(&self, child: u64, rows: u16, cols: u16) -> Result<(), RuntimeIoError> {
+        validate_pty_dimensions(rows, cols)?;
+        let child = self.child(child)?;
+        if child.status()? != ChildStatus::Running {
+            return Err(RuntimeIoError::Closed);
+        }
+        let control = child
+            .inner
+            .pty_control
+            .lock()
+            .map_err(|_poisoned| RuntimeIoError::StaleHandle)?;
+        let resize = control
+            .as_ref()
+            .ok_or(RuntimeIoError::InvalidArgument)?
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        drop(control);
+        resize.map_err(|_error| RuntimeIoError::HostFailure)
     }
 
     /// Connect one bounded stream to a numeric loopback socket address.
@@ -720,6 +867,7 @@ impl RuntimeIoHub {
             .ok_or(RuntimeIoError::StaleHandle)?;
         let _cleanup = CleanupGuard::new(&self.inner);
         drop(admission);
+        self.record_retired_stream_stats(&stream);
         stream.stop();
         let linked_child = stream
             .linked_child
@@ -919,6 +1067,25 @@ impl RuntimeIoHub {
         }
     }
 
+    fn record_retired_stream_stats(&self, stream: &StreamInner) {
+        self.inner.retired_max_stream_incoming_bytes.fetch_max(
+            stream.max_incoming_bytes.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+        self.inner.retired_max_stream_outgoing_bytes.fetch_max(
+            stream.max_outgoing_bytes.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+        self.inner.retired_stream_read_would_block.fetch_add(
+            stream.read_would_block.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+        self.inner.retired_stream_write_would_block.fetch_add(
+            stream.write_would_block.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+    }
+
     fn create_stream_reserved(&self) -> Result<ByteStream, RuntimeIoError> {
         let notification = self
             .inner
@@ -934,6 +1101,10 @@ impl RuntimeIoHub {
             max_write_bytes: self.inner.config.max_write_bytes,
             alive: AtomicBool::new(true),
             signal_generation: AtomicU64::new(0),
+            max_incoming_bytes: AtomicUsize::new(0),
+            max_outgoing_bytes: AtomicUsize::new(0),
+            read_would_block: AtomicU64::new(0),
+            write_would_block: AtomicU64::new(0),
             state: Mutex::new(StreamState::default()),
             changed: Condvar::new(),
             async_changed: Notify::new(),
@@ -965,7 +1136,6 @@ impl RuntimeIoHub {
     fn monitor_pty_child(
         &self,
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
-        master: Box<dyn MasterPty + Send>,
         state: Arc<ChildInner>,
     ) -> Result<ChildHandle, RuntimeIoError> {
         let monitor = Arc::clone(&state);
@@ -987,7 +1157,6 @@ impl RuntimeIoHub {
                     .wait()
                     .ok()
                     .and_then(|status| status.exit_code().try_into().ok());
-                drop(master);
                 monitor.complete(status);
             }),
         )?;
@@ -1012,6 +1181,7 @@ impl RuntimeIoHub {
             shutdown: Notify::new(),
             exited: Notify::new(),
             status: Mutex::new(ChildStatus::Running),
+            pty_control: Mutex::new(None),
         });
         self.inner
             .children
@@ -1232,6 +1402,9 @@ impl ByteStream {
             .lock()
             .map_err(|_poisoned| RuntimeIoError::StaleHandle)?;
         if state.incoming.is_empty() {
+            if !state.read_eof {
+                self.inner.read_would_block.fetch_add(1, Ordering::AcqRel);
+            }
             return Ok(if state.read_eof {
                 StreamRead::Eof
             } else {
@@ -1263,10 +1436,14 @@ impl ByteStream {
         }
         let available = self.inner.capacity.saturating_sub(state.outgoing.len());
         if available == 0 {
+            self.inner.write_would_block.fetch_add(1, Ordering::AcqRel);
             return Err(RuntimeIoError::WouldBlock);
         }
         let count = available.min(bytes.len());
         state.outgoing.extend(bytes.iter().copied().take(count));
+        self.inner
+            .max_outgoing_bytes
+            .fetch_max(state.outgoing.len(), Ordering::AcqRel);
         drop(state);
         self.inner.changed.notify_all();
         self.inner.async_changed.notify_waiters();
@@ -1322,6 +1499,8 @@ impl StreamInner {
                 return;
             };
             state.incoming.extend(chunk.iter().copied());
+            self.max_incoming_bytes
+                .fetch_max(state.incoming.len(), Ordering::AcqRel);
             offset += count;
             drop(state);
             self.signal();
@@ -1342,6 +1521,8 @@ impl StreamInner {
                     return;
                 };
                 state.incoming.extend(chunk.iter().copied());
+                self.max_incoming_bytes
+                    .fetch_max(state.incoming.len(), Ordering::AcqRel);
                 count
             };
             if count == 0 {
@@ -1527,6 +1708,13 @@ fn reserve_counter(
         })
         .map(|_previous| ())
         .map_err(|_current| RuntimeIoError::LimitReached)
+}
+
+const fn validate_pty_dimensions(rows: u16, cols: u16) -> Result<(), RuntimeIoError> {
+    if rows == 0 || cols == 0 || rows > MAX_PTY_DIMENSION || cols > MAX_PTY_DIMENSION {
+        return Err(RuntimeIoError::InvalidArgument);
+    }
+    Ok(())
 }
 
 fn allocate_resource_id() -> Result<u64, RuntimeIoError> {

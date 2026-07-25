@@ -147,19 +147,32 @@ static uint32_t monotonic_milliseconds(void) {
 }
 
 int main(int argc, char **argv) {
-    bool ctrl_only = false;
-    bool plain = false;
+    enum modifier_mode {
+        MODIFIERS_CTRL_ALT,
+        MODIFIERS_CTRL,
+        MODIFIERS_SHIFT,
+        MODIFIERS_NONE,
+    } modifier_mode = MODIFIERS_CTRL_ALT;
     const char *keycode = NULL;
     if (argc == 2) {
         keycode = argv[1];
     } else if (argc == 3 && strcmp(argv[1], "--ctrl-only") == 0) {
-        ctrl_only = true;
+        modifier_mode = MODIFIERS_CTRL;
+        keycode = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "--shift-only") == 0) {
+        modifier_mode = MODIFIERS_SHIFT;
+        keycode = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "--none") == 0) {
+        modifier_mode = MODIFIERS_NONE;
         keycode = argv[2];
     } else if (argc == 3 && strcmp(argv[1], "--plain") == 0) {
-        plain = true;
+        modifier_mode = MODIFIERS_NONE;
         keycode = argv[2];
     } else {
-        fail("usage: virtual-keyboard-key [--ctrl-only|--plain] <linux-evdev-keycode>");
+        fail(
+            "usage: virtual-keyboard-key "
+            "[--ctrl-only|--shift-only|--none|--plain] <linux-evdev-keycode>"
+        );
     }
     char *end = NULL;
     unsigned long parsed = strtoul(keycode, &end, 10);
@@ -218,11 +231,14 @@ int main(int argc, char **argv) {
     }
     usleep(10000);
     uint32_t modifiers = 0;
-    if (!plain) {
+    if (modifier_mode == MODIFIERS_CTRL_ALT || modifier_mode == MODIFIERS_CTRL) {
         modifiers = modifier_mask(keymap, XKB_MOD_NAME_CTRL);
-        if (!ctrl_only) {
-            modifiers |= modifier_mask(keymap, XKB_MOD_NAME_ALT);
-        }
+    }
+    if (modifier_mode == MODIFIERS_CTRL_ALT) {
+        modifiers |= modifier_mask(keymap, XKB_MOD_NAME_ALT);
+    }
+    if (modifier_mode == MODIFIERS_SHIFT) {
+        modifiers = modifier_mask(keymap, XKB_MOD_NAME_SHIFT);
     }
     uint32_t time = monotonic_milliseconds();
     wl_proxy_marshal_flags(

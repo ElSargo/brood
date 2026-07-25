@@ -37,6 +37,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[systems/plugin-ui]] describes guest-side SDK components, pane input, native chrome, and canvas rendering.
 - [[systems/plugin-graphics]] specifies the base canvas draw-packet, native text, resource, submission, and replay contract.
 - [[systems/plugin-advanced-graphics]] records the separate future protocol direction for user geometry, shaders, pipelines, and other GPU-style facilities.
+- [[systems/terminal-plugin]] defines the bundled first-party terminal product, its guest-owned architecture, and the reusable host gaps exposed by the workload.
 
 ## Core Concepts
 

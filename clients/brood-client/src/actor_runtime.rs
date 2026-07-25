@@ -421,6 +421,11 @@ impl PresentationWasmRuntime {
                         worker.raw(),
                         output.len()
                     );
+                    if output.first() == Some(&b'{')
+                        && let Ok(metrics) = std::str::from_utf8(&output)
+                    {
+                        eprintln!("presentation plugin worker metrics actor={actor_id} {metrics}");
+                    }
                 }
                 ComponentActorEvent::WorkerCancelled { worker } => {
                     eprintln!(
@@ -590,6 +595,34 @@ impl PresentationWasmRuntime {
             .context("init child did not produce a hosted actor")?
             .actor
             .generation();
+        let lifecycle = PluginLifecycleEvent::Start(PluginStartContext {
+            instance_id: id.to_string(),
+            generation,
+            reason: PluginStartReason::Initial,
+            session_id: self.bound_session_id,
+            workspace_root: ".".to_string(),
+            data: vec![PluginLifecycleEntry {
+                key: "realm".to_string(),
+                value: "client".to_string(),
+            }],
+        });
+        if let Err(error) = self.executor.block_on(
+            self.actors
+                .get(id)
+                .context("init child did not produce a hosted actor")?
+                .actor
+                .lifecycle(lifecycle, Duration::from_secs(2)),
+        ) {
+            if let Some(mut actor) = self.actors.remove(id)
+                && let Err(shutdown_error) = self.executor.block_on(actor.actor.shutdown())
+            {
+                eprintln!(
+                    "failed to shut down init child after lifecycle failure id={id}: \
+                     {shutdown_error:#}"
+                );
+            }
+            return Err(error).context("init child start lifecycle failed");
+        }
         if let Some(init) = self.init.as_mut() {
             init.children.insert(id.to_string());
         }
@@ -610,7 +643,17 @@ impl PresentationWasmRuntime {
             || Err(anyhow::anyhow!("init child actor is unavailable")),
             |mut actor| {
                 removed_pane = (actor.pane != 0).then_some(actor.pane);
-                self.executor.block_on(actor.actor.shutdown())
+                let lifecycle = PluginLifecycleEvent::Stop(brood_wasm::PluginStopContext {
+                    instance_id: id.clone(),
+                    generation: actor.actor.generation(),
+                    reason: brood_wasm::PluginStopReason::Shutdown,
+                    next_generation: None,
+                });
+                let lifecycle_result = self
+                    .executor
+                    .block_on(actor.actor.lifecycle(lifecycle, Duration::from_secs(2)));
+                let shutdown_result = self.executor.block_on(actor.actor.shutdown());
+                lifecycle_result.and(shutdown_result)
             },
         );
         if let Some(init) = self.init.as_mut() {

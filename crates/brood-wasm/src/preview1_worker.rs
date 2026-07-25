@@ -68,8 +68,8 @@ use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
 use crate::runtime_io::{
-    ChildStatus, RuntimeIoCapabilities, RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, StreamRead,
-    TimerStatus,
+    ChildStatus, PtySpawnOptions, RuntimeIoCapabilities, RuntimeIoConfig, RuntimeIoError,
+    RuntimeIoHub, StreamRead, TerminalProfile, TimerStatus,
 };
 
 #[allow(
@@ -590,15 +590,28 @@ impl host_abi::brood_preview1::BroodPreview1 for Preview1Host {
         arguments_len: u32,
         rows: u32,
         cols: u32,
+        terminal_profile: u32,
     ) -> Result<u64, host_abi::types::Errno> {
         self.ensure_worker()?;
         let command = read_guest_string(memory, command, command_len)?;
         let arguments = read_guest_arguments(memory, arguments, arguments_len)?;
         let rows = u16::try_from(rows).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
         let cols = u16::try_from(cols).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let terminal_profile = match terminal_profile {
+            0 => TerminalProfile::Xterm256Color,
+            _ => return Err(host_abi::types::Errno::Invalid),
+        };
         let pty = self
             .runtime_io
-            .spawn_pty(&command, &arguments, rows, cols)
+            .spawn_pty(
+                &command,
+                &arguments,
+                PtySpawnOptions {
+                    rows,
+                    cols,
+                    terminal_profile,
+                },
+            )
             .map_err(map_runtime_io_error)?;
         let child = pty.child.raw();
         self.runtime_children
@@ -606,6 +619,21 @@ impl host_abi::brood_preview1::BroodPreview1 for Preview1Host {
             .map_err(|_poisoned| host_abi::types::Errno::Unavailable)?
             .insert(child, [0, 0, 0, pty.terminal.raw()]);
         Ok(child)
+    }
+
+    fn pty_resize(
+        &mut self,
+        _memory: &mut wiggle::GuestMemory<'_>,
+        child: u64,
+        rows: u32,
+        cols: u32,
+    ) -> Result<(), host_abi::types::Errno> {
+        self.ensure_worker()?;
+        let rows = u16::try_from(rows).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        let cols = u16::try_from(cols).map_err(|_overflow| host_abi::types::Errno::Invalid)?;
+        self.runtime_io
+            .resize_pty(child, rows, cols)
+            .map_err(map_runtime_io_error)
     }
 
     async fn worker_loopback_connect(
@@ -1907,6 +1935,10 @@ impl Preview1WorkerRuntime {
         self.filesystem_watches.stats()
     }
 
+    pub fn runtime_io_stats(&self) -> crate::runtime_io::RuntimeIoStats {
+        self.runtime_io.stats()
+    }
+
     fn try_take_terminal_error(&self) -> Option<String> {
         self.terminal_error.lock().ok()?.take()
     }
@@ -2114,6 +2146,10 @@ impl Preview1CompatActor {
 
     pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
         self.runtime.filesystem_watch_stats()
+    }
+
+    pub fn runtime_io_stats(&self) -> crate::runtime_io::RuntimeIoStats {
+        self.runtime.runtime_io_stats()
     }
 
     pub const fn generation(&self) -> u64 {

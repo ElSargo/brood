@@ -63,6 +63,8 @@ let
         "${src}/plugins/picker/Cargo.lock"
         "${src}/plugins/session-switcher/Cargo.lock"
         "${src}/plugins/worktree-manager/Cargo.lock"
+        "${src}/plugins/terminal-session/Cargo.lock"
+        "${src}/plugins/terminal-ui/Cargo.lock"
         "${src}/plugins/workspace-file-log/Cargo.lock"
       ];
     };
@@ -358,6 +360,36 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/terminal-session/Cargo.toml ]]; then
+        component_core="plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.wasm"
+        component_output="plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR terminal session core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+        install -D "$component_output" \
+          examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm
+      fi
+
+      if [[ -f plugins/terminal-ui/Cargo.toml ]]; then
+        component_core="plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.wasm"
+        component_output="plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR terminal UI core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+        install -D "$component_output" \
+          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm
+      fi
+
       runHook postBuild
     '';
 
@@ -396,6 +428,12 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"
