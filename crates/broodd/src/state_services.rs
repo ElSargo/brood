@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use brood_cli::project::{ProjectContext, discover_project};
 use brood_wasm::{TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessRuntime};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
@@ -25,6 +26,7 @@ pub struct SurfaceSessionService {
     sessions: Vec<SurfaceSessionId>,
     names: BTreeMap<SurfaceSessionId, String>,
     working_directories: BTreeMap<SurfaceSessionId, PathBuf>,
+    projects: BTreeMap<SurfaceSessionId, ProjectContext>,
     directory_sessions: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
     directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
     surface_assignments: Vec<(WlSurface, SurfaceSessionId)>,
@@ -59,6 +61,7 @@ impl std::error::Error for SessionServiceError {}
 impl SurfaceSessionService {
     pub(crate) fn new(initial_directory: PathBuf, initial_name: String) -> Self {
         let initial = SurfaceSessionId::from_raw(1);
+        let initial_project = discover_project(&initial_directory);
         Self {
             active: Some(initial),
             last_interacted: initial,
@@ -67,6 +70,7 @@ impl SurfaceSessionService {
             sessions: vec![initial],
             names: std::iter::once((initial, initial_name)).collect(),
             working_directories: std::iter::once((initial, initial_directory)).collect(),
+            projects: std::iter::once((initial, initial_project)).collect(),
             directory_sessions: BTreeMap::new(),
             directory_defaults: BTreeMap::new(),
             surface_assignments: Vec::new(),
@@ -117,6 +121,7 @@ impl SurfaceSessionService {
         self.sessions.clear();
         self.names.clear();
         self.working_directories.clear();
+        self.projects.clear();
         self.directory_sessions.clear();
         self.directory_defaults.clear();
         Ok(())
@@ -127,6 +132,7 @@ impl SurfaceSessionService {
         name: String,
         directory: PathBuf,
     ) -> Result<SurfaceSessionId, SessionServiceError> {
+        let project = discover_project(&directory);
         let session = SurfaceSessionId::from_raw(self.next_id);
         self.next_id = self
             .next_id
@@ -135,6 +141,7 @@ impl SurfaceSessionService {
         self.sessions.push(session);
         self.names.insert(session, name);
         self.working_directories.insert(session, directory);
+        self.projects.insert(session, project);
         self.activate_created(session);
         Ok(session)
     }
@@ -204,6 +211,7 @@ impl SurfaceSessionService {
         self.sessions.retain(|existing| *existing != session);
         self.names.remove(&session);
         self.working_directories.remove(&session);
+        self.projects.remove(&session);
         self.interaction_order
             .retain(|existing| *existing != session);
         self.directory_sessions.retain(|_, assigned| {
@@ -256,6 +264,10 @@ impl SurfaceSessionService {
         self.working_directories.get(&session).map(PathBuf::as_path)
     }
 
+    pub(crate) fn project(&self, session: SurfaceSessionId) -> Option<&ProjectContext> {
+        self.projects.get(&session)
+    }
+
     pub(crate) fn resolve(&self, query: &str) -> Option<SurfaceSessionId> {
         let query = query.trim();
         if query.is_empty() {
@@ -292,6 +304,9 @@ impl SurfaceSessionService {
         self.working_directories
             .entry(session)
             .or_insert_with(|| directory.clone());
+        self.projects
+            .entry(session)
+            .or_insert_with(|| discover_project(&directory));
         if set_default
             || !self
                 .directory_defaults

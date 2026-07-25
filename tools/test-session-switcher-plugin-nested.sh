@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl weston-simple-shm wtype; do
+for tool in cargo cc foot git grim magick pkg-config python3 sway wayland-scanner weston-simple-egl weston-simple-shm wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the session-switcher proof" >&2
     exit 2
@@ -23,9 +23,16 @@ SERVER_LOG="$OUT/server.log"
 CLIENT_LOG="$OUT/client.log"
 CONFIG="$OUT/brood.toml"
 SWAY_CONFIG="$OUT/sway.conf"
+PROJECT="$OUT/project"
+OTHER_PROJECT="$OUT/other-project"
+DATA_HOME="$OUT/data"
 DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
-mkdir -p "$PACKAGE" "$RUNTIME_DIR"
+mkdir -p "$PACKAGE" "$RUNTIME_DIR" "$PROJECT" "$DATA_HOME"
 chmod 700 "$RUNTIME_DIR"
+git -C "$PROJECT" init --quiet
+git -C "$PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
+  commit --quiet --allow-empty -m initial
+git -C "$PROJECT" branch picker-worktree
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -52,11 +59,12 @@ cleanup() {
 trap 'echo "ERR command=$BASH_COMMAND line=$LINENO" >&2' ERR
 trap cleanup EXIT
 
-cargo build -p broodd -p brood-client --bins
+cargo build -p broodd -p brood-client --bins --locked
 cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
-  --release
+  --release \
+  --locked
 read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
 cc \
   -std=c11 \
@@ -66,6 +74,19 @@ cc \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
   "${WAYLAND_BUILD_FLAGS[@]}"
+VIRTUAL_POINTER_XML="$(
+  pkg-config --variable=pkgdatadir wlr-protocols
+)/unstable/wlr-virtual-pointer-unstable-v1.xml"
+[[ -n "$VIRTUAL_POINTER_XML" ]] || {
+  echo "ERR wlr-virtual-pointer protocol XML is required" >&2
+  exit 2
+}
+wayland-scanner client-header \
+  "$VIRTUAL_POINTER_XML" \
+  "$OUT/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+wayland-scanner private-code \
+  "$VIRTUAL_POINTER_XML" \
+  "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c"
 cc \
   -std=c11 \
   -Wall \
@@ -73,6 +94,16 @@ cc \
   -Werror \
   tools/virtual-pointer-input.c \
   -o "$OUT/virtual-pointer-input" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -I "$OUT" \
+  tools/virtual-pointer-click.c \
+  "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c" \
+  -o "$OUT/virtual-pointer-click" \
   "${WAYLAND_BUILD_FLAGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
@@ -85,6 +116,14 @@ cargo build \
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
   "$PACKAGE/brood_picker_plugin.component.wasm"
+cargo build \
+  --manifest-path plugins/worktree-manager/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.wasm \
+  "$PACKAGE/brood_worktree_manager_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -104,24 +143,28 @@ cargo run --quiet -p brood-wasm --example componentize -- \
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
-  --release
+  --release \
+  --locked
 
-printf '[init]\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
+printf '[init]\nbackend = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
+  "$PACKAGE/brood_worktree_manager_plugin.component.wasm" \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm" \
   "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm" \
   > "$CONFIG"
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
-env -u brood_session \
-  RUST_LOG="$RUST_LOG" \
-  target/debug/brood-sessiond \
-  --headless \
-  --no-init \
-  --no-default-modules \
-  --config "$CONFIG" \
-  --dbus-destination "$DBUS_DESTINATION" \
-  --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
-  > "$SERVER_LOG" 2>&1 &
+(
+  cd "$PROJECT"
+  env -u brood_session \
+    XDG_DATA_HOME="$DATA_HOME" \
+    RUST_LOG="$RUST_LOG" \
+    "$ROOT/target/debug/brood-sessiond" \
+    --headless \
+    --no-default-modules \
+    --config "$CONFIG" \
+    --dbus-destination "$DBUS_DESTINATION" \
+    --dbus-address "$DBUS_SESSION_BUS_ADDRESS"
+) > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 ctl() {
@@ -194,6 +237,7 @@ done
 }
 
 env -u brood_session \
+  XDG_DATA_HOME="$DATA_HOME" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
@@ -294,6 +338,26 @@ send_pointer() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-pointer-input" "$@"
+}
+
+click_at() {
+  local x="$1"
+  local y="$2"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-click" "$x" "$y" 1280 720
+}
+
+submit_text() {
+  local value="$1"
+  local primer="bcdefghijklmnopqrstuvwxyz0123"
+  local -a erase_primer=()
+  for _ in $(seq 1 "${#primer}"); do
+    erase_primer+=(-k BackSpace)
+  done
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    wtype "$primer" "${erase_primer[@]}" -s 100 "$value" -s 100 -k Return
 }
 
 capture "$OUT/sidebar-visible.png"
@@ -539,6 +603,129 @@ rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG"
 ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE))
 capture "$OUT/diff-closed.png"
 
+capture "$OUT/project-expanded.png"
+click_at 980 123
+sleep 0.2
+capture "$OUT/project-collapsed.png"
+
+click_at 980 123
+sleep 0.2
+
+click_at 1260 123
+submit_text picker-worktree
+for _ in $(seq 1 200); do
+  SESSION_JSON="$(ctl surface-session list-json)"
+  if rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON" \
+    && rg -q "operation=CreateWorktree success=true" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON"
+rg -q "operation=CreateWorktree success=true" "$CLIENT_LOG"
+read -r WORKTREE_SESSION_ID WORKTREE_DIRECTORY < <(
+  python3 - "$SESSION_JSON" "$PROJECT" "$DATA_HOME" <<'PY'
+import json
+import pathlib
+import sys
+
+catalog = json.loads(sys.argv[1])
+project = pathlib.Path(sys.argv[2]).resolve()
+data_home = pathlib.Path(sys.argv[3]).resolve()
+source = next(session for session in catalog["sessions"] if session["name"] == "Beta")
+created = next(
+    session for session in catalog["sessions"] if session["name"] == "picker-worktree"
+)
+assert source["project_id"] == created["project_id"]
+assert source["project_name"] == project.name
+assert created["branch"] == "picker-worktree"
+assert created["worktree"] is True
+directory = pathlib.Path(created["working_directory"]).resolve()
+directory.relative_to(data_home / "brood" / "worktrees")
+print(created["id"], directory)
+PY
+)
+[[ -d "$WORKTREE_DIRECTORY" ]]
+[[ "$(git -C "$WORKTREE_DIRECTORY" branch --show-current)" == "picker-worktree" ]]
+WORKTREE_PARENT="${WORKTREE_DIRECTORY%/*}"
+WORKTREE_NAME="${WORKTREE_DIRECTORY##*/}"
+WORKTREE_METADATA="$WORKTREE_PARENT/$WORKTREE_NAME.brood-worktree.json"
+for _ in $(seq 1 100); do
+  if python3 - "$WORKTREE_METADATA" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(0 if metadata["session"] == int(sys.argv[2]) else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+python3 - "$WORKTREE_METADATA" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert metadata["session"] == int(sys.argv[2])
+assert metadata["branch"] == "picker-worktree"
+assert pathlib.Path(metadata["path"]).resolve().parent == pathlib.Path(sys.argv[1]).parent.resolve()
+PY
+rg -q "actor=brood.backend-init" "$SERVER_LOG"
+rg -q "attached managed worktree session" "$SERVER_LOG"
+capture "$OUT/worktree-created.png"
+
+WORKTREE_COMPLETIONS_BEFORE="$(
+  rg -c "operation=CreateWorktree success=true" "$CLIENT_LOG"
+)"
+click_at 1260 123
+submit_text picker-worktree
+for _ in $(seq 1 100); do
+  WORKTREE_COMPLETIONS_AFTER="$(
+    rg -c "operation=CreateWorktree success=true" "$CLIENT_LOG"
+  )"
+  SESSION_JSON="$(ctl surface-session list-json)"
+  MATCHING_WORKTREE_SESSIONS="$(
+    python3 -c 'import json,sys; print(sum(s["name"] == "picker-worktree" for s in json.load(sys.stdin)["sessions"]))' \
+      <<< "$SESSION_JSON"
+  )"
+  if ((WORKTREE_COMPLETIONS_AFTER > WORKTREE_COMPLETIONS_BEFORE)) \
+    && [[ "$MATCHING_WORKTREE_SESSIONS" == "1" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+((WORKTREE_COMPLETIONS_AFTER > WORKTREE_COMPLETIONS_BEFORE))
+[[ "$MATCHING_WORKTREE_SESSIONS" == "1" ]]
+
+ctl spawn weston-simple-shm > /dev/null
+for _ in $(seq 1 100); do
+  rg -q "total_windows=3" <<< "$(ctl status)" && break
+  sleep 0.05
+done
+rg -q "total_windows=3" <<< "$(ctl status)"
+
+mkdir -p "$OTHER_PROJECT"
+git -C "$OTHER_PROJECT" init --quiet
+git -C "$OTHER_PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
+  commit --quiet --allow-empty -m initial
+ctl surface-session dir-new "$OTHER_PROJECT" default Other > /dev/null
+ctl spawn weston-simple-shm > /dev/null
+for _ in $(seq 1 100); do
+  SESSION_JSON="$(ctl surface-session list-json)"
+  if rg -q "total_windows=4" <<< "$(ctl status)" \
+    && [[ "$(python3 -c 'import json,sys; print(len({s["project_id"] for s in json.load(sys.stdin)["sessions"]}))' <<< "$SESSION_JSON")" == "2" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "total_windows=4" <<< "$(ctl status)"
+[[ "$(python3 -c 'import json,sys; print(len({s["project_id"] for s in json.load(sys.stdin)["sessions"]}))' <<< "$SESSION_JSON")" == "2" ]]
+capture "$OUT/projects.png"
+
 python3 - \
   "$OUT/sidebar-visible.png" \
   "$OUT/sidebar-hidden.png" \
@@ -548,7 +735,11 @@ python3 - \
   "$OUT/picker-visible.png" \
   "$OUT/diff-open.png" \
   "$OUT/diff-dragged.png" \
-  "$OUT/diff-closed.png" <<'PY'
+  "$OUT/diff-closed.png" \
+  "$OUT/project-expanded.png" \
+  "$OUT/project-collapsed.png" \
+  "$OUT/worktree-created.png" \
+  "$OUT/projects.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -633,6 +824,18 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
     raise SystemExit(f"second diff toggle did not visibly close the pane: RMSE={normalized}")
 print(f"diff_close_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[10], sys.argv[11], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.01:
+    raise SystemExit(f"project collapse did not visibly change the picker: RMSE={normalized}")
+print(f"project_collapse_capture_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
@@ -653,13 +856,41 @@ if sed -n '/presentation layout source changed source=actor/,$p' "$CLIENT_LOG" \
   exit 1
 fi
 
+ctl close-session "$WORKTREE_SESSION_ID" > /dev/null
+for _ in $(seq 1 100); do
+  if python3 - "$WORKTREE_METADATA" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(0 if metadata["session"] is None else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+python3 - "$WORKTREE_METADATA" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert metadata["session"] is None
+PY
+
 cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
 - backend: headless frame exporter, no presenter and no backend layout
-- input: real Ctrl+Alt+M, Ctrl+Alt+P, Ctrl+Alt+D, fuzzy text, Enter, pointer drag, touchpad scroll, and Ctrl+O events through the focused external Winit client
+- input: real Ctrl+Alt+M, Ctrl+Alt+P, Ctrl+Alt+D, fuzzy text, Enter, pointer clicks and drag, touchpad scroll, and Ctrl+O events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
+- projects: two Git repositories rendered as distinct collapsible project lists
+- worktree: branch picker-worktree was checked out beneath $DATA_HOME/brood/worktrees and activated as a new session
+- retry: requesting the same branch reused the checkout and existing session
+- occupation: closing that session persisted an unoccupied worktree record
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
 - picker: Ctrl+Alt+P opened the reusable actor as a 720px floating pane; Bt fuzzy-matched Beta and Enter returned the original session result
 - transition: the previous actor layout remained visible until its replacement was accepted
@@ -673,7 +904,7 @@ cat > "$OUT/proof.md" <<EOF
 - diff viewer: Ctrl+Alt+D created and focused an ordinary split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; the second press stopped the actor and closed its pane
 - diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
 - diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
-- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png
+- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, projects.png
 - status: $STATUS
 EOF
 
@@ -694,4 +925,6 @@ echo "diff_drag_text_layouts=$DRAG_TEXT_LAYOUTS"
 echo "diff_trackpad_settled_ms=$TRACKPAD_SETTLED_MS"
 echo "diff_trackpad_packets=$TRACKPAD_PACKET_COUNT"
 echo "diff_trackpad_text_layouts=$TRACKPAD_TEXT_LAYOUTS"
+echo "worktree=$OUT/worktree-created.png"
+echo "projects=$OUT/projects.png"
 echo "ctrl_o_layout_ms=$CTRL_O_LAYOUT_MS"

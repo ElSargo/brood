@@ -19,8 +19,9 @@ use brood_cli::{
     ClientArgs,
     control::{
         ControlTarget, DmabufFrame, PresentationWindowSummary, ServerLaunch,
-        activate_surface_session, close_surface_session, connect_or_spawn, create_surface_session,
-        dmabuf_resource, open_presentation_fast_path, rename_surface_session, request_dbus_command,
+        activate_surface_session, close_surface_session, connect_or_spawn,
+        create_managed_worktree_session, create_surface_session, dmabuf_resource,
+        open_presentation_fast_path, rename_surface_session, request_dbus_command,
         resolve_control_target,
     },
 };
@@ -460,6 +461,13 @@ struct CatalogWireSession {
     name: String,
     active: bool,
     windows: u64,
+    working_directory: Option<String>,
+    project_id: String,
+    project_name: String,
+    project_directory: String,
+    branch: Option<String>,
+    worktree: bool,
+    git: bool,
 }
 
 #[derive(Deserialize)]
@@ -578,6 +586,13 @@ fn spawn_catalog_updates(
                                     name: session.name,
                                     active: session.active,
                                     windows: session.windows,
+                                    working_directory: session.working_directory,
+                                    project_id: session.project_id,
+                                    project_name: session.project_name,
+                                    project_directory: session.project_directory,
+                                    branch: session.branch,
+                                    worktree: session.worktree,
+                                    git: session.git,
                                 })
                                 .collect::<Vec<_>>();
                             let windows = decoded
@@ -1009,6 +1024,12 @@ fn execute_session_command(
         SessionOperation::Create => {
             create_surface_session(target, name.unwrap_or_default()).map(Some)
         }
+        SessionOperation::CreateWorktree => session
+            .context("create worktree request is missing a source session ID")
+            .and_then(|session| {
+                let branch = name.context("create worktree request is missing a branch name")?;
+                create_managed_worktree_session(target, session, branch).map(Some)
+            }),
         SessionOperation::Rename => session
             .context("rename request is missing a session ID")
             .and_then(|session| {
@@ -1941,7 +1962,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     .filter(|operation| {
                         matches!(
                             operation,
-                            SessionOperation::Activate | SessionOperation::Create
+                            SessionOperation::Activate
+                                | SessionOperation::Create
+                                | SessionOperation::CreateWorktree
                         )
                     })
                     .and(completion.session)

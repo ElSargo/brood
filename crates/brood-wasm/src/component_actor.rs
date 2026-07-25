@@ -2682,6 +2682,13 @@ fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
                     name: session.name,
                     active: session.active,
                     windows: session.windows,
+                    working_directory: session.working_directory,
+                    project_id: session.project_id,
+                    project_name: session.project_name,
+                    project_directory: session.project_directory,
+                    branch: session.branch,
+                    worktree: session.worktree,
+                    git: session.git,
                 })
                 .collect(),
         }),
@@ -2707,6 +2714,7 @@ fn component_session_command_from_guest(
         abi::SessionOperation::Refresh => SessionOperation::Refresh,
         abi::SessionOperation::Activate => SessionOperation::Activate,
         abi::SessionOperation::Create => SessionOperation::Create,
+        abi::SessionOperation::CreateWorktree => SessionOperation::CreateWorktree,
         abi::SessionOperation::Rename => SessionOperation::Rename,
         abi::SessionOperation::Close => SessionOperation::Close,
     };
@@ -2722,6 +2730,14 @@ fn component_session_command_from_guest(
         SessionOperation::Create => ensure!(
             request.session.is_none(),
             "create session command does not accept a session ID"
+        ),
+        SessionOperation::CreateWorktree => ensure!(
+            request.session.is_some_and(|session| session != 0)
+                && request
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !name.trim().is_empty()),
+            "create worktree session command requires a source session ID and non-empty branch"
         ),
         SessionOperation::Rename => ensure!(
             request.session.is_some_and(|session| session != 0)
@@ -2748,6 +2764,7 @@ const fn component_session_operation_to_guest(
         SessionOperation::Refresh => abi::SessionOperation::Refresh,
         SessionOperation::Activate => abi::SessionOperation::Activate,
         SessionOperation::Create => abi::SessionOperation::Create,
+        SessionOperation::CreateWorktree => abi::SessionOperation::CreateWorktree,
         SessionOperation::Rename => abi::SessionOperation::Rename,
         SessionOperation::Close => abi::SessionOperation::Close,
     }

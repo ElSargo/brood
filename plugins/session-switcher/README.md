@@ -36,6 +36,9 @@ switcher's root layout policy.
 
 The pane supports:
 
+- project-grouped, collapsible session lists;
+- a project-heading action which creates a branch, managed Git worktree, and
+  active session;
 - pointer or keyboard session selection and activation;
 - search-as-you-type filtering;
 - creating an unmatched session with Enter;

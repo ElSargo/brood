@@ -62,6 +62,7 @@ let
         "${src}/plugins/diff-viewer/Cargo.lock"
         "${src}/plugins/picker/Cargo.lock"
         "${src}/plugins/session-switcher/Cargo.lock"
+        "${src}/plugins/worktree-manager/Cargo.lock"
         "${src}/plugins/workspace-file-log/Cargo.lock"
       ];
     };
@@ -298,6 +299,19 @@ let
       install -D "$component_output" \
         plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm
 
+      if [[ -f plugins/worktree-manager/Cargo.toml ]]; then
+        component_core="plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.wasm"
+        component_output="plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR worktree manager core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       if [[ -f plugins/coding-agent/Cargo.toml ]]; then
         component_core="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm"
         component_output="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm"
@@ -370,6 +384,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.wasm" ]]; then
           continue
         fi
         if [[ "$wasm" == "plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm" ]]; then

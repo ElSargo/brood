@@ -143,6 +143,13 @@ pub struct SessionSummary {
     pub name: String,
     pub active: bool,
     pub windows: u64,
+    pub working_directory: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_directory: String,
+    pub branch: Option<String>,
+    pub worktree: bool,
+    pub git: bool,
 }
 
 /// Latest-state session catalogue delivered by the presentation client.
@@ -158,6 +165,7 @@ pub enum SessionOperation {
     Refresh,
     Activate,
     Create,
+    CreateWorktree,
     Rename,
     Close,
 }
