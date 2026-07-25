@@ -166,6 +166,7 @@ env -u manifold_session \
   WGPU_BACKEND=vulkan \
   MANIFOLD_DMABUF_HAPPY_PATH=1 \
   MANIFOLD_TRACE_PLUGIN_INPUT=1 \
+  MANIFOLD_TRACE_PLUGIN_TEXT=1 \
   RUST_LOG="$RUST_LOG" \
   target/debug/manifold-client \
   --config "$CONFIG" \
@@ -197,13 +198,22 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "$KEYMAP_PRIMER" -s 100 -M ctrl -M alt -k a -m alt -m ctrl
 
+second_agent_ui_focused() {
+  rg -q "presentation key policy requested pane focus.*focused=Some.*changed=true" \
+    "$CLIENT_LOG" \
+    || {
+      rg -q "presentation key policy requested pane focus.*focused=Some.*deferred=true" \
+        "$CLIENT_LOG" \
+        && rg -q "fulfilled deferred pane focus" "$CLIENT_LOG"
+    }
+}
+
 for _ in $(seq 1 300); do
   if rg -q "sent key-policy actor message actor=manifold.client-init" "$CLIENT_LOG" \
     && rg -q "started presentation WASM actor id=coding-agent-ui-2" "$CLIENT_LOG" \
     && rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"registry-subscribe"' \
       "$CLIENT_LOG" \
-    && rg -q "presentation key policy requested pane focus.*focused=Some.*changed=true" \
-      "$CLIENT_LOG"; then
+    && second_agent_ui_focused; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -216,7 +226,7 @@ rg -q "sent key-policy actor message actor=manifold.client-init" "$CLIENT_LOG"
 rg -q "started presentation WASM actor id=coding-agent-ui-2" "$CLIENT_LOG"
 rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"registry-subscribe"' \
   "$CLIENT_LOG"
-rg -q "presentation key policy requested pane focus.*focused=Some.*changed=true" "$CLIENT_LOG"
+second_agent_ui_focused
 
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \

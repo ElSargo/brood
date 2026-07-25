@@ -103,6 +103,7 @@ RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core
 env RUST_LOG="$RUST_LOG" \
   target/debug/manifold-sessiond \
   --headless \
+  --no-init \
   --no-default-modules \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
@@ -137,6 +138,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   target/debug/manifold-client \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+  --init-actor "$ROOT/plugins/session-switcher/manifold_session_switcher_plugin.component.wasm" \
   --wasm-actor "workspace=$WORKSPACE" \
   --wasm-key-policy workspace "$WORKSPACE" \
   > "$CLIENT_LOG" 2>&1 &

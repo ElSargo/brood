@@ -19,13 +19,15 @@ use manifold_wasm::PresentationError;
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-use crate::plugin_graphics::{GraphicsSnapshot, ImageResource, TextLayoutResource};
+use crate::plugin_graphics::{GlyphCacheKey, GlyphImageResource, GraphicsSnapshot, ImageResource};
 
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const RESOURCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24PlusStencil8;
 const SAMPLE_COUNT: u32 = 4;
 const SLOW_FRAME: Duration = Duration::from_millis(8);
+const GLYPH_ATLAS_PAGE_SIZE: u32 = 1_024;
+const GLYPH_ATLAS_PADDING: u32 = 1;
 const MAX_SCENE_VERTICES: usize = 262_144;
 const MAX_SCENE_INDICES: usize = 786_432;
 const TARGET_CURVE_ERROR_PIXELS: f32 = 0.25;
@@ -72,15 +74,16 @@ impl CanvasVertex {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Geometry {
     indices: Range<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum DrawSource {
     White,
     Resource(u64),
+    GlyphAtlas(usize),
     Layer(usize),
 }
 
@@ -120,8 +123,32 @@ impl Default for CompileState {
 
 #[derive(Clone)]
 struct GpuTexture {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlyphAtlasEntry {
+    page: usize,
+    uv: [f32; 4],
+}
+
+#[derive(Debug, Default)]
+struct GlyphAtlasPageAllocator {
+    next_x: u32,
+    next_y: u32,
+    row_height: u32,
+}
+
+struct GlyphAtlasPage {
+    texture: GpuTexture,
+    allocator: GlyphAtlasPageAllocator,
+}
+
+#[derive(Default)]
+struct GpuGlyphAtlas {
+    pages: Vec<GlyphAtlasPage>,
+    entries: BTreeMap<GlyphCacheKey, GlyphAtlasEntry>,
 }
 
 #[derive(Clone)]
@@ -166,6 +193,7 @@ pub struct GpuCanvasRenderer {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     white: GpuTexture,
+    glyph_atlas: GpuGlyphAtlas,
     clip_pipeline: wgpu::RenderPipeline,
     source_over_pipeline: wgpu::RenderPipeline,
     screen_pipeline: wgpu::RenderPipeline,
@@ -182,8 +210,158 @@ pub fn validate_snapshot_lowering(
 ) -> std::result::Result<(), PresentationError> {
     let mut compiler = SceneCompiler::new(1, 1, MAX_TESSELLATION_SCALE);
     compiler
-        .compile(snapshot)
+        .compile(snapshot, None)
         .map_err(|error| error.presentation_error())
+}
+
+impl GlyphAtlasPageAllocator {
+    fn allocate(&mut self, width: u32, height: u32) -> Option<(u32, u32)> {
+        if width == 0
+            || height == 0
+            || width > GLYPH_ATLAS_PAGE_SIZE
+            || height > GLYPH_ATLAS_PAGE_SIZE
+        {
+            return None;
+        }
+        if self.next_x.checked_add(width)? > GLYPH_ATLAS_PAGE_SIZE {
+            self.next_x = 0;
+            self.next_y = self.next_y.checked_add(self.row_height)?;
+            self.row_height = 0;
+        }
+        if self.next_y.checked_add(height)? > GLYPH_ATLAS_PAGE_SIZE {
+            return None;
+        }
+        let origin = (self.next_x, self.next_y);
+        self.next_x = self.next_x.checked_add(width)?;
+        self.row_height = self.row_height.max(height);
+        Some(origin)
+    }
+}
+
+impl GpuGlyphAtlas {
+    fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        key: GlyphCacheKey,
+        resource: &GlyphImageResource,
+    ) -> Result<()> {
+        if self.entries.contains_key(&key) {
+            return Ok(());
+        }
+        let padded_width = resource
+            .width
+            .checked_add(GLYPH_ATLAS_PADDING.saturating_mul(2))
+            .context("glyph atlas width overflow")?;
+        let padded_height = resource
+            .height
+            .checked_add(GLYPH_ATLAS_PADDING.saturating_mul(2))
+            .context("glyph atlas height overflow")?;
+        let allocation = self.pages.iter_mut().enumerate().find_map(|(page, state)| {
+            state
+                .allocator
+                .allocate(padded_width, padded_height)
+                .map(|origin| (page, origin))
+        });
+        let (page, (outer_x, outer_y)) = match allocation {
+            Some(allocation) => allocation,
+            None => {
+                let page = self.pages.len();
+                let mut atlas_page = GlyphAtlasPage {
+                    texture: create_empty_texture(
+                        device,
+                        layout,
+                        sampler,
+                        (GLYPH_ATLAS_PAGE_SIZE, GLYPH_ATLAS_PAGE_SIZE),
+                        &format!("plugin GPU glyph atlas page {page}"),
+                    ),
+                    allocator: GlyphAtlasPageAllocator::default(),
+                };
+                let origin = atlas_page
+                    .allocator
+                    .allocate(padded_width, padded_height)
+                    .ok_or_else(|| anyhow!("glyph is too large for an atlas page"))?;
+                self.pages.push(atlas_page);
+                (page, origin)
+            }
+        };
+        let padded_bytes = usize::try_from(padded_width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(padded_height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("glyph atlas upload size overflow")?;
+        let mut pixels = vec![0_u8; padded_bytes];
+        let source_stride = usize::try_from(resource.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .context("glyph source stride overflow")?;
+        let destination_stride = usize::try_from(padded_width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .context("glyph atlas stride overflow")?;
+        for row in 0..usize::try_from(resource.height).context("glyph height overflow")? {
+            let source_start = row
+                .checked_mul(source_stride)
+                .context("glyph source offset overflow")?;
+            let destination_start = row
+                .checked_add(GLYPH_ATLAS_PADDING as usize)
+                .and_then(|row| row.checked_mul(destination_stride))
+                .and_then(|offset| offset.checked_add(GLYPH_ATLAS_PADDING as usize * 4))
+                .context("glyph atlas offset overflow")?;
+            pixels[destination_start..destination_start + source_stride].copy_from_slice(
+                &resource.linear_premultiplied_rgba8[source_start..source_start + source_stride],
+            );
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.pages[page].texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: outer_x,
+                    y: outer_y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_width.saturating_mul(4)),
+                rows_per_image: Some(padded_height),
+            },
+            wgpu::Extent3d {
+                width: padded_width,
+                height: padded_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let x = outer_x.saturating_add(GLYPH_ATLAS_PADDING);
+        let y = outer_y.saturating_add(GLYPH_ATLAS_PADDING);
+        let atlas_size = GLYPH_ATLAS_PAGE_SIZE as f32;
+        self.entries.insert(
+            key,
+            GlyphAtlasEntry {
+                page,
+                uv: [
+                    x as f32 / atlas_size,
+                    y as f32 / atlas_size,
+                    x.saturating_add(resource.width) as f32 / atlas_size,
+                    y.saturating_add(resource.height) as f32 / atlas_size,
+                ],
+            },
+        );
+        Ok(())
+    }
+
+    fn bind_group(&self, page: usize) -> Option<&wgpu::BindGroup> {
+        self.pages.get(page).map(|page| &page.texture.bind_group)
+    }
 }
 
 impl GpuCanvasRenderer {
@@ -306,6 +484,7 @@ impl GpuCanvasRenderer {
             texture_layout: texture_layout.clone(),
             sampler: sampler.clone(),
             white,
+            glyph_atlas: GpuGlyphAtlas::default(),
             clip_pipeline,
             source_over_pipeline,
             screen_pipeline,
@@ -319,7 +498,7 @@ impl GpuCanvasRenderer {
     }
 
     pub fn compile(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         snapshot: &GraphicsSnapshot,
@@ -328,8 +507,18 @@ impl GpuCanvasRenderer {
     ) -> Result<GpuCanvasScene> {
         let started = Instant::now();
         let (width, height, scale) = extent;
+        for (key, resource) in &snapshot.glyphs {
+            self.glyph_atlas.ensure(
+                device,
+                queue,
+                &self.texture_layout,
+                &self.sampler,
+                *key,
+                resource,
+            )?;
+        }
         let mut compiler = SceneCompiler::new(width, height, scale);
-        compiler.compile(snapshot)?;
+        compiler.compile(snapshot, Some(&self.glyph_atlas.entries))?;
         let SceneCompiler {
             vertices,
             indices,
@@ -369,15 +558,6 @@ impl GpuCanvasRenderer {
                     .unwrap_or_else(|| self.upload_image(device, queue, *handle, resource)),
             );
         }
-        for (handle, resource) in &snapshot.text_layouts {
-            resources.insert(
-                *handle,
-                previous
-                    .and_then(|scene| scene.resources.get(handle))
-                    .cloned()
-                    .unwrap_or_else(|| self.upload_text(device, queue, *handle, resource)),
-            );
-        }
         let reusable = previous.filter(|scene| scene.width == width && scene.height == height);
         let root = reusable.map_or_else(
             || self.create_target(device, width, height, "plugin GPU canvas root"),
@@ -411,7 +591,7 @@ impl GpuCanvasRenderer {
         if snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) || elapsed >= SLOW_FRAME
         {
             eprintln!(
-                "compiled plugin GPU scene pane={} sequence={} commands={} draws={} vertices={} indices={} layers={} time_us={}",
+                "compiled plugin GPU scene pane={} sequence={} commands={} draws={} vertices={} indices={} layers={} glyph_atlas_pages={} cached_glyphs={} time_us={}",
                 snapshot.pane,
                 snapshot.sequence,
                 snapshot.packet.commands.len(),
@@ -421,6 +601,8 @@ impl GpuCanvasRenderer {
                 vertices.len(),
                 indices.len(),
                 layer_count,
+                self.glyph_atlas.pages.len(),
+                self.glyph_atlas.entries.len(),
                 elapsed.as_micros(),
             );
         }
@@ -583,6 +765,10 @@ impl GpuCanvasRenderer {
                 .get(handle)
                 .map(|resource| &resource.bind_group)
                 .with_context(|| format!("plugin GPU resource {handle} disappeared")),
+            DrawSource::GlyphAtlas(page) => self
+                .glyph_atlas
+                .bind_group(*page)
+                .with_context(|| format!("plugin GPU glyph atlas page {page} disappeared")),
             DrawSource::Layer(layer) => scene
                 .layers
                 .get(*layer)
@@ -619,24 +805,6 @@ impl GpuCanvasRenderer {
             (resource.width, resource.height),
             &resource.linear_premultiplied_rgba8,
             &format!("plugin GPU image {handle}"),
-        )
-    }
-
-    fn upload_text(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        handle: u64,
-        resource: &TextLayoutResource,
-    ) -> GpuTexture {
-        upload_texture(
-            device,
-            queue,
-            &self.texture_layout,
-            &self.sampler,
-            (resource.width, resource.height),
-            &resource.linear_premultiplied_rgba8,
-            &format!("plugin GPU text layout {handle}"),
         )
     }
 
@@ -732,7 +900,11 @@ impl SceneCompiler {
         }
     }
 
-    fn compile(&mut self, snapshot: &GraphicsSnapshot) -> CompileResult<()> {
+    fn compile(
+        &mut self,
+        snapshot: &GraphicsSnapshot,
+        glyph_atlas: Option<&BTreeMap<GlyphCacheKey, GlyphAtlasEntry>>,
+    ) -> CompileResult<()> {
         let mut state = CompileState::default();
         let mut saved = Vec::new();
         let mut layers = Vec::new();
@@ -832,13 +1004,38 @@ impl SceneCompiler {
                     let resource = snapshot.text_layouts.get(layout).ok_or_else(|| {
                         SceneCompileError::Invalid(format!("text layout {layout} is unavailable"))
                     })?;
-                    let geometry = self.quad_geometry(
-                        Rect::new(*x, *y, resource.width as f32, resource.height as f32),
-                        state.transform,
-                        [state.opacity; 4],
-                        false,
-                    )?;
-                    self.push_draw(geometry, DrawSource::Resource(*layout), &state);
+                    for glyph in resource.glyphs.iter() {
+                        let image = snapshot.glyphs.get(&glyph.key).ok_or_else(|| {
+                            SceneCompileError::Invalid(format!(
+                                "text layout {layout} glyph {:?} is unavailable",
+                                glyph.key
+                            ))
+                        })?;
+                        let atlas = match glyph_atlas {
+                            Some(entries) => entries.get(&glyph.key).copied().ok_or_else(|| {
+                                SceneCompileError::Invalid(format!(
+                                    "text layout {layout} glyph {:?} is absent from the atlas",
+                                    glyph.key
+                                ))
+                            })?,
+                            None => GlyphAtlasEntry {
+                                page: 0,
+                                uv: [0.0, 0.0, 1.0, 1.0],
+                            },
+                        };
+                        let geometry = self.quad_geometry_with_uv(
+                            Rect::new(
+                                *x + glyph.x as f32,
+                                *y + glyph.y as f32,
+                                image.width as f32,
+                                image.height as f32,
+                            ),
+                            state.transform,
+                            [state.opacity; 4],
+                            atlas.uv,
+                        )?;
+                        self.push_draw(geometry, DrawSource::GlyphAtlas(atlas.page), &state);
+                    }
                 }
                 Command::BeginLayer => {
                     let layer = layers.len();
@@ -874,6 +1071,16 @@ impl SceneCompiler {
     }
 
     fn push_draw(&mut self, geometry: Geometry, source: DrawSource, state: &CompileState) {
+        if let Some(CanvasOp::Draw(previous)) = self.ops.last_mut()
+            && !is_advanced_blend(state.blend_mode)
+            && previous.source == source
+            && previous.blend_mode == state.blend_mode
+            && previous.clips == state.clips
+            && previous.geometry.indices.end == geometry.indices.start
+        {
+            previous.geometry.indices.end = geometry.indices.end;
+            return;
+        }
         self.ops.push(CanvasOp::Draw(DrawOp {
             geometry,
             clips: state.clips.clone(),
@@ -977,6 +1184,21 @@ impl SceneCompiler {
         color: [f32; 4],
         flip_vertical: bool,
     ) -> CompileResult<Geometry> {
+        let (top_uv, bottom_uv) = if flip_vertical {
+            (1.0, 0.0)
+        } else {
+            (0.0, 1.0)
+        };
+        self.quad_geometry_with_uv(rect, transform, color, [0.0, top_uv, 1.0, bottom_uv])
+    }
+
+    fn quad_geometry_with_uv(
+        &mut self,
+        rect: Rect,
+        transform: Transform,
+        color: [f32; 4],
+        [left_uv, top_uv, right_uv, bottom_uv]: [f32; 4],
+    ) -> CompileResult<Geometry> {
         self.ensure_capacity(4, 6)?;
         let base_vertex =
             u32::try_from(self.vertices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
@@ -984,16 +1206,11 @@ impl SceneCompiler {
             u32::try_from(self.indices.len()).map_err(|_overflow| SceneCompileError::Limit)?;
         let right = rect.x + rect.width;
         let bottom = rect.y + rect.height;
-        let (top_uv, bottom_uv) = if flip_vertical {
-            (1.0, 0.0)
-        } else {
-            (0.0, 1.0)
-        };
         for ((x, y), uv) in [
-            ((rect.x, rect.y), [0.0, top_uv]),
-            ((right, rect.y), [1.0, top_uv]),
-            ((right, bottom), [1.0, bottom_uv]),
-            ((rect.x, bottom), [0.0, bottom_uv]),
+            ((rect.x, rect.y), [left_uv, top_uv]),
+            ((right, rect.y), [right_uv, top_uv]),
+            ((right, bottom), [right_uv, bottom_uv]),
+            ((rect.x, bottom), [left_uv, bottom_uv]),
         ] {
             self.vertices.push(CanvasVertex {
                 position: self.ndc(transform_point(transform, x, y)),
@@ -1323,23 +1540,10 @@ fn upload_texture(
     label: &str,
 ) -> GpuTexture {
     let (width, height) = extent;
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: RESOURCE_FORMAT,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    let texture = create_empty_texture(device, layout, sampler, extent, label);
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &texture,
+            texture: &texture.texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -1356,10 +1560,35 @@ fn upload_texture(
             depth_or_array_layers: 1,
         },
     );
+    texture
+}
+
+fn create_empty_texture(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    extent: (u32, u32),
+    label: &str,
+) -> GpuTexture {
+    let (width, height) = extent;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: RESOURCE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = texture_bind_group(device, layout, sampler, &view, label);
     GpuTexture {
-        _texture: texture,
+        texture,
         bind_group,
     }
 }
@@ -1551,6 +1780,74 @@ const fn plus_blend() -> wgpu::BlendState {
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_atlas_allocator_wraps_rows_without_overlap() {
+        let mut allocator = GlyphAtlasPageAllocator::default();
+        assert_eq!(allocator.allocate(600, 10), Some((0, 0)));
+        assert_eq!(allocator.allocate(600, 20), Some((0, 10)));
+        assert_eq!(allocator.allocate(400, 5), Some((600, 10)));
+        assert_eq!(allocator.allocate(GLYPH_ATLAS_PAGE_SIZE + 1, 1), None);
+    }
+
+    #[test]
+    fn adjacent_atlas_glyphs_share_one_draw() {
+        let mut compiler = SceneCompiler::new(100, 100, 1.0);
+        let state = CompileState::default();
+        for x in [0.0, 10.0] {
+            let geometry = compiler
+                .quad_geometry_with_uv(
+                    Rect::new(x, 0.0, 8.0, 12.0),
+                    Transform::IDENTITY,
+                    [1.0; 4],
+                    [0.0, 0.0, 0.1, 0.1],
+                )
+                .expect("glyph quad");
+            compiler.push_draw(geometry, DrawSource::GlyphAtlas(0), &state);
+        }
+        assert_eq!(compiler.ops.len(), 1);
+        let CanvasOp::Draw(draw) = &compiler.ops[0] else {
+            panic!("expected a merged draw");
+        };
+        assert_eq!(draw.geometry.indices, 0..12);
+
+        let geometry = compiler
+            .quad_geometry_with_uv(
+                Rect::new(20.0, 0.0, 8.0, 12.0),
+                Transform::IDENTITY,
+                [1.0; 4],
+                [0.0, 0.0, 0.1, 0.1],
+            )
+            .expect("second-page glyph quad");
+        compiler.push_draw(geometry, DrawSource::GlyphAtlas(1), &state);
+        assert_eq!(compiler.ops.len(), 2);
+    }
+
+    #[test]
+    fn advanced_blend_draws_are_not_coalesced() {
+        let mut compiler = SceneCompiler::new(100, 100, 1.0);
+        let state = CompileState {
+            blend_mode: BlendMode::Multiply,
+            ..CompileState::default()
+        };
+        for x in [0.0, 10.0] {
+            let geometry = compiler
+                .quad_geometry_with_uv(
+                    Rect::new(x, 0.0, 8.0, 12.0),
+                    Transform::IDENTITY,
+                    [1.0; 4],
+                    [0.0, 0.0, 0.1, 0.1],
+                )
+                .expect("glyph quad");
+            compiler.push_draw(geometry, DrawSource::GlyphAtlas(0), &state);
+        }
+        assert_eq!(compiler.ops.len(), 2);
     }
 }
 

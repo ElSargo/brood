@@ -206,9 +206,16 @@ host-managed immutable resources:
 
 Handles are typed and scoped to one pane and actor generation. Stale handles
 cannot resolve to new resources, actors cannot use another pane's resources,
-and one resource type cannot be used as another. Every resource referenced by a
-packet must already be ready. A missing, pending, failed, stale, wrong-owner, or
+and one resource type cannot be used as another. Non-text resources referenced
+by a packet must already be ready. A missing, failed, stale, wrong-owner, or
 wrong-type resource rejects the complete packet rather than skipping one draw.
+
+Native text layouts are allowed to be pending. The client accepts and retains a
+packet that references pending text, but does not replace the pane's currently
+presented scene until every text dependency of the replacement is ready. The
+actor submits the same packet regardless of cache state; readiness and redraw
+scheduling are host concerns. A newer accepted packet supersedes an older
+pending replacement.
 
 Resource creation copies the source data needed by the host. Updating a
 resource creates a new immutable revision or handle; previously accepted packets
@@ -239,8 +246,19 @@ layout_text(text, font_intent, bounds, wrapping, alignment, style)
 
 Position-to-text, text-to-position, selection, and caret queries are also host
 functions operating on that immutable layout handle. The packet only uses
-`draw-text-layout` to place a ready handle; it contains no text-shaping request
-or alternate inline text path.
+`draw-text-layout`; it contains no text-shaping request or alternate inline text
+path.
+
+`layout_text` performs only the bounded CPU layout needed to return the handle
+and metrics. It records the positioned glyph dependencies, queues cache misses
+to persistent raster workers, and returns without rasterizing the complete text
+surface. Raster workers retain their glyph caches across layouts. A submitted
+draw packet may therefore depend on pending glyphs; the client captures it and
+publishes the replacement scene only after all of those dependencies are ready.
+Ready glyph images are packed into renderer-wide, incrementally allocated GPU
+atlas pages with transparent padding. Text lowering emits atlas UVs, and
+adjacent glyphs on the same page and compatible blend state are coalesced into
+one indexed GPU draw.
 
 An SDK may expose a convenient `draw_text(...)` function, but that function
 creates or retrieves a cached host text layout and emits `draw-text-layout`.

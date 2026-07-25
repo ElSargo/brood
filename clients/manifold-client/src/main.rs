@@ -2530,6 +2530,7 @@ struct Renderer {
     plugin_graphics: PluginGraphicsBridge,
     plugin_panes: BTreeMap<u64, PluginPaneTexture>,
     focused_pane: Option<FocusedPane>,
+    pending_focus_pane: Option<u64>,
     accepted_layout: ResolvedLayout,
     layout_source: LayoutSource,
     layout_state_dirty: bool,
@@ -2846,9 +2847,11 @@ fn apply_key_policy_host_message(
             let inventory = renderer.pane_inventory();
             let focused = renderer.focused_pane_id();
             let change = renderer.focus_pane(pane);
+            let deferred = renderer.pending_focus_pane == Some(pane);
             eprintln!(
-                "presentation key policy requested pane focus pane={pane} focused={focused:?} inventory={inventory:?} changed={}",
-                change.is_some()
+                "presentation key policy requested pane focus pane={pane} focused={focused:?} \
+                 inventory={inventory:?} changed={} deferred={deferred}",
+                change.is_some(),
             );
             change
         }
@@ -3513,6 +3516,7 @@ impl Renderer {
             plugin_graphics,
             plugin_panes: BTreeMap::new(),
             focused_pane: None,
+            pending_focus_pane: None,
             accepted_layout: ResolvedLayout::empty(),
             layout_source: LayoutSource::NativeFallback,
             layout_state_dirty: true,
@@ -3698,7 +3702,11 @@ impl Renderer {
     }
 
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
-        let target = self.focus_target_for_pane(pane)?;
+        let Some(target) = self.focus_target_for_pane(pane) else {
+            self.pending_focus_pane = Some(pane);
+            return None;
+        };
+        self.pending_focus_pane = None;
         self.set_focus(target)
     }
 
@@ -3807,6 +3815,7 @@ impl Renderer {
 
     fn reconcile_layout(&mut self) -> Option<FocusChange> {
         let panes = self.pane_inventory();
+        let pending_focus = self.pending_focus_pane.filter(|pane| panes.contains(pane));
         let valid = self
             .accepted_layout
             .clone()
@@ -3815,11 +3824,13 @@ impl Renderer {
         if self.layout_source == LayoutSource::NativeFallback {
             let extent = self.layout_extent();
             let focus = self.focused_pane_id();
-            return self.commit_layout(
+            let change = self.commit_layout(
                 native_flat_layout(&self.default_visible_pane_inventory(), extent),
-                focus,
+                pending_focus.or(focus),
                 LayoutSource::NativeFallback,
             );
+            self.clear_fulfilled_pending_focus(pending_focus);
+            return change;
         }
         if !valid {
             eprintln!(
@@ -3827,7 +3838,19 @@ impl Renderer {
                 panes.len()
             );
         }
-        self.project_accepted_layout(None)
+        let change = self.project_accepted_layout(pending_focus);
+        self.clear_fulfilled_pending_focus(pending_focus);
+        change
+    }
+
+    fn clear_fulfilled_pending_focus(&mut self, requested: Option<u64>) {
+        if requested.is_some() && requested == self.focused_pane_id() {
+            self.pending_focus_pane = None;
+            eprintln!(
+                "fulfilled deferred pane focus pane={}",
+                requested.expect("checked pending pane")
+            );
+        }
     }
 
     fn commit_actor_layout(
@@ -3837,7 +3860,15 @@ impl Renderer {
     ) -> (Option<FocusChange>, bool) {
         let panes = self.pane_inventory();
         match layout.validate_for_panes(&panes) {
-            Ok(layout) => (self.commit_layout(layout, focus, LayoutSource::Actor), true),
+            Ok(layout) => {
+                let pending_focus = self
+                    .pending_focus_pane
+                    .filter(|pane| layout.pane_item(*pane).is_some());
+                let change =
+                    self.commit_layout(layout, pending_focus.or(focus), LayoutSource::Actor);
+                self.clear_fulfilled_pending_focus(pending_focus);
+                (change, true)
+            }
             Err(error) => self.reject_actor_layout(&error),
         }
     }
@@ -4081,7 +4112,7 @@ impl Renderer {
                 target.2,
             );
         }
-        let first_plugin_scene = self.plugin_panes.is_empty();
+        let new_plugin_pane = !self.plugin_panes.contains_key(&pane);
         let rect = self.plugin_panes.get(&pane).map_or_else(
             || {
                 [
@@ -4095,11 +4126,8 @@ impl Renderer {
         );
         self.plugin_panes
             .insert(pane, PluginPaneTexture { scene, rect });
-        let focus_change = if first_plugin_scene {
-            self.set_focus(FocusedPane::Plugin(pane))
-        } else {
-            self.reconcile_layout()
-        };
+        self.layout_state_dirty |= new_plugin_pane;
+        let focus_change = self.reconcile_layout();
         let updated_target = self.plugin_scene_extent(pane);
         if updated_target.0 != target.0
             || updated_target.1 != target.1

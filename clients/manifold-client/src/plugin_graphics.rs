@@ -4,11 +4,16 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, Sender},
     },
+    thread,
+    time::Instant,
 };
 
 use anyhow::{Result, anyhow};
-use cosmic_text::{Attrs, Buffer, Color as TextColor, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{
+    Attrs, Buffer, CacheKey, FontSystem, Metrics, Shaping, SwashCache, SwashContent,
+};
 use manifold_graphics::{Command, Packet, PacketError};
 use manifold_wasm::{PresentationError, PresentationHost, TextLayoutOptions, TextLayoutResult};
 use winit::event_loop::EventLoopProxy;
@@ -25,7 +30,8 @@ const MAX_RESOURCE_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct PluginGraphicsBridge {
     shared: Arc<Mutex<GraphicsState>>,
-    text: Arc<Mutex<TextSystem>>,
+    text_layout: Arc<Mutex<FontSystem>>,
+    glyph_raster_tx: Sender<GlyphRasterRequest>,
     proxy: EventLoopProxy<ClientEvent>,
 }
 
@@ -51,6 +57,7 @@ pub struct GraphicsSnapshot {
     pub packet: Packet,
     pub images: BTreeMap<u64, ImageResource>,
     pub text_layouts: BTreeMap<u64, TextLayoutResource>,
+    pub glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,15 +79,65 @@ struct PaneScene {
 struct TextSystem {
     fonts: FontSystem,
     swash: SwashCache,
+    glyphs: BTreeMap<GlyphCacheKey, Option<GlyphImageResource>>,
+}
+
+#[derive(Debug)]
+struct GlyphRasterRequest {
+    handle: u64,
+    pane: u64,
+    generation: u64,
+    text: String,
+    options: TextLayoutOptions,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct TextLayoutResource {
-    pub pane: u64,
-    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub glyphs: Arc<[GlyphSprite]>,
+    pub glyph_images: BTreeMap<GlyphCacheKey, GlyphImageResource>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GlyphCacheKey {
+    cache_key: CacheKey,
+    color: [u8; 4],
+}
+
+#[derive(Clone, Debug)]
+pub struct GlyphImageResource {
     pub width: u32,
     pub height: u32,
     pub linear_premultiplied_rgba8: Arc<[u8]>,
+    left: i32,
+    top: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GlyphSprite {
+    pub key: GlyphCacheKey,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug)]
+struct TextLayoutEntry {
+    pane: u64,
+    generation: u64,
+    width: u32,
+    height: u32,
+    byte_len: usize,
+    state: TextLayoutState,
+}
+
+#[derive(Debug)]
+enum TextLayoutState {
+    Pending,
+    Ready(TextLayoutResource),
+    Failed,
 }
 
 #[derive(Debug, Default)]
@@ -89,22 +146,24 @@ struct GraphicsState {
     next_resource: u64,
     panes: BTreeMap<u64, PaneScene>,
     images: BTreeMap<u64, ImageResource>,
-    text_layouts: BTreeMap<u64, TextLayoutResource>,
+    text_layouts: BTreeMap<u64, TextLayoutEntry>,
 }
 
-type ReferencedResources = (
-    BTreeMap<u64, ImageResource>,
-    BTreeMap<u64, TextLayoutResource>,
-);
+struct ReferencedResources {
+    images: BTreeMap<u64, ImageResource>,
+    text_layouts: BTreeMap<u64, TextLayoutResource>,
+    glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
+    ready: bool,
+}
 
 impl PluginGraphicsBridge {
     pub fn new(proxy: EventLoopProxy<ClientEvent>) -> Self {
+        let shared = Arc::new(Mutex::new(GraphicsState::default()));
+        let glyph_raster_tx = start_glyph_raster_worker(shared.clone(), proxy.clone());
         Self {
-            shared: Arc::new(Mutex::new(GraphicsState::default())),
-            text: Arc::new(Mutex::new(TextSystem {
-                fonts: FontSystem::new(),
-                swash: SwashCache::new(),
-            })),
+            shared,
+            text_layout: Arc::new(Mutex::new(FontSystem::new())),
+            glyph_raster_tx,
             proxy,
         }
     }
@@ -125,19 +184,128 @@ impl PluginGraphicsBridge {
         let Some(scene) = state.panes.get(&pane) else {
             return Ok(None);
         };
-        let (images, text_layouts) =
-            referenced_resources(&state, pane, scene.generation, &scene.packet)
-                .map_err(|_error| anyhow!("accepted packet lost a referenced resource"))?;
+        let resources = referenced_resources(&state, pane, scene.generation, &scene.packet)
+            .map_err(|_error| anyhow!("accepted packet lost a referenced resource"))?;
+        if !resources.ready {
+            return Ok(None);
+        }
         let snapshot = GraphicsSnapshot {
             pane,
             sequence: scene.sequence,
             packet: scene.packet.clone(),
-            images,
-            text_layouts,
+            images: resources.images,
+            text_layouts: resources.text_layouts,
+            glyphs: resources.glyphs,
         };
         drop(state);
         Ok(Some(snapshot))
     }
+}
+
+fn start_glyph_raster_worker(
+    shared: Arc<Mutex<GraphicsState>>,
+    proxy: EventLoopProxy<ClientEvent>,
+) -> Sender<GlyphRasterRequest> {
+    let (sender, receiver) = mpsc::channel::<GlyphRasterRequest>();
+    let spawn_result = thread::Builder::new()
+        .name("manifold-glyph-raster".to_owned())
+        .spawn(move || {
+            let mut text_system = TextSystem {
+                fonts: FontSystem::new(),
+                swash: SwashCache::new(),
+                glyphs: BTreeMap::new(),
+            };
+            while let Ok(request) = receiver.recv() {
+                let started = Instant::now();
+                let pane = request.pane;
+                let handle = request.handle;
+                let result =
+                    create_text_layout_plan(&mut text_system.fonts, &request.text, request.options)
+                        .and_then(|plan| {
+                            if plan.width != request.width || plan.height != request.height {
+                                return Err(PresentationError::HostFailure);
+                            }
+                            rasterize_text_layout(&mut text_system, plan, request.options)
+                        });
+                let elapsed = started.elapsed();
+                finish_glyph_raster(&shared, &proxy, request, result);
+                if std::env::var_os("MANIFOLD_TRACE_PLUGIN_TEXT").is_some()
+                    || elapsed.as_millis() >= 8
+                {
+                    eprintln!(
+                        "plugin glyph raster pane={pane} handle={handle} time_us={}",
+                        elapsed.as_micros()
+                    );
+                }
+            }
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("failed to start plugin glyph raster worker: {error}");
+    }
+    sender
+}
+
+fn finish_glyph_raster(
+    shared: &Mutex<GraphicsState>,
+    proxy: &EventLoopProxy<ClientEvent>,
+    request: GlyphRasterRequest,
+    result: Result<TextLayoutResource, PresentationError>,
+) {
+    let notification = {
+        let Ok(mut state) = shared.lock() else {
+            return;
+        };
+        let Some(entry) = state.text_layouts.get_mut(&request.handle) else {
+            return;
+        };
+        if entry.pane != request.pane || entry.generation != request.generation {
+            return;
+        }
+        match result {
+            Ok(resource) if resource.width == entry.width && resource.height == entry.height => {
+                entry.state = TextLayoutState::Ready(resource);
+            }
+            Ok(_) | Err(_) => {
+                entry.state = TextLayoutState::Failed;
+                eprintln!(
+                    "plugin glyph raster failed pane={} handle={}",
+                    request.pane, request.handle
+                );
+                return;
+            }
+        }
+        let Some(scene) = state.panes.get(&request.pane) else {
+            return;
+        };
+        if scene.generation != request.generation
+            || !packet_references_text_layout(&scene.packet, request.handle)
+        {
+            return;
+        }
+        match referenced_resources(&state, request.pane, request.generation, &scene.packet) {
+            Ok(resources) if resources.ready => Some(scene.sequence),
+            Ok(_) | Err(_) => None,
+        }
+    };
+    if let Some(sequence) = notification
+        && proxy
+            .send_event(ClientEvent::PluginGraphicsChanged {
+                pane: request.pane,
+                sequence,
+            })
+            .is_err()
+    {
+        eprintln!(
+            "failed to publish ready plugin text scene pane={} sequence={sequence}",
+            request.pane
+        );
+    }
+}
+
+fn packet_references_text_layout(packet: &Packet, handle: u64) -> bool {
+    packet.commands.iter().any(
+        |command| matches!(command, Command::DrawTextLayout { layout, .. } if *layout == handle),
+    )
 }
 
 impl ActorPresentationHost {
@@ -174,7 +342,7 @@ impl PresentationHost for ActorPresentationHost {
             PacketError::Limit(_) => PresentationError::LimitReached,
             PacketError::Invalid(_) => PresentationError::InvalidPacket,
         })?;
-        let (images, text_layouts) = {
+        let resources = {
             let state = self
                 .bridge
                 .shared
@@ -189,12 +357,13 @@ impl PresentationHost for ActorPresentationHost {
             pane,
             sequence: 0,
             packet,
-            images,
-            text_layouts,
+            images: resources.images,
+            text_layouts: resources.text_layouts,
+            glyphs: resources.glyphs,
         };
         crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
         let packet = candidate.packet;
-        let (sequence, previous) = {
+        let (sequence, previous, ready) = {
             let mut state = self
                 .bridge
                 .shared
@@ -203,7 +372,7 @@ impl PresentationHost for ActorPresentationHost {
             if actor_generation != self.generation.load(Ordering::Acquire) {
                 return Err(PresentationError::InvalidPane);
             }
-            referenced_resources(&state, pane, actor_generation, &packet)?;
+            let resources = referenced_resources(&state, pane, actor_generation, &packet)?;
             state.next_sequence = state
                 .next_sequence
                 .checked_add(1)
@@ -218,13 +387,14 @@ impl PresentationHost for ActorPresentationHost {
                 },
             );
             drop(state);
-            (sequence, previous)
+            (sequence, previous, resources.ready)
         };
-        if self
-            .bridge
-            .proxy
-            .send_event(ClientEvent::PluginGraphicsChanged { pane, sequence })
-            .is_err()
+        if ready
+            && self
+                .bridge
+                .proxy
+                .send_event(ClientEvent::PluginGraphicsChanged { pane, sequence })
+                .is_err()
         {
             if let Ok(mut state) = self.bridge.shared.lock() {
                 match previous {
@@ -309,13 +479,14 @@ impl PresentationHost for ActorPresentationHost {
     ) -> Result<TextLayoutResult, PresentationError> {
         self.authorize(actor_generation, pane)?;
         validate_text_request(&text, options)?;
-        let (resource, metrics) = {
-            let mut text_system = self
+        let started = Instant::now();
+        let plan = {
+            let mut fonts = self
                 .bridge
-                .text
+                .text_layout
                 .lock()
                 .map_err(|_poisoned| PresentationError::HostFailure)?;
-            create_text_layout(&mut text_system, &text, options)?
+            create_text_layout_plan(&mut fonts, &text, options)?
         };
         let mut state = self
             .bridge
@@ -325,22 +496,46 @@ impl PresentationHost for ActorPresentationHost {
         if actor_generation != self.generation.load(Ordering::Acquire) {
             return Err(PresentationError::InvalidPane);
         }
-        let handle = allocate_resource_handle(
-            &mut state,
-            pane,
-            actor_generation,
-            resource.linear_premultiplied_rgba8.len(),
-        )?;
+        let handle = allocate_resource_handle(&mut state, pane, actor_generation, plan.byte_len)?;
         state.text_layouts.insert(
             handle,
-            TextLayoutResource {
+            TextLayoutEntry {
                 pane,
                 generation: actor_generation,
-                ..resource
+                width: plan.width,
+                height: plan.height,
+                byte_len: plan.byte_len,
+                state: TextLayoutState::Pending,
             },
         );
         drop(state);
-        Ok(TextLayoutResult { handle, ..metrics })
+        let request = GlyphRasterRequest {
+            handle,
+            pane,
+            generation: actor_generation,
+            text,
+            options,
+            width: plan.width,
+            height: plan.height,
+        };
+        if self.bridge.glyph_raster_tx.send(request).is_err() {
+            if let Ok(mut state) = self.bridge.shared.lock() {
+                state.text_layouts.remove(&handle);
+            }
+            return Err(PresentationError::HostFailure);
+        }
+        let elapsed = started.elapsed();
+        if std::env::var_os("MANIFOLD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "plugin text layout pane={pane} handle={handle} bytes={} time_us={}",
+                plan.byte_len,
+                elapsed.as_micros(),
+            );
+        }
+        Ok(TextLayoutResult {
+            handle,
+            ..plan.metrics
+        })
     }
 
     fn drop_resource(
@@ -393,6 +588,8 @@ fn referenced_resources(
 ) -> Result<ReferencedResources, PresentationError> {
     let mut images = BTreeMap::new();
     let mut text_layouts = BTreeMap::new();
+    let mut glyphs = BTreeMap::new();
+    let mut ready = true;
     for command in &packet.commands {
         match command {
             Command::DrawImage { image, .. } => {
@@ -404,17 +601,38 @@ fn referenced_resources(
                 images.insert(*image, resource.clone());
             }
             Command::DrawTextLayout { layout, .. } => {
-                let resource = state
+                let entry = state
                     .text_layouts
                     .get(layout)
-                    .filter(|resource| resource.pane == pane && resource.generation == generation)
+                    .filter(|entry| entry.pane == pane && entry.generation == generation)
                     .ok_or(PresentationError::InvalidResource)?;
-                text_layouts.insert(*layout, resource.clone());
+                let resource = match &entry.state {
+                    TextLayoutState::Pending => {
+                        ready = false;
+                        TextLayoutResource {
+                            width: entry.width,
+                            height: entry.height,
+                            glyphs: Arc::from([]),
+                            glyph_images: BTreeMap::new(),
+                        }
+                    }
+                    TextLayoutState::Ready(resource) => {
+                        glyphs.extend(resource.glyph_images.clone());
+                        resource.clone()
+                    }
+                    TextLayoutState::Failed => return Err(PresentationError::HostFailure),
+                };
+                text_layouts.insert(*layout, resource);
             }
             _ => {}
         }
     }
-    Ok((images, text_layouts))
+    Ok(ReferencedResources {
+        images,
+        text_layouts,
+        glyphs,
+        ready,
+    })
 }
 
 impl Drop for ActorPresentationHost {
@@ -462,7 +680,7 @@ fn allocate_resource_handle(
                 .text_layouts
                 .values()
                 .filter(|resource| resource.pane == pane && resource.generation == generation)
-                .map(|resource| resource.linear_premultiplied_rgba8.len()),
+                .map(|resource| resource.byte_len),
         )
         .try_fold(0_usize, usize::checked_add)
         .and_then(|bytes| bytes.checked_add(new_bytes))
@@ -498,18 +716,23 @@ fn validate_text_request(text: &str, options: TextLayoutOptions) -> Result<(), P
     Ok(())
 }
 
-fn create_text_layout(
-    text_system: &mut TextSystem,
+struct TextLayoutPlan {
+    buffer: Buffer,
+    metrics: TextLayoutResult,
+    width: u32,
+    height: u32,
+    byte_len: usize,
+}
+
+fn create_text_layout_plan(
+    fonts: &mut FontSystem,
     text: &str,
     options: TextLayoutOptions,
-) -> Result<(TextLayoutResource, TextLayoutResult), PresentationError> {
-    let mut buffer = Buffer::new(
-        &mut text_system.fonts,
-        Metrics::new(options.font_size, options.line_height),
-    );
+) -> Result<TextLayoutPlan, PresentationError> {
+    let mut buffer = Buffer::new(fonts, Metrics::new(options.font_size, options.line_height));
     buffer.set_size(Some(options.max_width), None);
     buffer.set_text(text, &Attrs::new(), Shaping::Advanced, None);
-    buffer.shape_until_scroll(&mut text_system.fonts, false);
+    buffer.shape_until_scroll(fonts, false);
 
     let mut measured_width = 0.0_f32;
     let mut measured_height = 0.0_f32;
@@ -540,67 +763,128 @@ fn create_text_layout(
     if bytes > MAX_TEXT_LAYOUT_BYTES {
         return Err(PresentationError::LimitReached);
     }
-    let mut pixels = vec![0_u8; bytes];
-    let [red, green, blue, alpha] = options.color;
-    let text_color = TextColor::rgba(
-        unit_to_u8(red),
-        unit_to_u8(green),
-        unit_to_u8(blue),
-        u8::MAX,
-    );
-    let TextSystem { fonts, swash } = text_system;
-    buffer.draw(
-        fonts,
-        swash,
-        text_color,
-        |x, y, rect_width, rect_height, color| {
-            for row in 0..rect_height {
-                for column in 0..rect_width {
-                    let pixel_x = x.saturating_add(i32::try_from(column).unwrap_or(i32::MAX));
-                    let pixel_y = y.saturating_add(i32::try_from(row).unwrap_or(i32::MAX));
-                    if pixel_x < 0 || pixel_y < 0 {
-                        continue;
-                    }
-                    let Some(offset) = usize::try_from(pixel_y)
-                        .ok()
-                        .and_then(|pixel_y| pixel_y.checked_mul(width as usize))
-                        .and_then(|row_offset| {
-                            usize::try_from(pixel_x)
-                                .ok()
-                                .and_then(|pixel_x| row_offset.checked_add(pixel_x))
-                        })
-                        .filter(|pixel| *pixel < (width as usize).saturating_mul(height as usize))
-                        .and_then(|pixel| pixel.checked_mul(4))
-                    else {
-                        continue;
-                    };
-                    let Some(destination) = pixels.get_mut(offset..offset.saturating_add(4)) else {
-                        continue;
-                    };
-                    let Ok(destination) = <&mut [u8; 4]>::try_from(destination) else {
-                        continue;
-                    };
-                    blend_text_pixel(destination, color, alpha);
-                }
-            }
-        },
-    );
-    Ok((
-        TextLayoutResource {
-            pane: 0,
-            generation: 0,
-            width,
-            height,
-            linear_premultiplied_rgba8: pixels.into(),
-        },
-        TextLayoutResult {
+    Ok(TextLayoutPlan {
+        buffer,
+        metrics: TextLayoutResult {
             handle: 0,
             width: measured_width,
             height: measured_height.max(options.line_height),
             first_baseline,
             line_count,
         },
-    ))
+        width,
+        height,
+        byte_len: bytes,
+    })
+}
+
+fn rasterize_text_layout(
+    text_system: &mut TextSystem,
+    plan: TextLayoutPlan,
+    options: TextLayoutOptions,
+) -> Result<TextLayoutResource, PresentationError> {
+    let requested_color = options.color.map(unit_to_u8);
+    let positioned = plan
+        .buffer
+        .layout_runs()
+        .flat_map(|run| {
+            run.glyphs.iter().map(move |glyph| {
+                let physical = glyph.physical((0.0, run.line_y), 1.0);
+                (physical.cache_key, physical.x, physical.y)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut sprites = Vec::with_capacity(positioned.len());
+    let mut glyph_images = BTreeMap::new();
+    for (cache_key, x, y) in positioned {
+        let key = GlyphCacheKey {
+            cache_key,
+            color: requested_color,
+        };
+        if !text_system.glyphs.contains_key(&key) {
+            let rendered = text_system
+                .swash
+                .get_image(&mut text_system.fonts, cache_key)
+                .as_ref()
+                .and_then(|image| glyph_image_resource(image, requested_color));
+            text_system.glyphs.insert(key, rendered);
+        }
+        let Some(image) = text_system.glyphs.get(&key).cloned().flatten() else {
+            continue;
+        };
+        sprites.push(GlyphSprite {
+            key,
+            x: x.saturating_add(image.left),
+            y: y.saturating_sub(image.top),
+        });
+        glyph_images.insert(key, image);
+    }
+    Ok(TextLayoutResource {
+        width: plan.width,
+        height: plan.height,
+        glyphs: sprites.into(),
+        glyph_images,
+    })
+}
+
+fn glyph_image_resource(
+    image: &cosmic_text::SwashImage,
+    requested_color: [u8; 4],
+) -> Option<GlyphImageResource> {
+    let width = image.placement.width;
+    let height = image.placement.height;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixel_count = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    let mut pixels = Vec::with_capacity(pixel_count.checked_mul(4)?);
+    match image.content {
+        SwashContent::Mask => {
+            if image.data.len() != pixel_count {
+                return None;
+            }
+            for coverage in &image.data {
+                pixels.extend_from_slice(&premultiplied_glyph_color(requested_color, *coverage));
+            }
+        }
+        SwashContent::Color => {
+            if image.data.len() != pixel_count.checked_mul(4)? {
+                return None;
+            }
+            for source in image.data.chunks_exact(4) {
+                let source = <[u8; 4]>::try_from(source).ok()?;
+                let opacity = unit_to_u8(
+                    f32::from(source[3]) / 255.0 * f32::from(requested_color[3]) / 255.0,
+                );
+                pixels.extend_from_slice(&linear_premultiplied_srgba8([
+                    source[0], source[1], source[2], opacity,
+                ]));
+            }
+        }
+        SwashContent::SubpixelMask => {
+            if image.data.len() != pixel_count.checked_mul(4)? {
+                return None;
+            }
+            for source in image.data.chunks_exact(4) {
+                let coverage = source[..3].iter().copied().max().unwrap_or(0);
+                pixels.extend_from_slice(&premultiplied_glyph_color(requested_color, coverage));
+            }
+        }
+    }
+    Some(GlyphImageResource {
+        width,
+        height,
+        linear_premultiplied_rgba8: pixels.into(),
+        left: image.placement.left,
+        top: image.placement.top,
+    })
+}
+
+fn premultiplied_glyph_color(color: [u8; 4], coverage: u8) -> [u8; 4] {
+    let alpha = unit_to_u8(f32::from(color[3]) / 255.0 * f32::from(coverage) / 255.0);
+    linear_premultiplied_srgba8([color[0], color[1], color[2], alpha])
 }
 
 fn unit_to_u8(value: f32) -> u8 {
@@ -625,15 +909,75 @@ fn linear_premultiplied_srgba8([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
     ]
 }
 
-fn blend_text_pixel(destination: &mut [u8; 4], color: TextColor, requested_alpha: f32) {
-    let [red, green, blue, alpha] = color.as_rgba();
-    let opacity = f32::from(alpha) / 255.0 * requested_alpha;
-    let inverse = 1.0 - opacity;
-    let premultiplied =
-        [red, green, blue].map(|channel| srgb_to_linear(f32::from(channel) / 255.0) * opacity);
-    let [red, green, blue, output_alpha] = destination;
-    for (output, source) in [red, green, blue].into_iter().zip(premultiplied) {
-        *output = unit_to_u8((f32::from(*output) / 255.0).mul_add(inverse, source));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_packet(handles: &[u64]) -> Packet {
+        let mut packet = Packet::new();
+        for handle in handles {
+            packet.push(Command::DrawTextLayout {
+                layout: *handle,
+                x: 0.0,
+                y: 0.0,
+            });
+        }
+        packet
     }
-    *output_alpha = unit_to_u8((f32::from(*output_alpha) / 255.0).mul_add(inverse, opacity));
+
+    fn pending_text_entry() -> TextLayoutEntry {
+        TextLayoutEntry {
+            pane: 7,
+            generation: 11,
+            width: 1,
+            height: 1,
+            byte_len: 4,
+            state: TextLayoutState::Pending,
+        }
+    }
+
+    fn ready_text_layout() -> TextLayoutResource {
+        TextLayoutResource {
+            width: 1,
+            height: 1,
+            glyphs: Arc::from([]),
+            glyph_images: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn pending_text_dependencies_hold_a_scene_until_all_are_ready() {
+        let mut state = GraphicsState::default();
+        state.text_layouts.insert(1, pending_text_entry());
+        state.text_layouts.insert(2, pending_text_entry());
+        let packet = text_packet(&[1, 2]);
+
+        let pending =
+            referenced_resources(&state, 7, 11, &packet).expect("pending handles resolve");
+        assert!(!pending.ready);
+
+        state.text_layouts.get_mut(&1).unwrap().state = TextLayoutState::Ready(ready_text_layout());
+        let partly_ready =
+            referenced_resources(&state, 7, 11, &packet).expect("ready handle resolves");
+        assert!(!partly_ready.ready);
+
+        state.text_layouts.get_mut(&2).unwrap().state = TextLayoutState::Ready(ready_text_layout());
+        let ready = referenced_resources(&state, 7, 11, &packet).expect("all handles resolve");
+        assert!(ready.ready);
+        assert_eq!(ready.text_layouts.len(), 2);
+        assert!(ready.glyphs.is_empty());
+    }
+
+    #[test]
+    fn failed_text_dependency_rejects_the_scene() {
+        let mut state = GraphicsState::default();
+        let mut entry = pending_text_entry();
+        entry.state = TextLayoutState::Failed;
+        state.text_layouts.insert(1, entry);
+
+        assert!(matches!(
+            referenced_resources(&state, 7, 11, &text_packet(&[1])),
+            Err(PresentationError::HostFailure)
+        ));
+    }
 }
