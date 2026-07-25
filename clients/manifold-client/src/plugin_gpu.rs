@@ -19,7 +19,7 @@ use manifold_wasm::PresentationError;
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-use crate::plugin_graphics::{GraphicsSnapshot, ImageResource, TextLayoutResource};
+use crate::plugin_graphics::{GlyphCacheKey, GlyphImageResource, GraphicsSnapshot, ImageResource};
 
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const RESOURCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -81,6 +81,7 @@ struct Geometry {
 enum DrawSource {
     White,
     Resource(u64),
+    Glyph(GlyphCacheKey),
     Layer(usize),
 }
 
@@ -166,6 +167,7 @@ pub struct GpuCanvasRenderer {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     white: GpuTexture,
+    glyphs: BTreeMap<GlyphCacheKey, GpuTexture>,
     clip_pipeline: wgpu::RenderPipeline,
     source_over_pipeline: wgpu::RenderPipeline,
     screen_pipeline: wgpu::RenderPipeline,
@@ -306,6 +308,7 @@ impl GpuCanvasRenderer {
             texture_layout: texture_layout.clone(),
             sampler: sampler.clone(),
             white,
+            glyphs: BTreeMap::new(),
             clip_pipeline,
             source_over_pipeline,
             screen_pipeline,
@@ -319,7 +322,7 @@ impl GpuCanvasRenderer {
     }
 
     pub fn compile(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         snapshot: &GraphicsSnapshot,
@@ -369,14 +372,11 @@ impl GpuCanvasRenderer {
                     .unwrap_or_else(|| self.upload_image(device, queue, *handle, resource)),
             );
         }
-        for (handle, resource) in &snapshot.text_layouts {
-            resources.insert(
-                *handle,
-                previous
-                    .and_then(|scene| scene.resources.get(handle))
-                    .cloned()
-                    .unwrap_or_else(|| self.upload_text(device, queue, *handle, resource)),
-            );
+        for (key, resource) in &snapshot.glyphs {
+            if !self.glyphs.contains_key(key) {
+                let texture = self.upload_glyph(device, queue, key, resource);
+                self.glyphs.insert(*key, texture);
+            }
         }
         let reusable = previous.filter(|scene| scene.width == width && scene.height == height);
         let root = reusable.map_or_else(
@@ -583,6 +583,11 @@ impl GpuCanvasRenderer {
                 .get(handle)
                 .map(|resource| &resource.bind_group)
                 .with_context(|| format!("plugin GPU resource {handle} disappeared")),
+            DrawSource::Glyph(key) => self
+                .glyphs
+                .get(key)
+                .map(|resource| &resource.bind_group)
+                .with_context(|| format!("plugin GPU glyph {key:?} disappeared")),
             DrawSource::Layer(layer) => scene
                 .layers
                 .get(*layer)
@@ -622,12 +627,12 @@ impl GpuCanvasRenderer {
         )
     }
 
-    fn upload_text(
+    fn upload_glyph(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        handle: u64,
-        resource: &TextLayoutResource,
+        key: &GlyphCacheKey,
+        resource: &GlyphImageResource,
     ) -> GpuTexture {
         upload_texture(
             device,
@@ -636,7 +641,7 @@ impl GpuCanvasRenderer {
             &self.sampler,
             (resource.width, resource.height),
             &resource.linear_premultiplied_rgba8,
-            &format!("plugin GPU text layout {handle}"),
+            &format!("plugin GPU glyph {key:?}"),
         )
     }
 
@@ -832,13 +837,26 @@ impl SceneCompiler {
                     let resource = snapshot.text_layouts.get(layout).ok_or_else(|| {
                         SceneCompileError::Invalid(format!("text layout {layout} is unavailable"))
                     })?;
-                    let geometry = self.quad_geometry(
-                        Rect::new(*x, *y, resource.width as f32, resource.height as f32),
-                        state.transform,
-                        [state.opacity; 4],
-                        false,
-                    )?;
-                    self.push_draw(geometry, DrawSource::Resource(*layout), &state);
+                    for glyph in resource.glyphs.iter() {
+                        let image = snapshot.glyphs.get(&glyph.key).ok_or_else(|| {
+                            SceneCompileError::Invalid(format!(
+                                "text layout {layout} glyph {:?} is unavailable",
+                                glyph.key
+                            ))
+                        })?;
+                        let geometry = self.quad_geometry(
+                            Rect::new(
+                                *x + glyph.x as f32,
+                                *y + glyph.y as f32,
+                                image.width as f32,
+                                image.height as f32,
+                            ),
+                            state.transform,
+                            [state.opacity; 4],
+                            false,
+                        )?;
+                        self.push_draw(geometry, DrawSource::Glyph(glyph.key), &state);
+                    }
                 }
                 Command::BeginLayer => {
                     let layer = layers.len();
