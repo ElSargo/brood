@@ -1,13 +1,13 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
-use exports::manifold::plugin::actor::{Command, Event, Guest, WorkerRequest};
-use manifold::plugin::host;
+use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
+use brood::plugin::host;
 
 const WORKER: u64 = 1;
-const REPORT: &str = ".manifold/component-workspace-watch.md";
+const REPORT: &str = ".brood/component-workspace-watch.md";
 
 struct ComponentWorkspaceWatch;
 

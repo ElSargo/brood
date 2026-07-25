@@ -4,13 +4,13 @@ type: concept
 authority: implementation
 last-reviewed: 2026-07-01
 code-links:
-  - crates/manifoldd/src/session_runner.rs
-  - crates/manifoldd/src/bin/manifold-runner-nix-develop.rs
+  - crates/broodd/src/session_runner.rs
+  - crates/broodd/src/bin/brood-runner-nix-develop.rs
 ---
 
 # Session Runner
 
-A session runner activates a project environment before Manifold starts a session server or entered command.
+A session runner activates a project environment before Brood starts a session server or entered command.
 
 Current runner ABI:
 
@@ -40,7 +40,7 @@ Current built-in runner:
 
 Runner discovery currently walks upward from the command cwd:
 
-- an enabled `[session.runner]` in `manifold.toml` wins
+- an enabled `[session.runner]` in `brood.toml` wins
 - `enabled = false` disables runner discovery for that project
 - otherwise `flake.nix` synthesizes a `nix-develop` runner
 

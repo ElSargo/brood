@@ -2,16 +2,16 @@
 
 This Preview 1 compatibility plugin creates two logical watches of the workspace
 mounted at `.`. Independent workers append the same observable changes to
-`.manifold/workspace-file-log.log` and
-`.manifold/workspace-file-log.mirror.log`. The primary worker also maintains the
+`.brood/workspace-file-log.log` and
+`.brood/workspace-file-log.mirror.log`. The primary worker also maintains the
 human-readable, sorted workspace model
-`.manifold/workspace-file-index.tsv`.
+`.brood/workspace-file-index.tsv`.
 
 The actor handles its `start` mailbox message by creating a capability-rooted
 host watches and spawning one worker for each. Each worker performs one ordinary WASI scan
 for `initial` records, then sleeps in the watch notification's host pollable.
 Native watch batches record `created`, `modified`, or `removed`; no periodic
-rescan is used. `.git`, `.direnv`, `.manifold`, and `target` are excluded so
+rescan is used. `.git`, `.direnv`, `.brood`, and `target` are excluded so
 repository metadata, the log itself, and build output do not feed the watcher.
 The line-oriented Preview 1 batch keeps ordinary ASCII paths readable and
 represents all other native path bytes with reversible `%HH` escapes.
@@ -32,11 +32,11 @@ Both workers' native watch events exercise independent notification lanes and
 bounded logical queues. `status-json` exposes two subscriptions backed by one
 native registration, while the two real logs demonstrate that both consumers
 remain useful; the proof also preserves those live counts in
-`.manifold/workspace-file-log.watch-status.json` for inspection after the
+`.brood/workspace-file-log.watch-status.json` for inspection after the
 headless server exits. This is the observable deduplication proof. A `snapshot`
 mailbox message separately makes the actor submit a completion read of the live
 log. Its read-completion handler submits the returned bytes as a completion
-write to `.manifold/workspace-file-log.snapshot`. The actor verifies the write
+write to `.brood/workspace-file-log.snapshot`. The actor verifies the write
 completion while its long-lived watcher worker remains active. This deliberately
 uses actor completion I/O rather than the worker's ordinary WASI filesystem.
 
@@ -55,7 +55,7 @@ An acceptance workload leaves the observed workspace under its reported path.
 Inspect both workspace file logs: their `initial`, `created`, `modified`, and
 `removed` records are the watch proof. The controller also checks the live server's one
 native registration and two logical subscriptions, then sends `snapshot` and
-checks that `.manifold/workspace-file-log.snapshot` is a nonempty byte-for-byte
+checks that `.brood/workspace-file-log.snapshot` is a nonempty byte-for-byte
 prefix of the append-only log containing the observed create, modify, and remove
 records. It creates two invalid-UTF-8 names that lossy conversion would conflate;
 distinct `preview1-collision-%FF.txt` and `preview1-collision-%FE.txt` records in
@@ -94,7 +94,7 @@ absence of cross-workspace files and log records directly inspectable.
 The same workload is the typed lifecycle proof. Each start or stop hook captures
 the structured host context, delegates an append to a worker with ordinary WASI
 filesystem access, and reports lifecycle completion only after that worker
-finishes. `.manifold/workspace-file-lifecycle.log` records generation, reason,
+finishes. `.brood/workspace-file-lifecycle.log` records generation, reason,
 related session or generation, instance ID, guest root, and sorted manifest
 data. After the nested daemon exits the active workspace ends with
 `reason=shutdown`; stable hashes after exit prove the joined generation cannot
@@ -103,8 +103,8 @@ append afterward.
 The Preview 1 artifact also carries the compatibility half of the runtime-I/O
 proof. Its acceptance workload sends a dedicated worker a real loopback peer
 address and preserves
-`.manifold/preview1-runtime-io-transcript.md`. The report contains the
+`.brood/preview1-runtime-io-transcript.md`. The report contains the
 PATH-selected command, pipe stdin and transformed stdout, exit 7, PTY terminal
 checks and interaction, the peer response, and distinct timer wake order. The
 peer independently records both request and response in
-`.manifold/runtime-io-peer.log`.
+`.brood/runtime-io-peer.log`.

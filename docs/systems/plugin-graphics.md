@@ -81,7 +81,7 @@ semantic metadata, but it does not choose the host sequence.
 
 ## Packet Encoding
 
-The packet codec is Manifold-owned and independent of Rust or C structure
+The packet codec is Brood-owned and independent of Rust or C structure
 layout. It uses fixed-width little-endian fields, relative offsets, and explicit
 lengths. A packet contains a small header, a command sequence, and optional
 inline data such as path points, colors, transforms, and short strings.
@@ -286,7 +286,7 @@ editor(...)     -> guest document state + text layouts + selection drawing
 The presentation client delivers pane resize, focus, pointer, keyboard, text,
 IME, visibility, and frame events. The actor or SDK maps pane-local input onto
 its own component state and submits a replacement packet when the visible state
-changes. Manifold does not retain a component tree, patch widget nodes, preserve
+changes. Brood does not retain a component tree, patch widget nodes, preserve
 widget identity, or translate backend widget events.
 
 Accessibility is orthogonal to component implementation. A later or optional

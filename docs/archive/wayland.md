@@ -1,16 +1,16 @@
 # Nested Wayland
 
-Manifold currently hosts nested Wayland clients as managed apps in panes through the v1 `manifold` proof of concept.
+Brood currently hosts nested Wayland clients as managed apps in panes through the v1 `brood` proof of concept.
 
 ## Goal
 
-Applications launched inside a Manifold session should create panes through their Wayland windows, be arranged by the presentation surface, and survive presentation window close/reopen where possible.
+Applications launched inside a Brood session should create panes through their Wayland windows, be arranged by the presentation surface, and survive presentation window close/reopen where possible.
 
 ## Direction
 
-`manifold` owns the current nested Wayland compositor state. For the MVP, `manifold` also opens the local presentation window and imports/composites hosted Wayland app surfaces itself.
+`brood` owns the current nested Wayland compositor state. For the MVP, `brood` also opens the local presentation window and imports/composites hosted Wayland app surfaces itself.
 
-A separate presentation endpoint process is deferred until Manifold needs process isolation or multi-endpoint presentation.
+A separate presentation endpoint process is deferred until Brood needs process isolation or multi-endpoint presentation.
 
 The nested compositor should advertise a stable virtual output as part of the
 session runtime, even while no presentation surface is attached. `show` may
@@ -26,9 +26,9 @@ The preferred Linux path is DMA-BUF/EGL-compatible surface sharing so client sur
 ## Open Questions
 
 - Which Wayland protocols are required for a useful first version?
-- How much window management belongs to Manifold versus the nested client app?
+- How much window management belongs to Brood versus the nested client app?
 - How should input grabs, popups, drag-and-drop, clipboard, and IME work?
 - What is the fallback for unsupported drivers or limited host compositors?
 - How should the presentation window handle moving across monitors with different scale, size, and refresh rates while keeping nested clients correctly configured and frame-paced?
-- How should Manifold discover and update the presentation output refresh rate? A Shadertoy test in nested Chrome appeared capped at 60 fps even on a 180 Hz monitor. Temporarily advertising a fixed 180 Hz output did not uncap either the hybrid or software Chrome path, so pacing may also be constrained by the host presentation loop, host compositor, or Chrome's Wayland frame-callback/presentation timing behavior.
+- How should Brood discover and update the presentation output refresh rate? A Shadertoy test in nested Chrome appeared capped at 60 fps even on a 180 Hz monitor. Temporarily advertising a fixed 180 Hz output did not uncap either the hybrid or software Chrome path, so pacing may also be constrained by the host presentation loop, host compositor, or Chrome's Wayland frame-callback/presentation timing behavior.
 - Maximize, close, and hide/detach behavior need a focused lifecycle pass. In manual testing, maximizing the presentation window and using close/hide commands did not behave reliably after moving across displays.

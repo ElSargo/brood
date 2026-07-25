@@ -4,16 +4,16 @@ This page describes the nested-development and nested-testing target shape by de
 
 Current implementation details are included only where they affect usability.
 
-Manifold should be able to run and test a development instance inside a stable instance. This gives the project a realistic way to exercise input routing, frame pacing, screenshot capture, hot-reload behavior, and latency metrics with Manifold acting as both the outer workspace and the inner system under test.
+Brood should be able to run and test a development instance inside a stable instance. This gives the project a realistic way to exercise input routing, frame pacing, screenshot capture, hot-reload behavior, and latency metrics with Brood acting as both the outer workspace and the inner system under test.
 
 ## Shape
 
-The nested test topology uses two normal `manifold` processes:
+The nested test topology uses two normal `brood` processes:
 
 ```text
 host compositor
-  -> stable manifoldd presentation target
-    -> dev manifoldd presentation window as a stable hosted app
+  -> stable broodd presentation target
+    -> dev broodd presentation window as a stable hosted app
       -> dev nested client, test harness, or WASM-controlled app
 ```
 
@@ -29,7 +29,7 @@ Both instances expose their own DBus control endpoints:
 The first built-in orchestration path is:
 
 ```sh
-manifold test
+brood test
 ```
 
 This launches:
@@ -37,7 +37,7 @@ This launches:
 - an outer supervisor instance
 - an inner system-under-test instance hosted inside the outer instance
 
-`manifold test` defaults to the nested topology. `manifold test nested` is the explicit spelling for the same workflow.
+`brood test` defaults to the nested topology. `brood test nested` is the explicit spelling for the same workflow.
 
 This topology is the intended default test mode for behavior and graphics validation. The outer instance should be the authoritative end-to-end supervisor:
 
@@ -48,14 +48,14 @@ This topology is the intended default test mode for behavior and graphics valida
 
 By default the outer supervisor uses an attached offscreen presentation target, so the nested topology can start without a host-visible presentation window while still running composition, frame callbacks, capture, layout, focus, and nested Wayland behavior through the presentation path. The inner instance still attaches a normal presentation window into the outer nested compositor.
 
-When Manifold launches a hosted app, it sets `manifold_session` in that app's environment. If `manifold test` sees that marker, it treats the current Manifold session as the outer container and starts only the subject compositor. Use `manifold test nested --force-outer` when a test must create another explicit outer supervisor even though it is already running inside Manifold.
+When Brood launches a hosted app, it sets `brood_session` in that app's environment. If `brood test` sees that marker, it treats the current Brood session as the outer container and starts only the subject compositor. Use `brood test nested --force-outer` when a test must create another explicit outer supervisor even though it is already running inside Brood.
 
-For exact `manifold test nested` arguments, see `crates/manifoldd/src/main.rs`.
+For exact `brood test nested` arguments, see `crates/broodd/src/main.rs`.
 
 When the topology is running, the outer instance can proxy control requests to the inner instance:
 
 ```sh
-manifold ctl --dbus-name <outer-destination> nested-inner status-json
+brood ctl --dbus-name <outer-destination> nested-inner status-json
 ```
 
 For automated agent verification, this built-in CLI is the default path. Use it
@@ -65,7 +65,7 @@ test topology with an inner client command and a temporary artifact directory,
 then inspects the printed DBus control endpoints, status, logs, and debug dumps:
 
 ```sh
-nix develop --command cargo run -- test nested --out-dir /tmp/manifold-test --inner-command 'weston-simple-egl -f'
+nix develop --command cargo run -- test nested --out-dir /tmp/brood-test --inner-command 'weston-simple-egl -f'
 ```
 
 Use `--keep-running` only when the verification script also cleans up the
@@ -97,7 +97,7 @@ exec stdbuf -oL -eL weston-eventdemo \
 ```
 
 The wrapper runs as the hosted client process. It inherits the subject
-compositor's nested Wayland environment from Manifold, so it does not need to
+compositor's nested Wayland environment from Brood, so it does not need to
 discover or set `WAYLAND_DISPLAY` itself unless the test is intentionally
 overriding that environment.
 
@@ -133,7 +133,7 @@ inline shell quoting to create the client process it wants to test.
 
 ## Success Criteria
 
-For `manifold test nested`, success starts with the command exiting zero, but a
+For `brood test nested`, success starts with the command exiting zero, but a
 useful behavior test should also validate the artifacts that match its topology:
 
 - outer-supervisor tests should record an outer debug dump, a nonempty composed
@@ -160,31 +160,31 @@ errors, or failed harness results as test failures.
 
 ## Headless Runtime
 
-`manifold run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and DBus control endpoint without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `manifold test` so the nesting policy can choose the right topology for the current environment.
+`brood run --headless` remains part of the runtime surface. It is for service-managed sessions that should expose a nested compositor and DBus control endpoint without being tied to a specific host presentation session. It is not the default behavior-test entry point; test workflows should go through `brood test` so the nesting policy can choose the right topology for the current environment.
 
 ## Harness
 
 Run:
 
 ```sh
-tools/dev-nested-manifold.sh --keep-running
+tools/dev-nested-brood.sh --keep-running
 ```
 
 This helper is the repo-local host-visible manual development harness. It starts the stable
-outer Manifold with a presentation window on the current desktop, then hosts the
-dev Manifold inside that window. Do not use it for automated no-host-window
-behavior tests; use `manifold test` for that.
+outer Brood with a presentation window on the current desktop, then hosts the
+dev Brood inside that window. Do not use it for automated no-host-window
+behavior tests; use `brood test` for that.
 
 The script:
 
-1. Builds `manifold`.
+1. Builds `brood`.
 2. Starts a stable instance on the real host display.
 3. Spawns a dev instance inside the stable instance.
 4. Waits for stable to map and render the dev presentation window.
 5. Spawns a real client inside the dev instance.
 6. Samples `status-json` from both instances.
 
-For exact helper-script arguments, see `tools/dev-nested-manifold.sh`.
+For exact helper-script arguments, see `tools/dev-nested-brood.sh`.
 
 The output directory contains:
 
@@ -200,7 +200,7 @@ There are two useful input paths:
 - Host or stable input into the dev presentation window, validating the full outer-to-inner routing path.
 - Direct dev DBus control endpoint injection, validating the inner compositor and client path without depending on outer hit testing.
 
-The long-term benchmark should drive both paths. The full-path benchmark proves Manifold can operate on itself. The direct inner benchmark keeps regressions easier to isolate.
+The long-term benchmark should drive both paths. The full-path benchmark proves Brood can operate on itself. The direct inner benchmark keeps regressions easier to isolate.
 
 ## Hot Reload Direction
 

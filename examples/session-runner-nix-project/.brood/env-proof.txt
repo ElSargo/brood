@@ -1,0 +1,4 @@
+BROOD_DUMMY_NIX_ENV=active
+BROOD_DUMMY_PROJECT_NAME=session-runner-nix-project
+BROOD_SESSION_PROJECT_DIR=/home/sargo/butter/brood-devenv/examples/session-runner-nix-project
+BROOD_SESSION_CACHE_DIR=/home/sargo/butter/brood-devenv/examples/session-runner-nix-project/.brood/cache/sessions/725106-1782597913999

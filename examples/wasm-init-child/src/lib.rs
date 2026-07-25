@@ -1,9 +1,9 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
-use exports::manifold::plugin::actor::{Command, Event, Guest};
+use exports::brood::plugin::actor::{Command, Event, Guest};
 
 struct ExampleChildActor;
 

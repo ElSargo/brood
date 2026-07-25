@@ -2,11 +2,11 @@
 
 This archived page was an earlier WASM design-target document. The current target plugin architecture is documented in [Plugin](../concepts/plugin.md), [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Actor](../systems/layout-actor.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md).
 
-It describes the intended Manifold app and module model as historical context, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
+It describes the intended Brood app and module model as historical context, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
 
-WASM is Manifold's planned fast-iteration layer for workspace behavior, built-in tools, user apps, extensions, and agents. Manifold should have a workspace and WASM app model; the open question is the exact shape, not whether this direction belongs in the project.
+WASM is Brood's planned fast-iteration layer for workspace behavior, built-in tools, user apps, extensions, and agents. Brood should have a workspace and WASM app model; the open question is the exact shape, not whether this direction belongs in the project.
 
-The integration should make behavior reloadable without rebuilding compositor internals, while preserving Manifold's core rule: authoritative workspace, session, and app state live behind the presentation surface, and presentation endpoints render the latest scene and surface state for one session at a time. More native, browser, and Wayland experiments are needed before freezing the API, ABI, runtime crate layout, or WIT package shape.
+The integration should make behavior reloadable without rebuilding compositor internals, while preserving Brood's core rule: authoritative workspace, session, and app state live behind the presentation surface, and presentation endpoints render the latest scene and surface state for one session at a time. More native, browser, and Wayland experiments are needed before freezing the API, ABI, runtime crate layout, or WIT package shape.
 
 ## Goals
 
@@ -28,13 +28,13 @@ The integration should make behavior reloadable without rebuilding compositor in
 
 ## Architectural Rule
 
-WASM modules talk to Manifold through a stable workspace/app API, not through compositor internals.
+WASM modules talk to Brood through a stable workspace/app API, not through compositor internals.
 
 This means the first useful milestone is not the WASM runtime itself. The first milestone is a native session model, with any needed workspace-level model around it, that can represent sessions, panes, pane producers, focus, commands, events, scene state, surface slots, and presentation requests independently from the current Smithay `Space<Window>` representation. Presentation layout, dragging, and animation belong to the presentation surface, not the producer model.
 
-The runtime then becomes an adapter over this model. Linux-native `manifold` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
+The runtime then becomes an adapter over this model. Linux-native `brood` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
-The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Manifold keeps the session process authoritative, uses actors as public mailbox and isolation domains, uses actor-scoped workers for shared-memory concurrency and blocking-looking WASI, and reserves policy providers for bounded pre-commit policy hooks that read immutable published state.
+The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Brood keeps the session process authoritative, uses actors as public mailbox and isolation domains, uses actor-scoped workers for shared-memory concurrency and blocking-looking WASI, and reserves policy providers for bounded pre-commit policy hooks that read immutable published state.
 
 The layout boundary is now defined in [Layout Actor](../systems/layout-actor.md). In short, the host sends state through an ordinary actor mailbox, the actor returns candidate resolved layout items through its ordinary host outbox, and the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
 
@@ -42,7 +42,7 @@ The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md
 
 The current UI experiment is recorded in [Session Switcher UI Experiment](../experiments/session-switcher-ui.md), with the target boundary summarized in [Plugin UI And Pane Rendering](../systems/plugin-ui.md). In short, components are guest SDK functions which emit canvas draw packets; the presentation client validates and renders the canvas without implementing a component ABI.
 
-The entered session environment model is recorded in [Session Environments](session-environments.md). In short, `manifold enter` should bind shells, commands, GUI apps, agents, and optional filesystem/network/DBus isolation layers to one session context.
+The entered session environment model is recorded in [Session Environments](session-environments.md). In short, `brood enter` should bind shells, commands, GUI apps, agents, and optional filesystem/network/DBus isolation layers to one session context.
 
 This boundary is recorded in [ADR 0005](../decisions/0005-wasm-through-workspace-api.md).
 
@@ -155,7 +155,7 @@ Capability families should start narrow:
 
 The broker should return explainable denial errors so failed experiments are easy to debug.
 
-Realm choice should not be treated as a separate hard security boundary. It primarily changes binding, lifecycle, and API ergonomics. Capability checks still apply at the operation level where Manifold needs them.
+Realm choice should not be treated as a separate hard security boundary. It primarily changes binding, lifecycle, and API ergonomics. Capability checks still apply at the operation level where Brood needs them.
 
 ### Event Bus
 
@@ -208,13 +208,13 @@ The first concrete command/API spike is documented in [WASM API Prototype](wasm-
 
 Candidate WIT packages:
 
-- `manifold:workspace`
-- `manifold:scene`
-- `manifold:events`
-- `manifold:storage`
-- `manifold:commands`
-- `manifold:host`
-- `manifold:agent`
+- `brood:workspace`
+- `brood:scene`
+- `brood:events`
+- `brood:storage`
+- `brood:commands`
+- `brood:host`
+- `brood:agent`
 
 Same-session apps should be able to communicate directly through host-mediated session APIs. Cross-session communication should require an explicit workspace-level grant or bridge.
 
@@ -262,7 +262,7 @@ A surface may switch which session it presents without recreating the surface-re
 
 ## Cross-Module Coordination
 
-Manifold should provide minimal built-in cross-module coordination primitives rather than forcing every interaction through a custom global broker.
+Brood should provide minimal built-in cross-module coordination primitives rather than forcing every interaction through a custom global broker.
 
 The initial built-ins should be:
 
@@ -292,8 +292,8 @@ The target usability is a host-managed load, reload, inspect, and unload loop fo
 
 Current usability note:
 
-- the exact currently implemented CLI entry points are defined in `crates/manifoldd/src/main.rs`
-- config-loaded startup modules are defined in `manifold.toml` and parsed in `crates/manifoldd/src/config.rs`
+- the exact currently implemented CLI entry points are defined in `crates/broodd/src/main.rs`
+- config-loaded startup modules are defined in `brood.toml` and parsed in `crates/broodd/src/config.rs`
 - the current runnable core-module paths are named actors, the synchronous key-decision lane, and the test harness; layout is ordinary actor traffic
 
 Reload policy should be explicit:
@@ -348,7 +348,7 @@ Validation:
 
 ### 3. Embed WASM Host On Linux Native
 
-Load a small WASM module in `manifold` and drive it through the workspace core.
+Load a small WASM module in `brood` and drive it through the workspace core.
 
 Minimum useful behavior:
 
@@ -360,7 +360,7 @@ Minimum useful behavior:
 
 Validation:
 
-- hot reload a trivial controller without restarting `manifold`
+- hot reload a trivial controller without restarting `brood`
 - hot reload a trivial WASM pane app and preserve pane identity
 - smoke test denial of an ungranted capability
 

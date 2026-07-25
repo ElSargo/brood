@@ -8,7 +8,7 @@ In this design, a realm is an API and lifetime contract for a WASM module instan
 
 ## Realm Kinds
 
-Manifold should support three realm kinds:
+Brood should support three realm kinds:
 
 - `global`
 - `session`
@@ -134,7 +134,7 @@ By contrast, operations on the bound session itself from the session realm shoul
 
 ## Coordination
 
-Manifold should provide a small built-in coordination layer rather than forcing all cross-realm interaction through a custom global broker.
+Brood should provide a small built-in coordination layer rather than forcing all cross-realm interaction through a custom global broker.
 
 The initial built-in primitives should be:
 

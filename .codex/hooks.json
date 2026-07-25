@@ -5,9 +5,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "first_prompt=\"$(python3 -c 'import json,sys; data=json.load(sys.stdin); value=data.get(\"prompt\") or data.get(\"userPrompt\") or \"\"; print(\" \".join(str(value).split())[:500])' 2>/dev/null || true)\"; if [ -n \"${MANIFOLD_PANE_ID:-}\" ] && [ -n \"${MANIFOLDD_DBUS_ADDRESS:-}\" ]; then busctl --quiet --address=\"$MANIFOLDD_DBUS_ADDRESS\" call \"${MANIFOLDD_DBUS_DESTINATION:-org.manifold.Session}\" /org/manifold/Agent org.manifold.Agent RegisterAgent \"sa{ss}\" codex 6 pane_id \"$MANIFOLD_PANE_ID\" status running cwd \"${PWD:-}\" source codex-hook surface_session \"${MANIFOLD_SURFACE_SESSION_ID:-1}\" first_user_message \"$first_prompt\" >/dev/null 2>&1 || true; fi",
+            "command": "first_prompt=\"$(python3 -c 'import json,sys; data=json.load(sys.stdin); value=data.get(\"prompt\") or data.get(\"userPrompt\") or \"\"; print(\" \".join(str(value).split())[:500])' 2>/dev/null || true)\"; if [ -n \"${BROOD_PANE_ID:-}\" ] && [ -n \"${BROODD_DBUS_ADDRESS:-}\" ]; then busctl --quiet --address=\"$BROODD_DBUS_ADDRESS\" call \"${BROODD_DBUS_DESTINATION:-org.brood.Session}\" /org/brood/Agent org.brood.Agent RegisterAgent \"sa{ss}\" codex 6 pane_id \"$BROOD_PANE_ID\" status running cwd \"${PWD:-}\" source codex-hook surface_session \"${BROOD_SURFACE_SESSION_ID:-1}\" first_user_message \"$first_prompt\" >/dev/null 2>&1 || true; fi",
             "timeout": 5,
-            "statusMessage": "Updating Manifold agent"
+            "statusMessage": "Updating Brood agent"
           }
         ]
       }
@@ -17,9 +17,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -n \"${MANIFOLD_PANE_ID:-}\" ] && [ -n \"${MANIFOLDD_DBUS_ADDRESS:-}\" ]; then busctl --quiet --address=\"$MANIFOLDD_DBUS_ADDRESS\" call \"${MANIFOLDD_DBUS_DESTINATION:-org.manifold.Session}\" /org/manifold/Agent org.manifold.Agent RegisterAgent \"sa{ss}\" codex 5 pane_id \"$MANIFOLD_PANE_ID\" status done cwd \"${PWD:-}\" source codex-hook surface_session \"${MANIFOLD_SURFACE_SESSION_ID:-1}\" >/dev/null 2>&1 || true; fi",
+            "command": "if [ -n \"${BROOD_PANE_ID:-}\" ] && [ -n \"${BROODD_DBUS_ADDRESS:-}\" ]; then busctl --quiet --address=\"$BROODD_DBUS_ADDRESS\" call \"${BROODD_DBUS_DESTINATION:-org.brood.Session}\" /org/brood/Agent org.brood.Agent RegisterAgent \"sa{ss}\" codex 5 pane_id \"$BROOD_PANE_ID\" status done cwd \"${PWD:-}\" source codex-hook surface_session \"${BROOD_SURFACE_SESSION_ID:-1}\" >/dev/null 2>&1 || true; fi",
             "timeout": 5,
-            "statusMessage": "Updating Manifold agent"
+            "statusMessage": "Updating Brood agent"
           }
         ]
       }

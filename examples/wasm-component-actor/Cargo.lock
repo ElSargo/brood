@@ -89,7 +89,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifold-component-actor-example"
+name = "brood-component-actor-example"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",

@@ -15,17 +15,17 @@ for tool in cargo grim magick pkg-config sway wasm-tools wtype; do
   fi
 done
 
-OUT="${MANIFOLD_CODING_AGENT_OUT:-$(mktemp -d /tmp/manifold-coding-agent.XXXXXX)}"
+OUT="${BROOD_CODING_AGENT_OUT:-$(mktemp -d /tmp/brood-coding-agent.XXXXXX)}"
 PACKAGE="$OUT/package"
 WORKSPACE="$OUT/workspace"
 RUNTIME_DIR="$OUT/runtime"
 COMPOSITOR_LOG="$OUT/compositor.log"
 SERVER_LOG="$OUT/server.log"
 CLIENT_LOG="$OUT/client.log"
-CONFIG="$OUT/manifold.toml"
+CONFIG="$OUT/brood.toml"
 SWAY_CONFIG="$OUT/sway.conf"
-DBUS_DESTINATION="org.manifold.CodingAgentTest.p$$"
-mkdir -p "$PACKAGE" "$WORKSPACE/.manifold" "$RUNTIME_DIR"
+DBUS_DESTINATION="org.brood.CodingAgentTest.p$$"
+mkdir -p "$PACKAGE" "$WORKSPACE/.brood" "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 git -C "$WORKSPACE" init -q
 
@@ -53,61 +53,61 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p manifoldd -p manifold-client --bins
+cargo build -p broodd -p brood-client --bins
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
 wasm-tools component new \
-  plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm \
-  --output "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
-wasm-tools validate "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
+  --output "$PACKAGE/brood_coding_agent_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_coding_agent_plugin.component.wasm"
 cargo build \
   --manifest-path examples/wasm-init-actor/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
 wasm-tools component new \
-  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm \
-  --output "$PACKAGE/manifold_wasm_init_actor_example.component.wasm"
-wasm-tools validate "$PACKAGE/manifold_wasm_init_actor_example.component.wasm"
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.wasm \
+  --output "$PACKAGE/brood_wasm_init_actor_example.component.wasm"
+wasm-tools validate "$PACKAGE/brood_wasm_init_actor_example.component.wasm"
 cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
 wasm-tools component new \
-  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
-  --output "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
-wasm-tools validate "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
+  --output "$PACKAGE/brood_session_switcher_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
-target/debug/manifold-client \
+target/debug/brood-client \
   --no-server \
   --wasm-key-policy workspace \
-  "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm" \
+  "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm" \
   --check-wasm-key-policy
 
 cat > "$CONFIG" <<EOF
 [init]
-session = "$PACKAGE/manifold_wasm_init_actor_example.component.wasm"
-client = "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
+session = "$PACKAGE/brood_wasm_init_actor_example.component.wasm"
+client = "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 
 [client.key-policy]
 provider = "workspace"
-path = "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
+path = "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm"
 EOF
 
-RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 (
   cd "$WORKSPACE"
-  env -u manifold_session \
+  env -u brood_session \
     RUST_LOG="$RUST_LOG" \
-    "$ROOT/target/debug/manifold-sessiond" \
+    "$ROOT/target/debug/brood-sessiond" \
     --headless \
     --config "$CONFIG" \
     --dbus-destination "$DBUS_DESTINATION" \
@@ -116,7 +116,7 @@ RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core
 SERVER_PID=$!
 
 ctl() {
-  env -u manifold_session target/debug/manifold ctl \
+  env -u brood_session target/debug/brood ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -160,15 +160,15 @@ for _ in $(seq 1 100); do
 done
 [[ -n "$WAYLAND_SOCKET" ]]
 
-env -u manifold_session \
+env -u brood_session \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
-  MANIFOLD_DMABUF_HAPPY_PATH=1 \
-  MANIFOLD_TRACE_PLUGIN_INPUT=1 \
-  MANIFOLD_TRACE_PLUGIN_TEXT=1 \
+  BROOD_DMABUF_HAPPY_PATH=1 \
+  BROOD_TRACE_PLUGIN_INPUT=1 \
+  BROOD_TRACE_PLUGIN_TEXT=1 \
   RUST_LOG="$RUST_LOG" \
-  target/debug/manifold-client \
+  target/debug/brood-client \
   --config "$CONFIG" \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
@@ -209,7 +209,7 @@ second_agent_ui_focused() {
 }
 
 for _ in $(seq 1 300); do
-  if rg -q "sent key-policy actor message actor=manifold.client-init" "$CLIENT_LOG" \
+  if rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
     && rg -q "started presentation WASM actor id=coding-agent-ui-2" "$CLIENT_LOG" \
     && rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"registry-subscribe"' \
       "$CLIENT_LOG" \
@@ -222,7 +222,7 @@ for _ in $(seq 1 300); do
   }
   sleep 0.1
 done
-rg -q "sent key-policy actor message actor=manifold.client-init" "$CLIENT_LOG"
+rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
 rg -q "started presentation WASM actor id=coding-agent-ui-2" "$CLIENT_LOG"
 rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"registry-subscribe"' \
   "$CLIENT_LOG"
@@ -233,7 +233,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   wtype "x" -k BackSpace -s 100 -k F2
 
 for _ in $(seq 1 300); do
-  if rg -q "started component plugin actor actor=manifold.session.1.coding-agent-2" "$SERVER_LOG" \
+  if rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG" \
     && rg -q 'session actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"; then
     break
   fi
@@ -243,7 +243,7 @@ for _ in $(seq 1 300); do
   }
   sleep 0.1
 done
-rg -q "started component plugin actor actor=manifold.session.1.coding-agent-2" "$SERVER_LOG"
+rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG"
 rg -q 'session actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"
 rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"create-agent"' \
   "$CLIENT_LOG"
@@ -257,7 +257,7 @@ capture() {
 
 capture "$OUT/agent-idle.png"
 
-PROMPT='create .manifold/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
+PROMPT='create .brood/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -k Tab -s 100 "$PROMPT" -s 100 -k Return
@@ -271,8 +271,8 @@ done
 rg -q 'presentation actor message.*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"
 
 for _ in $(seq 1 900); do
-  if [[ -f "$WORKSPACE/.manifold/agent-actor-proof.txt" ]] \
-    && rg -qx "actor-ui-worker-ok" "$WORKSPACE/.manifold/agent-actor-proof.txt"; then
+  if [[ -f "$WORKSPACE/.brood/agent-actor-proof.txt" ]] \
+    && rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt"; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -281,7 +281,7 @@ for _ in $(seq 1 900); do
   }
   sleep 0.2
 done
-rg -qx "actor-ui-worker-ok" "$WORKSPACE/.manifold/agent-actor-proof.txt"
+rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt"
 
 for _ in $(seq 1 600); do
   idle_updates="$(
@@ -357,7 +357,7 @@ cat > "$OUT/proof.md" <<EOF
 - UI: Ctrl+Alt+A launched and focused a second client-realm canvas actor
 - agents: two independently addressed session-realm actors, enumerated and switched through the UI
 - work: a private actor worker launched Codex with workspace-write authority
-- result: .manifold/agent-actor-proof.txt contains actor-ui-worker-ok
+- result: .brood/agent-actor-proof.txt contains actor-ui-worker-ok
 - survival: the focused UI accepted a model change after the completed turn
 - captures: agent-idle.png and agent-complete.png
 - status: $STATUS

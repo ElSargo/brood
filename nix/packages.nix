@@ -60,7 +60,7 @@ let
   };
 
   craneBaseArgs = {
-    pname = "manifold";
+    pname = "brood";
     version = "0.1.0";
     src = craneSrc;
     strictDeps = true;
@@ -90,7 +90,7 @@ let
   );
 
   softwareE2eCapture = pkgs.writeShellApplication {
-    name = "manifold-software-e2e-capture";
+    name = "brood-software-e2e-capture";
     runtimeInputs = [
       pkgs.bash
       pkgs.coreutils
@@ -109,29 +109,29 @@ let
       export LIBGL_DRIVERS_PATH=${pkgs.mesa}/lib/dri
       export GBM_BACKENDS_PATH=${pkgs.mesa}/lib/gbm
       exec bash ${src}/tools/software-e2e-capture.sh \
-        --manifold-bin ${manifold}/bin/manifold \
+        --brood-bin ${brood}/bin/brood \
         "$@"
     '';
   };
 
-  manifolddArtifacts = craneLib.buildDepsOnly (
+  brooddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
     // {
-      cargoBuildExtraArgs = "-p manifoldd -p manifold-client --bins";
-      cargoCheckExtraArgs = "-p manifoldd -p manifold-client --all-targets";
+      cargoBuildExtraArgs = "-p broodd -p brood-client --bins";
+      cargoCheckExtraArgs = "-p broodd -p brood-client --all-targets";
     }
   );
 
-  manifoldd = craneLib.buildPackage (
+  broodd = craneLib.buildPackage (
     craneBaseArgs
     // {
-      cargoArtifacts = manifolddArtifacts;
-      cargoBuildExtraArgs = "-p manifoldd -p manifold-client --bins";
+      cargoArtifacts = brooddArtifacts;
+      cargoBuildExtraArgs = "-p broodd -p brood-client --bins";
       doCheck = false;
     }
   );
 
-  shellCheck = pkgs.runCommand "manifold-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
+  shellCheck = pkgs.runCommand "brood-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
     cp -R ${src}/. source
     chmod -R u+w source
     cd source
@@ -139,8 +139,8 @@ let
     mapfile -d "" shell_files < <(
       find . \
         \( -path "./.git" -o -path "./.git/*" \
-        -o -path "./.manifold" -o -path "./.manifold/*" \
-        -o -path "*/.manifold" -o -path "*/.manifold/*" \
+        -o -path "./.brood" -o -path "./.brood/*" \
+        -o -path "*/.brood" -o -path "*/.brood/*" \
         -o -path "./target" -o -path "./target/*" \
         -o -path "./reference" -o -path "./reference/*" \
         -o -path "./result" -o -path "./result/*" \) -prune \
@@ -157,7 +157,7 @@ let
   '';
 
   wasmModules = pkgs.stdenvNoCC.mkDerivation {
-    name = "manifold-wasm-modules";
+    name = "brood-wasm-modules";
     inherit src;
     cargoVendorDir = wasmCargoVendorDir;
     nativeBuildInputs = [
@@ -208,8 +208,8 @@ let
       fi
 
       if [[ -f examples/wasm-component-actor/Cargo.toml ]]; then
-        component_core="examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.wasm"
-        component_output="examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm"
+        component_core="examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm"
+        component_output="examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR component actor core module was not built at $component_core" >&2
           exit 2
@@ -221,8 +221,8 @@ let
       fi
 
       if [[ -f examples/wasm-plugin-graphics/Cargo.toml ]]; then
-        component_core="examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/manifold_plugin_graphics_example.wasm"
-        component_output="examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/manifold_plugin_graphics_example.component.wasm"
+        component_core="examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/brood_plugin_graphics_example.wasm"
+        component_output="examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/brood_plugin_graphics_example.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR plugin graphics core module was not built at $component_core" >&2
           exit 2
@@ -234,8 +234,8 @@ let
       fi
 
       if [[ -f examples/wasm-init-actor/Cargo.toml ]]; then
-        component_core="examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm"
-        component_output="examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.component.wasm"
+        component_core="examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.wasm"
+        component_output="examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR session init actor core module was not built at $component_core" >&2
           exit 2
@@ -247,8 +247,8 @@ let
       fi
 
       if [[ -f plugins/session-switcher/Cargo.toml ]]; then
-        component_core="plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm"
-        component_output="plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.component.wasm"
+        component_core="plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm"
+        component_output="plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR session switcher core module was not built at $component_core" >&2
           exit 2
@@ -260,8 +260,8 @@ let
       fi
 
       if [[ -f plugins/coding-agent/Cargo.toml ]]; then
-        component_core="plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm"
-        component_output="plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm"
+        component_core="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm"
+        component_output="plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR coding agent core module was not built at $component_core" >&2
           exit 2
@@ -274,14 +274,14 @@ let
         # The preserved session and presentation init actors supervise coding
         # agent children from their own package roots.
         install -D "$component_output" \
-          examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm
+          examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm
         install -D "$component_output" \
-          plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.component.wasm
+          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm
       fi
 
       if [[ -f plugins/component-workspace-watch/Cargo.toml ]]; then
-        component_core="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.wasm"
-        component_output="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.component.wasm"
+        component_core="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/brood_component_workspace_watch_plugin.wasm"
+        component_output="plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/brood_component_workspace_watch_plugin.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR Component workspace watch core module was not built at $component_core" >&2
           exit 2
@@ -293,8 +293,8 @@ let
       fi
 
       if [[ -f plugins/component-runtime-io/Cargo.toml ]]; then
-        component_core="plugins/component-runtime-io/target/wasm32-unknown-unknown/release/manifold_component_runtime_io_plugin.wasm"
-        component_output="plugins/component-runtime-io/target/wasm32-unknown-unknown/release/manifold_component_runtime_io_plugin.component.wasm"
+        component_core="plugins/component-runtime-io/target/wasm32-unknown-unknown/release/brood_component_runtime_io_plugin.wasm"
+        component_output="plugins/component-runtime-io/target/wasm32-unknown-unknown/release/brood_component_runtime_io_plugin.component.wasm"
         if [[ ! -s "$component_core" ]]; then
           echo "ERR Component runtime I/O core module was not built at $component_core" >&2
           exit 2
@@ -315,25 +315,25 @@ let
       while IFS= read -r wasm; do
         # The raw core module is an intermediate input to the Component Model
         # encoder. Only its validated component is a runnable plugin artifact.
-        if [[ "$wasm" == "examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.wasm" ]]; then
+        if [[ "$wasm" == "examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm" ]]; then
           continue
         fi
-        if [[ "$wasm" == "examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/manifold_plugin_graphics_example.wasm" ]]; then
+        if [[ "$wasm" == "examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/brood_plugin_graphics_example.wasm" ]]; then
           continue
         fi
-        if [[ "$wasm" == "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/manifold_wasm_init_actor_example.wasm" ]]; then
+        if [[ "$wasm" == "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.wasm" ]]; then
           continue
         fi
-        if [[ "$wasm" == "plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.wasm" ]]; then
+        if [[ "$wasm" == "plugins/component-workspace-watch/target/wasm32-unknown-unknown/release/brood_component_workspace_watch_plugin.wasm" ]]; then
           continue
         fi
-        if [[ "$wasm" == "plugins/component-runtime-io/target/wasm32-unknown-unknown/release/manifold_component_runtime_io_plugin.wasm" ]]; then
+        if [[ "$wasm" == "plugins/component-runtime-io/target/wasm32-unknown-unknown/release/brood_component_runtime_io_plugin.wasm" ]]; then
           continue
         fi
-        if [[ "$wasm" == "plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm" ]]; then
+        if [[ "$wasm" == "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm" ]]; then
           continue
         fi
-        if [[ "$wasm" == "plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm" ]]; then
+        if [[ "$wasm" == "plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"
@@ -348,10 +348,10 @@ let
     '';
   };
 
-  runtimeFiles = pkgs.runCommand "manifold-runtime-files" { } ''
+  runtimeFiles = pkgs.runCommand "brood-runtime-files" { } ''
     mkdir -p "$out"
 
-    install -D ${src}/manifold.toml "$out/manifold.toml"
+    install -D ${src}/brood.toml "$out/brood.toml"
 
     mkdir -p "$out/apps"
     cp -R ${src}/apps/. "$out/apps/"
@@ -372,52 +372,52 @@ let
     fi
   '';
 
-  manifold = pkgs.symlinkJoin {
-    name = "manifold";
+  brood = pkgs.symlinkJoin {
+    name = "brood";
     paths = [
-      manifoldd
+      broodd
       runtimeFiles
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in manifold manifold-client manifold-sessiond manifold-runner-exec manifold-runner-nix-develop; do
+      for program in brood brood-client brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
           --prefix GI_TYPELIB_PATH : "${gtkTypelibPath}" \
           --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \
           --run 'export GSETTINGS_SCHEMA_DIR="''${GSETTINGS_SCHEMA_DIR:-${gsettingsSchemaDir}}"' \
-          --run 'export MANIFOLD_CONFIG="''${MANIFOLD_CONFIG:-'"$out"'/manifold.toml}"'
+          --run 'export BROOD_CONFIG="''${BROOD_CONFIG:-'"$out"'/brood.toml}"'
       done
     '';
   };
 
   desktopActions = pkgs.writeShellApplication {
-    name = "manifold-desktop";
+    name = "brood-desktop";
     runtimeInputs = [ pkgs.coreutils ];
     text = ''
       set -euo pipefail
 
       action="''${1:-show}"
-      manifold_bin="${manifold}/bin/manifold"
+      brood_bin="${brood}/bin/brood"
 
       export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
       export GI_TYPELIB_PATH="${gtkTypelibPath}:''${GI_TYPELIB_PATH:-}"
       export XDG_DATA_DIRS="${gtkDataDirs}:''${XDG_DATA_DIRS:-}"
       export GSETTINGS_SCHEMA_DIR="${gsettingsSchemaDir}"
-      export MANIFOLD_CONFIG="''${MANIFOLD_CONFIG:-${manifold}/manifold.toml}"
+      export BROOD_CONFIG="''${BROOD_CONFIG:-${brood}/brood.toml}"
 
       case "$action" in
         show)
-          exec "$manifold_bin" show --last-focused
+          exec "$brood_bin" show --last-focused
           ;;
         new-session)
-          response="$("$manifold_bin" ctl surface-session dir-new "$PWD" default)"
+          response="$("$brood_bin" ctl surface-session dir-new "$PWD" default)"
           case "$response" in
             "OK surface-session active="*)
               session_id="''${response#* active=}"
               session_id="''${session_id%% *}"
-              exec "$manifold_bin" show --id "$session_id" --set-default
+              exec "$brood_bin" show --id "$session_id" --set-default
               ;;
             *)
               printf '%s\n' "$response" >&2
@@ -426,36 +426,36 @@ let
           esac
           ;;
         picker)
-          "$manifold_bin" show >/dev/null
+          "$brood_bin" show >/dev/null
           exec "${profiles.sessionSwitcherPython}/bin/python3" \
-            "${runtimeFiles}/apps/manifold-session-switcher.py" \
+            "${runtimeFiles}/apps/brood-session-switcher.py" \
             --width 360 \
             --close-after-activate
           ;;
         quit)
-          exec "$manifold_bin" ctl quit
+          exec "$brood_bin" ctl quit
           ;;
         *)
-          echo "usage: manifold-desktop [show|new-session|picker|quit]" >&2
+          echo "usage: brood-desktop [show|new-session|picker|quit]" >&2
           exit 2
           ;;
       esac
     '';
   };
 
-  desktopIntegration = pkgs.runCommand "manifold-desktop-integration" { } ''
-    install -D -m 0644 ${../assets/icons/hicolor/512x512/apps/manifold.png} \
-      "$out/share/icons/hicolor/512x512/apps/manifold.png"
-    install -D -m 0644 ${../assets/icons/hicolor/512x512/apps/manifold.png} \
-      "$out/share/pixmaps/manifold.png"
+  desktopIntegration = pkgs.runCommand "brood-desktop-integration" { } ''
+    install -D -m 0644 ${../assets/icons/hicolor/512x512/apps/brood.png} \
+      "$out/share/icons/hicolor/512x512/apps/brood.png"
+    install -D -m 0644 ${../assets/icons/hicolor/512x512/apps/brood.png} \
+      "$out/share/pixmaps/brood.png"
 
-    install -D -m 0644 /dev/stdin "$out/share/applications/manifold.desktop" <<EOF
+    install -D -m 0644 /dev/stdin "$out/share/applications/brood.desktop" <<EOF
     [Desktop Entry]
     Type=Application
-    Name=Manifold
-    Comment=Show the Manifold workspace
-    Exec=${desktopActions}/bin/manifold-desktop show
-    Icon=manifold
+    Name=Brood
+    Comment=Show the Brood workspace
+    Exec=${desktopActions}/bin/brood-desktop show
+    Icon=brood
     Terminal=false
     Categories=Development;
     StartupNotify=true
@@ -463,24 +463,24 @@ let
 
     [Desktop Action NewSession]
     Name=New Session
-    Exec=${desktopActions}/bin/manifold-desktop new-session
+    Exec=${desktopActions}/bin/brood-desktop new-session
 
     [Desktop Action OpenPicker]
     Name=Open Picker
-    Exec=${desktopActions}/bin/manifold-desktop picker
+    Exec=${desktopActions}/bin/brood-desktop picker
 
     [Desktop Action Quit]
     Name=Quit
-    Exec=${desktopActions}/bin/manifold-desktop quit
+    Exec=${desktopActions}/bin/brood-desktop quit
     EOF
 
-    install -D -m 0644 /dev/stdin "$out/share/applications/org.manifold.SessionSwitcher.desktop" <<EOF
+    install -D -m 0644 /dev/stdin "$out/share/applications/org.brood.SessionSwitcher.desktop" <<EOF
     [Desktop Entry]
     Type=Application
-    Name=Manifold Session Picker
-    Comment=Pick a Manifold session
-    Exec=${desktopActions}/bin/manifold-desktop picker
-    Icon=manifold
+    Name=Brood Session Picker
+    Comment=Pick a Brood session
+    Exec=${desktopActions}/bin/brood-desktop picker
+    Icon=brood
     Terminal=false
     Categories=Development;
     StartupNotify=true
@@ -488,23 +488,23 @@ let
     EOF
   '';
 
-  manifoldWithDesktop = pkgs.symlinkJoin {
-    name = "manifold";
+  broodWithDesktop = pkgs.symlinkJoin {
+    name = "brood";
     paths = [
-      manifold
+      brood
       desktopActions
       desktopIntegration
     ];
   };
 
   devEnv = pkgs.buildEnv {
-    name = "manifold-dev-env";
+    name = "brood-dev-env";
     paths = profiles.devTools ++ profiles.nativeLibs ++ profiles.gtkRuntime;
     ignoreCollisions = true;
   };
 
   devEnvFull = pkgs.buildEnv {
-    name = "manifold-dev-env-full";
+    name = "brood-dev-env-full";
     paths =
       profiles.devTools
       ++ profiles.fullDevExtras
@@ -515,7 +515,7 @@ let
   };
 
   ciTools = pkgs.buildEnv {
-    name = "manifold-ci-tools";
+    name = "brood-ci-tools";
     paths = [
       pkgs.act
       pkgs.actionlint
@@ -523,7 +523,7 @@ let
   };
 
   localCi = pkgs.writeShellApplication {
-    name = "manifold-ci";
+    name = "brood-ci";
     runtimeInputs = [
       pkgs.actionlint
       pkgs.coreutils
@@ -586,7 +586,7 @@ let
   };
 
   cacheCi = pkgs.writeShellApplication {
-    name = "manifold-cache-ci";
+    name = "brood-cache-ci";
     runtimeInputs = [
       pkgs.cachix
       pkgs.coreutils
@@ -599,14 +599,14 @@ let
       ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
       cd "$ROOT"
 
-      cache="''${CACHIX_CACHE:-manifold-platform}"
+      cache="''${CACHIX_CACHE:-}"
       if (($# > 0)); then
         cache="$1"
         shift
       fi
 
-      if (($# > 0)); then
-        echo "usage: nix run .#cache-ci [cachix-cache-name]" >&2
+      if (($# > 0)) || [[ -z "$cache" ]]; then
+        echo "usage: CACHIX_CACHE=<cache-name> nix run .#cache-ci [cachix-cache-name]" >&2
         exit 2
       fi
 
@@ -618,7 +618,7 @@ let
         .#cargoArtifacts
         .#clippyCheck
         .#shellCheck
-        .#manifolddArtifacts
+        .#brooddArtifacts
       )
 
       echo "cache-ci=build attrs=''${attrs[*]}"
@@ -632,7 +632,7 @@ let
   };
 
   primeCargoTarget = pkgs.writeShellApplication {
-    name = "manifold-prime-cargo-target";
+    name = "brood-prime-cargo-target";
     runtimeInputs = [
       pkgs.coreutils
       pkgs.git
@@ -662,7 +662,7 @@ let
   };
 
   formatter = pkgs.writeShellApplication {
-    name = "manifold-format";
+    name = "brood-format";
     runtimeInputs = [
       pkgs.git
       pkgs.nixfmt
@@ -689,7 +689,7 @@ let
       shell_files=()
       for file in "''${source_files[@]}"; do
         case "$file" in
-          .manifold/* | */.manifold/* | reference/*)
+          .brood/* | */.brood/* | reference/*)
             continue
             ;;
           *.nix)
@@ -717,7 +717,7 @@ let
   };
 
   linter = pkgs.writeShellApplication {
-    name = "manifold-lint";
+    name = "brood-lint";
     runtimeInputs = [
       pkgs.findutils
       pkgs.git
@@ -755,7 +755,7 @@ let
         done < <(
           find "''${paths[@]}" \
             \( -path "./.git" -o -path "./.git/*" \
-            -o -path "./.manifold" -o -path "./.manifold/*" \
+            -o -path "./.brood" -o -path "./.brood/*" \
             -o -path "./target" -o -path "./target/*" \
             -o -path "./reference" -o -path "./reference/*" \
             -o -path "./result" -o -path "./result/*" \) -prune \
@@ -766,7 +766,7 @@ let
       shell_files=()
       for file in "''${source_files[@]}"; do
         case "$file" in
-          .manifold/* | */.manifold/* | reference/*)
+          .brood/* | */.brood/* | reference/*)
             continue
             ;;
           *.sh | *.bash)
@@ -788,7 +788,7 @@ let
     '';
   };
 
-  lintCheck = pkgs.runCommand "manifold-lint-check" { } ''
+  lintCheck = pkgs.runCommand "brood-lint-check" { } ''
     echo "lint=rust command=cargo-check artifacts=${cargoArtifacts}"
     echo "lint=rust command=cargo-clippy check=${clippyCheck}"
     echo "lint=shell check=${shellCheck}"
@@ -812,7 +812,7 @@ let
         gtkDataDirs
         gtkTypelibPath
         lib
-        manifoldd
+        broodd
         name
         nativeLibraryPath
         nativePkgConfigPath
@@ -825,19 +825,19 @@ let
     };
 
   devWorkflow = mkWorkflow {
-    name = "manifold-dev-workflow";
+    name = "brood-dev-workflow";
     path = appToolPath;
     exportDevVars = false;
   };
 
   devWorkflowFull = mkWorkflow {
-    name = "manifold-dev-workflow-full";
+    name = "brood-dev-workflow-full";
     path = fullDevToolPath;
     exportDevVars = true;
   };
 
   devWorkflowWithRuntime = pkgs.symlinkJoin {
-    name = "manifold-dev-workflow";
+    name = "brood-dev-workflow";
     paths = [
       devWorkflow
       runtimeFiles
@@ -847,7 +847,7 @@ let
   };
 
   devWorkflowFullWithRuntime = pkgs.symlinkJoin {
-    name = "manifold-dev-workflow-full";
+    name = "brood-dev-workflow-full";
     paths = [
       devWorkflowFull
       runtimeFiles
@@ -857,7 +857,7 @@ let
   };
 in
 {
-  default = manifoldWithDesktop;
+  default = broodWithDesktop;
   "dev-workflow" = devWorkflowWithRuntime;
   "dev-workflow-full" = devWorkflowFullWithRuntime;
   "dev-env" = devEnv;
@@ -888,10 +888,10 @@ in
     devWorkflowFull
     desktopActions
     desktopIntegration
-    manifoldWithDesktop
-    manifold
-    manifoldd
-    manifolddArtifacts
+    broodWithDesktop
+    brood
+    broodd
+    brooddArtifacts
     lintCheck
     runtimeFiles
     shellCheck

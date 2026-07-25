@@ -15,15 +15,15 @@ for tool in cargo cc foot grim magick pkg-config python3 sway weston-simple-egl 
   fi
 done
 
-OUT="${MANIFOLD_SESSION_SWITCHER_OUT:-$(mktemp -d /tmp/manifold-session-switcher.XXXXXX)}"
+OUT="${BROOD_SESSION_SWITCHER_OUT:-$(mktemp -d /tmp/brood-session-switcher.XXXXXX)}"
 PACKAGE="$OUT/package"
 RUNTIME_DIR="$OUT/runtime"
 COMPOSITOR_LOG="$OUT/compositor.log"
 SERVER_LOG="$OUT/server.log"
 CLIENT_LOG="$OUT/client.log"
-CONFIG="$OUT/manifold.toml"
+CONFIG="$OUT/brood.toml"
 SWAY_CONFIG="$OUT/sway.conf"
-DBUS_DESTINATION="org.manifold.SessionSwitcherTest.p$$"
+DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
 mkdir -p "$PACKAGE" "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 
@@ -51,7 +51,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p manifoldd -p manifold-client --bins
+cargo build -p broodd -p brood-client --bins
 cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -65,31 +65,31 @@ cc \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
   "${WAYLAND_BUILD_FLAGS[@]}"
-cargo run --quiet -p manifold-wasm --example componentize -- \
-  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
-  "$PACKAGE/manifold_session_switcher_plugin.component.wasm"
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
+  "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
-cargo run --quiet -p manifold-wasm --example componentize -- \
-  plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm \
-  "$PACKAGE/manifold_coding_agent_plugin.component.wasm"
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
+  "$PACKAGE/brood_coding_agent_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
 
 printf '[init]\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
-  "$PACKAGE/manifold_session_switcher_plugin.component.wasm" \
-  "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm" \
+  "$PACKAGE/brood_session_switcher_plugin.component.wasm" \
+  "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm" \
   > "$CONFIG"
 
-RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
-env -u manifold_session \
+RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+env -u brood_session \
   RUST_LOG="$RUST_LOG" \
-  target/debug/manifold-sessiond \
+  target/debug/brood-sessiond \
   --headless \
   --no-init \
   --no-default-modules \
@@ -100,7 +100,7 @@ env -u manifold_session \
 SERVER_PID=$!
 
 ctl() {
-  env -u manifold_session target/debug/manifold ctl \
+  env -u brood_session target/debug/brood ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -168,13 +168,13 @@ done
   exit 1
 }
 
-env -u manifold_session \
+env -u brood_session \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
-  MANIFOLD_DMABUF_HAPPY_PATH=1 \
+  BROOD_DMABUF_HAPPY_PATH=1 \
   RUST_LOG="$RUST_LOG" \
-  target/debug/manifold-client \
+  target/debug/brood-client \
   --config "$CONFIG" \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \

@@ -8,18 +8,18 @@ Accepted for the MVP prototype.
 
 The project needs to prove that an extra local compositor/session layer can feel native while preserving managed app state. A separate presentation endpoint would preserve the long-term split, but it adds lifecycle and protocol work before the core risk is proven.
 
-Remote connections are not a current goal. The first question is whether Manifold can host a Wayland app through local Wayland/DMA-BUF-compatible surface sharing, close its presentation window, reopen it, and make the managed app feel as though its regular window never went away.
+Remote connections are not a current goal. The first question is whether Brood can host a Wayland app through local Wayland/DMA-BUF-compatible surface sharing, close its presentation window, reopen it, and make the managed app feel as though its regular window never went away.
 
 ## Decision
 
-The MVP will use a single local `manifold` process that owns both the durable session and the local presentation window.
+The MVP will use a single local `brood` process that owns both the durable session and the local presentation window.
 
-- `manifold` owns the nested Wayland compositor for hosted Wayland apps.
-- `manifold` opens a normal desktop presentation window on the user's current compositor.
-- Hosted Wayland apps connect to Manifold's Wayland display, not directly to the system compositor.
+- `brood` owns the nested Wayland compositor for hosted Wayland apps.
+- `brood` opens a normal desktop presentation window on the user's current compositor.
+- Hosted Wayland apps connect to Brood's Wayland display, not directly to the system compositor.
 - Closing the presentation window detaches by default when there is managed app or session state worth preserving.
 - Remote presentation, remote networking, and multi-user security are non-goals for this phase.
-- A separate `manifold-client` process is deferred.
+- A separate `brood-client` process is deferred.
 
 ## Consequences
 

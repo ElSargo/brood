@@ -49,7 +49,7 @@ const FLAG_NOTIFICATION: u32 = 1 << 3;
 const FLAG_SELECT: u32 = 1 << 4;
 const FLAG_ERROR: u32 = 1 << 31;
 
-#[link(wasm_import_module = "manifold_preview1")]
+#[link(wasm_import_module = "brood_preview1")]
 unsafe extern "C" {
     #[link_name = "event_kind"]
     safe fn host_event_kind(value: *mut u32) -> u32;
@@ -118,12 +118,12 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_preview1_compat_v1() -> u32 {
+pub extern "C" fn brood_preview1_compat_v1() -> u32 {
     0x4d50_3101
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
+pub extern "C" fn brood_actor_dispatch_v1(_kind: u32) -> u32 {
     let Some(kind) = host_u32(host_event_kind) else {
         COMPAT_FLAGS.fetch_or(FLAG_ERROR, Ordering::Release);
         return 0;
@@ -153,7 +153,7 @@ pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
+pub extern "C" fn brood_worker_run_v1(argument: u32) -> u32 {
     if argument == u32::MAX {
         worker_read(argument)
     } else if argument == RUBE_WORKER_ARGUMENT {
@@ -623,7 +623,7 @@ pub extern "C" fn worker_spin(_unused: u32) -> u32 {
 /// Low 32 bits of the result contain the stack top and high 32 bits contain
 /// the TLS base. Zero reports allocation failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_worker_reserve_v1(
+pub extern "C" fn brood_worker_reserve_v1(
     stack_bytes: u32,
     tls_bytes: u32,
     tls_align: u32,
@@ -653,11 +653,11 @@ pub extern "C" fn manifold_worker_reserve_v1(
     (u64::from(tls_base) << 32) | u64::from(stack_top)
 }
 
-/// Release a slab previously returned by [`manifold_worker_reserve_v1`].
+/// Release a slab previously returned by [`brood_worker_reserve_v1`].
 ///
 /// Returns zero on success and one if the host supplied inconsistent metadata.
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_worker_release_v1(
+pub extern "C" fn brood_worker_release_v1(
     encoded: u64,
     stack_bytes: u32,
     tls_bytes: u32,

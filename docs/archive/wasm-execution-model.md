@@ -4,7 +4,7 @@ This archived page records an earlier focused target for execution lanes and fai
 
 Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
-Manifold should run user code through two execution lanes with different contracts:
+Brood should run user code through two execution lanes with different contracts:
 
 - a synchronous policy lane for bounded pre-commit policy
 - asynchronous actor/mailbox execution for normal app, controller, extension, and agent behavior
@@ -13,7 +13,7 @@ The lanes should share the same workspace command and event model, but they shou
 
 ## Current Runtime Boundary
 
-The current `manifold` prototype is built around Smithay and calloop. The calloop event loop owns Wayland dispatch, input routing, timers, DBus control endpoint handling, presentation attach/detach, and authoritative `Manifold` state.
+The current `brood` prototype is built around Smithay and calloop. The calloop event loop owns Wayland dispatch, input routing, timers, DBus control endpoint handling, presentation attach/detach, and authoritative `Brood` state.
 
 That loop should remain the session process authority. Async plugin work can live in a separate runtime, likely Tokio-backed, connected to the calloop thread by bounded channels. Returned command requests must re-enter the calloop/session thread before mutating workspace state.
 
@@ -28,7 +28,7 @@ calloop/session thread
 
 ## Policy Provider
 
-The policy provider is for user-defined policy that must participate in a state transition before Manifold commits it. It exists for cases where asynchronous reaction would be too late or could create inconsistent ownership.
+The policy provider is for user-defined policy that must participate in a state transition before Brood commits it. It exists for cases where asynchronous reaction would be too late or could create inconsistent ownership.
 
 Examples:
 
@@ -47,7 +47,7 @@ Allowed:
 
 Not allowed:
 
-- mutate `Manifold` directly
+- mutate `Brood` directly
 - spawn processes
 - perform filesystem, network, or blocking storage I/O
 - wait on async work
@@ -62,11 +62,11 @@ Sync policy hooks should run with hard limits:
 - deterministic ordering
 - automatic disabling after repeated failures
 
-The failure behavior should be defined per hook type. Most policy hooks should fail neutral, meaning Manifold ignores the failed hook and continues with host defaults. Security or validation hooks may fail closed if their manifest declares that behavior and the user/session grants it.
+The failure behavior should be defined per hook type. Most policy hooks should fail neutral, meaning Brood ignores the failed hook and continues with host defaults. Security or validation hooks may fail closed if their manifest declares that behavior and the user/session grants it.
 
 ## Async Actor Lane
 
-The async actor lane is for ordinary user code. It should be event-driven and actor-like: each module owns its state, receives ordered events through mailboxes, and returns command requests instead of mutating Manifold directly.
+The async actor lane is for ordinary user code. It should be event-driven and actor-like: each module owns its state, receives ordered events through mailboxes, and returns command requests instead of mutating Brood directly.
 
 Examples:
 
@@ -87,13 +87,13 @@ The apolicy provider should support:
 - call latency and failure counters
 - explicit command results
 
-Async module code should not run on the calloop thread. A Tokio runtime can own this lane, but Manifold state remains authoritative on the calloop/session thread.
+Async module code should not run on the calloop thread. A Tokio runtime can own this lane, but Brood state remains authoritative on the calloop/session thread.
 
 ## Published Sync-Path State
 
 Async plugin work often needs to prepare state that a synchronous policy hook can use without replaying events or waiting on async code.
 
-Manifold should provide a host-owned publication area for this. The publication area is not shared mutable WASM memory and it is not a message queue. It is an immutable latest-state surface maintained by the host for a plugin instance.
+Brood should provide a host-owned publication area for this. The publication area is not shared mutable WASM memory and it is not a message queue. It is an immutable latest-state surface maintained by the host for a plugin instance.
 
 The target shape is:
 
@@ -154,7 +154,7 @@ Published sync-path state should contain materialized decisions, not event histo
 
 ## Transactions And Events
 
-Manifold should treat backend observations and user input as candidate workspace transactions.
+Brood should treat backend observations and user input as candidate workspace transactions.
 
 ```text
 observe backend/input/control event
@@ -167,11 +167,11 @@ deliver events to async actors
 apply returned command requests through the command executor
 ```
 
-This keeps Manifold as the only committer. Hooks and async actors can propose decisions or request commands, but they do not directly mutate compositor, presentation, or workspace state.
+This keeps Brood as the only committer. Hooks and async actors can propose decisions or request commands, but they do not directly mutate compositor, presentation, or workspace state.
 
 ## Claim Resolution
 
-Sync policy hooks should not take ownership directly. They should return claims that Manifold resolves once.
+Sync policy hooks should not take ownership directly. They should return claims that Brood resolves once.
 
 ```rust
 enum PolicyDecision {
@@ -283,6 +283,6 @@ These should eventually appear in `status-json` so real workload tests can verif
 
 ## Design Rule
 
-Use a policy provider only when Manifold needs a decision before committing workspace state. Use the async actor lane for everything else.
+Use a policy provider only when Brood needs a decision before committing workspace state. Use the async actor lane for everything else.
 
 That preserves consistency for map, focus, command, and shortcut policy while keeping ordinary plugin work isolated from latency-sensitive paths.

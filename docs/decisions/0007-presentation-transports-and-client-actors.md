@@ -6,7 +6,7 @@ Accepted as the target presentation connection model.
 
 ## Context
 
-Manifold must support both a very low-latency same-device presentation client
+Brood must support both a very low-latency same-device presentation client
 and remote clients without creating separate session, pane, lease, or actor
 models. The existing client uses DBus only for startup and protocol-version
 handshake. A proposed dedicated Unix-socket protocol would add another local
@@ -21,7 +21,7 @@ and backend capability operations need to cross the presentation connection.
 
 The local connection has two planes:
 
-1. DBus discovers or activates `manifoldd`, authenticates the initial endpoint,
+1. DBus discovers or activates `broodd`, authenticates the initial endpoint,
    establishes a connection generation, exchanges size-sealed shared-memory and
    event descriptors, and brokers infrequent external-resource descriptors.
 2. Bounded bidirectional shared-memory lanes carry all ordinary steady-state
@@ -47,7 +47,7 @@ codecs remain subject to workload testing.
 Presentation actors run in the client for both local and remote connections.
 Their local mailboxes, policy decisions, viewport state, SDK component state,
 draw packets, and render updates do not traverse shared memory or the network.
-Session actors remain in `manifoldd`; cross-runtime messages and backend
+Session actors remain in `broodd`; cross-runtime messages and backend
 capability operations are asynchronous protocol traffic.
 
 ## Consequences

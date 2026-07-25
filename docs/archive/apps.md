@@ -2,7 +2,7 @@
 
 This archived page describes an older target app model.
 
-Manifold apps are intended to be sandboxed, capability-scoped modules. WASM remains a preferred direction for built-in and user-facing apps that do not need native GPU or process integration, but the current target plugin architecture is documented outside the archive.
+Brood apps are intended to be sandboxed, capability-scoped modules. WASM remains a preferred direction for built-in and user-facing apps that do not need native GPU or process integration, but the current target plugin architecture is documented outside the archive.
 
 Use these current pages first:
 

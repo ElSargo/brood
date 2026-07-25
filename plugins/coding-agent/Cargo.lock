@@ -89,17 +89,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifold-coding-agent-plugin"
+name = "brood-coding-agent-plugin"
 version = "0.1.0"
 dependencies = [
- "manifold-graphics",
+ "brood-graphics",
  "serde",
  "serde_json",
  "wit-bindgen",
 ]
 
 [[package]]
-name = "manifold-graphics"
+name = "brood-graphics"
 version = "0.1.0"
 
 [[package]]

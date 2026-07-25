@@ -1,6 +1,6 @@
 # Managed Session Isolation Plan
 
-This document is the concrete implementation plan for Manifold's `managed`
+This document is the concrete implementation plan for Brood's `managed`
 session profile. It records the intended build order, interfaces, and
 verification targets. The target behavior is described in
 [Session Environments](session-environments.md); this page is about how to get
@@ -8,7 +8,7 @@ there.
 
 ## Target
 
-`manifold enter --managed` should create or reuse a Manifold session whose programs
+`brood enter --managed` should create or reuse a Brood session whose programs
 see the normal project and system paths, but whose regular writes, runtime IPC,
 DBus names, and loopback services stay inside the session unless explicitly
 bridged or promoted.
@@ -41,7 +41,7 @@ The filesystem implementation should be backend-neutral from the control layer.
 The first backend can be a simple managed upper tree rooted at:
 
 ```text
-~/.manifold/worktrees/<session-id>/
+~/.brood/worktrees/<session-id>/
 ```
 
 Suggested layout:
@@ -65,7 +65,7 @@ the command model.
 ### Phase 1: Session Metadata And CLI Surface
 
 - Add an isolation profile to session state.
-- Add `manifold enter --managed` and a parser-level spelling for `--plain`,
+- Add `brood enter --managed` and a parser-level spelling for `--plain`,
   `--strict`, and future profile selection.
 - Record the project view path, lower path, upper root, and profile in session
   metadata.
@@ -75,9 +75,9 @@ the command model.
 
 Verification:
 
-- `manifold enter --managed env` prints the session id, profile, upper root, runtime
+- `brood enter --managed env` prints the session id, profile, upper root, runtime
   root, DBus address, and Wayland display.
-- `manifold show`, `hide`, and regular control commands still target the entered
+- `brood show`, `hide`, and regular control commands still target the entered
   session.
 
 ### Phase 2: Project Write Capture
@@ -86,8 +86,8 @@ Verification:
 - Materialize the project upper tree lazily on first project write.
 - Prefer reflink copy, then fall back to ordinary copy.
 - Keep the view path as the original project path inside the session.
-- Track changed project files and expose `manifold worktree status` and
-  `manifold worktree diff`.
+- Track changed project files and expose `brood worktree status` and
+  `brood worktree diff`.
 
 Verification:
 
@@ -163,7 +163,7 @@ Verification:
 
 ### Phase 7: Export, Promote, And Cleanup
 
-- Add `manifold worktree export`, `promote`, and `discard`.
+- Add `brood worktree export`, `promote`, and `discard`.
 - Promote project changes through git-aware patch application with conflict
   checks.
 - Promote external changes only through explicit path-by-path operations.

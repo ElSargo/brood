@@ -4,9 +4,9 @@ type: system
 authority: product
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifoldd/src/compositor.rs
-  - crates/manifoldd/src/runtime.rs
-  - crates/manifoldd/src/control.rs
+  - crates/broodd/src/compositor.rs
+  - crates/broodd/src/runtime.rs
+  - crates/broodd/src/control.rs
 ---
 
 # Wayland Compositor

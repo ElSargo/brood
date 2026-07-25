@@ -4,44 +4,44 @@ type: system-map
 authority: implementation
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifoldd/src/lib.rs
-  - crates/manifoldd/src/compositor.rs
-  - crates/manifoldd/src/control.rs
-  - crates/manifoldd/src/state.rs
-  - crates/manifold-wasm/src/module.rs
-  - crates/manifold-wasm/src/component_actor.rs
-  - crates/manifold-wasm/src/preview1_worker.rs
+  - crates/broodd/src/lib.rs
+  - crates/broodd/src/compositor.rs
+  - crates/broodd/src/control.rs
+  - crates/broodd/src/state.rs
+  - crates/brood-wasm/src/module.rs
+  - crates/brood-wasm/src/component_actor.rs
+  - crates/brood-wasm/src/preview1_worker.rs
 ---
 
 # Architecture
 
-Manifold is organized around a product-level [[concepts/workspace]] containing
+Brood is organized around a product-level [[concepts/workspace]] containing
 isolated [[concepts/session]]s. Session authority and presentation are separate
 process boundaries.
 
 ## Current Components
 
-`manifold`
+`brood`
 
 The user-facing binary. It parses commands, starts runtime sessions, starts nested test topologies, and sends DBus control commands.
 
-`manifold-sessiond`
+`brood-sessiond`
 
 The authoritative session server. It owns the nested Wayland compositor,
 hosted applications, session catalogue, durable actors, and control endpoint.
 It never creates a presentation window or computes viewport layout.
 
-`manifold-client`
+`brood-client`
 
 The portable presentation frontend. It owns its Winit/WGPU viewport,
 presentation actors, recursive layout leases, composition, hit testing, local
 focus, and physical input policy.
 
-`manifold-runner-exec`
+`brood-runner-exec`
 
 The sidecar command runner used for entered shell or command execution inside a session runner context.
 
-`manifold-runner-nix-develop`
+`brood-runner-nix-develop`
 
 The built-in Nix session runner. It caches a sourceable `nix print-dev-env --profile` activation script and then runs the supplied inner binary.
 
@@ -79,7 +79,7 @@ revokes presentation authority without closing hosted applications.
 
 ## Control Flow
 
-User-facing commands such as `enter`, `show`, `hide`, `list`, `switch`, `plug`, and `ctl` resolve a DBus control target. The default target is the entered session when available, otherwise the global Manifold session server. See [[systems/dbus-control]] and [[reference/cli]].
+User-facing commands such as `enter`, `show`, `hide`, `list`, `switch`, `plug`, and `ctl` resolve a DBus control target. The default target is the entered session when available, otherwise the global Brood session server. See [[systems/dbus-control]] and [[reference/cli]].
 
 ## Plugin And Extension Boundary
 

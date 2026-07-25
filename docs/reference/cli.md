@@ -4,13 +4,13 @@ type: reference
 authority: implementation
 last-reviewed: 2026-07-03
 code-links:
-  - crates/manifoldd/src/lib.rs
-  - crates/manifoldd/src/control.rs
+  - crates/broodd/src/lib.rs
+  - crates/broodd/src/control.rs
 ---
 
 # CLI Reference Pointers
 
-Exact top-level CLI flags, defaults, aliases, and hidden test options are defined in `crates/manifoldd/src/lib.rs`. `ctl` subcommands and typed DBus helper commands are defined in `crates/manifoldd/src/control.rs`.
+Exact top-level CLI flags, defaults, aliases, and hidden test options are defined in `crates/broodd/src/lib.rs`. `ctl` subcommands and typed DBus helper commands are defined in `crates/broodd/src/control.rs`.
 
 Current top-level commands:
 
@@ -29,6 +29,6 @@ Use this page as an orientation map only. Do not duplicate full parser behavior 
 
 Related:
 
-- [[../workflows/run-manifold]]
+- [[../workflows/run-brood]]
 - [[../workflows/enter-session]]
 - [[../workflows/test-nested]]

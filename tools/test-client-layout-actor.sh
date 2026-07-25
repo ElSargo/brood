@@ -15,7 +15,7 @@ for tool in weston weston-simple-egl gtk4-demo python3; do
   fi
 done
 
-cargo build -p manifold-client -p manifoldd --bins
+cargo build -p brood-client -p broodd --bins
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -24,31 +24,31 @@ cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
-cargo run --quiet -p manifold-wasm --example componentize -- \
-  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
-  plugins/session-switcher/manifold_session_switcher_plugin.component.wasm
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
+  plugins/session-switcher/brood_session_switcher_plugin.component.wasm
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
-cargo run --quiet -p manifold-wasm --example componentize -- \
-  plugins/coding-agent/target/wasm32-unknown-unknown/release/manifold_coding_agent_plugin.wasm \
-  plugins/session-switcher/manifold_coding_agent_plugin.component.wasm
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
+  plugins/session-switcher/brood_coding_agent_plugin.component.wasm
 
-target/debug/manifold-client \
+target/debug/brood-client \
   --no-server \
-  --wasm-key-policy workspace "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm" \
+  --wasm-key-policy workspace "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm" \
   --check-wasm-key-policy
 
-TEST_TMP="$(mktemp -d /tmp/manifold-client-layout-actor.XXXXXX)"
+TEST_TMP="$(mktemp -d /tmp/brood-client-layout-actor.XXXXXX)"
 RUNTIME_DIR="$TEST_TMP/runtime"
 WESTON_LOG="$TEST_TMP/weston.log"
 SERVER_LOG="$TEST_TMP/server.log"
 CLIENT_LOG="$TEST_TMP/client.log"
-DBUS_DESTINATION="org.manifold.LayoutActorTest.p$$"
-WESTON_SOCKET="manifold-layout-actor-$$"
-WORKSPACE="$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/manifold_default_workspace_plugin.wasm"
+DBUS_DESTINATION="org.brood.LayoutActorTest.p$$"
+WESTON_SOCKET="brood-layout-actor-$$"
+WORKSPACE="$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm"
 mkdir -m 700 "$RUNTIME_DIR"
 
 cleanup() {
@@ -99,9 +99,9 @@ done
   exit 1
 }
 
-RUST_LOG="${RUST_LOG:-manifoldd=info,manifold_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 env RUST_LOG="$RUST_LOG" \
-  target/debug/manifold-sessiond \
+  target/debug/brood-sessiond \
   --headless \
   --no-init \
   --no-default-modules \
@@ -111,7 +111,7 @@ env RUST_LOG="$RUST_LOG" \
 SERVER_PID=$!
 
 ctl() {
-  target/debug/manifold ctl \
+  target/debug/brood ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -133,12 +133,12 @@ ctl status > /dev/null 2>&1 || {
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WESTON_SOCKET" \
   WGPU_BACKEND=vulkan \
-  MANIFOLD_DMABUF_HAPPY_PATH=1 \
+  BROOD_DMABUF_HAPPY_PATH=1 \
   RUST_LOG="$RUST_LOG" \
-  target/debug/manifold-client \
+  target/debug/brood-client \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
-  --init-actor "$ROOT/plugins/session-switcher/manifold_session_switcher_plugin.component.wasm" \
+  --init-actor "$ROOT/plugins/session-switcher/brood_session_switcher_plugin.component.wasm" \
   --wasm-actor "workspace=$WORKSPACE" \
   --wasm-key-policy workspace "$WORKSPACE" \
   > "$CLIENT_LOG" 2>&1 &

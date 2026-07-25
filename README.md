@@ -1,6 +1,6 @@
-# Manifold
+# Brood
 
-Manifold is a new workspace project for a persistent, graphical developer environment.
+Brood is a new workspace project for a persistent, graphical developer environment.
 
 The core idea is a local virtual workspace containing isolated sessions. A
 session server owns durable state and hosted applications; an independent
@@ -10,7 +10,7 @@ layout, composition, interaction, and presentation-local plugins.
 
 ## Thesis
 
-Manifold should feel like a native editor while behaving more like a rich tmux session:
+Brood should feel like a native editor while behaving more like a rich tmux session:
 
 - managed apps and session state survive presentation window close/reopen
 - editor, browser, terminal, agent, git, and app panes share one pane model
@@ -19,9 +19,9 @@ Manifold should feel like a native editor while behaving more like a rich tmux s
 
 ## Initial Shape
 
-- `manifold`: CLI entrypoint that starts the presentation client.
-- `manifold-client`: WGPU presentation process that connects to the session server.
-- `manifold-sessiond`: authoritative local session server.
+- `brood`: CLI entrypoint that starts the presentation client.
+- `brood-client`: WGPU presentation process that connects to the session server.
+- `brood-sessiond`: authoritative local session server.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
 - plugins/WASM apps: built-in or user applications that use addressed actors, private shared-memory workers, completion-based I/O, WASI resources, optional sync policy lanes, canvas draw packets, native text services, and a future advanced-graphics escape hatch.
 
@@ -40,10 +40,10 @@ The current PoC can:
 - reconnect a new presentation client to the surviving session
 - compose client-local plugin panes and managed panes through recursive layout leases
 - report frame cadence, input-to-frame latency, client commits, frame callbacks, dmabuf state, and explicit-sync state
-- run async core-WASM behavior harnesses through `manifold run --test-harness`
+- run async core-WASM behavior harnesses through `brood run --test-harness`
 
 Graphical behavior tests start a headless server and a real external
-`manifold-client`, then drive and capture that client through a headless Wayland
+`brood-client`, then drive and capture that client through a headless Wayland
 compositor. The backend is never used as an outer presentation container.
 
 ## Common Commands
@@ -54,31 +54,31 @@ Run the project through the Nix development shell:
 nix develop --command cargo run
 ```
 
-By default the CLI starts `manifold-client`. The client connects to the default
-session server, starts `manifold-sessiond` when necessary, performs a protocol
+By default the CLI starts `brood-client`. The client connects to the default
+session server, starts `brood-sessiond` when necessary, performs a protocol
 handshake, and then opens its WGPU presentation window.
 
 The session service is always usable without a presentation client. Service
-managers and backend development invoke `manifold-sessiond`; exact command
+managers and backend development invoke `brood-sessiond`; exact command
 options remain defined by the CLI parser.
 
-The repo includes `flake.nix`, and checked-in development workflows should prefer it for builds and tests. Its default package is the Manifold app; heavier development environments are exposed through explicit `full` outputs.
+The repo includes `flake.nix`, and checked-in development workflows should prefer it for builds and tests. Its default package is the Brood app; heavier development environments are exposed through explicit `full` outputs.
 
 Start the one-line development workflow from Nix:
 
 ```sh
-nix run github:ElSargo/manifold#dev-workflow
+nix run github:ElSargo/brood#dev-workflow
 ```
 
 This clones a writable checkout under `~/.cache`, installs the packaged WASM
-example artifacts used by the normal config, starts a normal Manifold session
+example artifacts used by the normal config, starts a normal Brood session
 from the Nix-built binary, and opens a terminal in that checkout. See
 [Develop With Nix](docs/workflows/develop-with-nix.md).
 
 For the larger toolbox with Docker, Go, Firefox, and smoke tools:
 
 ```sh
-nix run github:ElSargo/manifold#dev-workflow-full
+nix run github:ElSargo/brood#dev-workflow-full
 ```
 
 For exact runtime, validation, and control commands, see the
@@ -91,7 +91,7 @@ client-composed frames and reconnect evidence. See
 [Testing](docs/systems/testing.md) for the supported paths.
 
 The session server uses Smithay and Wasmtime. The presentation client uses WGPU,
-and shared CLI/DBus types live in `manifold-cli`. Local transport carries
+and shared CLI/DBus types live in `brood-cli`. Local transport carries
 per-window frames and bounded input/configuration lanes; viewport placement
 never crosses that boundary.
 

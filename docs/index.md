@@ -5,20 +5,20 @@ authority: documentation
 last-reviewed: 2026-07-24
 ---
 
-# Manifold Knowledge Base
+# Brood Knowledge Base
 
 This directory is organized as a wiki-style knowledge base. Pages are grouped by reader intent and marked with `status` frontmatter so current behavior, target design, experiments, and historical notes are not confused.
 
 ## Start Here
 
-- [[overview]] explains what Manifold is.
+- [[overview]] explains what Brood is.
 - [[architecture]] maps the current implementation and intended boundaries.
 - [[CONTEXT]] is the glossary and terminology source of truth.
 
 ## Current Behavior
 
 - [[systems/runtime]] describes server/client startup, config loading, and session runners.
-- [[systems/configuration]] describes `manifold.toml`, startup apps, modules, and config discovery.
+- [[systems/configuration]] describes `brood.toml`, startup apps, modules, and config discovery.
 - [[systems/testing]] describes the supported real-workload acceptance paths.
 - [[systems/dbus-control]] describes the DBus control surfaces.
 - [[systems/wayland-compositor]] describes the nested Wayland compositor path.
@@ -50,7 +50,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 ## Workflows
 
-- [[workflows/run-manifold]]
+- [[workflows/run-brood]]
 - [[workflows/enter-session]]
 - [[workflows/test-nested]]
 - [[workflows/develop-with-nix]]

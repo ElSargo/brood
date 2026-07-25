@@ -7,7 +7,7 @@ last-reviewed: 2026-07-21
 
 # Plugin
 
-A plugin is trusted session software packaged to extend Manifold. Installing a
+A plugin is trusted session software packaged to extend Brood. Installing a
 plugin is equivalent to choosing to run it as the session user; the plugin
 runtime is a portability, lifecycle, and fault-isolation boundary rather than
 an adversarial sandbox.

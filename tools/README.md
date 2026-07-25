@@ -5,7 +5,7 @@ repository's Nix environment.
 
 ## Presentation Proofs
 
-`test-client-layout-actor.sh` starts a real `manifold-client` under headless
+`test-client-layout-actor.sh` starts a real `brood-client` under headless
 Weston, maps real managed applications, and verifies client-owned layout,
 managed-pane size convergence, and the presentation key-policy boundary.
 
@@ -24,7 +24,7 @@ artifacts.
 workloads and retains initial and reconnected client frames:
 
 ```sh
-nix run .#software-e2e-capture -- --out-dir /tmp/manifold-software-e2e
+nix run .#software-e2e-capture -- --out-dir /tmp/brood-software-e2e
 ```
 
 These are the retained acceptance paths because they exercise current,

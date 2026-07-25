@@ -2,7 +2,7 @@
 
 Native presentation endpoints will live here.
 
-`manifold-client` is the first separate endpoint. It opens a WGPU window and owns connection startup: it connects to the session server, starts one when necessary, and completes the presentation protocol handshake. It can also start deliberately without a server, preserving its local renderer and presentation actors while backend inventory, frames, and input forwarding remain unavailable. The target local transport registers atomic per-window surface-tree frames through the descriptor broker, then carries frame sequences and input through bounded shared-memory lanes with eventfd wakeups. The client imports those frames into WGPU, sends local state to a layout actor through its ordinary mailbox, validates resolved-layout messages returned through the actor host outbox, owns final scene composition and hit testing, and sends only the managed pane's requested logical size back to the session server. Placement never crosses that boundary.
+`brood-client` is the first separate endpoint. It opens a WGPU window and owns connection startup: it connects to the session server, starts one when necessary, and completes the presentation protocol handshake. It can also start deliberately without a server, preserving its local renderer and presentation actors while backend inventory, frames, and input forwarding remain unavailable. The target local transport registers atomic per-window surface-tree frames through the descriptor broker, then carries frame sequences and input through bounded shared-memory lanes with eventfd wakeups. The client imports those frames into WGPU, sends local state to a layout actor through its ordinary mailbox, validates resolved-layout messages returned through the actor host outbox, owns final scene composition and hit testing, and sends only the managed pane's requested logical size back to the session server. Placement never crosses that boundary.
 
 The local development path exports each managed window separately. The server
 composes one synchronized Wayland surface tree—including its subsurfaces and
@@ -49,7 +49,7 @@ Pane inventory changes reconcile client focus with newly active and fallback
 managed panes so the local key and pointer targets cannot diverge from the
 Wayland seat.
 
-The client also owns a `manifold-wasm` presentation runtime and its Tokio
+The client also owns a `brood-wasm` presentation runtime and its Tokio
 executor. Presentation-scoped Component and Preview 1 actors can be loaded with
 explicit instance identities at client startup. They share one client-owned
 filesystem watcher service, run independently of the session daemon, are
@@ -64,7 +64,7 @@ the result into its existing WGPU composition pass, and routes pane-local resize
 focus, pointer, scroll, key, and text events back to the actor. Native text
 layout is a separate client host function; packets only place immutable layout
 handles. The executable workload is in `examples/wasm-plugin-graphics`, and
-`ClientArgs` in `crates/manifold-cli/src/cli.rs` remains the source of truth for
+`ClientArgs` in `crates/brood-cli/src/cli.rs` remains the source of truth for
 the client invocation.
 
 `F6` remains a temporary recovery binding that toggles focus between a local

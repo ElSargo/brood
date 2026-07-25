@@ -1,7 +1,7 @@
 # Component runtime I/O proof
 
 This Component plugin exercises the target bounded runtime-I/O surface from a
-real worker. It writes `.manifold/runtime-io-transcript.md` with four directly
+real worker. It writes `.brood/runtime-io-transcript.md` with four directly
 inspectable sections: transformed output from a host subprocess pipeline, a
 prompt/input/reply exchange through a real PTY, a request and response from a
 real loopback peer, and the observed ordering of two timer notifications.

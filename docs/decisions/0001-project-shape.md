@@ -12,12 +12,12 @@ Earlier approaches considered an embedded GUI renderer inside Helix, an Electron
 
 ## Decision
 
-Manifold will begin as a new standalone project centered on a session process and thin native presentation endpoints.
+Brood will begin as a new standalone project centered on a session process and thin native presentation endpoints.
 
-For the MVP prototype, this split is narrowed by [0002: Local MVP Presentation](0002-local-mvp-presentation.md): `manifold` owns the first local presentation window, and `manifold-client` is deferred.
+For the MVP prototype, this split is narrowed by [0002: Local MVP Presentation](0002-local-mvp-presentation.md): `brood` owns the first local presentation window, and `brood-client` is deferred.
 
-- `manifold` owns authoritative session state.
-- `manifold-client` owns local presentation execution when the presenter is split out.
+- `brood` owns authoritative session state.
+- `brood-client` owns local presentation execution when the presenter is split out.
 - pane clients produce surfaces or scene data under session-process supervision.
 - browser integration is modeled as a first-party pane client.
 - WASM is the preferred portable plugin format and fault-isolation runtime.

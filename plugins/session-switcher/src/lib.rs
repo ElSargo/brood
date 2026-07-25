@@ -1,23 +1,23 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
 use std::sync::Mutex;
 
-use exports::manifold::plugin::actor::{
+use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
     LocalActorMessage, PresentationEvent, SessionCommand, SessionCommandCompleted, SessionEvent,
     SessionOperation, SessionSnapshot,
 };
-use manifold::plugin::host;
-use manifold_graphics::{Color, Command, Packet, Rect};
+use brood::plugin::host;
+use brood_graphics::{Color, Command, Packet, Rect};
 use serde::Deserialize;
 
-const INIT_ACTOR_ID: &str = "manifold.client-init";
+const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
-const COMPONENT_FILE: &str = "manifold_session_switcher_plugin.component.wasm";
-const CODING_AGENT_COMPONENT_FILE: &str = "manifold_coding_agent_plugin.component.wasm";
+const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
+const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;

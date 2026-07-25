@@ -1,10 +1,10 @@
 {
-  description = "Dummy Manifold nix develop runner project";
+  description = "Dummy Brood nix develop runner project";
 
-  inputs.manifold.url = "git+file:../..";
+  inputs.brood.url = "git+file:../..";
 
   outputs =
-    { self, manifold }:
+    { self, brood }:
     let
       systems = [
         "x86_64-linux"
@@ -21,12 +21,12 @@
     in
     {
       devShells = forEachSystem (system: {
-        default = manifold.devShells.${system}.default.overrideAttrs (old: {
-          MANIFOLD_DUMMY_NIX_ENV = "active";
-          MANIFOLD_DUMMY_PROJECT_NAME = "session-runner-nix-project";
+        default = brood.devShells.${system}.default.overrideAttrs (old: {
+          BROOD_DUMMY_NIX_ENV = "active";
+          BROOD_DUMMY_PROJECT_NAME = "session-runner-nix-project";
           shellHook = (old.shellHook or "") + ''
-            export MANIFOLD_DUMMY_NIX_ENV=active
-            export MANIFOLD_DUMMY_PROJECT_NAME=session-runner-nix-project
+            export BROOD_DUMMY_NIX_ENV=active
+            export BROOD_DUMMY_PROJECT_NAME=session-runner-nix-project
           '';
         });
       });

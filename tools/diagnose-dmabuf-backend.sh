@@ -7,29 +7,29 @@ cd "$ROOT"
 
 require_host_presentation_environment
 
-cargo build -p manifoldd --offline > /dev/null
+cargo build -p broodd --offline > /dev/null
 
-TMPDIR="$(mktemp -d /tmp/manifold-dmabuf-backend.XXXXXX)"
-DBUS_NAME="org.manifold.Test.p$$"
-LOG="$TMPDIR/manifoldd.log"
+TMPDIR="$(mktemp -d /tmp/brood-dmabuf-backend.XXXXXX)"
+DBUS_NAME="org.brood.Test.p$$"
+LOG="$TMPDIR/broodd.log"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
+    target/debug/brood ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" > /dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
+RUST_LOG="${RUST_LOG:-broodd=info,smithay=warn}" \
+  target/debug/brood run --dbus-name "$DBUS_NAME" > "$LOG" 2>&1 &
 PID=$!
 
-wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
+wait_for_broodd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifold ctl --dbus-name "$DBUS_NAME" "$@"
+  target/debug/brood ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 field() {

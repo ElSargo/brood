@@ -1,11 +1,11 @@
-# Manifold Context
+# Brood Context
 
-Manifold is a local persistent graphical workspace that explores whether an extra compositor/session layer can feel native
+Brood is a local persistent graphical workspace that explores whether an extra compositor/session layer can feel native
 
 ## Language
 
 **Workspace**:
-The product-level Manifold environment: the user's virtual workspace as a whole, including sessions, saved presentation preferences, configuration, and shared project context.
+The product-level Brood environment: the user's virtual workspace as a whole, including sessions, saved presentation preferences, configuration, and shared project context.
 _Avoid_: single session, presentation window
 
 **Session**:
@@ -21,7 +21,7 @@ The authoritative process that owns durable session state and the wider workspac
 _Avoid_: presentation client, display server, final renderer
 
 **Pane**:
-A unit of presentation in a Manifold workspace whose state lives behind a layer of indirection rather than in the presentation surface itself.
+A unit of presentation in a Brood workspace whose state lives behind a layer of indirection rather than in the presentation surface itself.
 _Avoid_: app, process, native child window, tab
 
 **Pane producer**:
@@ -81,11 +81,11 @@ A WASM application whose presentation actor may create panes and submit canvas d
 _Avoid_: managed app, assuming graphics cross the backend connection
 
 **Managed app**:
-An external native application whose windows or surfaces Manifold tracks, places, and preserves as part of a session.
+An external native application whose windows or surfaces Brood tracks, places, and preserves as part of a session.
 _Avoid_: captured window, child window, remote app
 
 **Hosted Wayland app**:
-A managed app launched under Manifold's nested Wayland compositor.
+A managed app launched under Brood's nested Wayland compositor.
 _Avoid_: treating every managed app as a nested Wayland app
 
 **Presentation window**:
@@ -117,7 +117,7 @@ A bounded, versioned, replayable canvas display list submitted by a presentation
 _Avoid_: component tree, native GPU command buffer, graphics swapchain, network-rendering requirement, pointer into retained guest memory
 
 **Session DBus proxy**:
-A session-scoped DBus bridge for external apps that need normal desktop-style communication inside a Manifold session.
+A session-scoped DBus bridge for external apps that need normal desktop-style communication inside a Brood session.
 _Avoid_: host-wide DBus access, cross-session DBus
 
 **Session filesystem access**:
@@ -129,7 +129,7 @@ Mutable session state such as cwd and environment variables that programs inheri
 _Avoid_: immutable launch template, global process environment
 
 **Power-user default**:
-Manifold's bias toward allowing explicit user/session actions without confirmation prompts by default, while making effects observable and reversible where practical.
+Brood's bias toward allowing explicit user/session actions without confirmation prompts by default, while making effects observable and reversible where practical.
 _Avoid_: nagging confirmation, safety theater
 
 **Agent action log**:
@@ -149,11 +149,11 @@ The extra local layer between managed app content and the user's desktop composi
 _Avoid_: remote desktop, streaming
 
 **Default implementation assumption**:
-In durable prose, unqualified references to "the implementation", "the backend", or default behavior mean the Linux-native Manifold path.
+In durable prose, unqualified references to "the implementation", "the backend", or default behavior mean the Linux-native Brood path.
 _Avoid_: treating experimental backend notes as supported defaults
 
 **Shared behavior spec**:
-The product-level Manifold semantics that backend work should try to satisfy, such as pane identity, focus rules, attach/detach behavior, show/hide, session persistence, and window grouping.
+The product-level Brood semantics that backend work should try to satisfy, such as pane identity, focus rules, attach/detach behavior, show/hide, session persistence, and window grouping.
 _Avoid_: shared runtime, common compositor abstraction
 
 **Capability grant**:
@@ -162,8 +162,8 @@ _Avoid_: ambient permission, unrestricted access
 
 ## Relationships
 
-- The current `manifoldd` binary is the MVP **session process** and also owns the MVP **presentation endpoint**.
-- The target `manifold-client` is an independent portable **presentation client** without authoritative session state. The split is first introduced as a typed in-process boundary.
+- The current `broodd` binary is the MVP **session process** and also owns the MVP **presentation endpoint**.
+- The target `brood-client` is an independent portable **presentation client** without authoritative session state. The split is first introduced as a typed in-process boundary.
 - A **presentation client** owns viewport state, client-side actors, graphics resources, WGPU composition, and selected **frame subscriptions**.
 - At most one client holds the generation-bearing **presentation lease** for a session; zero clients is a normal detached state.
 - A **workspace** is the product-level umbrella that contains one or more **sessions**.
@@ -181,14 +181,14 @@ _Avoid_: ambient permission, unrestricted access
 - Pane producers may send **presentation requests**. The **presentation surface** may honor, adapt, defer, or reject them according to its own constraints.
 - A **presentation window** may be destroyed while one or more **managed apps** continue running.
 - **Detach** is the default close behavior when there is session state worth preserving.
-- A **hosted Wayland app** is a **managed app** connected to Manifold's nested Wayland compositor.
+- A **hosted Wayland app** is a **managed app** connected to Brood's nested Wayland compositor.
 - A **pane producer** may create, fill, update, or remove one or more **panes**. **Pane clients**, **managed apps**, and **WASM pane apps** are different producer shapes.
 - A **WASM pane app** can create any number of **panes** without being one pane itself.
-- An external native program can create **panes** by creating Wayland windows that Manifold maps into the workspace.
+- An external native program can create **panes** by creating Wayland windows that Brood maps into the workspace.
 - A local **presentation client** uses DBus only to bootstrap and broker descriptors, bounded shared-memory lanes for ordinary steady-state protocol traffic, and DMA-BUF-compatible per-window surface sharing where available, with copied-image correctness fallback.
 - A remote **presentation client** maps the same semantic protocol lanes onto an authenticated network carrier and uses encoded or damage-based per-window surface transports. Remote presentation preserves client-side composition.
 - **Presentation actors** run in the client. Their local mailboxes, policy, layout, SDK UI state, draw packets, and render updates remain endpoint-local; only addressed session-actor messages and asynchronous backend operations cross the presentation connection.
-- The **WASM app host** should talk to Manifold through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, WGPU objects, or renderer internals.
+- The **WASM app host** should talk to Brood through workspace, scene, event, storage, mailbox, swapchain, and capability APIs rather than Smithay, WGPU objects, or renderer internals.
 - A **plugin** may contain multiple **plugin actors**, actor-scoped **plugin workers**, and optional **sync policy lanes**.
 - A **plugin actor** is the public address-space and mailbox boundary. It is dormant between events; once invoked its dispatcher must not suspend or block, and instead submits work and handles **completion** messages.
 - A **plugin worker** shares its actor's memory and capabilities, may use blocking-looking WASI, has no public mailbox, and is cancelled with its actor.
@@ -217,6 +217,6 @@ _Avoid_: ambient permission, unrestricted access
 - "agent action log" should not imply cross-session visibility by default. Workspace-level indexing may exist for user inspection, but the log belongs to the session.
 - "client" previously meant a Wayland client, a detachable display process, and sometimes a presentation window. Use **Wayland client**, **presentation client**, **presentation endpoint**, or **presentation window** explicitly in durable prose.
 - "frontend" remains a legacy/control-command spelling in the MVP tools. In docs, use **presentation endpoint** for the component and **presentation window** for the desktop window.
-- "server" and "daemon" are implementation-adjacent. Use **session process** for Manifold's authoritative state owner unless discussing protocol direction or process names.
-- "shared implementation" is premature. Use **shared behavior spec** when we mean common Manifold semantics across backend work, and reserve shared code for a later decision.
+- "server" and "daemon" are implementation-adjacent. Use **session process** for Brood's authoritative state owner unless discussing protocol direction or process names.
+- "shared implementation" is premature. Use **shared behavior spec** when we mean common Brood semantics across backend work, and reserve shared code for a later decision.
 - "workspace" can be ambiguous between the product umbrella and the concrete durable runtime object. Prefer **workspace** for the product-level environment and **session** for the implementation-level durable unit unless the document is explicitly talking about both layers at once.

@@ -105,7 +105,7 @@ static int create_keymap_fd(struct xkb_keymap *keymap, uint32_t *size_out) {
         free(text);
         fail("serialized XKB keymap is too large");
     }
-    int fd = memfd_create("manifold-test-keymap", MFD_CLOEXEC);
+    int fd = memfd_create("brood-test-keymap", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, (off_t)size) < 0) {
         free(text);
         fail("could not allocate the XKB keymap file");

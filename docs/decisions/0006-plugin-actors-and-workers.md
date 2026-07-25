@@ -61,7 +61,7 @@ to the enclosing local, containerized, or remote session environment.
 - Actor shutdown and hot replacement must cancel workers and in-flight I/O.
 - Runtime diagnostics and limits must cover worker count, outstanding I/O,
   completion backlog, starvation, cancellation, and worker state memory.
-- The durable ABI should use standard WASI plus Manifold-specific WIT APIs rather
+- The durable ABI should use standard WASI plus Brood-specific WIT APIs rather
   than a bespoke replacement for normal file and stream I/O.
 - Normal trusted-plugin operation does not add per-I/O approval prompts. Host
   bridges and authority are configured at the session boundary.

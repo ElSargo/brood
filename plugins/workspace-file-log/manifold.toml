@@ -1,6 +1,0 @@
-[module.workspace-file-log]
-enabled = true
-kind = "plugin"
-path = "target/wasm32-wasip1-threads/release/manifold_workspace_file_log_plugin.wasm"
-capabilities = ["filesystem:workspace-write"]
-startup-message = "start"

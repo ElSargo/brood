@@ -1,6 +1,6 @@
 # Coding agent actor workload
 
-This plugin is a vertical slice of the target Manifold agent architecture. The
+This plugin is a vertical slice of the target Brood agent architecture. The
 default session init actor preserves its terminal startup behavior while also
 creating independently addressed coding-agent actors. The default client init
 actor preserves the session switcher while also creating separate canvas UI

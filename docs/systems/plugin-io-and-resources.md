@@ -97,11 +97,11 @@ worker calls read
 
 Arguments, environment, working directory, and standard streams come from the
 session, plugin configuration, and worker spawn request—not from accidental
-inheritance of `manifoldd` internals. Stdin defaults closed unless supplied;
+inheritance of `broodd` internals. Stdin defaults closed unless supplied;
 stdout and stderr default to bounded session/plugin logs unless attached to an
 explicit stream.
 
-Ordinary file and stream libraries should work. Manifold does not promise
+Ordinary file and stream libraries should work. Brood does not promise
 `fork`, arbitrary signals, devices, unrestricted `ioctl`, arbitrary `mmap`,
 Unix account mutation, ambient descriptors, or system-wide process inspection.
 
@@ -234,7 +234,7 @@ Operations include `try_wait`, wait, close stdin, terminate, kill, and bounded
 status/resource queries.
 
 A native child has the authority of its session environment. WASI directory
-handles do not sandbox that child. Manifold should state this plainly rather
+handles do not sandbox that child. Brood should state this plainly rather
 than add per-spawn approval prompts which imply a boundary that does not exist.
 Containerized and remote sessions constrain children at the session boundary.
 

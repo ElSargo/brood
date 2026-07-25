@@ -154,7 +154,7 @@ arrives. An actor may omit a pane to keep it out of this viewport. Non-pane
 items let the client expose interactive targets without learning the actor's
 internal model.
 
-The portable `manifold-layout` crate owns validation, normalized projection,
+The portable `brood-layout` crate owns validation, normalized projection,
 recursive lease-fragment composition, and hit testing. It does not depend on
 Smithay, Winit, WGPU, transport code, or the WASM runtime.
 

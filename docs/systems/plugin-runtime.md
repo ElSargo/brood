@@ -7,7 +7,7 @@ last-reviewed: 2026-07-21
 
 # Plugin Runtime
 
-Manifold treats an installed and approved plugin as trusted user code in its
+Brood treats an installed and approved plugin as trusted user code in its
 execution environment. Actors may run in the session backend or in a
 presentation client according to explicit package placement. The runtime
 provides fault isolation, scheduling, lifecycle, and a portable I/O environment;
@@ -182,7 +182,7 @@ Completions, resources, and cancellation belong to one actor generation, so a
 late result cannot enter a replacement actor.
 
 Standard WASI is preferred for files, streams, sockets, clocks, and other
-portable facilities. Manifold APIs add actor addressing, workers,
+portable facilities. Brood APIs add actor addressing, workers,
 notifications, publications, and host services rather than replacing normal
 language I/O with a bespoke syscall vocabulary. Compatibility does not imply a
 complete Linux emulation: `fork`, arbitrary `ioctl`, ambient descriptors, and
@@ -359,7 +359,7 @@ order. The local peer independently records what it received and returned.
 declares a bounded shared-memory maximum, then performs a real recursive
 workspace scan and live filesystem watch. Creating, editing, and removing
 files produces corresponding records in
-`.manifold/workspace-file-log.log`; the visible file history demonstrates that
+`.brood/workspace-file-log.log`; the visible file history demonstrates that
 normal actor mailbox, worker, shared-memory, and filesystem behavior remains
 usable inside the ceilings. The nested workload also creates two invalid-UTF-8
 names which lossy conversion would conflate; both real guest logs retain them
@@ -370,7 +370,7 @@ model through the Component backend. Its typed WIT resource is an
 actor-generation-owned logical subscription backed by the daemon watcher
 service. The guest SDK wrapper projects its notification into the ordinary
 worker pollable set, and the plugin maintains a live Markdown history at
-`.manifold/component-workspace-watch.md`. The nested proof replaces the actor
+`.brood/component-workspace-watch.md`. The nested proof replaces the actor
 generation and observes the old subscription reach zero before the replacement
 is published. It also creates two invalid-UTF-8 Unix filenames which would
 collapse to the same replacement-character text under lossy conversion; the

@@ -2,7 +2,7 @@
 
 This Component Model plugin is the user-observable filesystem-watch proof. It
 opens a recursive watch on its configured workspace capability and maintains
-`.manifold/component-workspace-watch.md` as a live Markdown table. Creating,
+`.brood/component-workspace-watch.md` as a live Markdown table. Creating,
 editing, and removing workspace files adds typed `created`, `modified`, and
 `removed` rows with relative paths. The initial `rescan` row makes registration
 coverage visible instead of treating setup as an invisible success condition.

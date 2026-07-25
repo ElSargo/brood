@@ -1,7 +1,7 @@
 {
   pkgs,
   lib,
-  manifoldd,
+  broodd,
   runtimeFiles,
   sessionSwitcherPython,
   path,
@@ -28,20 +28,20 @@ pkgs.writeShellApplication {
   text = ''
     set -euo pipefail
 
-    MANIFOLD_BIN="''${MANIFOLD_BIN:-''${MANIFOLDD_BIN:-${manifoldd}/bin/manifold}}"
-    REPO_URL="''${MANIFOLD_DEV_REPO_URL:-https://github.com/ElSargo/manifold.git}"
+    BROOD_BIN="''${BROOD_BIN:-''${BROODD_BIN:-${broodd}/bin/brood}}"
+    REPO_URL="''${BROOD_DEV_REPO_URL:-https://github.com/ElSargo/brood.git}"
     CACHE_HOME="''${XDG_CACHE_HOME:-$HOME/.cache}"
-    CACHE_ROOT="''${MANIFOLD_DEV_CACHE_DIR:-$CACHE_HOME/manifold/dev-workflow}"
-    SOURCE_DIR="''${MANIFOLD_DEV_SOURCE_DIR:-$CACHE_ROOT/source}"
-    RUN_ROOT="''${MANIFOLD_DEV_RUN_ROOT:-$CACHE_ROOT/runs}"
-    RUST_LOG="''${RUST_LOG:-manifoldd=info,smithay=warn}"
+    CACHE_ROOT="''${BROOD_DEV_CACHE_DIR:-$CACHE_HOME/brood/dev-workflow}"
+    SOURCE_DIR="''${BROOD_DEV_SOURCE_DIR:-$CACHE_ROOT/source}"
+    RUN_ROOT="''${BROOD_DEV_RUN_ROOT:-$CACHE_ROOT/runs}"
+    RUST_LOG="''${RUST_LOG:-broodd=info,smithay=warn}"
 
     export PATH="${sessionSwitcherPython}/bin:${path}:$PATH"
     export LD_LIBRARY_PATH="${nativeLibraryPath}:''${LD_LIBRARY_PATH:-}"
     export GI_TYPELIB_PATH="${gtkTypelibPath}:''${GI_TYPELIB_PATH:-}"
     export XDG_DATA_DIRS="${gtkDataDirs}:''${XDG_DATA_DIRS:-}"
     export GSETTINGS_SCHEMA_DIR="${gsettingsSchemaDir}"
-    export MANIFOLD_DEV_SHELL=1
+    export BROOD_DEV_SHELL=1
     ${lib.optionalString exportDevVars ''
       export PKG_CONFIG_PATH="${nativePkgConfigPath}:''${PKG_CONFIG_PATH:-}"
       export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
@@ -72,12 +72,12 @@ pkgs.writeShellApplication {
         return
       fi
       if [[ -e "$SOURCE_DIR" ]] && [[ -n "$(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-        echo "ERR MANIFOLD_DEV_SOURCE_DIR exists but is not a git checkout: $SOURCE_DIR" >&2
+        echo "ERR BROOD_DEV_SOURCE_DIR exists but is not a git checkout: $SOURCE_DIR" >&2
         exit 2
       fi
       git clone "$REPO_URL" "$SOURCE_DIR"
-      if [[ -n "''${MANIFOLD_DEV_REF:-}" ]]; then
-        git -C "$SOURCE_DIR" checkout "$MANIFOLD_DEV_REF"
+      if [[ -n "''${BROOD_DEV_REF:-}" ]]; then
+        git -C "$SOURCE_DIR" checkout "$BROOD_DEV_REF"
       fi
       echo "source=$SOURCE_DIR"
     }
@@ -111,7 +111,7 @@ pkgs.writeShellApplication {
       local log="$3"
       local label="$4"
       for _ in $(seq 1 200); do
-        if "$MANIFOLD_BIN" ctl --dbus-name "$name" status-json >/dev/null 2>&1; then
+        if "$BROOD_BIN" ctl --dbus-name "$name" status-json >/dev/null 2>&1; then
           return 0
         fi
         if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
@@ -127,23 +127,23 @@ pkgs.writeShellApplication {
     }
 
     spawn_default_dev_client() {
-      if [[ -n "''${MANIFOLD_DEV_CLIENT:-}" ]]; then
+      if [[ -n "''${BROOD_DEV_CLIENT:-}" ]]; then
         local q_source
         q_source="$(shell_quote "$SOURCE_DIR")"
-        "$MANIFOLD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
-          bash -lc "cd $q_source && exec ''${MANIFOLD_DEV_CLIENT}" >/dev/null
+        "$BROOD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
+          bash -lc "cd $q_source && exec ''${BROOD_DEV_CLIENT}" >/dev/null
       else
-        "$MANIFOLD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
+        "$BROOD_BIN" ctl --dbus-name "$DBUS_DESTINATION" spawn \
           "${pkgs.foot}/bin/foot" --working-directory "$SOURCE_DIR" >/dev/null
       fi
     }
 
     cleanup() {
-      if [[ "''${MANIFOLD_DEV_KEEP_RUNNING:-0}" == "1" ]]; then
+      if [[ "''${BROOD_DEV_KEEP_RUNNING:-0}" == "1" ]]; then
         return
       fi
       if [[ -n "''${DBUS_DESTINATION:-}" ]]; then
-        "$MANIFOLD_BIN" ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
+        "$BROOD_BIN" ctl --dbus-name "$DBUS_DESTINATION" quit >/dev/null 2>&1 || true
       fi
       if [[ -n "''${SESSION_PID:-}" ]] && kill -0 "$SESSION_PID" 2>/dev/null; then
         kill "$SESSION_PID" >/dev/null 2>&1 || true
@@ -158,7 +158,7 @@ pkgs.writeShellApplication {
     exec 9>"$CACHE_ROOT/workflow.lock"
     flock 9
 
-    DBUS_DESTINATION="org.manifold.DevWorkflow.p$$"
+    DBUS_DESTINATION="org.brood.DevWorkflow.p$$"
     SESSION_LOG="$RUN_DIR/session.log"
     RUNTIME_INSTALL_LOG="$RUN_DIR/runtime-install.log"
 
@@ -170,21 +170,21 @@ pkgs.writeShellApplication {
 
     (
       cd "$SOURCE_DIR"
-      RUST_LOG="$RUST_LOG" "$MANIFOLD_BIN" run --no-session-runner --dbus-name "$DBUS_DESTINATION" --config "$SOURCE_DIR/manifold.toml"
+      RUST_LOG="$RUST_LOG" "$BROOD_BIN" run --no-session-runner --dbus-name "$DBUS_DESTINATION" --config "$SOURCE_DIR/brood.toml"
     ) >"$SESSION_LOG" 2>&1 &
     SESSION_PID=$!
 
-    wait_for_control "$DBUS_DESTINATION" "$SESSION_PID" "$SESSION_LOG" "Manifold session"
+    wait_for_control "$DBUS_DESTINATION" "$SESSION_PID" "$SESSION_LOG" "Brood session"
 
     spawn_default_dev_client
 
-    echo "OK Manifold developer workflow ready"
+    echo "OK Brood developer workflow ready"
     echo "source=$SOURCE_DIR"
     echo "run_dir=$RUN_DIR"
     echo "dbus_destination=$DBUS_DESTINATION"
     echo "runtime_install_log=$RUNTIME_INSTALL_LOG"
     echo "session_log=$SESSION_LOG"
-    echo "Stop with Ctrl-C or close the Manifold presentation."
+    echo "Stop with Ctrl-C or close the Brood presentation."
 
     wait "$SESSION_PID"
   '';

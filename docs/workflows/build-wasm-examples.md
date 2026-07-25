@@ -27,9 +27,9 @@ nix develop --command cargo build \
   --manifest-path examples/wasm-component-actor/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
-nix develop --command cargo run -p manifold-wasm --example componentize -- \
-  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.wasm \
-  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm
+nix develop --command cargo run -p brood-wasm --example componentize -- \
+  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm \
+  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.component.wasm
 ```
 
 The Preview 1 compatibility worker remains a core
@@ -59,8 +59,8 @@ component with `wasm-tools` inside the sandbox, and installs these new artifacts
 at:
 
 ```text
-result/examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm
-result/examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/manifold_preview1_worker_example.wasm
+result/examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.component.wasm
+result/examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/brood_preview1_worker_example.wasm
 ```
 
 These artifacts are examples and real plugin workloads, not a synthetic

@@ -4,14 +4,14 @@ type: reference
 authority: implementation
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifoldd/src/config.rs
-  - crates/manifold-cli/src/realm_init.rs
-  - manifold.toml
+  - crates/broodd/src/config.rs
+  - crates/brood-cli/src/realm_init.rs
+  - brood.toml
 ---
 
 # Config Schema Reference Pointers
 
-Exact config schema behavior is defined by the deserializers in `crates/manifoldd/src/config.rs`.
+Exact config schema behavior is defined by the deserializers in `crates/broodd/src/config.rs`.
 
 Current top-level config families:
 

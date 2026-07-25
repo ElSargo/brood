@@ -21,7 +21,7 @@ nix develop --command cargo build \
 The result remains a core module at:
 
 ```text
-examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/manifold_preview1_worker_example.wasm
+examples/wasm-preview1-worker/target/wasm32-wasip1-threads/release/brood_preview1_worker_example.wasm
 ```
 
 Do not componentize this artifact. Its imported shared memory, exported worker

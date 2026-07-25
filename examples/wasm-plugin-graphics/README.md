@@ -7,6 +7,6 @@ Text is shaped and rasterized by the client's native text service before the
 packet references its immutable layout handle.
 
 Build and componentize it from the repository root using the checked-in Nix
-development shell, then pass the resulting component to `manifold-client` as a
+development shell, then pass the resulting component to `brood-client` as a
 presentation actor. The exact client flags are defined by `ClientArgs` in
-`crates/manifold-cli/src/cli.rs`.
+`crates/brood-cli/src/cli.rs`.

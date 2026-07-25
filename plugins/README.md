@@ -2,15 +2,15 @@
 
 `workspace-file-log` is a complete Preview 1 actor-and-worker plugin. It watches
 the active workspace through ordinary WASI filesystem calls and records changed
-file names in `.manifold/workspace-file-log.log`, including reversible native
+file names in `.brood/workspace-file-log.log`, including reversible native
 path-byte escapes for names that are not UTF-8.
 
-Root-level target-shape Manifold plugins live here.
+Root-level target-shape Brood plugins live here.
 
-- `default-workspace/` ports the existing prototype key handler and map/layout hook into the new `manifold-wasm` ABI shape: exported policy providers plus guest arena allocation.
+- `default-workspace/` ports the existing prototype key handler and map/layout hook into the new `brood-wasm` ABI shape: exported policy providers plus guest arena allocation.
 - `session-switcher/` is the default client-realm shell plugin: its init actor starts a native plugin pane which renders the live session catalogue and performs typed create, switch, rename, and close operations.
 
-These crates are currently standalone because `manifold-wasm` is host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest SDK instead of hand-writing ABI exports and JSON envelopes.
+These crates are currently standalone because `brood-wasm` is host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest SDK instead of hand-writing ABI exports and JSON envelopes.
 
 `component-workspace-watch` is the Component Model filesystem-watch proof. It
 contains the current small guest-side typed-resource wrapper and maintains a

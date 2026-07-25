@@ -1,0 +1,8 @@
+[session.runner]
+enabled = true
+kind = "nix-develop"
+cache_root = ".brood/cache"
+
+[startup.env-proof]
+enabled = true
+argv = ["./scripts/write-env-proof.sh"]

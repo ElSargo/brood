@@ -12,7 +12,7 @@ last-reviewed: 2026-07-24
 
 ## Purpose
 
-Manifold separates the durable session server from the software that presents
+Brood separates the durable session server from the software that presents
 and interacts with it. A presentation client is an independent viewport over
 the available window catalog. It owns layout, interaction state, presentation
 actors, GPU resources, and final rendering. Sessions remain grouping and

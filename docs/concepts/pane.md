@@ -7,7 +7,7 @@ last-reviewed: 2026-07-21
 
 # Pane
 
-A pane is the unit of presentation in a Manifold workspace. Pane state lives behind a layer of indirection rather than in the presentation surface itself.
+A pane is the unit of presentation in a Brood workspace. Pane state lives behind a layer of indirection rather than in the presentation surface itself.
 
 A pane may be produced by:
 

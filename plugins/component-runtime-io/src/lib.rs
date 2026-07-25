@@ -1,15 +1,15 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
-use exports::manifold::plugin::actor::{
+use exports::brood::plugin::actor::{
     Command, Event, Guest, WorkerEvent, WorkerFinished, WorkerRequest,
 };
-use manifold::plugin::host;
+use brood::plugin::host;
 
 const WORKER: u64 = 1;
-const REPORT: &str = ".manifold/runtime-io-transcript.md";
+const REPORT: &str = ".brood/runtime-io-transcript.md";
 
 struct RuntimeIoProof;
 

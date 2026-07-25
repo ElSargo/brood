@@ -4,12 +4,12 @@ type: implementation-map
 authority: product
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifoldd/src/runtime.rs
-  - crates/manifoldd/src/compositor.rs
-  - crates/manifoldd/src/control.rs
-  - clients/manifold-client/src/main.rs
-  - clients/manifold-client/src/actor_runtime.rs
-  - crates/manifold-layout/src/lib.rs
+  - crates/broodd/src/runtime.rs
+  - crates/broodd/src/compositor.rs
+  - crates/broodd/src/control.rs
+  - clients/brood-client/src/main.rs
+  - clients/brood-client/src/actor_runtime.rs
+  - crates/brood-layout/src/lib.rs
 ---
 
 # Code Architecture
@@ -21,7 +21,7 @@ CLI and ABI details belong to their defining code and are not duplicated here.
 
 ### Session server
 
-`manifold-sessiond` owns:
+`brood-sessiond` owns:
 
 - the Smithay nested Wayland display;
 - surface sessions, hosted applications, and stable managed-pane identities;
@@ -35,7 +35,7 @@ presentation renderer, viewport layout, chrome, or global hit testing.
 
 ### Presentation client
 
-`manifold-client` owns:
+`brood-client` owns:
 
 - its Winit window, WGPU device, swapchain, and composition loop;
 - client init and presentation actors;
@@ -45,7 +45,7 @@ presentation renderer, viewport layout, chrome, or global hit testing.
 - local focus, hit testing, pointer grabs, and physical key state;
 - frame import and managed-pane size requests.
 
-The user-facing `manifold` command launches or focuses this process and uses
+The user-facing `brood` command launches or focuses this process and uses
 the server only as the session authority.
 
 ## Presentation Transport
@@ -62,7 +62,7 @@ connection.
 
 ## Recursive Layout
 
-`manifold-layout` is portable and compositor independent. The client creates a
+`brood-layout` is portable and compositor independent. The client creates a
 root layout lease and may grant one recursive `rest` child per node. Each
 holder receives only its viewport, pane allocation, focus context, and current
 revision.

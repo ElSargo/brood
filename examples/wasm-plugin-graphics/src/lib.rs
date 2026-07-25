@@ -1,13 +1,13 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
 use std::sync::Mutex;
 
-use exports::manifold::plugin::actor::{Event, Guest, PresentationEvent};
-use manifold::plugin::host;
-use manifold_graphics::{BlendMode, Color, Command, Packet, Path, Rect, Transform};
+use exports::brood::plugin::actor::{Event, Guest, PresentationEvent};
+use brood::plugin::host;
+use brood_graphics::{BlendMode, Color, Command, Packet, Path, Rect, Transform};
 
 const LEFT_BUTTON: u32 = 0x110;
 
@@ -45,7 +45,7 @@ static STATE: Mutex<DemoState> = Mutex::new(DemoState::new());
 struct GraphicsDemo;
 
 impl Guest for GraphicsDemo {
-    fn dispatch(event: Event) -> Vec<exports::manifold::plugin::actor::Command> {
+    fn dispatch(event: Event) -> Vec<exports::brood::plugin::actor::Command> {
         let Event::Presentation(event) = event else {
             return Vec::new();
         };

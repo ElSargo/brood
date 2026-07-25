@@ -1,12 +1,12 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use exports::manifold::plugin::actor::{Command, Event, Guest, WorkerRequest};
-use manifold::plugin::host;
+use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
+use brood::plugin::host;
 
 static INPUT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static RESULT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
@@ -76,7 +76,7 @@ impl Guest for ExampleActor {
                     payload: b"duplicate.pipe".to_vec(),
                 }),
             ],
-            Event::Completion(exports::manifold::plugin::actor::Completion::Read(completion)) => {
+            Event::Completion(exports::brood::plugin::actor::Completion::Read(completion)) => {
                 vec![Command::SpawnWorker(WorkerRequest {
                     worker: 99,
                     payload: completion.bytes,

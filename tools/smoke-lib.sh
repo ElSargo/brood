@@ -55,7 +55,7 @@ describe_host_presentation_environment() {
 }
 
 require_host_presentation_environment() {
-  if [[ "${MANIFOLD_SKIP_HOST_PREFLIGHT:-}" == "1" ]]; then
+  if [[ "${BROOD_SKIP_HOST_PREFLIGHT:-}" == "1" ]]; then
     return 0
   fi
 
@@ -82,18 +82,18 @@ require_host_presentation_environment() {
   return 1
 }
 
-wait_for_manifoldd_control() {
+wait_for_broodd_control() {
   local dbus_name="$1"
   local pid="$2"
   local log="$3"
 
   for _ in $(seq 1 120); do
     if ! kill -0 "$pid" 2> /dev/null; then
-      echo "ERR manifoldd exited before DBus control became responsive" >&2
+      echo "ERR broodd exited before DBus control became responsive" >&2
       tail -120 "$log" >&2 || true
       return 1
     fi
-    if target/debug/manifold ctl --dbus-name "$dbus_name" status > /dev/null 2>&1; then
+    if target/debug/brood ctl --dbus-name "$dbus_name" status > /dev/null 2>&1; then
       return 0
     fi
     sleep 0.1

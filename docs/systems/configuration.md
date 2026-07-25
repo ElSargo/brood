@@ -4,24 +4,24 @@ type: system
 authority: implementation
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifoldd/src/config.rs
-  - manifold.toml
+  - crates/broodd/src/config.rs
+  - brood.toml
 ---
 
 # Configuration
 
-Manifold configuration is TOML. The current checked-in config is `manifold.toml`; user config is discovered through the normal XDG path first.
+Brood configuration is TOML. The current checked-in config is `brood.toml`; user config is discovered through the normal XDG path first.
 
-Exact parsing behavior lives in `crates/manifoldd/src/config.rs`.
+Exact parsing behavior lives in `crates/broodd/src/config.rs`.
 
 ## Config Discovery
 
 Current discovery order:
 
-- `MANIFOLD_CONFIG`, when set and non-empty
-- `$XDG_CONFIG_HOME/manifold/manifold.toml`
-- `~/.config/manifold/manifold.toml`
-- nearest checked-in `manifold.toml` found by walking upward from the running binary
+- `BROOD_CONFIG`, when set and non-empty
+- `$XDG_CONFIG_HOME/brood/brood.toml`
+- `~/.config/brood/brood.toml`
+- nearest checked-in `brood.toml` found by walking upward from the running binary
 
 ## Config Sections
 
@@ -51,7 +51,7 @@ definitions.
 `[client.key-policy]` selects the provider export and core-WASM artifact used
 before the client routes a key to either a local plugin pane or a managed
 window. Relative artifact paths resolve from the config directory. A CLI
-selection remains an explicit recovery override; normal `manifold` startup
+selection remains an explicit recovery override; normal `brood` startup
 uses this config selection without wrapper arguments.
 
 The `<id>` in `[module.<id>]` is also the hosted actor instance ID for Component
@@ -90,11 +90,11 @@ guest-relative and never reveals the host path. Timeouts must be non-zero.
 `startup-message` remains a legacy bootstrap convenience for plugins without a
 lifecycle table. Combining it with `lifecycle` is rejected rather than running
 two competing startup mechanisms. Exact parser spelling and defaults remain in
-[`config.rs`](../../crates/manifoldd/src/config.rs).
+[`config.rs`](../../crates/broodd/src/config.rs).
 
 For legacy core-module artifacts, the config table key remains only a module
 label. Those artifacts keep their declared actor/provider names and singular
-replacement lane. Runtime `manifold plug --id` rejects that legacy case rather
+replacement lane. Runtime `brood plug --id` rejects that legacy case rather
 than reporting an actor ID that was never registered.
 
 The old `fast-key-handler` and `fast-map-hook` names are rejected with a legacy

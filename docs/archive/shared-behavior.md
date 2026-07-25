@@ -1,21 +1,21 @@
 # Shared Behavior Spec
 
-This document records the Manifold behavior that supported backend work should satisfy, even when compositor, renderer, windowing, or presentation mechanisms differ.
+This document records the Brood behavior that supported backend work should satisfy, even when compositor, renderer, windowing, or presentation mechanisms differ.
 
-Unless a section explicitly says otherwise, references here to the implementation, backend, or default behavior mean the Linux-native Manifold path.
+Unless a section explicitly says otherwise, references here to the implementation, backend, or default behavior mean the Linux-native Brood path.
 
 ## Principles
 
-- Manifold preserves workspace meaning above backend mechanics.
+- Brood preserves workspace meaning above backend mechanics.
 - The product-level workspace contains sessions; a presentation surface presents one session at a time.
 - Surfaces should remain GPU-resident whenever the platform can support it.
 - Presentation should add as little latency as possible between producer commits, input, and visible output.
-- Fallbacks are correctness paths, not the architecture Manifold is trying to optimize for.
+- Fallbacks are correctness paths, not the architecture Brood is trying to optimize for.
 - Tests should validate user-observable behavior before shared runtime code exists.
 
 ## Workspace And Sessions
 
-The workspace is the whole managed Manifold environment at the product level. A session is the concrete durable runtime unit: an isolated collection of related panes, producer state, plugin state, environment, cwd, agents, programs, and capabilities.
+The workspace is the whole managed Brood environment at the product level. A session is the concrete durable runtime unit: an isolated collection of related panes, producer state, plugin state, environment, cwd, agents, programs, and capabilities.
 
 Expected behavior:
 
@@ -33,7 +33,7 @@ Expected behavior:
 - Isolated sessions should be able to add managed filesystem copy-on-write
   views, session-local runtime IPC paths, network namespaces, PID/IPC
   namespaces, and DBus proxies without changing the pane or presentation model.
-- Manifold uses power-user defaults: explicit session actions should not trigger confirmation prompts by default.
+- Brood uses power-user defaults: explicit session actions should not trigger confirmation prompts by default.
 - Prefer observable effects, logs, history, undo/recovery where practical, and opt-in guardrails over nagging confirmations.
 - Agents are same-session apps for trust and capability purposes, but their requested and performed actions should be logged inside the session for traceability.
 
@@ -44,18 +44,18 @@ staged implementation plan.
 
 ## Entered Session Environment
 
-An entered session is a shell or command environment bound to one Manifold session.
+An entered session is a shell or command environment bound to one Brood session.
 
 Expected behavior:
 
-- `manifold enter` creates or reuses a session environment when invoked from outside an entered session, sets the session command context, points GUI clients at the session's nested Wayland display, and then starts a shell or requested command.
+- `brood enter` creates or reuses a session environment when invoked from outside an entered session, sets the session command context, points GUI clients at the session's nested Wayland display, and then starts a shell or requested command.
 - The session server records directory-associated sessions and a directory default so repeated `enter` and `show` calls from the same directory reuse the same session by default.
 - Bare `enter` should refuse to nest when the shell is already inside a session; `enter --new` should force a new session and print an easy session identifier without moving the directory default unless requested.
 - Session-aware commands infer their target from the entered environment unless explicitly overridden.
-- `manifold show` fronts, attaches, or switches presentation to the directory-bound or explicitly selected session, or creates an empty session when invoked outside one and no binding exists, without changing the shell environment.
-- `manifold hide` resolves the same session target shape as `show` and detaches the presentation surface when one exists, without closing the session.
+- `brood show` fronts, attaches, or switches presentation to the directory-bound or explicitly selected session, or creates an empty session when invoked outside one and no binding exists, without changing the shell environment.
+- `brood hide` resolves the same session target shape as `show` and detaches the presentation surface when one exists, without closing the session.
 - Session listing should show the live sessions associated with the current directory by default and all live sessions when requested globally.
-- `manifold` is the normal user-facing command; direct control commands should use the same default target as the rest of the command surface.
+- `brood` is the normal user-facing command; direct control commands should use the same default target as the rest of the command surface.
 - Entered shells should make the active DBus control endpoint, session id, session name, Wayland display, and optional DBus/filesystem isolation paths observable for diagnostics.
 - Entering a session should not by itself require filesystem, network, or PID isolation; those are profiles layered on top.
 
@@ -84,7 +84,7 @@ Expected behavior:
 
 ## Pane Identity
 
-A pane is the unit of presentation in a Manifold workspace. Its state is not owned by the presentation surface itself; the presentation surface is an indirect view of state owned by a producer, the session process, or a host-managed model behind it.
+A pane is the unit of presentation in a Brood workspace. Its state is not owned by the presentation surface itself; the presentation surface is an indirect view of state owned by a producer, the session process, or a host-managed model behind it.
 
 Expected behavior:
 
@@ -100,8 +100,8 @@ Pane producers include supervised pane clients, managed app surfaces, and plugin
 
 Expected behavior:
 
-- Managed native apps are external processes whose surfaces are tracked and placed by Manifold.
-- Hosted Wayland apps are managed apps connected to Manifold's nested Wayland compositor; their Wayland windows can create panes.
+- Managed native apps are external processes whose surfaces are tracked and placed by Brood.
+- Hosted Wayland apps are managed apps connected to Brood's nested Wayland compositor; their Wayland windows can create panes.
 - Plugin/WASM pane apps own durable app state in the session process and can create any number of panes by describing host-rendered native component trees or emitting semantic scene patches.
 - Browser panes have a current behavior/testing path: real Chromium launched as a hosted Wayland managed app.
 - Browser panes also have a roadmap path: a minimal first-party browser pane client designed to show pages with less overhead.
@@ -114,7 +114,7 @@ Focus belongs to the workspace pane model, even when a backend uses platform-spe
 
 Expected behavior:
 
-- Pointer, keyboard, wheel, and future IME/clipboard events route to the focused or hit-tested pane according to Manifold policy.
+- Pointer, keyboard, wheel, and future IME/clipboard events route to the focused or hit-tested pane according to Brood policy.
 - The host owns final key routing and shortcut conflict resolution; privileged plugins may influence immediate key policy only through bounded policy providers.
 - Focus changes are observable through status, events, or testable workspace state.
 - Detach and reattach should not lose the intended focused pane when that pane still exists.
@@ -148,12 +148,12 @@ Expected behavior:
 
 ## Window Grouping
 
-Manifold may present multiple producer surfaces as one workspace group.
+Brood may present multiple producer surfaces as one workspace group.
 
 Expected behavior:
 
 - A multi-window app can create multiple panes or be associated with one workspace group when that best matches user intent.
-- Popups, auxiliary windows, and browser-created windows should not escape Manifold placement policy by default.
+- Popups, auxiliary windows, and browser-created windows should not escape Brood placement policy by default.
 - Backend-specific host windows may differ, but workspace commands should see a coherent pane or group identity.
 
 ## Session Persistence
@@ -176,12 +176,12 @@ Expected behavior:
 - Prefer GPU-resident surfaces through DMA-BUF or equivalent platform-native handles.
 - Avoid full-frame CPU streaming as the primary local presentation path.
 - Keep input-to-visible-result and commit-to-visible-result latency within a frame whenever practical.
-- For native nested clients, prefer a late-latched ordering where host input is forwarded, the client commits, Manifold composites, and Manifold submits within one output frame when the client can meet the deadline.
+- For native nested clients, prefer a late-latched ordering where host input is forwarded, the client commits, Brood composites, and Brood submits within one output frame when the client can meet the deadline.
 - Report fallback use, frame cadence, and latency in diagnostics so performance failures are explainable.
 
 ## Nested Development
 
-Manifold should be able to host a development Manifold instance inside a stable Manifold instance. This is both a product stress test and a practical development workflow.
+Brood should be able to host a development Brood instance inside a stable Brood instance. This is both a product stress test and a practical development workflow.
 
 Expected behavior:
 

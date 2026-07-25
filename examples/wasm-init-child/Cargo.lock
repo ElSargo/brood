@@ -89,7 +89,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifold-wasm-init-child-example"
+name = "brood-wasm-init-child-example"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",

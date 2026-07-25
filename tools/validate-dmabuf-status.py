@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Manifold dmabuf status telemetry against a client WAYLAND_DEBUG trace."""
+"""Validate Brood dmabuf status telemetry against a client WAYLAND_DEBUG trace."""
 
 from __future__ import annotations
 
@@ -226,7 +226,7 @@ def validate_status(status_json: str, trace: str, require_explicit_sync: bool) -
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--status-json", required=True, help="Manifold status-json payload")
+    parser.add_argument("--status-json", required=True, help="Brood status-json payload")
     parser.add_argument("--trace", required=True, type=pathlib.Path, help="WAYLAND_DEBUG trace path")
     parser.add_argument(
         "--require-explicit-sync",

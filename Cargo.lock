@@ -414,6 +414,124 @@ dependencies = [
 ]
 
 [[package]]
+name = "brood-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brood-ipc",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "zbus",
+]
+
+[[package]]
+name = "brood-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brood-cli",
+ "brood-dmabuf",
+ "brood-graphics",
+ "brood-ipc",
+ "brood-layout",
+ "brood-wasm",
+ "bytemuck",
+ "clap",
+ "cosmic-text",
+ "lyon_tessellation",
+ "num-traits",
+ "pollster",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "brood-dmabuf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wgpu",
+ "wgpu-hal",
+]
+
+[[package]]
+name = "brood-graphics"
+version = "0.1.0"
+
+[[package]]
+name = "brood-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "brood-layout"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "brood-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cap-fs-ext",
+ "cap-std",
+ "futures",
+ "notify",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wiggle",
+ "wit-component 0.251.0",
+]
+
+[[package]]
+name = "broodd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brood-cli",
+ "brood-ipc",
+ "brood-wasm",
+ "calloop 0.14.4",
+ "calloop-wayland-source 0.4.1",
+ "clap",
+ "image",
+ "num-traits",
+ "serde",
+ "serde_json",
+ "smithay",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "zbus",
+]
+
+[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2368,124 +2486,6 @@ name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
-
-[[package]]
-name = "manifold-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "manifold-ipc",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "zbus",
-]
-
-[[package]]
-name = "manifold-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "clap",
- "cosmic-text",
- "lyon_tessellation",
- "manifold-cli",
- "manifold-dmabuf",
- "manifold-graphics",
- "manifold-ipc",
- "manifold-layout",
- "manifold-wasm",
- "num-traits",
- "pollster",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "manifold-dmabuf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "wgpu",
- "wgpu-hal",
-]
-
-[[package]]
-name = "manifold-graphics"
-version = "0.1.0"
-
-[[package]]
-name = "manifold-ipc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "manifold-layout"
-version = "0.1.0"
-dependencies = [
- "num-traits",
- "serde",
-]
-
-[[package]]
-name = "manifold-wasm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cap-fs-ext",
- "cap-std",
- "futures",
- "notify",
- "portable-pty",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "wasmtime",
- "wasmtime-wasi",
- "wiggle",
- "wit-component 0.251.0",
-]
-
-[[package]]
-name = "manifoldd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop 0.14.4",
- "calloop-wayland-source 0.4.1",
- "clap",
- "image",
- "manifold-cli",
- "manifold-ipc",
- "manifold-wasm",
- "num-traits",
- "serde",
- "serde_json",
- "smithay",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
- "zbus",
-]
 
 [[package]]
 name = "matchers"

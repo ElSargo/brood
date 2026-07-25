@@ -4,16 +4,16 @@ type: system
 authority: product
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifoldd/src/lib.rs
-  - crates/manifoldd/src/runtime.rs
-  - clients/manifold-client/src/main.rs
-  - crates/manifoldd/src/config.rs
-  - crates/manifoldd/src/session_runner.rs
+  - crates/broodd/src/lib.rs
+  - crates/broodd/src/runtime.rs
+  - clients/brood-client/src/main.rs
+  - crates/broodd/src/config.rs
+  - crates/broodd/src/session_runner.rs
 ---
 
 # Runtime
 
-Manifold has two runtime roles: an authoritative session server and an
+Brood has two runtime roles: an authoritative session server and an
 independent presentation client. The server is coherent with zero connected
 clients and never creates a native or offscreen presentation target.
 
@@ -65,4 +65,4 @@ client into the server process.
 - [[input-shortcuts]]
 - [[configuration]]
 - [[testing]]
-- [[../workflows/run-manifold]]
+- [[../workflows/run-brood]]

@@ -3,13 +3,13 @@ use std::{alloc::Layout, slice};
 const OUTBOX_CAPACITY: usize = 64 * 1024;
 static mut OUTBOX: [u8; OUTBOX_CAPACITY] = [0; OUTBOX_CAPACITY];
 
-#[link(wasm_import_module = "manifold")]
+#[link(wasm_import_module = "brood")]
 unsafe extern "C" {
     fn read_message() -> i32;
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_arena_alloc(capacity: i32, align: i32) -> i32 {
+pub extern "C" fn brood_arena_alloc(capacity: i32, align: i32) -> i32 {
     let Ok(layout) = arena_layout(capacity, align) else {
         return 0;
     };
@@ -17,7 +17,7 @@ pub extern "C" fn manifold_arena_alloc(capacity: i32, align: i32) -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_arena_free(ptr: i32, capacity: i32, align: i32) {
+pub extern "C" fn brood_arena_free(ptr: i32, capacity: i32, align: i32) {
     let Ok(layout) = arena_layout(capacity, align) else {
         return;
     };
@@ -27,13 +27,13 @@ pub extern "C" fn manifold_arena_free(ptr: i32, capacity: i32, align: i32) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_actor_layout_subscribe_pane_mapped() {}
+pub extern "C" fn brood_actor_layout_subscribe_pane_mapped() {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_actor_layout_subscribe_layout_state() {}
+pub extern "C" fn brood_actor_layout_subscribe_layout_state() {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_actor_layout_epoch_run(
+pub extern "C" fn brood_actor_layout_epoch_run(
     _epoch: i64,
     inbox_ptr: i32,
     _inbox_cap: i32,
@@ -94,7 +94,7 @@ pub extern "C" fn manifold_actor_layout_epoch_run(
 /// an unwanted third client.
 #[unsafe(no_mangle)]
 #[cfg(not(feature = "broken"))]
-pub extern "C" fn manifold_actor_poison_epoch_run(
+pub extern "C" fn brood_actor_poison_epoch_run(
     _epoch: i64,
     inbox_ptr: i32,
     _inbox_cap: i32,
@@ -116,7 +116,7 @@ pub extern "C" fn manifold_actor_poison_epoch_run(
 /// cannot partially replace a live multi-actor generation.
 #[unsafe(no_mangle)]
 #[cfg(feature = "broken")]
-pub extern "C" fn manifold_actor_poison_epoch_run() -> i32 {
+pub extern "C" fn brood_actor_poison_epoch_run() -> i32 {
     0
 }
 

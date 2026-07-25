@@ -19,19 +19,19 @@ const EVENT_WORKER_FINISHED: u32 = 7;
 const EVENT_LIFECYCLE_START: u32 = 11;
 const EVENT_LIFECYCLE_STOP: u32 = 12;
 const STACK_ALIGNMENT: usize = 16;
-const LOG_DIRECTORY: &str = ".manifold";
-const LOG_PATH: &str = ".manifold/workspace-file-log.log";
-const MIRROR_LOG_PATH: &str = ".manifold/workspace-file-log.mirror.log";
-const INDEX_PATH: &str = ".manifold/workspace-file-index.tsv";
-const PAUSE_ACK_PATH: &str = ".manifold/workspace-file-log.paused";
-const LIFECYCLE_LOG_PATH: &str = ".manifold/workspace-file-lifecycle.log";
-const SNAPSHOT_PATH: &str = ".manifold/workspace-file-log.snapshot";
+const LOG_DIRECTORY: &str = ".brood";
+const LOG_PATH: &str = ".brood/workspace-file-log.log";
+const MIRROR_LOG_PATH: &str = ".brood/workspace-file-log.mirror.log";
+const INDEX_PATH: &str = ".brood/workspace-file-index.tsv";
+const PAUSE_ACK_PATH: &str = ".brood/workspace-file-log.paused";
+const LIFECYCLE_LOG_PATH: &str = ".brood/workspace-file-lifecycle.log";
+const SNAPSHOT_PATH: &str = ".brood/workspace-file-log.snapshot";
 const SNAPSHOT_MAX_BYTES: u32 = 1024 * 1024;
 const WORKER_ARGUMENT: u32 = 1;
 const MIRROR_WORKER_ARGUMENT: u32 = 2;
 const LIFECYCLE_WORKER_ARGUMENT: u32 = 3;
 const RUNTIME_IO_WORKER_ARGUMENT: u32 = 4;
-const RUNTIME_IO_REPORT_PATH: &str = ".manifold/preview1-runtime-io-transcript.md";
+const RUNTIME_IO_REPORT_PATH: &str = ".brood/preview1-runtime-io-transcript.md";
 
 static WATCH_STARTED: AtomicU32 = AtomicU32::new(0);
 static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -48,7 +48,7 @@ static LIFECYCLE_WORKER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECORD: Mutex<Option<String>> = Mutex::new(None);
 static RUNTIME_IO_ADDRESS: Mutex<Option<String>> = Mutex::new(None);
 
-#[link(wasm_import_module = "manifold_preview1")]
+#[link(wasm_import_module = "brood_preview1")]
 unsafe extern "C" {
     #[link_name = "event_kind"]
     safe fn host_event_kind(value: *mut u32) -> u32;
@@ -200,12 +200,12 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_preview1_compat_v1() -> u32 {
+pub extern "C" fn brood_preview1_compat_v1() -> u32 {
     0x4d50_3101
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_actor_dispatch_v1(_kind: u32) -> u32 {
+pub extern "C" fn brood_actor_dispatch_v1(_kind: u32) -> u32 {
     let Some(kind) = host_u32(host_event_kind) else {
         ERROR_CODE.store(1, Ordering::Release);
         return 0;
@@ -467,7 +467,7 @@ fn dispatch_snapshot_write() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_worker_run_v1(argument: u32) -> u32 {
+pub extern "C" fn brood_worker_run_v1(argument: u32) -> u32 {
     if argument == RUNTIME_IO_WORKER_ARGUMENT {
         return run_runtime_io_proof().map_or_else(|code| code, |()| 0);
     }
@@ -881,7 +881,7 @@ fn scan_workspace() -> std::io::Result<BTreeSet<String>> {
 fn excluded_directory(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | ".direnv" | ".manifold" | "target")
+        Some(".git" | ".direnv" | ".brood" | "target")
     )
 }
 
@@ -1001,7 +1001,7 @@ fn excluded_path(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(
             component.as_os_str().to_str(),
-            Some(".git" | ".direnv" | ".manifold" | "target")
+            Some(".git" | ".direnv" | ".brood" | "target")
         )
     })
 }
@@ -1056,7 +1056,7 @@ pub extern "C" fn actor_error(_unused: u32) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_worker_reserve_v1(
+pub extern "C" fn brood_worker_reserve_v1(
     stack_bytes: u32,
     tls_bytes: u32,
     tls_align: u32,
@@ -1082,7 +1082,7 @@ pub extern "C" fn manifold_worker_reserve_v1(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn manifold_worker_release_v1(
+pub extern "C" fn brood_worker_release_v1(
     encoded: u64,
     stack_bytes: u32,
     tls_bytes: u32,

@@ -1,6 +1,6 @@
 # Decision Records
 
-This directory contains architecture decision records for Manifold.
+This directory contains architecture decision records for Brood.
 
 Decisions should be short, dated, and explicit about context, decision, consequences, and open follow-up work.
 

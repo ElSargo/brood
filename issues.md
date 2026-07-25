@@ -62,7 +62,7 @@ warnings without pretending these areas are already structurally clean.
   `string_slice` debt was cgroup scope parsing; it now matches an exact,
   nonempty path component with structural prefix/suffix operations, preserving
   arbitrary Unicode without byte indexing. Acceptance belongs in a real
-  entered-project workflow using `manifold-runner-exec`, before the
+  entered-project workflow using `brood-runner-exec`, before the
   session/plugin runtime starts. Any future bounded UI preview must define its
   own bound and truncate at extended-grapheme boundaries while retaining the
   record as source of truth.
@@ -81,7 +81,7 @@ warnings without pretending these areas are already structurally clean.
   supervisor can wait either for that pane to be presented or, explicitly, for
   that process to exit; unrelated windows and child exits satisfy neither
   policy, and a known failure cannot be hidden by visibility.
-- `Manifold` now coordinates typed surface-session, focus, registry, and test-
+- `Brood` now coordinates typed surface-session, focus, registry, and test-
   harness services instead of owning those transition tables as loose fields.
   Session
   allocation, activation, routing, rename, directory assignment, and removal
@@ -102,12 +102,12 @@ warnings without pretending these areas are already structurally clean.
   Nix-store Cargo path, project/working/cache context, and a deliberate
   `configuration-rejected` result before the invoking shell observes status 37.
 - Session command execution returns a typed `CommandOutcome` instead of
-  terminating from `control.rs`; only the `manifold` binary entrypoint maps an
+  terminating from `control.rs`; only the `brood` binary entrypoint maps an
   explicit child code to its process exit status, while signal termination
   remains a fallible control result. A plugin is not applicable to binary exit
   policy, so the user-facing proof runs the real CLI: an entered command prints
   its domain rejection and exits 37, and the invoking shell observes
-  `manifold enter` exit status 37.
+  `brood enter` exit status 37.
 - Subprocess pipes, real PTYs, loopback sockets, and timers now share one
   bounded byte-stream and notification/pollable lifecycle owned by the actor
   generation. Component and Preview 1 guests use the same capability grants,
@@ -178,11 +178,11 @@ warnings without pretending these areas are already structurally clean.
   daemon-owned native watcher service and retires subscriptions before actor
   replacement completes. `plugins/component-workspace-watch` is the observable
   proof: its nested workload creates, edits, and removes real workspace files,
-  and the plugin maintains `.manifold/component-workspace-watch.md` with the
+  and the plugin maintains `.brood/component-workspace-watch.md` with the
   corresponding paths and event kinds. The same proof observes one live native
   registration and logical subscription, then zero of each after generation
   replacement.
-- Manifold owns one native filesystem-watcher service which deduplicates
+- Brood owns one native filesystem-watcher service which deduplicates
   canonical path plus recursion-mode registrations across actor generations.
   Logical subscriptions keep private bounded queues, overflow, notification,
   capability projection, and teardown; stale setup results cannot attach to a

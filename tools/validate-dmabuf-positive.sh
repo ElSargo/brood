@@ -7,16 +7,16 @@ cd "$ROOT"
 
 require_host_presentation_environment
 
-REQUIRE_EXPLICIT_SYNC="${MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC:-0}"
+REQUIRE_EXPLICIT_SYNC="${BROOD_DMABUF_REQUIRE_EXPLICIT_SYNC:-0}"
 case "$REQUIRE_EXPLICIT_SYNC" in
   0 | 1) ;;
   *)
-    echo "ERR MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC must be 0 or 1" >&2
+    echo "ERR BROOD_DMABUF_REQUIRE_EXPLICIT_SYNC must be 0 or 1" >&2
     exit 2
     ;;
 esac
 
-IMPORT_CLIENT="${MANIFOLD_DMABUF_IMPORT_CLIENT:-}"
+IMPORT_CLIENT="${BROOD_DMABUF_IMPORT_CLIENT:-}"
 IMPORT_ARGS=()
 if [[ -z "$IMPORT_CLIENT" ]]; then
   if command -v weston-simple-dmabuf-egl > /dev/null 2>&1; then
@@ -27,27 +27,27 @@ if [[ -z "$IMPORT_CLIENT" ]]; then
       IMPORT_ARGS=(--explicit-sync=0)
     fi
   else
-    echo "SKIP no dmabuf import client found; install weston-simple-dmabuf-egl or set MANIFOLD_DMABUF_IMPORT_CLIENT" >&2
+    echo "SKIP no dmabuf import client found; install weston-simple-dmabuf-egl or set BROOD_DMABUF_IMPORT_CLIENT" >&2
     exit 77
   fi
-elif [[ -n "${MANIFOLD_DMABUF_IMPORT_ARGS:-}" ]]; then
+elif [[ -n "${BROOD_DMABUF_IMPORT_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
-  IMPORT_ARGS=(${MANIFOLD_DMABUF_IMPORT_ARGS})
+  IMPORT_ARGS=(${BROOD_DMABUF_IMPORT_ARGS})
 fi
 
-FEEDBACK_CLIENT="${MANIFOLD_DMABUF_FEEDBACK_CLIENT:-}"
+FEEDBACK_CLIENT="${BROOD_DMABUF_FEEDBACK_CLIENT:-}"
 if [[ -z "$FEEDBACK_CLIENT" ]] && command -v weston-simple-dmabuf-feedback > /dev/null 2>&1; then
   FEEDBACK_CLIENT="$(command -v weston-simple-dmabuf-feedback)"
 fi
 
-cargo build -p manifoldd --offline > /dev/null
+cargo build -p broodd --offline > /dev/null
 
-exec 9> /tmp/manifold-host-smoke.lock
+exec 9> /tmp/brood-host-smoke.lock
 flock 9
 
-TMPDIR="$(mktemp -d /tmp/manifold-dmabuf-positive.XXXXXX)"
-DBUS_NAME="org.manifold.Test.p$$"
-LOG="$TMPDIR/manifoldd.log"
+TMPDIR="$(mktemp -d /tmp/brood-dmabuf-positive.XXXXXX)"
+DBUS_NAME="org.brood.Test.p$$"
+LOG="$TMPDIR/broodd.log"
 TRACE="$TMPDIR/client-wayland.log"
 IMPORT_LOG="$TMPDIR/import-client.log"
 IMPORT_WRAPPER="$TMPDIR/import-client-wrapper.sh"
@@ -57,7 +57,7 @@ FEEDBACK_WRAPPER="$TMPDIR/feedback-client-wrapper.sh"
 
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
-    target/debug/manifold ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
+    target/debug/brood ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
     sleep 0.5
     kill "$PID" > /dev/null 2>&1 || true
   fi
@@ -71,14 +71,14 @@ trap cleanup EXIT
 } > "$IMPORT_WRAPPER"
 chmod +x "$IMPORT_WRAPPER"
 
-RUST_LOG="${RUST_LOG:-manifoldd=info,smithay=warn}" \
-  target/debug/manifold run --dbus-name "$DBUS_NAME" -c "$IMPORT_WRAPPER" > "$LOG" 2>&1 &
+RUST_LOG="${RUST_LOG:-broodd=info,smithay=warn}" \
+  target/debug/brood run --dbus-name "$DBUS_NAME" -c "$IMPORT_WRAPPER" > "$LOG" 2>&1 &
 PID=$!
 
-wait_for_manifoldd_control "$DBUS_NAME" "$PID" "$LOG"
+wait_for_broodd_control "$DBUS_NAME" "$PID" "$LOG"
 
 ctl() {
-  target/debug/manifold ctl --dbus-name "$DBUS_NAME" "$@"
+  target/debug/brood ctl --dbus-name "$DBUS_NAME" "$@"
 }
 
 STATUS_JSON=""
@@ -132,7 +132,7 @@ PY
 
 if [[ "$DMABUF_VERSION" == "v4" ]]; then
   [[ -n "$FEEDBACK_CLIENT" ]] || {
-    echo "ERR dmabuf v4 advertised but no feedback client found; install weston-simple-dmabuf-feedback or set MANIFOLD_DMABUF_FEEDBACK_CLIENT" >&2
+    echo "ERR dmabuf v4 advertised but no feedback client found; install weston-simple-dmabuf-feedback or set BROOD_DMABUF_FEEDBACK_CLIENT" >&2
     exit 1
   }
   printf '#!/usr/bin/env bash\nexec env WAYLAND_DEBUG=1 %q >%q 2>%q\n' "$FEEDBACK_CLIENT" "$FEEDBACK_LOG" "$FEEDBACK_TRACE" > "$FEEDBACK_WRAPPER"

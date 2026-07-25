@@ -1,6 +1,6 @@
 # Protocol Notes
 
-The Manifold protocol connects the local session process, pane clients, and WASM app hosts. A separate presentation endpoint protocol is deferred until Manifold needs a split presenter process.
+The Brood protocol connects the local session process, pane clients, and WASM app hosts. A separate presentation endpoint protocol is deferred until Brood needs a split presenter process.
 
 This document records the intended shape only. Encoding, transport, schemas, and versioning remain undecided.
 

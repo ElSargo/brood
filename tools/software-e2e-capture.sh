@@ -2,20 +2,20 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: software-e2e-capture.sh --out-dir DIR [--manifold-bin PATH] [--client-bin PATH]" >&2
+  echo "usage: software-e2e-capture.sh --out-dir DIR [--brood-bin PATH] [--client-bin PATH]" >&2
 }
 
 OUT_DIR=""
-MANIFOLD_BIN="${MANIFOLD_BIN:-manifold}"
-CLIENT_BIN="${MANIFOLD_CLIENT_BIN:-}"
+BROOD_BIN="${BROOD_BIN:-brood}"
+CLIENT_BIN="${BROOD_CLIENT_BIN:-}"
 while (($# > 0)); do
   case "$1" in
     --out-dir)
       OUT_DIR="$2"
       shift 2
       ;;
-    --manifold-bin)
-      MANIFOLD_BIN="$2"
+    --brood-bin)
+      BROOD_BIN="$2"
       shift 2
       ;;
     --client-bin)
@@ -34,15 +34,15 @@ while (($# > 0)); do
 done
 
 if [[ -z "$OUT_DIR" ]]; then
-  OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/manifold-software-e2e.XXXXXX")"
+  OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/brood-software-e2e.XXXXXX")"
 fi
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(realpath "$OUT_DIR")"
 if [[ -z "$CLIENT_BIN" ]]; then
-  CLIENT_BIN="$(dirname "$(realpath "$(command -v "$MANIFOLD_BIN")")")/manifold-client"
+  CLIENT_BIN="$(dirname "$(realpath "$(command -v "$BROOD_BIN")")")/brood-client"
 fi
 
-for tool in "$MANIFOLD_BIN" "$CLIENT_BIN" dbus-daemon grim python3 sway weston-terminal; do
+for tool in "$BROOD_BIN" "$CLIENT_BIN" dbus-daemon grim python3 sway weston-terminal; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR missing required command: $tool" >&2
     exit 127
@@ -63,8 +63,8 @@ chmod 700 "$SERVER_RUNTIME_DIR" "$PRESENTATION_RUNTIME_DIR"
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=llvmpipe
 export WGPU_BACKEND=gl
-unset DISPLAY WAYLAND_DISPLAY manifold_session MANIFOLD_SURFACE_SESSION_ID
-unset MANIFOLDD_DBUS_ADDRESS MANIFOLDD_DBUS_DESTINATION
+unset DISPLAY WAYLAND_DISPLAY brood_session BROOD_SURFACE_SESSION_ID
+unset BROODD_DBUS_ADDRESS BROODD_DBUS_DESTINATION
 
 dbus_args=(--session)
 if [[ -n "${DBUS_SESSION_BUS_CONFIG:-}" ]]; then
@@ -75,13 +75,13 @@ DBUS_SESSION_BUS_ADDRESS="$(sed -n '1p' <<< "$dbus_info")"
 DBUS_SESSION_BUS_PID="$(sed -n '2p' <<< "$dbus_info")"
 export DBUS_SESSION_BUS_ADDRESS
 
-DESTINATION="org.manifold.SoftwareE2E.p$$"
+DESTINATION="org.brood.SoftwareE2E.p$$"
 SERVER_LOG="$OUT_DIR/server.log"
 CLIENT_LOG="$OUT_DIR/client.log"
 RECONNECTED_LOG="$OUT_DIR/client-reconnected.log"
 COMPOSITOR_LOG="$OUT_DIR/compositor.log"
 SWAY_CONFIG="$OUT_DIR/sway.conf"
-EMPTY_CONFIG="$OUT_DIR/manifold.toml"
+EMPTY_CONFIG="$OUT_DIR/brood.toml"
 SERVER_PID=""
 CLIENT_PID=""
 COMPOSITOR_PID=""
@@ -108,7 +108,7 @@ cleanup() {
 trap cleanup EXIT
 printf '' > "$EMPTY_CONFIG"
 
-env XDG_RUNTIME_DIR="$SERVER_RUNTIME_DIR" "$MANIFOLD_BIN" run \
+env XDG_RUNTIME_DIR="$SERVER_RUNTIME_DIR" "$BROOD_BIN" run \
   --no-session-runner \
   --no-default-modules \
   --no-init \
@@ -120,7 +120,7 @@ env XDG_RUNTIME_DIR="$SERVER_RUNTIME_DIR" "$MANIFOLD_BIN" run \
 SERVER_PID=$!
 
 ctl() {
-  "$MANIFOLD_BIN" ctl \
+  "$BROOD_BIN" ctl \
     --dbus-destination "$DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"

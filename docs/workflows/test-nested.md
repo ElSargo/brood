@@ -21,7 +21,7 @@ frontend-owned logs and captures.
 Run the packaged end-to-end capture on a host with a DRM render node:
 
 ```sh
-nix run .#software-e2e-capture -- --out-dir /tmp/manifold-software-e2e
+nix run .#software-e2e-capture -- --out-dir /tmp/brood-software-e2e
 ```
 
 The output directory contains the initial and reconnected client-composed

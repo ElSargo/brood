@@ -89,7 +89,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifold-component-runtime-io-plugin"
+name = "brood-component-runtime-io-plugin"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",

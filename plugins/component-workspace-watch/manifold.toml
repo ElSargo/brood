@@ -1,6 +1,0 @@
-[module.component-workspace-watch]
-enabled = true
-kind = "plugin"
-path = "target/wasm32-unknown-unknown/release/manifold_component_workspace_watch_plugin.component.wasm"
-capabilities = ["filesystem:workspace-write"]
-startup-message = "start"

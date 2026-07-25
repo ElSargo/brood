@@ -1,0 +1,556 @@
+package brood:plugin@0.1.0;
+
+interface host {
+    type operation-id = u64;
+    type notification-id = u64;
+    type pollable-id = u64;
+
+    enum submit-error {
+        actor-stopped,
+        limit-reached,
+        backlog-full,
+        not-permitted,
+        invalid-argument,
+        cancelled,
+    }
+
+    enum notification-error {
+        actor-stopped,
+        limit-reached,
+        backlog-full,
+        invalid-handle,
+        invalid-generation,
+        already-watched,
+    }
+
+    variant watch-result {
+        armed,
+        queued(u64),
+    }
+
+    enum wait-mode {
+        biased,
+        fair,
+    }
+
+    enum wait-error {
+        actor-stopped,
+        limit-reached,
+        invalid-pollable,
+        duplicate-pollable,
+        empty-wait-set,
+        timed-out,
+        cancelled,
+    }
+
+    enum filesystem-watch-error {
+        actor-stopped,
+        limit-reached,
+        invalid-handle,
+        not-permitted,
+        not-ready,
+        backend-unavailable,
+    }
+
+    enum runtime-io-error {
+        actor-stopped,
+        limit-reached,
+        not-permitted,
+        invalid-argument,
+        host-failure,
+        would-block,
+        closed,
+        invalid-handle,
+    }
+
+    enum graphics-error {
+        unavailable,
+        invalid-pane,
+        invalid-argument,
+        limit-reached,
+        invalid-packet,
+        invalid-resource,
+        resource-in-use,
+        host-failure,
+    }
+
+    record text-layout-options {
+        font-size: f32,
+        max-width: f32,
+        line-height: f32,
+        red: f32,
+        green: f32,
+        blue: f32,
+        alpha: f32,
+    }
+
+    record text-layout-result {
+        handle: u64,
+        width: f32,
+        height: f32,
+        first-baseline: f32,
+        line-count: u32,
+    }
+
+    graphics-submit-draw-packet: func(
+        pane: u64,
+        packet: list<u8>,
+    ) -> result<u64, graphics-error>;
+
+    /// Copies row-major straight-alpha sRGB pixels into an immutable image.
+    graphics-create-image-rgba8: func(
+        pane: u64,
+        width: u32,
+        height: u32,
+        pixels: list<u8>,
+    ) -> result<u64, graphics-error>;
+
+    graphics-layout-text: func(
+        pane: u64,
+        text: string,
+        options: text-layout-options,
+    ) -> result<text-layout-result, graphics-error>;
+
+    graphics-drop-resource: func(
+        pane: u64,
+        handle: u64,
+    ) -> result<_, graphics-error>;
+
+    variant stream-read-result {
+        data(list<u8>),
+        would-block,
+        eof,
+    }
+
+    record process-io {
+        child: u64,
+        stdin: u64,
+        stdout: u64,
+        stderr: u64,
+        resolved-command: string,
+    }
+
+    record pty-io {
+        child: u64,
+        terminal: u64,
+        resolved-command: string,
+    }
+
+    enum child-state { running, exited, signalled }
+    enum timer-state { pending, expired }
+
+    subprocess-spawn: func(command: string, arguments: list<string>) -> result<process-io, runtime-io-error>;
+    pty-spawn: func(command: string, arguments: list<string>, rows: u16, cols: u16) -> result<pty-io, runtime-io-error>;
+    worker-loopback-connect: async func(address: string) -> result<u64, runtime-io-error>;
+    stream-notification: func(handle: u64) -> result<notification-id, runtime-io-error>;
+    stream-read: func(handle: u64, max-bytes: u32) -> result<stream-read-result, runtime-io-error>;
+    stream-write: func(handle: u64, bytes: list<u8>) -> result<u32, runtime-io-error>;
+    stream-close-write: func(handle: u64) -> result<_, runtime-io-error>;
+    stream-drop: async func(handle: u64) -> result<_, runtime-io-error>;
+    child-notification: func(child: u64) -> result<notification-id, runtime-io-error>;
+    child-status: func(child: u64) -> result<tuple<child-state, option<s32>>, runtime-io-error>;
+    child-drop: async func(child: u64) -> result<_, runtime-io-error>;
+    timer-create: func(delay-ms: u64) -> result<u64, runtime-io-error>;
+    timer-notification: func(timer: u64) -> result<notification-id, runtime-io-error>;
+    timer-status: func(timer: u64) -> result<timer-state, runtime-io-error>;
+    timer-drop: async func(timer: u64) -> result<_, runtime-io-error>;
+
+    enum filesystem-event-kind {
+        created,
+        modified,
+        removed,
+        changed,
+        rescan,
+    }
+
+    record filesystem-event {
+        kind: filesystem-event-kind,
+        /// Relative path in the host platform's lossless native encoding.
+        /// Unix uses raw path bytes; Windows uses little-endian UTF-16 units.
+        path: list<u8>,
+    }
+
+    record filesystem-watch-batch {
+        generation: u64,
+        events: list<filesystem-event>,
+    }
+
+    /// A capability-rooted, actor-generation-owned filesystem subscription.
+    /// Readiness is projected into the ordinary notification/pollable model;
+    /// this resource deliberately defines no separate blocking wait.
+    resource filesystem-watch {
+        notification: func() -> result<notification-id, filesystem-watch-error>;
+        read: func() -> result<filesystem-watch-batch, filesystem-watch-error>;
+    }
+
+    filesystem-watch-create: func(
+        path: string,
+        recursive: bool,
+    ) -> result<filesystem-watch, filesystem-watch-error>;
+
+    record ready-pollable {
+        index: u32,
+        pollable: pollable-id,
+        generation: u64,
+    }
+
+    submit-read: func(
+        path: string,
+        offset: u64,
+        max-bytes: u64,
+    ) -> result<operation-id, submit-error>;
+
+    submit-write: func(
+        path: string,
+        offset: u64,
+        bytes: list<u8>,
+    ) -> result<operation-id, submit-error>;
+
+    /// Queue cancellation. True reports queue admission, not that cancellation
+    /// won a race with completion. If it wins, one terminal cancelled event is
+    /// delivered later.
+    cancel: func(operation: operation-id) -> bool;
+
+    /// Worker-only blocking-looking file read. The async canonical ABI
+    /// suspends only the calling component task. The host rejects this import
+    /// outside a registered worker guest task.
+    worker-read-file: async func(
+        path: string,
+        offset: u64,
+        max-bytes: u64,
+    ) -> result<list<u8>, submit-error>;
+
+    /// Worker-only blocking-looking file write. The host rejects this import
+    /// outside a registered worker guest task.
+    worker-write-file: async func(
+        path: string,
+        offset: u64,
+        bytes: list<u8>,
+    ) -> result<u64, submit-error>;
+
+    /// Cooperatively yield a CPU-running stackless worker. Native async host
+    /// calls release the component Store so the owning actor can dispatch.
+    /// A true result asks the cooperative worker to return without doing more
+    /// actor-visible work; cancellation is terminal only after it does so.
+    worker-yield: async func() -> bool;
+
+    /// Create an actor-generation-scoped scheduling notification. Shared data
+    /// and its atomic generation counter remain guest-owned.
+    notification-create: func() -> result<notification-id, notification-error>;
+    notification-drop: func(notification: notification-id) -> result<_, notification-error>;
+    notification-signal: func(
+        notification: notification-id,
+        published-generation: u64,
+    ) -> result<u64, notification-error>;
+    notification-watch-actor: func(
+        notification: notification-id,
+        observed-generation: u64,
+        token: u64,
+    ) -> result<watch-result, notification-error>;
+    notification-unwatch-actor: func(
+        notification: notification-id,
+    ) -> result<bool, notification-error>;
+
+    notification-pollable: func(
+        notification: notification-id,
+        observed-generation: u64,
+    ) -> result<pollable-id, wait-error>;
+    pollable-drop: func(pollable: pollable-id) -> result<_, wait-error>;
+    pollable-try: func(
+        pollables: list<pollable-id>,
+    ) -> result<list<ready-pollable>, wait-error>;
+    /// Worker-only bounded wait. Timeout is relative milliseconds; absent
+    /// means no deadline. Worker cancellation is always selected implicitly.
+    worker-wait-any: async func(
+        pollables: list<pollable-id>,
+        timeout-ms: option<u64>,
+        mode: wait-mode,
+    ) -> result<ready-pollable, wait-error>;
+}
+
+interface actor {
+    type operation-id = u64;
+    type worker-id = u64;
+
+    record mailbox-message {
+        sender: string,
+        body: list<u8>,
+    }
+
+    /// Explicit address for a backend actor in one surface-session realm.
+    /// `actor` is either `init` for the blessed root or a child ID published
+    /// by that root. The client host supplies and authenticates placement.
+    record session-actor-message {
+        session-id: u64,
+        actor: string,
+        body: list<u8>,
+    }
+
+    /// Explicit address for another actor in the sender's current realm.
+    record local-actor-message {
+        actor: string,
+        body: list<u8>,
+    }
+
+    /// Explicit address for an actor in the presentation realm currently
+    /// attached to the sender's surface session.
+    record presentation-actor-message {
+        actor: string,
+        body: list<u8>,
+    }
+
+    record read-completed {
+        operation: operation-id,
+        bytes: list<u8>,
+    }
+
+    record write-completed {
+        operation: operation-id,
+        bytes-written: u64,
+    }
+
+    record operation-failed {
+        operation: operation-id,
+        message: string,
+    }
+
+    variant completion {
+        read(read-completed),
+        write(write-completed),
+        cancelled(operation-id),
+        failed(operation-failed),
+    }
+
+    record worker-request {
+        worker: worker-id,
+        payload: list<u8>,
+    }
+
+    record worker-finished {
+        worker: worker-id,
+        output: list<u8>,
+    }
+
+    record worker-failed {
+        worker: worker-id,
+        message: string,
+    }
+
+    record notification-event {
+        notification: u64,
+        generation: u64,
+        token: u64,
+    }
+
+    record lifecycle-entry { key: string, value: string }
+    enum start-reason { initial, replacement, session-rebind }
+    enum stop-reason { replacement, session-rebind, shutdown }
+    record start-context {
+        instance-id: string,
+        generation: u64,
+        reason: start-reason,
+        session-id: option<u64>,
+        workspace-root: string,
+        data: list<lifecycle-entry>,
+    }
+    record stop-context {
+        instance-id: string,
+        generation: u64,
+        reason: stop-reason,
+        next-generation: option<u64>,
+    }
+    variant lifecycle-event { start(start-context), stop(stop-context) }
+
+    record actor-start-request {
+        id: string,
+        /// Path relative to the init actor's capability root.
+        path: string,
+        /// Authority requested for the child actor. The realm host validates
+        /// these declarations before constructing the child generation.
+        capabilities: list<string>,
+    }
+    record actor-started { id: string, generation: u64 }
+    record actor-failed { id: string, message: string }
+    variant child-event {
+        started(actor-started),
+        stopped(string),
+        failed(actor-failed),
+    }
+
+    record app-start-request { id: string, argv: list<string> }
+    record app-started { id: string, pane: u64 }
+    record app-failed { id: string, message: string }
+    variant app-event {
+        started(app-started),
+        stopped(string),
+        failed(app-failed),
+    }
+
+    variant worker-event {
+        /// The worker was admitted and its guest call was scheduled. This does
+        /// not assert that it has reached a particular I/O operation.
+        started(worker-id),
+        finished(worker-finished),
+        failed(worker-failed),
+        /// A cooperative cancellation request was observed and the worker
+        /// export has now terminated.
+        cancelled(worker-id),
+    }
+
+    record pane-created {
+        pane: u64,
+        width: f32,
+        height: f32,
+        scale: f32,
+    }
+
+    record pane-resized {
+        pane: u64,
+        width: f32,
+        height: f32,
+        scale: f32,
+    }
+
+    record pane-focused { pane: u64, focused: bool }
+    record pointer-moved { pane: u64, x: f32, y: f32 }
+    record pointer-button {
+        pane: u64,
+        x: f32,
+        y: f32,
+        button: u32,
+        pressed: bool,
+        modifiers: u32,
+    }
+    record pointer-scroll {
+        pane: u64,
+        x: f32,
+        y: f32,
+        horizontal: f32,
+        vertical: f32,
+        modifiers: u32,
+    }
+    record key-event {
+        pane: u64,
+        /// Linux input scancode, or zero when the input source does not expose
+        /// a physical key (for example a virtual keyboard).
+        physical-key: u32,
+        /// Stable semantic name for non-text keys and the logical character
+        /// for printable keys. Text insertion still uses `text-event`.
+        logical-key: string,
+        pressed: bool,
+        repeat: bool,
+        modifiers: u32,
+    }
+    record text-event { pane: u64, text: string }
+
+    record session-summary {
+        id: u64,
+        name: string,
+        active: bool,
+        windows: u64,
+    }
+
+    record session-snapshot {
+        revision: u64,
+        active: u64,
+        sessions: list<session-summary>,
+    }
+
+    enum session-operation {
+        refresh,
+        activate,
+        create,
+        rename,
+        close,
+    }
+
+    record session-command {
+        request: u64,
+        operation: session-operation,
+        session: option<u64>,
+        name: option<string>,
+    }
+
+    record session-command-completed {
+        request: u64,
+        operation: session-operation,
+        success: bool,
+        session: option<u64>,
+        message: string,
+    }
+
+    variant session-event {
+        snapshot(session-snapshot),
+        command-completed(session-command-completed),
+    }
+
+    variant presentation-event {
+        pane-created(pane-created),
+        pane-resized(pane-resized),
+        pane-focused(pane-focused),
+        pointer-moved(pointer-moved),
+        pointer-button(pointer-button),
+        pointer-scroll(pointer-scroll),
+        key(key-event),
+        text(text-event),
+    }
+
+    variant event {
+        mailbox(mailbox-message),
+        completion(completion),
+        worker(worker-event),
+        notification(notification-event),
+        lifecycle(lifecycle-event),
+        /// Lifecycle feedback for actors owned by this realm's blessed init actor.
+        child(child-event),
+        /// Lifecycle feedback for apps launched by this session's blessed init actor.
+        app(app-event),
+        presentation(presentation-event),
+        /// Client-realm session catalogue state and command completion.
+        session(session-event),
+    }
+
+    variant command {
+        spawn-worker(worker-request),
+        /// Request cooperative cancellation. The worker must reach a host call
+        /// or yield point and return before the terminal cancelled event.
+        cancel-worker(worker-id),
+        /// Completes the one pending start or stop hook. Hooks may span
+        /// dispatcher turns while worker/completion results arrive.
+        lifecycle-complete(result<_, string>),
+        /// Start or replace a child actor in the current realm. Only the blessed
+        /// init actor has this capability.
+        start-actor(actor-start-request),
+        /// Stop a child previously started by the current realm's init actor.
+        stop-actor(string),
+        /// Start a Wayland app in the current session. Only a blessed session
+        /// init actor has this capability.
+        start-app(app-start-request),
+        /// Asynchronously enqueue a message for an explicitly addressed actor
+        /// in a connected surface-session realm. Only presentation actors have
+        /// this cross-placement capability.
+        send-session-message(session-actor-message),
+        /// Asynchronously enqueue a message for another actor in this realm.
+        send-local-message(local-actor-message),
+        /// Asynchronously enqueue a message for an actor in the presentation
+        /// realm attached to this session. Only session-realm actors have this
+        /// cross-placement capability.
+        send-presentation-message(presentation-actor-message),
+        /// Request a typed session catalogue operation from the presentation
+        /// client. Completion and the resulting snapshot arrive as events.
+        session-command(session-command),
+        /// Enqueue one ordinary message to the local realm host. The host
+        /// authenticates the emitting actor generation and validates the
+        /// payload before applying any requested capability operation.
+        send-host-message(list<u8>),
+        stop,
+    }
+
+    dispatch: func(event: event) -> list<command>;
+    worker-run: async func(worker: worker-id, payload: list<u8>) -> result<list<u8>, string>;
+}
+
+world brood-plugin {
+    import host;
+    export actor;
+}

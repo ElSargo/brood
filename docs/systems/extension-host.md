@@ -4,20 +4,20 @@ type: system
 authority: implementation
 last-reviewed: 2026-07-24
 code-links:
-  - crates/manifold-wasm/src/module.rs
-  - crates/manifold-wasm/src/actor.rs
-  - crates/manifold-wasm/src/hosted_actor.rs
-  - crates/manifold-wasm/src/legacy_runtime.rs
-  - crates/manifold-wasm/src/global_key_policy.rs
-  - crates/manifold-wasm/src/policy_provider.rs
-  - crates/manifold-wasm/src/component_actor.rs
-  - crates/manifold-wasm/src/preview1_worker.rs
-  - crates/manifold-wasm/src/completion_io.rs
-  - crates/manifold-wasm/src/coordination.rs
-  - crates/manifold-wasm/src/test_harness.rs
-  - crates/manifoldd/src/wasm_test.rs
-  - crates/manifoldd/src/control.rs
-  - crates/manifoldd/src/state.rs
+  - crates/brood-wasm/src/module.rs
+  - crates/brood-wasm/src/actor.rs
+  - crates/brood-wasm/src/hosted_actor.rs
+  - crates/brood-wasm/src/legacy_runtime.rs
+  - crates/brood-wasm/src/global_key_policy.rs
+  - crates/brood-wasm/src/policy_provider.rs
+  - crates/brood-wasm/src/component_actor.rs
+  - crates/brood-wasm/src/preview1_worker.rs
+  - crates/brood-wasm/src/completion_io.rs
+  - crates/brood-wasm/src/coordination.rs
+  - crates/brood-wasm/src/test_harness.rs
+  - crates/broodd/src/wasm_test.rs
+  - crates/broodd/src/control.rs
+  - crates/broodd/src/state.rs
 ---
 
 # Extension Host
@@ -52,7 +52,7 @@ The actor/worker prototype adds two artifact shapes:
 
 - A Component Model actor owns one component instance and Store, a bounded
   default mailbox, a reserved completion lane, and cooperative async workers.
-  Its Manifold WIT exposes completion reads, writes, cancellation, worker
+  Its Brood WIT exposes completion reads, writes, cancellation, worker
   spawning, and explicit worker yield points. The runnable component imports no
   standard WASI surface, so its dispatcher cannot bypass completion I/O; host
   task identity gates the worker-only async imports.
@@ -71,7 +71,7 @@ terminal cancellation completion. Actor generations prevent a stale completion
 from reaching a replacement actor.
 
 Runnable Component and Preview 1 actors are registered by stable instance ID.
-Configuration module IDs and `manifold plug --id` can host the same artifact
+Configuration module IDs and `brood plug --id` can host the same artifact
 more than once; replacement is generation-scoped and does not stop unrelated
 instances. Actor listing and mailbox diagnostics expose every entry. Legacy
 core-module actor inventories retain their singular lane and declared export
@@ -105,7 +105,7 @@ that target.
 
 ## Hot Replacement
 
-`manifold plug` hot-loads a WASM artifact into a running session. Plugin loading
+`brood plug` hot-loads a WASM artifact into a running session. Plugin loading
 recognizes the Preview 1 compatibility marker, falls back from core-module
 inspection to Component Model loading, and otherwise discovers core-module
 actor/policy exports. A key policy can also be selected explicitly. See the
@@ -140,7 +140,7 @@ process.
 
 Extension-host acceptance loads real plugins through the normal runtime and
 judges their observable output. Presentation actors must run in
-`manifold-client`; same-name replacement must preserve the old generation until
+`brood-client`; same-name replacement must preserve the old generation until
 the candidate is ready, reject late layout results, and leave unrelated actors
 running. Rendered evidence is captured by the client.
 

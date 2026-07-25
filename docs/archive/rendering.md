@@ -34,13 +34,13 @@ The native Linux path should aim for a late-latched one-frame pipeline whenever 
 - receive host input
 - forward and flush that input to the nested client immediately
 - let the client render and commit a fresh surface
-- drain pending nested Wayland commits just before Manifold renders
+- drain pending nested Wayland commits just before Brood renders
 - composite the newest committed client buffer
-- submit Manifold's frame to the host compositor as late as the frame budget allows
+- submit Brood's frame to the host compositor as late as the frame budget allows
 
-The scheduler should eventually be deadline-driven rather than "render as soon as redraw is requested." It should derive a frame clock from presentation feedback or observed host cadence, reserve a measured render/composite budget plus safety margin, and schedule Manifold composition near the end of the target frame.
+The scheduler should eventually be deadline-driven rather than "render as soon as redraw is requested." It should derive a frame clock from presentation feedback or observed host cadence, reserve a measured render/composite budget plus safety margin, and schedule Brood composition near the end of the target frame.
 
-Diagnostics must make this goal measurable. At minimum they should expose input-to-client-commit, client-commit-to-Manifold-submit, input-to-Manifold-submit, whether a visible input batch had a matching client commit before the submitted frame, frame cadence, and missed/stale-frame indicators. Winit's current abstraction may not expose enough phase control or presentation timing for the final version; a lower-latency Winit fork or a more direct Smithay/DRM presentation path is explicitly on the table if profiling shows Winit is the limiting layer.
+Diagnostics must make this goal measurable. At minimum they should expose input-to-client-commit, client-commit-to-Brood-submit, input-to-Brood-submit, whether a visible input batch had a matching client commit before the submitted frame, frame cadence, and missed/stale-frame indicators. Winit's current abstraction may not expose enough phase control or presentation timing for the final version; a lower-latency Winit fork or a more direct Smithay/DRM presentation path is explicitly on the table if profiling shows Winit is the limiting layer.
 
 ## Fallback Policy
 

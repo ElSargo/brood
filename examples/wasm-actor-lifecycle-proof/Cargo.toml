@@ -1,5 +1,5 @@
 [package]
-name = "manifold-wasm-actor-lifecycle-proof"
+name = "brood-wasm-actor-lifecycle-proof"
 version = "0.1.0"
 edition = "2024"
 

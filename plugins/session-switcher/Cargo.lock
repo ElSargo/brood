@@ -115,14 +115,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "manifold-graphics"
+name = "brood-graphics"
 version = "0.1.0"
 
 [[package]]
-name = "manifold-session-switcher-plugin"
+name = "brood-session-switcher-plugin"
 version = "0.1.0"
 dependencies = [
- "manifold-graphics",
+ "brood-graphics",
  "serde",
  "serde-json-core",
  "wit-bindgen",

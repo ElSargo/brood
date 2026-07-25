@@ -1,6 +1,6 @@
 # Pane Clients
 
-Pane clients are first-party or external processes that produce scene data or surfaces for one or more panes in a Manifold session.
+Pane clients are first-party or external processes that produce scene data or surfaces for one or more panes in a Brood session.
 
 Likely first-party pane clients:
 

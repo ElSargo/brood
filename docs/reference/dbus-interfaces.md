@@ -4,22 +4,22 @@ type: reference
 authority: implementation
 last-reviewed: 2026-07-03
 code-links:
-  - crates/manifoldd/src/control.rs
+  - crates/broodd/src/control.rs
 ---
 
 # DBus Interface Reference Pointers
 
-Exact DBus method signatures and tuple shapes are defined in `crates/manifoldd/src/control.rs`.
+Exact DBus method signatures and tuple shapes are defined in `crates/broodd/src/control.rs`.
 
 Current interface names:
 
-- `org.manifold.Session.Control`
-- `org.manifold.Manager`
-- `org.manifold.Extension`
-- `org.manifold.Plugin`
-- `org.manifold.Agent`
-- `org.manifold.Status`
-- `org.manifold.Compositor`
+- `org.brood.Session.Control`
+- `org.brood.Manager`
+- `org.brood.Extension`
+- `org.brood.Plugin`
+- `org.brood.Agent`
+- `org.brood.Status`
+- `org.brood.Compositor`
 
 Related:
 

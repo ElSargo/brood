@@ -1,5 +1,5 @@
 [package]
-name = "manifold-component-workspace-watch-plugin"
+name = "brood-component-workspace-watch-plugin"
 version = "0.1.0"
 edition = "2024"
 publish = false

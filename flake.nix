@@ -1,12 +1,5 @@
 {
-  description = "Manifold development shell";
-
-  nixConfig = {
-    extra-substituters = [ "https://manifold-platform.cachix.org" ];
-    extra-trusted-public-keys = [
-      "manifold-platform.cachix.org-1:cXJupbtXzFJe8vIIyt+ZYN+ganoykFuUIZOPfFQ+GP0="
-    ];
-  };
+  description = "Brood development shell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

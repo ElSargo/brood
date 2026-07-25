@@ -1,9 +1,9 @@
 wit_bindgen::generate!({
-    path: "../../crates/manifold-wasm/wit",
-    world: "manifold-plugin",
+    path: "../../crates/brood-wasm/wit",
+    world: "brood-plugin",
 });
 
-use exports::manifold::plugin::actor::{
+use exports::brood::plugin::actor::{
     ActorStartRequest, AppStartRequest, ChildEvent, Command, Event, Guest, LifecycleEvent,
     LocalActorMessage, PresentationActorMessage, SessionActorMessage,
 };
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 const CROSS_REALM_PROOF: &[u8] = b"client-to-session-actor-proof";
-const CODING_AGENT_COMPONENT_FILE: &str = "manifold_coding_agent_plugin.component.wasm";
+const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const FIRST_AGENT: &str = "coding-agent-1";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -83,7 +83,7 @@ impl Guest for ExampleInitActor {
             ],
             Event::Child(event) => handle_child(event),
             Event::Mailbox(message)
-                if message.sender == "presentation:manifold.client-init"
+                if message.sender == "presentation:brood.client-init"
                     && message.body == CROSS_REALM_PROOF =>
             {
                 vec![Command::StartApp(AppStartRequest {

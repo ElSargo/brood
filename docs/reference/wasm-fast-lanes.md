@@ -4,20 +4,20 @@ type: reference
 authority: implementation
 last-reviewed: 2026-07-22
 code-links:
-  - crates/manifold-wasm/src/module.rs
-  - crates/manifold-wasm/src/module_link.rs
-  - crates/manifold-wasm/src/actor.rs
-  - crates/manifold-wasm/src/actor_link.rs
-  - crates/manifold-wasm/src/global_key_policy.rs
-  - crates/manifold-wasm/src/global_key_policy_link.rs
-  - crates/manifold-wasm/src/resolved_layout.rs
-  - crates/manifold-wasm/src/policy_provider.rs
-  - crates/manifold-wasm/src/test_harness.rs
-  - clients/manifold-client/src/layout.rs
-  - clients/manifold-client/src/main.rs
-  - crates/manifoldd/src/wasm_test.rs
-  - crates/manifoldd/src/control.rs
-  - crates/manifoldd/src/state.rs
+  - crates/brood-wasm/src/module.rs
+  - crates/brood-wasm/src/module_link.rs
+  - crates/brood-wasm/src/actor.rs
+  - crates/brood-wasm/src/actor_link.rs
+  - crates/brood-wasm/src/global_key_policy.rs
+  - crates/brood-wasm/src/global_key_policy_link.rs
+  - crates/brood-wasm/src/resolved_layout.rs
+  - crates/brood-wasm/src/policy_provider.rs
+  - crates/brood-wasm/src/test_harness.rs
+  - clients/brood-client/src/layout.rs
+  - clients/brood-client/src/main.rs
+  - crates/broodd/src/wasm_test.rs
+  - crates/broodd/src/control.rs
+  - crates/broodd/src/state.rs
 ---
 
 # WASM Core-Module Lanes

@@ -6,7 +6,7 @@ Use [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcut
 
 This note scopes the first WASM API spike to workspace navigation, managed app launch, and keyboard shortcut handling. These are deliberately small because they already exist in the native prototype as focus commands, hosted app spawning, browser launch control, and normal-mode key handling.
 
-The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Manifold should execute those requests through the same session process paths used by native input and control commands.
+The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Brood should execute those requests through the same session process paths used by native input and control commands.
 
 The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): actors provide public isolation and mailbox addressing, actor-scoped workers provide shared-memory concurrency and blocking-looking WASI, and bounded pre-commit policy hooks read immutable published state.
 
@@ -80,7 +80,7 @@ For the first spike, `run-managed-app` can call the current hosted Wayland spawn
 
 ## Keyboard Shortcuts
 
-Keyboard shortcuts should be command bindings. A WASM controller registers bindings, and Manifold dispatches matched key chords to commands when input policy allows interception. Privileged raw or modal key policy belongs in a key policy provider, not an arbitrary actor queue.
+Keyboard shortcuts should be command bindings. A WASM controller registers bindings, and Brood dispatches matched key chords to commands when input policy allows interception. Privileged raw or modal key policy belongs in a key policy provider, not an arbitrary actor queue.
 
 Initial host functions:
 
@@ -113,7 +113,7 @@ Modes:
 - `passthrough`
 - `global`
 
-The first implementation should use `normal` mode only. This matches the current normal-mode handling where keys are consumed by Manifold and not forwarded to the focused Wayland client. `passthrough` and `global` are useful later, but they need conflict handling and clearer user expectations.
+The first implementation should use `normal` mode only. This matches the current normal-mode handling where keys are consumed by Brood and not forwarded to the focused Wayland client. `passthrough` and `global` are useful later, but they need conflict handling and clearer user expectations.
 
 Shortcut dispatch should produce a normal workspace command request. For example, a WASM controller can bind `j` in normal mode to `focus-next`, or bind `w` to `run-managed-app({ argv: ["wezterm"] })`. The controller should not receive every raw key event unless it has a separate input-observation capability.
 
@@ -138,7 +138,7 @@ Initial workspace events for navigation policy:
 - `pane-metadata-changed`
 - `active-session-changed`
 
-`pane-client-input` means input that Manifold actually forwarded to a client pane, such as keyboard, pointer button, or axis input. It should not be emitted for Manifold-consumed shortcut keys, focus-only changes, or pointer motion that is not delivered as client input.
+`pane-client-input` means input that Brood actually forwarded to a client pane, such as keyboard, pointer button, or axis input. It should not be emitted for Brood-consumed shortcut keys, focus-only changes, or pointer motion that is not delivered as client input.
 
 The host should expose a current-state snapshot plus ordered event polling:
 
@@ -195,14 +195,14 @@ pub enum WorkspaceCommand {
 }
 ```
 
-The command executor should be the only layer that calls current `manifold` implementation details. WASM, native controllers, DBus control endpoint commands, and tests should converge on this command model as it matures.
+The command executor should be the only layer that calls current `brood` implementation details. WASM, native controllers, DBus control endpoint commands, and tests should converge on this command model as it matures.
 
 ## WIT Sketch
 
 Once the Rust command model survives the first spike, the WIT can mirror the same concepts:
 
 ```wit
-package manifold:workspace@0.1.0;
+package brood:workspace@0.1.0;
 
 interface commands {
   type pane-id = string;
@@ -265,9 +265,9 @@ The first runnable spike uses a narrow core-WASM ABI instead of WIT.
 
 Current usability note:
 
-- the exact run arguments are defined in `crates/manifoldd/src/main.rs`
-- config-loaded startup modules are parsed in `crates/manifoldd/src/config.rs`
-- the checked-in example module path lives in `manifold.toml`
+- the exact run arguments are defined in `crates/broodd/src/main.rs`
+- config-loaded startup modules are parsed in `crates/broodd/src/config.rs`
+- the checked-in example module path lives in `brood.toml`
 
 The guest should export the current v2 key handler entry point:
 
@@ -288,7 +288,7 @@ ABI values:
 - `modifiers`: bitset where `1` is Ctrl and `2` is Alt
 - return `0` for unhandled, non-zero for handled
 
-The host imports these functions from module `manifold`:
+The host imports these functions from module `brood`:
 
 ```text
 focus_next()
@@ -313,7 +313,7 @@ owns navigation policy should build focus-or-spawn behavior from these primitive
 calls so it can update its own model before requesting host focus. The older
 `focus_or_spawn_app` import remains a compatibility helper.
 
-When a handler is loaded, normal-mode key presses go to `on_key` first. Modified shortcut chords can also be claimed from passthrough mode, which lets workspace-level bindings work without toggling modes first. A successful normal-mode call replaces the built-in normal-mode map for that key path; if the guest traps, Manifold logs the failure and falls back to the built-in handler so the session remains usable during experiments.
+When a handler is loaded, normal-mode key presses go to `on_key` first. Modified shortcut chords can also be claimed from passthrough mode, which lets workspace-level bindings work without toggling modes first. A successful normal-mode call replaces the built-in normal-mode map for that key path; if the guest traps, Brood logs the failure and falls back to the built-in handler so the session remains usable during experiments.
 
 The sample handler lives in `examples/wasm-key-handler` and maps a minimal workspace keymap around app-ID-targeted Foot panes:
 
@@ -331,7 +331,7 @@ For the example build/run flow, see `examples/wasm-key-handler/README.md`.
 
 The first spike should be tested with real workload behavior:
 
-- Start `manifold`.
+- Start `brood`.
 - Launch two hosted apps through `run-managed-app`.
 - Register normal-mode shortcuts for focus next, focus previous, and launch app.
 - Send real key input into the presentation window.

@@ -4,8 +4,8 @@ type: system
 authority: product
 last-reviewed: 2026-07-24
 code-links:
-  - clients/manifold-client/src/main.rs
-  - crates/manifold-layout/src/lib.rs
+  - clients/brood-client/src/main.rs
+  - crates/brood-layout/src/lib.rs
   - nix/packages.nix
   - tools/test-client-layout-actor.sh
   - tools/test-session-switcher-plugin-nested.sh
@@ -14,7 +14,7 @@ code-links:
 # Testing
 
 Behavior tests use the checked-in Nix environment and exercise the external
-`manifold-client`. Product runtime commands are for normal or manual use, not
+`brood-client`. Product runtime commands are for normal or manual use, not
 as an automated substitute for the test supervisor.
 
 ## Graphical Topology
@@ -58,7 +58,7 @@ managed-pane size convergence.
 
 ## Lifecycle Proof
 
-A frontend replacement proof closes or kills only `manifold-client`, confirms
+A frontend replacement proof closes or kills only `brood-client`, confirms
 that the session server and hosted applications remain alive, then starts a
 replacement client. The replacement receives the existing pane identities and
 frames, obtains new presentation and layout-lease generations, and reconstructs

@@ -23,7 +23,7 @@ composition.
 The experiment should answer:
 
 - whether the canvas packet and native text service are sufficient for real
-  Manifold shell UI;
+  Brood shell UI;
 - whether SDK component functions can remain concise without runtime component
   support;
 - whether pane-local pointer, keyboard, text, scroll, focus, and resize events

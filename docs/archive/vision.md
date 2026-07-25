@@ -1,10 +1,10 @@
 # Vision
 
-Manifold is a persistent graphical workspace for software development.
+Brood is a persistent graphical workspace for software development.
 
 It should combine the durable session model of terminal multiplexers with a native graphical compositor capable of editor text, browser surfaces, terminals, agent workflows, git tools, rich documents, and eventually nested Wayland applications.
 
-Sessions should also become enterable development environments. A developer or agent should be able to enter a Manifold session from a shell, launch GUI apps and local services into that session, run session-scoped control commands, and optionally isolate filesystem, network, process, and DBus state so parallel work does not cross-contaminate.
+Sessions should also become enterable development environments. A developer or agent should be able to enter a Brood session from a shell, launch GUI apps and local services into that session, run session-scoped control commands, and optionally isolate filesystem, network, process, and DBus state so parallel work does not cross-contaminate.
 
 ## Goals
 
@@ -14,9 +14,9 @@ Sessions should also become enterable development environments. A developer or a
 - Render with native smoothness: high-refresh compositing, smooth scrolling, animations, and low input latency.
 - Treat browser and Wayland surfaces as first-class composited surfaces, not native child windows.
 - Allow built-in and user apps to run outside the core binary, preferably as sandboxed WASM modules using host capabilities.
-- Make `manifold enter` create or reuse the default session tied to the current directory when invoked from outside one, and let `manifold enter --new` force creation when nested without stealing that default.
-- Let `manifold show` front or attach the session tied to the current directory, or create an empty one when invoked outside a session and no binding exists.
-- Let `manifold hide` remove that presentation surface from view without closing the session.
+- Make `brood enter` create or reuse the default session tied to the current directory when invoked from outside one, and let `brood enter --new` force creation when nested without stealing that default.
+- Let `brood show` front or attach the session tied to the current directory, or create an empty one when invoked outside a session and no binding exists.
+- Let `brood hide` remove that presentation surface from view without closing the session.
 - Make active sessions discoverable from the current directory, with a global session list when needed.
 - Support optional session isolation profiles for filesystem overlays, network namespaces, PID/IPC namespaces, and DBus proxies.
 - Make parallel agents practical by giving each agent a coherent session capsule with its own panes, ports, DBus scope, filesystem writes, logs, and change export path.
@@ -34,8 +34,8 @@ Sessions should also become enterable development environments. A developer or a
 
 ## Product Feel
 
-Manifold should feel immediate. Local typing, pane focus, scrolling, and browser interaction should land within a frame whenever possible. The preferred path keeps browser, Wayland, and other producer surfaces in GPU memory through platform-native sharing or presentation mechanisms; CPU upload and copy-heavy paths are correctness fallbacks, not the target feel. Closing the presentation window should detach when there is state worth preserving; reopening should make managed apps feel as though their regular window was still there.
+Brood should feel immediate. Local typing, pane focus, scrolling, and browser interaction should land within a frame whenever possible. The preferred path keeps browser, Wayland, and other producer surfaces in GPU memory through platform-native sharing or presentation mechanisms; CPU upload and copy-heavy paths are correctness fallbacks, not the target feel. Closing the presentation window should detach when there is state worth preserving; reopening should make managed apps feel as though their regular window was still there.
 
-Entering a session should feel like entering a focused development capsule rather than remembering a pile of random socket paths. From inside that capsule, command-line tools, screenshots, input injection, hosted apps, agents, local servers, and `manifold ctl` should naturally target the current Manifold session unless the user explicitly chooses another one.
+Entering a session should feel like entering a focused development capsule rather than remembering a pile of random socket paths. From inside that capsule, command-line tools, screenshots, input injection, hosted apps, agents, local servers, and `brood ctl` should naturally target the current Brood session unless the user explicitly chooses another one.
 
 See [Session Environments](session-environments.md) for the target command context, isolation, filesystem overlay, network namespace, and DBus proxy model.

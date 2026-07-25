@@ -4,7 +4,7 @@ The checked-in `plugins/session-switcher` package implements the session
 switcher as a client-realm Component Model plugin. Its blessed init instance
 starts one presentation child actor; the child owns the session model, query
 and rename editors, selection, scrolling, hit testing, styling, and draw-packet
-construction. `manifold-client` supplies only typed session snapshots and
+construction. `brood-client` supplies only typed session snapshots and
 operations, pane input, native text layouts, canvas validation, and final WGPU
 composition.
 

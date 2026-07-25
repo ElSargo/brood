@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify Manifold's presentation backend from DMA-BUF status fields."""
+"""Classify Brood's presentation backend from DMA-BUF status fields."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def classify(
         return (
             "fallback_no_dmabuf_import",
             "presentation renderer reported no importable dmabuf formats; "
-            "Manifold must not advertise linux-dmabuf or syncobj",
+            "Brood must not advertise linux-dmabuf or syncobj",
             "Use this backend for fallback correctness; validate positive dmabuf on native/DRM Linux "
             "with ./tools/validate-dmabuf-positive.sh",
         )
@@ -32,7 +32,7 @@ def classify(
         return (
             "drm_capable_dmabuf_and_explicit_sync",
             "backend advertises dmabuf v4 and explicit sync",
-            "Run MANIFOLD_DMABUF_REQUIRE_EXPLICIT_SYNC=1 ./tools/validate-dmabuf-positive.sh",
+            "Run BROOD_DMABUF_REQUIRE_EXPLICIT_SYNC=1 ./tools/validate-dmabuf-positive.sh",
         )
     if dmabuf == "v4" and explicit_sync == "none":
         if explicit_sync_disabled in EXPLICIT_SYNC_DISABLED_REASONS_WITH_DMABUF_V4:

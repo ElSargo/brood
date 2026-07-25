@@ -124,7 +124,7 @@ where
 }
 
 #[cfg(target_arch = "wasm32")]
-#[link(wasm_import_module = "manifold")]
+#[link(wasm_import_module = "brood")]
 unsafe extern "C" {
     fn read_message() -> i32;
 }
@@ -135,7 +135,7 @@ unsafe fn read_message() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn manifold_arena_alloc(capacity: i32, align: i32) -> i32 {
+pub extern "C" fn brood_arena_alloc(capacity: i32, align: i32) -> i32 {
     if capacity <= 0 || align <= 0 {
         return 0;
     }
@@ -160,10 +160,10 @@ pub extern "C" fn manifold_arena_alloc(capacity: i32, align: i32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn manifold_arena_free(_ptr: i32, _capacity: i32, _align: i32) {}
+pub extern "C" fn brood_arena_free(_ptr: i32, _capacity: i32, _align: i32) {}
 
 #[no_mangle]
-pub extern "C" fn manifold_policy_provider_key_workspace(
+pub extern "C" fn brood_policy_provider_key_workspace(
     query_ptr: i32,
     query_len: i32,
     state_ptr: i32,
@@ -285,7 +285,7 @@ pub extern "C" fn manifold_policy_provider_key_workspace(
 }
 
 #[no_mangle]
-pub extern "C" fn manifold_actor_workspace_epoch_run(
+pub extern "C" fn brood_actor_workspace_epoch_run(
     _epoch: i64,
     inbox_ptr: i32,
     _inbox_cap: i32,
@@ -336,7 +336,7 @@ pub extern "C" fn manifold_actor_workspace_epoch_run(
 }
 
 #[no_mangle]
-pub extern "C" fn manifold_actor_workspace_subscribe_layout_state() {}
+pub extern "C" fn brood_actor_workspace_subscribe_layout_state() {}
 
 fn messages_for_global_key<'a>(
     key_code: i32,
@@ -356,8 +356,8 @@ fn messages_for_global_key<'a>(
         KEY_COMMA => focus_cycle_terminal(state, false, buffer)
             .unwrap_or(&[Message::LayoutAction("focus-previous-split")]),
         KEY_G => &[Message::FocusOrSpawnApp {
-            app_id: "manifold-lazygit",
-            argv: &["foot", "--app-id", "manifold-lazygit", "lazygit"],
+            app_id: "brood-lazygit",
+            argv: &["foot", "--app-id", "brood-lazygit", "lazygit"],
         }],
         KEY_ENTER => focus_or_spawn_app(
             state,
@@ -367,32 +367,32 @@ fn messages_for_global_key<'a>(
         ),
         KEY_1 => focus_or_spawn_app(
             state,
-            b"manifold-terminal-1",
-            &["foot", "--app-id", "manifold-terminal-1"],
+            b"brood-terminal-1",
+            &["foot", "--app-id", "brood-terminal-1"],
             buffer,
         ),
         KEY_2 => focus_or_spawn_app(
             state,
-            b"manifold-terminal-2",
-            &["foot", "--app-id", "manifold-terminal-2"],
+            b"brood-terminal-2",
+            &["foot", "--app-id", "brood-terminal-2"],
             buffer,
         ),
         KEY_3 => focus_or_spawn_app(
             state,
-            b"manifold-terminal-3",
-            &["foot", "--app-id", "manifold-terminal-3"],
+            b"brood-terminal-3",
+            &["foot", "--app-id", "brood-terminal-3"],
             buffer,
         ),
         KEY_4 => focus_or_spawn_app(
             state,
-            b"manifold-terminal-4",
-            &["foot", "--app-id", "manifold-terminal-4"],
+            b"brood-terminal-4",
+            &["foot", "--app-id", "brood-terminal-4"],
             buffer,
         ),
         KEY_5 => focus_or_spawn_app(
             state,
-            b"manifold-terminal-5",
-            &["foot", "--app-id", "manifold-terminal-5"],
+            b"brood-terminal-5",
+            &["foot", "--app-id", "brood-terminal-5"],
             buffer,
         ),
         _ => &[],
@@ -421,11 +421,11 @@ fn focus_cycle_terminal<'a>(
     let mut panes = [0_u64; 5];
     let mut count = 0;
     for app_id in [
-        b"manifold-terminal-1" as &[u8],
-        b"manifold-terminal-2" as &[u8],
-        b"manifold-terminal-3" as &[u8],
-        b"manifold-terminal-4" as &[u8],
-        b"manifold-terminal-5" as &[u8],
+        b"brood-terminal-1" as &[u8],
+        b"brood-terminal-2" as &[u8],
+        b"brood-terminal-3" as &[u8],
+        b"brood-terminal-4" as &[u8],
+        b"brood-terminal-5" as &[u8],
     ] {
         if let Some(pane) = pane_for_app_id(state, app_id) {
             panes[count] = pane;
@@ -561,7 +561,7 @@ fn write_layout_actor_outbox(
     } else {
         publication.bytes(b"null");
     }
-    publication.bytes(br#", "focus_rules":[{"key":36,"modifiers":1,"app_id":"pi-foot","argv":["foot","--app-id","pi-foot","pi"]},{"key":10,"modifiers":1,"app_id":"manifold-terminal-1","argv":["foot","--app-id","manifold-terminal-1"]},{"key":11,"modifiers":1,"app_id":"manifold-terminal-2","argv":["foot","--app-id","manifold-terminal-2"]},{"key":12,"modifiers":1,"app_id":"manifold-terminal-3","argv":["foot","--app-id","manifold-terminal-3"]},{"key":13,"modifiers":1,"app_id":"manifold-terminal-4","argv":["foot","--app-id","manifold-terminal-4"]},{"key":14,"modifiers":1,"app_id":"manifold-terminal-5","argv":["foot","--app-id","manifold-terminal-5"]}], "panes":["#);
+    publication.bytes(br#", "focus_rules":[{"key":36,"modifiers":1,"app_id":"pi-foot","argv":["foot","--app-id","pi-foot","pi"]},{"key":10,"modifiers":1,"app_id":"brood-terminal-1","argv":["foot","--app-id","brood-terminal-1"]},{"key":11,"modifiers":1,"app_id":"brood-terminal-2","argv":["foot","--app-id","brood-terminal-2"]},{"key":12,"modifiers":1,"app_id":"brood-terminal-3","argv":["foot","--app-id","brood-terminal-3"]},{"key":13,"modifiers":1,"app_id":"brood-terminal-4","argv":["foot","--app-id","brood-terminal-4"]},{"key":14,"modifiers":1,"app_id":"brood-terminal-5","argv":["foot","--app-id","brood-terminal-5"]}], "panes":["#);
     let mut index = 0;
     while index < panes.len() {
         if index > 0 {
@@ -576,31 +576,31 @@ fn write_layout_actor_outbox(
     write_app_pane(
         &mut publication,
         app_panes,
-        b"manifold-terminal-1",
+        b"brood-terminal-1",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
         app_panes,
-        b"manifold-terminal-2",
+        b"brood-terminal-2",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
         app_panes,
-        b"manifold-terminal-3",
+        b"brood-terminal-3",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
         app_panes,
-        b"manifold-terminal-4",
+        b"brood-terminal-4",
         &mut first_app_pane,
     );
     write_app_pane(
         &mut publication,
         app_panes,
-        b"manifold-terminal-5",
+        b"brood-terminal-5",
         &mut first_app_pane,
     );
     publication.bytes(br#"]}"#);
@@ -824,7 +824,7 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::LayoutAction("close-active-pane") => "host",
             Message::LayoutAction(_) => "workspace",
             Message::SessionSwitcherAction(_) => "session-switcher",
-            Message::CodingAgentAction(_) => "manifold.client-init",
+            Message::CodingAgentAction(_) => "brood.client-init",
             _ => "host",
         };
         writer.bytes(br#"{"actor":""#);

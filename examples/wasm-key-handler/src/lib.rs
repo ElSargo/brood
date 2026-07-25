@@ -33,20 +33,20 @@ const MOD_ALT: i32 = 2;
 const MOD_SHIFT: i32 = 4;
 
 const FOOT: &[u8] = b"foot";
-const AGENT_APP_ID: &[u8] = b"manifold-pi";
-const AGENT_COMMAND: &[u8] = b"foot --app-id manifold-pi pi";
-const LAZYGIT_APP_ID: &[u8] = b"manifold-lazygit";
-const LAZYGIT_COMMAND: &[u8] = b"foot --app-id manifold-lazygit lazygit";
-const TERMINAL_1_APP_ID: &[u8] = b"manifold-terminal-1";
-const TERMINAL_1_COMMAND: &[u8] = b"foot --app-id manifold-terminal-1";
-const TERMINAL_2_APP_ID: &[u8] = b"manifold-terminal-2";
-const TERMINAL_2_COMMAND: &[u8] = b"foot --app-id manifold-terminal-2";
-const TERMINAL_3_APP_ID: &[u8] = b"manifold-terminal-3";
-const TERMINAL_3_COMMAND: &[u8] = b"foot --app-id manifold-terminal-3";
-const TERMINAL_4_APP_ID: &[u8] = b"manifold-terminal-4";
-const TERMINAL_4_COMMAND: &[u8] = b"foot --app-id manifold-terminal-4";
-const TERMINAL_5_APP_ID: &[u8] = b"manifold-terminal-5";
-const TERMINAL_5_COMMAND: &[u8] = b"foot --app-id manifold-terminal-5";
+const AGENT_APP_ID: &[u8] = b"brood-pi";
+const AGENT_COMMAND: &[u8] = b"foot --app-id brood-pi pi";
+const LAZYGIT_APP_ID: &[u8] = b"brood-lazygit";
+const LAZYGIT_COMMAND: &[u8] = b"foot --app-id brood-lazygit lazygit";
+const TERMINAL_1_APP_ID: &[u8] = b"brood-terminal-1";
+const TERMINAL_1_COMMAND: &[u8] = b"foot --app-id brood-terminal-1";
+const TERMINAL_2_APP_ID: &[u8] = b"brood-terminal-2";
+const TERMINAL_2_COMMAND: &[u8] = b"foot --app-id brood-terminal-2";
+const TERMINAL_3_APP_ID: &[u8] = b"brood-terminal-3";
+const TERMINAL_3_COMMAND: &[u8] = b"foot --app-id brood-terminal-3";
+const TERMINAL_4_APP_ID: &[u8] = b"brood-terminal-4";
+const TERMINAL_4_COMMAND: &[u8] = b"foot --app-id brood-terminal-4";
+const TERMINAL_5_APP_ID: &[u8] = b"brood-terminal-5";
+const TERMINAL_5_COMMAND: &[u8] = b"foot --app-id brood-terminal-5";
 
 static mut FOCUSED_PANE: i64 = -1;
 
@@ -64,7 +64,7 @@ const ACTION_SPLIT_ACTIVE_SMART: i32 = 17;
 const ACTION_FOCUS_NEXT_SPLIT: i32 = 18;
 const ACTION_FOCUS_PREVIOUS_SPLIT: i32 = 19;
 
-#[link(wasm_import_module = "manifold")]
+#[link(wasm_import_module = "brood")]
 unsafe extern "C" {
     fn layout_action(action: i32) -> i32;
     fn focused_pane_id() -> i64;

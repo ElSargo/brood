@@ -18,9 +18,9 @@ nix develop --command cargo build \
   --manifest-path examples/wasm-component-actor/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
-nix develop --command cargo run -p manifold-wasm --example componentize -- \
-  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.wasm \
-  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/manifold_component_actor_example.component.wasm
+nix develop --command cargo run -p brood-wasm --example componentize -- \
+  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm \
+  examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.component.wasm
 ```
 
 This component intentionally imports no standard WASI interfaces. That makes

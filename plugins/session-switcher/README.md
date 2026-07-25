@@ -1,11 +1,11 @@
 # Session Switcher Plugin
 
-This is the default presentation-local Manifold shell plugin. The same
+This is the default presentation-local Brood shell plugin. The same
 Component Model artifact runs first as the blessed client init actor and starts
 the child actor which owns the native session-switcher pane. The init actor
 also starts and supervises coding-agent UI children, so adding the agent
 workload does not replace the default shell. The switcher child receives typed
-session snapshots from `manifold-client`, renders them through canvas packets,
+session snapshots from `brood-client`, renders them through canvas packets,
 and requests typed session operations without DBus, subprocesses, or a native
 toolkit inside the plugin.
 
@@ -38,10 +38,10 @@ nix develop --command cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release
-nix develop --command cargo run -p manifold-wasm --example componentize -- \
-  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.wasm \
-  plugins/session-switcher/target/wasm32-unknown-unknown/release/manifold_session_switcher_plugin.component.wasm
+nix develop --command cargo run -p brood-wasm --example componentize -- \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm
 ```
 
-The repository `manifold.toml` selects the component as `[init].client`.
+The repository `brood.toml` selects the component as `[init].client`.
 Exact client recovery and override flags remain defined in the CLI parser.

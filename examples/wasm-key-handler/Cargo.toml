@@ -1,5 +1,5 @@
 [package]
-name = "manifold-wasm-key-handler"
+name = "brood-wasm-key-handler"
 version = "0.1.0"
 edition = "2024"
 

@@ -9,7 +9,7 @@ last-reviewed: 2026-07-10
 
 A WASM controller is a WASM-backed [[plugin]] role that changes workspace behavior through host APIs. Examples include key handling, layout actors, commands, status publication, automation, or behavior-test control.
 
-Controllers are not compositor plugins. They should interact with Manifold through workspace, session, pane, event, storage, command, mailbox, publication, and capability APIs rather than through renderer or Smithay internals.
+Controllers are not compositor plugins. They should interact with Brood through workspace, session, pane, event, storage, command, mailbox, publication, and capability APIs rather than through renderer or Smithay internals.
 
 Normal controller behavior should run through addressed actors. Actor
 dispatchers remain completion-driven and delegate blocking-looking I/O or
