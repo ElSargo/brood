@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-25
 ---
 
 # Plugin UI And Pane Rendering
@@ -82,11 +82,23 @@ The actor returns from each dispatch without waiting for I/O, a worker, or GPU
 execution. It may delegate unrelated work and update the pane when a completion
 arrives. Drawing is normal actor output, not a synchronous key decision lane.
 
+The bundled terminal presentation actor follows this lifecycle without a
+terminal-specific pane API. It converts pane size to rows and columns using the
+native monospace cell metrics, sends coalescible resize messages to its session
+actor, maps pane key and text events to terminal input bytes, and renders the
+latest complete terminal revision with ordinary canvas commands and text
+layout handles. The session actor, not the presentation actor, owns the shell.
+
 ## Input And Text Editing
 
 The client converts platform events into a stable pane-local event model and
 owns focus between panes and client chrome. Inside the pane, the SDK decides
 which component is hovered, pressed, focused, scrolled, or edited.
+
+Keyboard events use stable semantic names for navigation, editing, and function
+keys. Modifier bits are Ctrl=1, Alt=2, Shift=4, and Super=8 across key and
+pointer events. Printable insertion uses text events; a plugin must not derive
+locale-dependent text from the physical scancode.
 
 The client bridges platform text and IME input but does not own the plugin's
 editor or text-field state. The SDK combines those events with native text
@@ -139,6 +151,11 @@ revisions, and optional semantic metadata. Diagnostics report rejected or
 superseded UI updates, actor latency, frame/update counters, text failures,
 resource use, and recovery state.
 
+For input-driven panes, diagnostics correlate the first admitted key event with
+the first subsequently refreshed plugin scene that is actually presented. This
+key-to-present measurement covers the asynchronous actor, text-layout, packet,
+and renderer path rather than stopping at mailbox admission.
+
 SDK component correctness is tested at the SDK and workload level rather than by
 adding component rules to the runtime. Real behavior tests should drive pointer,
 keyboard, text, resize, focus, and scroll input through a nested presentation
@@ -151,6 +168,7 @@ Related:
 - [[presentation-client]]
 - [[plugin-runtime]]
 - [[input-shortcuts]]
+- [[terminal-plugin]]
 - [[layout-actor]]
 - [[../concepts/pane]]
 - [[../experiments/session-switcher-ui]]

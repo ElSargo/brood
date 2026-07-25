@@ -112,10 +112,13 @@ let
     pkgs.gobject-introspection
     pkgs.glmark2
     pkgs.grim
+    pkgs.jq
     pkgs.mesa-demos
     pkgs.sway
     pkgs.vulkan-tools
+    pkgs.wayland-scanner
     pkgs.wayland-utils
+    pkgs.wlr-protocols
     pkgs.wtype
     westonWithSimpleClients
   ];

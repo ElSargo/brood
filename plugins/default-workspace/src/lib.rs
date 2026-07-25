@@ -45,6 +45,7 @@ const KEY_J: i32 = 44;
 const KEY_K: i32 = 45;
 const KEY_L: i32 = 46;
 const KEY_S: i32 = 39;
+const KEY_T: i32 = 28;
 const KEY_U: i32 = 30;
 const KEY_W: i32 = 25;
 const KEY_N: i32 = 57;
@@ -213,12 +214,39 @@ pub extern "C" fn brood_policy_provider_key_workspace(
         };
     }
 
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_T
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::TerminalAction("new")])
+        };
+    }
+
     if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_M
     {
         return if input.key_state == KEY_RELEASED || input.repeat {
             write_consume(output, &[])
         } else {
             write_consume(output, &[Message::SessionSwitcherAction("toggle")])
+        };
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_P
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::SessionSwitcherAction("picker")])
+        };
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_D
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::DiffViewerAction("toggle")])
         };
     }
 
@@ -536,6 +564,8 @@ enum Message<'a> {
     ToggleShortcutPassthrough,
     SessionSwitcherAction(&'a str),
     CodingAgentAction(&'a str),
+    DiffViewerAction(&'a str),
+    TerminalAction(&'a str),
 }
 
 fn write_layout_actor_outbox(
@@ -824,7 +854,9 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::LayoutAction("close-active-pane") => "host",
             Message::LayoutAction(_) => "workspace",
             Message::SessionSwitcherAction(_) => "session-switcher",
-            Message::CodingAgentAction(_) => "brood.client-init",
+            Message::CodingAgentAction(_)
+            | Message::DiffViewerAction(_)
+            | Message::TerminalAction(_) => "brood.client-init",
             _ => "host",
         };
         writer.bytes(br#"{"actor":""#);
@@ -874,6 +906,18 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             }
             Message::CodingAgentAction(action) => {
                 payload.bytes(br#"{"kind":"coding-agent-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
+            Message::DiffViewerAction(action) => {
+                payload.bytes(br#"{"kind":"diff-viewer-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
+            Message::TerminalAction(action) => {
+                payload.bytes(br#"{"kind":"terminal-action","action":"#);
                 payload.byte(b'"');
                 payload.quoted_body(action.as_bytes());
                 payload.bytes(br#""}"#);

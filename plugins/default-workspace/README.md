@@ -36,9 +36,10 @@ nix develop --command cargo run -- test nested --force-outer --inner-headless \
 
 The normal config selects this provider for the presentation client. Its
 always-available workspace chords are `Ctrl+Alt+M` for the session-switcher
-pane, `Ctrl+J` / `Ctrl+K` for managed-window focus, and `Ctrl+O` for a new
-`foot` window. The switcher chord emits an ordinary action message to the
-`session-switcher` actor; the policy does not toggle client-owned pane state.
+pane, `Ctrl+Alt+D` for the project diff, `Ctrl+Alt+T` for a fresh first-party
+terminal, `Ctrl+J` / `Ctrl+K` for managed-window focus, and `Ctrl+O` for a new
+`foot` window. Product chords emit ordinary action messages to their owning
+actors; the policy does not spawn processes or toggle client-owned pane state.
 The repository acceptance proof uses this exact module with real terminal
 surfaces, injected key press/release events, and compositor screenshots. Run
 `tools/test-session-switcher-plugin-nested.sh` through the checked-in Nix shell.

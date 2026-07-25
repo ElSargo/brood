@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -92,6 +92,7 @@ use brood_wasm::{TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRunti
 const MANDATORY_SHM_FORMATS: usize = 2;
 const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const SESSION_INIT_ACTOR_PREFIX: &str = "brood.session-init";
+const BACKEND_INIT_ACTOR_ID: &str = "brood.backend-init";
 pub const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
 const BROOD_SURFACE_SESSION_ID_ENV: &str = "BROOD_SURFACE_SESSION_ID";
 const SESSION_OUTPUT_SIZE: (i32, i32) = (1280, 800);
@@ -287,6 +288,12 @@ pub struct SurfaceSessionSummary {
     pub windows: usize,
     #[serde(default)]
     pub working_directory: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_directory: String,
+    pub branch: Option<String>,
+    pub worktree: bool,
+    pub git: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,6 +607,34 @@ struct MissingRealmArtifact {
     path: String,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct ManagedWorktreeRecord {
+    project_id: String,
+    project_name: String,
+    source_directory: String,
+    branch: String,
+    path: String,
+    metadata_path: String,
+    session: Option<u64>,
+    last_used_unix: u64,
+}
+
+struct PendingManagedWorktree {
+    project: brood_cli::project::ProjectContext,
+    branch: String,
+    target: PathBuf,
+    response: tokio::sync::oneshot::Sender<std::result::Result<u64, String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct BackendActorHostMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    request: Option<u64>,
+    path: Option<String>,
+    message: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfiguredWorkspacePlugin {
     path: PathBuf,
@@ -717,6 +752,10 @@ pub struct Brood {
     wasm_host_mailbox: Option<brood_wasm::Mailbox>,
     legacy_wasm_actor_generation: Option<brood_wasm::LegacyWasmActorGeneration>,
     wasm_io_actors: BTreeMap<String, brood_wasm::HostedWasmActor>,
+    backend_init_actor: Option<PathBuf>,
+    backend_init: Option<RealmInitState>,
+    next_managed_worktree_request: u64,
+    pending_managed_worktrees: BTreeMap<u64, PendingManagedWorktree>,
     session_init_actor: Option<PathBuf>,
     realm_inits: BTreeMap<SurfaceSessionId, RealmInitState>,
     pending_realm_artifacts: BTreeMap<u64, PendingRealmArtifact>,
@@ -842,6 +881,10 @@ impl Brood {
             wasm_host_mailbox: Some(wasm_host_mailbox),
             legacy_wasm_actor_generation: None,
             wasm_io_actors: BTreeMap::new(),
+            backend_init_actor: None,
+            backend_init: None,
+            next_managed_worktree_request: 1,
+            pending_managed_worktrees: BTreeMap::new(),
             session_init_actor: None,
             realm_inits: BTreeMap::new(),
             pending_realm_artifacts: BTreeMap::new(),
@@ -1197,6 +1240,38 @@ impl Brood {
         )
     }
 
+    pub fn hosted_runtime_io_stats(&self) -> brood_wasm::RuntimeIoStats {
+        self.wasm_io_actors.values().fold(
+            brood_wasm::RuntimeIoStats::default(),
+            |mut aggregate, actor| {
+                let next = actor.runtime_io_stats();
+                aggregate.resources = aggregate.resources.saturating_add(next.resources);
+                aggregate.streams = aggregate.streams.saturating_add(next.streams);
+                aggregate.children = aggregate.children.saturating_add(next.children);
+                aggregate.timers = aggregate.timers.saturating_add(next.timers);
+                aggregate.buffered_incoming_bytes = aggregate
+                    .buffered_incoming_bytes
+                    .saturating_add(next.buffered_incoming_bytes);
+                aggregate.buffered_outgoing_bytes = aggregate
+                    .buffered_outgoing_bytes
+                    .saturating_add(next.buffered_outgoing_bytes);
+                aggregate.max_stream_incoming_bytes = aggregate
+                    .max_stream_incoming_bytes
+                    .max(next.max_stream_incoming_bytes);
+                aggregate.max_stream_outgoing_bytes = aggregate
+                    .max_stream_outgoing_bytes
+                    .max(next.max_stream_outgoing_bytes);
+                aggregate.stream_read_would_block = aggregate
+                    .stream_read_would_block
+                    .saturating_add(next.stream_read_would_block);
+                aggregate.stream_write_would_block = aggregate
+                    .stream_write_would_block
+                    .saturating_add(next.stream_write_would_block);
+                aggregate
+            },
+        )
+    }
+
     /// Route a byte-oriented policy message through the shared public actor
     /// namespace. Hosted Component/Preview actors carry sender metadata in
     /// their mailbox ABI; legacy actors retain their older byte-only mailbox.
@@ -1388,6 +1463,7 @@ impl Brood {
         let mut init_requests = Vec::new();
         let mut local_messages = Vec::new();
         let mut presentation_messages = Vec::new();
+        let mut host_messages = Vec::new();
         for (actor_name, actor) in &mut self.wasm_io_actors {
             match actor {
                 brood_wasm::HostedWasmActor::Component(actor) => {
@@ -1501,7 +1577,17 @@ impl Brood {
                 brood_wasm::ComponentActorEvent::PresentationMessageRequested { actor, body } => {
                     presentation_messages.push((actor_name, actor, body));
                 }
+                brood_wasm::ComponentActorEvent::HostMessageRequested { payload } => {
+                    host_messages.push((actor_name, payload));
+                }
                 _ => {}
+            }
+        }
+        for (actor_name, payload) in host_messages {
+            if actor_name == BACKEND_INIT_ACTOR_ID {
+                self.handle_backend_actor_host_message(&payload);
+            } else {
+                warn!(actor = %actor_name, "ignored server component host message outside the backend realm");
             }
         }
         for (sender_actor, recipient, body) in local_messages {
@@ -2103,18 +2189,40 @@ impl Brood {
     }
 
     fn apply_control_environment(&mut self, child: &mut Command, session: SurfaceSessionId) {
+        child.envs(self.session_process_environment(session));
+    }
+
+    fn session_process_environment(
+        &mut self,
+        session: SurfaceSessionId,
+    ) -> BTreeMap<OsString, OsString> {
+        let mut environment = BTreeMap::from([
+            (OsString::from("WAYLAND_DISPLAY"), self.socket_name.clone()),
+            (
+                OsString::from(BROOD_SURFACE_SESSION_ID_ENV),
+                OsString::from(session.raw().to_string()),
+            ),
+        ]);
         if let Some(session) = self.brood_session.as_deref() {
-            child.env(BROOD_SESSION_ENV, session);
+            environment.insert(OsString::from(BROOD_SESSION_ENV), OsString::from(session));
         }
         if let Some(destination) = self.brood_dbus_destination.as_deref() {
-            child.env(BROODD_DBUS_DESTINATION_ENV, destination);
+            environment.insert(
+                OsString::from(BROODD_DBUS_DESTINATION_ENV),
+                OsString::from(destination),
+            );
         }
         if let Some(address) = self.brood_dbus_address.clone() {
-            child.env(BROODD_DBUS_ADDRESS_ENV, &address);
+            environment.insert(
+                OsString::from(BROODD_DBUS_ADDRESS_ENV),
+                OsString::from(&address),
+            );
             match self.ensure_session_dbus_bus(session) {
                 Ok(session_bus_address) => {
-                    child.env("DBUS_SESSION_BUS_ADDRESS", session_bus_address);
-                    child.env(BROOD_SURFACE_SESSION_ID_ENV, session.raw().to_string());
+                    environment.insert(
+                        OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                        OsString::from(session_bus_address),
+                    );
                 }
                 Err(err) => {
                     warn!(
@@ -2122,7 +2230,10 @@ impl Brood {
                         session = session.raw(),
                         "failed to start session DBus bus; managed client inherits Brood control bus"
                     );
-                    child.env("DBUS_SESSION_BUS_ADDRESS", &address);
+                    environment.insert(
+                        OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                        OsString::from(address),
+                    );
                 }
             }
         } else {
@@ -2130,6 +2241,7 @@ impl Brood {
                 "managed client inherits host DBUS_SESSION_BUS_ADDRESS; DBus policy modes off/proxy/private are not enforced yet"
             );
         }
+        environment
     }
 
     fn apply_session_working_directory(&self, child: &mut Command, session: SurfaceSessionId) {
@@ -2616,9 +2728,9 @@ impl Brood {
         &self,
         session: SurfaceSessionId,
     ) -> Option<SurfaceSessionSummary> {
-        self.sessions
-            .contains(session)
-            .then(|| SurfaceSessionSummary {
+        self.sessions.contains(session).then(|| {
+            let project = self.sessions.project(session);
+            SurfaceSessionSummary {
                 id: session.raw(),
                 name: self.surface_session_name(session).to_string(),
                 active: session == self.sessions.active(),
@@ -2627,7 +2739,17 @@ impl Brood {
                     .sessions
                     .working_directory(session)
                     .map(|directory| directory.to_string_lossy().into_owned()),
-            })
+                project_id: project.map_or_else(String::new, |project| project.id.clone()),
+                project_name: project
+                    .map_or_else(|| "Project".to_string(), |project| project.name.clone()),
+                project_directory: project.map_or_else(String::new, |project| {
+                    project.source_directory.to_string_lossy().into_owned()
+                }),
+                branch: project.and_then(|project| project.branch.clone()),
+                worktree: project.is_some_and(|project| project.is_worktree),
+                git: project.is_some_and(|project| project.is_git),
+            }
+        })
     }
 
     pub fn rename_surface_session(&mut self, session: SurfaceSessionId, name: &str) -> bool {
@@ -2724,6 +2846,22 @@ impl Brood {
     }
 
     fn remove_surface_session_record(&mut self, session: SurfaceSessionId) {
+        if self.backend_init.is_some() {
+            match serde_json::to_vec(&serde_json::json!({
+                "kind": "released",
+                "session": session.raw(),
+                "now": unix_timestamp(),
+            })) {
+                Ok(body) => {
+                    if let Err(error) = self.send_backend_actor_message("host:session", body) {
+                        warn!(error = %error, "failed to release backend worktree occupation");
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to encode backend worktree release");
+                }
+            }
+        }
         if let Err(error) = self.stop_session_init_actor(session) {
             warn!(surface_session = session.raw(), error = %error, "failed to stop surface-session init actor");
         }
@@ -3564,6 +3702,298 @@ impl Brood {
             .collect()
     }
 
+    /// Configure the daemon-owned actor realm. Its root exists independently
+    /// of surface sessions and receives only the managed backend data root.
+    pub(crate) fn configure_backend_init_actor(&mut self, path: &Path) -> Result<()> {
+        ensure!(
+            self.backend_init_actor.is_none(),
+            "backend init actor is already configured"
+        );
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("resolve backend init actor {}", path.display()))?;
+        let artifact = brood_wasm::WasmPluginArtifact::load(&path)?;
+        ensure!(
+            matches!(artifact, brood_wasm::WasmPluginArtifact::Component { .. }),
+            "realm init actor must be a Component Model actor"
+        );
+        let data_root = brood_cli::project::managed_worktree_root();
+        std::fs::create_dir_all(&data_root)
+            .with_context(|| format!("create backend actor data root {}", data_root.display()))?;
+        let filesystem = HostedPluginFilesystem {
+            host_path: data_root,
+            writable: true,
+        };
+        let lifecycle = ConfiguredPluginLifecycle {
+            start_timeout: Duration::from_secs(2),
+            stop_timeout: Duration::from_secs(2),
+            data: BTreeMap::from([("realm".to_string(), "backend".to_string())]),
+        };
+        self.replace_wasm_component_actor(
+            BACKEND_INIT_ACTOR_ID,
+            &path,
+            Some(&filesystem),
+            Some(&(lifecycle.clone(), brood_wasm::PluginStartReason::Initial)),
+            ConfiguredPluginResources::default(),
+            brood_wasm::RuntimeIoCapabilities {
+                commands: vec!["git".to_string(), "mkdir".to_string(), "rm".to_string()],
+                ..brood_wasm::RuntimeIoCapabilities::default()
+            },
+            true,
+            false,
+            None,
+            false,
+        )?;
+        self.configured_plugin_lifecycles
+            .insert(BACKEND_INIT_ACTOR_ID.to_string(), lifecycle);
+        self.backend_init_actor = Some(path.clone());
+        self.backend_init = Some(RealmInitState {
+            actor_id: BACKEND_INIT_ACTOR_ID.to_string(),
+            root: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            children: BTreeMap::new(),
+            apps: BTreeMap::new(),
+        });
+        self.send_backend_actor_message(
+            "host",
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "bootstrap",
+                "records": load_managed_worktree_records(),
+            }))
+            .context("encode backend worktree bootstrap")?,
+        )?;
+        self.drain_hosted_actor_events();
+        Ok(())
+    }
+
+    pub(crate) fn request_managed_worktree_session(
+        &mut self,
+        source_session: SurfaceSessionId,
+        branch: &str,
+        response: tokio::sync::oneshot::Sender<std::result::Result<u64, String>>,
+    ) {
+        let branch = branch.trim().to_string();
+        let prepared = (|| {
+            ensure!(
+                self.backend_init.is_some(),
+                "managed worktrees require a configured backend init actor"
+            );
+            ensure!(
+                self.sessions.contains(source_session),
+                "source session {} is unavailable",
+                source_session.raw()
+            );
+            ensure!(!branch.is_empty(), "branch name cannot be empty");
+            let source_directory = self
+                .sessions
+                .working_directory(source_session)
+                .context("source session has no project directory")?;
+            let project = brood_cli::project::discover_project(source_directory);
+            ensure!(
+                project.is_git,
+                "project {} is not a Git repository",
+                project.name
+            );
+            let target = brood_cli::project::managed_worktree_directory(&project, &branch);
+            let data_root = brood_cli::project::managed_worktree_root();
+            let relative = target.strip_prefix(&data_root).with_context(|| {
+                format!(
+                    "managed worktree {} is outside {}",
+                    target.display(),
+                    data_root.display()
+                )
+            })?;
+            let metadata_name = format!(
+                "{}.brood-worktree.json",
+                relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("managed worktree path has no UTF-8 name")?
+            );
+            let metadata_path = relative
+                .parent()
+                .context("managed worktree path has no project directory")?
+                .join(metadata_name);
+            let request = self.next_managed_worktree_request;
+            self.next_managed_worktree_request =
+                self.next_managed_worktree_request.saturating_add(1);
+            let message = serde_json::to_vec(&serde_json::json!({
+                "kind": "acquire",
+                "request": request,
+                "project_id": project.id,
+                "project_name": project.name,
+                "source_directory": project.source_directory,
+                "branch": branch,
+                "target": target,
+                "metadata_path": metadata_path,
+                "now": unix_timestamp(),
+            }))
+            .context("encode managed worktree request")?;
+            Ok::<_, anyhow::Error>((request, project, target, message))
+        })();
+        let (request, project, target, message) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = response.send(Err(format!("{error:#}")));
+                return;
+            }
+        };
+        self.pending_managed_worktrees.insert(
+            request,
+            PendingManagedWorktree {
+                project,
+                branch,
+                target,
+                response,
+            },
+        );
+        if let Err(error) = self.send_backend_actor_message("host:control", message)
+            && let Some(pending) = self.pending_managed_worktrees.remove(&request)
+        {
+            let _ = pending.response.send(Err(format!("{error:#}")));
+        }
+    }
+
+    fn send_backend_actor_message(&self, sender: &str, body: Vec<u8>) -> Result<()> {
+        let init = self
+            .backend_init
+            .as_ref()
+            .context("backend init actor is not running")?;
+        let actor = self
+            .wasm_io_actors
+            .get(&init.actor_id)
+            .context("backend init actor generation is unavailable")?;
+        let brood_wasm::HostedWasmActor::Component(actor) = actor else {
+            anyhow::bail!("backend init actor is not a component actor");
+        };
+        actor.try_send_message(sender.to_string(), body)
+    }
+
+    fn handle_backend_actor_host_message(&mut self, payload: &[u8]) {
+        let message = match serde_json::from_slice::<BackendActorHostMessage>(payload) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(error = %error, "backend actor emitted invalid host message");
+                return;
+            }
+        };
+        match message.message_type.as_str() {
+            "worktree-provisioned" => {
+                let Some(request) = message.request else {
+                    warn!("backend actor provision response has no request ID");
+                    return;
+                };
+                let Some(path) = message.path else {
+                    self.fail_managed_worktree_request(
+                        request,
+                        "backend actor provision response has no path",
+                    );
+                    return;
+                };
+                self.finish_managed_worktree_request(request, Path::new(&path));
+            }
+            "worktree-failed" => {
+                let Some(request) = message.request else {
+                    warn!("backend actor failure response has no request ID");
+                    return;
+                };
+                self.fail_managed_worktree_request(
+                    request,
+                    message
+                        .message
+                        .as_deref()
+                        .unwrap_or("worktree actor failed"),
+                );
+            }
+            "worktree-maintenance-requested" => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "kind": "maintenance",
+                    "now": unix_timestamp(),
+                }));
+                match body {
+                    Ok(body) => {
+                        if let Err(error) =
+                            self.send_backend_actor_message("host:maintenance", body)
+                        {
+                            warn!(error = %error, "failed to service backend maintenance tick");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "failed to encode backend maintenance tick");
+                    }
+                }
+            }
+            other => {
+                warn!(message_type = %other, "backend actor emitted unknown host message");
+            }
+        }
+    }
+
+    fn finish_managed_worktree_request(&mut self, request: u64, path: &Path) {
+        let Some(pending) = self.pending_managed_worktrees.remove(&request) else {
+            warn!(
+                request,
+                "backend actor completed an unknown worktree request"
+            );
+            return;
+        };
+        if path != pending.target {
+            let _ = pending.response.send(Err(format!(
+                "backend actor returned unexpected worktree path {}",
+                path.display()
+            )));
+            return;
+        }
+        let result = (|| {
+            let existing = self.sessions.sessions().iter().copied().find(|session| {
+                self.sessions
+                    .working_directory(*session)
+                    .is_some_and(|directory| directory == path)
+            });
+            let session = if let Some(session) = existing {
+                self.switch_to_surface_session(session);
+                session
+            } else {
+                let session = self.create_and_attach_named_surface_session_in_directory(
+                    Some(pending.branch.clone()),
+                    path.to_path_buf(),
+                )?;
+                self.remember_directory_surface_session(path.to_path_buf(), session, true);
+                session
+            };
+            let attached = serde_json::to_vec(&serde_json::json!({
+                "kind": "attached",
+                "request": request,
+                "session": session.raw(),
+                "now": unix_timestamp(),
+            }))
+            .context("encode managed worktree attachment")?;
+            self.send_backend_actor_message("host:session", attached)?;
+            info!(
+                request,
+                surface_session = session.raw(),
+                branch = %pending.branch,
+                project = %pending.project.name,
+                path = %path.display(),
+                "attached managed worktree session"
+            );
+            Ok::<_, anyhow::Error>(session.raw())
+        })();
+        let _ = pending
+            .response
+            .send(result.map_err(|error| format!("{error:#}")));
+    }
+
+    fn fail_managed_worktree_request(&mut self, request: u64, message: &str) {
+        let Some(pending) = self.pending_managed_worktrees.remove(&request) else {
+            warn!(request, error = %message, "backend actor failed an unknown worktree request");
+            return;
+        };
+        let _ = pending.response.send(Err(message.to_string()));
+    }
+
     /// Configure the root artifact used for every new surface-session realm.
     pub(crate) fn configure_session_init_actor(&mut self, path: &Path) -> Result<()> {
         ensure!(
@@ -3659,6 +4089,7 @@ impl Brood {
             true,
             true,
             Some(session),
+            true,
         )?;
         self.configured_plugin_lifecycles
             .insert(actor_id.clone(), lifecycle);
@@ -3886,16 +4317,23 @@ impl Brood {
                 None
             };
         let runtime_io = crate::config::runtime_io_capabilities(capabilities)?;
+        let lifecycle = ConfiguredPluginLifecycle {
+            start_timeout: Duration::from_secs(2),
+            stop_timeout: Duration::from_secs(2),
+            data: BTreeMap::new(),
+        };
+        let lifecycle_request = (lifecycle.clone(), brood_wasm::PluginStartReason::Initial);
         self.replace_wasm_component_actor(
             &actor_id,
             &path,
             filesystem.as_ref(),
-            None,
+            Some(&lifecycle_request),
             ConfiguredPluginResources::default(),
             runtime_io,
             false,
             false,
             Some(session),
+            true,
         )?;
         let generation = self
             .wasm_io_actors
@@ -3903,8 +4341,10 @@ impl Brood {
             .context("init child did not produce a hosted actor")?
             .generation();
         if let Some(init) = self.realm_inits.get_mut(&session) {
-            init.children.insert(id.to_string(), actor_id);
+            init.children.insert(id.to_string(), actor_id.clone());
         }
+        self.configured_plugin_lifecycles
+            .insert(actor_id, lifecycle);
         Ok(generation)
     }
 
@@ -3924,7 +4364,14 @@ impl Brood {
             );
             return;
         };
-        let result = self.stop_hosted_io_actor(&actor_id);
+        let lifecycle_result = self.stop_hosted_io_actor_lifecycle(
+            &actor_id,
+            brood_wasm::PluginStopReason::Shutdown,
+            None,
+        );
+        let stop_result = self.stop_hosted_io_actor(&actor_id);
+        self.configured_plugin_lifecycles.remove(&actor_id);
+        let result = lifecycle_result.and(stop_result);
         if let Some(init) = self.realm_inits.get_mut(&session) {
             init.children.remove(&id);
         }
@@ -4253,7 +4700,7 @@ impl Brood {
             instance_id: actor_name.to_string(),
             generation: actor.generation(),
             reason,
-            session_id: Some(session.unwrap_or_else(|| self.sessions.active()).raw()),
+            session_id: session.map(SurfaceSessionId::raw),
             workspace_root: ".".to_string(),
             data: lifecycle
                 .data
@@ -4323,7 +4770,18 @@ impl Brood {
                 let instance_id =
                     instance_id.map_or_else(|| wasm_plugin_instance_id(path), str::to_string);
                 return self
-                    .replace_wasm_component_actor(&instance_id, path, filesystem.as_ref(), lifecycle.as_ref(), resources, runtime_io, false, false, None)
+                    .replace_wasm_component_actor(
+                        &instance_id,
+                        path,
+                        filesystem.as_ref(),
+                        lifecycle.as_ref(),
+                        resources,
+                        runtime_io,
+                        false,
+                        false,
+                        Some(self.sessions.active()),
+                        false,
+                    )
                     .with_context(|| {
                         format!(
                             "{} is neither a legacy Brood module ({core_module_error}) nor a component actor",
@@ -4370,6 +4828,7 @@ impl Brood {
         actor_management: bool,
         app_management: bool,
         lifecycle_session: Option<SurfaceSessionId>,
+        presentation_messaging: bool,
     ) -> Result<()> {
         let Some(runtime) = self.async_runtime.clone() else {
             anyhow::bail!("async runtime is not initialized");
@@ -4385,6 +4844,13 @@ impl Brood {
             |grant| grant.host_path.clone(),
         );
         let writable = filesystem.is_some_and(|grant| grant.writable);
+        let working_directory = lifecycle_session
+            .and_then(|session| self.sessions.working_directory(session))
+            .map(PathBuf::from)
+            .or_else(|| filesystem.map(|grant| grant.host_path.clone()));
+        let environment = lifecycle_session
+            .map(|session| self.session_process_environment(session))
+            .unwrap_or_default();
         let actor = runtime.block_on(brood_wasm::ComponentActor::load(
             path,
             brood_wasm::ComponentActorConfig {
@@ -4400,12 +4866,13 @@ impl Brood {
                 max_filesystem_watch_events: resources.filesystem_watch_events,
                 runtime_io: brood_wasm::RuntimeIoConfig {
                     capabilities: runtime_io,
-                    working_directory: filesystem.map(|grant| grant.host_path.clone()),
+                    working_directory,
+                    environment,
                     ..brood_wasm::RuntimeIoConfig::default()
                 },
                 actor_management,
                 app_management,
-                presentation_messaging: lifecycle_session.is_some(),
+                presentation_messaging,
                 ..brood_wasm::ComponentActorConfig::default()
             },
         ))?;
@@ -5278,6 +5745,56 @@ fn fallback_marker_id(index: usize) -> u64 {
 fn current_process_directory() -> PathBuf {
     let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     directory.canonicalize().unwrap_or(directory)
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn load_managed_worktree_records() -> Vec<ManagedWorktreeRecord> {
+    let root = brood_cli::project::managed_worktree_root();
+    let Ok(project_directories) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for project_directory in project_directories.flatten() {
+        let Ok(worktree_directories) = fs::read_dir(project_directory.path()) else {
+            continue;
+        };
+        for metadata_entry in worktree_directories.flatten() {
+            let metadata_path = metadata_entry.path();
+            if !metadata_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".brood-worktree.json"))
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&metadata_path) else {
+                continue;
+            };
+            let Ok(mut record) = serde_json::from_slice::<ManagedWorktreeRecord>(&bytes) else {
+                warn!(path = %metadata_path.display(), "ignored invalid managed worktree metadata");
+                continue;
+            };
+            let record_path = Path::new(&record.path);
+            let expected_metadata = root.join(&record.metadata_path);
+            if metadata_path == expected_metadata
+                && record_path.starts_with(&root)
+                && record_path.parent() == metadata_path.parent()
+            {
+                // Session IDs are daemon-generation local. A restarted backend
+                // must reacquire occupation rather than preserving a stale ID.
+                record.session = None;
+                records.push(record);
+            } else {
+                warn!(path = %metadata_path.display(), "ignored mismatched managed worktree metadata");
+            }
+        }
+    }
+    records
 }
 
 fn window_surface_origin_in_compositor_space(

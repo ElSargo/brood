@@ -15,7 +15,8 @@ before the client connects, verifies that both enter the client catalog and
 layout lease while only the selected session is shown by default, and captures
 the visible result on switch. Catalog revisions must arrive through the
 dedicated shared-memory lane rather than a DBus polling worker. It also drives
-real keys, clicks, and text;
+real keys, clicks, and text; opens the reusable fuzzy picker as a floating
+pane; selects a session through a non-contiguous query;
 creates, renames, and closes sessions; hides and restores the right-hand
 sidebar through an ordinary actor action; and retains graphical proof
 artifacts.

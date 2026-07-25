@@ -35,17 +35,23 @@ The experiment should answer:
 
 The experiment has two views owned by the same presentation-local application.
 
-### Persistent Session Sidebar
+### Persistent Project And Session Sidebar
 
 The presentation surface has a persistent scrollable sidebar listing the
-sessions known to the active workspace.
+projects and sessions known to the active workspace.
 
 Expected behavior:
 
 - the sidebar remains visible while ordinary managed-app panes change;
 - switching sessions changes the presented session content, not the sidebar's
   pane identity, scroll state, size, or placement;
-- each row shows session name, active state, and a small window count;
+- sessions are nested beneath stable project headings;
+- project lists can be collapsed without changing session state;
+- each project heading offers worktree creation when the project is backed by
+  Git;
+- worktree creation prompts for a branch, creates the checkout in Brood's
+  managed data directory, then creates and activates a session there;
+- each session row shows session name, active state, and a small window count;
 - clicking a row switches the presentation surface to that session;
 - right-clicking a row opens a rename interaction;
 - renaming commits through a host command rather than mutating host state;
@@ -131,6 +137,7 @@ Required operations are:
 ```text
 SwitchSession(session)
 CreateSession(name)
+CreateWorktreeSession(project, branch)
 RenameSession(session, name)
 OpenSessionPicker
 CloseSessionPicker
@@ -163,6 +170,11 @@ record correlated actor and client metrics.
 Minimum behavior checks:
 
 - create at least three sessions and verify the sidebar lists them;
+- create sessions from two projects and verify distinct project headings;
+- collapse and restore a project and verify its sessions hide without being
+  closed;
+- create a real branch/worktree from a project heading and verify the managed
+  checkout, session working directory, project identity, and active session;
 - capture the sidebar and active-session content before switching;
 - click a row and verify the session changes while sidebar placement and scroll
   state remain stable;

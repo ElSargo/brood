@@ -76,6 +76,13 @@ struct CatalogSession {
     name: String,
     active: bool,
     windows: u64,
+    working_directory: Option<String>,
+    project_id: String,
+    project_name: String,
+    project_directory: String,
+    branch: Option<String>,
+    worktree: bool,
+    git: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -248,6 +255,13 @@ pub fn publish_catalog_snapshot(state: &mut Brood) -> std::result::Result<(), Fr
                 name: session.name,
                 active: session.active,
                 windows: u64::try_from(session.windows).unwrap_or(u64::MAX),
+                working_directory: session.working_directory,
+                project_id: session.project_id,
+                project_name: session.project_name,
+                project_directory: session.project_directory,
+                branch: session.branch,
+                worktree: session.worktree,
+                git: session.git,
             })
             .collect(),
         windows: state

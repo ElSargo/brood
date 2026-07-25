@@ -82,6 +82,15 @@ wasm-tools component new \
   --output "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/picker/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
+  --output "$PACKAGE/brood_picker_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_picker_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \

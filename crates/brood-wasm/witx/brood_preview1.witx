@@ -100,7 +100,13 @@
     (param $command (@witx pointer u8)) (param $command_len u32)
     (param $arguments (@witx pointer u8)) (param $arguments_len u32)
     (param $rows u32) (param $cols u32)
+    ;; zero selects the deterministic xterm-256color/truecolor profile.
+    (param $terminal_profile u32)
     (result $result (expected $identifier (error $errno)))
+  )
+  (@interface func (export "pty_resize")
+    (param $child u64) (param $rows u32) (param $cols u32)
+    (result $result (expected (error $errno)))
   )
   (@interface func (export "worker_loopback_connect")
     (param $address (@witx pointer u8)) (param $address_len u32)

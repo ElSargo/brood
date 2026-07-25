@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-21
+last-reviewed: 2026-07-25
 ---
 
 # Plugin Runtime
@@ -59,10 +59,11 @@ one environment are trusted peers. See [[../concepts/session]].
 
 ```text
 Session backend                         Presentation client
-├── session actor                       ├── presentation actor
-│   ├── worker                          │   ├── worker
-│   └── worker                          │   └── worker
-├── backend policy/service lanes        ├── local key decision + layout actor
+├── daemon actor                        ├── presentation actor
+│   └── worker                          │   ├── worker
+├── session actor                       │   └── worker
+│   └── worker                          ├── local key decision + layout actor
+├── backend policy/service lanes
 └── immutable publications              └── local UI and graphics publications
                  bounded addressed messages
 ```
@@ -80,12 +81,18 @@ or from a native subprocess launched by that plugin.
 
 ## Realm Init Actors
 
-Every surface session and presentation client may have one blessed init actor.
-It is an ordinary Component Model actor with an ordinary Store, mailbox,
-lifecycle, resource table, and failure boundary. The host creates it as part of
-realm creation and delivers its normal start lifecycle event before admitting
-the rest of the realm's actor topology. A server with no surface sessions has no
-session init actor; creating a session creates its root.
+The daemon, every surface session, and every presentation client may have one
+blessed init actor. Each is an ordinary Component Model actor with an ordinary
+Store, mailbox, lifecycle, resource table, and failure boundary. The host
+creates it as part of realm creation and delivers its normal start lifecycle
+event before admitting the rest of that realm's actor topology.
+
+The daemon realm exists once per server process and is not attached to an
+active surface session. It owns backend policy and services whose identity must
+survive session creation, activation, and closure. A server with no surface
+sessions may therefore still run its daemon init actor. Session roots are
+created and destroyed with their individual surface sessions; the presentation
+root is created and destroyed with its client process.
 
 The blessing adds one capability: the init actor may request that the local host
 start, replace, or stop a named child actor. Child paths are capability-rooted
@@ -109,7 +116,15 @@ Only the realm's root receives actor management, and only a surface-session
 root receives app launch. A child cannot replace the root or stop an actor it
 does not own, and actors in one placement cannot use init authority in another
 placement. A client init actor creates client-local actors; a session init actor
-creates backend actors and apps in its own surface session.
+creates actors and apps in its own surface session; a daemon init actor creates
+backend actors whose lifecycle is independent of every session.
+
+The default daemon root is the worktree manager. It serializes managed
+worktree acquisition, records occupation, and decides which idle worktrees are
+eligible for cleanup. Its workers perform allow-listed Git operations and
+persist metadata under the managed XDG data root. The host remains responsible
+for validating actor results and attaching or activating surface sessions; it
+does not absorb worktree policy into the session picker.
 
 The host retains mechanism and recovery responsibility. It validates identities
 and package-root paths and enforces generation and resource limits. Scheduler
@@ -224,6 +239,27 @@ new operations and invalidates all handles and derived pollables, then closes
 streams and sockets, kills live children, cancels timers and pumps, and joins
 all host work before replacement can be published. Count, buffered-byte, and
 write-chunk ceilings apply uniformly to Component and Preview 1 guests.
+
+### Terminal plugin composition
+
+The first-party terminal is an ordinary bundled Component plugin, not a host
+subsystem. Its session actor owns the allowlisted shell PTY, parser, terminal
+state, and scrollback. Its presentation actor owns pane-local input, native text
+layout handles, and canvas packets. The host supplies only the same bounded
+PTY/process, stream readiness, presentation input, text, graphics, and
+diagnostic facilities available to other plugins.
+
+The session actor parses output in a worker and publishes revisioned snapshots.
+It coalesces a short burst of PTY reads before publishing and chunks a snapshot
+to stay below mailbox limits; it does not forward one actor message per native
+read. The presentation actor assembles a complete revision, supersedes stale
+render work, and emits a retained canvas packet. Input dispatch only enqueues
+bounded writes or work and never waits for the PTY or renderer.
+
+Terminal escape handling, the screen grid, scrollback, selection, and
+keybindings remain guest code. The runtime does not expose descriptors,
+arbitrary `ioctl`, signal numbers, termios internals, compositor objects, or GPU
+objects to support it.
 
 ## Messaging, Policy, And Publications
 
@@ -348,6 +384,19 @@ The Component path demonstrates completion I/O and cooperative workers; the
 Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
 memory. Their export names and Store layout are not the durable plugin ABI.
 
+The bundled `terminal-session` and `terminal-ui` Components are the real
+terminal product proof. The session guest launches an allowlisted shell
+in a PTY, parses escape sequences with a guest terminal parser, retains grid and
+scrollback state, and publishes coalesced revisions. The presentation guest
+accepts real pane key, text, pointer-scroll, and resize events; negotiates
+application-cursor input; navigates scrollback; renders styled native text runs
+through canvas packets; and can be destroyed and recreated without terminating
+the session-owned shell. The nested proof records shell, ANSI/Unicode, exact
+key bytes, Helix, repeated alternate-screen resize, scrollback, streaming
+output, child exit, resource pressure, mailbox, packet, text churn,
+key-to-present, teardown, and screenshot evidence. The complete product
+boundary and remaining reusable gaps are in [[terminal-plugin]].
+
 `plugins/component-runtime-io` and the runtime-I/O worker in
 `plugins/workspace-file-log` exercise the same bounded stream and pollable
 contract through both backends. Their nested workload preserves separate
@@ -399,5 +448,6 @@ Related:
 - [[input-shortcuts]]
 - [[layout-actor]]
 - [[plugin-ui]]
+- [[terminal-plugin]]
 - [[plugin-graphics]]
 - [[plugin-advanced-graphics]]

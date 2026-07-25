@@ -8,13 +8,13 @@ use std::{
     sync::Mutex,
 };
 
+use brood::plugin::host;
+use brood_graphics::{Color, Command, Packet, Rect};
 use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
     LocalActorMessage, PresentationActorMessage, PresentationEvent, SessionActorMessage,
     WorkerEvent, WorkerRequest,
 };
-use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
 use serde::{Deserialize, Serialize};
 
 const COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
@@ -231,6 +231,20 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
                 start_ui_command(UI_ID),
                 ActorCommand::LifecycleComplete(Ok(())),
             ]
+        }
+        LifecycleEvent::Start(context) if context.instance_id.starts_with("coding-agent-ui") => {
+            let mut ui = UiState::new();
+            ui.session_id = context.session_id.unwrap_or_default();
+            if let Ok(mut state) = STATE.lock() {
+                *state = RoleState::Ui(ui);
+            }
+            vec![ActorCommand::LifecycleComplete(Ok(()))]
+        }
+        LifecycleEvent::Start(context) if context.instance_id.contains(".coding-agent-") => {
+            if let Ok(mut state) = STATE.lock() {
+                *state = RoleState::Agent(AgentState::new());
+            }
+            vec![ActorCommand::LifecycleComplete(Ok(()))]
         }
         LifecycleEvent::Start(context) => {
             let session_id = context.session_id.unwrap_or_default();
@@ -1183,6 +1197,9 @@ fn draw_text(
             ui.pane,
             text,
             host::TextLayoutOptions {
+                font_intent: host::FontIntent::Ui,
+                font_weight: host::FontWeight::Normal,
+                font_style: host::FontStyle::Normal,
                 font_size: size,
                 max_width: width,
                 line_height: size * 1.35,

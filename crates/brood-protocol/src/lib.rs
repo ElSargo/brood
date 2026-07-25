@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 17;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 18;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
@@ -305,6 +305,13 @@ pub struct CatalogSession {
     pub name: String,
     pub active: bool,
     pub windows: u64,
+    pub working_directory: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_directory: String,
+    pub branch: Option<String>,
+    pub worktree: bool,
+    pub git: bool,
 }
 
 /// One managed window in a catalog snapshot.
@@ -607,6 +614,7 @@ pub enum SessionOperation {
     Refresh,
     Activate,
     Create,
+    CreateWorktree,
     Rename,
     Close,
 }

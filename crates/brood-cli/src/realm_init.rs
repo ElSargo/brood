@@ -9,6 +9,7 @@ const BROOD_CONFIG_ENV: &str = "BROOD_CONFIG";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RealmKind {
+    Backend,
     Session,
     Client,
 }
@@ -23,6 +24,7 @@ struct RootConfig {
 
 #[derive(Default, serde::Deserialize)]
 struct InitConfig {
+    backend: Option<PathBuf>,
     session: Option<PathBuf>,
     client: Option<PathBuf>,
 }
@@ -55,6 +57,7 @@ pub fn realm_init_actor_path(config_path: &Path, realm: RealmKind) -> Result<Opt
     let config: RootConfig = toml::from_str(&contents)
         .with_context(|| format!("parse Brood config {}", config_path.display()))?;
     let path = match realm {
+        RealmKind::Backend => config.init.backend,
         RealmKind::Session => config.init.session,
         RealmKind::Client => config.init.client,
     };

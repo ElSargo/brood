@@ -3,27 +3,34 @@ wit_bindgen::generate!({
     world: "brood-plugin",
 });
 
-use std::sync::Mutex;
+use std::{collections::BTreeSet, sync::Mutex};
 
-use exports::brood::plugin::actor::{
-    ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
-    LocalActorMessage, PresentationEvent, SessionCommand, SessionCommandCompleted, SessionEvent,
-    SessionOperation, SessionSnapshot,
-};
 use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect};
-use serde::Deserialize;
+use exports::brood::plugin::actor::{
+    ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
+    LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
+    SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
+};
+use serde::{Deserialize, Serialize};
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
+const PICKER_ACTOR_ID: &str = "picker";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
+const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
+const DIFF_VIEWER_COMPONENT_FILE: &str = "brood_diff_viewer_plugin.component.wasm";
+const TERMINAL_UI_COMPONENT_FILE: &str = "brood_terminal_ui_plugin.component.wasm";
+const TERMINAL_UI_ID: &str = "terminal-ui";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
+const DIFF_VIEWER_ID: &str = "diff-viewer";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
 const HEADER_HEIGHT: f32 = 104.0;
-const FOOTER_HEIGHT: f32 = 38.0;
+const FOOTER_HEIGHT: f32 = 58.0;
 const ROW_HEIGHT: f32 = 46.0;
+const PROJECT_ROW_HEIGHT: f32 = 38.0;
 const SIDE_MARGIN: f32 = 14.0;
 const SIDEBAR_WIDTH: f64 = 320.0;
 
@@ -43,12 +50,33 @@ struct ViewSession {
     name: String,
     active: bool,
     windows: u64,
+    project_id: String,
+    project_name: String,
+    branch: Option<String>,
+    worktree: bool,
+    git: bool,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum EditMode {
     Search,
     Rename(u64),
+    CreateWorktree(u64),
+}
+
+#[derive(Clone)]
+struct ProjectGroup {
+    id: String,
+    name: String,
+    source_session: u64,
+    sessions: Vec<usize>,
+    git: bool,
+}
+
+#[derive(Clone)]
+enum ListItem {
+    Project(ProjectGroup),
+    Session(usize),
 }
 
 struct SwitcherState {
@@ -58,6 +86,7 @@ struct SwitcherState {
     width: f32,
     height: f32,
     sessions: Vec<ViewSession>,
+    collapsed_projects: BTreeSet<String>,
     selected: Option<u64>,
     query: String,
     mode: EditMode,
@@ -68,9 +97,12 @@ struct SwitcherState {
     error: bool,
     next_coding_agent_ui: u64,
     coding_agent_uis: Vec<String>,
+    diff_viewer_running: bool,
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
+    picker_pane: Option<u64>,
+    picker_visible: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -103,7 +135,7 @@ struct LayoutLeaseToken {
 struct LayoutStateSize {
     w: i32,
     #[serde(rename = "h")]
-    _height: i32,
+    height: i32,
 }
 
 #[derive(Clone)]
@@ -130,6 +162,77 @@ struct CodingAgentActionMessage {
     action: serde_json_core::heapless::String<32>,
 }
 
+#[derive(Deserialize)]
+struct TerminalActionMessage {
+    kind: serde_json_core::heapless::String<32>,
+    action: serde_json_core::heapless::String<32>,
+}
+
+#[derive(Deserialize)]
+struct TerminalLifecycleMessage {
+    kind: serde_json_core::heapless::String<32>,
+    terminal: Option<serde_json_core::heapless::String<64>>,
+}
+
+#[derive(Deserialize)]
+struct PickerLayoutMessage {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+    pane: u64,
+    visible: bool,
+}
+
+#[derive(Deserialize)]
+struct PickerReplyKind {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+}
+
+#[derive(Deserialize)]
+struct PickerSelection {
+    #[serde(rename = "type")]
+    _message_type: serde_json_core::heapless::String<32>,
+    result: SessionPickerResult,
+}
+
+#[derive(Deserialize)]
+struct SessionPickerResult {
+    value: SessionPickerValue,
+}
+
+#[derive(Deserialize)]
+struct SessionPickerValue {
+    session: u64,
+}
+
+#[derive(Deserialize)]
+struct PickerErrorMessage {
+    #[serde(rename = "type")]
+    _message_type: serde_json_core::heapless::String<32>,
+    message: serde_json_core::heapless::String<256>,
+}
+
+#[derive(Serialize)]
+struct SessionPickerRequest<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    title: &'static str,
+    placeholder: &'static str,
+    items: Vec<SessionPickerItem<'a>>,
+}
+
+#[derive(Serialize)]
+struct SessionPickerItem<'a> {
+    label: &'a str,
+    detail: String,
+    value: SessionPickerValueWire,
+}
+
+#[derive(Serialize)]
+struct SessionPickerValueWire {
+    session: u64,
+}
+
 impl SwitcherState {
     const fn new() -> Self {
         Self {
@@ -139,6 +242,7 @@ impl SwitcherState {
             width: 320.0,
             height: 720.0,
             sessions: Vec::new(),
+            collapsed_projects: BTreeSet::new(),
             selected: None,
             query: String::new(),
             mode: EditMode::Search,
@@ -149,40 +253,106 @@ impl SwitcherState {
             error: false,
             next_coding_agent_ui: 2,
             coding_agent_uis: Vec::new(),
+            diff_viewer_running: false,
             text_resources: Vec::new(),
             layout: None,
             workspace_focus: None,
+            picker_pane: None,
+            picker_visible: false,
         }
     }
 
     fn next_request(&mut self) -> u64 {
         self.request = self.request.saturating_add(1).max(1);
         self.pending = Some(self.request);
+        self.error = false;
+        self.status.clear();
         self.request
     }
 
-    fn filtered_indices(&self) -> Vec<usize> {
-        if self.mode != EditMode::Search || self.query.trim().is_empty() {
-            return (0..self.sessions.len()).collect();
+    fn project_groups(&self) -> Vec<ProjectGroup> {
+        let mut groups = Vec::<ProjectGroup>::new();
+        for (index, session) in self.sessions.iter().enumerate() {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.id == session.project_id)
+            {
+                group.sessions.push(index);
+                let source_is_worktree = self
+                    .sessions
+                    .iter()
+                    .find(|candidate| candidate.id == group.source_session)
+                    .is_some_and(|candidate| candidate.worktree);
+                if source_is_worktree && !session.worktree {
+                    group.source_session = session.id;
+                }
+            } else {
+                groups.push(ProjectGroup {
+                    id: session.project_id.clone(),
+                    name: session.project_name.clone(),
+                    source_session: session.id,
+                    sessions: vec![index],
+                    git: session.git,
+                });
+            }
         }
-        let query = self.query.to_lowercase();
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, session)| {
-                session
-                    .name
-                    .to_lowercase()
-                    .contains(&query)
-                    .then_some(index)
-            })
-            .collect()
+        groups.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        groups
     }
 
-    fn visible_rows(&self) -> usize {
-        ((self.height - HEADER_HEIGHT - FOOTER_HEIGHT) / ROW_HEIGHT)
-            .floor()
-            .max(1.0) as usize
+    fn list_items(&self) -> Vec<ListItem> {
+        let query = (self.mode == EditMode::Search)
+            .then(|| self.query.trim().to_lowercase())
+            .filter(|query| !query.is_empty());
+        let mut items = Vec::new();
+        for mut group in self.project_groups() {
+            let project_matches = query.as_ref().is_some_and(|query| {
+                group.name.to_lowercase().contains(query) || group.id.to_lowercase().contains(query)
+            });
+            if let Some(query) = query.as_ref()
+                && !project_matches
+            {
+                group.sessions.retain(|index| {
+                    let session = &self.sessions[*index];
+                    session.name.to_lowercase().contains(query)
+                        || session
+                            .branch
+                            .as_ref()
+                            .is_some_and(|branch| branch.to_lowercase().contains(query))
+                });
+            }
+            if group.sessions.is_empty() {
+                continue;
+            }
+            let expanded = query.is_some() || !self.collapsed_projects.contains(&group.id);
+            items.push(ListItem::Project(group.clone()));
+            if expanded {
+                items.extend(group.sessions.into_iter().map(ListItem::Session));
+            }
+        }
+        items
+    }
+
+    fn visible_item_count(&self, items: &[ListItem], scroll: usize) -> usize {
+        let available = (self.height - HEADER_HEIGHT - FOOTER_HEIGHT).max(PROJECT_ROW_HEIGHT);
+        let mut used = 0.0;
+        items
+            .iter()
+            .skip(scroll)
+            .take_while(|item| {
+                let height = item_height(item);
+                if used + height > available && used > 0.0 {
+                    return false;
+                }
+                used += height;
+                true
+            })
+            .count()
     }
 
     fn ensure_selection(&mut self) {
@@ -201,19 +371,22 @@ impl SwitcherState {
     }
 
     fn ensure_selected_visible(&mut self) {
-        let filtered = self.filtered_indices();
+        let items = self.list_items();
         let Some(position) = self.selected.and_then(|selected| {
-            filtered
+            items
                 .iter()
-                .position(|index| self.sessions[*index].id == selected)
+                .position(|item| matches!(item, ListItem::Session(index) if self.sessions[*index].id == selected))
         }) else {
-            self.scroll = self.scroll.min(filtered.len().saturating_sub(1));
+            self.scroll = self.scroll.min(items.len().saturating_sub(1));
             return;
         };
         if position < self.scroll {
             self.scroll = position;
-        } else if position >= self.scroll + self.visible_rows() {
-            self.scroll = position + 1 - self.visible_rows();
+        } else {
+            let visible = self.visible_item_count(&items, self.scroll).max(1);
+            if position >= self.scroll + visible {
+                self.scroll = position + 1 - visible;
+            }
         }
     }
 
@@ -241,7 +414,17 @@ impl Guest for SessionSwitcher {
                             path: COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
                         }),
+                        ActorCommand::StartActor(ActorStartRequest {
+                            id: PICKER_ACTOR_ID.to_string(),
+                            path: PICKER_COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
+                        }),
                         start_coding_agent_ui(CODING_AGENT_UI_ID),
+                        ActorCommand::StartActor(ActorStartRequest {
+                            id: TERMINAL_UI_ID.to_string(),
+                            path: TERMINAL_UI_COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
+                        }),
                         ActorCommand::LifecycleComplete(Ok(())),
                     ]
                 } else {
@@ -250,6 +433,12 @@ impl Guest for SessionSwitcher {
             }
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
+            }
+            Event::Child(ChildEvent::Started(started)) if started.id == DIFF_VIEWER_ID => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.diff_viewer_running = true;
+                }
+                Vec::new()
             }
             Event::Child(ChildEvent::Started(started))
                 if started.id == CODING_AGENT_UI_ID
@@ -266,12 +455,18 @@ impl Guest for SessionSwitcher {
             Event::Child(ChildEvent::Stopped(id)) => {
                 if let Ok(mut state) = STATE.lock() {
                     state.coding_agent_uis.retain(|actor| actor != &id);
+                    if id == DIFF_VIEWER_ID {
+                        state.diff_viewer_running = false;
+                    }
                 }
                 Vec::new()
             }
             Event::Child(ChildEvent::Failed(failed)) => {
                 if let Ok(mut state) = STATE.lock() {
                     state.coding_agent_uis.retain(|actor| actor != &failed.id);
+                    if failed.id == DIFF_VIEWER_ID {
+                        state.diff_viewer_running = false;
+                    }
                     state.error = true;
                     state.status = format!("Agent UI failed: {}", failed.message);
                 }
@@ -283,7 +478,13 @@ impl Guest for SessionSwitcher {
                 handle_layout_message(&message.body)
             }
             Event::Mailbox(message) if message.sender == "key-policy" => {
-                handle_sidebar_action(&message.body)
+                handle_key_policy_action(&message.body)
+            }
+            Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
+                handle_picker_message(&message.body)
+            }
+            Event::Mailbox(message) if message.sender.starts_with("session:") => {
+                handle_terminal_lifecycle(&message.body)
             }
             _ => Vec::new(),
         }
@@ -331,9 +532,27 @@ fn apply_snapshot(state: &mut SwitcherState, snapshot: SessionSnapshot) {
             name: session.name,
             active: session.active,
             windows: session.windows,
+            project_id: session.project_id,
+            project_name: session.project_name,
+            branch: session.branch,
+            worktree: session.worktree,
+            git: session.git,
         })
         .collect();
-    state.sessions.sort_by_key(|session| session.id);
+    state.sessions.sort_by(|left, right| {
+        left.project_name
+            .to_lowercase()
+            .cmp(&right.project_name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let projects = state
+        .sessions
+        .iter()
+        .map(|session| session.project_id.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .collapsed_projects
+        .retain(|project| projects.contains(project));
     state.ensure_selection();
     state.ensure_selected_visible();
 }
@@ -346,7 +565,10 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
     if completion.success {
         if matches!(
             completion.operation,
-            SessionOperation::Activate | SessionOperation::Create | SessionOperation::Rename
+            SessionOperation::Activate
+                | SessionOperation::Create
+                | SessionOperation::Rename
+                | SessionOperation::CreateWorktree
         ) && let Some(session) = completion.session
         {
             state.selected = Some(session);
@@ -355,12 +577,13 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
             SessionOperation::Refresh => "Sessions refreshed".to_string(),
             SessionOperation::Activate => "Switched session".to_string(),
             SessionOperation::Create => "Created session".to_string(),
+            SessionOperation::CreateWorktree => "Created worktree session".to_string(),
             SessionOperation::Rename => "Renamed session".to_string(),
             SessionOperation::Close => "Closed session".to_string(),
         };
         if matches!(
             completion.operation,
-            SessionOperation::Create | SessionOperation::Rename
+            SessionOperation::Create | SessionOperation::CreateWorktree | SessionOperation::Rename
         ) {
             state.query.clear();
             state.mode = EditMode::Search;
@@ -414,8 +637,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             commands
         }
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
-            let filtered_len = state.filtered_indices().len();
-            let max_scroll = filtered_len.saturating_sub(state.visible_rows());
+            let items = state.list_items();
+            let visible = state.visible_item_count(&items, state.scroll);
+            let max_scroll = items.len().saturating_sub(visible.max(1));
             if scroll.vertical < 0.0 {
                 state.scroll = (state.scroll + 1).min(max_scroll);
             } else if scroll.vertical > 0.0 {
@@ -437,8 +661,10 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             {
                 state.query.push(character);
             }
-            state.scroll = 0;
-            select_first_filtered(&mut state);
+            if state.mode == EditMode::Search {
+                state.scroll = 0;
+                select_first_filtered(&mut state);
+            }
             redraw_or_record_error(&mut state);
             Vec::new()
         }
@@ -459,7 +685,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if state.pane == 0 {
         return Vec::new();
     }
-    if message.focused_pane != Some(state.pane) {
+    if message.focused_pane != Some(state.pane) && message.focused_pane != state.picker_pane {
         state.workspace_focus = message.focused_pane;
     }
     state.layout = Some(LayoutContext {
@@ -474,20 +700,50 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     publish_layout(&state, true, message.focused_pane)
 }
 
-fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
+fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "coding-agent-action"
+        && message.action.as_str() == "new-ui"
     {
-        if consumed == bytes.len()
-            && message.kind.as_str() == "coding-agent-action"
-            && message.action.as_str() == "new-ui"
-        {
-            let Ok(mut state) = STATE.lock() else {
-                return Vec::new();
-            };
-            let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
-            state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
-            return vec![start_coding_agent_ui(&id)];
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
+        state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
+        return vec![start_coding_agent_ui(&id)];
+    }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "diff-viewer-action"
+        && message.action.as_str() == "toggle"
+    {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        state.diff_viewer_running = !state.diff_viewer_running;
+        return if state.diff_viewer_running {
+            vec![start_diff_viewer()]
+        } else {
+            vec![ActorCommand::StopActor(DIFF_VIEWER_ID.to_string())]
+        };
+    }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "terminal-action"
+        && message.action.as_str() == "new"
+    {
+        let Ok(state) = STATE.lock() else {
+            return Vec::new();
+        };
+        if state.session_id == 0 {
+            return Vec::new();
         }
+        return vec![ActorCommand::SendSessionMessage(SessionActorMessage {
+            session_id: state.session_id,
+            actor: "init".to_string(),
+            body: br#"{"kind":"create-terminal"}"#.to_vec(),
+        })];
     }
     let Ok((message, consumed)) = serde_json_core::from_slice::<SidebarActionMessage>(bytes) else {
         return Vec::new();
@@ -504,6 +760,7 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let requested_focus = match message.action.as_str() {
+        "picker" => return open_session_picker(&mut state),
         "show" => {
             state.sidebar_visible = true;
             Some(pane)
@@ -526,6 +783,154 @@ fn handle_sidebar_action(bytes: &[u8]) -> Vec<ActorCommand> {
         layout.focused_pane = requested_focus;
     }
     publish_layout(&state, false, requested_focus)
+}
+
+fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalLifecycleMessage>(bytes)
+    else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.kind.as_str() != "terminal-started" {
+        return Vec::new();
+    }
+    let Some(terminal) = message.terminal else {
+        return Vec::new();
+    };
+    let Some(suffix) = terminal.as_str().strip_prefix("terminal-session-") else {
+        return Vec::new();
+    };
+    vec![ActorCommand::StartActor(ActorStartRequest {
+        id: format!("terminal-ui-{suffix}"),
+        path: TERMINAL_UI_COMPONENT_FILE.to_string(),
+        capabilities: Vec::new(),
+    })]
+}
+
+fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((kind, consumed)) = serde_json_core::from_slice::<PickerReplyKind>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() {
+        return Vec::new();
+    }
+    match kind.message_type.as_str() {
+        "picker-pane" => handle_picker_layout_message(bytes),
+        "picker-created" => {
+            if let Ok(mut state) = STATE.lock() {
+                state.status = "Session picker opened".to_string();
+                state.error = false;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        "picker-selected" => handle_picker_selection(bytes),
+        "picker-error" => {
+            if let Ok((message, consumed)) =
+                serde_json_core::from_slice::<PickerErrorMessage>(bytes)
+                && consumed == bytes.len()
+                && let Ok(mut state) = STATE.lock()
+            {
+                state.status = message.message.as_str().to_string();
+                state.error = true;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        "picker-cancelled" => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<PickerLayoutMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.message_type.as_str() != "picker-pane" {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if message.pane == 0 {
+        return Vec::new();
+    }
+    state.picker_pane = Some(message.pane);
+    state.picker_visible = message.visible;
+    let focus = if message.visible {
+        Some(message.pane)
+    } else {
+        state
+            .workspace_focus
+            .or_else(|| state.sidebar_visible.then_some(state.pane))
+    };
+    if let Some(layout) = state.layout.as_mut() {
+        layout.focused_pane = focus;
+    }
+    publish_layout(&state, false, focus)
+}
+
+fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<PickerSelection>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let request = state.next_request();
+    vec![session_command(
+        request,
+        SessionOperation::Activate,
+        Some(message.result.value.session),
+        None,
+    )]
+}
+
+fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    let items = state
+        .sessions
+        .iter()
+        .map(|session| SessionPickerItem {
+            label: &session.name,
+            detail: if session.windows == 1 {
+                "1 window".to_string()
+            } else {
+                format!("{} windows", session.windows)
+            },
+            value: SessionPickerValueWire {
+                session: session.id,
+            },
+        })
+        .collect::<Vec<_>>();
+    let request = SessionPickerRequest {
+        message_type: "picker-create",
+        title: "Switch session",
+        placeholder: "Type to fuzzy-match sessions…",
+        items,
+    };
+    let Ok(body) = serde_json::to_vec(&request) else {
+        state.error = true;
+        state.status = "Could not encode the session picker".to_string();
+        redraw_or_record_error(state);
+        return Vec::new();
+    };
+    vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body,
+    })]
+}
+
+fn start_diff_viewer() -> ActorCommand {
+    ActorCommand::StartActor(ActorStartRequest {
+        id: DIFF_VIEWER_ID.to_string(),
+        path: DIFF_VIEWER_COMPONENT_FILE.to_string(),
+        capabilities: vec![
+            "filesystem:workspace-read".to_string(),
+            "subprocess:git".to_string(),
+        ],
+    })
 }
 
 fn start_coding_agent_ui(id: &str) -> ActorCommand {
@@ -552,11 +957,12 @@ fn publish_layout(
         return Vec::new();
     };
     let pane = state.pane;
+    let picker_pane = state.picker_pane;
     let delegated = message
         .visible_panes
         .iter()
         .copied()
-        .filter(|visible| *visible != pane)
+        .filter(|visible| *visible != pane && Some(*visible) != picker_pane)
         .chain(message.available_windows.iter().map(|window| window.pane))
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
@@ -567,6 +973,8 @@ fn publish_layout(
     let needs_rest = allow_delegation && !message.rest && !delegated.is_empty();
     let has_rest = message.rest || !delegated.is_empty();
     let pane_visible = state.sidebar_visible && message.visible_panes.contains(&pane);
+    let picker_visible = state.picker_visible
+        && picker_pane.is_some_and(|picker| message.visible_panes.contains(&picker));
     let width = f64::from(message.size.w.max(1));
     let sidebar_fraction = if has_rest && pane_visible {
         (SIDEBAR_WIDTH / width).clamp(0.2, 0.45)
@@ -595,14 +1003,28 @@ fn publish_layout(
         ));
     }
 
-    let layout_item = if pane_visible {
-        format!(
+    let mut layout_items = Vec::new();
+    if pane_visible {
+        layout_items.push(format!(
             "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
             pane, pane, sidebar_offset, sidebar_size
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
+    if picker_visible && let Some(picker) = picker_pane {
+        let height = f64::from(message.size.height.max(1));
+        let picker_width = (720.0 / width).clamp(0.45, 0.88);
+        let picker_height = (480.0 / height).clamp(0.40, 0.82);
+        layout_items.push(format!(
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":100,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            picker,
+            picker,
+            -picker_width,
+            -picker_height,
+            picker_width * 2.0,
+            picker_height * 2.0
+        ));
+    }
+    let layout_items = layout_items.join(",");
     let rest = if has_rest {
         format!(
             ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}}}}",
@@ -618,7 +1040,7 @@ fn publish_layout(
             message.lease.id,
             message.lease.generation,
             message.revision,
-            layout_item,
+            layout_items,
             rest,
             focus
         )
@@ -634,14 +1056,36 @@ fn handle_pointer_button(
     button: u32,
 ) -> Vec<ActorCommand> {
     if y < 96.0 && x >= state.width - 76.0 && button == LEFT_BUTTON {
-        return create_from_query(state);
+        return submit(state);
     }
     if y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
         return Vec::new();
     }
-    let filtered = state.filtered_indices();
-    let row = ((y - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(0.0) as usize;
-    let Some(index) = filtered.get(state.scroll + row).copied() else {
+    let items = state.list_items();
+    let mut item_y = HEADER_HEIGHT;
+    let item = items.iter().skip(state.scroll).find(|item| {
+        let height = item_height(item);
+        let hit = y >= item_y && y < item_y + height;
+        item_y += height;
+        hit
+    });
+    let Some(item) = item.cloned() else {
+        return Vec::new();
+    };
+    if let ListItem::Project(project) = item {
+        if button != LEFT_BUTTON {
+            return Vec::new();
+        }
+        if x >= state.width - 48.0 && project.git {
+            begin_worktree(state, &project);
+        } else if !state.collapsed_projects.remove(&project.id) {
+            state.collapsed_projects.insert(project.id);
+            state.scroll = state.scroll.min(state.list_items().len().saturating_sub(1));
+        }
+        state.ensure_selected_visible();
+        return Vec::new();
+    }
+    let ListItem::Session(index) = item else {
         return Vec::new();
     };
     let session = state.sessions[index].clone();
@@ -687,14 +1131,16 @@ fn handle_key(state: &mut SwitcherState, logical_key: &str) -> Vec<ActorCommand>
         }
         "Backspace" => {
             state.query.pop();
-            state.scroll = 0;
-            select_first_filtered(state);
+            if state.mode == EditMode::Search {
+                state.scroll = 0;
+                select_first_filtered(state);
+            }
             Vec::new()
         }
         "Delete" if state.mode == EditMode::Search && state.query.is_empty() => {
             close_selected(state)
         }
-        "F2" => {
+        "F2" if state.mode == EditMode::Search => {
             if let Some(session) = state.selected_session().cloned() {
                 begin_rename(state, &session);
             }
@@ -705,7 +1151,8 @@ fn handle_key(state: &mut SwitcherState, logical_key: &str) -> Vec<ActorCommand>
 }
 
 fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
-    if let EditMode::Rename(session) = state.mode {
+    if let EditMode::Rename(session) = &state.mode {
+        let session = *session;
         let name = state.query.trim().to_string();
         if name.is_empty() {
             state.error = true;
@@ -720,11 +1167,32 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
             Some(name),
         )];
     }
-    let filtered = state.filtered_indices();
+    if let EditMode::CreateWorktree(session) = &state.mode {
+        let session = *session;
+        let branch = state.query.trim().to_string();
+        if branch.is_empty() {
+            state.error = true;
+            state.status = "A branch name cannot be empty".to_string();
+            return Vec::new();
+        }
+        let request = state.next_request();
+        return vec![session_command(
+            request,
+            SessionOperation::CreateWorktree,
+            Some(session),
+            Some(branch),
+        )];
+    }
+    let visible_sessions = state
+        .list_items()
+        .into_iter()
+        .filter_map(|item| match item {
+            ListItem::Project(_) => None,
+            ListItem::Session(index) => Some(state.sessions[index].id),
+        })
+        .collect::<Vec<_>>();
     if let Some(selected) = state.selected
-        && filtered
-            .iter()
-            .any(|index| state.sessions[*index].id == selected)
+        && visible_sessions.contains(&selected)
     {
         let request = state.next_request();
         return vec![session_command(
@@ -778,16 +1246,30 @@ fn begin_rename(state: &mut SwitcherState, session: &ViewSession) {
     state.error = false;
 }
 
+fn begin_worktree(state: &mut SwitcherState, project: &ProjectGroup) {
+    state.mode = EditMode::CreateWorktree(project.source_session);
+    state.query.clear();
+    state.status = format!("New branch in {}: Enter to create", project.name);
+    state.error = false;
+}
+
 fn move_selection(state: &mut SwitcherState, delta: isize) {
-    let filtered = state.filtered_indices();
-    if filtered.is_empty() {
+    let visible = state
+        .list_items()
+        .into_iter()
+        .filter_map(|item| match item {
+            ListItem::Project(_) => None,
+            ListItem::Session(index) => Some(index),
+        })
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
         state.selected = None;
         return;
     }
     let current = state
         .selected
         .and_then(|selected| {
-            filtered
+            visible
                 .iter()
                 .position(|index| state.sessions[*index].id == selected)
         })
@@ -795,15 +1277,17 @@ fn move_selection(state: &mut SwitcherState, delta: isize) {
     let next = if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
     } else {
-        (current + delta as usize).min(filtered.len() - 1)
+        (current + delta as usize).min(visible.len() - 1)
     };
-    state.selected = Some(state.sessions[filtered[next]].id);
+    state.selected = Some(state.sessions[visible[next]].id);
     state.ensure_selected_visible();
 }
 
 fn select_first_filtered(state: &mut SwitcherState) {
-    let filtered = state.filtered_indices();
-    state.selected = filtered.first().map(|index| state.sessions[*index].id);
+    state.selected = state.list_items().into_iter().find_map(|item| match item {
+        ListItem::Project(_) => None,
+        ListItem::Session(index) => Some(state.sessions[index].id),
+    });
 }
 
 fn session_command(
@@ -850,7 +1334,9 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         state.width - 28.0,
     )?;
 
-    let input_color = if state.mode == EditMode::Search {
+    let input_color = if state.error {
+        RED
+    } else if state.mode == EditMode::Search {
         PANEL
     } else {
         BLUE
@@ -867,10 +1353,10 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         width: 1.5,
     });
     let prompt = if state.query.is_empty() {
-        if state.mode == EditMode::Search {
-            "Search or create…".to_string()
-        } else {
-            "New name…".to_string()
+        match &state.mode {
+            EditMode::Search => "Search or create…".to_string(),
+            EditMode::Rename(_) => "New session name…".to_string(),
+            EditMode::CreateWorktree(_) => "Branch name…".to_string(),
         }
     } else {
         format!("{}▏", state.query)
@@ -902,8 +1388,10 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         &mut resources,
         if state.pending.is_some() {
             "…"
-        } else {
+        } else if state.mode == EditMode::Search {
             "+ New"
+        } else {
+            "Create"
         },
         14.0,
         PANEL_DARK,
@@ -912,8 +1400,8 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         48.0,
     )?;
 
-    let filtered = state.filtered_indices();
-    let visible = state.visible_rows();
+    let items = state.list_items();
+    let visible = state.visible_item_count(&items, state.scroll);
     packet.push(Command::Save);
     packet.push(Command::ClipRect(Rect::new(
         0.0,
@@ -921,81 +1409,142 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         state.width,
         state.height - HEADER_HEIGHT - FOOTER_HEIGHT,
     )));
-    for (visible_row, index) in filtered
-        .iter()
-        .skip(state.scroll)
-        .take(visible)
-        .copied()
-        .enumerate()
-    {
-        let session = state.sessions[index].clone();
-        let y = HEADER_HEIGHT + visible_row as f32 * ROW_HEIGHT;
-        let selected = state.selected == Some(session.id);
-        if session.active || selected {
-            packet.push(Command::FillRoundedRect {
-                rect: Rect::new(SIDE_MARGIN, y + 3.0, state.width - 28.0, ROW_HEIGHT - 6.0),
-                radius: 6.0,
-                color: if session.active {
-                    Color::rgba(BLUE.r, BLUE.g, BLUE.b, 0.46)
+    let mut y = HEADER_HEIGHT;
+    for item in items.iter().skip(state.scroll).take(visible) {
+        match item {
+            ListItem::Project(project) => {
+                packet.push(Command::FillRect {
+                    rect: Rect::new(0.0, y, state.width, PROJECT_ROW_HEIGHT),
+                    color: PANEL_DARK,
+                });
+                let collapsed = state.collapsed_projects.contains(&project.id);
+                add_text(
+                    state,
+                    &mut packet,
+                    &mut resources,
+                    if collapsed { "▸" } else { "▾" },
+                    14.0,
+                    MUTED,
+                    SIDE_MARGIN,
+                    y + 8.0,
+                    14.0,
+                )?;
+                add_text(
+                    state,
+                    &mut packet,
+                    &mut resources,
+                    &truncate(&project.name, 22),
+                    14.0,
+                    FG,
+                    SIDE_MARGIN + 18.0,
+                    y + 8.0,
+                    state.width - 126.0,
+                )?;
+                add_text(
+                    state,
+                    &mut packet,
+                    &mut resources,
+                    &project.sessions.len().to_string(),
+                    12.0,
+                    MUTED,
+                    state.width - 76.0,
+                    y + 9.0,
+                    24.0,
+                )?;
+                if project.git {
+                    add_text(
+                        state,
+                        &mut packet,
+                        &mut resources,
+                        "+",
+                        20.0,
+                        YELLOW,
+                        state.width - 36.0,
+                        y + 4.0,
+                        20.0,
+                    )?;
+                }
+            }
+            ListItem::Session(index) => {
+                let session = state.sessions[*index].clone();
+                let selected = state.selected == Some(session.id);
+                if session.active || selected {
+                    packet.push(Command::FillRoundedRect {
+                        rect: Rect::new(
+                            SIDE_MARGIN + 12.0,
+                            y + 3.0,
+                            state.width - 40.0,
+                            ROW_HEIGHT - 6.0,
+                        ),
+                        radius: 6.0,
+                        color: if session.active {
+                            Color::rgba(BLUE.r, BLUE.g, BLUE.b, 0.46)
+                        } else {
+                            Color::rgba(PANEL.r, PANEL.g, PANEL.b, 0.72)
+                        },
+                    });
+                }
+                if selected {
+                    packet.push(Command::StrokeRoundedRect {
+                        rect: Rect::new(
+                            SIDE_MARGIN + 12.0,
+                            y + 3.0,
+                            state.width - 40.0,
+                            ROW_HEIGHT - 6.0,
+                        ),
+                        radius: 6.0,
+                        color: YELLOW,
+                        width: 1.5,
+                    });
+                }
+                add_text(
+                    state,
+                    &mut packet,
+                    &mut resources,
+                    &truncate(&session.name, 24),
+                    16.0,
+                    FG,
+                    SIDE_MARGIN + 22.0,
+                    y + 8.0,
+                    state.width - 158.0,
+                )?;
+                let count = if session.windows == 1 {
+                    "1 window".to_string()
                 } else {
-                    Color::rgba(PANEL.r, PANEL.g, PANEL.b, 0.72)
-                },
-            });
+                    format!("{} windows", session.windows)
+                };
+                add_text(
+                    state,
+                    &mut packet,
+                    &mut resources,
+                    &count,
+                    12.0,
+                    if session.active { GREEN } else { MUTED },
+                    state.width - 116.0,
+                    y + 11.0,
+                    70.0,
+                )?;
+                add_text(
+                    state,
+                    &mut packet,
+                    &mut resources,
+                    "×",
+                    18.0,
+                    RED,
+                    state.width - 38.0,
+                    y + 7.0,
+                    20.0,
+                )?;
+            }
         }
-        if selected {
-            packet.push(Command::StrokeRoundedRect {
-                rect: Rect::new(SIDE_MARGIN, y + 3.0, state.width - 28.0, ROW_HEIGHT - 6.0),
-                radius: 6.0,
-                color: YELLOW,
-                width: 1.5,
-            });
-        }
-        let display_name = truncate(&session.name, 28);
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            &display_name,
-            16.0,
-            FG,
-            SIDE_MARGIN + 10.0,
-            y + 8.0,
-            state.width - 146.0,
-        )?;
-        let count = if session.windows == 1 {
-            "1 window".to_string()
-        } else {
-            format!("{} windows", session.windows)
-        };
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            &count,
-            12.0,
-            if session.active { GREEN } else { MUTED },
-            state.width - 116.0,
-            y + 11.0,
-            70.0,
-        )?;
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            "×",
-            18.0,
-            RED,
-            state.width - 38.0,
-            y + 7.0,
-            20.0,
-        )?;
+        y += item_height(item);
     }
     packet.push(Command::Restore);
 
-    if filtered.len() > visible {
+    if items.len() > visible {
         let track_height = state.height - HEADER_HEIGHT - FOOTER_HEIGHT - 12.0;
-        let thumb_height = (track_height * visible as f32 / filtered.len() as f32).max(24.0);
-        let max_scroll = filtered.len().saturating_sub(visible).max(1);
+        let thumb_height = (track_height * visible as f32 / items.len() as f32).max(24.0);
+        let max_scroll = items.len().saturating_sub(visible).max(1);
         let thumb_y = HEADER_HEIGHT
             + 6.0
             + (track_height - thumb_height) * state.scroll as f32 / max_scroll as f32;
@@ -1017,7 +1566,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
     });
     let footer = if !state.status.is_empty() {
         state.status.clone()
-    } else if filtered.is_empty() {
+    } else if items.is_empty() {
         "No match — Enter creates it".to_string()
     } else {
         "Enter open  ·  F2 rename  ·  Delete close".to_string()
@@ -1026,11 +1575,15 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         state,
         &mut packet,
         &mut resources,
-        &truncate(&footer, 48),
+        &if state.error {
+            truncate(&footer, 150)
+        } else {
+            truncate(&footer, 48)
+        },
         12.0,
         if state.error { RED } else { MUTED },
         SIDE_MARGIN,
-        state.height - 28.0,
+        state.height - FOOTER_HEIGHT + 8.0,
         state.width - 28.0,
     )?;
 
@@ -1042,6 +1595,13 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
     }
     state.text_resources = resources;
     Ok(())
+}
+
+const fn item_height(item: &ListItem) -> f32 {
+    match item {
+        ListItem::Project(_) => PROJECT_ROW_HEIGHT,
+        ListItem::Session(_) => ROW_HEIGHT,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1060,6 +1620,9 @@ fn add_text(
         state.pane,
         text,
         host::TextLayoutOptions {
+            font_intent: host::FontIntent::Ui,
+            font_weight: host::FontWeight::Normal,
+            font_style: host::FontStyle::Normal,
             font_size: size,
             max_width: max_width.max(1.0),
             line_height: size + 4.0,

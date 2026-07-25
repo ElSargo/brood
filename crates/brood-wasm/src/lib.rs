@@ -94,9 +94,9 @@ pub use policy_provider::{
 };
 pub use policy_provider_link::POLICY_PROVIDER_EXPORT_PREFIX;
 pub use presentation::{
-    PresentationError, PresentationEvent, PresentationHost, SessionCommandCompletion,
-    SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
-    TextLayoutOptions, TextLayoutResult,
+    FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent, PresentationHost,
+    SessionCommandCompletion, SessionCommandRequest, SessionEvent, SessionOperation,
+    SessionSnapshot, SessionSummary, TextLayoutOptions, TextLayoutResult,
 };
 pub use preview1_worker::{
     COMPAT_DISPATCH_EXPORT, COMPAT_MARKER_EXPORT, COMPAT_MARKER_MAGIC, COMPAT_WORKER_EXPORT,
@@ -111,8 +111,9 @@ pub use resolved_layout::{
 };
 pub use resource_limits::WasmResourceLimits;
 pub use runtime_io::{
-    ByteStream, ChildHandle, ChildStatus, ProcessIo, PtyIo, RuntimeIoCapabilities, RuntimeIoConfig,
-    RuntimeIoError, RuntimeIoHub, StreamRead, TimerHandle, TimerStatus,
+    ByteStream, ChildHandle, ChildStatus, ProcessIo, PtyIo, PtySpawnOptions, RuntimeIoCapabilities,
+    RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, RuntimeIoStats, StreamRead, TerminalProfile,
+    TimerHandle, TimerStatus,
 };
 pub use test_harness::{
     TestHarnessChildId, TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessOutcomeKind,

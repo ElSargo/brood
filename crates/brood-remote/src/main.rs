@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_cli::control::{
     ControlTarget, activate_surface_session, close_surface_session,
-    complete_realm_artifact_request, create_surface_session, handshake,
-    install_session_init_artifact, open_presentation_fast_path, rename_surface_session,
+    complete_realm_artifact_request, create_managed_worktree_session, create_surface_session,
+    handshake, install_session_init_artifact, open_presentation_fast_path, rename_surface_session,
     request_dbus_command, resolve_control_target, shared_memory_resource,
     take_realm_artifact_requests,
 };
@@ -845,6 +845,12 @@ fn execute_session_operation(
         }
         SessionOperation::Create => {
             create_surface_session(target, name.unwrap_or_default()).map(Some)
+        }
+        SessionOperation::CreateWorktree => {
+            let session =
+                session.context("create worktree request is missing a source session ID")?;
+            let branch = name.context("create worktree request is missing a branch name")?;
+            create_managed_worktree_session(target, session, branch).map(Some)
         }
         SessionOperation::Rename => {
             let session = session.context("rename request is missing a session ID")?;

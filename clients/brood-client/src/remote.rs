@@ -419,6 +419,13 @@ fn handle_reliable_message(
                     name: session.name,
                     active: session.active,
                     windows: session.windows,
+                    working_directory: session.working_directory,
+                    project_id: session.project_id,
+                    project_name: session.project_name,
+                    project_directory: session.project_directory,
+                    branch: session.branch,
+                    worktree: session.worktree,
+                    git: session.git,
                 })
                 .collect();
             let windows = catalog
@@ -890,6 +897,9 @@ impl RemoteBackendCommandLane {
             WasmSessionOperation::Refresh => brood_protocol::SessionOperation::Refresh,
             WasmSessionOperation::Activate => brood_protocol::SessionOperation::Activate,
             WasmSessionOperation::Create => brood_protocol::SessionOperation::Create,
+            WasmSessionOperation::CreateWorktree => {
+                brood_protocol::SessionOperation::CreateWorktree
+            }
             WasmSessionOperation::Rename => brood_protocol::SessionOperation::Rename,
             WasmSessionOperation::Close => brood_protocol::SessionOperation::Close,
         };

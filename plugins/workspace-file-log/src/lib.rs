@@ -158,8 +158,11 @@ unsafe extern "C" {
         arguments_len: u32,
         rows: u32,
         cols: u32,
+        terminal_profile: u32,
         child: *mut u64,
     ) -> u32;
+    #[link_name = "pty_resize"]
+    safe fn host_pty_resize(child: u64, rows: u32, cols: u32) -> u32;
     #[link_name = "worker_loopback_connect"]
     unsafe fn host_worker_loopback_connect(
         address: *const u8,
@@ -600,6 +603,7 @@ fn spawn_child(pty: bool, command: &str, arguments: &[&str]) -> Result<u64, u32>
                 encoded.len() as u32,
                 24,
                 80,
+                0,
                 &raw mut child,
             )
         }
@@ -614,6 +618,9 @@ fn spawn_child(pty: bool, command: &str, arguments: &[&str]) -> Result<u64, u32>
             )
         }
     };
+    if status == 0 && child != 0 && pty && host_pty_resize(child, 30, 96) != 0 {
+        return Err(34);
+    }
     (status == 0 && child != 0).then_some(child).ok_or(34)
 }
 

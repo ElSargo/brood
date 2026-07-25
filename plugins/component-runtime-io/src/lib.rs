@@ -60,10 +60,14 @@ impl Guest for RuntimeIoProof {
                 "-c".into(),
                 "test -t 0 && printf 'stdin-is-tty '; test -t 1 && printf 'stdout-is-tty terminal-prompt> '; IFS= read -r answer; printf 'terminal-reply=%s\\n' \"$answer\"".into(),
             ],
-            24,
-            80,
+            host::PtySpawnOptions {
+                rows: 24,
+                cols: 80,
+                terminal_profile: host::TerminalProfile::Xterm256color,
+            },
         )
         .map_err(debug("spawn PTY"))?;
+        host::pty_resize(pty.child, 30, 96).map_err(debug("resize PTY"))?;
         write_all(pty.terminal, b"typed-through-pty\n").await?;
         host::stream_close_write(pty.terminal).map_err(debug("close PTY input"))?;
         let terminal_output = read_to_eof(pty.terminal).await?;

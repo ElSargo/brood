@@ -43,14 +43,15 @@ use crate::filesystem_watch::{
 use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::presentation::{
-    PresentationError, PresentationEvent, PresentationHost, SessionCommandRequest, SessionEvent,
-    SessionOperation, TextLayoutOptions,
+    FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent, PresentationHost,
+    SessionCommandRequest, SessionEvent, SessionOperation, TextLayoutOptions,
 };
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
 };
 use crate::runtime_io::{
-    ChildStatus, RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, StreamRead, TimerStatus,
+    ChildStatus, PtySpawnOptions, RuntimeIoConfig, RuntimeIoError, RuntimeIoHub, StreamRead,
+    TerminalProfile, TimerStatus,
 };
 
 use std::{
@@ -543,6 +544,20 @@ impl bindings::brood::plugin::host::Host for ActorStore {
                     pane,
                     text,
                     TextLayoutOptions {
+                        font_intent: match options.font_intent {
+                            bindings::brood::plugin::host::FontIntent::Ui => FontIntent::Ui,
+                            bindings::brood::plugin::host::FontIntent::Monospace => {
+                                FontIntent::Monospace
+                            }
+                        },
+                        font_weight: match options.font_weight {
+                            bindings::brood::plugin::host::FontWeight::Normal => FontWeight::Normal,
+                            bindings::brood::plugin::host::FontWeight::Bold => FontWeight::Bold,
+                        },
+                        font_style: match options.font_style {
+                            bindings::brood::plugin::host::FontStyle::Normal => FontStyle::Normal,
+                            bindings::brood::plugin::host::FontStyle::Italic => FontStyle::Italic,
+                        },
                         font_size: options.font_size,
                         max_width: options.max_width,
                         line_height: options.line_height,
@@ -556,6 +571,8 @@ impl bindings::brood::plugin::host::Host for ActorStore {
                 height: layout.height,
                 first_baseline: layout.first_baseline,
                 line_count: layout.line_count,
+                cell_width: layout.cell_width,
+                line_height: layout.line_height,
             })
             .map_err(map_component_presentation_error))
     }
@@ -607,8 +624,7 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         &mut self,
         command: String,
         arguments: Vec<String>,
-        rows: u16,
-        cols: u16,
+        options: bindings::brood::plugin::host::PtySpawnOptions,
     ) -> wasmtime::Result<
         std::result::Result<
             bindings::brood::plugin::host::PtyIo,
@@ -617,12 +633,37 @@ impl bindings::brood::plugin::host::Host for ActorStore {
     > {
         Ok(self
             .runtime_io
-            .spawn_pty(&command, &arguments, rows, cols)
+            .spawn_pty(
+                &command,
+                &arguments,
+                PtySpawnOptions {
+                    rows: options.rows,
+                    cols: options.cols,
+                    terminal_profile: match options.terminal_profile {
+                        bindings::brood::plugin::host::TerminalProfile::Xterm256color => {
+                            TerminalProfile::Xterm256Color
+                        }
+                    },
+                },
+            )
             .map(|pty| bindings::brood::plugin::host::PtyIo {
                 child: pty.child.raw(),
                 terminal: pty.terminal.raw(),
                 resolved_command: pty.child.resolved_command().to_string_lossy().into_owned(),
             })
+            .map_err(map_component_runtime_io_error))
+    }
+
+    fn pty_resize(
+        &mut self,
+        child: u64,
+        rows: u16,
+        cols: u16,
+    ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::RuntimeIoError>>
+    {
+        Ok(self
+            .runtime_io
+            .resize_pty(child, rows, cols)
             .map_err(map_component_runtime_io_error))
     }
 
@@ -1726,6 +1767,10 @@ impl ComponentActor {
         self.filesystem_watches.stats()
     }
 
+    pub fn runtime_io_stats(&self) -> crate::runtime_io::RuntimeIoStats {
+        self.runtime_io.stats()
+    }
+
     /// Nonblocking actor-mailbox delivery.
     pub fn try_send_message(&self, sender: String, body: Vec<u8>) -> Result<()> {
         try_enqueue_mailbox(
@@ -2682,6 +2727,13 @@ fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
                     name: session.name,
                     active: session.active,
                     windows: session.windows,
+                    working_directory: session.working_directory,
+                    project_id: session.project_id,
+                    project_name: session.project_name,
+                    project_directory: session.project_directory,
+                    branch: session.branch,
+                    worktree: session.worktree,
+                    git: session.git,
                 })
                 .collect(),
         }),
@@ -2707,6 +2759,7 @@ fn component_session_command_from_guest(
         abi::SessionOperation::Refresh => SessionOperation::Refresh,
         abi::SessionOperation::Activate => SessionOperation::Activate,
         abi::SessionOperation::Create => SessionOperation::Create,
+        abi::SessionOperation::CreateWorktree => SessionOperation::CreateWorktree,
         abi::SessionOperation::Rename => SessionOperation::Rename,
         abi::SessionOperation::Close => SessionOperation::Close,
     };
@@ -2722,6 +2775,14 @@ fn component_session_command_from_guest(
         SessionOperation::Create => ensure!(
             request.session.is_none(),
             "create session command does not accept a session ID"
+        ),
+        SessionOperation::CreateWorktree => ensure!(
+            request.session.is_some_and(|session| session != 0)
+                && request
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| !name.trim().is_empty()),
+            "create worktree session command requires a source session ID and non-empty branch"
         ),
         SessionOperation::Rename => ensure!(
             request.session.is_some_and(|session| session != 0)
@@ -2748,6 +2809,7 @@ const fn component_session_operation_to_guest(
         SessionOperation::Refresh => abi::SessionOperation::Refresh,
         SessionOperation::Activate => abi::SessionOperation::Activate,
         SessionOperation::Create => abi::SessionOperation::Create,
+        SessionOperation::CreateWorktree => abi::SessionOperation::CreateWorktree,
         SessionOperation::Rename => abi::SessionOperation::Rename,
         SessionOperation::Close => abi::SessionOperation::Close,
     }
