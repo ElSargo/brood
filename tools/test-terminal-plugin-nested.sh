@@ -343,7 +343,7 @@ done
 capture "$OUT/terminal-reconnected.png"
 
 COLOR_ENV_FILE="$OUT/terminal-color-env.txt"
-type_line "printf 'TERM=%s\\nCOLORTERM=%s\\nNO_COLOR=%s\\n' \"\$TERM\" \"\$COLORTERM\" \"\${NO_COLOR-unset}\" > '$COLOR_ENV_FILE'"
+type_line "printf 'TERM=%s\\nCOLORTERM=%s\\nNO_COLOR=%s\\nWAYLAND_DISPLAY=%s\\nDBUS_SESSION_BUS_ADDRESS=%s\\nBROOD_SURFACE_SESSION_ID=%s\\n' \"\$TERM\" \"\$COLORTERM\" \"\${NO_COLOR-unset}\" \"\$WAYLAND_DISPLAY\" \"\$DBUS_SESSION_BUS_ADDRESS\" \"\$BROOD_SURFACE_SESSION_ID\" > '$COLOR_ENV_FILE'"
 for _ in $(seq 1 200); do
   [[ -s "$COLOR_ENV_FILE" ]] && break
   sleep 0.05
@@ -351,6 +351,39 @@ done
 rg -qx 'TERM=xterm-256color' "$COLOR_ENV_FILE"
 rg -qx 'COLORTERM=truecolor' "$COLOR_ENV_FILE"
 rg -qx 'NO_COLOR=unset' "$COLOR_ENV_FILE"
+rg -qx "WAYLAND_DISPLAY=$(jq -r .wayland_display <<< "$STATUS_LIVE")" "$COLOR_ENV_FILE"
+rg -qx "BROOD_SURFACE_SESSION_ID=$(jq -r .active_surface_session <<< "$STATUS_LIVE")" \
+  "$COLOR_ENV_FILE"
+CHILD_DBUS_ADDRESS="$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' "$COLOR_ENV_FILE")"
+[[ "$CHILD_DBUS_ADDRESS" != "$DBUS_SESSION_BUS_ADDRESS" ]]
+rg -q '/brood-inprocess-dbus-[^/]+-surface-[0-9]+/bus$' <<< "$CHILD_DBUS_ADDRESS"
+
+GHOSTTY_BASELINE="$(ctl status-json | jq -r .total_windows)"
+GHOSTTY_PID_FILE="$OUT/ghostty-child.pid"
+type_line "env -u LD_LIBRARY_PATH ghostty --config-file=/dev/null --class=brood-terminal-ghostty-proof -e sleep 30 > '$OUT/ghostty-child.log' 2>&1 & printf '%s\n' \"\$!\" > '$GHOSTTY_PID_FILE'"
+for _ in $(seq 1 100); do
+  [[ -s "$GHOSTTY_PID_FILE" ]] && break
+  sleep 0.05
+done
+[[ -s "$GHOSTTY_PID_FILE" ]]
+GHOSTTY_PID="$(< "$GHOSTTY_PID_FILE")"
+[[ "$GHOSTTY_PID" =~ ^[0-9]+$ ]]
+for _ in $(seq 1 300); do
+  GHOSTTY_STATUS="$(ctl status-json)"
+  GHOSTTY_WINDOWS="$(jq -r .total_windows <<< "$GHOSTTY_STATUS")"
+  ((GHOSTTY_WINDOWS > GHOSTTY_BASELINE)) && break
+  sleep 0.05
+done
+((GHOSTTY_WINDOWS > GHOSTTY_BASELINE))
+capture "$OUT/terminal-ghostty-managed.png"
+kill "$GHOSTTY_PID"
+for _ in $(seq 1 200); do
+  GHOSTTY_WINDOWS="$(ctl status-json | jq -r .total_windows)"
+  ((GHOSTTY_WINDOWS == GHOSTTY_BASELINE)) && break
+  sleep 0.05
+done
+((GHOSTTY_WINDOWS == GHOSTTY_BASELINE))
+focus_terminal "$CLIENT2_LOG"
 
 LAZYGIT_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
 LAZYGIT_CREATED_BASELINE="$(metric_value "$CLIENT2_LOG" layouts_created_total)"
@@ -561,7 +594,8 @@ python3 - \
   "$OUT/terminal-reconnected.png" \
   "$OUT/terminal-scrollback.png" \
   "$OUT/terminal-ctrl-alt-t.png" \
-  "$OUT/terminal-lazygit-color.png" <<'PY'
+  "$OUT/terminal-lazygit-color.png" \
+  "$OUT/terminal-ghostty-managed.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -632,6 +666,12 @@ jq -n \
         layout_cache_entries: $terminal.layout_cache_entries,
         layouts_created: $lazygit_created,
         layouts_dropped: $lazygit_dropped
+      },
+      managed_gui_descendant: {
+        application: "ghostty",
+        wayland_display: $live.wayland_display,
+        isolated_session_bus: true,
+        mapped_inside_backend: true
       },
       repeated_resizes: $terminal.pty_resizes,
       streaming_bytes: $terminal.pty_bytes,
@@ -706,13 +746,14 @@ cat > "$OUT/proof.md" <<EOF
 - product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-2 actors, focused the new pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
 - keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
 - color policy: the controlled PTY profile removed ambient NO_COLOR, retained xterm-256color/truecolor, and rendered a real lazygit screen in terminal-lazygit-color.png
+- managed GUI descendants: the terminal shell inherited the backend Wayland socket and isolated session bus; a real Ghostty child mapped inside Brood in terminal-ghostty-managed.png instead of opening through the host Ghostty instance
 - TUI text reuse: lazygit started and presented in ${LAZYGIT_PRESENT_MS}ms with a bounded recent-layout cache; its interaction created ${LAZYGIT_CREATED} layouts and dropped ${LAZYGIT_DROPPED}
 - scrollback: guest-owned history was navigated with real Shift+PageUp and Shift+End input
 - presentation ownership: the client disconnected while the session-owned shell and its two native resources remained live, then a new presentation actor reattached
 - TUI: Helix rendered full-screen and remained responsive through repeated compositor/pane resizes
 - streaming: 4,000 output lines reached a revised canvas packet in ${STREAM_RENDER_MS}ms
 - teardown: both the boot shell and the shortcut-created shell retired every PTY child and stream resource
-- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
+- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-ghostty-managed.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
 - structured metrics: proof.json
 EOF
 

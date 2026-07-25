@@ -233,10 +233,15 @@ The result contains a process handle, attached streams, and an exit pollable.
 Operations include `try_wait`, wait, close stdin, terminate, kill, and bounded
 status/resource queries.
 
-A native child has the authority of its session environment. WASI directory
-handles do not sandbox that child. Brood should state this plainly rather
-than add per-spawn approval prompts which imply a boundary that does not exist.
-Containerized and remote sessions constrain children at the session boundary.
+A native child has the authority and controlled launch environment of its
+session. This includes the session working directory, nested display, control
+identity, surface-session identity, and isolated session bus. Supplying both
+the display and bus matters for single-instance graphical applications: a
+child must not contact an existing host-desktop instance and ask it to create
+an unmanaged window. WASI directory handles do not sandbox that child. Brood
+should state this plainly rather than add per-spawn approval prompts which
+imply a boundary that does not exist. Containerized and remote sessions
+constrain children at the session boundary.
 
 Actor-generation processes terminate during actor shutdown by default.
 Terminals and other durable services may explicitly create session-scoped
@@ -251,8 +256,9 @@ initial rows and columns, and an explicit terminal profile. The standard
 `COLORTERM=truecolor` and removes ambient color-policy variables such as
 `NO_COLOR`, `CLICOLOR`, and `FORCE_COLOR`. This prevents the service launcher's
 preferences from silently changing a terminal product. The child still starts
-in the actor's resolved session working directory. Executable selection remains
-capability-scoped and allowlisted.
+in the actor's resolved session working directory and receives host-controlled
+session environment overrides. Executable selection remains capability-scoped
+and allowlisted; guests cannot supply arbitrary environment entries per spawn.
 
 Resize is a resource operation on the child handle. The host validates nonzero
 dimensions against its PTY limit, retains only the native master control object

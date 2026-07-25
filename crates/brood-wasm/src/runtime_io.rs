@@ -5,8 +5,9 @@
 //! while workers project the notification into their ordinary poll path.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
+    ffi::OsString,
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -79,6 +80,9 @@ pub struct RuntimeIoConfig {
     pub capabilities: RuntimeIoCapabilities,
     /// Host working directory inherited by admitted subprocesses.
     pub working_directory: Option<PathBuf>,
+    /// Host-controlled session environment overrides inherited by admitted
+    /// subprocesses. Guests cannot add or replace entries at spawn time.
+    pub environment: BTreeMap<OsString, OsString>,
     /// Maximum streams, children, and timers owned at once.
     pub max_resources: usize,
     /// Maximum live child processes.
@@ -96,6 +100,7 @@ impl Default for RuntimeIoConfig {
         Self {
             capabilities: RuntimeIoCapabilities::default(),
             working_directory: None,
+            environment: BTreeMap::new(),
             max_resources: 64,
             max_children: 8,
             max_timers: 32,
@@ -512,6 +517,7 @@ impl RuntimeIoHub {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.envs(&self.inner.config.environment);
         if let Some(directory) = &self.inner.config.working_directory {
             command.current_dir(directory);
         }
@@ -602,6 +608,9 @@ impl RuntimeIoHub {
         // `portable-pty` otherwise falls back to `$HOME`, unlike
         // `std::process::Command`, which inherits the caller's cwd.
         builder.cwd(cwd);
+        for (key, value) in &self.inner.config.environment {
+            builder.env(key, value);
+        }
         match options.terminal_profile {
             TerminalProfile::Xterm256Color => {
                 // A terminal profile must not inherit process-wide color

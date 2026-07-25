@@ -32,6 +32,12 @@ snapshot revision rather than converting each native read into a mailbox
 message. The presentation actor assembles one revision atomically and
 supersedes stale render work.
 
+The PTY shell receives the same host-controlled nested display, surface-session
+identity, control identity, and isolated session bus as other managed backend
+children. GUI descendants therefore map into the owning Brood session.
+Single-instance clients such as Ghostty cannot escape through an inherited host
+session bus and create a normal desktop window.
+
 The snapshot is an application protocol over ordinary bounded actor messages.
 It includes the visible rows, cursor and input modes, viewport extent, child
 state, and pressure counters. It is not a host screen-grid protocol.
@@ -120,10 +126,11 @@ next reusable interfaces to close.
 The built-in Nix-backed nested proof drives a real presentation client and PTY.
 It verifies shell interaction, ANSI styles and Unicode, exact function and
 modified-key bytes, application-cursor negotiation, Helix, alternate-screen
-resize, scrollback navigation, presentation replacement, sustained output,
-real `Ctrl+Alt+T` creation of a fresh paired terminal, child exit, and zero
-leaked runtime or text resources. It captures screenshots and structured
-latency, mailbox, stream, packet, and text-churn metrics.
+resize, scrollback navigation, presentation replacement, a real managed Ghostty
+descendant, sustained output, real `Ctrl+Alt+T` creation of a fresh paired
+terminal, child exit, and zero leaked runtime or text resources. It captures
+screenshots and structured latency, mailbox, stream, packet, and text-churn
+metrics.
 
 Related:
 
