@@ -4,7 +4,7 @@ wit_bindgen::generate!({
 });
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{HashMap, HashSet},
     sync::Mutex,
 };
 
@@ -24,6 +24,7 @@ const CURSOR: u32 = 0x928374;
 const MOD_CTRL: u32 = 1;
 const MOD_ALT: u32 = 2;
 const MOD_SHIFT: u32 = 4;
+const MAX_CACHED_LAYOUTS: usize = 512;
 
 static STATE: Mutex<Option<UiState>> = Mutex::new(None);
 
@@ -43,11 +44,12 @@ struct UiState {
     render_worker: Option<u64>,
     next_worker: u64,
     rendered_revision: u64,
-    cache: BTreeMap<RunKey, u64>,
+    cache: HashMap<RunKey, CachedLayout>,
     layouts_created: u64,
     layouts_reused: u64,
     layouts_dropped: u64,
     packets: u64,
+    snapshots_received: u64,
     max_packet_bytes: usize,
     max_commands: usize,
     requested_viewport: usize,
@@ -73,11 +75,12 @@ impl UiState {
             render_worker: None,
             next_worker: 1,
             rendered_revision: 0,
-            cache: BTreeMap::new(),
+            cache: HashMap::new(),
             layouts_created: 0,
             layouts_reused: 0,
             layouts_dropped: 0,
             packets: 0,
+            snapshots_received: 0,
             max_packet_bytes: 0,
             max_commands: 0,
             requested_viewport: 0,
@@ -196,7 +199,7 @@ struct Run {
     text: String,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RunKey {
     cells: u16,
     fg: u32,
@@ -204,6 +207,11 @@ struct RunKey {
     faint: bool,
     italic: bool,
     text: String,
+}
+
+struct CachedLayout {
+    handle: u64,
+    last_used_revision: u64,
 }
 
 impl Guest for TerminalUi {
@@ -546,6 +554,7 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         max_viewport_offset: header.max_viewport_offset,
         rows_data,
     });
+    state.snapshots_received = state.snapshots_received.saturating_add(1);
     state.requested_viewport = header.viewport_offset;
     state.assembly = None;
     state.start_render_if_idle()
@@ -579,7 +588,7 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         rect: Rect::new(0.0, 0.0, width, height),
         color: rgb(DEFAULT_BG),
     });
-    let mut active = BTreeSet::new();
+    let mut active = HashSet::new();
     let mut created = 0_u64;
     let mut reused = 0_u64;
     for (row, runs) in snapshot.rows_data.iter().enumerate() {
@@ -605,9 +614,10 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
                 text: run.text.clone(),
             };
             active.insert(key.clone());
-            let handle = if let Some(handle) = cache.get(&key) {
+            let handle = if let Some(cached) = cache.get_mut(&key) {
                 reused = reused.saturating_add(1);
-                *handle
+                cached.last_used_revision = snapshot.revision;
+                cached.handle
             } else {
                 let color = rgb_channels(run.fg);
                 let layout = host::graphics_layout_text(
@@ -635,7 +645,13 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
                     },
                 )
                 .map_err(|error| format!("layout terminal run: {error:?}"))?;
-                cache.insert(key.clone(), layout.handle);
+                cache.insert(
+                    key.clone(),
+                    CachedLayout {
+                        handle: layout.handle,
+                        last_used_revision: snapshot.revision,
+                    },
+                );
                 created = created.saturating_add(1);
                 layout.handle
             };
@@ -703,21 +719,30 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         .map_err(|error| format!("encode terminal draw packet: {error}"))?;
     host::graphics_submit_draw_packet(pane, &bytes)
         .map_err(|error| format!("submit terminal draw packet: {error:?}"))?;
-    let obsolete = cache
-        .keys()
-        .filter(|key| !active.contains(*key))
-        .cloned()
+    let drop_count = cache.len().saturating_sub(MAX_CACHED_LAYOUTS);
+    let mut obsolete = cache
+        .iter()
+        .filter(|(key, _)| !active.contains(*key))
+        .map(|(key, cached)| (cached.last_used_revision, key.clone()))
         .collect::<Vec<_>>();
+    obsolete.sort_by_key(|(revision, _)| *revision);
     let mut dropped = 0_u64;
-    for key in obsolete {
-        if let Some(handle) = cache.remove(&key) {
-            host::graphics_drop_resource(pane, handle)
+    for (_, key) in obsolete.into_iter().take(drop_count) {
+        if let Some(cached) = cache.remove(&key) {
+            host::graphics_drop_resource(pane, cached.handle)
                 .map_err(|error| format!("drop obsolete terminal layout: {error:?}"))?;
             dropped = dropped.saturating_add(1);
         }
     }
 
-    {
+    let (
+        created_total,
+        reused_total,
+        dropped_total,
+        packets_total,
+        snapshots_received,
+        cache_entries,
+    ) = {
         let mut guard = STATE
             .lock()
             .map_err(|_| "terminal UI state is poisoned".to_string())?;
@@ -731,9 +756,18 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         state.packets = state.packets.saturating_add(1);
         state.max_packet_bytes = state.max_packet_bytes.max(bytes.len());
         state.max_commands = state.max_commands.max(command_count);
-    }
+        (
+            state.layouts_created,
+            state.layouts_reused,
+            state.layouts_dropped,
+            state.packets,
+            state.snapshots_received,
+            state.cache.len(),
+        )
+    };
+    let snapshots_coalesced = snapshots_received.saturating_sub(packets_total);
     Ok(format!(
-        "{{\"revision\":{},\"rows\":{},\"cols\":{},\"packet_bytes\":{},\"commands\":{},\"layouts_created\":{},\"layouts_reused\":{},\"layouts_dropped\":{},\"pty_chunks\":{},\"pty_bytes\":{},\"pty_resizes\":{},\"viewport_offset\":{},\"max_viewport_offset\":{},\"application_cursor\":{},\"bracketed_paste\":{},\"exited\":{},\"exit_code\":{}}}",
+        "{{\"revision\":{},\"rows\":{},\"cols\":{},\"packet_bytes\":{},\"commands\":{},\"layouts_created\":{},\"layouts_reused\":{},\"layouts_dropped\":{},\"layouts_created_total\":{},\"layouts_reused_total\":{},\"layouts_dropped_total\":{},\"layout_cache_entries\":{},\"packets_total\":{},\"snapshots_received\":{},\"snapshots_coalesced\":{},\"pty_chunks\":{},\"pty_bytes\":{},\"pty_resizes\":{},\"viewport_offset\":{},\"max_viewport_offset\":{},\"application_cursor\":{},\"bracketed_paste\":{},\"exited\":{},\"exit_code\":{}}}",
         snapshot.revision,
         snapshot.rows,
         snapshot.cols,
@@ -742,6 +776,13 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         created,
         reused,
         dropped,
+        created_total,
+        reused_total,
+        dropped_total,
+        cache_entries,
+        packets_total,
+        snapshots_received,
+        snapshots_coalesced,
         snapshot.chunks_read,
         snapshot.bytes_read,
         snapshot.resizes,

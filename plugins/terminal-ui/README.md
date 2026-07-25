@@ -7,10 +7,10 @@ to `terminal-session-N`. The actor
 assembles revisioned snapshot chunks atomically, coalesces superseded revisions,
 and renders styled runs through the public native monospace text service.
 
-The actor keeps a guest-side layout cache keyed by visible styled run. Host text
-resources which leave the accepted packet are dropped after replacement, making
-layout churn and live-resource counts measurable without adding a terminal grid
-to the host.
+The actor keeps a 512-entry guest-side recent-layout cache keyed by styled run.
+Inactive least-recently-used handles are dropped only when that bound is
+exceeded, preserving TUI working sets while keeping churn and live-resource
+counts measurable without adding a terminal grid to the host.
 
 It encodes navigation and function keys with xterm modifiers and
 application-cursor mode, routes committed text, and keeps scrollback navigation

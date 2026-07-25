@@ -342,6 +342,57 @@ done
 ((RECONNECT_BYTES > RECONNECT_BASELINE))
 capture "$OUT/terminal-reconnected.png"
 
+COLOR_ENV_FILE="$OUT/terminal-color-env.txt"
+type_line "printf 'TERM=%s\\nCOLORTERM=%s\\nNO_COLOR=%s\\n' \"\$TERM\" \"\$COLORTERM\" \"\${NO_COLOR-unset}\" > '$COLOR_ENV_FILE'"
+for _ in $(seq 1 200); do
+  [[ -s "$COLOR_ENV_FILE" ]] && break
+  sleep 0.05
+done
+rg -qx 'TERM=xterm-256color' "$COLOR_ENV_FILE"
+rg -qx 'COLORTERM=truecolor' "$COLOR_ENV_FILE"
+rg -qx 'NO_COLOR=unset' "$COLOR_ENV_FILE"
+
+LAZYGIT_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
+LAZYGIT_CREATED_BASELINE="$(metric_value "$CLIENT2_LOG" layouts_created_total)"
+LAZYGIT_DROPPED_BASELINE="$(metric_value "$CLIENT2_LOG" layouts_dropped_total)"
+LAZYGIT_STARTED_MS="$(date +%s%3N)"
+type_line 'lazygit'
+for _ in $(seq 1 300); do
+  LAZYGIT_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
+  LAZYGIT_CACHE="$(metric_value "$CLIENT2_LOG" layout_cache_entries)"
+  if ((LAZYGIT_BYTES > LAZYGIT_BASELINE + 1000 && LAZYGIT_CACHE > 20)); then
+    break
+  fi
+  sleep 0.05
+done
+LAZYGIT_PRESENT_MS=$(( $(date +%s%3N) - LAZYGIT_STARTED_MS ))
+((LAZYGIT_BYTES > LAZYGIT_BASELINE + 1000))
+((LAZYGIT_CACHE > 20 && LAZYGIT_CACHE <= 512))
+wayland_env wtype -s 5 'jkjkjkjkjkjkjkjkjkjk'
+sleep 0.5
+wayland_env wtype -s 5 'kjkjkjkjkjkjkjkjkjkj'
+sleep 0.5
+LAZYGIT_CREATED="$(
+  metric_value "$CLIENT2_LOG" layouts_created_total
+)"
+LAZYGIT_DROPPED="$(
+  metric_value "$CLIENT2_LOG" layouts_dropped_total
+)"
+LAZYGIT_CREATED=$((LAZYGIT_CREATED - LAZYGIT_CREATED_BASELINE))
+LAZYGIT_DROPPED=$((LAZYGIT_DROPPED - LAZYGIT_DROPPED_BASELINE))
+capture "$OUT/terminal-lazygit-color.png"
+LAZYGIT_EXIT_FILE="$OUT/lazygit-exited"
+wayland_env wtype 'q'
+sleep 0.25
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-only 46
+sleep 0.25
+type_line "touch '$LAZYGIT_EXIT_FILE'"
+for _ in $(seq 1 200); do
+  [[ -e "$LAZYGIT_EXIT_FILE" ]] && break
+  sleep 0.05
+done
+[[ -e "$LAZYGIT_EXIT_FILE" ]]
+
 HELIX_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
 type_line 'printf "terminal plugin TUI proof λ中\n" > /tmp/brood-terminal-proof.txt; hx /tmp/brood-terminal-proof.txt'
 for _ in $(seq 1 300); do
@@ -509,7 +560,8 @@ python3 - \
   "$OUT/terminal-helix-resized.png" \
   "$OUT/terminal-reconnected.png" \
   "$OUT/terminal-scrollback.png" \
-  "$OUT/terminal-ctrl-alt-t.png" <<'PY'
+  "$OUT/terminal-ctrl-alt-t.png" \
+  "$OUT/terminal-lazygit-color.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -554,6 +606,9 @@ jq -n \
   --argjson input "$INPUT_METRIC" \
   --argjson stream_render_ms "$STREAM_RENDER_MS" \
   --argjson spawn_present_ms "$SPAWN_PRESENT_MS" \
+  --argjson lazygit_present_ms "$LAZYGIT_PRESENT_MS" \
+  --argjson lazygit_created "$LAZYGIT_CREATED" \
+  --argjson lazygit_dropped "$LAZYGIT_DROPPED" \
   --arg key_hex "$KEY_HEX" \
   --arg application_key_hex "$APPLICATION_KEY_HEX" \
   '{
@@ -567,6 +622,17 @@ jq -n \
         application_cursor_up: $application_key_hex
       },
       tui: "helix",
+      lazygit: {
+        color_environment: {
+          term: "xterm-256color",
+          colorterm: "truecolor",
+          no_color: "unset"
+        },
+        startup_to_present_ms: $lazygit_present_ms,
+        layout_cache_entries: $terminal.layout_cache_entries,
+        layouts_created: $lazygit_created,
+        layouts_dropped: $lazygit_dropped
+      },
       repeated_resizes: $terminal.pty_resizes,
       streaming_bytes: $terminal.pty_bytes,
       streaming_render_ms: $stream_render_ms,
@@ -607,6 +673,15 @@ jq -n \
       children: $exited.hosted_runtime_io_children
     },
     terminal_render: $terminal,
+    render_pressure: {
+      snapshots_received: $terminal.snapshots_received,
+      snapshots_coalesced: $terminal.snapshots_coalesced,
+      packets: $terminal.packets_total,
+      cached_layouts: $terminal.layout_cache_entries,
+      layouts_created: $terminal.layouts_created_total,
+      layouts_reused: $terminal.layouts_reused_total,
+      layouts_dropped: $terminal.layouts_dropped_total
+    },
     graphics: $graphics,
     input: $input,
     mailbox: [
@@ -630,12 +705,14 @@ cat > "$OUT/proof.md" <<EOF
 - input: real Wayland key/text events through the focused external presentation client
 - product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-2 actors, focused the new pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
 - keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
+- color policy: the controlled PTY profile removed ambient NO_COLOR, retained xterm-256color/truecolor, and rendered a real lazygit screen in terminal-lazygit-color.png
+- TUI text reuse: lazygit started and presented in ${LAZYGIT_PRESENT_MS}ms with a bounded recent-layout cache; its interaction created ${LAZYGIT_CREATED} layouts and dropped ${LAZYGIT_DROPPED}
 - scrollback: guest-owned history was navigated with real Shift+PageUp and Shift+End input
 - presentation ownership: the client disconnected while the session-owned shell and its two native resources remained live, then a new presentation actor reattached
 - TUI: Helix rendered full-screen and remained responsive through repeated compositor/pane resizes
 - streaming: 4,000 output lines reached a revised canvas packet in ${STREAM_RENDER_MS}ms
 - teardown: both the boot shell and the shortcut-created shell retired every PTY child and stream resource
-- screenshots: terminal-shell-ansi-unicode.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
+- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
 - structured metrics: proof.json
 EOF
 

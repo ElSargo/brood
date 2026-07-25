@@ -248,9 +248,11 @@ actor. Detached unsupervised daemons are outside the model.
 A PTY spawn adds one duplex bounded stream, a child lifecycle handle, validated
 initial rows and columns, and an explicit terminal profile. The standard
 `xterm-256color` profile deterministically supplies `TERM=xterm-256color` and
-`COLORTERM=truecolor`; the child still starts in the actor's resolved session
-working directory. Executable selection remains capability-scoped and
-allowlisted.
+`COLORTERM=truecolor` and removes ambient color-policy variables such as
+`NO_COLOR`, `CLICOLOR`, and `FORCE_COLOR`. This prevents the service launcher's
+preferences from silently changing a terminal product. The child still starts
+in the actor's resolved session working directory. Executable selection remains
+capability-scoped and allowlisted.
 
 Resize is a resource operation on the child handle. The host validates nonzero
 dimensions against its PTY limit, retains only the native master control object

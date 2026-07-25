@@ -330,9 +330,11 @@ render timing, packet and resource sizes, fallback/recovery state, and text or
 resource errors in SDK-facing terms.
 
 Text diagnostics include layouts created, dropped, currently live, and peak
-live, alongside maximum packet bytes and command count. Run caches must release
-obsolete layout handles as revisions change; churn is measured directly rather
-than hidden behind an unbounded host cache.
+live, alongside maximum packet bytes and command count. Run caches may retain a
+bounded recent working set for interactive reuse, but must evict it with an
+explicit limit and release every handle at actor teardown. Churn, cache size,
+and reuse remain measured directly rather than hidden behind an unbounded host
+cache.
 
 ## Proof Before Freezing
 

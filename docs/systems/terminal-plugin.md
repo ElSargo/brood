@@ -69,10 +69,12 @@ to the live bottom. The session actor retains scrollback and supplies only the
 requested visible rows.
 
 Rendering groups adjacent cells into guest-owned styled runs. The actor requests
-monospace native layouts with stable cell metrics, caches layouts by visible
-run, draws backgrounds and decorations with normal canvas commands, and drops
-obsolete handles after replacing the packet. The client sees immutable text
-resources and drawing commands, never terminal cells.
+monospace native layouts with stable cell metrics, caches a bounded recent set
+of styled runs, draws backgrounds and decorations with normal canvas commands,
+and evicts least-recently-used inactive handles after replacing the packet. The
+client sees immutable text resources and drawing commands, never terminal
+cells. Snapshot, packet, cache-reuse, and eviction counts expose coalescing and
+churn directly; host presentation diagnostics supply key-to-present latency.
 
 ## Lifecycle
 

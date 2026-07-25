@@ -604,6 +604,12 @@ impl RuntimeIoHub {
         builder.cwd(cwd);
         match options.terminal_profile {
             TerminalProfile::Xterm256Color => {
+                // A terminal profile must not inherit process-wide color
+                // suppression from the service manager or launcher. Programs
+                // such as lazygit honor NO_COLOR even when stdout is a PTY.
+                for variable in ["NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"] {
+                    builder.env_remove(variable);
+                }
                 builder.env("TERM", "xterm-256color");
                 builder.env("COLORTERM", "truecolor");
             }
