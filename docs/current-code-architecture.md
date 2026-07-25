@@ -2,7 +2,7 @@
 status: canonical
 type: implementation-map
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-07-25
 code-links:
   - crates/broodd/src/runtime.rs
   - crates/broodd/src/compositor.rs
@@ -53,7 +53,9 @@ the server only as the session authority.
 DBus bootstraps the local connection and descriptor exchange. Bounded
 shared-memory lanes carry scene inventory, input, configuration, and actor
 messages. DMA-BUF is the preferred per-window image transport; copied images
-remain a correctness fallback.
+remain a correctness fallback. Remote endpoints carry the same semantic
+protocol over independent QUIC streams and use encoded network-frame
+resources. See [[systems/presentation-transport]].
 
 The server publishes each managed surface tree as an independent window frame.
 The client returns a requested logical content size for a pane. Placement,

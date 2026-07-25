@@ -27,6 +27,8 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 ## Target Design
 
 - [[systems/presentation-client]] specifies the independent portable presentation client, session lease, window frame subscriptions, client-side WASM runtime, recursive layout, WGPU renderer, and transports.
+- [[systems/presentation-transport]] defines the transport-neutral protocol,
+  capability-selected local and network carriers, and frame-resource profiles.
 - [[systems/plugin-runtime]] defines plugin trust, actors, actor-scoped workers,
   policy providers, publications, and session isolation.
 - [[systems/plugin-io-and-resources]] specifies completions, notifications,

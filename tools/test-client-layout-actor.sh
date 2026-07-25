@@ -175,7 +175,8 @@ for line in open(sys.argv[1], encoding="utf-8"):
     if request:
         requested[int(request.group(1))] = (int(request.group(2)), int(request.group(3)))
     frame = re.search(
-        r"imported window DMA-BUF window_id=(\d+) app_id=\S* resource_id=\d+ size=(\d+)x(\d+)",
+        r"(?:imported window DMA-BUF|uploaded window shared-memory image) "
+        r"window_id=(\d+) app_id=\S* resource_id=\d+ size=(\d+)x(\d+)",
         line,
     )
     if frame:
@@ -268,7 +269,8 @@ for line in open(sys.argv[1], encoding="utf-8"):
         requested[int(request.group(1))] = (int(request.group(2)), int(request.group(3)))
 
     frame = re.search(
-        r"imported window DMA-BUF window_id=(\d+) app_id=\S* resource_id=\d+ size=(\d+)x(\d+)",
+        r"(?:imported window DMA-BUF|uploaded window shared-memory image) "
+        r"window_id=(\d+) app_id=\S* resource_id=\d+ size=(\d+)x(\d+)",
         line,
     )
     if frame:

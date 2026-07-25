@@ -42,15 +42,15 @@ use smithay::{
             native,
         },
         renderer::{
-            Bind, ImportDma, ImportEgl, RendererSuper,
+            Bind, ExportMem, ImportDma, ImportEgl, Offscreen, RendererSuper,
             damage::OutputDamageTracker,
             element::solid::SolidColorRenderElement,
-            gles::{GlesError, GlesRenderer},
+            gles::{GlesError, GlesRenderbuffer, GlesRenderer},
         },
     },
     desktop::{Space, Window},
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    utils::{DeviceFd, Physical, Size, Transform},
+    utils::{DeviceFd, Physical, Rectangle, Size, Transform},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -120,6 +120,10 @@ impl FrameExporter {
 
     pub(crate) const fn renderer(&mut self) -> &mut GlesRenderer {
         &mut self.renderer
+    }
+
+    pub(crate) const fn supports_dmabuf_export(&self) -> bool {
+        self.allocator.is_some()
     }
 
     fn create_exportable_dmabuf(
@@ -346,10 +350,23 @@ struct ExternalWindowFrame {
     window: Window,
 }
 
+enum RenderedWindowBacking {
+    Dmabuf(Dmabuf),
+    SharedMemory(Vec<u8>),
+}
+
 fn render_external_client_scene(
     exporter: &mut FrameExporter,
     state: &mut Brood,
 ) -> std::result::Result<(), FrameExportFailure> {
+    let frame_transport = state
+        .dmabuf
+        .fast_path
+        .as_ref()
+        .map(|fast_path| fast_path.profile.frames)
+        .ok_or_else(|| {
+            FrameExportFailure::new("render_window_scene", "fast path is unavailable")
+        })?;
     let active_window = state.active_presentation_client_window();
     let mut windows = state
         .space
@@ -388,28 +405,44 @@ fn render_external_client_scene(
     let mut rendered = Vec::with_capacity(windows.len());
     for window in windows {
         let size: Size<i32, Physical> = (window.source_w.max(1), window.source_h.max(1)).into();
-        let existing = state
-            .dmabuf
-            .fast_path
-            .as_mut()
-            .and_then(|fast_path| fast_path.window_buffers.remove(&window.window_id));
-        let mut dmabuf = match existing {
-            Some(buffer) if buffer.size() == (size.w, size.h).into() => buffer,
-            _ => exporter
-                .create_exportable_dmabuf(size)
-                .map_err(|error| FrameExportFailure::new("allocate_window_dmabuf", error))?,
+        let backing = match frame_transport {
+            brood_protocol::FrameTransportKind::Dmabuf => {
+                let existing = state
+                    .dmabuf
+                    .fast_path
+                    .as_mut()
+                    .and_then(|fast_path| fast_path.window_buffers.remove(&window.window_id));
+                let mut dmabuf = match existing {
+                    Some(buffer) if buffer.size() == (size.w, size.h).into() => buffer,
+                    _ => exporter.create_exportable_dmabuf(size).map_err(|error| {
+                        FrameExportFailure::new("allocate_window_dmabuf", error)
+                    })?,
+                };
+                render_window_dmabuf(exporter, state, &window, &mut dmabuf)?;
+                let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
+                    return Err(FrameExportFailure::new(
+                        "store_window_dmabuf",
+                        "fast path closed while rendering",
+                    ));
+                };
+                fast_path
+                    .window_buffers
+                    .insert(window.window_id, dmabuf.clone());
+                RenderedWindowBacking::Dmabuf(dmabuf)
+            }
+            brood_protocol::FrameTransportKind::SharedMemory => {
+                RenderedWindowBacking::SharedMemory(render_window_shared_memory(
+                    exporter, state, &window,
+                )?)
+            }
+            brood_protocol::FrameTransportKind::Network => {
+                return Err(FrameExportFailure::new(
+                    "render_window_scene",
+                    "network frame transport reached local exporter",
+                ));
+            }
         };
-        render_window_dmabuf(exporter, state, &window, &mut dmabuf)?;
-        let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
-            return Err(FrameExportFailure::new(
-                "store_window_dmabuf",
-                "fast path closed while rendering",
-            ));
-        };
-        fast_path
-            .window_buffers
-            .insert(window.window_id, dmabuf.clone());
-        rendered.push((window, dmabuf));
+        rendered.push((window, backing));
     }
 
     let scene_size: Size<i32, Physical> = state
@@ -426,6 +459,89 @@ fn render_window_dmabuf(
     dmabuf: &mut Dmabuf,
 ) -> std::result::Result<(), FrameExportFailure> {
     let size: Size<i32, Physical> = (window.source_w.max(1), window.source_h.max(1)).into();
+    let (output, window_space) = window_render_space(state, window, size);
+    let mut damage_tracker = OutputDamageTracker::from_output(&output);
+
+    let sync = {
+        let (renderer, mut framebuffer) = exporter
+            .bind_dmabuf(dmabuf)
+            .map_err(|error| FrameExportFailure::new("bind_window_dmabuf", error))?;
+        let sync = smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
+            &output,
+            renderer,
+            &mut framebuffer,
+            1.0,
+            0,
+            [&window_space],
+            &[],
+            &mut damage_tracker,
+            [0.02, 0.02, 0.025, 1.0],
+        )
+        .map_err(|error| FrameExportFailure::new("render_window_dmabuf", error))?
+        .sync;
+        sync.wait()
+            .map_err(|error| FrameExportFailure::new("wait_window_dmabuf", error))?;
+        sync
+    };
+    drop(sync);
+    Ok(())
+}
+
+fn render_window_shared_memory(
+    exporter: &mut FrameExporter,
+    state: &Brood,
+    window: &ExternalWindowFrame,
+) -> std::result::Result<Vec<u8>, FrameExportFailure> {
+    let size: Size<i32, Physical> = (window.source_w.max(1), window.source_h.max(1)).into();
+    let (output, window_space) = window_render_space(state, window, size);
+    let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    let mut renderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(
+        exporter.renderer(),
+        Fourcc::Abgr8888,
+        (size.w, size.h).into(),
+    )
+    .map_err(|error| FrameExportFailure::new("allocate_window_shared_memory", error))?;
+
+    let renderer = exporter.renderer();
+    let mut framebuffer = renderer
+        .bind(&mut renderbuffer)
+        .map_err(|error| FrameExportFailure::new("bind_window_shared_memory", error))?;
+    let sync = smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
+        &output,
+        renderer,
+        &mut framebuffer,
+        1.0,
+        0,
+        [&window_space],
+        &[],
+        &mut damage_tracker,
+        [0.02, 0.02, 0.025, 1.0],
+    )
+    .map_err(|error| FrameExportFailure::new("render_window_shared_memory", error))?
+    .sync;
+    sync.wait()
+        .map_err(|error| FrameExportFailure::new("wait_window_shared_memory", error))?;
+    let mapping = renderer
+        .copy_framebuffer(
+            &framebuffer,
+            Rectangle::from_size((size.w, size.h).into()),
+            Fourcc::Abgr8888,
+        )
+        .map_err(|error| FrameExportFailure::new("copy_window_shared_memory", error))?;
+    drop(framebuffer);
+    let pixels = renderer
+        .map_texture(&mapping)
+        .map_err(|error| FrameExportFailure::new("map_window_shared_memory", error))?
+        .to_vec();
+    drop(sync);
+    Ok(pixels)
+}
+
+fn window_render_space(
+    state: &Brood,
+    window: &ExternalWindowFrame,
+    size: Size<i32, Physical>,
+) -> (Output, Space<Window>) {
     let output = Output::new(
         format!("brood-window-{}", window.window_id),
         PhysicalProperties {
@@ -446,37 +562,16 @@ fn render_window_dmabuf(
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut window_space = Space::default();
     window_space.map_output(&output, (0, 0));
     window_space.map_element(window.window.clone(), (0, 0), true);
-
-    let sync = {
-        let (renderer, mut framebuffer) = exporter
-            .bind_dmabuf(dmabuf)
-            .map_err(|error| FrameExportFailure::new("bind_window_dmabuf", error))?;
-        smithay::desktop::space::render_output::<_, SolidColorRenderElement, _, _>(
-            &output,
-            renderer,
-            &mut framebuffer,
-            1.0,
-            0,
-            [&window_space],
-            &[],
-            &mut damage_tracker,
-            [0.02, 0.02, 0.025, 1.0],
-        )
-        .map_err(|error| FrameExportFailure::new("render_window_dmabuf", error))?
-        .sync
-    };
-    sync.wait()
-        .map_err(|error| FrameExportFailure::new("wait_window_dmabuf", error))
+    (output, window_space)
 }
 
 fn publish_window_scene(
     state: &mut Brood,
     scene_size: Size<i32, Physical>,
-    windows: Vec<(ExternalWindowFrame, Dmabuf)>,
+    windows: Vec<(ExternalWindowFrame, RenderedWindowBacking)>,
 ) -> std::result::Result<(), FrameExportFailure> {
     state.dmabuf.latest_client_buffer_sequence =
         state.dmabuf.latest_client_buffer_sequence.wrapping_add(1);
@@ -505,23 +600,92 @@ fn publish_window_scene(
         })
         .map_err(|error| FrameExportFailure::new("publish_scene_begin", error))?;
 
-    for (window, dmabuf) in windows {
-        let weak_dmabuf = dmabuf.weak();
-        let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
-            *id
-        } else {
-            fast_path.resources.retain(|buffer, _| !buffer.is_gone());
-            let id = fast_path.next_resource_id;
-            fast_path.next_resource_id = id.wrapping_add(1);
-            fast_path.resources.insert(weak_dmabuf, id);
-            fast_path.buffers.insert(id, dmabuf);
-            fast_path.resource_app_ids.insert(id, window.app_id.clone());
-            id
+    for (window, backing) in windows {
+        let (opcode, resource_id) = match backing {
+            RenderedWindowBacking::Dmabuf(dmabuf) => {
+                let weak_dmabuf = dmabuf.weak();
+                let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
+                    *id
+                } else {
+                    fast_path.resources.retain(|buffer, _| !buffer.is_gone());
+                    let id = fast_path.next_resource_id;
+                    fast_path.next_resource_id = id.wrapping_add(1);
+                    fast_path.resources.insert(weak_dmabuf, id);
+                    fast_path.buffers.insert(id, dmabuf);
+                    fast_path.resource_app_ids.insert(id, window.app_id.clone());
+                    id
+                };
+                (brood_ipc::FRAME_WINDOW_DMABUF, resource_id)
+            }
+            RenderedWindowBacking::SharedMemory(pixels) => {
+                let width = u32::try_from(window.source_w.max(1))
+                    .map_err(|error| FrameExportFailure::new("shared_image_width", error))?;
+                let height = u32::try_from(window.source_h.max(1))
+                    .map_err(|error| FrameExportFailure::new("shared_image_height", error))?;
+                let stride = width.checked_mul(4).ok_or_else(|| {
+                    FrameExportFailure::new("shared_image_stride", "stride overflow")
+                })?;
+                let metadata = brood_ipc::SharedImageMetadata {
+                    width,
+                    height,
+                    stride,
+                    pixel_format: brood_protocol::FramePixelFormat::Rgba8,
+                    color_space: brood_protocol::FrameColorSpace::Srgb,
+                };
+                let existing = fast_path
+                    .window_shared_image_resources
+                    .get(&window.window_id)
+                    .copied()
+                    .filter(|resource| {
+                        fast_path
+                            .shared_images
+                            .get(resource)
+                            .is_some_and(|(_, image)| image.metadata() == metadata)
+                    });
+                let resource_id = if let Some(resource) = existing {
+                    resource
+                } else {
+                    if let Some(stale) = fast_path
+                        .window_shared_image_resources
+                        .remove(&window.window_id)
+                    {
+                        fast_path.shared_images.remove(&stale);
+                    }
+                    let resource = fast_path.next_resource_id;
+                    fast_path.next_resource_id = resource.wrapping_add(1);
+                    let image =
+                        brood_ipc::SharedImageProducer::create(fast_path.generation, metadata)
+                            .map_err(|error| {
+                                FrameExportFailure::new("create_shared_image", error)
+                            })?;
+                    fast_path
+                        .shared_images
+                        .insert(resource, (window.app_id.clone(), image));
+                    fast_path
+                        .window_shared_image_resources
+                        .insert(window.window_id, resource);
+                    resource
+                };
+                let (_, image) =
+                    fast_path
+                        .shared_images
+                        .get_mut(&resource_id)
+                        .ok_or_else(|| {
+                            FrameExportFailure::new(
+                                "publish_shared_image",
+                                "shared image disappeared before publication",
+                            )
+                        })?;
+                image
+                    .publish(sequence, &pixels)
+                    .map_err(|error| FrameExportFailure::new("publish_shared_image", error))?;
+                (brood_ipc::FRAME_WINDOW_SHM, resource_id)
+            }
         };
         fast_path
             .frames
             .try_send(brood_ipc::CriticalRecord {
-                opcode: brood_ipc::FRAME_WINDOW_DMABUF,
+                opcode,
                 connection_generation: fast_path.generation,
                 sequence,
                 arguments: [

@@ -18,10 +18,10 @@ use anyhow::{Context, Result, anyhow};
 use brood_cli::{
     ClientArgs,
     control::{
-        ControlTarget, DmabufFrame, PresentationWindowSummary, ServerLaunch,
+        ControlTarget, DmabufFrame, PresentationWindowSummary, ServerLaunch, SharedMemoryFrame,
         activate_surface_session, close_surface_session, connect_or_spawn, create_surface_session,
         dmabuf_resource, open_presentation_fast_path, rename_surface_session, request_dbus_command,
-        resolve_control_target,
+        resolve_control_target, shared_memory_resource,
     },
 };
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
@@ -29,6 +29,7 @@ use brood_layout::{
     LayoutAction, LayoutItemKind, LayoutLeaseId, LayoutLeaseTree, LayoutRect, LayoutSize,
     LocalPoint, ResolvedLayout,
 };
+use brood_protocol::{ClientLifecycle, ClientMessage, InputEvent, PanePosition};
 use clap::Parser;
 use num_traits::ToPrimitive;
 use serde::Deserialize;
@@ -260,7 +261,11 @@ fn main() -> Result<()> {
             "connected to Brood server pid={} protocol={}",
             handshake.server_pid, handshake.protocol_version
         );
-        let fast_path = open_presentation_fast_path(&target)?;
+        let fast_path = open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
+        eprintln!(
+            "selected presentation transport carrier={:?} frames={:?}",
+            fast_path.profile.carrier, fast_path.profile.frames
+        );
         let session_id = if fast_path.active_session != 0 {
             eprintln!(
                 "attached presentation to active session id={}",
@@ -291,6 +296,8 @@ fn main() -> Result<()> {
                 target.clone(),
                 frames,
                 frame_notifications,
+                fast_path.generation,
+                fast_path.profile,
                 event_loop.create_proxy(),
             )?;
             spawn_catalog_updates(catalog, catalog_notifications, event_loop.create_proxy())?;
@@ -365,7 +372,10 @@ fn main() -> Result<()> {
         .context("run event loop");
 
     if let Some(sender) = application.input_sender.as_mut() {
-        let _ = send_input(sender, brood_ipc::INPUT_CLIENT_DISCONNECT, [0, 0, 0, 0, 0]);
+        let _ = send_input(
+            sender,
+            ClientMessage::Lifecycle(ClientLifecycle::Disconnect),
+        );
     }
     let shutdown_result = application
         .wasm_runtime
@@ -436,7 +446,13 @@ struct SceneWindowUpdate {
     resource_id: u64,
     rect: [i32; 4],
     active: bool,
-    resource: Option<DmabufFrame>,
+    resource: Option<FrameResource>,
+}
+
+#[derive(Debug)]
+enum FrameResource {
+    Dmabuf(DmabufFrame),
+    SharedMemory(SharedMemoryFrame),
 }
 
 struct PendingScene {
@@ -624,6 +640,8 @@ fn spawn_frame_updates(
     target: ControlTarget,
     mut frames: brood_ipc::CriticalConsumer,
     notifications: brood_ipc::EventNotifier,
+    generation: u64,
+    profile: brood_protocol::TransportProfile,
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let _worker = thread::Builder::new()
@@ -648,6 +666,14 @@ fn spawn_frame_updates(
                             });
                         }
                         brood_ipc::FRAME_WINDOW_DMABUF => {
+                            if profile.frames != brood_protocol::FrameTransportKind::Dmabuf {
+                                let _send_result =
+                                    proxy.send_event(ClientEvent::TransportError(format!(
+                                        "received DMA-BUF frame under {:?} profile",
+                                        profile.frames
+                                    )));
+                                return;
+                            }
                             let Some(scene) = pending_scene.as_mut() else {
                                 continue;
                             };
@@ -662,12 +688,64 @@ fn spawn_frame_updates(
                             let resource_id = record.arguments[1];
                             let resource = if resources.insert(resource_id) {
                                 match dmabuf_resource(&target, resource_id) {
-                                    Ok(resource) => Some(resource),
+                                    Ok(resource) => Some(FrameResource::Dmabuf(resource)),
                                     Err(error) => {
                                         let _send_result =
                                             proxy.send_event(ClientEvent::TransportError(format!(
                                                 "fetch DMA-BUF resource {resource_id}: {error:#}"
                                             )));
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let (x, y) = unpack_i32_pair(record.arguments[2]);
+                            let (width, height) = unpack_i32_pair(record.arguments[3]);
+                            scene.windows.push(SceneWindowUpdate {
+                                window_id: record.arguments[0],
+                                resource_id,
+                                rect: [x, y, width, height],
+                                active: record.arguments[4] != 0,
+                                resource,
+                            });
+                        }
+                        brood_ipc::FRAME_WINDOW_SHM => {
+                            if profile.frames != brood_protocol::FrameTransportKind::SharedMemory {
+                                let _send_result =
+                                    proxy.send_event(ClientEvent::TransportError(format!(
+                                        "received shared-memory frame under {:?} profile",
+                                        profile.frames
+                                    )));
+                                return;
+                            }
+                            let Some(scene) = pending_scene.as_mut() else {
+                                continue;
+                            };
+                            if scene.sequence != record.sequence {
+                                let _send_result =
+                                    proxy.send_event(ClientEvent::TransportError(format!(
+                                        "window record sequence {} does not match scene {}",
+                                        record.sequence, scene.sequence
+                                    )));
+                                return;
+                            }
+                            let resource_id = record.arguments[1];
+                            let resource = if resources.insert(resource_id) {
+                                match shared_memory_resource(
+                                    &target,
+                                    resource_id,
+                                    generation,
+                                ) {
+                                    Ok(resource) => {
+                                        Some(FrameResource::SharedMemory(resource))
+                                    }
+                                    Err(error) => {
+                                        let _send_result = proxy.send_event(
+                                            ClientEvent::TransportError(format!(
+                                                "fetch shared-memory resource {resource_id}: {error:#}"
+                                            )),
+                                        );
                                         return;
                                     }
                                 }
@@ -881,9 +959,9 @@ impl InputLane {
     }
 
     fn defer(&mut self, record: brood_ipc::CriticalRecord) {
-        if record.opcode == brood_ipc::INPUT_WINDOW_POINTER_MOTION
+        if brood_ipc::is_coalescible_client_record(&record)
             && let Some(previous) = self.deferred.back_mut()
-            && previous.opcode == brood_ipc::INPUT_WINDOW_POINTER_MOTION
+            && brood_ipc::is_coalescible_client_record(previous)
         {
             *previous = record;
             self.coalesced_motion = self.coalesced_motion.saturating_add(1);
@@ -2236,27 +2314,21 @@ impl ApplicationHandler<ClientEvent> for Application {
                             let sent = match delta {
                                 MouseScrollDelta::LineDelta(horizontal, vertical) => send_input(
                                     sender,
-                                    brood_ipc::INPUT_WINDOW_POINTER_WHEEL,
-                                    [
-                                        pane,
-                                        brood_ipc::encode_i32_argument(wheel_v120(horizontal)),
-                                        brood_ipc::encode_i32_argument(wheel_v120(vertical)),
-                                        x.to_bits(),
-                                        y.to_bits(),
-                                    ],
+                                    ClientMessage::Input(InputEvent::PointerWheel {
+                                        position: PanePosition { pane, x, y },
+                                        horizontal_v120: wheel_v120(horizontal),
+                                        vertical_v120: wheel_v120(vertical),
+                                    }),
                                 ),
                                 MouseScrollDelta::PixelDelta(position) => {
                                     let scale = renderer.window.scale_factor().max(f64::EPSILON);
                                     send_input(
                                         sender,
-                                        brood_ipc::INPUT_WINDOW_POINTER_AXIS,
-                                        [
-                                            pane,
-                                            (-position.x / scale).to_bits(),
-                                            (-position.y / scale).to_bits(),
-                                            x.to_bits(),
-                                            y.to_bits(),
-                                        ],
+                                        ClientMessage::Input(InputEvent::PointerAxis {
+                                            position: PanePosition { pane, x, y },
+                                            horizontal: -position.x / scale,
+                                            vertical: -position.y / scale,
+                                        }),
                                     )
                                 }
                             };
@@ -2275,8 +2347,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Some(sender) = self.input_sender.as_mut() {
                     let _sent = send_input(
                         sender,
-                        brood_ipc::INPUT_PRESENTATION_FOCUS,
-                        [u64::from(focused), 0, 0, 0, 0],
+                        ClientMessage::Input(InputEvent::PresentationFocus { focused }),
                     );
                 }
                 if !focused {
@@ -2423,14 +2494,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     send_input(
                         sender,
-                        brood_ipc::INPUT_KEYBOARD_KEY,
-                        [
-                            u64::from(scancode + 8),
-                            u64::from(event.state == ElementState::Pressed),
-                            0,
-                            0,
-                            0,
-                        ],
+                        ClientMessage::Input(InputEvent::KeyboardKey {
+                            keycode: scancode + 8,
+                            pressed: event.state == ElementState::Pressed,
+                        }),
                     );
                 }
             }
@@ -2449,8 +2516,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     {
                         if send_input(
                             sender,
-                            brood_ipc::INPUT_FRAME_PRESENTED,
-                            [sequence, 0, 0, 0, 0],
+                            ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence }),
                         ) {
                             self.last_presented_sequence = Some(sequence);
                         } else {
@@ -2624,8 +2690,14 @@ struct LayoutStateSize {
 }
 
 struct ImportedFrame {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    source: ImportedFrameSource,
+}
+
+enum ImportedFrameSource {
+    Dmabuf,
+    SharedMemory(brood_ipc::SharedImageConsumer),
 }
 
 struct PluginPaneTexture {
@@ -2649,14 +2721,11 @@ fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
         .unwrap_or(60_000);
     send_input(
         lane,
-        brood_ipc::INPUT_PRESENTATION_SIZE,
-        [
-            u64::from(size.width.max(1)),
-            u64::from(size.height.max(1)),
-            u64::from(refresh_millihz),
-            0,
-            0,
-        ],
+        ClientMessage::Input(InputEvent::PresentationSize {
+            width: size.width.max(1),
+            height: size.height.max(1),
+            refresh_millihz,
+        }),
     );
 }
 
@@ -2667,8 +2736,11 @@ fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer
     for (window, width, height) in renderer.pending_managed_resize_requests() {
         if send_input(
             lane,
-            brood_ipc::INPUT_WINDOW_RESIZE,
-            [window, u64::from(width), u64::from(height), 0, 0],
+            ClientMessage::Input(InputEvent::WindowResize {
+                pane: window,
+                width,
+                height,
+            }),
         ) {
             renderer.mark_managed_resize_sent(window, width, height);
             eprintln!(
@@ -2701,15 +2773,15 @@ fn flush_renderer_plugin_resize_events(
     Ok(())
 }
 
-fn send_input(lane: &mut InputLane, opcode: u32, arguments: [u64; 5]) -> bool {
+fn send_input(lane: &mut InputLane, message: ClientMessage) -> bool {
     lane.flush_deferred();
     lane.sequence = lane.sequence.wrapping_add(1);
-    let record = brood_ipc::CriticalRecord {
-        opcode,
-        connection_generation: lane.generation,
-        sequence: lane.sequence,
-        arguments,
-        ..brood_ipc::CriticalRecord::default()
+    let record = match brood_ipc::encode_client_record(message, lane.generation, lane.sequence) {
+        Ok(record) => record,
+        Err(error) => {
+            eprintln!("cannot encode local presentation input: {error}");
+            return false;
+        }
     };
     if lane.has_deferred() {
         lane.defer(record);
@@ -2726,11 +2798,14 @@ fn send_input(lane: &mut InputLane, opcode: u32, arguments: [u64; 5]) -> bool {
 }
 
 fn send_window_focus(lane: &mut InputLane, window_id: u64) {
-    let _sent = send_input(lane, brood_ipc::INPUT_WINDOW_FOCUS, [window_id, 0, 0, 0, 0]);
+    let _sent = send_input(
+        lane,
+        ClientMessage::Input(InputEvent::WindowFocus { pane: window_id }),
+    );
 }
 
 fn send_keyboard_reset(lane: &mut InputLane) {
-    let _sent = send_input(lane, brood_ipc::INPUT_KEYBOARD_RESET, [0, 0, 0, 0, 0]);
+    let _sent = send_input(lane, ClientMessage::Input(InputEvent::KeyboardReset));
 }
 
 fn send_presentation_events(
@@ -2944,8 +3019,9 @@ fn route_pointer_motion(
             if let Some(sender) = input_sender
                 && send_input(
                     sender,
-                    brood_ipc::INPUT_WINDOW_POINTER_MOTION,
-                    [pane, x.to_bits(), y.to_bits(), 0, 0],
+                    ClientMessage::Input(InputEvent::PointerMotion {
+                        position: PanePosition { pane, x, y },
+                    }),
                 )
             {
                 *managed_pointer_target = Some(pane);
@@ -2989,14 +3065,11 @@ fn send_pointer_button_to_target(
             if let Some(sender) = input_sender
                 && send_input(
                     sender,
-                    brood_ipc::INPUT_WINDOW_POINTER_BUTTON,
-                    [
-                        pane,
-                        u64::from(button.button),
-                        u64::from(button.pressed),
-                        x.to_bits(),
-                        y.to_bits(),
-                    ],
+                    ClientMessage::Input(InputEvent::PointerButton {
+                        position: PanePosition { pane, x, y },
+                        button: button.button,
+                        pressed: button.pressed,
+                    }),
                 )
             {
                 *managed_pointer_target = Some(pane);
@@ -3066,7 +3139,7 @@ fn send_managed_pointer_leave(lane: Option<&mut InputLane>, target: &mut Option<
     let Some(lane) = lane else {
         return;
     };
-    if !send_input(lane, brood_ipc::INPUT_WINDOW_POINTER_LEAVE, [0, 0, 0, 0, 0]) {
+    if !send_input(lane, ClientMessage::Input(InputEvent::PointerLeave)) {
         *target = Some(previous);
     }
 }
@@ -3096,41 +3169,115 @@ fn key_policy_modifier_bits(modifiers: ModifiersState) -> i32 {
 }
 
 impl ImportedFrame {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "frame import requires the renderer resources plus transport identity and payload"
+    )]
     fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         bind_group_layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         window_id: u64,
         resource_id: u64,
-        frame: DmabufFrame,
+        sequence: u64,
+        frame: FrameResource,
     ) -> Result<Self> {
-        if frame.color_space != brood_ipc::FrameColorSpace::Srgb {
-            return Err(anyhow!(
-                "unsupported happy-path DMA-BUF color space {:?}",
-                frame.color_space
-            ));
-        }
-        let (format, view_format) = dmabuf_texture_formats(frame.fourcc)?;
-        let texture = import_single_plane(
-            device,
-            frame.fd,
-            SinglePlaneDmabuf {
-                width: frame.width,
-                height: frame.height,
-                format,
-                view_format: Some(view_format),
-                modifier: frame.modifier,
-                stride: u64::from(frame.stride),
-                offset: u64::from(frame.offset),
-            },
-        )?;
+        let (texture, view_format, source) = match frame {
+            FrameResource::Dmabuf(frame) => {
+                if frame.color_space != brood_ipc::FrameColorSpace::Srgb {
+                    return Err(anyhow!(
+                        "unsupported DMA-BUF color space {:?}",
+                        frame.color_space
+                    ));
+                }
+                let (format, view_format) = dmabuf_texture_formats(frame.fourcc)?;
+                let texture = import_single_plane(
+                    device,
+                    frame.fd,
+                    SinglePlaneDmabuf {
+                        width: frame.width,
+                        height: frame.height,
+                        format,
+                        view_format: Some(view_format),
+                        modifier: frame.modifier,
+                        stride: u64::from(frame.stride),
+                        offset: u64::from(frame.offset),
+                    },
+                )?;
+                eprintln!(
+                    "imported window DMA-BUF window_id={} app_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={} modifier={} y_inverted={}",
+                    window_id,
+                    frame.app_id,
+                    resource_id,
+                    frame.width,
+                    frame.height,
+                    format,
+                    frame.color_space,
+                    frame.stride,
+                    frame.modifier,
+                    frame.y_inverted
+                );
+                (texture, view_format, ImportedFrameSource::Dmabuf)
+            }
+            FrameResource::SharedMemory(frame) => {
+                let metadata = frame.image.metadata();
+                if metadata.color_space != brood_protocol::FrameColorSpace::Srgb {
+                    return Err(anyhow!(
+                        "unsupported shared-memory color space {:?}",
+                        metadata.color_space
+                    ));
+                }
+                let (format, view_format) = match metadata.pixel_format {
+                    brood_protocol::FramePixelFormat::Rgba8 => (
+                        wgpu::TextureFormat::Rgba8Unorm,
+                        wgpu::TextureFormat::Rgba8UnormSrgb,
+                    ),
+                    brood_protocol::FramePixelFormat::Bgra8 => (
+                        wgpu::TextureFormat::Bgra8Unorm,
+                        wgpu::TextureFormat::Bgra8UnormSrgb,
+                    ),
+                };
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("hosted shared-memory image"),
+                    size: wgpu::Extent3d {
+                        width: metadata.width,
+                        height: metadata.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[view_format],
+                });
+                write_shared_image(&texture, queue, &frame.image, sequence)?;
+                eprintln!(
+                    "uploaded window shared-memory image window_id={} app_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={}",
+                    window_id,
+                    frame.app_id,
+                    resource_id,
+                    metadata.width,
+                    metadata.height,
+                    format,
+                    metadata.color_space,
+                    metadata.stride
+                );
+                (
+                    texture,
+                    view_format,
+                    ImportedFrameSource::SharedMemory(frame.image),
+                )
+            }
+        };
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("hosted DMA-BUF sRGB view"),
+            label: Some("hosted frame sRGB view"),
             format: Some(view_format),
             ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("hosted DMA-BUF bind group"),
+            label: Some("hosted frame bind group"),
             layout: bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -3143,24 +3290,51 @@ impl ImportedFrame {
                 },
             ],
         });
-        eprintln!(
-            "imported window DMA-BUF window_id={} app_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={} modifier={} y_inverted={}",
-            window_id,
-            frame.app_id,
-            resource_id,
-            frame.width,
-            frame.height,
-            format,
-            frame.color_space,
-            frame.stride,
-            frame.modifier,
-            frame.y_inverted
-        );
         Ok(Self {
-            _texture: texture,
+            texture,
             bind_group,
+            source,
         })
     }
+
+    fn update(&self, queue: &wgpu::Queue, sequence: u64) -> Result<()> {
+        if let ImportedFrameSource::SharedMemory(image) = &self.source {
+            write_shared_image(&self.texture, queue, image, sequence)?;
+        }
+        Ok(())
+    }
+}
+
+fn write_shared_image(
+    texture: &wgpu::Texture,
+    queue: &wgpu::Queue,
+    image: &brood_ipc::SharedImageConsumer,
+    sequence: u64,
+) -> Result<()> {
+    let metadata = image.metadata();
+    let pixels = image
+        .pixels(sequence)
+        .context("read published shared-memory frame")?;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(metadata.stride),
+            rows_per_image: Some(metadata.height),
+        },
+        wgpu::Extent3d {
+            width: metadata.width,
+            height: metadata.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
 }
 
 fn create_frame_pipeline(
@@ -3603,13 +3777,18 @@ impl Renderer {
             if let Some(frame) = window.resource {
                 let imported = ImportedFrame::new(
                     &self.device,
+                    &self.queue,
                     &self.frame_bind_group_layout,
                     &self.frame_sampler,
                     window.window_id,
                     window.resource_id,
+                    sequence,
                     frame,
                 )?;
                 self.imported_frames.insert(window.resource_id, imported);
+            }
+            if let Some(imported) = self.imported_frames.get(&window.resource_id) {
+                imported.update(&self.queue, sequence)?;
             }
             if window.active {
                 backend_focus = Some(window.window_id);

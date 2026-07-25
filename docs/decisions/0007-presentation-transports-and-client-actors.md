@@ -1,4 +1,4 @@
-# 0007: Local Presentation Uses Shared Memory And Client-Owned Actors
+# 0007: Presentation Uses Negotiated Transports And Client-Owned Actors
 
 ## Status
 
@@ -37,12 +37,12 @@ registered through the descriptor broker, then shared-memory frame records
 refer to generation-scoped resource IDs and timeline points. Copied images
 remain the correctness fallback.
 
-Remote clients use the same transport-independent semantic lanes over an
-authenticated encrypted network carrier. QUIC is the initial target because it
-provides multiplexed reliable streams, datagrams, congestion control, security,
-and liveness. Remote surface subscriptions use per-window encoded or
-damage-based transports rather than DMA-BUF. The final remote carrier and frame
-codecs remain subject to workload testing.
+Remote clients use the same transport-independent semantic lanes over a
+mutually certificate-authenticated QUIC carrier. Each semantic lane has an
+independent ordered stream pair. Remote surface subscriptions use network frame
+resources rather than DMA-BUF. A losslessly compressed full-window image is
+the correctness baseline; damage, video, and GPU-aware codecs remain subject
+to workload testing.
 
 Presentation actors run in the client for both local and remote connections.
 Their local mailboxes, policy decisions, viewport state, SDK component state,
@@ -54,6 +54,9 @@ capability operations are asynchronous protocol traffic.
 
 - The protocol model defines semantic critical, reliable, latest-state, bulk,
   and frame-resource lanes independently of their carrier.
+- Carrier and frame transport are independent capability axes. The standard
+  profiles are local shared memory plus DMA-BUF, local shared memory plus
+  shared images, and network plus network images.
 - The shared-memory ABI requires explicit versioning, bounds, memory ordering,
   sequence validation, wakeup behavior, saturation policy, and crash cleanup.
 - DBus owner loss and optionally pidfds provide local peer-liveness signals.

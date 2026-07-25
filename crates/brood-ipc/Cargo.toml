@@ -7,6 +7,8 @@ edition.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+memmap2.workspace = true
+brood-protocol.workspace = true
 thiserror.workspace = true
 
 [lints.rust]

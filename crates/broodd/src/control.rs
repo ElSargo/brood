@@ -30,6 +30,7 @@ use anyhow::{Context, Result, bail, ensure};
 pub use brood_cli::control::{
     ControlTarget, request_dbus_command, resolve_control_target, session_marker_value,
 };
+use brood_protocol::{ClientLifecycle, ClientMessage, InputEvent};
 use smithay::{
     backend::{
         allocator::Buffer,
@@ -96,6 +97,7 @@ type DbusDmabufFrame = (
 type DbusFastPath = (
     u64,
     u64,
+    u32,
     zvariant::OwnedFd,
     zvariant::OwnedFd,
     zvariant::OwnedFd,
@@ -107,6 +109,7 @@ type DbusFastPath = (
     zvariant::OwnedFd,
     zvariant::OwnedFd,
 );
+type DbusSharedMemoryFrame = (String, zvariant::OwnedFd);
 type DbusAgent = (
     String,
     String,
@@ -136,6 +139,7 @@ type AgentListResponse = DbusResponse<Vec<DbusAgent>>;
 type OptionalControlResponse = DbusResponse<Option<String>>;
 type DmabufFrameResponse = DbusResponse<DbusDmabufFrame>;
 type FastPathResponse = DbusResponse<DbusFastPath>;
+type SharedMemoryFrameResponse = DbusResponse<DbusSharedMemoryFrame>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -150,11 +154,16 @@ enum DbusStateRequest {
         response: DmabufFrameResponse,
     },
     OpenPresentationFastPath {
+        frame_transports: Vec<u32>,
         response: FastPathResponse,
     },
     DmabufResource {
         resource_id: u64,
         response: DmabufFrameResponse,
+    },
+    SharedMemoryResource {
+        resource_id: u64,
+        response: SharedMemoryFrameResponse,
     },
     ListSurfaceSessions {
         response: SessionListResponse,
@@ -389,9 +398,15 @@ impl ControlDbus {
         .await
     }
 
-    async fn open_presentation_fast_path(&self) -> fdo::Result<DbusFastPath> {
+    async fn open_presentation_fast_path(
+        &self,
+        frame_transports: Vec<u32>,
+    ) -> fdo::Result<DbusFastPath> {
         request_state(&self.sender, |response| {
-            DbusStateRequest::OpenPresentationFastPath { response }
+            DbusStateRequest::OpenPresentationFastPath {
+                frame_transports,
+                response,
+            }
         })
         .await
     }
@@ -400,6 +415,16 @@ impl ControlDbus {
         request_state(&self.sender, |response| DbusStateRequest::DmabufResource {
             resource_id,
             response,
+        })
+        .await
+    }
+
+    async fn shared_memory_resource(&self, resource_id: u64) -> fdo::Result<DbusSharedMemoryFrame> {
+        request_state(&self.sender, |response| {
+            DbusStateRequest::SharedMemoryResource {
+                resource_id,
+                response,
+            }
         })
         .await
     }
@@ -2279,13 +2304,23 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
         DbusStateRequest::LatestDmabufFrame { response } => {
             send_response(response, latest_dmabuf_frame(state));
         }
-        DbusStateRequest::OpenPresentationFastPath { response } => {
-            send_response(response, open_presentation_fast_path(state));
+        DbusStateRequest::OpenPresentationFastPath {
+            frame_transports,
+            response,
+        } => {
+            send_response(
+                response,
+                open_presentation_fast_path(state, frame_transports),
+            );
         }
         DbusStateRequest::DmabufResource {
             resource_id,
             response,
         } => send_response(response, dmabuf_resource(state, resource_id)),
+        DbusStateRequest::SharedMemoryResource {
+            resource_id,
+            response,
+        } => send_response(response, shared_memory_resource(state, resource_id)),
         DbusStateRequest::ListSurfaceSessions { response } => {
             state.refresh_window_state();
             let sessions = dbus_surface_sessions(state.surface_session_summaries());
@@ -2583,8 +2618,31 @@ fn send_response<T>(response: DbusResponse<T>, result: Result<T>) {
 
 static FAST_PATH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-fn open_presentation_fast_path(state: &mut Brood) -> Result<DbusFastPath> {
+fn open_presentation_fast_path(
+    state: &mut Brood,
+    frame_transports: Vec<u32>,
+) -> Result<DbusFastPath> {
     let generation = FAST_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let client_frames = frame_transports
+        .into_iter()
+        .map(brood_protocol::FrameTransportKind::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("decode client frame transport capabilities")?;
+    let client_capabilities = brood_protocol::EndpointCapabilities {
+        protocol_version: brood_protocol::PRESENTATION_PROTOCOL_VERSION,
+        carriers: vec![brood_protocol::CarrierKind::LocalSharedMemory],
+        frame_transports: client_frames,
+        max_reliable_message_bytes: brood_protocol::MAX_ACTOR_MESSAGE_BYTES,
+        max_frame_bytes: u64::from(u32::MAX),
+    };
+    let dmabuf_available = state
+        .dmabuf
+        .exporter
+        .as_ref()
+        .is_some_and(|exporter| exporter.borrow().supports_dmabuf_export());
+    let server_capabilities = brood_protocol::EndpointCapabilities::local_server(dmabuf_available);
+    let profile = brood_protocol::negotiate_profile(&client_capabilities, &server_capabilities)
+        .context("negotiate local presentation transport")?;
     let active_session = if state.surface_session_count() == 0 {
         0
     } else {
@@ -2621,6 +2679,7 @@ fn open_presentation_fast_path(state: &mut Brood) -> Result<DbusFastPath> {
         brood_ipc::ActorMessageProducer::map(presentation_message_file.as_fd(), generation)?;
     let fast_path = crate::state::PresentationFastPath {
         generation,
+        profile,
         input,
         frames,
         catalog,
@@ -2637,6 +2696,8 @@ fn open_presentation_fast_path(state: &mut Brood) -> Result<DbusFastPath> {
         buffers: std::collections::HashMap::new(),
         resource_app_ids: std::collections::HashMap::new(),
         window_buffers: std::collections::HashMap::new(),
+        shared_images: std::collections::HashMap::new(),
+        window_shared_image_resources: std::collections::HashMap::new(),
         next_resource_id: 1,
         last_presented_sequence: None,
         in_flight_sequence: None,
@@ -2674,6 +2735,7 @@ fn open_presentation_fast_path(state: &mut Brood) -> Result<DbusFastPath> {
     Ok((
         generation,
         active_session,
+        profile.frames.into(),
         input_fd.into(),
         input_notify_fd.into(),
         frame_fd.into(),
@@ -2737,93 +2799,100 @@ fn drain_fast_path_input(state: &mut Brood) {
         if record.connection_generation != fast_path.generation {
             continue;
         }
-        let time = monotonic_time_msec(state);
-        match record.opcode {
-            brood_ipc::INPUT_KEYBOARD_KEY => state.forward_keyboard_key(
-                u32::try_from(record.arguments[0])
-                    .map_or(u32::MAX, |value| value)
-                    .into(),
-                if record.arguments[1] == 0 {
-                    KeyState::Released
-                } else {
-                    KeyState::Pressed
-                },
-                time,
-            ),
-            brood_ipc::INPUT_KEYBOARD_RESET => state.reset_transient_input_state(),
-            brood_ipc::INPUT_WINDOW_POINTER_MOTION => {
-                state.forward_pointer_motion_to_pane(
-                    record.arguments[0],
-                    Point::from((
-                        f64::from_bits(record.arguments[1]),
-                        f64::from_bits(record.arguments[2]),
-                    )),
-                    time,
-                );
+        let message = match brood_ipc::decode_client_record(&record) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(%error, opcode = record.opcode, "rejected malformed local presentation record");
+                continue;
             }
-            brood_ipc::INPUT_WINDOW_POINTER_BUTTON => {
-                let pane = record.arguments[0];
-                state.forward_pointer_motion_to_pane(
-                    pane,
-                    Point::from((
-                        f64::from_bits(record.arguments[3]),
-                        f64::from_bits(record.arguments[4]),
-                    )),
-                    time,
-                );
-                state.forward_pointer_button_to_pane(
-                    pane,
-                    u32::try_from(record.arguments[1]).map_or(u32::MAX, |value| value),
-                    if record.arguments[2] == 0 {
-                        ButtonState::Released
+        };
+        drop(record);
+        let time = monotonic_time_msec(state);
+        match message {
+            ClientMessage::Input(InputEvent::KeyboardKey { keycode, pressed }) => {
+                state.forward_keyboard_key(
+                    keycode.into(),
+                    if pressed {
+                        KeyState::Pressed
                     } else {
-                        ButtonState::Pressed
+                        KeyState::Released
                     },
                     time,
                 );
             }
-            brood_ipc::INPUT_WINDOW_POINTER_AXIS => {
-                let pane = record.arguments[0];
+            ClientMessage::Input(InputEvent::KeyboardReset) => {
+                state.reset_transient_input_state();
+            }
+            ClientMessage::Input(InputEvent::PointerMotion { position }) => {
                 state.forward_pointer_motion_to_pane(
-                    pane,
-                    Point::from((
-                        f64::from_bits(record.arguments[3]),
-                        f64::from_bits(record.arguments[4]),
-                    )),
+                    position.pane,
+                    Point::from((position.x, position.y)),
                     time,
                 );
-                let horizontal = f64::from_bits(record.arguments[1]);
-                let vertical = f64::from_bits(record.arguments[2]);
+            }
+            ClientMessage::Input(InputEvent::PointerButton {
+                position,
+                button,
+                pressed,
+            }) => {
+                state.forward_pointer_motion_to_pane(
+                    position.pane,
+                    Point::from((position.x, position.y)),
+                    time,
+                );
+                state.forward_pointer_button_to_pane(
+                    position.pane,
+                    button,
+                    if pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    },
+                    time,
+                );
+            }
+            ClientMessage::Input(InputEvent::PointerAxis {
+                position,
+                horizontal,
+                vertical,
+            }) => {
+                state.forward_pointer_motion_to_pane(
+                    position.pane,
+                    Point::from((position.x, position.y)),
+                    time,
+                );
                 let frame = crate::input::managed_continuous_axis_frame(time, horizontal, vertical);
-                state.forward_pointer_axis_to_pane(pane, frame);
+                state.forward_pointer_axis_to_pane(position.pane, frame);
             }
-            brood_ipc::INPUT_WINDOW_POINTER_WHEEL => {
-                let pane = record.arguments[0];
+            ClientMessage::Input(InputEvent::PointerWheel {
+                position,
+                horizontal_v120,
+                vertical_v120,
+            }) => {
                 state.forward_pointer_motion_to_pane(
-                    pane,
-                    Point::from((
-                        f64::from_bits(record.arguments[3]),
-                        f64::from_bits(record.arguments[4]),
-                    )),
+                    position.pane,
+                    Point::from((position.x, position.y)),
                     time,
                 );
-                let horizontal = brood_ipc::decode_i32_argument(record.arguments[1]);
-                let vertical = brood_ipc::decode_i32_argument(record.arguments[2]);
-                let frame = crate::input::managed_wheel_axis_frame(time, horizontal, vertical);
-                state.forward_pointer_axis_to_pane(pane, frame);
+                let frame =
+                    crate::input::managed_wheel_axis_frame(time, horizontal_v120, vertical_v120);
+                state.forward_pointer_axis_to_pane(position.pane, frame);
             }
-            brood_ipc::INPUT_WINDOW_POINTER_LEAVE => {
+            ClientMessage::Input(InputEvent::PointerLeave) => {
                 state.forward_pointer_leave_managed_pane(time);
             }
-            brood_ipc::INPUT_PRESENTATION_SIZE => {
+            ClientMessage::Input(InputEvent::PresentationSize {
+                width,
+                height,
+                refresh_millihz,
+            }) => {
                 state.configure_external_presentation_output(
-                    i32::try_from(record.arguments[0]).map_or(i32::MAX, |value| value),
-                    i32::try_from(record.arguments[1]).map_or(i32::MAX, |value| value),
-                    i32::try_from(record.arguments[2]).map_or(i32::MAX, |value| value),
+                    i32::try_from(width).map_or(i32::MAX, |value| value),
+                    i32::try_from(height).map_or(i32::MAX, |value| value),
+                    i32::try_from(refresh_millihz).map_or(i32::MAX, |value| value),
                 );
             }
-            brood_ipc::INPUT_FRAME_PRESENTED => {
-                let sequence = record.arguments[0];
+            ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence }) => {
                 let accepted = fast_path.in_flight_sequence == Some(sequence);
                 if accepted {
                     fast_path.last_presented_sequence = Some(sequence);
@@ -2833,7 +2902,6 @@ fn drain_fast_path_input(state: &mut Brood) {
                 if redraw_pending {
                     fast_path.pending_redraw = false;
                 }
-                drop(record);
                 if accepted {
                     crate::frame_export::send_external_client_frame_callbacks(state);
                 }
@@ -2841,28 +2909,34 @@ fn drain_fast_path_input(state: &mut Brood) {
                     request_redraw = true;
                 }
             }
-            brood_ipc::INPUT_CLIENT_DISCONNECT => {
+            ClientMessage::Lifecycle(ClientLifecycle::Disconnect) => {
                 disconnected = true;
                 break;
             }
-            brood_ipc::INPUT_PRESENTATION_FOCUS => {
-                state.set_presentation_window_focused(record.arguments[0] != 0);
+            ClientMessage::Input(InputEvent::PresentationFocus { focused }) => {
+                state.set_presentation_window_focused(focused);
             }
-            brood_ipc::INPUT_WINDOW_FOCUS
-                if state.focus_pane_from_presentation_client(record.arguments[0]) =>
-            {
-                request_redraw = true;
+            ClientMessage::Input(InputEvent::WindowFocus { pane }) => {
+                if state.focus_pane_from_presentation_client(pane) {
+                    request_redraw = true;
+                }
             }
-            brood_ipc::INPUT_WINDOW_RESIZE
+            ClientMessage::Input(InputEvent::WindowResize {
+                pane,
+                width,
+                height,
+            }) => {
                 if state.configure_presentation_client_pane_size(
-                    record.arguments[0],
-                    i32::try_from(record.arguments[1]).map_or(i32::MAX, |value| value),
-                    i32::try_from(record.arguments[2]).map_or(i32::MAX, |value| value),
-                ) =>
-            {
-                request_redraw = true;
+                    pane,
+                    i32::try_from(width).map_or(i32::MAX, |value| value),
+                    i32::try_from(height).map_or(i32::MAX, |value| value),
+                ) {
+                    request_redraw = true;
+                }
             }
-            _ => {}
+            ClientMessage::Actor(_) | ClientMessage::ReleaseResource { .. } => {
+                warn!("message reached the wrong local presentation lane");
+            }
         }
     }
     if disconnected {
@@ -2910,6 +2984,23 @@ fn dmabuf_resource(state: &mut Brood, resource_id: u64) -> Result<DbusDmabufFram
         .remove(&resource_id)
         .unwrap_or_default();
     dmabuf_frame_tuple(&dmabuf, resource_id, app_id)
+}
+
+fn shared_memory_resource(state: &mut Brood, resource_id: u64) -> Result<DbusSharedMemoryFrame> {
+    let fast_path = state
+        .dmabuf
+        .fast_path
+        .as_mut()
+        .context("presentation fast path is unavailable")?;
+    let (app_id, image) = fast_path
+        .shared_images
+        .get(&resource_id)
+        .with_context(|| format!("unknown shared-memory resource {resource_id}"))?;
+    let fd = image
+        .as_fd()
+        .try_clone_to_owned()
+        .context("duplicate shared-memory image descriptor")?;
+    Ok((app_id.clone(), fd.into()))
 }
 
 fn dmabuf_frame_tuple(

@@ -268,6 +268,14 @@ pub struct ClientArgs {
     /// Override the session server executable used for auto-start.
     #[arg(long = "server", value_name = "PATH")]
     pub server: Option<PathBuf>,
+    /// Preferred managed-window frame transport.
+    #[arg(
+        long = "frame-transport",
+        env = "BROOD_FRAME_TRANSPORT",
+        value_enum,
+        default_value_t = FrameTransportArg::Auto
+    )]
+    pub frame_transport: FrameTransportArg,
     /// Config file used to select the blessed client init actor.
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
@@ -289,6 +297,30 @@ pub struct ClientArgs {
     /// Validate configured presentation actors without opening a presentation.
     #[arg(long = "check-wasm-actors", hide = true)]
     pub check_wasm_actors: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum FrameTransportArg {
+    /// Negotiate DMA-BUF first and shared-memory images as the fallback.
+    #[default]
+    Auto,
+    /// Require same-device DMA-BUF import.
+    Dmabuf,
+    /// Require copied images in a size-sealed shared-memory pool.
+    SharedMemory,
+}
+
+impl FrameTransportArg {
+    /// Frame transports advertised to the session server, in preference order.
+    #[must_use]
+    pub fn capabilities(self) -> Vec<brood_protocol::FrameTransportKind> {
+        use brood_protocol::FrameTransportKind::{Dmabuf, SharedMemory};
+        match self {
+            Self::Auto => vec![Dmabuf, SharedMemory],
+            Self::Dmabuf => vec![Dmabuf],
+            Self::SharedMemory => vec![SharedMemory],
+        }
+    }
 }
 
 #[derive(Debug, Parser)]

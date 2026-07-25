@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, OpenOptions},
-    os::fd::OwnedFd,
+    os::fd::{AsFd, OwnedFd},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -22,7 +22,7 @@ use crate::{
 
 pub const CONTROL_OBJECT_PATH: &str = "/org/brood/Session";
 pub const CONTROL_INTERFACE: &str = "org.brood.Session.Control";
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 12;
+pub use brood_protocol::PRESENTATION_PROTOCOL_VERSION;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -44,6 +44,7 @@ type DbusPresentationWindow = (u64, u64, String);
 type DbusFastPath = (
     u64,
     u64,
+    u32,
     zbus::zvariant::OwnedFd,
     zbus::zvariant::OwnedFd,
     zbus::zvariant::OwnedFd,
@@ -55,6 +56,7 @@ type DbusFastPath = (
     zbus::zvariant::OwnedFd,
     zbus::zvariant::OwnedFd,
 );
+type DbusSharedMemoryFrame = (String, zbus::zvariant::OwnedFd);
 
 #[proxy(
     interface = "org.brood.Session.Control",
@@ -63,8 +65,10 @@ type DbusFastPath = (
 trait BroodControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
     fn latest_dmabuf_frame(&self) -> zbus::Result<DbusDmabufFrame>;
-    fn open_presentation_fast_path(&self) -> zbus::Result<DbusFastPath>;
+    fn open_presentation_fast_path(&self, frame_transports: Vec<u32>)
+    -> zbus::Result<DbusFastPath>;
     fn dmabuf_resource(&self, resource_id: u64) -> zbus::Result<DbusDmabufFrame>;
+    fn shared_memory_resource(&self, resource_id: u64) -> zbus::Result<DbusSharedMemoryFrame>;
 }
 
 #[proxy(interface = "org.brood.Session", default_path = "/org/brood/Session")]
@@ -137,6 +141,7 @@ pub struct Handshake {
 pub struct PresentationFastPath {
     pub generation: u64,
     pub active_session: u64,
+    pub profile: brood_protocol::TransportProfile,
     pub input_fd: OwnedFd,
     pub input_notify_fd: OwnedFd,
     pub frame_fd: OwnedFd,
@@ -147,6 +152,12 @@ pub struct PresentationFastPath {
     pub actor_message_notify_fd: OwnedFd,
     pub presentation_message_fd: OwnedFd,
     pub presentation_message_notify_fd: OwnedFd,
+}
+
+#[derive(Debug)]
+pub struct SharedMemoryFrame {
+    pub app_id: String,
+    pub image: brood_ipc::SharedImageConsumer,
 }
 
 #[derive(Debug)]
@@ -320,11 +331,15 @@ fn presentation_proxy<'a>(
         .context("build Brood presentation proxy")
 }
 
-pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<PresentationFastPath> {
+pub fn open_presentation_fast_path(
+    target: &ControlTarget,
+    frame_transports: &[brood_protocol::FrameTransportKind],
+) -> Result<PresentationFastPath> {
     let connection = connection(target)?;
     let (
         generation,
         active_session,
+        selected_frame_transport,
         input_fd,
         input_notify_fd,
         frame_fd,
@@ -336,11 +351,18 @@ pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<Presentatio
         presentation_message_fd,
         presentation_message_notify_fd,
     ) = presentation_proxy(&connection, target)?
-        .open_presentation_fast_path()
+        .open_presentation_fast_path(frame_transports.iter().copied().map(u32::from).collect())
         .context("open local presentation fast path")?;
+    let frames = selected_frame_transport
+        .try_into()
+        .context("decode selected local frame transport")?;
     Ok(PresentationFastPath {
         generation,
         active_session,
+        profile: brood_protocol::TransportProfile {
+            carrier: brood_protocol::CarrierKind::LocalSharedMemory,
+            frames,
+        },
         input_fd: input_fd.into(),
         input_notify_fd: input_notify_fd.into(),
         frame_fd: frame_fd.into(),
@@ -352,6 +374,21 @@ pub fn open_presentation_fast_path(target: &ControlTarget) -> Result<Presentatio
         presentation_message_fd: presentation_message_fd.into(),
         presentation_message_notify_fd: presentation_message_notify_fd.into(),
     })
+}
+
+pub fn shared_memory_resource(
+    target: &ControlTarget,
+    resource_id: u64,
+    generation: u64,
+) -> Result<SharedMemoryFrame> {
+    let connection = connection(target)?;
+    let (app_id, fd) = presentation_proxy(&connection, target)?
+        .shared_memory_resource(resource_id)
+        .with_context(|| format!("request shared-memory frame resource {resource_id}"))?;
+    let fd: OwnedFd = fd.into();
+    let image = brood_ipc::SharedImageConsumer::map(fd.as_fd(), generation)
+        .context("map shared-memory frame resource")?;
+    Ok(SharedMemoryFrame { app_id, image })
 }
 
 pub fn latest_dmabuf_frame(target: &ControlTarget) -> Result<DmabufFrame> {

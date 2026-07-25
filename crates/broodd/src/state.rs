@@ -5700,6 +5700,7 @@ impl RuntimeStats {
 #[allow(dead_code)]
 pub struct PresentationFastPath {
     pub generation: u64,
+    pub profile: brood_protocol::TransportProfile,
     pub input: brood_ipc::CriticalConsumer,
     pub frames: brood_ipc::CriticalProducer,
     pub catalog: brood_ipc::CriticalProducer,
@@ -5716,6 +5717,8 @@ pub struct PresentationFastPath {
     pub buffers: HashMap<u64, Dmabuf>,
     pub resource_app_ids: HashMap<u64, String>,
     pub window_buffers: HashMap<u64, Dmabuf>,
+    pub shared_images: HashMap<u64, (String, brood_ipc::SharedImageProducer)>,
+    pub window_shared_image_resources: HashMap<u64, u64>,
     pub next_resource_id: u64,
     pub last_presented_sequence: Option<u64>,
     pub in_flight_sequence: Option<u64>,

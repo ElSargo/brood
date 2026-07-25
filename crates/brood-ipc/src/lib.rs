@@ -8,10 +8,21 @@
 #![cfg(target_os = "linux")]
 
 mod actor_message;
+mod local_protocol;
+mod shared_image;
 
 pub use actor_message::{
     ACTOR_MESSAGE_BODY_CAPACITY, ActorMessageConsumer, ActorMessageLaneError, ActorMessageLaneFile,
     ActorMessageProducer, ActorMessageRecord,
+};
+pub use brood_protocol::{
+    FrameColorSpace, FramePixelFormat, UnsupportedFrameColorSpace, UnsupportedFramePixelFormat,
+};
+pub use local_protocol::{
+    LocalProtocolError, decode_client_record, encode_client_record, is_coalescible_client_record,
+};
+pub use shared_image::{
+    SharedImageConsumer, SharedImageError, SharedImageMetadata, SharedImageProducer,
 };
 
 use std::{
@@ -95,6 +106,11 @@ pub const FRAME_SCENE_BEGIN: u32 = 0x100;
 /// width/height, and whether the window is active. These coordinates describe
 /// content within the resource; they are not presentation placement.
 pub const FRAME_WINDOW_DMABUF: u32 = 0x101;
+/// One shared-memory image window in the current scene batch.
+///
+/// Arguments match [`FRAME_WINDOW_DMABUF`], but the resource ID names a
+/// size-sealed shared-image mapping instead of a DMA-BUF.
+pub const FRAME_WINDOW_SHM: u32 = 0x105;
 /// End and publish the current atomic scene batch.
 pub const FRAME_SCENE_END: u32 = 0x102;
 /// Ask the external presentation client to focus its operating-system window.
@@ -130,40 +146,6 @@ pub fn decode_i32_argument(value: u64) -> i32 {
     let value = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
     i32::from_ne_bytes(value.to_ne_bytes())
 }
-
-/// Color space carried by one managed-window frame resource.
-///
-/// The transport preserves the producer's encoded pixel values and describes
-/// them separately. Final conversion for an operating-system surface belongs
-/// to the presentation client.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrameColorSpace {
-    /// BT.709 primaries, D65 white point, and the sRGB transfer function.
-    Srgb = 1,
-}
-
-impl From<FrameColorSpace> for u32 {
-    fn from(value: FrameColorSpace) -> Self {
-        value as Self
-    }
-}
-
-impl TryFrom<u32> for FrameColorSpace {
-    type Error = UnsupportedFrameColorSpace;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Srgb),
-            _ => Err(UnsupportedFrameColorSpace(value)),
-        }
-    }
-}
-
-/// A frame resource used a color-space identifier unknown to this endpoint.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("unsupported frame color space {0}")]
-pub struct UnsupportedFrameColorSpace(pub u32);
 
 /// Non-blocking eventfd used to wake a critical-lane consumer.
 ///

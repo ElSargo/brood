@@ -5,7 +5,7 @@ security-boundary: mixed
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-07-25
 ---
 
 # Presentation Client Architecture
@@ -111,6 +111,11 @@ DBus is the local discovery, authentication, and descriptor broker. A
 successful handshake creates a fresh connection generation, immutable
 negotiated capabilities, bounded protocol lanes, and optional presentation
 lease.
+
+Carrier and frame transport are negotiated independently. The three standard
+profiles are local shared-memory lanes with DMA-BUF, local shared-memory lanes
+with shared images, and authenticated network lanes with network images. All
+profiles carry the same semantic messages. See [[presentation-transport]].
 
 Disconnect immediately revokes connection-owned authority and releases frame
 subscriptions and transport resources. It does not close window producers. A
@@ -252,7 +257,8 @@ Backend-composed frames and backend layout status are not valid substitutes.
 
 The following remain open without changing the ownership model:
 
-- final remote carrier and frame encoding;
+- damage, video, and GPU-aware remote frame codecs beyond the lossless
+  correctness baseline;
 - final plugin packaging and signing policy;
 - exact DMA-BUF-to-WGPU import strategy on every platform;
 - simultaneous independent controller leases;
