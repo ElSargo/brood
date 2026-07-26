@@ -207,6 +207,21 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "$KEYMAP_PRIMER" -s 100 -M ctrl -M alt -k a -m alt -m ctrl
 
+for _ in $(seq 1 300); do
+  if rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
+    && rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.1
+done
+rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
+rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype -s 100 -k Return
+
+AGENT_UI="coding-agent-ui-s1-2"
+
 second_agent_ui_focused() {
   rg -q "presentation key policy requested pane focus.*focused=Some.*changed=true" \
     "$CLIENT_LOG" \
@@ -219,8 +234,8 @@ second_agent_ui_focused() {
 
 for _ in $(seq 1 300); do
   if rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
-    && rg -q "started presentation WASM actor id=coding-agent-ui-2" "$CLIENT_LOG" \
-    && rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"registry-subscribe"' \
+    && rg -q "started presentation WASM actor id=$AGENT_UI" "$CLIENT_LOG" \
+    && rg -q "presentation actor message sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
       "$CLIENT_LOG" \
     && second_agent_ui_focused; then
     break
@@ -232,8 +247,8 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
-rg -q "started presentation WASM actor id=coding-agent-ui-2" "$CLIENT_LOG"
-rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"registry-subscribe"' \
+rg -q "started presentation WASM actor id=$AGENT_UI" "$CLIENT_LOG"
+rg -q "presentation actor message sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
   "$CLIENT_LOG"
 second_agent_ui_focused
 
@@ -254,7 +269,7 @@ for _ in $(seq 1 300); do
 done
 rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG"
 rg -q 'session actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"
-rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=init.*"kind":"create-agent"' \
+rg -q "presentation actor message sender=$AGENT_UI recipient=init.*\"kind\":\"create-agent\"" \
   "$CLIENT_LOG"
 
 capture() {
@@ -314,13 +329,13 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -s 100 -k F6
 for _ in $(seq 1 300); do
-  if rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=coding-agent-2.*"kind":"configure"' \
+  if rg -q "presentation actor message sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
     "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
-rg -q 'presentation actor message sender=coding-agent-ui-2 recipient=coding-agent-2.*"kind":"configure"' \
+rg -q "presentation actor message sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
   "$CLIENT_LOG"
 if rg -q "presentation init child actor failed|component actor mailbox rejected message: channel closed" \
   "$CLIENT_LOG"; then
@@ -363,7 +378,7 @@ cat > "$OUT/proof.md" <<EOF
 # Coding agent actor proof
 
 - input: real text and Enter events through a headless Sway presentation
-- UI: Ctrl+Alt+A launched and focused a second client-realm canvas actor
+- UI: Ctrl+Alt+A opened the session agent picker and Enter launched a session-scoped client-realm canvas actor for its selected agent
 - agents: two independently addressed session-realm actors, enumerated and switched through the UI
 - work: a private actor worker launched Codex with workspace-write authority
 - result: .brood/agent-actor-proof.txt contains actor-ui-worker-ok

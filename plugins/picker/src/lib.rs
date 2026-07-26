@@ -51,6 +51,8 @@ enum PickerMessage {
     },
     #[serde(rename = "picker-cancel")]
     Cancel { picker: u64 },
+    #[serde(rename = "picker-close")]
+    Close,
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +296,13 @@ fn handle_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
         } => create_picker(sender, request, title, placeholder, items),
         PickerMessage::Add { picker, items } => add_items(sender, picker, items),
         PickerMessage::Cancel { picker } => cancel_picker(sender, picker),
+        PickerMessage::Close if sender == "pane-close" => {
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            finish_active(&mut state, false)
+        }
+        PickerMessage::Close => Vec::new(),
     }
 }
 

@@ -151,10 +151,13 @@ shortcuts or wrapper arguments:
 
 - `Ctrl+Alt+M` focuses the visible session switcher, hides it when invoked
   again while focused, and restores it on the next invocation;
-- `Ctrl+Alt+A` creates and focuses another coding-agent UI actor;
+- `Ctrl+Alt+A` fuzzy-picks a running agent in the active session and opens a
+  session-scoped coding-agent UI for it;
 - `Ctrl+Alt+T` asks the client- and session-init actors to create a fresh paired
   terminal presentation and session actor;
 - `Ctrl+Alt+P` opens the reusable fuzzy session picker;
+- `Ctrl+Alt+D` opens or focuses the active session's single project-diff pane;
+- `Ctrl+Alt+Q` closes the focused managed or plugin pane;
 - `Ctrl+J` and `Ctrl+K` cycle focus through the presentation's managed
   windows;
 - `Ctrl+O` queues a new `foot` window in the active surface session.

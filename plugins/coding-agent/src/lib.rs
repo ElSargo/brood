@@ -155,6 +155,7 @@ struct UiState {
     agents: Vec<String>,
     views: BTreeMap<String, AgentView>,
     selected: usize,
+    preferred_agent: Option<String>,
     prompt: String,
     text_resources: BTreeMap<TextLayoutKey, u64>,
     frame_text_resources: BTreeSet<TextLayoutKey>,
@@ -174,6 +175,7 @@ impl UiState {
             agents: Vec::new(),
             views: BTreeMap::new(),
             selected: 0,
+            preferred_agent: None,
             prompt: String::new(),
             text_resources: BTreeMap::new(),
             frame_text_resources: BTreeSet::new(),
@@ -728,9 +730,18 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
 
 fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
     match message.kind.as_str() {
-        "bind" => ui.session_id = message.session_id,
+        "bind" => {
+            ui.session_id = message.session_id;
+            ui.preferred_agent = (!message.agent.is_empty()).then_some(message.agent);
+        }
         "registry" => {
-            let selected = ui.selected_agent().map(str::to_string);
+            if message.session_id != 0 && message.session_id != ui.session_id {
+                return;
+            }
+            let selected = ui
+                .preferred_agent
+                .take()
+                .or_else(|| ui.selected_agent().map(str::to_string));
             ui.agents = message
                 .agents
                 .iter()
@@ -1008,10 +1019,15 @@ fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
         color: PANEL,
     });
     let agents = ui.agents.clone();
-    for (index, agent) in agents.iter().enumerate().take(6) {
-        let x = 12.0 + index as f32 * 164.0;
+    let tab_width = if agents.is_empty() {
+        152.0
+    } else {
+        ((ui.width - 24.0) / agents.len() as f32).clamp(48.0, 152.0)
+    };
+    for (index, agent) in agents.iter().enumerate() {
+        let x = 12.0 + index as f32 * (tab_width + 4.0);
         packet.push(Command::FillRoundedRect {
-            rect: Rect::new(x, 8.0, 152.0, 28.0),
+            rect: Rect::new(x, 8.0, tab_width, 28.0),
             radius: 5.0,
             color: if index == ui.selected {
                 BLUE
@@ -1019,18 +1035,17 @@ fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
                 PANEL_LIGHT
             },
         });
-        draw_text(ui, packet, agent, x + 9.0, 12.0, 14.0, 134.0, FG);
+        draw_text(
+            ui,
+            packet,
+            agent,
+            x + 7.0,
+            12.0,
+            14.0,
+            (tab_width - 14.0).max(24.0),
+            FG,
+        );
     }
-    draw_text(
-        ui,
-        packet,
-        "F2 new  ·  Tab switch",
-        (ui.width - 190.0).max(12.0),
-        14.0,
-        12.0,
-        178.0,
-        MUTED,
-    );
 }
 
 fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {

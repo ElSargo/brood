@@ -3,15 +3,17 @@
 This is the default presentation-local Brood shell plugin. The same
 Component Model artifact runs first as the blessed client init actor and starts
 the child actor which owns the native session-switcher pane, the reusable
-`picker` actor, and the initial coding-agent UI. The init actor also starts and
-supervises more coding-agent UI children, so adding the agent
-workload does not replace the default shell. The switcher child receives typed
-session snapshots from `brood-client`, renders them through canvas packets,
-and requests typed session operations without DBus, subprocesses, or a native
-toolkit inside the plugin.
+`picker` actor, and the initial terminal UI. The init actor also starts and
+supervises diff, terminal, and coding-agent UI children, so adding those
+workloads does not replace the default shell. The switcher child receives
+typed session snapshots from `brood-client`, renders them through canvas
+packets, and requests typed session operations without DBus, subprocesses, or
+a native toolkit inside the plugin.
 
-When the active surface session changes, the init actor rebinds every coding
-agent UI child to that session's independently supervised agent registry.
+Presentation children retain the surface session that owned their creation.
+Changing the active session changes which scoped children are visible; it
+does not rebind an existing terminal, diff viewer, or coding-agent UI to
+another session.
 
 The child claims the root layout lease, keeps its own pane in a right sidebar,
 and asks the host to delegate every other pane through its `rest` slot to the
@@ -28,11 +30,22 @@ request on the reusable picker actor and activates the session returned in the
 selection reply. The picker pane is a centered overlay in this actor's root
 layout and is never delegated into the workspace subtree.
 
+`Ctrl+Alt+A` sends the init actor an agent-picker action. The picker enumerates
+the current session's registry, and selecting an entry starts a coding-agent
+UI already bound to that session and agent. The UI remains independently
+addressed and its tab bar continues to follow the whole session registry.
+
 The init actor also owns the diff viewer's pane lifecycle. `Ctrl+Alt+D` starts
-the diff actor with narrow read-only workspace and `subprocess:git`
-capabilities; the next press stops the actor and therefore closes the pane. The
-diff viewer stays an ordinary workspace pane and does not participate in the
-switcher's root layout policy.
+one diff actor per session with narrow read-only workspace and
+`subprocess:git` capabilities, or focuses that actor when it is already open.
+The diff viewer stays an ordinary workspace pane and does not participate in
+the switcher's root layout policy.
+
+`Ctrl+Alt+T` creates a new paired terminal session actor and terminal UI; there
+is no per-session terminal limit. `Ctrl+Alt+Q` closes the focused managed or
+plugin pane. Closing a plugin pane stops its presentation actor and performs
+the corresponding session-side cleanup where required. The reusable picker
+and switcher use their own hide/cancel lifecycle instead of being destroyed.
 
 The pane supports:
 

@@ -180,18 +180,25 @@ fn main() -> Result<()> {
             false,
             &snapshot,
         )?;
-        let new_agent_ui = key_policy.evaluate(
+        let open_agent_picker = key_policy.evaluate(
             38,
             brood_wasm::ABI_KEY_PRESSED,
             brood_wasm::ABI_MOD_CTRL | brood_wasm::ABI_MOD_ALT,
             false,
             &snapshot,
         )?;
-        let repeated_new_agent_ui = key_policy.evaluate(
+        let repeated_open_agent_picker = key_policy.evaluate(
             38,
             brood_wasm::ABI_KEY_PRESSED,
             brood_wasm::ABI_MOD_CTRL | brood_wasm::ABI_MOD_ALT,
             true,
+            &snapshot,
+        )?;
+        let close_pane = key_policy.evaluate(
+            24,
+            brood_wasm::ABI_KEY_PRESSED,
+            brood_wasm::ABI_MOD_CTRL | brood_wasm::ABI_MOD_ALT,
+            false,
             &snapshot,
         )?;
         let repeated_toggle_switcher = key_policy.evaluate(
@@ -221,11 +228,18 @@ fn main() -> Result<()> {
                 message.actor == "session-switcher"
                     && message.payload == br#"{"type":"sidebar-action","action":"toggle"}"#
             })
-            || !new_agent_ui.actor_messages.iter().any(|message| {
+            || !open_agent_picker.actor_messages.iter().any(|message| {
                 message.actor == "brood.client-init"
-                    && message.payload == br#"{"kind":"coding-agent-action","action":"new-ui"}"#
+                    && message.payload == br#"{"kind":"coding-agent-action","action":"picker"}"#
             })
-            || !repeated_new_agent_ui.actor_messages.is_empty()
+            || !repeated_open_agent_picker.actor_messages.is_empty()
+            || !close_pane.host_messages.iter().any(|message| {
+                matches!(
+                    message,
+                    HostMessage::LayoutAction { action }
+                        if action == "close-active-pane"
+                )
+            })
             || !repeated_toggle_switcher.actor_messages.is_empty()
             || !focus_existing
                 .host_messages
@@ -1870,7 +1884,7 @@ impl Application {
                         renderer,
                         &mut self.input_sender,
                         self.backend_commands.as_ref(),
-                        self.wasm_runtime.as_ref(),
+                        self.wasm_runtime.as_mut(),
                         message,
                         self.window_focused,
                     ) {
@@ -1905,6 +1919,10 @@ impl Application {
                     return Ok(());
                 };
                 runtime.drain_events()?;
+                let pane_sessions = runtime.pane_sessions().collect::<Vec<_>>();
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_plugin_pane_sessions(&pane_sessions);
+                }
                 if let Some(renderer) = self.renderer.as_ref() {
                     let (width, height, scale) = renderer.logical_extent();
                     let panes = runtime.drain_pending_pane_creations().collect::<Vec<_>>();
@@ -2077,6 +2095,12 @@ impl ApplicationHandler<ClientEvent> for Application {
             Ok(renderer) => {
                 renderer.window.request_redraw();
                 self.renderer = Some(renderer);
+                if let (Some(runtime), Some(renderer)) =
+                    (self.wasm_runtime.as_ref(), self.renderer.as_mut())
+                {
+                    let sessions = runtime.pane_sessions().collect::<Vec<_>>();
+                    renderer.set_plugin_pane_sessions(&sessions);
+                }
                 if let Some((active_session, windows)) = self.pending_backend_snapshot.take()
                     && let Some(renderer) = self.renderer.as_mut()
                 {
@@ -2258,7 +2282,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Some(snapshot) = session {
                     self.latest_session_snapshot = Some(snapshot.clone());
                     if let Some(runtime) = self.wasm_runtime.as_mut() {
-                        runtime.bind_session(snapshot.active);
+                        runtime.bind_session_snapshot(&snapshot);
                         if let Err(error) =
                             runtime.broadcast_session_event(&SessionEvent::Snapshot(snapshot))
                         {
@@ -2734,7 +2758,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                             renderer,
                             &mut self.input_sender,
                             self.backend_commands.as_ref(),
-                            self.wasm_runtime.as_ref(),
+                            self.wasm_runtime.as_mut(),
                             message,
                             self.window_focused,
                         ) {
@@ -2907,6 +2931,7 @@ struct Renderer {
     current_sequence: Option<u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_panes: BTreeMap<u64, PluginPaneTexture>,
+    plugin_pane_sessions: BTreeMap<u64, Option<u64>>,
     focused_pane: Option<FocusedPane>,
     pending_focus_pane: Option<u64>,
     accepted_layout: ResolvedLayout,
@@ -3181,7 +3206,7 @@ fn apply_key_policy_host_message(
     renderer: &mut Renderer,
     input_sender: &mut Option<InputLane>,
     backend_commands: Option<&BackendCommandLane>,
-    runtime: Option<&PresentationWasmRuntime>,
+    mut runtime: Option<&mut PresentationWasmRuntime>,
     message: HostMessage,
     window_focused: bool,
 ) -> Result<()> {
@@ -3197,8 +3222,15 @@ fn apply_key_policy_host_message(
                         format!("close-pane-{pane}"),
                         vec!["close-pane".to_string(), pane.to_string()],
                     )?;
+                } else if let Some(pane) = renderer.focused_plugin_pane() {
+                    let closed = if let Some(runtime) = runtime.as_deref_mut() {
+                        runtime.close_pane(pane)?
+                    } else {
+                        false
+                    };
+                    eprintln!("key-policy close local pane={pane} changed={closed}");
                 } else {
-                    eprintln!("key-policy close ignored for a presentation-local actor pane");
+                    eprintln!("key-policy close ignored without a focused pane");
                 }
                 None
             } else {
@@ -3258,7 +3290,12 @@ fn apply_key_policy_host_message(
     };
 
     if let Some(change) = focus_change {
-        dispatch_focus_change(runtime, input_sender.as_mut(), change, window_focused)?;
+        dispatch_focus_change(
+            runtime.as_deref(),
+            input_sender.as_mut(),
+            change,
+            window_focused,
+        )?;
     }
     Ok(())
 }
@@ -4055,6 +4092,7 @@ impl Renderer {
             current_sequence: None,
             plugin_graphics,
             plugin_panes: BTreeMap::new(),
+            plugin_pane_sessions: BTreeMap::new(),
             focused_pane: None,
             pending_focus_pane: None,
             accepted_layout: ResolvedLayout::empty(),
@@ -4208,7 +4246,7 @@ impl Renderer {
                 } else {
                     previous_focus
                 },
-                self.plugin_panes.keys().copied(),
+                self.visible_plugin_panes(),
                 &managed_panes,
                 backend_focus,
             );
@@ -4264,16 +4302,17 @@ impl Renderer {
     fn key_policy_snapshot(&self) -> KeyPolicySnapshot {
         KeyPolicySnapshot {
             focused_pane: self.focused_pane_id(),
-            panes: self.pane_inventory(),
+            panes: self.default_visible_pane_inventory(),
             managed_panes: self
                 .available_windows
                 .iter()
+                .filter(|window| window.session == self.active_session)
                 .map(|window| window.pane)
                 .collect(),
             app_panes: self
                 .available_windows
                 .iter()
-                .filter(|window| !window.app_id.is_empty())
+                .filter(|window| window.session == self.active_session && !window.app_id.is_empty())
                 .map(|window| KeyPolicyAppPane {
                     pane: window.pane,
                     app_id: window.app_id.clone(),
@@ -4585,10 +4624,31 @@ impl Renderer {
 
     fn default_visible_pane_inventory(&self) -> Vec<u64> {
         default_visible_panes(
-            self.plugin_panes.keys().copied(),
+            self.visible_plugin_panes(),
             &self.available_windows,
             self.active_session,
         )
+    }
+
+    fn visible_plugin_panes(&self) -> Vec<u64> {
+        self.plugin_panes
+            .keys()
+            .copied()
+            .filter(|pane| {
+                self.plugin_pane_sessions.get(pane).is_none_or(|session| {
+                    session.is_none_or(|session| session == self.active_session)
+                })
+            })
+            .collect()
+    }
+
+    fn set_plugin_pane_sessions(&mut self, sessions: &[(u64, Option<u64>)]) {
+        let updated = sessions.iter().copied().collect::<BTreeMap<_, _>>();
+        if self.plugin_pane_sessions != updated {
+            self.plugin_pane_sessions = updated;
+            self.layout_state_dirty = true;
+            self.window.request_redraw();
+        }
     }
 
     const fn focused_pane_id(&self) -> Option<u64> {
@@ -4599,7 +4659,7 @@ impl Renderer {
     }
 
     fn focus_target_for_pane(&self, pane: u64) -> Option<FocusedPane> {
-        if self.plugin_panes.contains_key(&pane) {
+        if self.visible_plugin_panes().contains(&pane) {
             return Some(FocusedPane::Plugin(pane));
         }
         self.available_windows
@@ -4710,6 +4770,7 @@ impl Renderer {
 
     fn remove_plugin_pane(&mut self, pane: u64) -> Option<FocusChange> {
         let removed = self.plugin_panes.remove(&pane).is_some();
+        self.plugin_pane_sessions.remove(&pane);
         self.sent_plugin_sizes.remove(&pane);
         if !removed {
             return None;

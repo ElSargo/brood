@@ -30,9 +30,17 @@ DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
 mkdir -p "$PACKAGE" "$RUNTIME_DIR" "$PROJECT" "$DATA_HOME"
 chmod 700 "$RUNTIME_DIR"
 git -C "$PROJECT" init --quiet
+for index in $(seq 1 180); do
+  printf 'original project line %03d\n' "$index"
+done > "$PROJECT/tracked.txt"
+git -C "$PROJECT" add tracked.txt
 git -C "$PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
-  commit --quiet --allow-empty -m initial
+  commit --quiet -m initial
 git -C "$PROJECT" branch picker-worktree
+for index in $(seq 1 180); do
+  printf 'changed project line %03d with enough content to exercise split diff scrolling\n' "$index"
+done > "$PROJECT/tracked.txt"
+printf 'untracked session-local diff\n' > "$PROJECT/untracked.txt"
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -271,7 +279,7 @@ rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
 for _ in $(seq 1 200); do
   if rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG" \
@@ -281,7 +289,7 @@ for _ in $(seq 1 200); do
   sleep 0.1
 done
 rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG"
@@ -334,6 +342,12 @@ send_diff_toggle() {
     "$OUT/virtual-keyboard-key" 32
 }
 
+send_close_pane() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" 16
+}
+
 send_pointer() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
@@ -362,18 +376,18 @@ submit_text() {
 
 capture "$OUT/sidebar-visible.png"
 
-accepted_before="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+accepted_before="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
 send_picker
 for _ in $(seq 1 100); do
   if rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
     && rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
 rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
 rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
 capture "$OUT/picker-visible.png"
 
@@ -381,7 +395,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "Bt" -s 100 -k Return
 for _ in $(seq 1 100); do
-  accepted_after="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+  accepted_after="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
   if rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && ((accepted_after > accepted_before)); then
     break
@@ -447,7 +461,7 @@ CTRL_O_INPUT_PID=$!
 for _ in $(seq 1 200); do
   if rg -q "total_windows=3" <<< "$(ctl status)" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"; then
     break
   fi
@@ -457,20 +471,20 @@ wait "$CTRL_O_INPUT_PID"
 CTRL_O_LAYOUT_MS=$(( $(date +%s%3N) - CTRL_O_STARTED_MS ))
 rg -q "total_windows=3" <<< "$(ctl status)"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=4" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"
 capture "$OUT/ctrl-o-terminal.png"
 
 CATALOG_TWO_BEFORE="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
-LAYOUT_THREE_BEFORE="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+LAYOUT_TWO_BEFORE="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
 CLOSE_STARTED_MS="$(date +%s%3N)"
-ctl close-pane 3 > /dev/null
+send_close_pane
 for _ in $(seq 1 200); do
   CATALOG_TWO_AFTER="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
-  LAYOUT_THREE_AFTER="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
+  LAYOUT_TWO_AFTER="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
   if rg -q "total_windows=2" <<< "$(ctl status)" \
     && ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE)) \
-    && ((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE)); then
+    && ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE)); then
     break
   fi
   sleep 0.01
@@ -478,13 +492,14 @@ done
 CLOSE_LAYOUT_MS=$(( $(date +%s%3N) - CLOSE_STARTED_MS ))
 rg -q "total_windows=2" <<< "$(ctl status)"
 ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
-((LAYOUT_THREE_AFTER > LAYOUT_THREE_BEFORE))
+((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE))
 
 DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+DIFF_ACTOR="diff-viewer-s3"
 send_diff_toggle
 for _ in $(seq 1 200); do
   DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
-  if rg -q "started presentation WASM actor id=diff-viewer" "$CLIENT_LOG" \
+  if rg -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG" \
     && rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
     && ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE)) \
     && rg -q "focused local plugin pane=" "$CLIENT_LOG"; then
@@ -492,24 +507,24 @@ for _ in $(seq 1 200); do
   fi
   sleep 0.05
 done
-rg -q "started presentation WASM actor id=diff-viewer" "$CLIENT_LOG"
+rg -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
 ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE))
 DIFF_PANE="$(
-  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+  sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
     | sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' \
     | head -1
 )"
 [[ -n "$DIFF_PANE" ]]
 INITIAL_DIFF_SEQUENCE="$(
-  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+  sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
     | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
     | head -1
 )"
 [[ -n "$INITIAL_DIFF_SEQUENCE" ]]
 for _ in $(seq 1 400); do
   POPULATED_DIFF_SEQUENCE="$(
-    sed -n '/presentation actor worker finished actor=diff-viewer/,$p' "$CLIENT_LOG" \
+    sed -n "/presentation actor worker finished actor=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
       | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
       | tail -1
   )"
@@ -523,7 +538,7 @@ done
 capture "$OUT/diff-open.png"
 
 read -r DIFF_WIDTH DIFF_HEIGHT < <(
-  sed -n '/started presentation WASM actor id=diff-viewer/,$p' "$CLIENT_LOG" \
+  sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
     | sed -n 's/.*sent plugin pane resize pane='"$DIFF_PANE"' logical_size=\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' \
     | tail -1
 )
@@ -589,17 +604,17 @@ TRACKPAD_TEXT_LAYOUTS="${TRACKPAD_TEXT_LAYOUTS:-0}"
 ((TRACKPAD_TEXT_LAYOUTS < TRACKPAD_PACKET_COUNT * 40))
 ((TRACKPAD_SETTLED_MS < 2000))
 
-CLOSED_LAYOUTS_BEFORE="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
-send_diff_toggle
+CLOSED_LAYOUTS_BEFORE="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+send_close_pane
 for _ in $(seq 1 100); do
-  CLOSED_LAYOUTS_AFTER="$(rg -c "accepted leased actor layout .* panes=3" "$CLIENT_LOG")"
-  if rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG" \
+  CLOSED_LAYOUTS_AFTER="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  if rg -q "stopped presentation init child actor id=$DIFF_ACTOR" "$CLIENT_LOG" \
     && ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE)); then
     break
   fi
   sleep 0.05
 done
-rg -q "stopped presentation init child actor id=diff-viewer" "$CLIENT_LOG"
+rg -q "stopped presentation init child actor id=$DIFF_ACTOR" "$CLIENT_LOG"
 ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE))
 capture "$OUT/diff-closed.png"
 
@@ -822,7 +837,7 @@ metric = subprocess.run(
 ).stderr
 normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
-    raise SystemExit(f"second diff toggle did not visibly close the pane: RMSE={normalized}")
+    raise SystemExit(f"close-pane binding did not visibly close the diff pane: RMSE={normalized}")
 print(f"diff_close_capture_rmse={normalized:.6f}")
 
 metric = subprocess.run(
@@ -840,7 +855,7 @@ PY
 
 STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
-rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
 if rg -q "rejected actor-submitted layout" "$CLIENT_LOG"; then
   echo "ERR client rejected a recursive layout update" >&2
@@ -884,7 +899,7 @@ cat > "$OUT/proof.md" <<EOF
 # Recursive session-switcher proof
 
 - backend: headless frame exporter, no presenter and no backend layout
-- input: real Ctrl+Alt+M, Ctrl+Alt+P, Ctrl+Alt+D, fuzzy text, Enter, pointer clicks and drag, touchpad scroll, and Ctrl+O events through the focused external Winit client
+- input: real Ctrl+Alt+M, Ctrl+Alt+P, Ctrl+Alt+D, Ctrl+Alt+Q, fuzzy text, Enter, pointer clicks and drag, touchpad scroll, and Ctrl+O events through the focused external Winit client
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
 - projects: two Git repositories rendered as distinct collapsible project lists
@@ -898,10 +913,10 @@ cat > "$OUT/proof.md" <<EOF
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
 - hidden: managed pane resized to ${HIDDEN_WIDTH}x${SIDEBAR_HEIGHT} through the same recursive layout fragment
 - restored: managed pane returned to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT}
-- Ctrl+O: spawned foot in Gamma, expanded the layout to four panes, and imported its DMA-BUF
-- Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted four-pane layout
-- close latency: ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
-- diff viewer: Ctrl+Alt+D created and focused an ordinary split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; the second press stopped the actor and closed its pane
+- Ctrl+O: spawned foot in Gamma, expanded the layout to three panes, and imported its DMA-BUF
+- Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted three-pane layout
+- managed close: Ctrl+Alt+Q closed the focused foot pane in ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
+- diff viewer: Ctrl+Alt+D created and focused the session-scoped split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; Ctrl+Alt+Q stopped the focused actor and closed its pane
 - diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
 - diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
 - captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, projects.png

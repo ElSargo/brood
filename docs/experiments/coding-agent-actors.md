@@ -20,12 +20,14 @@ replacing the UI does not stop the agents. An agent failure does not stop its
 peers or the session root.
 
 Each UI is a compact canvas application with agent tabs, status and
-configuration, a transcript, and a prompt editor. `Ctrl+Alt+A` creates and
-focuses another independently addressed UI actor without replacing or
-restarting the agents. The architecture must also support editor panes, diff
-viewers, LSP bridges, automation, and other agents as peers. Those clients
-should use the same actor address and mailbox protocol rather than a privileged
-coding-agent host API.
+configuration, a transcript, and a prompt editor. `Ctrl+Alt+A` fuzzy-picks
+from the active session's agent registry and creates an independently
+addressed UI actor focused on that agent. Each UI remains bound to its owning
+session and shows the complete session registry in its tab bar. Opening or
+closing a UI does not replace or restart the agents. The architecture must
+also support editor panes, diff viewers, LSP bridges, automation, and other
+agents as peers. Those clients should use the same actor address and mailbox
+protocol rather than a privileged coding-agent host API.
 
 ## Ownership
 

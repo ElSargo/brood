@@ -19,6 +19,7 @@ const FIRST_AGENT: &str = "coding-agent-1";
 #[serde(default)]
 struct WireMessage {
     kind: String,
+    session_id: u64,
     agents: Vec<WireAgent>,
     terminal: Option<String>,
 }
@@ -44,6 +45,7 @@ struct PendingTerminal {
 }
 
 struct InitState {
+    session_id: u64,
     agents: Vec<WireAgent>,
     subscribers: Vec<Subscriber>,
     next_agent: u64,
@@ -52,6 +54,7 @@ struct InitState {
 }
 
 static STATE: Mutex<InitState> = Mutex::new(InitState {
+    session_id: 0,
     agents: Vec::new(),
     subscribers: Vec::new(),
     next_agent: 2,
@@ -84,11 +87,16 @@ impl Guest for ExampleInitActor {
                     Command::LifecycleComplete(Ok(())),
                 ]
             }
-            Event::Lifecycle(LifecycleEvent::Start(_)) => vec![
-                start_terminal("terminal-session"),
-                start_agent(FIRST_AGENT),
-                Command::LifecycleComplete(Ok(())),
-            ],
+            Event::Lifecycle(LifecycleEvent::Start(context)) => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.session_id = context.session_id.unwrap_or_default();
+                }
+                vec![
+                    start_terminal("terminal-session"),
+                    start_agent(FIRST_AGENT),
+                    Command::LifecycleComplete(Ok(())),
+                ]
+            }
             Event::Child(event) => handle_child(event),
             Event::Mailbox(message)
                 if message.sender == "presentation:brood.client-init"
@@ -148,7 +156,12 @@ fn handle_child(event: ChildEvent) -> Vec<Command> {
                 .position(|pending| pending.id == started.id)
             {
                 let pending = state.pending_terminals.remove(index);
-                return terminal_reply(&pending.subscriber, "terminal-started", &pending.id);
+                return terminal_reply(
+                    &pending.subscriber,
+                    "terminal-started",
+                    &pending.id,
+                    state.session_id,
+                );
             }
             if !started.id.starts_with("coding-agent-") {
                 return Vec::new();
@@ -175,7 +188,12 @@ fn handle_child(event: ChildEvent) -> Vec<Command> {
                 .position(|pending| pending.id == failed.id)
             {
                 let pending = state.pending_terminals.remove(index);
-                return terminal_reply(&pending.subscriber, "terminal-failed", &pending.id);
+                return terminal_reply(
+                    &pending.subscriber,
+                    "terminal-failed",
+                    &pending.id,
+                    state.session_id,
+                );
             }
             if !failed.id.starts_with("coding-agent-") {
                 return Vec::new();
@@ -217,6 +235,14 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             });
             vec![start_terminal(&id)]
         }
+        "stop-terminal" => message
+            .terminal
+            .filter(|terminal| {
+                terminal == "terminal-session" || terminal.starts_with("terminal-session-")
+            })
+            .map(Command::StopActor)
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -238,6 +264,7 @@ fn subscriber_from_sender(sender: &str) -> Subscriber {
 fn registry_commands(state: &InitState) -> Vec<Command> {
     let Ok(body) = serde_json::to_vec(&WireMessage {
         kind: "registry".to_string(),
+        session_id: state.session_id,
         agents: state.agents.clone(),
         terminal: None,
     }) else {
@@ -261,9 +288,15 @@ fn registry_commands(state: &InitState) -> Vec<Command> {
         .collect()
 }
 
-fn terminal_reply(subscriber: &Subscriber, kind: &str, terminal: &str) -> Vec<Command> {
+fn terminal_reply(
+    subscriber: &Subscriber,
+    kind: &str,
+    terminal: &str,
+    session_id: u64,
+) -> Vec<Command> {
     let Ok(body) = serde_json::to_vec(&WireMessage {
         kind: kind.to_string(),
+        session_id,
         agents: Vec::new(),
         terminal: Some(terminal.to_string()),
     }) else {

@@ -1,8 +1,9 @@
 # Diff Viewer Plugin
 
-The diff viewer is a presentation-local, read-only project diff. It opens as an
-ordinary workspace pane and closes that pane when its action is toggled again.
-The default workspace policy binds the action to `Ctrl+Alt+D`.
+The diff viewer is a session-scoped, read-only project diff. It opens as an
+ordinary workspace pane. Each surface session can own one viewer:
+`Ctrl+Alt+D` opens it or focuses the existing pane, and `Ctrl+Alt+Q` closes the
+focused pane.
 
 The pane follows Zed's project-diff shape: every changed file appears in one
 continuous, scrollable surface and changed lines are aligned in a split view.
@@ -25,10 +26,10 @@ closing and reopening also reloads the project.
 The rendered snapshot is bounded to 900 KiB so its worker result stays inside
 the actor generation's normal result budget.
 
-The client init actor owns the toggle lifecycle. It starts the child with only
-read-only workspace and `subprocess:git` capabilities, and stopping that child
-destroys its pane. The diff actor does not claim layout authority or request
-special placement.
+The client init actor owns the lifecycle. It starts the child with only the
+owning session's read-only workspace and `subprocess:git` capabilities, and
+stopping that child destroys its pane. The diff actor does not claim layout
+authority or request special placement.
 
 Build and componentize through the checked-in Nix environment:
 

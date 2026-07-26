@@ -220,6 +220,23 @@ impl Guest for DiffViewer {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
             Event::Presentation(event) => handle_presentation(event),
+            Event::Mailbox(message)
+                if message.sender == "brood.client-init"
+                    && message.body == br#"{"kind":"focus"}"# =>
+            {
+                let Ok(state) = STATE.lock() else {
+                    return Vec::new();
+                };
+                (state.pane != 0)
+                    .then(|| {
+                        ActorCommand::SendHostMessage(
+                            format!(r#"{{"type":"focus-pane","pane":{}}}"#, state.pane)
+                                .into_bytes(),
+                        )
+                    })
+                    .into_iter()
+                    .collect()
+            }
             Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
         }
@@ -448,7 +465,7 @@ fn redraw_with_layouts(
     add_text(
         &mut packet,
         &mut text_resources,
-        "R refresh   Ctrl+Alt+D close",
+        "R refresh   Ctrl+Alt+Q close",
         12.0,
         MUTED,
         (state.width - 220.0).max(260.0),

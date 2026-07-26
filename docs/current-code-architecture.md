@@ -76,14 +76,16 @@ tree. It then canonicalizes transforms and z order, clips children, selects
 focus, builds hit-test regions, and derives managed-pane size requests.
 
 The default client init actor starts the session switcher, reusable picker, and
-initial coding-agent UI as independently addressed children. The switcher
-claims the root, places its pane on the right, and delegates `rest` to the
-workspace actor, where the agent UI and session windows are composed. The
+initial terminal UI as independently addressed children. The switcher claims
+the root, places its pane on the right, and delegates `rest` to the workspace
+actor, where scoped plugin panes and session windows are composed. The
 picker's pane joins that root fragment as a floating overlay only while one of
 its FIFO-queued mailbox requests is active. The key policy sends ordinary
-sidebar and new-agent-UI actions to the init actor; the relevant actor updates
-its child graph or republishes its layout fragment. Session-catalogue changes
-rebind each agent UI to the active session's agent registry.
+sidebar, picker, and pane-lifecycle actions to the init actor; the relevant
+actor updates its child graph or republishes its layout fragment. A plugin pane
+retains its owning surface session across catalogue changes and is visible
+only with that session. Agent UI panes subscribe to the complete registry for
+their owning session.
 
 Picker callers stream items to a stable request ID and receive the original
 selected JSON result and append-order index through ordinary local messages.

@@ -57,10 +57,7 @@ struct UiState {
 
 impl UiState {
     fn new(session_id: u64, instance_id: &str) -> Self {
-        let session_actor = instance_id.strip_prefix("terminal-ui-").map_or_else(
-            || "terminal-session".to_string(),
-            |suffix| format!("terminal-session-{suffix}"),
-        );
+        let session_actor = terminal_session_actor(instance_id);
         Self {
             pane: 0,
             session_id,
@@ -137,6 +134,18 @@ impl UiState {
             payload: Vec::new(),
         })]
     }
+}
+
+fn terminal_session_actor(instance_id: &str) -> String {
+    if let Some(scoped) = instance_id.strip_prefix("terminal-ui-s")
+        && let Some((_session, suffix)) = scoped.split_once('-')
+    {
+        return format!("terminal-session-{suffix}");
+    }
+    instance_id.strip_prefix("terminal-ui-").map_or_else(
+        || "terminal-session".to_string(),
+        |suffix| format!("terminal-session-{suffix}"),
+    )
 }
 
 #[derive(Clone)]

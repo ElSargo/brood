@@ -12,8 +12,8 @@ use brood_wasm::{
     NativeFilesystemWatcherService, PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext,
     PluginStartReason, PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor,
     Preview1FilesystemGrant, Preview1WorkerConfig, Registry, RuntimeIoCapabilities,
-    RuntimeIoConfig, SessionCommandRequest, SessionEvent, WasmActor, WasmActorDeclaration,
-    WasmActorEventKind, WasmPluginArtifact,
+    RuntimeIoConfig, SessionCommandRequest, SessionEvent, SessionSnapshot, WasmActor,
+    WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
 };
 use tokio::sync::Mutex;
 use winit::event_loop::EventLoopProxy;
@@ -46,6 +46,7 @@ pub struct PresentationWasmRuntime {
     bound_session_id: Option<u64>,
     next_actor_pane: u64,
     workspace_root: PathBuf,
+    session_workspaces: BTreeMap<u64, PathBuf>,
 }
 
 pub struct SessionActorMessageRequest {
@@ -78,6 +79,7 @@ struct PresentationInitState {
 
 struct PresentationActor {
     pane: u64,
+    session: Option<u64>,
     actor: HostedWasmActor,
 }
 
@@ -127,13 +129,14 @@ impl PresentationWasmRuntime {
             bound_session_id: session_id,
             next_actor_pane: u64::MAX,
             workspace_root,
+            session_workspaces: BTreeMap::new(),
         };
         if let Some(path) = init_actor {
             runtime.load_init_actor(path, session_id, graphics)?;
         }
         for spec in specs {
             let pane = runtime.allocate_actor_pane()?;
-            runtime.load_actor(spec, pane, graphics, &[])?;
+            runtime.load_actor(spec, pane, None, graphics, &[])?;
         }
         Ok(runtime)
     }
@@ -159,6 +162,7 @@ impl PresentationWasmRuntime {
                 path: path.to_path_buf(),
             },
             pane,
+            None,
             self.graphics.clone().as_ref(),
             &[],
         )?;
@@ -214,7 +218,11 @@ impl PresentationWasmRuntime {
         ))?;
         self.actors.insert(
             CLIENT_INIT_ACTOR_ID.to_string(),
-            PresentationActor { pane: 0, actor },
+            PresentationActor {
+                pane: 0,
+                session: None,
+                actor,
+            },
         );
         self.init = Some(PresentationInitState {
             root: path
@@ -234,6 +242,7 @@ impl PresentationWasmRuntime {
         &mut self,
         spec: PresentationActorSpec,
         pane: u64,
+        session: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
         capabilities: &[String],
     ) -> Result<()> {
@@ -246,7 +255,9 @@ impl PresentationWasmRuntime {
             WasmPluginArtifact::Legacy(artifact) => {
                 self.load_legacy_actor(spec, artifact.inventory.actors)
             }
-            artifact => self.load_hosted_actor(spec, pane, graphics, artifact, capabilities),
+            artifact => {
+                self.load_hosted_actor(spec, pane, session, graphics, artifact, capabilities)
+            }
         }
     }
 
@@ -329,12 +340,17 @@ impl PresentationWasmRuntime {
         &mut self,
         spec: PresentationActorSpec,
         pane: u64,
+        session: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
         artifact: WasmPluginArtifact,
         capabilities: &[String],
     ) -> Result<()> {
         let watcher = self.filesystem_watcher_service.clone();
         let presentation = graphics.map(|graphics| graphics.actor_host(pane));
+        let workspace_root = session
+            .and_then(|session| self.session_workspaces.get(&session))
+            .unwrap_or(&self.workspace_root)
+            .clone();
         let actor = self.executor.block_on(load_hosted_actor(
             &spec,
             watcher,
@@ -342,7 +358,7 @@ impl PresentationWasmRuntime {
             artifact,
             false,
             capabilities,
-            &self.workspace_root,
+            &workspace_root,
         ))?;
         if let Some(presentation) = presentation {
             presentation.bind_generation(actor.generation());
@@ -354,8 +370,14 @@ impl PresentationWasmRuntime {
             actor.generation(),
             spec.path.display()
         );
-        self.actors
-            .insert(spec.id, PresentationActor { pane, actor });
+        self.actors.insert(
+            spec.id,
+            PresentationActor {
+                pane,
+                session,
+                actor,
+            },
+        );
         Ok(())
     }
 
@@ -610,7 +632,8 @@ impl PresentationWasmRuntime {
             "init child actors must use the hosted Component or Preview 1 runtime"
         );
         let pane = self.allocate_actor_pane()?;
-        self.load_actor(spec, pane, graphics, capabilities)?;
+        let session = init_child_session(&spec.id, self.bound_session_id);
+        self.load_actor(spec, pane, session, graphics, capabilities)?;
         let generation = self
             .actors
             .get(id)
@@ -621,8 +644,13 @@ impl PresentationWasmRuntime {
             instance_id: id.to_string(),
             generation,
             reason: PluginStartReason::Initial,
-            session_id: self.bound_session_id,
-            workspace_root: ".".to_string(),
+            session_id: session,
+            workspace_root: self
+                .session_workspaces
+                .get(&session.unwrap_or_default())
+                .unwrap_or(&self.workspace_root)
+                .to_string_lossy()
+                .into_owned(),
             data: vec![PluginLifecycleEntry {
                 key: "realm".to_string(),
                 value: "client".to_string(),
@@ -784,6 +812,42 @@ impl PresentationWasmRuntime {
             .map(|actor| actor.pane)
     }
 
+    pub fn pane_sessions(&self) -> impl Iterator<Item = (u64, Option<u64>)> + '_ {
+        self.actors
+            .values()
+            .filter(|actor| actor.pane != 0)
+            .map(|actor| (actor.pane, actor.session))
+    }
+
+    pub fn close_pane(&mut self, pane: u64) -> Result<bool> {
+        let Some(actor_id) = self
+            .actors
+            .iter()
+            .find_map(|(id, actor)| (actor.pane == pane).then(|| id.clone()))
+        else {
+            return Ok(false);
+        };
+        match actor_id.as_str() {
+            "session-switcher" => {
+                self.send_actor_message(
+                    &actor_id,
+                    "key-policy".to_string(),
+                    br#"{"type":"sidebar-action","action":"hide"}"#.to_vec(),
+                )?;
+            }
+            "picker" => {
+                self.send_actor_message(
+                    &actor_id,
+                    "pane-close".to_string(),
+                    br#"{"type":"picker-close"}"#.to_vec(),
+                )?;
+            }
+            _ if self.is_init_child(&actor_id) => self.handle_init_stop(actor_id),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     pub fn drain_pending_pane_creations(&mut self) -> impl Iterator<Item = u64> + '_ {
         self.pending_pane_creations.drain(..)
     }
@@ -873,8 +937,19 @@ impl PresentationWasmRuntime {
         self.bound_session_id
     }
 
-    pub const fn bind_session(&mut self, session_id: u64) {
-        self.bound_session_id = Some(session_id);
+    pub fn bind_session_snapshot(&mut self, snapshot: &SessionSnapshot) {
+        self.bound_session_id = Some(snapshot.active);
+        self.session_workspaces = snapshot
+            .sessions
+            .iter()
+            .map(|session| {
+                let directory = session
+                    .working_directory
+                    .as_deref()
+                    .unwrap_or(&session.project_directory);
+                (session.id, PathBuf::from(directory))
+            })
+            .collect();
     }
 
     pub fn send_actor_message(
@@ -1136,6 +1211,18 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::Key { pane, .. }
         | PresentationEvent::Text { pane, .. } => *pane,
     }
+}
+
+fn init_child_session(actor_id: &str, active_session: Option<u64>) -> Option<u64> {
+    if matches!(actor_id, "session-switcher" | "picker") {
+        return None;
+    }
+    actor_id
+        .split("-s")
+        .nth(1)
+        .and_then(|suffix| suffix.split('-').next())
+        .and_then(|session| session.parse().ok())
+        .or(active_session)
 }
 
 #[cfg(test)]

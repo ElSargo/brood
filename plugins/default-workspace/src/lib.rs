@@ -210,7 +210,16 @@ pub extern "C" fn brood_policy_provider_key_workspace(
         return if input.key_state == KEY_RELEASED || input.repeat {
             write_consume(output, &[])
         } else {
-            write_consume(output, &[Message::CodingAgentAction("new-ui")])
+            write_consume(output, &[Message::CodingAgentAction("picker")])
+        };
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_Q
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::LayoutAction("close-active-pane")])
         };
     }
 

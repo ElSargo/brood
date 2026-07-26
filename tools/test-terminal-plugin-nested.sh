@@ -512,10 +512,11 @@ capture "$OUT/terminal-shell-exited.png"
 
 SPAWN_STARTED_MS="$(date +%s%3N)"
 wayland_env "$OUT/virtual-keyboard-key" 20
+DYNAMIC_UI="terminal-ui-s1-2"
 for _ in $(seq 1 300); do
   STATUS_SPAWNED="$(ctl status-json)"
-  DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" terminal-ui-2)"
-  if rg -q "started presentation WASM actor id=terminal-ui-2" "$CLIENT2_LOG" \
+  DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" "$DYNAMIC_UI")"
+  if rg -q "started presentation WASM actor id=$DYNAMIC_UI" "$CLIENT2_LOG" \
     && jq -e \
       --argjson exited "$STATUS_EXITED" \
       '
@@ -530,7 +531,7 @@ for _ in $(seq 1 300); do
   sleep 0.05
 done
 SPAWN_PRESENT_MS=$(( $(date +%s%3N) - SPAWN_STARTED_MS ))
-rg -q "started presentation WASM actor id=terminal-ui-2" "$CLIENT2_LOG"
+rg -q "started presentation WASM actor id=$DYNAMIC_UI" "$CLIENT2_LOG"
 jq -e \
   --argjson exited "$STATUS_EXITED" \
   '
@@ -544,7 +545,7 @@ jq -e \
 DYNAMIC_BASELINE="$(jq -r '.pty_bytes // 0' <<< "$DYNAMIC_METRIC")"
 type_line 'printf "\033[35m__CTRL_ALT_T_TERMINAL__\033[0m λ中\n"'
 for _ in $(seq 1 200); do
-  DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" terminal-ui-2)"
+  DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" "$DYNAMIC_UI")"
   DYNAMIC_BYTES="$(jq -r '.pty_bytes // 0' <<< "$DYNAMIC_METRIC")"
   ((DYNAMIC_BYTES > DYNAMIC_BASELINE + 16)) && break
   sleep 0.05
@@ -554,7 +555,7 @@ capture "$OUT/terminal-ctrl-alt-t.png"
 
 type_line 'exit'
 for _ in $(seq 1 300); do
-  DYNAMIC_EXIT_METRIC="$(last_actor_metric "$CLIENT2_LOG" terminal-ui-2)"
+  DYNAMIC_EXIT_METRIC="$(last_actor_metric "$CLIENT2_LOG" "$DYNAMIC_UI")"
   STATUS_FINAL_EXIT="$(ctl status-json)"
   if jq -e '.exited == true' <<< "$DYNAMIC_EXIT_METRIC" > /dev/null \
     && jq -e \
@@ -691,7 +692,7 @@ jq -n \
       presentation_reconnect: true,
       ctrl_alt_t_spawn: {
         session_actor: "terminal-session-2",
-        presentation_actor: "terminal-ui-2",
+        presentation_actor: "terminal-ui-s1-2",
         spawn_to_present_ms: $spawn_present_ms,
         pty_bytes: $shortcut_terminal.pty_bytes,
         child_exit: $shortcut_terminal.exited
@@ -755,7 +756,7 @@ cat > "$OUT/proof.md" <<EOF
 - shell: real allowlisted sh PTY in $ROOT
 - terminal environment: xterm-256color with truecolor intent, rendered by guest-parsed ANSI runs
 - input: real Wayland key/text events through the focused external presentation client
-- product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-2 actors, focused the new pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
+- product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-s1-2 actors, focused the new session-scoped pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
 - keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
 - color policy: the controlled PTY profile removed ambient NO_COLOR, retained xterm-256color/truecolor, and rendered a real lazygit screen in terminal-lazygit-color.png
 - managed GUI descendants: the terminal shell inherited the backend Wayland socket and isolated session bus; a real Ghostty child mapped inside Brood in terminal-ghostty-managed.png instead of opening through the host Ghostty instance

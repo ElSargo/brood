@@ -3,7 +3,10 @@ wit_bindgen::generate!({
     world: "brood-plugin",
 });
 
-use std::{collections::BTreeSet, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
 use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect};
@@ -24,7 +27,7 @@ const DIFF_VIEWER_COMPONENT_FILE: &str = "brood_diff_viewer_plugin.component.was
 const TERMINAL_UI_COMPONENT_FILE: &str = "brood_terminal_ui_plugin.component.wasm";
 const TERMINAL_UI_ID: &str = "terminal-ui";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
-const DIFF_VIEWER_ID: &str = "diff-viewer";
+const DIFF_VIEWER_ID_PREFIX: &str = "diff-viewer-s";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
 const HEADER_HEIGHT: f32 = 104.0;
@@ -97,7 +100,11 @@ struct SwitcherState {
     error: bool,
     next_coding_agent_ui: u64,
     coding_agent_uis: Vec<String>,
-    diff_viewer_running: bool,
+    coding_agent_targets: BTreeMap<String, String>,
+    agents: Vec<WireAgent>,
+    agent_picker_pending: bool,
+    diff_viewers: BTreeSet<String>,
+    terminal_uis: BTreeMap<String, u64>,
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
@@ -171,7 +178,26 @@ struct TerminalActionMessage {
 #[derive(Deserialize)]
 struct TerminalLifecycleMessage {
     kind: serde_json_core::heapless::String<32>,
+    #[serde(default)]
+    session_id: u64,
     terminal: Option<serde_json_core::heapless::String<64>>,
+}
+
+#[derive(Clone, Deserialize)]
+struct AgentRegistryMessage {
+    kind: serde_json_core::heapless::String<32>,
+    #[serde(default)]
+    session_id: u64,
+    #[serde(default)]
+    agents: Vec<WireAgent>,
+}
+
+#[derive(Clone, Deserialize)]
+struct WireAgent {
+    id: String,
+    status: String,
+    model: String,
+    reasoning: String,
 }
 
 #[derive(Deserialize)]
@@ -202,7 +228,10 @@ struct SessionPickerResult {
 
 #[derive(Deserialize)]
 struct SessionPickerValue {
-    session: u64,
+    #[serde(default)]
+    session: Option<u64>,
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +262,27 @@ struct SessionPickerValueWire {
     session: u64,
 }
 
+#[derive(Serialize)]
+struct AgentPickerRequest<'a> {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    title: &'static str,
+    placeholder: &'static str,
+    items: Vec<AgentPickerItem<'a>>,
+}
+
+#[derive(Serialize)]
+struct AgentPickerItem<'a> {
+    label: &'a str,
+    detail: String,
+    value: AgentPickerValue<'a>,
+}
+
+#[derive(Serialize)]
+struct AgentPickerValue<'a> {
+    agent: &'a str,
+}
+
 impl SwitcherState {
     const fn new() -> Self {
         Self {
@@ -253,7 +303,11 @@ impl SwitcherState {
             error: false,
             next_coding_agent_ui: 2,
             coding_agent_uis: Vec::new(),
-            diff_viewer_running: false,
+            coding_agent_targets: BTreeMap::new(),
+            agents: Vec::new(),
+            agent_picker_pending: false,
+            diff_viewers: BTreeSet::new(),
+            terminal_uis: BTreeMap::new(),
             text_resources: Vec::new(),
             layout: None,
             workspace_focus: None,
@@ -419,12 +473,12 @@ impl Guest for SessionSwitcher {
                             path: PICKER_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
                         }),
-                        start_coding_agent_ui(CODING_AGENT_UI_ID),
                         ActorCommand::StartActor(ActorStartRequest {
                             id: TERMINAL_UI_ID.to_string(),
                             path: TERMINAL_UI_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
                         }),
+                        subscribe_agent_registry(context.session_id.unwrap_or_default()),
                         ActorCommand::LifecycleComplete(Ok(())),
                     ]
                 } else {
@@ -434,9 +488,20 @@ impl Guest for SessionSwitcher {
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
-            Event::Child(ChildEvent::Started(started)) if started.id == DIFF_VIEWER_ID => {
+            Event::Child(ChildEvent::Started(started))
+                if started.id.starts_with(DIFF_VIEWER_ID_PREFIX) =>
+            {
                 if let Ok(mut state) = STATE.lock() {
-                    state.diff_viewer_running = true;
+                    state.diff_viewers.insert(started.id);
+                }
+                Vec::new()
+            }
+            Event::Child(ChildEvent::Started(started))
+                if started.id == TERMINAL_UI_ID || started.id.starts_with("terminal-ui-s") =>
+            {
+                if let Ok(mut state) = STATE.lock() {
+                    let session = actor_session(&started.id).unwrap_or(state.session_id);
+                    state.terminal_uis.insert(started.id, session);
                 }
                 Vec::new()
             }
@@ -450,27 +515,41 @@ impl Guest for SessionSwitcher {
                 if !state.coding_agent_uis.contains(&started.id) {
                     state.coding_agent_uis.push(started.id.clone());
                 }
-                vec![bind_coding_agent_ui(&started.id, state.session_id)]
+                let target = state.coding_agent_targets.remove(&started.id);
+                vec![bind_coding_agent_ui(
+                    &started.id,
+                    actor_session(&started.id).unwrap_or(state.session_id),
+                    target.as_deref(),
+                )]
             }
             Event::Child(ChildEvent::Stopped(id)) => {
-                if let Ok(mut state) = STATE.lock() {
-                    state.coding_agent_uis.retain(|actor| actor != &id);
-                    if id == DIFF_VIEWER_ID {
-                        state.diff_viewer_running = false;
-                    }
-                }
-                Vec::new()
+                let Ok(mut state) = STATE.lock() else {
+                    return Vec::new();
+                };
+                state.coding_agent_uis.retain(|actor| actor != &id);
+                state.coding_agent_targets.remove(&id);
+                state.diff_viewers.remove(&id);
+                state
+                    .terminal_uis
+                    .remove(&id)
+                    .and_then(|session| stop_terminal_command(session, &id))
+                    .into_iter()
+                    .collect()
             }
             Event::Child(ChildEvent::Failed(failed)) => {
-                if let Ok(mut state) = STATE.lock() {
-                    state.coding_agent_uis.retain(|actor| actor != &failed.id);
-                    if failed.id == DIFF_VIEWER_ID {
-                        state.diff_viewer_running = false;
-                    }
-                    state.error = true;
-                    state.status = format!("Agent UI failed: {}", failed.message);
-                }
-                Vec::new()
+                let Ok(mut state) = STATE.lock() else {
+                    return Vec::new();
+                };
+                state.coding_agent_uis.retain(|actor| actor != &failed.id);
+                state.coding_agent_targets.remove(&failed.id);
+                state.diff_viewers.remove(&failed.id);
+                let stop = state
+                    .terminal_uis
+                    .remove(&failed.id)
+                    .and_then(|session| stop_terminal_command(session, &failed.id));
+                state.error = true;
+                state.status = format!("Plugin pane failed: {}", failed.message);
+                stop.into_iter().collect()
             }
             Event::Presentation(event) => handle_presentation(event),
             Event::Session(event) => handle_session_event(event),
@@ -484,7 +563,7 @@ impl Guest for SessionSwitcher {
                 handle_picker_message(&message.body)
             }
             Event::Mailbox(message) if message.sender.starts_with("session:") => {
-                handle_terminal_lifecycle(&message.body)
+                handle_session_message(&message.body)
             }
             _ => Vec::new(),
         }
@@ -505,11 +584,8 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
             state.session_id = snapshot.active;
             apply_snapshot(&mut state, snapshot);
             if active_changed {
-                state
-                    .coding_agent_uis
-                    .iter()
-                    .map(|actor| bind_coding_agent_ui(actor, state.session_id))
-                    .collect()
+                state.agents.clear();
+                vec![subscribe_agent_registry(state.session_id)]
             } else {
                 Vec::new()
             }
@@ -704,14 +780,16 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
         && consumed == bytes.len()
         && message.kind.as_str() == "coding-agent-action"
-        && message.action.as_str() == "new-ui"
+        && message.action.as_str() == "picker"
     {
         let Ok(mut state) = STATE.lock() else {
             return Vec::new();
         };
-        let id = format!("coding-agent-ui-{}", state.next_coding_agent_ui);
-        state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
-        return vec![start_coding_agent_ui(&id)];
+        if state.agents.is_empty() {
+            state.agent_picker_pending = true;
+            return vec![subscribe_agent_registry(state.session_id)];
+        }
+        return open_agent_picker(&mut state);
     }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
         && consumed == bytes.len()
@@ -721,11 +799,15 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         let Ok(mut state) = STATE.lock() else {
             return Vec::new();
         };
-        state.diff_viewer_running = !state.diff_viewer_running;
-        return if state.diff_viewer_running {
-            vec![start_diff_viewer()]
+        let id = format!("{DIFF_VIEWER_ID_PREFIX}{}", state.session_id);
+        return if state.diff_viewers.contains(&id) {
+            vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+                actor: id,
+                body: br#"{"kind":"focus"}"#.to_vec(),
+            })]
         } else {
-            vec![ActorCommand::StopActor(DIFF_VIEWER_ID.to_string())]
+            state.diff_viewers.insert(id.clone());
+            vec![start_diff_viewer(&id)]
         };
     }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
@@ -785,6 +867,26 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     publish_layout(&state, false, requested_focus)
 }
 
+fn handle_session_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<AgentRegistryMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "registry"
+    {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        if message.session_id != state.session_id {
+            return Vec::new();
+        }
+        state.agents = message.agents;
+        if state.agent_picker_pending && !state.agents.is_empty() {
+            return open_agent_picker(&mut state);
+        }
+        return Vec::new();
+    }
+    handle_terminal_lifecycle(bytes)
+}
+
 fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalLifecycleMessage>(bytes)
     else {
@@ -799,8 +901,18 @@ fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
     let Some(suffix) = terminal.as_str().strip_prefix("terminal-session-") else {
         return Vec::new();
     };
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let session_id = if message.session_id == 0 {
+        state.session_id
+    } else {
+        message.session_id
+    };
+    let id = format!("terminal-ui-s{session_id}-{suffix}");
+    state.terminal_uis.insert(id.clone(), session_id);
     vec![ActorCommand::StartActor(ActorStartRequest {
-        id: format!("terminal-ui-{suffix}"),
+        id,
         path: TERMINAL_UI_COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
     })]
@@ -879,13 +991,30 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    let request = state.next_request();
-    vec![session_command(
-        request,
-        SessionOperation::Activate,
-        Some(message.result.value.session),
-        None,
-    )]
+    if let Some(session) = message.result.value.session {
+        let request = state.next_request();
+        return vec![session_command(
+            request,
+            SessionOperation::Activate,
+            Some(session),
+            None,
+        )];
+    }
+    let Some(agent) = message.result.value.agent else {
+        return Vec::new();
+    };
+    if !state.agents.iter().any(|available| available.id == agent) {
+        state.error = true;
+        state.status = "The selected agent is no longer available".to_string();
+        return Vec::new();
+    }
+    let id = format!(
+        "coding-agent-ui-s{}-{}",
+        state.session_id, state.next_coding_agent_ui
+    );
+    state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
+    state.coding_agent_targets.insert(id.clone(), agent);
+    vec![start_coding_agent_ui(&id)]
 }
 
 fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
@@ -922,9 +1051,37 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     })]
 }
 
-fn start_diff_viewer() -> ActorCommand {
+fn open_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    state.agent_picker_pending = false;
+    let items = state
+        .agents
+        .iter()
+        .map(|agent| AgentPickerItem {
+            label: &agent.id,
+            detail: format!("{} · {} · {}", agent.status, agent.model, agent.reasoning),
+            value: AgentPickerValue { agent: &agent.id },
+        })
+        .collect::<Vec<_>>();
+    let request = AgentPickerRequest {
+        message_type: "picker-create",
+        title: "Open coding agent",
+        placeholder: "Type to fuzzy-match agents in this session…",
+        items,
+    };
+    let Ok(body) = serde_json::to_vec(&request) else {
+        state.error = true;
+        state.status = "Could not encode the agent picker".to_string();
+        return Vec::new();
+    };
+    vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body,
+    })]
+}
+
+fn start_diff_viewer(id: &str) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
-        id: DIFF_VIEWER_ID.to_string(),
+        id: id.to_string(),
         path: DIFF_VIEWER_COMPONENT_FILE.to_string(),
         capabilities: vec![
             "filesystem:workspace-read".to_string(),
@@ -941,11 +1098,50 @@ fn start_coding_agent_ui(id: &str) -> ActorCommand {
     })
 }
 
-fn bind_coding_agent_ui(id: &str, session_id: u64) -> ActorCommand {
+fn bind_coding_agent_ui(id: &str, session_id: u64, agent: Option<&str>) -> ActorCommand {
     ActorCommand::SendLocalMessage(LocalActorMessage {
         actor: id.to_string(),
-        body: format!(r#"{{"kind":"bind","session_id":{session_id}}}"#).into_bytes(),
+        body: format!(
+            r#"{{"kind":"bind","session_id":{session_id},"agent":"{}"}}"#,
+            agent.unwrap_or_default()
+        )
+        .into_bytes(),
     })
+}
+
+fn subscribe_agent_registry(session_id: u64) -> ActorCommand {
+    ActorCommand::SendSessionMessage(SessionActorMessage {
+        session_id,
+        actor: "init".to_string(),
+        body: br#"{"kind":"registry-subscribe"}"#.to_vec(),
+    })
+}
+
+fn actor_session(actor: &str) -> Option<u64> {
+    actor
+        .split("-s")
+        .nth(1)
+        .and_then(|suffix| suffix.split('-').next())
+        .and_then(|session| session.parse().ok())
+}
+
+fn stop_terminal_command(session_id: u64, ui_actor: &str) -> Option<ActorCommand> {
+    let terminal = if ui_actor == TERMINAL_UI_ID {
+        "terminal-session".to_string()
+    } else {
+        let suffix = ui_actor.strip_prefix("terminal-ui-s")?.split_once('-')?.1;
+        format!("terminal-session-{suffix}")
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "kind": "stop-terminal",
+        "terminal": terminal,
+    }))
+    .ok()?;
+    Some(ActorCommand::SendSessionMessage(SessionActorMessage {
+        session_id,
+        actor: "init".to_string(),
+        body,
+    }))
 }
 
 fn publish_layout(
