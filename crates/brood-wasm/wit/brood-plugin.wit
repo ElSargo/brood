@@ -317,6 +317,13 @@ interface actor {
         body: list<u8>,
     }
 
+    /// Explicit address for an actor in the daemon realm. `actor` is either
+    /// `init` for the blessed root or a child ID published by that root.
+    record daemon-actor-message {
+        actor: string,
+        body: list<u8>,
+    }
+
     /// Explicit address for another actor in the sender's current realm.
     record local-actor-message {
         actor: string,
@@ -399,6 +406,11 @@ interface actor {
         /// Authority requested for the child actor. The realm host validates
         /// these declarations before constructing the child generation.
         capabilities: list<string>,
+        /// Immutable session association for a presentation child and its
+        /// default pane. `none` denotes presentation-global state. Session
+        /// realm hosts already supply their enclosing session and ignore this
+        /// presentation-only association.
+        session-id: option<u64>,
     }
     record actor-started { id: string, generation: u64 }
     record actor-failed { id: string, message: string }
@@ -501,7 +513,6 @@ interface actor {
         refresh,
         activate,
         create,
-        create-worktree,
         rename,
         close,
     }
@@ -572,6 +583,10 @@ interface actor {
         /// in a connected surface-session realm. Only presentation actors have
         /// this cross-placement capability.
         send-session-message(session-actor-message),
+        /// Asynchronously enqueue a message for an explicitly addressed actor
+        /// in the daemon realm. Only presentation actors have this
+        /// cross-placement capability.
+        send-daemon-message(daemon-actor-message),
         /// Asynchronously enqueue a message for another actor in this realm.
         send-local-message(local-actor-message),
         /// Asynchronously enqueue a message for an actor in the presentation

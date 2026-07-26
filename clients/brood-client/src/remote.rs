@@ -26,7 +26,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::{
     ClientEvent, FrameResource, PresentationWindowSummary, SceneWindowUpdate,
-    actor_runtime::{SessionActorMessageRequest, SessionCommandEnvelope},
+    actor_runtime::{BackendActorMessageRequest, SessionCommandEnvelope},
 };
 use brood_wasm::{
     SessionCommandCompletion, SessionOperation as WasmSessionOperation, SessionSnapshot,
@@ -447,8 +447,8 @@ fn handle_reliable_message(
                 windows,
             }
         }
-        ServerMessage::Actor(message) => ClientEvent::SessionActorMessage {
-            session_id: message.session,
+        ServerMessage::Actor(message) => ClientEvent::BackendActorMessage {
+            realm: message.realm,
             sender: message.sender,
             recipient: message.recipient,
             body: message.body,
@@ -821,10 +821,10 @@ impl RemoteActorMessageLane {
         }
     }
 
-    pub fn send(&mut self, message: &SessionActorMessageRequest) -> Result<()> {
+    pub fn send(&mut self, message: &BackendActorMessageRequest) -> Result<()> {
         self.flush_deferred();
         let command = ReliableCommand::Actor(ActorMessage {
-            session: message.session_id,
+            realm: message.realm,
             sender: message.sender.clone(),
             recipient: message.actor.clone(),
             body: message.body.clone(),
@@ -897,9 +897,6 @@ impl RemoteBackendCommandLane {
             WasmSessionOperation::Refresh => brood_protocol::SessionOperation::Refresh,
             WasmSessionOperation::Activate => brood_protocol::SessionOperation::Activate,
             WasmSessionOperation::Create => brood_protocol::SessionOperation::Create,
-            WasmSessionOperation::CreateWorktree => {
-                brood_protocol::SessionOperation::CreateWorktree
-            }
             WasmSessionOperation::Rename => brood_protocol::SessionOperation::Rename,
             WasmSessionOperation::Close => brood_protocol::SessionOperation::Close,
         };

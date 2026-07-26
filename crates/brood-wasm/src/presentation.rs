@@ -190,7 +190,6 @@ pub enum SessionOperation {
     Refresh,
     Activate,
     Create,
-    CreateWorktree,
     Rename,
     Close,
 }

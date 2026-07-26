@@ -230,7 +230,7 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
             let session_id = context.session_id.unwrap_or_default();
             set_root_state(true, session_id);
             vec![
-                start_ui_command(UI_ID),
+                start_ui_command(UI_ID, session_id),
                 ActorCommand::LifecycleComplete(Ok(())),
             ]
         }
@@ -274,11 +274,12 @@ fn set_root_state(client: bool, session_id: u64) {
     });
 }
 
-fn start_ui_command(id: &str) -> ActorCommand {
+fn start_ui_command(id: &str, session_id: u64) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
         id: id.to_string(),
         path: COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
+        session_id: Some(session_id),
     })
 }
 
@@ -290,6 +291,7 @@ fn start_agent_command(id: &str) -> ActorCommand {
             "filesystem:workspace-write".to_string(),
             "subprocess:codex".to_string(),
         ],
+        session_id: None,
     })
 }
 
@@ -381,7 +383,7 @@ fn handle_root_message(
             ("coding-agent-action", "new-ui") if sender == "key-policy" => {
                 let id = format!("coding-agent-ui-{}", root.next_ui);
                 root.next_ui = root.next_ui.saturating_add(1);
-                vec![start_ui_command(&id)]
+                vec![start_ui_command(&id, root.session_id)]
             }
             _ => Vec::new(),
         };

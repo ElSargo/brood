@@ -2866,14 +2866,27 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
             let body = message.body()?.to_vec();
             Ok::<_, brood_ipc::ActorMessageLaneError>((sender, recipient, body))
         })();
-        let session = SurfaceSessionId::from_raw(message.session_id());
+        let realm = message.realm();
         drop(message);
-        messages.push((session, decoded));
+        messages.push((realm, decoded));
     }
     state.dmabuf.fast_path = Some(fast_path);
-    for (session, decoded) in messages {
-        match decoded {
-            Ok((sender, recipient, body)) => {
+    for (realm, decoded) in messages {
+        match (realm, decoded) {
+            (Ok(brood_protocol::BackendActorRealm::Daemon), Ok((sender, recipient, body))) => {
+                if let Err(error) = state.send_daemon_actor_message(&recipient, &sender, body) {
+                    warn!(
+                        actor = %recipient,
+                        error = %error,
+                        "rejected presentation-to-daemon actor message"
+                    );
+                }
+            }
+            (
+                Ok(brood_protocol::BackendActorRealm::Session(session)),
+                Ok((sender, recipient, body)),
+            ) => {
+                let session = SurfaceSessionId::from_raw(session);
                 if let Err(error) =
                     state.send_session_actor_message(session, &recipient, &sender, body)
                 {
@@ -2885,7 +2898,8 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
                     );
                 }
             }
-            Err(error) => warn!(error = %error, "rejected malformed actor-message record"),
+            (Err(error), _) => warn!(error = %error, "rejected malformed actor-message realm"),
+            (_, Err(error)) => warn!(error = %error, "rejected malformed actor-message record"),
         }
     }
 }

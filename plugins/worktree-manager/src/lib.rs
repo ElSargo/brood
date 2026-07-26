@@ -20,6 +20,11 @@ const UNUSED_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum HostRequest {
+    CreateWorktreeSession {
+        request: u64,
+        source_session: u64,
+        branch: String,
+    },
     Acquire {
         request: u64,
         project_id: String,
@@ -214,16 +219,14 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
     let Ok(request) = serde_json::from_slice::<HostRequest>(bytes) else {
         return Vec::new();
     };
-    let authorized = matches!(
-        (&request, sender),
+    let authorized = match (&request, sender) {
+        (HostRequest::CreateWorktreeSession { .. }, sender) => sender.starts_with("presentation:"),
         (HostRequest::Acquire { .. }, "host:control")
-            | (
-                HostRequest::Attached { .. } | HostRequest::Released { .. },
-                "host:session"
-            )
-            | (HostRequest::Bootstrap { .. }, "host")
-            | (HostRequest::Maintenance { .. }, "host:maintenance")
-    );
+        | (HostRequest::Attached { .. } | HostRequest::Released { .. }, "host:session")
+        | (HostRequest::Bootstrap { .. }, "host")
+        | (HostRequest::Maintenance { .. }, "host:maintenance") => true,
+        _ => false,
+    };
     if !authorized {
         return Vec::new();
     }
@@ -231,6 +234,26 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
         return Vec::new();
     };
     match request {
+        HostRequest::CreateWorktreeSession {
+            request,
+            source_session,
+            branch,
+        } => {
+            let value = serde_json::json!({
+                "type": "worktree-session-requested",
+                "request": request,
+                "source_session": source_session,
+                "branch": branch,
+                "presentation_actor": sender
+                    .strip_prefix("presentation:")
+                    .unwrap_or(sender),
+            });
+            serde_json::to_vec(&value)
+                .ok()
+                .map(Command::SendHostMessage)
+                .into_iter()
+                .collect()
+        }
         HostRequest::Acquire {
             request,
             project_id,

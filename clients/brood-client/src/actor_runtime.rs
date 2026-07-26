@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use brood_protocol::BackendActorRealm;
 use brood_wasm::{
     ActorId, ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentChildEvent,
     FilesystemGrant, HostedWasmActor, LegacyWasmActorGeneration, LegacyWasmRuntimeEvent, Mailbox,
@@ -38,7 +39,7 @@ pub struct PresentationWasmRuntime {
     event_proxy: Option<EventLoopProxy<ClientEvent>>,
     graphics: Option<PluginGraphicsBridge>,
     init: Option<PresentationInitState>,
-    outbound_session_messages: VecDeque<SessionActorMessageRequest>,
+    outbound_backend_messages: VecDeque<BackendActorMessageRequest>,
     outbound_session_commands: VecDeque<SessionCommandEnvelope>,
     outbound_host_messages: VecDeque<HostActorMessage>,
     pending_pane_creations: VecDeque<u64>,
@@ -49,9 +50,9 @@ pub struct PresentationWasmRuntime {
     session_workspaces: BTreeMap<u64, PathBuf>,
 }
 
-pub struct SessionActorMessageRequest {
+pub struct BackendActorMessageRequest {
     pub sender: String,
-    pub session_id: u64,
+    pub realm: BackendActorRealm,
     pub actor: String,
     pub body: Vec<u8>,
 }
@@ -121,7 +122,7 @@ impl PresentationWasmRuntime {
             event_proxy,
             graphics: graphics.cloned(),
             init: None,
-            outbound_session_messages: VecDeque::new(),
+            outbound_backend_messages: VecDeque::new(),
             outbound_session_commands: VecDeque::new(),
             outbound_host_messages: VecDeque::new(),
             pending_pane_creations: VecDeque::new(),
@@ -427,8 +428,9 @@ impl PresentationWasmRuntime {
                     id,
                     path,
                     capabilities,
+                    session_id,
                 } if actor_id == CLIENT_INIT_ACTOR_ID => {
-                    self.handle_init_start(id, &path, &capabilities, graphics);
+                    self.handle_init_start(id, &path, &capabilities, session_id, graphics);
                 }
                 ComponentActorEvent::ActorStopRequested { id }
                     if actor_id == CLIENT_INIT_ACTOR_ID =>
@@ -488,18 +490,39 @@ impl PresentationWasmRuntime {
                     actor,
                     body,
                 } => {
+                    let sender_session = self
+                        .actors
+                        .get(&actor_id)
+                        .with_context(|| format!("presentation actor {actor_id:?} is unavailable"))?
+                        .session;
                     ensure!(
-                        self.bound_session_id == Some(session_id),
-                        "presentation actor addressed session {session_id} outside its bound viewport"
+                        sender_session == Some(session_id)
+                            || sender_session.is_none()
+                                && (self.session_workspaces.contains_key(&session_id)
+                                    || self.bound_session_id == Some(session_id)),
+                        "presentation actor {actor_id:?} addressed session {session_id} outside its association"
                     );
                     ensure!(
-                        self.outbound_session_messages.len() < 64,
-                        "presentation actor session-message queue is full"
+                        self.outbound_backend_messages.len() < 64,
+                        "presentation actor backend-message queue is full"
                     );
-                    self.outbound_session_messages
-                        .push_back(SessionActorMessageRequest {
+                    self.outbound_backend_messages
+                        .push_back(BackendActorMessageRequest {
                             sender: actor_id,
-                            session_id,
+                            realm: BackendActorRealm::Session(session_id),
+                            actor,
+                            body,
+                        });
+                }
+                ComponentActorEvent::DaemonMessageRequested { actor, body } => {
+                    ensure!(
+                        self.outbound_backend_messages.len() < 64,
+                        "presentation actor backend-message queue is full"
+                    );
+                    self.outbound_backend_messages
+                        .push_back(BackendActorMessageRequest {
+                            sender: actor_id,
+                            realm: BackendActorRealm::Daemon,
                             actor,
                             body,
                         });
@@ -559,9 +582,10 @@ impl PresentationWasmRuntime {
         id: String,
         guest_path: &str,
         capabilities: &[String],
+        session: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
     ) {
-        let result = self.start_init_child(&id, guest_path, capabilities, graphics);
+        let result = self.start_init_child(&id, guest_path, capabilities, session, graphics);
         match result {
             Ok(generation) => {
                 self.send_init_child_event(ComponentChildEvent::Started { id, generation });
@@ -578,6 +602,7 @@ impl PresentationWasmRuntime {
         id: &str,
         guest_path: &str,
         capabilities: &[String],
+        session: Option<u64>,
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<u64> {
         ensure!(
@@ -632,7 +657,13 @@ impl PresentationWasmRuntime {
             "init child actors must use the hosted Component or Preview 1 runtime"
         );
         let pane = self.allocate_actor_pane()?;
-        let session = init_child_session(&spec.id, self.bound_session_id);
+        if let Some(session) = session {
+            ensure!(
+                self.session_workspaces.contains_key(&session)
+                    || self.bound_session_id == Some(session),
+                "presentation child requested unknown session {session}"
+            );
+        }
         self.load_actor(spec, pane, session, graphics, capabilities)?;
         let generation = self
             .actors
@@ -767,8 +798,8 @@ impl PresentationWasmRuntime {
         })
     }
 
-    pub fn drain_session_messages(&mut self) -> Vec<SessionActorMessageRequest> {
-        self.outbound_session_messages.drain(..).collect()
+    pub fn drain_backend_messages(&mut self) -> Vec<BackendActorMessageRequest> {
+        self.outbound_backend_messages.drain(..).collect()
     }
 
     pub fn drain_session_commands(&mut self) -> Vec<SessionCommandEnvelope> {
@@ -933,10 +964,6 @@ impl PresentationWasmRuntime {
             .collect()
     }
 
-    pub const fn bound_session_id(&self) -> Option<u64> {
-        self.bound_session_id
-    }
-
     pub fn bind_session_snapshot(&mut self, snapshot: &SessionSnapshot) {
         self.bound_session_id = Some(snapshot.active);
         self.session_workspaces = snapshot
@@ -950,6 +977,27 @@ impl PresentationWasmRuntime {
                 (session.id, PathBuf::from(directory))
             })
             .collect();
+    }
+
+    pub fn stop_actors_for_closed_sessions(&mut self, snapshot: &SessionSnapshot) {
+        let live = snapshot
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        let stale = self
+            .actors
+            .iter()
+            .filter_map(|(id, actor)| {
+                actor
+                    .session
+                    .filter(|session| !live.contains(session))
+                    .map(|_| id.clone())
+            })
+            .collect::<Vec<_>>();
+        for actor in stale {
+            self.handle_init_stop(actor);
+        }
     }
 
     pub fn send_actor_message(
@@ -970,6 +1018,32 @@ impl PresentationWasmRuntime {
             return self.send_legacy_message(actor_id, payload);
         }
         anyhow::bail!("presentation actor {actor_id:?} is unavailable")
+    }
+
+    pub fn send_backend_actor_message(
+        &self,
+        realm: BackendActorRealm,
+        actor_id: &str,
+        sender: &str,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let actor_session = self
+            .actors
+            .get(actor_id)
+            .with_context(|| format!("presentation actor {actor_id:?} is unavailable"))?
+            .session;
+        if let BackendActorRealm::Session(session) = realm {
+            ensure!(
+                actor_id == CLIENT_INIT_ACTOR_ID || actor_session == Some(session),
+                "session {session} addressed presentation actor {actor_id:?} outside its association"
+            );
+        }
+        let sender = match realm {
+            BackendActorRealm::Daemon => format!("daemon:{sender}"),
+            BackendActorRealm::Session(_) => format!("session:{sender}"),
+        };
+        self.send_actor_message(actor_id, sender, payload)
+            .with_context(|| format!("deliver backend message to presentation actor {actor_id:?}"))
     }
 
     pub fn pane_for_actor(&self, actor: &ActorIdentity) -> Option<u64> {
@@ -1092,6 +1166,7 @@ async fn load_hosted_actor(
                     }),
                     actor_management,
                     session_messaging: true,
+                    daemon_messaging: true,
                     session_control: true,
                     ..ComponentActorConfig::default()
                 },
@@ -1211,18 +1286,6 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::Key { pane, .. }
         | PresentationEvent::Text { pane, .. } => *pane,
     }
-}
-
-fn init_child_session(actor_id: &str, active_session: Option<u64>) -> Option<u64> {
-    if matches!(actor_id, "session-switcher" | "picker") {
-        return None;
-    }
-    actor_id
-        .split("-s")
-        .nth(1)
-        .and_then(|suffix| suffix.split('-').next())
-        .and_then(|session| session.parse().ok())
-        .or(active_session)
 }
 
 #[cfg(test)]

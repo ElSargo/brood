@@ -152,6 +152,7 @@ pub enum ComponentActorEvent {
         id: String,
         path: String,
         capabilities: Vec<String>,
+        session_id: Option<u64>,
     },
     ActorStopRequested {
         id: String,
@@ -162,6 +163,10 @@ pub enum ComponentActorEvent {
     },
     SessionMessageRequested {
         session_id: u64,
+        actor: String,
+        body: Vec<u8>,
+    },
+    DaemonMessageRequested {
         actor: String,
         body: Vec<u8>,
     },
@@ -221,6 +226,9 @@ pub struct ComponentActorConfig {
     /// Admit explicitly addressed presentation-to-session actor messages.
     /// Backend actors never receive this cross-placement capability.
     pub session_messaging: bool,
+    /// Admit explicitly addressed presentation-to-daemon actor messages.
+    /// Backend actors never receive this cross-placement capability.
+    pub daemon_messaging: bool,
     /// Admit explicitly addressed session-to-presentation actor messages.
     /// Presentation actors never receive this cross-placement capability.
     pub presentation_messaging: bool,
@@ -257,6 +265,7 @@ impl Default for ComponentActorConfig {
             actor_management: false,
             app_management: false,
             session_messaging: false,
+            daemon_messaging: false,
             presentation_messaging: false,
             session_control: false,
             epoch_tick_interval: Duration::from_millis(2),
@@ -2344,6 +2353,7 @@ async fn run_component_event_loop(
                                                     id: request.id,
                                                     path: request.path,
                                                     capabilities: request.capabilities,
+                                                    session_id: request.session_id,
                                                 })
                                                 .context("realm init actor request queue is full")?;
                                         }
@@ -2384,6 +2394,22 @@ async fn run_component_event_loop(
                                                     body: request.body,
                                                 })
                                                 .context("session actor message request queue is full")?;
+                                        }
+                                        abi::Command::SendDaemonMessage(request) => {
+                                            ensure!(
+                                                config.daemon_messaging,
+                                                "daemon message requested outside a presentation realm"
+                                            );
+                                            ensure!(
+                                                !request.actor.trim().is_empty(),
+                                                "daemon actor address is invalid"
+                                            );
+                                            event_observer
+                                                .try_send(ComponentActorEvent::DaemonMessageRequested {
+                                                    actor: request.actor,
+                                                    body: request.body,
+                                                })
+                                                .context("daemon actor message request queue is full")?;
                                         }
                                         abi::Command::SendLocalMessage(request) => {
                                             ensure!(
@@ -2759,7 +2785,6 @@ fn component_session_command_from_guest(
         abi::SessionOperation::Refresh => SessionOperation::Refresh,
         abi::SessionOperation::Activate => SessionOperation::Activate,
         abi::SessionOperation::Create => SessionOperation::Create,
-        abi::SessionOperation::CreateWorktree => SessionOperation::CreateWorktree,
         abi::SessionOperation::Rename => SessionOperation::Rename,
         abi::SessionOperation::Close => SessionOperation::Close,
     };
@@ -2775,14 +2800,6 @@ fn component_session_command_from_guest(
         SessionOperation::Create => ensure!(
             request.session.is_none(),
             "create session command does not accept a session ID"
-        ),
-        SessionOperation::CreateWorktree => ensure!(
-            request.session.is_some_and(|session| session != 0)
-                && request
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| !name.trim().is_empty()),
-            "create worktree session command requires a source session ID and non-empty branch"
         ),
         SessionOperation::Rename => ensure!(
             request.session.is_some_and(|session| session != 0)
@@ -2809,7 +2826,6 @@ const fn component_session_operation_to_guest(
         SessionOperation::Refresh => abi::SessionOperation::Refresh,
         SessionOperation::Activate => abi::SessionOperation::Activate,
         SessionOperation::Create => abi::SessionOperation::Create,
-        SessionOperation::CreateWorktree => abi::SessionOperation::CreateWorktree,
         SessionOperation::Rename => abi::SessionOperation::Rename,
         SessionOperation::Close => abi::SessionOperation::Close,
     }

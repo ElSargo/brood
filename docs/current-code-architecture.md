@@ -50,12 +50,14 @@ the server only as the session authority.
 
 ## Presentation Transport
 
-DBus bootstraps the local connection and descriptor exchange. Bounded
+DBus bootstraps the local connection and descriptor exchange and exposes the
+public local control API. Bounded
 shared-memory lanes carry scene inventory, input, configuration, and actor
-messages. DMA-BUF is the preferred per-window image transport; copied images
-remain a correctness fallback. Remote endpoints carry the same semantic
-protocol over independent QUIC streams and use encoded network-frame
-resources. See [[systems/presentation-transport]].
+messages addressed to either a daemon or session realm; product actors do not
+use DBus to message one another. DMA-BUF is the preferred per-window image
+transport; copied images remain a correctness fallback. Remote endpoints carry
+the same semantic protocol over independent QUIC streams and use encoded
+network-frame resources. See [[systems/presentation-transport]].
 
 The server publishes each managed surface tree as an independent window frame.
 The client returns a requested logical content size for a pane. Placement,
@@ -82,9 +84,11 @@ actor, where scoped plugin panes and session windows are composed. The
 picker's pane joins that root fragment as a floating overlay only while one of
 its FIFO-queued mailbox requests is active. The key policy sends ordinary
 sidebar, picker, and pane-lifecycle actions to the init actor; the relevant
-actor updates its child graph or republishes its layout fragment. A plugin pane
-retains its owning surface session across catalogue changes and is visible
-only with that session. Agent UI panes subscribe to the complete registry for
+actor updates its child graph or republishes its layout fragment. Every child
+start records an optional surface-session association; global actors omit it.
+A plugin pane retains that association across catalogue changes and is visible
+only with its session. Empty managed-window inventory does not close a session
+or its plugin actors. Agent UI panes subscribe to the complete registry for
 their owning session.
 
 Picker callers stream items to a stable request ID and receive the original

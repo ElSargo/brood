@@ -133,6 +133,7 @@ fn start_agent(id: &str) -> Command {
             "filesystem:workspace-write".to_string(),
             "subprocess:codex".to_string(),
         ],
+        session_id: None,
     })
 }
 
@@ -141,6 +142,7 @@ fn start_terminal(id: &str) -> Command {
         id: id.to_string(),
         path: TERMINAL_SESSION_COMPONENT_FILE.to_string(),
         capabilities: vec!["pty".to_string(), "subprocess:sh".to_string()],
+        session_id: None,
     })
 }
 
