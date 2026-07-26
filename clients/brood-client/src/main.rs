@@ -24,9 +24,8 @@ use brood_cli::{
     ClientArgs,
     control::{
         ControlTarget, DmabufFrame, PresentationWindowSummary, ServerLaunch, SharedMemoryFrame,
-        activate_surface_session, close_surface_session, connect_or_spawn,
-        create_managed_worktree_session, create_surface_session, dmabuf_resource,
-        open_presentation_fast_path, rename_surface_session, request_dbus_command,
+        activate_surface_session, close_surface_session, connect_or_spawn, create_surface_session,
+        dmabuf_resource, open_presentation_fast_path, rename_surface_session, request_dbus_command,
         resolve_control_target, shared_memory_resource,
     },
 };
@@ -36,7 +35,8 @@ use brood_layout::{
     LocalPoint, ResolvedLayout,
 };
 use brood_protocol::{
-    ArtifactManifest, ArtifactRealm, ClientLifecycle, ClientMessage, InputEvent, PanePosition,
+    ArtifactManifest, ArtifactRealm, BackendActorRealm, ClientLifecycle, ClientMessage, InputEvent,
+    PanePosition,
 };
 use clap::Parser;
 use num_traits::ToPrimitive;
@@ -573,8 +573,8 @@ enum ClientEvent {
         completion: SessionCommandCompletion,
     },
     ActorHostMessagesReady,
-    SessionActorMessage {
-        session_id: u64,
+    BackendActorMessage {
+        realm: BackendActorRealm,
         sender: String,
         recipient: String,
         body: Vec<u8>,
@@ -976,8 +976,8 @@ fn spawn_actor_message_updates(
                 while let Some(message) = messages.try_recv() {
                     let decoded = (|| {
                         Ok::<_, brood_ipc::ActorMessageLaneError>(
-                            ClientEvent::SessionActorMessage {
-                                session_id: message.session_id(),
+                            ClientEvent::BackendActorMessage {
+                                realm: message.realm()?,
                                 sender: message.sender()?.to_string(),
                                 recipient: message.recipient()?.to_string(),
                                 body: message.body()?.to_vec(),
@@ -1047,13 +1047,13 @@ struct LocalActorMessageLane {
 }
 
 impl LocalActorMessageLane {
-    fn send(&mut self, message: &actor_runtime::SessionActorMessageRequest) -> Result<()> {
+    fn send(&mut self, message: &actor_runtime::BackendActorMessageRequest) -> Result<()> {
         self.flush_deferred();
         self.sequence = self.sequence.wrapping_add(1);
         let record = brood_ipc::ActorMessageRecord::new(
             self.generation,
             self.sequence,
-            message.session_id,
+            message.realm,
             &message.sender,
             &message.actor,
             &message.body,
@@ -1097,7 +1097,7 @@ impl LocalActorMessageLane {
 }
 
 impl ActorMessageLane {
-    fn send(&mut self, message: &actor_runtime::SessionActorMessageRequest) -> Result<()> {
+    fn send(&mut self, message: &actor_runtime::BackendActorMessageRequest) -> Result<()> {
         match self {
             Self::Local(lane) => lane.send(message),
             Self::Remote(lane) => lane.send(message),
@@ -1353,12 +1353,6 @@ fn execute_session_command(
         SessionOperation::Create => {
             create_surface_session(target, name.unwrap_or_default()).map(Some)
         }
-        SessionOperation::CreateWorktree => session
-            .context("create worktree request is missing a source session ID")
-            .and_then(|session| {
-                let branch = name.context("create worktree request is missing a branch name")?;
-                create_managed_worktree_session(target, session, branch).map(Some)
-            }),
         SessionOperation::Rename => session
             .context("rename request is missing a session ID")
             .and_then(|session| {
@@ -1714,7 +1708,7 @@ impl Application {
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
             }
-            ClientEvent::SessionActorMessage { .. } => {
+            ClientEvent::BackendActorMessage { .. } => {
                 return Err(anyhow!(
                     "session actor message reached scene transport path"
                 ));
@@ -2188,72 +2182,74 @@ impl Application {
     }
 
     fn drain_wasm_events(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        let result =
-            (|| {
-                let Some(runtime) = self.wasm_runtime.as_mut() else {
-                    return Ok(());
-                };
-                runtime.drain_events()?;
-                let pane_sessions = runtime.pane_sessions().collect::<Vec<_>>();
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.set_plugin_pane_sessions(&pane_sessions);
+        let result = (|| {
+            let Some(runtime) = self.wasm_runtime.as_mut() else {
+                return Ok(());
+            };
+            runtime.drain_events()?;
+            let pane_sessions = runtime.pane_sessions().collect::<Vec<_>>();
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_plugin_pane_sessions(&pane_sessions);
+            }
+            if let Some(renderer) = self.renderer.as_ref() {
+                let (width, height, scale) = renderer.logical_extent();
+                let panes = runtime.drain_pending_pane_creations().collect::<Vec<_>>();
+                for pane in panes {
+                    runtime.send_presentation_event(PresentationEvent::PaneCreated {
+                        pane,
+                        width,
+                        height,
+                        scale,
+                    })?;
                 }
-                if let Some(renderer) = self.renderer.as_ref() {
-                    let (width, height, scale) = renderer.logical_extent();
-                    let panes = runtime.drain_pending_pane_creations().collect::<Vec<_>>();
-                    for pane in panes {
-                        runtime.send_presentation_event(PresentationEvent::PaneCreated {
-                            pane,
-                            width,
-                            height,
-                            scale,
-                        })?;
+            }
+            let panes = runtime.drain_pending_pane_removals().collect::<Vec<_>>();
+            if let Some(renderer) = self.renderer.as_mut() {
+                for pane in panes {
+                    let change = renderer.remove_plugin_pane(pane);
+                    if let Some(change) = change {
+                        dispatch_focus_change(
+                            Some(runtime),
+                            self.input_sender.as_mut(),
+                            change,
+                            self.window_focused,
+                        )?;
                     }
                 }
-                let panes = runtime.drain_pending_pane_removals().collect::<Vec<_>>();
-                if let Some(renderer) = self.renderer.as_mut() {
-                    for pane in panes {
-                        let change = renderer.remove_plugin_pane(pane);
-                        if let Some(change) = change {
-                            dispatch_focus_change(
-                                Some(runtime),
-                                self.input_sender.as_mut(),
-                                change,
-                                self.window_focused,
-                            )?;
-                        }
-                    }
+            }
+            let messages = runtime.drain_backend_messages();
+            let commands = runtime.drain_session_commands();
+            if !commands.is_empty() {
+                let lane = self
+                    .backend_commands
+                    .as_ref()
+                    .context("presentation actor requested session control without a backend")?;
+                for command in commands {
+                    lane.try_send_session(command)?;
                 }
-                let messages = runtime.drain_session_messages();
-                let commands = runtime.drain_session_commands();
-                if !commands.is_empty() {
-                    let lane = self.backend_commands.as_ref().context(
-                        "presentation actor requested session control without a backend",
-                    )?;
-                    for command in commands {
-                        lane.try_send_session(command)?;
+            }
+            if !messages.is_empty() {
+                let lane = self
+                    .actor_message_sender
+                    .as_mut()
+                    .context("presentation actor requested a backend message without a backend")?;
+                for message in &messages {
+                    if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
+                        && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "presentation actor message realm={:?} sender={} recipient={} body={}",
+                            message.realm,
+                            message.sender,
+                            message.actor,
+                            String::from_utf8_lossy(&message.body)
+                        );
                     }
+                    lane.send(message)?;
                 }
-                if !messages.is_empty() {
-                    let lane = self.actor_message_sender.as_mut().context(
-                        "presentation actor requested a session message without a backend",
-                    )?;
-                    for message in &messages {
-                        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
-                            && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
-                        {
-                            eprintln!(
-                                "presentation actor message sender={} recipient={} body={}",
-                                message.sender,
-                                message.actor,
-                                String::from_utf8_lossy(&message.body)
-                            );
-                        }
-                        lane.send(message)?;
-                    }
-                }
-                Ok(())
-            })();
+            }
+            Ok(())
+        })();
         if let Err(error) = result {
             self.error = Some(error);
             event_loop.exit();
@@ -2581,11 +2577,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.latest_session_snapshot = Some(snapshot.clone());
                     if let Some(runtime) = self.wasm_runtime.as_mut() {
                         runtime.bind_session_snapshot(&snapshot);
-                        if let Err(error) =
-                            runtime.broadcast_session_event(&SessionEvent::Snapshot(snapshot))
+                        if let Err(error) = runtime
+                            .broadcast_session_event(&SessionEvent::Snapshot(snapshot.clone()))
                         {
                             self.fail(event_loop, error);
+                            return;
                         }
+                        runtime.stop_actors_for_closed_sessions(&snapshot);
                     }
                 }
             }
@@ -2608,9 +2606,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     .filter(|operation| {
                         matches!(
                             operation,
-                            SessionOperation::Activate
-                                | SessionOperation::Create
-                                | SessionOperation::CreateWorktree
+                            SessionOperation::Activate | SessionOperation::Create
                         )
                     })
                     .and(completion.session)
@@ -2655,8 +2651,8 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.fail(event_loop, error);
                 }
             }
-            ClientEvent::SessionActorMessage {
-                session_id,
+            ClientEvent::BackendActorMessage {
+                realm,
                 sender,
                 recipient,
                 body,
@@ -2666,31 +2662,22 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     if body.starts_with(b"BTRM") {
                         eprintln!(
-                            "session actor message sender={sender} recipient={recipient} terminal_snapshot_bytes={}",
+                            "backend actor message realm={realm:?} sender={sender} recipient={recipient} terminal_snapshot_bytes={}",
                             body.len()
                         );
                     } else {
                         eprintln!(
-                            "session actor message sender={sender} recipient={recipient} body={}",
+                            "backend actor message realm={realm:?} sender={sender} recipient={recipient} body={}",
                             String::from_utf8_lossy(&body)
                         );
                     }
                 }
-                let expected_session = self
-                    .wasm_runtime
-                    .as_ref()
-                    .and_then(PresentationWasmRuntime::bound_session_id);
-                if expected_session != Some(session_id) {
-                    eprintln!(
-                        "dropped session actor message for session {session_id}; \
-                         presentation is attached to {expected_session:?}"
-                    );
-                } else if let Some(runtime) = self.wasm_runtime.as_ref()
+                if let Some(runtime) = self.wasm_runtime.as_ref()
                     && let Err(error) =
-                        runtime.send_actor_message(&recipient, format!("session:{sender}"), body)
+                        runtime.send_backend_actor_message(realm, &recipient, &sender, body)
                 {
                     eprintln!(
-                        "dropped session actor message for unavailable presentation actor \
+                        "dropped backend actor message for unavailable presentation actor \
                          {recipient:?}: {error:#}"
                     );
                 }

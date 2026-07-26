@@ -10,10 +10,12 @@ typed session snapshots from `brood-client`, renders them through canvas
 packets, and requests typed session operations without DBus, subprocesses, or
 a native toolkit inside the plugin.
 
-Presentation children retain the surface session that owned their creation.
-Changing the active session changes which scoped children are visible; it
-does not rebind an existing terminal, diff viewer, or coding-agent UI to
-another session.
+The init actor marks each child as presentation-global or supplies its owning
+surface-session ID in the start request. Changing the active session changes
+which scoped children are visible; it does not infer ownership from the actor
+name or rebind an existing terminal, diff viewer, or coding-agent UI to another
+session. A session and its scoped children remain alive with no managed Wayland
+windows and stop only when the session is explicitly closed.
 
 The child claims the root layout lease, keeps its own pane in a right sidebar,
 and asks the host to delegate every other pane through its `rest` slot to the
@@ -51,7 +53,7 @@ The pane supports:
 
 - project-grouped, collapsible session lists;
 - a project-heading action which creates a branch, managed Git worktree, and
-  active session;
+  active session through an addressed daemon-actor request rather than DBus;
 - pointer or keyboard session selection and activation;
 - search-as-you-type filtering;
 - creating an unmatched session with Enter;

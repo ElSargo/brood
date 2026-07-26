@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 18;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 19;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
@@ -577,10 +577,18 @@ pub enum ClientMessage {
     ReleaseResource { resource: u64 },
 }
 
-/// Addressed message crossing between presentation and session actor realms.
+/// Backend actor realm addressed by a presentation connection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendActorRealm {
+    Daemon,
+    Session(u64),
+}
+
+/// Addressed message crossing between presentation and backend actor realms.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActorMessage {
-    pub session: u64,
+    pub realm: BackendActorRealm,
     pub sender: String,
     pub recipient: String,
     pub body: Vec<u8>,
@@ -614,7 +622,6 @@ pub enum SessionOperation {
     Refresh,
     Activate,
     Create,
-    CreateWorktree,
     Rename,
     Close,
 }

@@ -30,6 +30,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use brood_protocol::BackendActorRealm;
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
@@ -623,7 +624,12 @@ struct PendingManagedWorktree {
     project: brood_cli::project::ProjectContext,
     branch: String,
     target: PathBuf,
-    response: tokio::sync::oneshot::Sender<std::result::Result<u64, String>>,
+    response: ManagedWorktreeResponse,
+}
+
+enum ManagedWorktreeResponse {
+    Control(tokio::sync::oneshot::Sender<std::result::Result<u64, String>>),
+    Presentation { actor: String, request: u64 },
 }
 
 #[derive(serde::Deserialize)]
@@ -633,6 +639,9 @@ struct BackendActorHostMessage {
     request: Option<u64>,
     path: Option<String>,
     message: Option<String>,
+    source_session: Option<u64>,
+    branch: Option<String>,
+    presentation_actor: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1002,6 +1011,40 @@ impl Brood {
         Ok(())
     }
 
+    /// Deliver one presentation-originated mailbox message to the daemon
+    /// realm's blessed init actor or one of its owned children.
+    pub(crate) fn send_daemon_actor_message(
+        &mut self,
+        actor: &str,
+        sender: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        self.drain_hosted_actor_events();
+        let init = self
+            .backend_init
+            .as_ref()
+            .context("daemon actor realm is unavailable")?;
+        let actor_id = if actor == "init" || actor == init.actor_id {
+            init.actor_id.clone()
+        } else if let Some(actor_id) = init.children.get(actor) {
+            actor_id.clone()
+        } else if init.children.values().any(|actor_id| actor_id == actor) {
+            actor.to_string()
+        } else {
+            anyhow::bail!("actor {actor:?} does not belong to the daemon realm")
+        };
+        let sender = format!("presentation:{sender}");
+        self.try_route_wasm_actor_message(&actor_id, sender.clone(), body)?;
+        self.plugin_actor_messages = self.plugin_actor_messages.saturating_add(1);
+        self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
+        info!(
+            actor = %actor_id,
+            sender = %sender,
+            "delivered presentation-to-daemon actor message"
+        );
+        Ok(())
+    }
+
     fn send_local_realm_actor_message(
         &mut self,
         session: SurfaceSessionId,
@@ -1042,16 +1085,17 @@ impl Brood {
 
     fn send_presentation_actor_message(
         &mut self,
-        session: SurfaceSessionId,
+        realm: BackendActorRealm,
         sender: &str,
         actor: &str,
         body: &[u8],
     ) -> Result<()> {
-        ensure!(
-            session == self.sessions.active(),
-            "surface session {} is not attached to the current presentation",
-            session.raw()
-        );
+        if let BackendActorRealm::Session(session) = realm {
+            ensure!(
+                SurfaceSessionId::from_raw(session) == self.sessions.active(),
+                "surface session {session} is not attached to the current presentation"
+            );
+        }
         let fast_path = self
             .dmabuf
             .fast_path
@@ -1062,7 +1106,7 @@ impl Brood {
         let record = brood_ipc::ActorMessageRecord::new(
             fast_path.generation,
             fast_path.presentation_message_sequence,
-            session.raw(),
+            realm,
             sender,
             actor,
             body,
@@ -1081,7 +1125,7 @@ impl Brood {
             fast_path.presentation_message_notifications.notify()?;
         }
         info!(
-            surface_session = session.raw(),
+            ?realm,
             sender, actor, "queued session-to-presentation actor message"
         );
         Ok(())
@@ -1551,6 +1595,7 @@ impl Brood {
                     id,
                     path,
                     capabilities,
+                    session_id: _,
                 } => {
                     if let Some(session) = self.realm_init_root_session(&actor_name) {
                         init_requests.push(InitRequest::StartActor(
@@ -1611,16 +1656,29 @@ impl Brood {
             }
         }
         for (sender_actor, recipient, body) in presentation_messages {
-            let owner = self
-                .realm_init_root_session(&sender_actor)
-                .map(|session| (session, "init".to_string()))
-                .or_else(|| self.realm_init_child_owner(&sender_actor));
-            let Some((session, sender)) = owner else {
-                warn!(actor = %sender_actor, "rejected presentation message from actor outside a session realm");
+            let owner = if sender_actor == BACKEND_INIT_ACTOR_ID {
+                Some((BackendActorRealm::Daemon, "init".to_string()))
+            } else {
+                self.realm_init_root_session(&sender_actor)
+                    .map(|session| {
+                        (
+                            BackendActorRealm::Session(session.raw()),
+                            "init".to_string(),
+                        )
+                    })
+                    .or_else(|| {
+                        self.realm_init_child_owner(&sender_actor)
+                            .map(|(session, sender)| {
+                                (BackendActorRealm::Session(session.raw()), sender)
+                            })
+                    })
+            };
+            let Some((realm, sender)) = owner else {
+                warn!(actor = %sender_actor, "rejected presentation message from actor outside a backend realm");
                 continue;
             };
             if let Err(error) =
-                self.send_presentation_actor_message(session, &sender, &recipient, &body)
+                self.send_presentation_actor_message(realm, &sender, &recipient, &body)
             {
                 warn!(
                     actor = %sender_actor,
@@ -2656,7 +2714,6 @@ impl Brood {
         if self.sessions.activate_recent(session).is_err() {
             return false;
         }
-        self.prune_empty_unfocused_surface_sessions();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -2827,24 +2884,6 @@ impl Brood {
         true
     }
 
-    fn prune_empty_unfocused_surface_sessions(&mut self) -> bool {
-        let sessions = self
-            .sessions
-            .sessions()
-            .iter()
-            .copied()
-            .filter(|session| *session != self.sessions.active())
-            .filter(|session| !self.surface_session_has_content_panes_or_pending(*session))
-            .collect::<Vec<_>>();
-        if sessions.is_empty() {
-            return false;
-        }
-        for session in sessions {
-            self.remove_surface_session_record(session);
-        }
-        true
-    }
-
     fn remove_surface_session_record(&mut self, session: SurfaceSessionId) {
         if self.backend_init.is_some() {
             match serde_json::to_vec(&serde_json::json!({
@@ -2877,21 +2916,6 @@ impl Brood {
             })
             .map(|(surface, _assigned_session)| surface.clone())
             .collect()
-    }
-
-    fn surface_session_has_content_panes_or_pending(&self, session: SurfaceSessionId) -> bool {
-        self.sessions
-            .surface_assignments()
-            .iter()
-            .any(|(surface, assigned_session)| {
-                *assigned_session == session
-                    && self.pane_for_toplevel_surface(surface).is_some()
-                    && self.window_for_any_toplevel_surface(surface).is_some()
-            })
-            || self
-                .pending_child_panes
-                .iter()
-                .any(|pending| pending.session == session)
     }
 
     pub fn resolve_surface_session(&self, query: &str) -> Option<SurfaceSessionId> {
@@ -2929,7 +2953,6 @@ impl Brood {
         if self.sessions.activate(session).is_err() {
             return false;
         }
-        self.prune_empty_unfocused_surface_sessions();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -2944,7 +2967,6 @@ impl Brood {
             self.start_configured_workspace_plugins_after_rebind();
             return false;
         };
-        self.prune_empty_unfocused_surface_sessions();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         true
@@ -2973,7 +2995,6 @@ impl Brood {
                 .unwrap_or_else(|| default_surface_session_name(next)),
             directory,
         )?;
-        self.prune_empty_unfocused_surface_sessions();
         self.reconfigure_focus_stack();
         self.start_configured_workspace_plugins_after_rebind();
         if self.session_init_actor.is_some() {
@@ -3742,7 +3763,7 @@ impl Brood {
             true,
             false,
             None,
-            false,
+            true,
         )?;
         self.configured_plugin_lifecycles
             .insert(BACKEND_INIT_ACTOR_ID.to_string(), lifecycle);
@@ -3773,6 +3794,19 @@ impl Brood {
         source_session: SurfaceSessionId,
         branch: &str,
         response: tokio::sync::oneshot::Sender<std::result::Result<u64, String>>,
+    ) {
+        self.begin_managed_worktree_session(
+            source_session,
+            branch,
+            ManagedWorktreeResponse::Control(response),
+        );
+    }
+
+    fn begin_managed_worktree_session(
+        &mut self,
+        source_session: SurfaceSessionId,
+        branch: &str,
+        response: ManagedWorktreeResponse,
     ) {
         let branch = branch.trim().to_string();
         let prepared = (|| {
@@ -3836,7 +3870,7 @@ impl Brood {
         let (request, project, target, message) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = response.send(Err(format!("{error:#}")));
+                self.complete_managed_worktree_response(response, Err(format!("{error:#}")));
                 return;
             }
         };
@@ -3852,7 +3886,7 @@ impl Brood {
         if let Err(error) = self.send_backend_actor_message("host:control", message)
             && let Some(pending) = self.pending_managed_worktrees.remove(&request)
         {
-            let _ = pending.response.send(Err(format!("{error:#}")));
+            self.complete_managed_worktree_response(pending.response, Err(format!("{error:#}")));
         }
     }
 
@@ -3880,6 +3914,22 @@ impl Brood {
             }
         };
         match message.message_type.as_str() {
+            "worktree-session-requested" => {
+                let (Some(request), Some(source_session), Some(branch), Some(actor)) = (
+                    message.request,
+                    message.source_session,
+                    message.branch,
+                    message.presentation_actor,
+                ) else {
+                    warn!("backend actor worktree-session request is incomplete");
+                    return;
+                };
+                self.begin_managed_worktree_session(
+                    SurfaceSessionId::from_raw(source_session),
+                    &branch,
+                    ManagedWorktreeResponse::Presentation { actor, request },
+                );
+            }
             "worktree-provisioned" => {
                 let Some(request) = message.request else {
                     warn!("backend actor provision response has no request ID");
@@ -3940,10 +3990,13 @@ impl Brood {
             return;
         };
         if path != pending.target {
-            let _ = pending.response.send(Err(format!(
-                "backend actor returned unexpected worktree path {}",
-                path.display()
-            )));
+            self.complete_managed_worktree_response(
+                pending.response,
+                Err(format!(
+                    "backend actor returned unexpected worktree path {}",
+                    path.display()
+                )),
+            );
             return;
         }
         let result = (|| {
@@ -3981,9 +4034,10 @@ impl Brood {
             );
             Ok::<_, anyhow::Error>(session.raw())
         })();
-        let _ = pending
-            .response
-            .send(result.map_err(|error| format!("{error:#}")));
+        self.complete_managed_worktree_response(
+            pending.response,
+            result.map_err(|error| format!("{error:#}")),
+        );
     }
 
     fn fail_managed_worktree_request(&mut self, request: u64, message: &str) {
@@ -3991,7 +4045,51 @@ impl Brood {
             warn!(request, error = %message, "backend actor failed an unknown worktree request");
             return;
         };
-        let _ = pending.response.send(Err(message.to_string()));
+        self.complete_managed_worktree_response(pending.response, Err(message.to_string()));
+    }
+
+    fn complete_managed_worktree_response(
+        &mut self,
+        response: ManagedWorktreeResponse,
+        result: std::result::Result<u64, String>,
+    ) {
+        match response {
+            ManagedWorktreeResponse::Control(response) => {
+                let _ = response.send(result);
+            }
+            ManagedWorktreeResponse::Presentation { actor, request } => {
+                let (success, session, message) = match result {
+                    Ok(session) => (true, Some(session), String::new()),
+                    Err(message) => (false, None, message),
+                };
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "type": "worktree-session-completed",
+                    "request": request,
+                    "success": success,
+                    "session": session,
+                    "message": message,
+                }));
+                match body {
+                    Ok(body) => {
+                        if let Err(error) = self.send_presentation_actor_message(
+                            BackendActorRealm::Daemon,
+                            "init",
+                            &actor,
+                            &body,
+                        ) {
+                            warn!(
+                                actor = %actor,
+                                error = %error,
+                                "failed to deliver daemon worktree completion"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "failed to encode daemon worktree completion");
+                    }
+                }
+            }
+        }
     }
 
     /// Configure the root artifact used for every new surface-session realm.
@@ -5681,7 +5779,6 @@ impl Brood {
                 outcome.focus_cleared = true;
             }
         }
-        self.prune_empty_unfocused_surface_sessions();
         self.reconfigure_focus_stack();
         self.last_window_count = window_count;
         outcome

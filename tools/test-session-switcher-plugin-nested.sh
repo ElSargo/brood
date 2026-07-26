@@ -4,8 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-  exec dbus-run-session -- "$0" "$@"
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" || -n "${BROOD_SURFACE_SESSION_ID:-}" ]]; then
+  exec env \
+    -u brood_session \
+    -u BROOD_SURFACE_SESSION_ID \
+    -u BROOD_PANE_ID \
+    -u DBUS_SESSION_BUS_ADDRESS \
+    dbus-run-session -- "$0" "$@"
 fi
 
 for tool in cargo cc foot git grim magick pkg-config python3 sway wayland-scanner weston-simple-egl weston-simple-shm wtype; do
@@ -163,7 +168,7 @@ printf '[init]\nbackend = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider =
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 (
   cd "$PROJECT"
-  env -u brood_session \
+  env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
     XDG_DATA_HOME="$DATA_HOME" \
     RUST_LOG="$RUST_LOG" \
     "$ROOT/target/debug/brood-sessiond" \
@@ -176,7 +181,8 @@ RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,
 SERVER_PID=$!
 
 ctl() {
-  env -u brood_session target/debug/brood ctl \
+  env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
+    target/debug/brood ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -196,6 +202,7 @@ ctl status > /dev/null 2>&1 || {
 }
 
 ctl surface-session new Beta > /dev/null
+ctl close-session 1 > /dev/null
 ctl spawn weston-simple-egl > /dev/null
 for _ in $(seq 1 100); do
   rg -q "total_windows=1" <<< "$(ctl status)" && break
@@ -244,7 +251,7 @@ done
   exit 1
 }
 
-env -u brood_session \
+env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   XDG_DATA_HOME="$DATA_HOME" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
@@ -253,6 +260,7 @@ env -u brood_session \
   BROOD_TRACE_PLUGIN_INPUT=1 \
   BROOD_TRACE_PLUGIN_GRAPHICS=1 \
   BROOD_TRACE_PLUGIN_TEXT=1 \
+  BROOD_TRACE_PLUGIN_WORKERS=1 \
   RUST_LOG="$RUST_LOG" \
   target/debug/brood-client \
   --config "$CONFIG" \
@@ -553,7 +561,7 @@ DRAG_PACKETS_BEFORE="$(
 DRAG_X=$((DIFF_WIDTH - 8))
 DRAG_START_Y=70
 DRAG_END_Y=$((DIFF_HEIGHT * 2 / 3))
-send_pointer drag "$DRAG_X" "$DRAG_START_Y" "$DRAG_END_Y" 12 1280 720
+send_pointer drag "$DRAG_X" "$DRAG_START_Y" "$DRAG_X" "$DRAG_END_Y" 12 1280 720
 for _ in $(seq 1 100); do
   DRAG_PACKETS_AFTER="$(
     rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
@@ -626,18 +634,24 @@ capture "$OUT/project-collapsed.png"
 click_at 980 123
 sleep 0.2
 
+WORKTREE_DAEMON_REQUESTS_BEFORE="$(
+  rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
+)"
 click_at 1260 123
 submit_text picker-worktree
 for _ in $(seq 1 200); do
   SESSION_JSON="$(ctl surface-session list-json)"
+  WORKTREE_DAEMON_REQUESTS_AFTER="$(
+    rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
+  )"
   if rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON" \
-    && rg -q "operation=CreateWorktree success=true" "$CLIENT_LOG"; then
+    && ((WORKTREE_DAEMON_REQUESTS_AFTER > WORKTREE_DAEMON_REQUESTS_BEFORE)); then
     break
   fi
   sleep 0.05
 done
 rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON"
-rg -q "operation=CreateWorktree success=true" "$CLIENT_LOG"
+((WORKTREE_DAEMON_REQUESTS_AFTER > WORKTREE_DAEMON_REQUESTS_BEFORE))
 read -r WORKTREE_SESSION_ID WORKTREE_DIRECTORY < <(
   python3 - "$SESSION_JSON" "$PROJECT" "$DATA_HOME" <<'PY'
 import json
@@ -655,6 +669,8 @@ assert source["project_id"] == created["project_id"]
 assert source["project_name"] == project.name
 assert created["branch"] == "picker-worktree"
 assert created["worktree"] is True
+assert created["active"] is True
+assert created["windows"] == 0
 directory = pathlib.Path(created["working_directory"]).resolve()
 directory.relative_to(data_home / "brood" / "worktrees")
 print(created["id"], directory)
@@ -690,17 +706,155 @@ assert metadata["branch"] == "picker-worktree"
 assert pathlib.Path(metadata["path"]).resolve().parent == pathlib.Path(sys.argv[1]).parent.resolve()
 PY
 rg -q "actor=brood.backend-init" "$SERVER_LOG"
+rg -q "delivered presentation-to-daemon actor message" "$SERVER_LOG"
+rg -q "realm=Daemon sender=\"init\" actor=\"session-switcher\"" "$SERVER_LOG"
 rg -q "attached managed worktree session" "$SERVER_LOG"
 capture "$OUT/worktree-created.png"
 
+WORKTREE_DIFF_ACTOR="diff-viewer-s${WORKTREE_SESSION_ID}"
+WORKTREE_DIFF_STARTS_BEFORE="$(
+  rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
+)"
+WORKTREE_DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+send_diff_toggle
+for _ in $(seq 1 200); do
+  WORKTREE_DIFF_STARTS_AFTER="$(
+    rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
+  )"
+  WORKTREE_DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+  if ((WORKTREE_DIFF_STARTS_AFTER > WORKTREE_DIFF_STARTS_BEFORE)) \
+    && ((WORKTREE_DIFF_PACKETS_AFTER > WORKTREE_DIFF_PACKETS_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+((WORKTREE_DIFF_STARTS_AFTER > WORKTREE_DIFF_STARTS_BEFORE))
+((WORKTREE_DIFF_PACKETS_AFTER > WORKTREE_DIFF_PACKETS_BEFORE))
+WORKTREE_DIFF_PANE="$(
+  sed -n "/started presentation WASM actor id=$WORKTREE_DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+    | sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' \
+    | head -1
+)"
+[[ -n "$WORKTREE_DIFF_PANE" ]]
+capture "$OUT/worktree-plugin-before-switch.png"
+
+send_picker
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype "Bt" -s 100 -k Return
+for _ in $(seq 1 100); do
+  SESSION_JSON="$(ctl surface-session list-json)"
+  if python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+worktree = next(session for session in catalog["sessions"] if session["id"] == int(sys.argv[2]))
+active = next(session for session in catalog["sessions"] if session["active"])
+raise SystemExit(0 if active["name"] == "Beta" and worktree["windows"] == 0 else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.05
+done
+python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+worktree = next(session for session in catalog["sessions"] if session["id"] == int(sys.argv[2]))
+active = next(session for session in catalog["sessions"] if session["active"])
+assert active["name"] == "Beta"
+assert worktree["windows"] == 0
+PY
+if sed -n "/started presentation WASM actor id=$WORKTREE_DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+  | rg -q "stopped presentation init child actor id=$WORKTREE_DIFF_ACTOR"; then
+  echo "ERR session-scoped plugin actor stopped while its windowless session was inactive" >&2
+  exit 1
+fi
+
+WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN="$(
+  rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+)"
+send_picker
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype "picker-worktree" -s 100 -k Return
+for _ in $(seq 1 200); do
+  SESSION_JSON="$(ctl surface-session list-json)"
+  WORKTREE_DIFF_LAYOUTS_AFTER_RETURN="$(
+    rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+  )"
+  if python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+worktree = next(session for session in catalog["sessions"] if session["id"] == int(sys.argv[2]))
+raise SystemExit(0 if worktree["active"] and worktree["windows"] == 0 else 1)
+PY
+  then
+    ((WORKTREE_DIFF_LAYOUTS_AFTER_RETURN > WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN)) && break
+  fi
+  sleep 0.05
+done
+python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+worktree = next(session for session in catalog["sessions"] if session["id"] == int(sys.argv[2]))
+assert worktree["active"] is True
+assert worktree["windows"] == 0
+PY
+[[ "$(
+  rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG"
+)" == "$WORKTREE_DIFF_STARTS_AFTER" ]]
+((WORKTREE_DIFF_LAYOUTS_AFTER_RETURN > WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN))
+capture "$OUT/worktree-plugin-after-switch.png"
+
+WORKTREE_DIFF_FOCUSES_BEFORE="$(
+  rg -c "focused local plugin pane=$WORKTREE_DIFF_PANE" "$CLIENT_LOG"
+)"
+click_at 480 360
+for _ in $(seq 1 100); do
+  WORKTREE_DIFF_FOCUSES_AFTER="$(
+    rg -c "focused local plugin pane=$WORKTREE_DIFF_PANE" "$CLIENT_LOG"
+  )"
+  if ((WORKTREE_DIFF_FOCUSES_AFTER > WORKTREE_DIFF_FOCUSES_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+((WORKTREE_DIFF_FOCUSES_AFTER > WORKTREE_DIFF_FOCUSES_BEFORE))
+send_close_pane
+for _ in $(seq 1 100); do
+  if rg -q "stopped presentation init child actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "stopped presentation init child actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG"
+SESSION_JSON="$(ctl surface-session list-json)"
+python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+worktree = next(session for session in catalog["sessions"] if session["id"] == int(sys.argv[2]))
+assert worktree["active"] is True
+assert worktree["windows"] == 0
+PY
+
 WORKTREE_COMPLETIONS_BEFORE="$(
-  rg -c "operation=CreateWorktree success=true" "$CLIENT_LOG"
+  rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
 )"
 click_at 1260 123
 submit_text picker-worktree
 for _ in $(seq 1 100); do
   WORKTREE_COMPLETIONS_AFTER="$(
-    rg -c "operation=CreateWorktree success=true" "$CLIENT_LOG"
+    rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
   )"
   SESSION_JSON="$(ctl surface-session list-json)"
   MATCHING_WORKTREE_SESSIONS="$(
@@ -754,6 +908,8 @@ python3 - \
   "$OUT/project-expanded.png" \
   "$OUT/project-collapsed.png" \
   "$OUT/worktree-created.png" \
+  "$OUT/worktree-plugin-before-switch.png" \
+  "$OUT/worktree-plugin-after-switch.png" \
   "$OUT/projects.png" <<'PY'
 import pathlib
 import subprocess
@@ -857,8 +1013,8 @@ STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
 rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
-if rg -q "rejected actor-submitted layout" "$CLIENT_LOG"; then
-  echo "ERR client rejected a recursive layout update" >&2
+if rg -q "rejected actor-submitted layout; using native fallback" "$CLIENT_LOG"; then
+  echo "ERR client abandoned actor layout after rejecting a recursive update" >&2
   exit 1
 fi
 if rg -q "presentation backend snapshot" "$CLIENT_LOG"; then
@@ -903,7 +1059,8 @@ cat > "$OUT/proof.md" <<EOF
 - recursive ownership: session-switcher root lease delegates its rest slot to workspace
 - catalog: atomic shared-memory snapshots carried both sessions and all window identities
 - projects: two Git repositories rendered as distinct collapsible project lists
-- worktree: branch picker-worktree was checked out beneath $DATA_HOME/brood/worktrees and activated as a new session
+- worktree: an addressed presentation-to-daemon actor message checked out branch picker-worktree beneath $DATA_HOME/brood/worktrees and activated it as a new session
+- durable plugin session: the windowless worktree session and its diff pane survived switching to Beta; returning reused the same presentation actor generation and rendered pane
 - retry: requesting the same branch reused the checkout and existing session
 - occupation: closing that session persisted an unoccupied worktree record
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
@@ -919,7 +1076,7 @@ cat > "$OUT/proof.md" <<EOF
 - diff viewer: Ctrl+Alt+D created and focused the session-scoped split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; Ctrl+Alt+Q stopped the focused actor and closed its pane
 - diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
 - diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
-- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, projects.png
+- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, worktree-plugin-before-switch.png, worktree-plugin-after-switch.png, projects.png
 - status: $STATUS
 EOF
 

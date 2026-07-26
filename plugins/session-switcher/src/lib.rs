@@ -11,8 +11,8 @@ use std::{
 use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect};
 use exports::brood::plugin::actor::{
-    ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
-    LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
+    ActorStartRequest, ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest,
+    LifecycleEvent, LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
     SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
 };
 use serde::{Deserialize, Serialize};
@@ -242,6 +242,26 @@ struct PickerErrorMessage {
 }
 
 #[derive(Serialize)]
+struct WorktreeSessionRequest<'a> {
+    kind: &'static str,
+    request: u64,
+    source_session: u64,
+    branch: &'a str,
+}
+
+#[derive(Deserialize)]
+struct WorktreeSessionCompletion {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<64>,
+    request: u64,
+    success: bool,
+    #[serde(default)]
+    session: Option<u64>,
+    #[serde(default)]
+    message: serde_json_core::heapless::String<256>,
+}
+
+#[derive(Serialize)]
 struct SessionPickerRequest<'a> {
     #[serde(rename = "type")]
     message_type: &'static str,
@@ -467,16 +487,19 @@ impl Guest for SessionSwitcher {
                             id: CHILD_ACTOR_ID.to_string(),
                             path: COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
+                            session_id: None,
                         }),
                         ActorCommand::StartActor(ActorStartRequest {
                             id: PICKER_ACTOR_ID.to_string(),
                             path: PICKER_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
+                            session_id: None,
                         }),
                         ActorCommand::StartActor(ActorStartRequest {
                             id: TERMINAL_UI_ID.to_string(),
                             path: TERMINAL_UI_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
+                            session_id: context.session_id,
                         }),
                         subscribe_agent_registry(context.session_id.unwrap_or_default()),
                         ActorCommand::LifecycleComplete(Ok(())),
@@ -532,9 +555,16 @@ impl Guest for SessionSwitcher {
                 state
                     .terminal_uis
                     .remove(&id)
-                    .and_then(|session| stop_terminal_command(session, &id))
-                    .into_iter()
-                    .collect()
+                    .map_or_else(Vec::new, |session| {
+                        state
+                            .sessions
+                            .iter()
+                            .any(|candidate| candidate.id == session)
+                            .then(|| stop_terminal_command(session, &id))
+                            .flatten()
+                            .into_iter()
+                            .collect()
+                    })
             }
             Event::Child(ChildEvent::Failed(failed)) => {
                 let Ok(mut state) = STATE.lock() else {
@@ -564,6 +594,9 @@ impl Guest for SessionSwitcher {
             }
             Event::Mailbox(message) if message.sender.starts_with("session:") => {
                 handle_session_message(&message.body)
+            }
+            Event::Mailbox(message) if message.sender.starts_with("daemon:") => {
+                handle_daemon_message(&message.body)
             }
             _ => Vec::new(),
         }
@@ -641,10 +674,7 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
     if completion.success {
         if matches!(
             completion.operation,
-            SessionOperation::Activate
-                | SessionOperation::Create
-                | SessionOperation::Rename
-                | SessionOperation::CreateWorktree
+            SessionOperation::Activate | SessionOperation::Create | SessionOperation::Rename
         ) && let Some(session) = completion.session
         {
             state.selected = Some(session);
@@ -653,13 +683,12 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
             SessionOperation::Refresh => "Sessions refreshed".to_string(),
             SessionOperation::Activate => "Switched session".to_string(),
             SessionOperation::Create => "Created session".to_string(),
-            SessionOperation::CreateWorktree => "Created worktree session".to_string(),
             SessionOperation::Rename => "Renamed session".to_string(),
             SessionOperation::Close => "Closed session".to_string(),
         };
         if matches!(
             completion.operation,
-            SessionOperation::Create | SessionOperation::CreateWorktree | SessionOperation::Rename
+            SessionOperation::Create | SessionOperation::Rename
         ) {
             state.query.clear();
             state.mode = EditMode::Search;
@@ -667,6 +696,36 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
     } else {
         state.status = completion.message;
     }
+}
+
+fn handle_daemon_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((completion, consumed)) =
+        serde_json_core::from_slice::<WorktreeSessionCompletion>(bytes)
+    else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || completion.message_type.as_str() != "worktree-session-completed" {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if state.pending == Some(completion.request) {
+        state.pending = None;
+    }
+    state.error = !completion.success;
+    if completion.success {
+        if let Some(session) = completion.session {
+            state.selected = Some(session);
+        }
+        state.status = "Created worktree session".to_string();
+        state.query.clear();
+        state.mode = EditMode::Search;
+    } else {
+        state.status = completion.message.as_str().to_string();
+    }
+    redraw_or_record_error(&mut state);
+    Vec::new()
 }
 
 fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
@@ -807,7 +866,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
             })]
         } else {
             state.diff_viewers.insert(id.clone());
-            vec![start_diff_viewer(&id)]
+            vec![start_diff_viewer(&id, state.session_id)]
         };
     }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
@@ -915,6 +974,7 @@ fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
         id,
         path: TERMINAL_UI_COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
+        session_id: Some(session_id),
     })]
 }
 
@@ -1014,7 +1074,7 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
     );
     state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
     state.coding_agent_targets.insert(id.clone(), agent);
-    vec![start_coding_agent_ui(&id)]
+    vec![start_coding_agent_ui(&id, state.session_id)]
 }
 
 fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
@@ -1079,7 +1139,7 @@ fn open_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     })]
 }
 
-fn start_diff_viewer(id: &str) -> ActorCommand {
+fn start_diff_viewer(id: &str, session_id: u64) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
         id: id.to_string(),
         path: DIFF_VIEWER_COMPONENT_FILE.to_string(),
@@ -1087,14 +1147,16 @@ fn start_diff_viewer(id: &str) -> ActorCommand {
             "filesystem:workspace-read".to_string(),
             "subprocess:git".to_string(),
         ],
+        session_id: Some(session_id),
     })
 }
 
-fn start_coding_agent_ui(id: &str) -> ActorCommand {
+fn start_coding_agent_ui(id: &str, session_id: u64) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
         id: id.to_string(),
         path: CODING_AGENT_COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
+        session_id: Some(session_id),
     })
 }
 
@@ -1372,12 +1434,21 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
             return Vec::new();
         }
         let request = state.next_request();
-        return vec![session_command(
+        let Ok(body) = serde_json::to_vec(&WorktreeSessionRequest {
+            kind: "create-worktree-session",
             request,
-            SessionOperation::CreateWorktree,
-            Some(session),
-            Some(branch),
-        )];
+            source_session: session,
+            branch: &branch,
+        }) else {
+            state.pending = None;
+            state.error = true;
+            state.status = "Could not encode the worktree request".to_string();
+            return Vec::new();
+        };
+        return vec![ActorCommand::SendDaemonMessage(DaemonActorMessage {
+            actor: "init".to_string(),
+            body,
+        })];
     }
     let visible_sessions = state
         .list_items()

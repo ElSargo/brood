@@ -13,8 +13,10 @@ use std::{
 
 use thiserror::Error;
 
+use brood_protocol::BackendActorRealm;
+
 const MAGIC: u64 = 0x4d41_4e49_4143_544d;
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const CAPACITY: usize = 16;
 const CAPACITY_U32: u32 = 16;
 const RECORD_BYTES: usize = 16 * 1024;
@@ -22,7 +24,10 @@ const RECORD_HEADER_BYTES: usize = 40;
 /// Maximum combined UTF-8 sender, UTF-8 recipient, and mailbox body bytes.
 pub const ACTOR_MESSAGE_BODY_CAPACITY: usize = RECORD_BYTES - RECORD_HEADER_BYTES;
 
-/// One explicitly session-scoped actor message.
+const REALM_SESSION: u32 = 1;
+const REALM_DAEMON: u32 = 2;
+
+/// One explicitly backend-realm-scoped actor message.
 #[repr(C, align(64))]
 pub struct ActorMessageRecord {
     connection_generation: u64,
@@ -31,7 +36,7 @@ pub struct ActorMessageRecord {
     sender_len: u32,
     recipient_len: u32,
     body_len: u32,
-    reserved: u32,
+    realm: u32,
     bytes: [u8; ACTOR_MESSAGE_BODY_CAPACITY],
 }
 
@@ -42,12 +47,19 @@ impl ActorMessageRecord {
     pub fn new(
         connection_generation: u64,
         sequence: u64,
-        session_id: u64,
+        realm: BackendActorRealm,
         sender: &str,
         recipient: &str,
         body: &[u8],
     ) -> Result<Box<Self>, ActorMessageLaneError> {
-        if session_id == 0 || sender.is_empty() || recipient.is_empty() {
+        let (realm, session_id) = match realm {
+            BackendActorRealm::Daemon => (REALM_DAEMON, 0),
+            BackendActorRealm::Session(session_id) if session_id != 0 => {
+                (REALM_SESSION, session_id)
+            }
+            BackendActorRealm::Session(_) => return Err(ActorMessageLaneError::InvalidMessage),
+        };
+        if sender.is_empty() || recipient.is_empty() {
             return Err(ActorMessageLaneError::InvalidMessage);
         }
         let sender_len = sender.len();
@@ -88,7 +100,7 @@ impl ActorMessageRecord {
             sender_len,
             recipient_len,
             body_len,
-            reserved: 0,
+            realm,
             bytes,
         }))
     }
@@ -106,6 +118,17 @@ impl ActorMessageRecord {
     #[must_use]
     pub const fn session_id(&self) -> u64 {
         self.session_id
+    }
+
+    /// Decode the backend actor realm carried by this message.
+    pub const fn realm(&self) -> Result<BackendActorRealm, ActorMessageLaneError> {
+        match (self.realm, self.session_id) {
+            (REALM_DAEMON, 0) => Ok(BackendActorRealm::Daemon),
+            (REALM_SESSION, session_id) if session_id != 0 => {
+                Ok(BackendActorRealm::Session(session_id))
+            }
+            _ => Err(ActorMessageLaneError::InvalidMessage),
+        }
     }
 
     /// Decode the sender metadata.
@@ -187,7 +210,7 @@ impl Slot {
                 sender_len: 0,
                 recipient_len: 0,
                 body_len: 0,
-                reserved: 0,
+                realm: 0,
                 bytes: [0; ACTOR_MESSAGE_BODY_CAPACITY],
             }),
         }

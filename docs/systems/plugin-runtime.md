@@ -119,6 +119,13 @@ placement. A client init actor creates client-local actors; a session init actor
 creates actors and apps in its own surface session; a daemon init actor creates
 backend actors whose lifecycle is independent of every session.
 
+A presentation root identifies each child as either presentation-global or
+associated with one surface session when it starts that child. The host retains
+this association for pane filtering, workspace authority, cross-realm message
+validation, and explicit session teardown. Actor names are labels, not an
+ownership convention, and changing the active session never changes an
+existing child's association.
+
 The default daemon root is the worktree manager. It serializes managed
 worktree acquisition, records occupation, and decides which idle worktrees are
 eligible for cleanup. Its workers perform allow-listed Git operations and
@@ -268,13 +275,20 @@ panes, and agents. Mailboxes are bounded, reject or expose backpressure, and
 carry sender, target, slot, generation, and causal identity. Workers report
 through their owning actor rather than adding another public addressing layer.
 
-Cross-placement delivery is bidirectional and connection-scoped. A
-presentation actor may address a session actor in the attached surface session,
-and a session actor may address a presentation actor on a subscribed
-connection. Disconnecting a presentation removes its return route without
-changing the session actor's identity or lifecycle. Subscription, replay,
+Cross-placement delivery is bidirectional, addressed by realm, and
+connection-scoped. A presentation actor may address either the daemon realm or
+a session realm. A session-associated presentation actor may address its own
+session; a presentation-global actor may address a known session when its
+application protocol requires it. Daemon and session actors may reply to a
+presentation actor on the subscribed connection. The transport authenticates
+the source placement and never infers a realm from an actor name.
+
+Disconnecting a presentation removes its return route without changing a
+daemon or session actor's identity or lifecycle. Subscription, replay,
 snapshot, and unsubscription remain application protocols carried in mailbox
-messages; the host does not impose a special observer API.
+messages; the host does not impose a special observer API. DBus may bootstrap a
+local presentation connection and remains a public control surface, but it is
+not an internal actor-to-actor messaging workaround.
 
 An actor may also place a bounded message in its local host outbox. The host
 attaches the actor generation as authenticated origin before interpreting the

@@ -61,6 +61,9 @@ viewport hit-test result crosses the server boundary.
 - The server never creates a native or offscreen presentation target.
 - Closing, crashing, or replacing a client does not terminate a session or its
   managed applications.
+- A session with no managed windows remains alive until it is explicitly
+  closed; plugin panes, actors, agents, processes, and other session resources
+  are valid content.
 - Viewport state does not become backend-owned merely because a client may
   persist preferences through an explicit session operation.
 - Only the current presentation lease generation may configure or send primary
@@ -102,15 +105,19 @@ presentation client
 
 Presentation actors run in the client for local and remote deployments. Their
 mailbox traffic, layout updates, UI state, animations, and drawing remain local.
-Only explicitly addressed session operations and actor messages cross the
-connection.
+Only explicitly addressed operations and daemon- or session-realm actor
+messages cross the connection. A presentation child records its optional
+session association at creation; the client does not derive ownership from the
+active session or from an actor ID.
 
 ## Connection And Lease Lifecycle
 
-DBus is the local discovery, authentication, and descriptor broker. A
+DBus is the local discovery, authentication, descriptor broker, and public
+control surface. A
 successful handshake creates a fresh connection generation, immutable
 negotiated capabilities, bounded protocol lanes, and optional presentation
-lease.
+lease. Product actors use addressed mailbox traffic over those lanes to reach
+daemon and session actors rather than calling the local DBus control API.
 
 Carrier and frame transport are negotiated independently. The three standard
 profiles are local shared-memory lanes with DMA-BUF, local shared-memory lanes
@@ -167,6 +174,12 @@ relevant window resources visible until the complete replacement layout is
 accepted, then swaps layouts atomically and releases panes the replacement no
 longer references. Native fallback is startup and failure recovery, not an
 intermediate session-switch state.
+
+Presentation-global panes may appear in any session view. A session-associated
+plugin pane remains owned by its recorded session across activation and
+catalogue changes and is hidden when that session is outside the accepted
+layout. Explicit session closure stops its associated presentation actors;
+merely having no managed windows does not.
 
 The default session switcher claims the root, places its pane on the right, and
 delegates `rest` to the workspace actor. Hiding and showing are ordinary
