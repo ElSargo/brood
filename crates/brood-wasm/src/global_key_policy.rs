@@ -73,6 +73,12 @@ pub enum HostMessage {
     SetShortcutPassthrough {
         enabled: bool,
     },
+    SetClipboard {
+        text: String,
+    },
+    RequestClipboardPaste {
+        pane: u64,
+    },
     SetResolvedLayout {
         #[serde(default)]
         lease: Option<crate::resolved_layout::LayoutLeaseToken>,

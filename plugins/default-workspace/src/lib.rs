@@ -198,6 +198,13 @@ pub extern "C" fn brood_policy_provider_key_workspace(
         };
     }
 
+    if input.modifiers & MOD_CTRL != 0
+        && input.modifiers & MOD_ALT == 0
+        && focused_terminal_plugin(&state)
+    {
+        return OUTPUT_ABSTAIN;
+    }
+
     if input.modifiers & MOD_CTRL != 0 && input.key_code == KEY_B {
         if input.key_state == KEY_PRESSED {
             toggle_workspace_input_mode();
@@ -1122,6 +1129,15 @@ fn write_u64(writer: &mut Writer<'_>, mut value: u64) {
 
 fn pane_for_app_id(state: &PolicyState, app_id: &[u8]) -> Option<u64> {
     pane_for_app_id_in_list(&state.app_panes, app_id)
+}
+
+fn focused_terminal_plugin(state: &PolicyState) -> bool {
+    let Some(focused) = state.focused_pane else {
+        return false;
+    };
+    state.app_panes.iter().any(|item| {
+        item.pane == focused && item.app_id.as_bytes().starts_with(b"terminal-ui")
+    })
 }
 
 fn pane_for_app_id_in_list(app_panes: &[AppPane], app_id: &[u8]) -> Option<u64> {

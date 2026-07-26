@@ -150,6 +150,7 @@ int main(int argc, char **argv) {
     enum modifier_mode {
         MODIFIERS_CTRL_ALT,
         MODIFIERS_CTRL,
+        MODIFIERS_CTRL_SHIFT,
         MODIFIERS_SHIFT,
         MODIFIERS_NONE,
     } modifier_mode = MODIFIERS_CTRL_ALT;
@@ -160,6 +161,9 @@ int main(int argc, char **argv) {
         keycode = argv[1];
     } else if (argc == 3 && strcmp(argv[1], "--ctrl-only") == 0) {
         modifier_mode = MODIFIERS_CTRL;
+        keycode = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "--ctrl-shift-only") == 0) {
+        modifier_mode = MODIFIERS_CTRL_SHIFT;
         keycode = argv[2];
     } else if (argc == 3 && strcmp(argv[1], "--shift-only") == 0) {
         modifier_mode = MODIFIERS_SHIFT;
@@ -178,7 +182,8 @@ int main(int argc, char **argv) {
     } else {
         fail(
             "usage: virtual-keyboard-key "
-            "[--ctrl-only|--shift-only|--none|--plain] <linux-evdev-keycode> "
+            "[--ctrl-only|--ctrl-shift-only|--shift-only|--none|--plain] "
+            "<linux-evdev-keycode> "
             "| --repeat <count> <interval-us> <linux-evdev-keycode>"
         );
     }
@@ -251,7 +256,11 @@ int main(int argc, char **argv) {
     }
     usleep(10000);
     uint32_t modifiers = 0;
-    if (modifier_mode == MODIFIERS_CTRL_ALT || modifier_mode == MODIFIERS_CTRL) {
+    if (
+        modifier_mode == MODIFIERS_CTRL_ALT ||
+        modifier_mode == MODIFIERS_CTRL ||
+        modifier_mode == MODIFIERS_CTRL_SHIFT
+    ) {
         modifiers = modifier_mask(keymap, XKB_MOD_NAME_CTRL);
     }
     if (modifier_mode == MODIFIERS_CTRL_ALT) {
@@ -259,6 +268,9 @@ int main(int argc, char **argv) {
     }
     if (modifier_mode == MODIFIERS_SHIFT) {
         modifiers = modifier_mask(keymap, XKB_MOD_NAME_SHIFT);
+    }
+    if (modifier_mode == MODIFIERS_CTRL_SHIFT) {
+        modifiers |= modifier_mask(keymap, XKB_MOD_NAME_SHIFT);
     }
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,

@@ -2734,6 +2734,9 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
         PresentationEvent::Text { pane, text } => {
             abi::PresentationEvent::Text(abi::TextEvent { pane, text })
         }
+        PresentationEvent::Paste { pane, text } => {
+            abi::PresentationEvent::Paste(abi::PasteEvent { pane, text })
+        }
     };
     abi::Event::Presentation(event)
 }

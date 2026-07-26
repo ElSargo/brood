@@ -52,6 +52,7 @@ use winit::{
 };
 
 mod actor_runtime;
+mod clipboard;
 mod key_policy;
 mod layout;
 mod plugin_gpu;
@@ -64,6 +65,7 @@ use brood_wasm::{
     SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
     WasmActorEventKind, WasmPluginArtifact,
 };
+use clipboard::ClipboardBridge;
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
 use layout::{
     LayoutSource, convert_actor_layout_fragment, convert_actor_layout_lease, native_flat_layout,
@@ -156,6 +158,34 @@ fn main() -> Result<()> {
         {
             return Err(anyhow!(
                 "presentation key policy did not resolve Ctrl+J to the next visible pane"
+            ));
+        }
+        let terminal_snapshot = KeyPolicySnapshot {
+            app_panes: vec![KeyPolicyAppPane {
+                pane: 1,
+                app_id: "terminal-ui".to_string(),
+            }],
+            ..snapshot.clone()
+        };
+        let terminal_control = key_policy.evaluate(
+            46,
+            brood_wasm::ABI_KEY_PRESSED,
+            brood_wasm::ABI_MOD_CTRL,
+            false,
+            &terminal_snapshot,
+        )?;
+        let terminal_global = key_policy.evaluate(
+            28,
+            brood_wasm::ABI_KEY_PRESSED,
+            brood_wasm::ABI_MOD_CTRL | brood_wasm::ABI_MOD_ALT,
+            false,
+            &terminal_snapshot,
+        )?;
+        if terminal_control.decision != GlobalKeyDecision::Abstain
+            || terminal_global.decision != GlobalKeyDecision::Consume
+        {
+            return Err(anyhow!(
+                "presentation key policy did not preserve terminal control keys and explicit global shortcuts"
             ));
         }
         let mode_toggle = key_policy.evaluate(
@@ -264,6 +294,7 @@ fn main() -> Result<()> {
         .context("create event loop")?;
     let event_proxy = event_loop.create_proxy();
     let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
+    let clipboard = ClipboardBridge::start();
     let (
         input_sender,
         actor_message_sender,
@@ -434,6 +465,7 @@ fn main() -> Result<()> {
         )?),
         key_policy: Some(key_policy),
         plugin_graphics: Some(plugin_graphics),
+        clipboard,
         input_sender,
         actor_message_sender,
         backend_commands,
@@ -1384,6 +1416,7 @@ struct Application {
     wasm_runtime: Option<PresentationWasmRuntime>,
     key_policy: Option<ClientKeyPolicy>,
     plugin_graphics: Option<PluginGraphicsBridge>,
+    clipboard: Option<ClipboardBridge>,
     backend_commands: Option<BackendCommandLane>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<ClientEvent>>,
     next_renderer_generation: u64,
@@ -2126,6 +2159,7 @@ impl Application {
                         &mut self.input_sender,
                         self.backend_commands.as_ref(),
                         self.wasm_runtime.as_mut(),
+                        self.clipboard.as_ref(),
                         message,
                         self.window_focused,
                     ) {
@@ -3017,29 +3051,38 @@ impl ApplicationHandler<ClientEvent> for Application {
                         event.physical_key, event.state
                     );
                 }
-                let policy_evaluation = event.physical_key.to_scancode().and_then(|scancode| {
-                    let snapshot = renderer.key_policy_snapshot();
-                    self.key_policy.as_mut().and_then(|policy| {
-                        match policy.evaluate(
-                            i32::try_from(scancode.saturating_add(8)).unwrap_or(i32::MAX),
-                            match event.state {
-                                ElementState::Pressed => brood_wasm::ABI_KEY_PRESSED,
-                                ElementState::Released => brood_wasm::ABI_KEY_RELEASED,
-                            },
-                            key_policy_modifier_bits(self.modifiers),
-                            event.repeat,
-                            &snapshot,
-                        ) {
-                            Ok(evaluation) => Some(evaluation),
-                            Err(error) => {
-                                eprintln!(
-                                    "presentation key policy failed; forwarding key: {error:#}"
-                                );
-                                None
-                            }
+                let policy_evaluation =
+                    event.physical_key.to_scancode().and_then(|scancode| {
+                        let mut snapshot = renderer.key_policy_snapshot();
+                        if let Some(runtime) = self.wasm_runtime.as_ref() {
+                            snapshot.app_panes.extend(runtime.pane_actor_ids().map(
+                                |(pane, actor)| KeyPolicyAppPane {
+                                    pane,
+                                    app_id: actor.to_string(),
+                                },
+                            ));
                         }
-                    })
-                });
+                        self.key_policy.as_mut().and_then(|policy| {
+                            match policy.evaluate(
+                                i32::try_from(scancode.saturating_add(8)).unwrap_or(i32::MAX),
+                                match event.state {
+                                    ElementState::Pressed => brood_wasm::ABI_KEY_PRESSED,
+                                    ElementState::Released => brood_wasm::ABI_KEY_RELEASED,
+                                },
+                                key_policy_modifier_bits(self.modifiers),
+                                event.repeat,
+                                &snapshot,
+                            ) {
+                                Ok(evaluation) => Some(evaluation),
+                                Err(error) => {
+                                    eprintln!(
+                                        "presentation key policy failed; forwarding key: {error:#}"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    });
 
                 let mut forward_key = true;
                 if let Some(evaluation) = policy_evaluation {
@@ -3068,6 +3111,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                             &mut self.input_sender,
                             self.backend_commands.as_ref(),
                             self.wasm_runtime.as_mut(),
+                            self.clipboard.as_ref(),
                             message,
                             self.window_focused,
                         ) {
@@ -3546,6 +3590,7 @@ fn apply_key_policy_host_message(
     input_sender: &mut Option<InputLane>,
     backend_commands: Option<&BackendCommandLane>,
     mut runtime: Option<&mut PresentationWasmRuntime>,
+    clipboard: Option<&ClipboardBridge>,
     message: HostMessage,
     window_focused: bool,
 ) -> Result<()> {
@@ -3619,6 +3664,25 @@ fn apply_key_policy_host_message(
             None
         }
         HostMessage::ToggleShortcutPassthrough | HostMessage::SetShortcutPassthrough { .. } => None,
+        HostMessage::SetClipboard { text } => {
+            clipboard
+                .context("presentation clipboard service is unavailable")?
+                .set_text(text);
+            None
+        }
+        HostMessage::RequestClipboardPaste { pane } => {
+            anyhow::ensure!(
+                renderer.focused_plugin_pane() == Some(pane),
+                "clipboard paste target is not the focused plugin pane"
+            );
+            if let Some(text) = clipboard.and_then(ClipboardBridge::text) {
+                send_presentation_event(
+                    runtime.as_deref(),
+                    PresentationEvent::Paste { pane, text },
+                )?;
+            }
+            None
+        }
         HostMessage::SetResolvedLayout { .. }
         | HostMessage::ClaimRootLayout
         | HostMessage::DelegateLayoutRest { .. } => {

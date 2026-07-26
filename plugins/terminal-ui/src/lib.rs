@@ -14,6 +14,7 @@ use exports::brood::plugin::actor::{
     Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
     WorkerFinished, WorkerRequest,
 };
+use unicode_width::UnicodeWidthChar;
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
 const FONT_SIZE: f32 = 16.0;
@@ -21,9 +22,14 @@ const REQUESTED_LINE_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
 const DEFAULT_BG: u32 = 0x1d2021;
 const CURSOR: u32 = 0x928374;
+const SELECTION_BG: u32 = 0x504945;
 const MOD_CTRL: u32 = 1;
 const MOD_ALT: u32 = 2;
 const MOD_SHIFT: u32 = 4;
+const LEFT_BUTTON: u32 = 0x110;
+const MIDDLE_BUTTON: u32 = 0x112;
+const SCROLL_PIXELS_PER_LINE: f32 = 5.0;
+const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
 
 static STATE: Mutex<Option<UiState>> = Mutex::new(None);
@@ -56,6 +62,12 @@ struct UiState {
     max_packet_bytes: usize,
     max_commands: usize,
     requested_viewport: usize,
+    selection: Option<Selection>,
+    pressed_mouse_button: Option<u8>,
+    mouse_modifiers: u32,
+    scroll_accumulator: f32,
+    mouse_wheel_accumulator: f32,
+    suppressed_text: Option<String>,
 }
 
 impl UiState {
@@ -87,6 +99,12 @@ impl UiState {
             max_packet_bytes: 0,
             max_commands: 0,
             requested_viewport: 0,
+            selection: None,
+            pressed_mouse_button: None,
+            mouse_modifiers: 0,
+            scroll_accumulator: 0.0,
+            mouse_wheel_accumulator: 0.0,
+            suppressed_text: None,
         }
     }
 
@@ -166,6 +184,8 @@ struct Snapshot {
     cursor_visible: bool,
     application_cursor: bool,
     bracketed_paste: bool,
+    mouse_tracking: u8,
+    mouse_sgr: bool,
     exited: bool,
     exit_code: Option<i32>,
     chunks_read: u64,
@@ -193,6 +213,8 @@ struct SnapshotHeader {
     cursor_visible: bool,
     application_cursor: bool,
     bracketed_paste: bool,
+    mouse_tracking: u8,
+    mouse_sgr: bool,
     exited: bool,
     exit_code: Option<i32>,
     chunks_read: u64,
@@ -214,6 +236,19 @@ struct Run {
     underline: bool,
     strikethrough: bool,
     text: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CellPoint {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Selection {
+    anchor: CellPoint,
+    extent: CellPoint,
+    dragging: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -312,6 +347,26 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             vec![state.resize_command()]
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
+            state.suppressed_text =
+                ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0 && key.logical_key.chars().count() == 1)
+                    .then(|| key.logical_key.clone());
+            let copy_shortcut = key.modifiers & (MOD_CTRL | MOD_SHIFT) == (MOD_CTRL | MOD_SHIFT)
+                && key.logical_key.eq_ignore_ascii_case("c");
+            if copy_shortcut {
+                return state
+                    .selection
+                    .and_then(|selection| selection_text(state.latest.as_deref(), selection))
+                    .and_then(set_clipboard_command)
+                    .into_iter()
+                    .collect();
+            }
+            let paste_shortcut = (key.modifiers & (MOD_CTRL | MOD_SHIFT)
+                == (MOD_CTRL | MOD_SHIFT)
+                && key.logical_key.eq_ignore_ascii_case("v"))
+                || (key.modifiers & MOD_SHIFT != 0 && key.logical_key == "Insert");
+            if paste_shortcut {
+                return vec![request_clipboard_paste_command(state.pane)];
+            }
             let page = state
                 .latest
                 .as_ref()
@@ -342,6 +397,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .is_some_and(|snapshot| snapshot.application_cursor);
             key_bytes(&key.logical_key, key.modifiers, application_cursor)
                 .map(|bytes| {
+                    state.selection = None;
                     state.requested_viewport = 0;
                     state.session_message(input_body(&bytes))
                 })
@@ -349,6 +405,13 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .collect()
         }
         PresentationEvent::Text(text) if text.pane == state.pane && !text.text.is_empty() => {
+            if state
+                .suppressed_text
+                .take()
+                .is_some_and(|key| key.eq_ignore_ascii_case(&text.text))
+            {
+                return Vec::new();
+            }
             let printable = text
                 .text
                 .chars()
@@ -357,21 +420,156 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             if printable.is_empty() {
                 Vec::new()
             } else {
+                state.selection = None;
                 state.requested_viewport = 0;
                 vec![state.session_message(input_body(printable.as_bytes()))]
             }
+        }
+        PresentationEvent::Paste(paste) if paste.pane == state.pane && !paste.text.is_empty() => {
+            let bracketed = state
+                .latest
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.bracketed_paste);
+            state.selection = None;
+            state.requested_viewport = 0;
+            vec![state.session_message(input_body(&paste_bytes(
+                &paste.text,
+                bracketed,
+            )))]
+        }
+        PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
+            if state
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.dragging)
+            {
+                let point = pointer_cell(state, moved.x, moved.y);
+                let changed = state.selection.as_mut().is_some_and(|selection| {
+                    let changed = selection.extent != point;
+                    selection.extent = point;
+                    changed
+                });
+                drop(guard);
+                if changed {
+                    let _ignored = render_latest_snapshot();
+                }
+                return Vec::new();
+            }
+            let Some(snapshot) = state.latest.as_ref() else {
+                return Vec::new();
+            };
+            if snapshot.mouse_tracking < 2
+                || (snapshot.mouse_tracking == 2 && state.pressed_mouse_button.is_none())
+            {
+                return Vec::new();
+            }
+            let button = state.pressed_mouse_button.unwrap_or(3).saturating_add(32);
+            mouse_report(
+                pointer_cell(state, moved.x, moved.y),
+                button,
+                true,
+                state.mouse_modifiers,
+                snapshot.mouse_sgr,
+            )
+            .map(|bytes| state.session_message(input_body(&bytes)))
+            .into_iter()
+            .collect()
+        }
+        PresentationEvent::PointerButton(button) if button.pane == state.pane => {
+            let tracking = state
+                .latest
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.mouse_tracking);
+            let local_pointer = tracking == 0 || button.modifiers & MOD_SHIFT != 0;
+            if local_pointer && button.button == MIDDLE_BUTTON && button.pressed {
+                return vec![request_clipboard_paste_command(state.pane)];
+            }
+            if local_pointer && button.button == LEFT_BUTTON {
+                let point = pointer_cell(state, button.x, button.y);
+                let mut clipboard = None;
+                if button.pressed {
+                    state.selection = Some(Selection {
+                        anchor: point,
+                        extent: point,
+                        dragging: true,
+                    });
+                } else if let Some(selection) = state.selection.as_mut() {
+                    selection.extent = point;
+                    selection.dragging = false;
+                    clipboard = selection_text(state.latest.as_deref(), *selection);
+                }
+                drop(guard);
+                let _ignored = render_latest_snapshot();
+                return clipboard
+                    .and_then(set_clipboard_command)
+                    .into_iter()
+                    .collect();
+            }
+            if local_pointer {
+                return Vec::new();
+            }
+            let Some(mouse_button) = mouse_button_number(button.button) else {
+                return Vec::new();
+            };
+            let mouse_sgr = state
+                .latest
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.mouse_sgr);
+            let reported_button = if button.pressed {
+                state.pressed_mouse_button = Some(mouse_button);
+                state.mouse_modifiers = button.modifiers;
+                mouse_button
+            } else {
+                state.pressed_mouse_button = None;
+                if mouse_sgr { mouse_button } else { 3 }
+            };
+            mouse_report(
+                pointer_cell(state, button.x, button.y),
+                reported_button,
+                button.pressed,
+                button.modifiers,
+                mouse_sgr,
+            )
+            .map(|bytes| state.session_message(input_body(&bytes)))
+            .into_iter()
+            .collect()
         }
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
             let Some(snapshot) = state.latest.as_ref() else {
                 return Vec::new();
             };
-            let delta = if scroll.vertical > 0.0 {
-                3_isize
-            } else if scroll.vertical < 0.0 {
-                -3
-            } else {
-                0
-            };
+            if snapshot.mouse_tracking > 0 && scroll.modifiers & MOD_SHIFT == 0 {
+                state.mouse_wheel_accumulator += scroll.vertical / MOUSE_WHEEL_PIXELS_PER_CLICK;
+                let clicks = state.mouse_wheel_accumulator.trunc() as isize;
+                state.mouse_wheel_accumulator -= clicks as f32;
+                if clicks == 0 {
+                    return Vec::new();
+                }
+                let point = pointer_cell(state, scroll.x, scroll.y);
+                let button = if clicks > 0 { 64 } else { 65 };
+                let mut bytes = Vec::new();
+                for _ in 0..clicks.unsigned_abs().min(64) {
+                    if let Some(report) = mouse_report(
+                        point,
+                        button,
+                        true,
+                        scroll.modifiers,
+                        snapshot.mouse_sgr,
+                    ) {
+                        bytes.extend_from_slice(&report);
+                    }
+                }
+                return (!bytes.is_empty())
+                    .then(|| state.session_message(input_body(&bytes)))
+                    .into_iter()
+                    .collect();
+            }
+            state.scroll_accumulator += scroll.vertical / SCROLL_PIXELS_PER_LINE;
+            let delta = state.scroll_accumulator.trunc() as isize;
+            state.scroll_accumulator -= delta as f32;
+            if delta == 0 {
+                return Vec::new();
+            }
             let next = state
                 .requested_viewport
                 .saturating_add_signed(delta)
@@ -385,6 +583,163 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         }
         _ => Vec::new(),
     }
+}
+
+fn set_clipboard_command(text: String) -> Option<Command> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": "set-clipboard",
+        "text": text,
+    }))
+    .ok()
+    .map(Command::SendHostMessage)
+}
+
+fn request_clipboard_paste_command(pane: u64) -> Command {
+    Command::SendHostMessage(
+        format!(r#"{{"type":"request-clipboard-paste","pane":{pane}}}"#).into_bytes(),
+    )
+}
+
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if bracketed {
+        let mut bytes = Vec::with_capacity(normalized.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        normalized.into_bytes()
+    }
+}
+
+fn pointer_cell(state: &UiState, x: f32, y: f32) -> CellPoint {
+    let (rows, cols) = state
+        .latest
+        .as_ref()
+        .map_or_else(|| state.grid_size(), |snapshot| (snapshot.rows, snapshot.cols));
+    let row = ((y - PADDING) / state.line_height)
+        .floor()
+        .clamp(0.0, f32::from(rows.saturating_sub(1))) as u16;
+    let col = ((x - PADDING) / state.cell_width)
+        .floor()
+        .clamp(0.0, f32::from(cols.saturating_sub(1))) as u16;
+    CellPoint { row, col }
+}
+
+const fn mouse_button_number(button: u32) -> Option<u8> {
+    match button {
+        0x110 => Some(0),
+        0x112 => Some(1),
+        0x111 => Some(2),
+        _ => None,
+    }
+}
+
+fn mouse_report(
+    point: CellPoint,
+    button: u8,
+    pressed: bool,
+    modifiers: u32,
+    sgr: bool,
+) -> Option<Vec<u8>> {
+    let modifier = 4 * u8::from(modifiers & MOD_SHIFT != 0)
+        + 8 * u8::from(modifiers & MOD_ALT != 0)
+        + 16 * u8::from(modifiers & MOD_CTRL != 0);
+    let button = button.saturating_add(modifier);
+    let col = point.col.saturating_add(1);
+    let row = point.row.saturating_add(1);
+    if sgr {
+        let suffix = if pressed { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{button};{col};{row}{suffix}").into_bytes());
+    }
+    if col > 223 || row > 223 {
+        return None;
+    }
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        button.saturating_add(32),
+        u8::try_from(col).ok()?.saturating_add(32),
+        u8::try_from(row).ok()?.saturating_add(32),
+    ])
+}
+
+fn selection_text(snapshot: Option<&Snapshot>, selection: Selection) -> Option<String> {
+    let snapshot = snapshot?;
+    let (start, end) = normalized_selection(selection);
+    let mut lines = Vec::new();
+    for row in start.row..=end.row {
+        let cells = snapshot_row_cells(snapshot, row);
+        let first = if row == start.row { start.col } else { 0 };
+        let last = if row == end.row {
+            end.col
+        } else {
+            snapshot.cols.saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in first..=last {
+            if let Some(text) = cells.get(usize::from(col)) {
+                line.push_str(text);
+            }
+        }
+        lines.push(line.trim_end_matches(' ').to_string());
+    }
+    let text = lines.join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn snapshot_row_cells(snapshot: &Snapshot, row: u16) -> Vec<String> {
+    let mut cells = vec![" ".to_string(); usize::from(snapshot.cols)];
+    let Some(runs) = snapshot.rows_data.get(usize::from(row)) else {
+        return cells;
+    };
+    for run in runs {
+        let mut col = usize::from(run.start);
+        for character in run.text.chars() {
+            let width = UnicodeWidthChar::width(character).unwrap_or(1);
+            if width == 0 {
+                if let Some(previous) = cells.get_mut(col.saturating_sub(1)) {
+                    previous.push(character);
+                }
+                continue;
+            }
+            if let Some(cell) = cells.get_mut(col) {
+                cell.clear();
+                cell.push(character);
+            }
+            for continuation in 1..width {
+                if let Some(cell) = cells.get_mut(col.saturating_add(continuation)) {
+                    cell.clear();
+                }
+            }
+            col = col.saturating_add(width);
+        }
+    }
+    cells
+}
+
+fn normalized_selection(selection: Selection) -> (CellPoint, CellPoint) {
+    if selection.anchor <= selection.extent {
+        (selection.anchor, selection.extent)
+    } else {
+        (selection.extent, selection.anchor)
+    }
+}
+
+fn selection_columns(selection: Selection, row: u16, cols: u16) -> Option<(u16, u16)> {
+    let (start, end) = normalized_selection(selection);
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let first = if row == start.row { start.col } else { 0 };
+    let last = if row == end.row {
+        end.col
+    } else {
+        cols.saturating_sub(1)
+    };
+    Some((first.min(cols), last.saturating_add(1).min(cols)))
 }
 
 fn input_body(bytes: &[u8]) -> Vec<u8> {
@@ -550,6 +905,8 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         cursor_visible: header.cursor_visible,
         application_cursor: header.application_cursor,
         bracketed_paste: header.bracketed_paste,
+        mouse_tracking: header.mouse_tracking,
+        mouse_sgr: header.mouse_sgr,
         exited: header.exited,
         exit_code: header.exit_code,
         chunks_read: header.chunks_read,
@@ -576,7 +933,7 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
 }
 
 fn render_latest_snapshot() -> Result<Vec<u8>, String> {
-    let (pane, width, height, cell_width, line_height, snapshot, mut cache) = {
+    let (pane, width, height, cell_width, line_height, snapshot, selection, mut cache) = {
         let mut guard = STATE
             .lock()
             .map_err(|_| "terminal UI state is poisoned".to_string())?;
@@ -594,6 +951,7 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
             state.cell_width,
             state.line_height,
             snapshot,
+            state.selection,
             std::mem::take(&mut state.cache),
         )
     };
@@ -615,6 +973,25 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
                     rect: Rect::new(x, y, run_width, line_height),
                     color: rgb(run.bg),
                 });
+            }
+            if let Some((selection_start, selection_end)) = selection
+                .and_then(|selection| selection_columns(selection, row as u16, snapshot.cols))
+            {
+                let run_start = run.start;
+                let run_end = run.start.saturating_add(run.cells);
+                let highlight_start = selection_start.max(run_start);
+                let highlight_end = selection_end.min(run_end);
+                if highlight_start < highlight_end {
+                    packet.push(DrawCommand::FillRect {
+                        rect: Rect::new(
+                            PADDING + f32::from(highlight_start) * cell_width,
+                            y,
+                            f32::from(highlight_end - highlight_start) * cell_width,
+                            line_height,
+                        ),
+                        color: rgb(SELECTION_BG),
+                    });
+                }
             }
             if run.text.trim_end().is_empty() {
                 continue;
@@ -780,7 +1157,7 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
     };
     let snapshots_coalesced = snapshots_received.saturating_sub(packets_total);
     Ok(format!(
-        "{{\"revision\":{},\"rows\":{},\"cols\":{},\"packet_bytes\":{},\"commands\":{},\"layouts_created\":{},\"layouts_reused\":{},\"layouts_dropped\":{},\"layouts_created_total\":{},\"layouts_reused_total\":{},\"layouts_dropped_total\":{},\"layout_cache_entries\":{},\"packets_total\":{},\"snapshots_received\":{},\"snapshots_coalesced\":{},\"pty_chunks\":{},\"pty_bytes\":{},\"pty_resizes\":{},\"viewport_offset\":{},\"max_viewport_offset\":{},\"application_cursor\":{},\"bracketed_paste\":{},\"exited\":{},\"exit_code\":{}}}",
+        "{{\"revision\":{},\"rows\":{},\"cols\":{},\"packet_bytes\":{},\"commands\":{},\"layouts_created\":{},\"layouts_reused\":{},\"layouts_dropped\":{},\"layouts_created_total\":{},\"layouts_reused_total\":{},\"layouts_dropped_total\":{},\"layout_cache_entries\":{},\"packets_total\":{},\"snapshots_received\":{},\"snapshots_coalesced\":{},\"pty_chunks\":{},\"pty_bytes\":{},\"pty_resizes\":{},\"viewport_offset\":{},\"max_viewport_offset\":{},\"application_cursor\":{},\"bracketed_paste\":{},\"mouse_tracking\":{},\"mouse_sgr\":{},\"exited\":{},\"exit_code\":{}}}",
         snapshot.revision,
         snapshot.rows,
         snapshot.cols,
@@ -803,6 +1180,8 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         snapshot.max_viewport_offset,
         snapshot.application_cursor,
         snapshot.bracketed_paste,
+        snapshot.mouse_tracking,
+        snapshot.mouse_sgr,
         snapshot.exited,
         snapshot
             .exit_code
@@ -889,6 +1268,8 @@ fn decode_chunk(bytes: &[u8]) -> Result<DecodedChunk, ()> {
             cursor_visible,
             application_cursor: screen_flags & 1 != 0,
             bracketed_paste: screen_flags & 2 != 0,
+            mouse_tracking: (screen_flags >> 2) & 3,
+            mouse_sgr: screen_flags & 16 != 0,
             exited,
             exit_code: (raw_exit != i32::MIN).then_some(raw_exit),
             chunks_read,

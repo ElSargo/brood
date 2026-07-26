@@ -159,6 +159,10 @@ pub enum PresentationEvent {
         pane: u64,
         text: String,
     },
+    Paste {
+        pane: u64,
+        text: String,
+    },
 }
 
 /// One backend surface session as observed by a presentation-local actor.

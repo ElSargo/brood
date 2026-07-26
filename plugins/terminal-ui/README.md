@@ -12,8 +12,15 @@ Inactive least-recently-used handles are dropped only when that bound is
 exceeded, preserving TUI working sets while keeping churn and live-resource
 counts measurable without adding a terminal grid to the host.
 
-It encodes navigation and function keys with xterm modifiers and
-application-cursor mode, routes committed text, and keeps scrollback navigation
-local to the presentation/session actor protocol. Monospace layouts carry
-normal/bold and normal/italic intent; other terminal decorations are canvas
-commands.
+It encodes control, navigation, and function keys with xterm modifiers and
+application-cursor mode. Smooth wheel and trackpad deltas accumulate into
+guest-owned scrollback movement; applications that negotiate xterm mouse
+tracking instead receive SGR mouse reports. Holding Shift keeps pointer input
+local so text can still be selected inside mouse-aware applications.
+
+Drag selection, selection highlighting, copied-text extraction, and bracketed
+paste remain presentation-guest behavior. The client supplies only a
+presentation-local clipboard bridge. Selection copies on release, while
+`Ctrl-Shift-C`, `Ctrl-Shift-V`, `Shift-Insert`, and middle click provide the
+usual explicit copy/paste paths. Monospace layouts carry normal/bold and
+normal/italic intent; other terminal decorations are canvas commands.

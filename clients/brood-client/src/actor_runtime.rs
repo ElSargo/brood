@@ -831,6 +831,13 @@ impl PresentationWasmRuntime {
             .map(|actor| (actor.pane, actor.session))
     }
 
+    pub fn pane_actor_ids(&self) -> impl Iterator<Item = (u64, &str)> + '_ {
+        self.actors
+            .iter()
+            .filter(|(_id, actor)| actor.pane != 0)
+            .map(|(id, actor)| (actor.pane, id.as_str()))
+    }
+
     pub fn close_pane(&mut self, pane: u64) -> Result<bool> {
         let Some(actor_id) = self
             .actors
@@ -1221,7 +1228,8 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::PointerButton { pane, .. }
         | PresentationEvent::PointerScroll { pane, .. }
         | PresentationEvent::Key { pane, .. }
-        | PresentationEvent::Text { pane, .. } => *pane,
+        | PresentationEvent::Text { pane, .. }
+        | PresentationEvent::Paste { pane, .. } => *pane,
     }
 }
 

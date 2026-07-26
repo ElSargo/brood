@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cc grim jq magick pkg-config python3 sway swaymsg tmux weston wtype; do
+for tool in cc grim jq magick pkg-config python3 sway swaymsg tmux weston wl-copy wl-paste wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the terminal plugin proof" >&2
     exit 2
@@ -86,6 +86,14 @@ cc \
   -Werror \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/virtual-pointer-input.c \
+  -o "$OUT/virtual-pointer-input" \
   "${WAYLAND_BUILD_FLAGS[@]}"
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
@@ -534,6 +542,17 @@ if [[ "$WESTON_DIRECT" == 1 ]]; then
     sleep 0.05
   done
 else
+  [[ "$(metric_value "$SCROLL_LOG" mouse_tracking)" == 3 ]]
+  [[ "$(metric_value "$SCROLL_LOG" mouse_sgr)" == true ]]
+  MOUSE_SCROLL_BASELINE="$(metric_value "$SCROLL_LOG" pty_bytes)"
+  wayland_env "$OUT/virtual-pointer-input" scroll 640 360 2 12 1280 720
+  for _ in $(seq 1 200); do
+    MOUSE_SCROLL_BYTES="$(metric_value "$SCROLL_LOG" pty_bytes)"
+    ((MOUSE_SCROLL_BYTES > MOUSE_SCROLL_BASELINE)) && break
+    sleep 0.05
+  done
+  ((MOUSE_SCROLL_BYTES > MOUSE_SCROLL_BASELINE))
+  capture "$OUT/terminal-helix-mouse-scroll.png"
   wayland_env "$OUT/virtual-keyboard-key" --none 88
 # Saturate the terminal above refresh rate so input/compositor phase alignment
 # cannot create artificial missed frames. Presentation should remain display
@@ -638,6 +657,53 @@ for _ in $(seq 1 200); do
 done
 ((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE))
 [[ "$HELIX_EXIT_BRACKETED" == true ]]
+
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-only 38
+sleep 0.1
+type_line "printf '__BROOD_MOUSE_COPY__\\n'"
+sleep 0.2
+wayland_env "$OUT/virtual-pointer-input" drag 10 28 205 28 12 1180 680
+for _ in $(seq 1 100); do
+  MOUSE_COPY_TEXT="$(wayland_env wl-paste --no-newline 2> /dev/null || true)"
+  [[ "$MOUSE_COPY_TEXT" == "__BROOD_MOUSE_COPY__" ]] && break
+  sleep 0.05
+done
+[[ "$MOUSE_COPY_TEXT" == "__BROOD_MOUSE_COPY__" ]]
+capture "$OUT/terminal-mouse-selection.png"
+
+printf '__STALE_CLIPBOARD__' | wayland_env wl-copy
+sleep 0.2
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-shift-only 46
+for _ in $(seq 1 100); do
+  SHORTCUT_COPY_TEXT="$(wayland_env wl-paste --no-newline 2> /dev/null || true)"
+  [[ "$SHORTCUT_COPY_TEXT" == "__BROOD_MOUSE_COPY__" ]] && break
+  sleep 0.05
+done
+[[ "$SHORTCUT_COPY_TEXT" == "__BROOD_MOUSE_COPY__" ]]
+
+PASTE_PROOF_FILE="$OUT/clipboard-paste-worked"
+printf "touch '%s'" "$PASTE_PROOF_FILE" | wayland_env wl-copy
+sleep 0.2
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-shift-only 47
+wayland_env "$OUT/virtual-keyboard-key" --none 28
+for _ in $(seq 1 200); do
+  [[ -e "$PASTE_PROOF_FILE" ]] && break
+  sleep 0.05
+done
+[[ -e "$PASTE_PROOF_FILE" ]]
+
+CTRL_C_PROOF_FILE="$OUT/ctrl-c-worked"
+wayland_env wtype 'sleep 30'
+wayland_env wtype -k Return
+sleep 0.1
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-only 46
+type_line "touch '$CTRL_C_PROOF_FILE'"
+for _ in $(seq 1 200); do
+  [[ -e "$CTRL_C_PROOF_FILE" ]] && break
+  sleep 0.05
+done
+[[ -e "$CTRL_C_PROOF_FILE" ]]
+
 STREAM_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
 STREAM_STARTED_MS="$(date +%s%3N)"
 type_line 'seq 1 4000; printf "\033[32m__STREAM_DONE__\033[0m\n"'
@@ -655,12 +721,20 @@ capture "$OUT/terminal-streaming.png"
 
 MAX_VIEWPORT="$(metric_value "$CLIENT2_LOG" max_viewport_offset)"
 ((MAX_VIEWPORT > 0))
-wayland_env "$OUT/virtual-keyboard-key" --shift-only 104
+wayland_env "$OUT/virtual-pointer-input" scroll 590 340 -2 12 1180 680
 for _ in $(seq 1 200); do
   VIEWPORT="$(metric_value "$CLIENT2_LOG" viewport_offset)"
   ((VIEWPORT > 0)) && break
   sleep 0.05
 done
+if ((VIEWPORT == 0)); then
+  wayland_env "$OUT/virtual-pointer-input" scroll 590 340 2 12 1180 680
+  for _ in $(seq 1 200); do
+    VIEWPORT="$(metric_value "$CLIENT2_LOG" viewport_offset)"
+    ((VIEWPORT > 0)) && break
+    sleep 0.05
+  done
+fi
 ((VIEWPORT > 0))
 capture "$OUT/terminal-scrollback.png"
 wayland_env "$OUT/virtual-keyboard-key" --shift-only 107
@@ -671,7 +745,7 @@ for _ in $(seq 1 200); do
 done
 ((VIEWPORT == 0))
 
-type_line 'exit'
+wayland_env "$OUT/virtual-keyboard-key" --ctrl-only 32
 for _ in $(seq 1 300); do
   EXIT_METRIC="$(last_metric "$CLIENT2_LOG")"
   STATUS_EXITED="$(ctl status-json)"
@@ -791,8 +865,10 @@ python3 - \
   "$OUT/terminal-initial.png" \
   "$OUT/terminal-shell-ansi-unicode.png" \
   "$OUT/terminal-helix.png" \
+  "$OUT/terminal-helix-mouse-scroll.png" \
   "$OUT/terminal-helix-resized.png" \
   "$OUT/terminal-shell-after-helix.png" \
+  "$OUT/terminal-mouse-selection.png" \
   "$OUT/terminal-reconnected.png" \
   "$OUT/terminal-scrollback.png" \
   "$OUT/terminal-ctrl-alt-t.png" \
@@ -946,18 +1022,20 @@ cat > "$OUT/proof.md" <<EOF
 - packaged Components: terminal-session and terminal-ui resolved from the first-party init actor closures
 - shell: real allowlisted sh PTY in $ROOT
 - terminal environment: xterm-256color with truecolor intent, rendered by guest-parsed ANSI runs
-- input: real Wayland key/text events through the focused external presentation client
+- input: real Wayland key/text/pointer events through the focused external presentation client
 - product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-s1-2 actors, focused the new session-scoped pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
 - keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
 - color policy: the controlled PTY profile removed ambient NO_COLOR, retained xterm-256color/truecolor, and rendered a real lazygit screen in terminal-lazygit-color.png
 - managed GUI descendants: the terminal shell inherited the backend Wayland socket and isolated session bus; a real Ghostty child mapped inside Brood in terminal-ghostty-managed.png instead of opening through the host Ghostty instance
 - TUI text reuse: lazygit started and presented in ${LAZYGIT_PRESENT_MS}ms with a bounded recent-layout cache; its interaction created ${LAZYGIT_CREATED} layouts and dropped ${LAZYGIT_DROPPED}
-- scrollback: guest-owned history was navigated with real Shift+PageUp and Shift+End input
+- control keys: Ctrl-L cleared the shell, Ctrl-C interrupted a foreground process, and Ctrl-D exited it
+- clipboard: a real pointer drag selected and copied terminal text through the outer Wayland clipboard, then Ctrl-Shift-V pasted an external clipboard command back into the shell
+- mouse: Helix negotiated SGR any-motion reporting and consumed real virtual-pointer scroll input; guest-owned shell history was navigated with smooth virtual-pointer axis input and reset with Shift+End
 - presentation ownership: the client disconnected while the session-owned shell and its two native resources remained live, then a new presentation actor reattached
 - TUI: Helix rendered full-screen and remained responsive through repeated compositor/pane resizes
 - streaming: 4,000 output lines reached a revised canvas packet in ${STREAM_RENDER_MS}ms
 - teardown: both the boot shell and the shortcut-created shell retired every PTY child and stream resource
-- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-ghostty-managed.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-shell-after-helix.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
+- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-ghostty-managed.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-mouse-scroll.png, terminal-helix-resized.png, terminal-shell-after-helix.png, terminal-mouse-selection.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
 - structured metrics: proof.json
 EOF
 

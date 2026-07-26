@@ -229,21 +229,23 @@ static void pointer_axis(struct virtual_pointer *pointer, double delta) {
 }
 
 int main(int argc, char **argv) {
-    bool drag = argc == 8 && strcmp(argv[1], "drag") == 0;
+    bool drag = argc == 9 && strcmp(argv[1], "drag") == 0;
     bool scroll = argc == 8 && strcmp(argv[1], "scroll") == 0;
     if (!drag && !scroll) {
         fail(
-            "usage: virtual-pointer-input drag|scroll <x> <start-y|y> "
-            "<end-y|delta> <steps> <extent-x> <extent-y>"
+            "usage: virtual-pointer-input drag <start-x> <start-y> <end-x> "
+            "<end-y> <steps> <extent-x> <extent-y> | scroll <x> <y> "
+            "<delta> <steps> <extent-x> <extent-y>"
         );
     }
 
     uint32_t x = parse_u32(argv[2], "x");
     uint32_t y = parse_u32(argv[3], "y");
-    double end_or_delta = parse_double(argv[4], drag ? "end-y" : "delta");
-    uint32_t steps = parse_u32(argv[5], "steps");
-    uint32_t extent_x = parse_u32(argv[6], "extent-x");
-    uint32_t extent_y = parse_u32(argv[7], "extent-y");
+    double end_or_delta = parse_double(argv[4], drag ? "end-x" : "delta");
+    uint32_t end_y = drag ? parse_u32(argv[5], "end-y") : 0;
+    uint32_t steps = parse_u32(argv[drag ? 6 : 5], "steps");
+    uint32_t extent_x = parse_u32(argv[drag ? 7 : 6], "extent-x");
+    uint32_t extent_y = parse_u32(argv[drag ? 8 : 7], "extent-y");
     if (steps == 0 || extent_x == 0 || extent_y == 0) {
         fail("steps and extents must be non-zero");
     }
@@ -278,15 +280,16 @@ int main(int argc, char **argv) {
     }
     usleep(50000);
     if (drag) {
-        uint32_t end_y = (uint32_t)end_or_delta;
+        uint32_t end_x = (uint32_t)end_or_delta;
         pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer press");
         }
         usleep(20000);
         for (uint32_t step = 1; step <= steps; ++step) {
+            uint32_t next_x = x + (end_x - x) * step / steps;
             uint32_t next_y = y + (end_y - y) * step / steps;
-            absolute_motion(pointer, x, next_y, extent_x, extent_y);
+            absolute_motion(pointer, next_x, next_y, extent_x, extent_y);
             if (wl_display_roundtrip(display) < 0) {
                 fail("the compositor rejected pointer drag motion");
             }

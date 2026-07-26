@@ -579,6 +579,8 @@ struct Screen {
     auto_wrap: bool,
     application_cursor: bool,
     bracketed_paste: bool,
+    mouse_tracking: u8,
+    mouse_sgr: bool,
     responses: Vec<u8>,
 }
 
@@ -602,6 +604,8 @@ impl Screen {
             auto_wrap: true,
             application_cursor: false,
             bracketed_paste: false,
+            mouse_tracking: 0,
+            mouse_sgr: false,
             responses: Vec::new(),
         }
     }
@@ -1109,6 +1113,10 @@ impl Perform for Screen {
                         25 => self.cursor_visible = true,
                         47 | 1047 | 1049 => self.enter_alternate(),
                         1048 => self.saved_cursor = (self.cursor_row, self.cursor_col),
+                        1000 => self.mouse_tracking = 1,
+                        1002 => self.mouse_tracking = 2,
+                        1003 => self.mouse_tracking = 3,
+                        1006 => self.mouse_sgr = true,
                         2004 => self.bracketed_paste = true,
                         _ => {}
                     }
@@ -1126,6 +1134,10 @@ impl Perform for Screen {
                         25 => self.cursor_visible = false,
                         47 | 1047 | 1049 => self.leave_alternate(),
                         1048 => (self.cursor_row, self.cursor_col) = self.saved_cursor,
+                        1000 if self.mouse_tracking == 1 => self.mouse_tracking = 0,
+                        1002 if self.mouse_tracking == 2 => self.mouse_tracking = 0,
+                        1003 if self.mouse_tracking == 3 => self.mouse_tracking = 0,
+                        1006 => self.mouse_sgr = false,
                         2004 => self.bracketed_paste = false,
                         _ => {}
                     }
@@ -1234,7 +1246,9 @@ fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
             ));
             bytes.push(
                 u8::from(state.screen.application_cursor)
-                    | (u8::from(state.screen.bracketed_paste) << 1),
+                    | (u8::from(state.screen.bracketed_paste) << 1)
+                    | (state.screen.mouse_tracking << 2)
+                    | (u8::from(state.screen.mouse_sgr) << 4),
             );
             bytes.push(u8::from(state.exited));
             bytes.extend_from_slice(&state.exit_code.unwrap_or(i32::MIN).to_le_bytes());

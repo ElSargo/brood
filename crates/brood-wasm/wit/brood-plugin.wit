@@ -476,6 +476,7 @@ interface actor {
         modifiers: u32,
     }
     record text-event { pane: u64, text: string }
+    record paste-event { pane: u64, text: string }
 
     record session-summary {
         id: u64,
@@ -535,6 +536,7 @@ interface actor {
         pointer-scroll(pointer-scroll),
         key(key-event),
         text(text-event),
+        paste(paste-event),
     }
 
     variant event {
