@@ -170,6 +170,8 @@ start_client() {
     WGPU_BACKEND=vulkan \
     BROOD_DMABUF_HAPPY_PATH=1 \
     BROOD_TRACE_PLUGIN_INPUT=1 \
+    BROOD_TRACE_PLUGIN_WORKERS=1 \
+    BROOD_TERMINAL_SCROLL_BENCH=1 \
     RUST_LOG="$RUST_LOG" \
     "$PACKAGE/bin/brood-client" \
     --config "$PACKAGE/brood.toml" \
@@ -427,14 +429,53 @@ done
 [[ -e "$LAZYGIT_EXIT_FILE" ]]
 
 HELIX_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-type_line 'printf "terminal plugin TUI proof λ中\n" > /tmp/brood-terminal-proof.txt; hx /tmp/brood-terminal-proof.txt'
+type_line '{ printf "terminal plugin TUI proof λ中\n"; seq 1 2000 | sed "s/^/terminal plugin scroll line /"; } > /tmp/brood-terminal-proof.txt; hx /tmp/brood-terminal-proof.txt'
 for _ in $(seq 1 300); do
   HELIX_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-  ((HELIX_BYTES > HELIX_BASELINE + 500)) && break
+  HELIX_COMMANDS="$(metric_value "$CLIENT2_LOG" commands)"
+  if ((HELIX_BYTES > HELIX_BASELINE + 10000 && HELIX_COMMANDS > 500)); then
+    break
+  fi
   sleep 0.05
 done
-((HELIX_BYTES > HELIX_BASELINE + 500))
+((HELIX_BYTES > HELIX_BASELINE + 10000 && HELIX_COMMANDS > 500))
+sleep 0.1
 capture "$OUT/terminal-helix.png"
+
+wayland_env "$OUT/virtual-keyboard-key" --none 88
+# Saturate the terminal above refresh rate so input/compositor phase alignment
+# cannot create artificial missed frames. Presentation should remain display
+# limited while the terminal pipeline continues producing well above 60 Hz.
+wayland_env "$OUT/virtual-keyboard-key" --repeat 360 8333 36
+# Give the final PTY update enough time to reach presentation without including
+# Helix's unrelated cursor-blink timer in the measured scene stream.
+sleep 0.08
+wayland_env "$OUT/virtual-keyboard-key" --none 87
+for _ in $(seq 1 200); do
+  HELIX_SCROLL_METRIC="$(
+    sed -n 's/^plugin helix scroll diagnostics //p' "$CLIENT2_LOG" | tail -1
+  )"
+  [[ -n "$HELIX_SCROLL_METRIC" ]] && break
+  sleep 0.05
+done
+[[ -n "$HELIX_SCROLL_METRIC" ]]
+# The headless compositor has host-scheduler jitter, so keep a narrow tolerance
+# on actual presents while requiring nearly every 120 Hz Helix update to arrive.
+jq -e '
+  .input_events == 360
+  and .input_fps_milli >= 118000
+  and .scenes >= 350
+  and .scene_fps_milli >= 115000
+  and .frames >= 175
+  and .fps_milli >= 57000
+  and .intervals > 0
+' \
+  <<< "$HELIX_SCROLL_METRIC" > /dev/null
+
+if [[ "${BROOD_TERMINAL_SCROLL_ONLY:-0}" == 1 ]]; then
+  printf '%s\n' "$HELIX_SCROLL_METRIC"
+  exit 0
+fi
 
 RESIZE_BASELINE="$(metric_value "$CLIENT2_LOG" pty_resizes)"
 for mode in 1024x640 1400x800 960x600 1180x680; do
@@ -449,7 +490,42 @@ done
 ((RESIZES >= RESIZE_BASELINE + 4))
 capture "$OUT/terminal-helix-resized.png"
 
+# Let Helix consume the last PTY resize and finish its redraw before measuring
+# the following command. The compositor emits two pane sizes per output mode,
+# so the resize count alone can advance before the final terminal redraw.
+RESIZE_SETTLE_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
+RESIZE_SETTLE_QUIET=0
+for _ in $(seq 1 200); do
+  sleep 0.05
+  RESIZE_SETTLE_NEXT="$(metric_value "$CLIENT2_LOG" pty_bytes)"
+  if [[ "$RESIZE_SETTLE_NEXT" == "$RESIZE_SETTLE_BYTES" ]]; then
+    RESIZE_SETTLE_QUIET=$((RESIZE_SETTLE_QUIET + 1))
+    ((RESIZE_SETTLE_QUIET >= 8)) && break
+  else
+    RESIZE_SETTLE_BYTES="$RESIZE_SETTLE_NEXT"
+    RESIZE_SETTLE_QUIET=0
+  fi
+done
+((RESIZE_SETTLE_QUIET >= 8))
+
+HELIX_EXIT_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
+wayland_env "$OUT/virtual-keyboard-key" --none 1
+sleep 0.05
 type_line ':q!'
+sleep 0.5
+capture "$OUT/terminal-shell-after-helix.png"
+for _ in $(seq 1 200); do
+  HELIX_EXIT_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
+  HELIX_EXIT_COMMANDS="$(metric_value "$CLIENT2_LOG" commands)"
+  HELIX_EXIT_BRACKETED="$(metric_value "$CLIENT2_LOG" bracketed_paste)"
+  if ((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE && HELIX_EXIT_COMMANDS < 100)) \
+    && [[ "$HELIX_EXIT_BRACKETED" == true ]]; then
+    break
+  fi
+  sleep 0.05
+done
+((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE && HELIX_EXIT_COMMANDS < 100))
+[[ "$HELIX_EXIT_BRACKETED" == true ]]
 STREAM_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
 STREAM_STARTED_MS="$(date +%s%3N)"
 type_line 'seq 1 4000; printf "\033[32m__STREAM_DONE__\033[0m\n"'
@@ -604,6 +680,7 @@ python3 - \
   "$OUT/terminal-shell-ansi-unicode.png" \
   "$OUT/terminal-helix.png" \
   "$OUT/terminal-helix-resized.png" \
+  "$OUT/terminal-shell-after-helix.png" \
   "$OUT/terminal-reconnected.png" \
   "$OUT/terminal-scrollback.png" \
   "$OUT/terminal-ctrl-alt-t.png" \
@@ -651,6 +728,7 @@ jq -n \
   --argjson terminal "$LAST_TERMINAL_METRIC" \
   --argjson graphics "$GRAPHICS_METRIC" \
   --argjson input "$INPUT_METRIC" \
+  --argjson helix_scroll "$HELIX_SCROLL_METRIC" \
   --argjson stream_render_ms "$STREAM_RENDER_MS" \
   --argjson spawn_present_ms "$SPAWN_PRESENT_MS" \
   --argjson lazygit_present_ms "$LAZYGIT_PRESENT_MS" \
@@ -669,6 +747,7 @@ jq -n \
         application_cursor_up: $application_key_hex
       },
       tui: "helix",
+      helix_scroll: $helix_scroll,
       lazygit: {
         color_environment: {
           term: "xterm-256color",
@@ -766,7 +845,7 @@ cat > "$OUT/proof.md" <<EOF
 - TUI: Helix rendered full-screen and remained responsive through repeated compositor/pane resizes
 - streaming: 4,000 output lines reached a revised canvas packet in ${STREAM_RENDER_MS}ms
 - teardown: both the boot shell and the shortcut-created shell retired every PTY child and stream resource
-- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-ghostty-managed.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
+- screenshots: terminal-shell-ansi-unicode.png, terminal-lazygit-color.png, terminal-ghostty-managed.png, terminal-reconnected.png, terminal-helix.png, terminal-helix-resized.png, terminal-shell-after-helix.png, terminal-streaming.png, terminal-scrollback.png, terminal-shell-exited.png, terminal-ctrl-alt-t.png
 - structured metrics: proof.json
 EOF
 

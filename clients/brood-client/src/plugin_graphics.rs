@@ -34,7 +34,7 @@ const MAX_RESOURCE_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct PluginGraphicsBridge {
     shared: Arc<Mutex<GraphicsState>>,
-    text_layout: Arc<Mutex<FontSystem>>,
+    text_system: Arc<Mutex<TextSystem>>,
     glyph_raster_tx: Sender<GlyphRasterRequest>,
     proxy: EventLoopProxy<ClientEvent>,
 }
@@ -102,10 +102,8 @@ struct GlyphRasterRequest {
     handle: u64,
     pane: u64,
     generation: u64,
-    text: String,
     options: TextLayoutOptions,
-    width: u32,
-    height: u32,
+    plan: TextLayoutPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -180,10 +178,16 @@ struct ReferencedResources {
 impl PluginGraphicsBridge {
     pub fn new(proxy: EventLoopProxy<ClientEvent>) -> Self {
         let shared = Arc::new(Mutex::new(GraphicsState::default()));
-        let glyph_raster_tx = start_glyph_raster_worker(Arc::clone(&shared), proxy.clone());
+        let text_system = Arc::new(Mutex::new(TextSystem {
+            fonts: FontSystem::new(),
+            swash: SwashCache::new(),
+            glyphs: BTreeMap::new(),
+        }));
+        let glyph_raster_tx =
+            start_glyph_raster_worker(Arc::clone(&shared), Arc::clone(&text_system), proxy.clone());
         Self {
             shared,
-            text_layout: Arc::new(Mutex::new(FontSystem::new())),
+            text_system,
             glyph_raster_tx,
             proxy,
         }
@@ -241,33 +245,23 @@ impl PluginGraphicsBridge {
 
 fn start_glyph_raster_worker(
     shared: Arc<Mutex<GraphicsState>>,
+    text_system: Arc<Mutex<TextSystem>>,
     proxy: EventLoopProxy<ClientEvent>,
 ) -> Sender<GlyphRasterRequest> {
     let (sender, receiver) = mpsc::channel::<GlyphRasterRequest>();
     let spawn_result = thread::Builder::new()
         .name("brood-glyph-raster".to_owned())
         .spawn(move || {
-            let mut text_system = TextSystem {
-                fonts: FontSystem::new(),
-                swash: SwashCache::new(),
-                glyphs: BTreeMap::new(),
-            };
             while let Ok(request) = receiver.recv() {
                 let started = Instant::now();
                 let pane = request.pane;
                 let handle = request.handle;
-                let result =
-                    create_text_layout_plan(&mut text_system.fonts, &request.text, request.options)
-                        .and_then(|plan| {
-                            if plan.width != request.width || plan.height != request.height {
-                                return Err(PresentationError::HostFailure);
-                            }
-                            Ok(rasterize_text_layout(
-                                &mut text_system,
-                                &plan,
-                                request.options,
-                            ))
-                        });
+                let result = text_system
+                    .lock()
+                    .map_err(|_poisoned| PresentationError::HostFailure)
+                    .map(|mut text_system| {
+                        rasterize_text_layout(&mut text_system, &request.plan, request.options)
+                    });
                 let elapsed = started.elapsed();
                 finish_glyph_raster(&shared, &proxy, &request, result);
                 if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8
@@ -549,13 +543,15 @@ impl PresentationHost for ActorPresentationHost {
         validate_text_request(&text, options)?;
         let started = Instant::now();
         let plan = {
-            let mut fonts = self
+            let mut text_system = self
                 .bridge
-                .text_layout
+                .text_system
                 .lock()
                 .map_err(|_poisoned| PresentationError::HostFailure)?;
-            create_text_layout_plan(&mut fonts, &text, options)?
+            create_text_layout_plan(&mut text_system.fonts, &text, options)?
         };
+        let metrics = plan.metrics;
+        let byte_len = plan.byte_len;
         let mut state = self
             .bridge
             .shared
@@ -564,7 +560,7 @@ impl PresentationHost for ActorPresentationHost {
         if actor_generation != self.generation.load(Ordering::Acquire) {
             return Err(PresentationError::InvalidPane);
         }
-        let handle = allocate_resource_handle(&mut state, pane, actor_generation, plan.byte_len)?;
+        let handle = allocate_resource_handle(&mut state, pane, actor_generation, byte_len)?;
         state.text_layouts.insert(
             handle,
             TextLayoutEntry {
@@ -572,7 +568,7 @@ impl PresentationHost for ActorPresentationHost {
                 generation: actor_generation,
                 width: plan.width,
                 height: plan.height,
-                byte_len: plan.byte_len,
+                byte_len,
                 state: TextLayoutState::Pending,
             },
         );
@@ -583,10 +579,8 @@ impl PresentationHost for ActorPresentationHost {
             handle,
             pane,
             generation: actor_generation,
-            text,
             options,
-            width: plan.width,
-            height: plan.height,
+            plan,
         };
         if self.bridge.glyph_raster_tx.send(request).is_err() {
             if let Ok(mut state) = self.bridge.shared.lock() {
@@ -598,14 +592,11 @@ impl PresentationHost for ActorPresentationHost {
         if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8 {
             eprintln!(
                 "plugin text layout pane={pane} handle={handle} bytes={} time_us={}",
-                plan.byte_len,
+                byte_len,
                 elapsed.as_micros(),
             );
         }
-        Ok(TextLayoutResult {
-            handle,
-            ..plan.metrics
-        })
+        Ok(TextLayoutResult { handle, ..metrics })
     }
 
     fn drop_resource(
@@ -773,6 +764,7 @@ fn validate_text_request(text: &str, options: TextLayoutOptions) -> Result<(), P
     Ok(())
 }
 
+#[derive(Debug)]
 struct TextLayoutPlan {
     buffer: Buffer,
     metrics: TextLayoutResult,
@@ -812,7 +804,12 @@ fn create_text_layout_plan(
             FontStyle::Italic => CosmicStyle::Italic,
         })
         .font_features(features);
-    buffer.set_text(text, &attrs, Shaping::Advanced, None);
+    let shaping = if options.font_intent == FontIntent::Monospace && text.is_ascii() {
+        Shaping::Basic
+    } else {
+        Shaping::Advanced
+    };
+    buffer.set_text(text, &attrs, shaping, None);
     buffer.shape_until_scroll(fonts, false);
 
     let mut measured_width = 0.0_f32;

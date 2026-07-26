@@ -154,6 +154,8 @@ int main(int argc, char **argv) {
         MODIFIERS_NONE,
     } modifier_mode = MODIFIERS_CTRL_ALT;
     const char *keycode = NULL;
+    const char *repeat_count_value = NULL;
+    const char *repeat_interval_value = NULL;
     if (argc == 2) {
         keycode = argv[1];
     } else if (argc == 3 && strcmp(argv[1], "--ctrl-only") == 0) {
@@ -168,16 +170,34 @@ int main(int argc, char **argv) {
     } else if (argc == 3 && strcmp(argv[1], "--plain") == 0) {
         modifier_mode = MODIFIERS_NONE;
         keycode = argv[2];
+    } else if (argc == 5 && strcmp(argv[1], "--repeat") == 0) {
+        modifier_mode = MODIFIERS_NONE;
+        repeat_count_value = argv[2];
+        repeat_interval_value = argv[3];
+        keycode = argv[4];
     } else {
         fail(
             "usage: virtual-keyboard-key "
-            "[--ctrl-only|--shift-only|--none|--plain] <linux-evdev-keycode>"
+            "[--ctrl-only|--shift-only|--none|--plain] <linux-evdev-keycode> "
+            "| --repeat <count> <interval-us> <linux-evdev-keycode>"
         );
     }
     char *end = NULL;
     unsigned long parsed = strtoul(keycode, &end, 10);
     if (end == keycode || *end != '\0' || parsed > UINT32_MAX) {
         fail("the keycode must be an unsigned 32-bit integer");
+    }
+    unsigned long repeat_count = 1;
+    unsigned long repeat_interval_us = 0;
+    if (repeat_count_value != NULL) {
+        repeat_count = strtoul(repeat_count_value, &end, 10);
+        if (end == repeat_count_value || *end != '\0' || repeat_count == 0) {
+            fail("repeat count must be a positive integer");
+        }
+        repeat_interval_us = strtoul(repeat_interval_value, &end, 10);
+        if (end == repeat_interval_value || *end != '\0' || repeat_interval_us == 0) {
+            fail("repeat interval must be a positive number of microseconds");
+        }
     }
 
     struct wl_display *display = wl_display_connect(NULL);
@@ -240,7 +260,6 @@ int main(int argc, char **argv) {
     if (modifier_mode == MODIFIERS_SHIFT) {
         modifiers = modifier_mask(keymap, XKB_MOD_NAME_SHIFT);
     }
-    uint32_t time = monotonic_milliseconds();
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
         2,
@@ -256,30 +275,58 @@ int main(int argc, char **argv) {
         fail("the compositor rejected the virtual keyboard modifiers");
     }
     usleep(10000);
-    wl_proxy_marshal_flags(
-        (struct wl_proxy *)keyboard,
-        1,
-        NULL,
-        wl_proxy_get_version((struct wl_proxy *)keyboard),
-        0,
-        time,
-        (uint32_t)parsed,
-        WL_KEYBOARD_KEY_STATE_PRESSED
-    );
-    if (wl_display_roundtrip(display) < 0) {
-        fail("the virtual keyboard key press failed");
+    struct timespec deadline = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) < 0) {
+        fail("could not establish the repeat deadline");
     }
-    usleep(10000);
-    wl_proxy_marshal_flags(
-        (struct wl_proxy *)keyboard,
-        1,
-        NULL,
-        wl_proxy_get_version((struct wl_proxy *)keyboard),
-        0,
-        time + 1,
-        (uint32_t)parsed,
-        WL_KEYBOARD_KEY_STATE_RELEASED
-    );
+    for (unsigned long index = 0; index < repeat_count; index++) {
+        if (index > 0) {
+            uint64_t next_nanoseconds =
+                (uint64_t)deadline.tv_nsec + (uint64_t)repeat_interval_us * UINT64_C(1000);
+            deadline.tv_sec += (time_t)(next_nanoseconds / UINT64_C(1000000000));
+            deadline.tv_nsec = (long)(next_nanoseconds % UINT64_C(1000000000));
+            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL) == EINTR) {
+            }
+        }
+        uint32_t time = monotonic_milliseconds();
+        wl_proxy_marshal_flags(
+            (struct wl_proxy *)keyboard,
+            1,
+            NULL,
+            wl_proxy_get_version((struct wl_proxy *)keyboard),
+            0,
+            time,
+            (uint32_t)parsed,
+            WL_KEYBOARD_KEY_STATE_PRESSED
+        );
+        if (repeat_count_value == NULL) {
+            wl_proxy_marshal_flags(
+                (struct wl_proxy *)keyboard,
+                1,
+                NULL,
+                wl_proxy_get_version((struct wl_proxy *)keyboard),
+                0,
+                time + 1,
+                (uint32_t)parsed,
+                WL_KEYBOARD_KEY_STATE_RELEASED
+            );
+        }
+        if (wl_display_flush(display) < 0) {
+            fail("the virtual keyboard repeat failed");
+        }
+    }
+    if (repeat_count_value != NULL) {
+        wl_proxy_marshal_flags(
+            (struct wl_proxy *)keyboard,
+            1,
+            NULL,
+            wl_proxy_get_version((struct wl_proxy *)keyboard),
+            0,
+            monotonic_milliseconds(),
+            (uint32_t)parsed,
+            WL_KEYBOARD_KEY_STATE_RELEASED
+        );
+    }
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
         2,

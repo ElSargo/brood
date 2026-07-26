@@ -21,6 +21,7 @@ const INITIAL_COLS: u16 = 80;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
 const MAX_SCROLLBACK: usize = 2_000;
 const MAX_SNAPSHOT_BODY: usize = 12 * 1024;
+const BULK_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
 const DEFAULT_FG: u32 = 0xebdbb2;
 const DEFAULT_BG: u32 = 0x1d2021;
@@ -45,6 +46,7 @@ struct SessionState {
     chunks_read: u64,
     bytes_read: u64,
     resizes: u64,
+    resize_output_batches: u8,
     snapshots_published: u64,
     exited: bool,
     exit_code: Option<i32>,
@@ -69,6 +71,7 @@ impl SessionState {
             chunks_read: 0,
             bytes_read: 0,
             resizes: 0,
+            resize_output_batches: 0,
             snapshots_published: 0,
             exited: false,
             exit_code: None,
@@ -79,6 +82,10 @@ impl SessionState {
     fn mark_changed(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.snapshot_generation = self.snapshot_generation.saturating_add(1);
+    }
+
+    fn signal_changed(&mut self) {
+        self.mark_changed();
         let _ = host::notification_signal(self.snapshot_notification, self.snapshot_generation);
     }
 
@@ -217,10 +224,15 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             state.snapshot_commands()
         }
         Some(b'I') if sender.starts_with("presentation:") => {
+            let revision = state.revision;
             state.viewport_offset = 0;
             state.queue_input(body.get(1..).unwrap_or_default());
             state.flush_input();
-            Vec::new()
+            if state.revision != revision {
+                state.snapshot_commands()
+            } else {
+                Vec::new()
+            }
         }
         Some(b'R') if sender.starts_with("presentation:") && body.len() == 5 => {
             let rows = u16::from_le_bytes([body[1], body[2]]);
@@ -235,6 +247,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
                 state.error = Some(format!("PTY resize failed: {error:?}"));
             }
             state.resizes = state.resizes.saturating_add(1);
+            state.resize_output_batches = state.resize_output_batches.max(4);
             state.mark_changed();
             state.snapshot_commands()
         }
@@ -311,7 +324,7 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         state.child = Some(pty.child);
         state.terminal = Some(pty.terminal);
         state.stream_notification = Some(stream_notification);
-        state.mark_changed();
+        state.signal_changed();
     }
 
     let mut parser = Parser::new();
@@ -322,10 +335,15 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         {
             host::StreamReadResult::Data(bytes) => {
                 consume_terminal_bytes(&mut parser, &bytes)?;
-                let timer = host::timer_create(8)
-                    .map_err(|error| format!("create snapshot timer: {error:?}"))?;
-                wait_timer(timer).await?;
-                let _ = host::timer_drop(timer).await;
+                if bytes.len() >= BULK_OUTPUT_CHUNK_BYTES
+                    || !alternate_screen_active()?
+                    || take_resize_output_batch()?
+                {
+                    let timer = host::timer_create(8)
+                        .map_err(|error| format!("create snapshot timer: {error:?}"))?;
+                    wait_timer(timer).await?;
+                    let _ = host::timer_drop(timer).await;
+                }
                 let mut eof = false;
                 loop {
                     match host::stream_read(pty.terminal, 16 * 1024)
@@ -369,7 +387,7 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         state.child = None;
         state.terminal = None;
         state.stream_notification = None;
-        state.mark_changed();
+        state.signal_changed();
         format!(
             "{{\"session\":{},\"chunks\":{},\"bytes\":{},\"revision\":{},\"exit\":\"{:?}\",\"code\":{}}}",
             state.session_id,
@@ -383,6 +401,28 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
     let _ = host::stream_drop(pty.terminal).await;
     let _ = host::child_drop(pty.child).await;
     Ok(metrics.into_bytes())
+}
+
+fn take_resize_output_batch() -> Result<bool, String> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|_| "terminal state is poisoned".to_string())?;
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "terminal state is unavailable".to_string())?;
+    let pending = state.resize_output_batches > 0;
+    state.resize_output_batches = state.resize_output_batches.saturating_sub(1);
+    Ok(pending)
+}
+
+fn alternate_screen_active() -> Result<bool, String> {
+    let guard = STATE
+        .lock()
+        .map_err(|_| "terminal state is poisoned".to_string())?;
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| "terminal state is unavailable".to_string())?;
+    Ok(state.screen.alternate.is_some())
 }
 
 fn consume_terminal_bytes(parser: &mut Parser, bytes: &[u8]) -> Result<(), String> {
@@ -524,9 +564,9 @@ impl Cell {
 struct Screen {
     rows: u16,
     cols: u16,
-    cells: Vec<Cell>,
+    cells: Vec<Vec<Cell>>,
     scrollback: VecDeque<Vec<Cell>>,
-    alternate: Option<(Vec<Cell>, u16, u16)>,
+    alternate: Option<(Vec<Vec<Cell>>, u16, u16)>,
     cursor_row: u16,
     cursor_col: u16,
     saved_cursor: (u16, u16),
@@ -547,7 +587,7 @@ impl Screen {
         Self {
             rows,
             cols,
-            cells: vec![Cell::blank(Style::default()); usize::from(rows) * usize::from(cols)],
+            cells: blank_rows(rows, cols, Style::default()),
             scrollback: VecDeque::new(),
             alternate: None,
             cursor_row: 0,
@@ -566,16 +606,10 @@ impl Screen {
         }
     }
 
-    fn index(&self, row: u16, col: u16) -> usize {
-        usize::from(row) * usize::from(self.cols) + usize::from(col)
-    }
-
     fn resize(&mut self, rows: u16, cols: u16) {
-        let old_rows = self.rows;
-        let old_cols = self.cols;
-        let next = resize_cells(&self.cells, old_rows, old_cols, rows, cols);
+        let next = resize_rows(&self.cells, rows, cols);
         if let Some((main, _, _)) = self.alternate.as_mut() {
-            *main = resize_cells(main, old_rows, old_cols, rows, cols);
+            *main = resize_rows(main, rows, cols);
         }
         self.rows = rows;
         self.cols = cols;
@@ -602,9 +636,7 @@ impl Screen {
             return &self.scrollback[absolute_row];
         }
         let live_row = absolute_row.saturating_sub(self.scrollback.len());
-        let width = usize::from(self.cols);
-        let start = live_row.min(usize::from(self.rows.saturating_sub(1))) * width;
-        &self.cells[start..start + width]
+        &self.cells[live_row.min(usize::from(self.rows.saturating_sub(1)))]
     }
 
     fn cursor_row_bounds(&self) -> (u16, u16) {
@@ -622,9 +654,8 @@ impl Screen {
 
     fn normalize_row(&mut self, row: u16) {
         for col in 0..self.cols {
-            let index = self.index(row, col);
             let valid = col > 0 && {
-                let previous = &self.cells[self.index(row, col - 1)];
+                let previous = &self.cells[usize::from(row)][usize::from(col - 1)];
                 !previous.continuation
                     && previous
                         .text
@@ -633,38 +664,35 @@ impl Screen {
                         .sum::<usize>()
                         == 2
             };
-            if self.cells[index].continuation && !valid {
-                self.cells[index] = Cell::blank(self.style);
+            let cell = &mut self.cells[usize::from(row)][usize::from(col)];
+            if cell.continuation && !valid {
+                reset_cell(cell, self.style);
             }
         }
     }
 
     fn insert_blank_chars(&mut self, count: u16) {
         let count = count.max(1).min(self.cols.saturating_sub(self.cursor_col));
-        let row_start = self.index(self.cursor_row, 0);
-        let start = row_start + usize::from(self.cursor_col);
-        let end = row_start + usize::from(self.cols);
+        let row = &mut self.cells[usize::from(self.cursor_row)];
+        let start = usize::from(self.cursor_col);
+        let end = usize::from(self.cols);
         let count = usize::from(count);
-        for index in (start + count..end).rev() {
-            self.cells[index] = self.cells[index - count].clone();
-        }
-        for cell in &mut self.cells[start..start + count] {
-            *cell = Cell::blank(self.style);
+        row[start..end].rotate_right(count);
+        for cell in &mut row[start..start + count] {
+            reset_cell(cell, self.style);
         }
         self.normalize_row(self.cursor_row);
     }
 
     fn delete_chars(&mut self, count: u16) {
         let count = count.max(1).min(self.cols.saturating_sub(self.cursor_col));
-        let row_start = self.index(self.cursor_row, 0);
-        let start = row_start + usize::from(self.cursor_col);
-        let end = row_start + usize::from(self.cols);
+        let row = &mut self.cells[usize::from(self.cursor_row)];
+        let start = usize::from(self.cursor_col);
+        let end = usize::from(self.cols);
         let count = usize::from(count);
-        for index in start..end - count {
-            self.cells[index] = self.cells[index + count].clone();
-        }
-        for cell in &mut self.cells[end - count..end] {
-            *cell = Cell::blank(self.style);
+        row[start..end].rotate_left(count);
+        for cell in &mut row[end - count..end] {
+            reset_cell(cell, self.style);
         }
         self.normalize_row(self.cursor_row);
     }
@@ -679,16 +707,12 @@ impl Screen {
         if !(self.scroll_top..=self.scroll_bottom).contains(&self.cursor_row) {
             return;
         }
-        let width = usize::from(self.cols);
-        let start = usize::from(self.cursor_row) * width;
-        let end = (usize::from(self.scroll_bottom) + 1) * width;
+        let start = usize::from(self.cursor_row);
+        let end = usize::from(self.scroll_bottom) + 1;
         let lines = usize::from(count.max(1).min(self.scroll_bottom - self.cursor_row + 1));
-        let shift = lines * width;
-        for index in (start + shift..end).rev() {
-            self.cells[index] = self.cells[index - shift].clone();
-        }
-        for cell in &mut self.cells[start..start + shift] {
-            *cell = Cell::blank(self.style);
+        self.cells[start..end].rotate_right(lines);
+        for row in &mut self.cells[start..start + lines] {
+            reset_row(row, self.style);
         }
     }
 
@@ -696,29 +720,27 @@ impl Screen {
         if !(self.scroll_top..=self.scroll_bottom).contains(&self.cursor_row) {
             return;
         }
-        let width = usize::from(self.cols);
-        let start = usize::from(self.cursor_row) * width;
-        let end = (usize::from(self.scroll_bottom) + 1) * width;
+        let start = usize::from(self.cursor_row);
+        let end = usize::from(self.scroll_bottom) + 1;
         let lines = usize::from(count.max(1).min(self.scroll_bottom - self.cursor_row + 1));
-        let shift = lines * width;
-        for index in start..end - shift {
-            self.cells[index] = self.cells[index + shift].clone();
-        }
-        for cell in &mut self.cells[end - shift..end] {
-            *cell = Cell::blank(self.style);
+        self.cells[start..end].rotate_left(lines);
+        for row in &mut self.cells[end - lines..end] {
+            reset_row(row, self.style);
         }
     }
 
     fn clear_row(&mut self, row: u16, start: u16, end: u16) {
         let end = end.min(self.cols);
-        for col in start.min(end)..end {
-            let index = self.index(row, col);
-            self.cells[index] = Cell::blank(self.style);
+        for cell in &mut self.cells[usize::from(row)][usize::from(start.min(end))..usize::from(end)]
+        {
+            reset_cell(cell, self.style);
         }
     }
 
     fn clear_screen(&mut self) {
-        self.cells.fill(Cell::blank(Style::default()));
+        for row in &mut self.cells {
+            reset_row(row, Style::default());
+        }
     }
 
     fn newline(&mut self) {
@@ -742,39 +764,35 @@ impl Screen {
 
     fn scroll_up(&mut self, count: u16) {
         for _ in 0..count.max(1) {
-            if self.scroll_top == 0
+            let full_screen = self.scroll_top == 0
                 && self.scroll_bottom == self.rows.saturating_sub(1)
-                && self.alternate.is_none()
-            {
-                let row = self.cells[..usize::from(self.cols)].to_vec();
-                self.scrollback.push_back(row);
-                if self.scrollback.len() > MAX_SCROLLBACK {
-                    self.scrollback.pop_front();
-                }
-            }
-            let width = usize::from(self.cols);
-            let start = usize::from(self.scroll_top) * width;
-            let end = (usize::from(self.scroll_bottom) + 1) * width;
-            for index in start..end - width {
-                self.cells[index] = self.cells[index + width].clone();
-            }
-            for cell in &mut self.cells[end - width..end] {
-                *cell = Cell::blank(self.style);
-            }
+                && self.alternate.is_none();
+            let start = usize::from(self.scroll_top);
+            let end = usize::from(self.scroll_bottom);
+            let retired = self.cells.remove(start);
+            let mut blank = if full_screen {
+                let recycled = if self.scrollback.len() >= MAX_SCROLLBACK {
+                    self.scrollback.pop_front()
+                } else {
+                    None
+                };
+                self.scrollback.push_back(retired);
+                recycled.unwrap_or_else(|| vec![Cell::blank(self.style); usize::from(self.cols)])
+            } else {
+                retired
+            };
+            reset_row(&mut blank, self.style);
+            self.cells.insert(end, blank);
         }
     }
 
     fn scroll_down(&mut self, count: u16) {
         for _ in 0..count.max(1) {
-            let width = usize::from(self.cols);
-            let start = usize::from(self.scroll_top) * width;
-            let end = (usize::from(self.scroll_bottom) + 1) * width;
-            for index in (start + width..end).rev() {
-                self.cells[index] = self.cells[index - width].clone();
-            }
-            for cell in &mut self.cells[start..start + width] {
-                *cell = Cell::blank(self.style);
-            }
+            let start = usize::from(self.scroll_top);
+            let end = usize::from(self.scroll_bottom);
+            let mut retired = self.cells.remove(end);
+            reset_row(&mut retired, self.style);
+            self.cells.insert(start, retired);
         }
     }
 
@@ -782,8 +800,9 @@ impl Screen {
         let width = UnicodeWidthChar::width(character).unwrap_or(1);
         if width == 0 {
             let col = self.cursor_col.saturating_sub(1);
-            let index = self.index(self.cursor_row, col);
-            self.cells[index].text.push(character);
+            self.cells[usize::from(self.cursor_row)][usize::from(col)]
+                .text
+                .push(character);
             return;
         }
         if self.cursor_col >= self.cols || (width == 2 && self.cursor_col + 1 >= self.cols) {
@@ -797,15 +816,13 @@ impl Screen {
         if self.insert_mode {
             self.insert_blank_chars(width as u16);
         }
-        let index = self.index(self.cursor_row, self.cursor_col);
-        self.cells[index] = Cell {
+        self.cells[usize::from(self.cursor_row)][usize::from(self.cursor_col)] = Cell {
             text: character.to_string(),
             continuation: false,
             style: self.style,
         };
         if width == 2 && self.cursor_col + 1 < self.cols {
-            let continuation = self.index(self.cursor_row, self.cursor_col + 1);
-            self.cells[continuation] = Cell {
+            self.cells[usize::from(self.cursor_row)][usize::from(self.cursor_col + 1)] = Cell {
                 text: String::new(),
                 continuation: true,
                 style: self.style,
@@ -820,7 +837,7 @@ impl Screen {
         }
         let main = std::mem::replace(
             &mut self.cells,
-            vec![Cell::blank(Style::default()); usize::from(self.rows) * usize::from(self.cols)],
+            blank_rows(self.rows, self.cols, Style::default()),
         );
         self.alternate = Some((main, self.cursor_row, self.cursor_col));
         self.cursor_row = 0;
@@ -918,14 +935,32 @@ impl Screen {
     }
 }
 
-fn resize_cells(cells: &[Cell], old_rows: u16, old_cols: u16, rows: u16, cols: u16) -> Vec<Cell> {
-    let mut next = vec![Cell::blank(Style::default()); usize::from(rows) * usize::from(cols)];
-    let copy_rows = rows.min(old_rows);
-    let copy_cols = cols.min(old_cols);
+fn blank_rows(rows: u16, cols: u16, style: Style) -> Vec<Vec<Cell>> {
+    (0..rows)
+        .map(|_| vec![Cell::blank(style); usize::from(cols)])
+        .collect()
+}
+
+fn reset_cell(cell: &mut Cell, style: Style) {
+    cell.text.clear();
+    cell.text.push(' ');
+    cell.continuation = false;
+    cell.style = style;
+}
+
+fn reset_row(row: &mut [Cell], style: Style) {
+    for cell in row {
+        reset_cell(cell, style);
+    }
+}
+
+fn resize_rows(cells: &[Vec<Cell>], rows: u16, cols: u16) -> Vec<Vec<Cell>> {
+    let mut next = blank_rows(rows, cols, Style::default());
+    let copy_rows = usize::from(rows).min(cells.len());
     for row in 0..copy_rows {
+        let copy_cols = usize::from(cols).min(cells[row].len());
         for col in 0..copy_cols {
-            next[usize::from(row) * usize::from(cols) + usize::from(col)] =
-                cells[usize::from(row) * usize::from(old_cols) + usize::from(col)].clone();
+            next[row][col] = cells[row][col].clone();
         }
     }
     next
@@ -1230,48 +1265,70 @@ fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
 
 fn encode_row(screen: &Screen, viewport_offset: usize, row: u16) -> Vec<u8> {
     let cells = screen.visible_row(viewport_offset, row);
-    let mut runs = Vec::<(u16, u16, Style, String)>::new();
+    let mut bytes = Vec::with_capacity(cells.len().saturating_mul(2));
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    let mut run_count = 0_u16;
     let mut start = 0_u16;
     let mut style = cells.first().map_or(Style::default(), |cell| cell.style);
-    let mut text = String::new();
+    let mut run = begin_encoded_run(&mut bytes, start, style);
     for (col, cell) in cells.iter().enumerate() {
         if cell.style != style {
-            runs.push((start, col as u16 - start, style, std::mem::take(&mut text)));
+            finish_encoded_run(&mut bytes, run, col as u16 - start);
+            run_count = run_count.saturating_add(1);
             start = col as u16;
             style = cell.style;
+            run = begin_encoded_run(&mut bytes, start, style);
         }
         if !cell.continuation {
-            text.push_str(&cell.text);
+            let text_bytes = cell.text.as_bytes();
+            let remaining = (u16::MAX as usize).saturating_sub(bytes.len() - run.text_start);
+            bytes.extend_from_slice(&text_bytes[..text_bytes.len().min(remaining)]);
         }
     }
-    runs.push((start, screen.cols - start, style, text));
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(runs.len() as u16).to_le_bytes());
-    for (start, cells, style, text) in runs {
-        let (fg, bg) = if style.inverse {
-            (style.bg, style.fg)
-        } else {
-            (style.fg, style.bg)
-        };
-        bytes.extend_from_slice(&start.to_le_bytes());
-        bytes.extend_from_slice(&cells.to_le_bytes());
-        bytes.extend_from_slice(&fg.to_le_bytes());
-        bytes.extend_from_slice(&bg.to_le_bytes());
-        bytes.push(
-            u8::from(style.bold)
-                | (u8::from(style.faint) << 1)
-                | (u8::from(style.italic) << 2)
-                | (u8::from(style.underline) << 3)
-                | (u8::from(style.strikethrough) << 4),
-        );
-        bytes.extend_from_slice(&(text.len().min(u16::MAX as usize) as u16).to_le_bytes());
-        bytes.extend_from_slice(
-            text.as_bytes()
-                .get(..u16::MAX as usize)
-                .unwrap_or(text.as_bytes()),
-        );
-    }
+    finish_encoded_run(&mut bytes, run, screen.cols - start);
+    run_count = run_count.saturating_add(1);
+    bytes[..2].copy_from_slice(&run_count.to_le_bytes());
     bytes
+}
+
+struct EncodedRun {
+    cells_offset: usize,
+    text_length_offset: usize,
+    text_start: usize,
+}
+
+fn begin_encoded_run(bytes: &mut Vec<u8>, start: u16, style: Style) -> EncodedRun {
+    let (fg, bg) = if style.inverse {
+        (style.bg, style.fg)
+    } else {
+        (style.fg, style.bg)
+    };
+    bytes.extend_from_slice(&start.to_le_bytes());
+    let cells_offset = bytes.len();
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&fg.to_le_bytes());
+    bytes.extend_from_slice(&bg.to_le_bytes());
+    bytes.push(
+        u8::from(style.bold)
+            | (u8::from(style.faint) << 1)
+            | (u8::from(style.italic) << 2)
+            | (u8::from(style.underline) << 3)
+            | (u8::from(style.strikethrough) << 4),
+    );
+    let text_length_offset = bytes.len();
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    EncodedRun {
+        cells_offset,
+        text_length_offset,
+        text_start: bytes.len(),
+    }
+}
+
+fn finish_encoded_run(bytes: &mut [u8], run: EncodedRun, cells: u16) {
+    bytes[run.cells_offset..run.cells_offset + 2].copy_from_slice(&cells.to_le_bytes());
+    let text_length = (bytes.len() - run.text_start) as u16;
+    bytes[run.text_length_offset..run.text_length_offset + 2]
+        .copy_from_slice(&text_length.to_le_bytes());
 }
 
 export!(TerminalSession);

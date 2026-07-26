@@ -10,7 +10,11 @@ use std::{
     mem::size_of,
     os::fd::AsFd,
     path::PathBuf,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -66,6 +70,8 @@ use layout::{
 };
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
+
+pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     let args = ClientArgs::parse();
@@ -1392,6 +1398,191 @@ struct Application {
     plugin_key_to_present_samples: u64,
     plugin_last_key_to_present_us: u128,
     plugin_max_key_to_present_us: u128,
+    plugin_scroll_benchmark: Option<PluginScrollBenchmark>,
+}
+
+struct PluginScrollBenchmark {
+    pane: u64,
+    started: Instant,
+    first_input: Option<Instant>,
+    last_input: Option<Instant>,
+    input_intervals_us: Vec<u128>,
+    first_scene: Option<Instant>,
+    last_scene: Option<Instant>,
+    scene_intervals_us: Vec<u128>,
+    first_presented: Option<Instant>,
+    last_presented: Option<Instant>,
+    intervals_us: Vec<u128>,
+    input_events: u64,
+    frames: u64,
+    pending_scene: bool,
+}
+
+impl PluginScrollBenchmark {
+    fn new(pane: u64) -> Self {
+        Self {
+            pane,
+            started: Instant::now(),
+            first_input: None,
+            last_input: None,
+            input_intervals_us: Vec::with_capacity(256),
+            first_scene: None,
+            last_scene: None,
+            scene_intervals_us: Vec::with_capacity(256),
+            first_presented: None,
+            last_presented: None,
+            intervals_us: Vec::with_capacity(256),
+            input_events: 0,
+            frames: 0,
+            pending_scene: false,
+        }
+    }
+
+    fn record_input(&mut self, now: Instant) {
+        record_cadence(
+            now,
+            &mut self.first_input,
+            &mut self.last_input,
+            &mut self.input_intervals_us,
+        );
+        self.input_events = self.input_events.saturating_add(1);
+    }
+
+    fn record_scene(&mut self, now: Instant) {
+        record_cadence(
+            now,
+            &mut self.first_scene,
+            &mut self.last_scene,
+            &mut self.scene_intervals_us,
+        );
+        self.pending_scene = true;
+    }
+
+    fn record_present(&mut self, now: Instant) {
+        if !self.pending_scene {
+            return;
+        }
+        self.pending_scene = false;
+        record_cadence(
+            now,
+            &mut self.first_presented,
+            &mut self.last_presented,
+            &mut self.intervals_us,
+        );
+        self.frames = self.frames.saturating_add(1);
+    }
+
+    fn diagnostics(mut self) -> String {
+        let input = cadence_diagnostics(
+            &mut self.input_intervals_us,
+            self.first_input,
+            self.last_input,
+            self.input_events,
+        );
+        let scenes = u64::try_from(self.scene_intervals_us.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(self.first_scene.is_some()));
+        let scene = cadence_diagnostics(
+            &mut self.scene_intervals_us,
+            self.first_scene,
+            self.last_scene,
+            scenes,
+        );
+        let presented = cadence_diagnostics(
+            &mut self.intervals_us,
+            self.first_presented,
+            self.last_presented,
+            self.frames,
+        );
+        let within_budget = self
+            .intervals_us
+            .iter()
+            .filter(|interval| **interval <= 16_667)
+            .count();
+        format!(
+            "{{\"pane\":{},\"input_events\":{},\"input_fps_milli\":{},\"input_mean_interval_us\":{},\"input_p95_interval_us\":{},\"scenes\":{},\"scene_fps_milli\":{},\"scene_mean_interval_us\":{},\"scene_p95_interval_us\":{},\"frames\":{},\"elapsed_us\":{},\"span_us\":{},\"fps_milli\":{},\"mean_interval_us\":{},\"p95_interval_us\":{},\"p99_interval_us\":{},\"max_interval_us\":{},\"within_16_667_us\":{},\"intervals\":{}}}",
+            self.pane,
+            self.input_events,
+            input.fps_milli,
+            input.mean_interval_us,
+            input.p95_interval_us,
+            scenes,
+            scene.fps_milli,
+            scene.mean_interval_us,
+            scene.p95_interval_us,
+            self.frames,
+            self.started.elapsed().as_micros(),
+            presented.span_us,
+            presented.fps_milli,
+            presented.mean_interval_us,
+            presented.p95_interval_us,
+            presented.p99_interval_us,
+            presented.max_interval_us,
+            within_budget,
+            presented.intervals,
+        )
+    }
+}
+
+struct CadenceDiagnostics {
+    span_us: u128,
+    fps_milli: u128,
+    mean_interval_us: u128,
+    p95_interval_us: u128,
+    p99_interval_us: u128,
+    max_interval_us: u128,
+    intervals: usize,
+}
+
+fn record_cadence(
+    now: Instant,
+    first: &mut Option<Instant>,
+    last: &mut Option<Instant>,
+    intervals_us: &mut Vec<u128>,
+) {
+    if let Some(previous) = *last {
+        intervals_us.push(now.duration_since(previous).as_micros());
+    } else {
+        *first = Some(now);
+    }
+    *last = Some(now);
+}
+
+fn cadence_diagnostics(
+    intervals_us: &mut [u128],
+    first: Option<Instant>,
+    last: Option<Instant>,
+    events: u64,
+) -> CadenceDiagnostics {
+    intervals_us.sort_unstable();
+    let intervals = intervals_us.len();
+    let span_us = first
+        .zip(last)
+        .map_or(0, |(first, last)| last.duration_since(first).as_micros());
+    let percentile = |percent: usize| {
+        if intervals == 0 {
+            return 0;
+        }
+        let rank = intervals.saturating_mul(percent).div_ceil(100);
+        intervals_us[rank.saturating_sub(1).min(intervals - 1)]
+    };
+    CadenceDiagnostics {
+        span_us,
+        fps_milli: if events <= 1 || span_us == 0 {
+            0
+        } else {
+            u128::from(events - 1).saturating_mul(1_000_000_000) / span_us
+        },
+        mean_interval_us: if intervals == 0 {
+            0
+        } else {
+            intervals_us.iter().sum::<u128>() / intervals as u128
+        },
+        p95_interval_us: percentile(95),
+        p99_interval_us: percentile(99),
+        max_interval_us: intervals_us.last().copied().unwrap_or(0),
+        intervals,
+    }
 }
 
 impl Application {
@@ -1964,7 +2155,9 @@ impl Application {
                         "presentation actor requested a session message without a backend",
                     )?;
                     for message in &messages {
-                        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
+                            && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
+                        {
                             eprintln!(
                                 "presentation actor message sender={} recipient={} body={}",
                                 message.sender,
@@ -2210,6 +2403,11 @@ impl ApplicationHandler<ClientEvent> for Application {
                             if self.pending_plugin_input.is_some() {
                                 self.pending_plugin_scene = true;
                             }
+                            if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut()
+                                && benchmark.pane == pane
+                            {
+                                benchmark.record_scene(Instant::now());
+                            }
                             if let Some(change) = change
                                 && let Err(error) = dispatch_focus_change(
                                     self.wasm_runtime.as_ref(),
@@ -2363,7 +2561,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                 recipient,
                 body,
             } => {
-                if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
+                    && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
+                {
                     if body.starts_with(b"BTRM") {
                         eprintln!(
                             "session actor message sender={sender} recipient={recipient} terminal_snapshot_bytes={}",
@@ -2701,7 +2901,29 @@ impl ApplicationHandler<ClientEvent> for Application {
                 ..
             } => {
                 let logical_key = plugin_logical_key(&event.logical_key);
-                if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                if std::env::var_os("BROOD_TERMINAL_SCROLL_BENCH").is_some()
+                    && matches!(logical_key.as_str(), "F11" | "F12")
+                    && let Some(pane) = renderer.focused_plugin_pane()
+                {
+                    if event.state == ElementState::Pressed {
+                        if logical_key == "F12" {
+                            self.plugin_scroll_benchmark = Some(PluginScrollBenchmark::new(pane));
+                            PLUGIN_SCROLL_BENCH_ACTIVE.store(true, Ordering::Relaxed);
+                        } else {
+                            if let Some(benchmark) = self.plugin_scroll_benchmark.take() {
+                                eprintln!(
+                                    "plugin helix scroll diagnostics {}",
+                                    benchmark.diagnostics()
+                                );
+                            }
+                            PLUGIN_SCROLL_BENCH_ACTIVE.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+                if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
+                    && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
+                {
                     eprintln!(
                         "plugin keyboard input logical={logical_key:?} physical={:?} \
                          state={:?} synthetic={is_synthetic}",
@@ -2786,6 +3008,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                             modifiers,
                         },
                     );
+                    let delivered = sent.is_ok();
                     if let Err(error) = sent {
                         eprintln!("dropped plugin key event: {error:#}");
                     } else if event.state == ElementState::Pressed
@@ -2794,11 +3017,20 @@ impl ApplicationHandler<ClientEvent> for Application {
                         self.pending_plugin_input = Some(Instant::now());
                         self.pending_plugin_scene = false;
                     }
+                    if delivered
+                        && event.state == ElementState::Pressed
+                        && let Some(benchmark) = self.plugin_scroll_benchmark.as_mut()
+                        && benchmark.pane == pane
+                    {
+                        benchmark.record_input(Instant::now());
+                    }
                     if event.state == ElementState::Pressed
                         && let Some(text) = event.text.as_ref()
                         && !text.is_empty()
                     {
-                        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
+                            && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
+                        {
                             eprintln!("plugin text input text={text:?}");
                         }
                         if let Err(error) = send_presentation_event(
@@ -2830,6 +3062,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     reconfigure,
                 } => {
                     self.renderer_recoveries = 0;
+                    if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
+                        benchmark.record_present(Instant::now());
+                    }
                     if self.pending_plugin_scene
                         && let Some(started) = self.pending_plugin_input.take()
                     {

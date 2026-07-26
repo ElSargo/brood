@@ -454,21 +454,33 @@ impl PresentationWasmRuntime {
                     worker.raw()
                 ),
                 ComponentActorEvent::WorkerStarted { worker } => {
-                    eprintln!(
-                        "presentation actor worker started actor={actor_id} worker={}",
-                        worker.raw()
-                    );
+                    if std::env::var_os("BROOD_TRACE_PLUGIN_WORKERS").is_some()
+                        && !crate::PLUGIN_SCROLL_BENCH_ACTIVE
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "presentation actor worker started actor={actor_id} worker={}",
+                            worker.raw()
+                        );
+                    }
                 }
                 ComponentActorEvent::WorkerFinished { worker, output } => {
-                    eprintln!(
-                        "presentation actor worker finished actor={actor_id} worker={} bytes={}",
-                        worker.raw(),
-                        output.len()
-                    );
-                    if output.first() == Some(&b'{')
-                        && let Ok(metrics) = std::str::from_utf8(&output)
+                    if std::env::var_os("BROOD_TRACE_PLUGIN_WORKERS").is_some()
+                        && !crate::PLUGIN_SCROLL_BENCH_ACTIVE
+                            .load(std::sync::atomic::Ordering::Relaxed)
                     {
-                        eprintln!("presentation plugin worker metrics actor={actor_id} {metrics}");
+                        eprintln!(
+                            "presentation actor worker finished actor={actor_id} worker={} bytes={}",
+                            worker.raw(),
+                            output.len()
+                        );
+                        if output.first() == Some(&b'{')
+                            && let Ok(metrics) = std::str::from_utf8(&output)
+                        {
+                            eprintln!(
+                                "presentation plugin worker metrics actor={actor_id} {metrics}"
+                            );
+                        }
                     }
                 }
                 ComponentActorEvent::WorkerCancelled { worker } => {
