@@ -4873,6 +4873,10 @@ impl Brood {
                 actor_management,
                 app_management,
                 presentation_messaging,
+                event_waker: Some(brood_wasm::ComponentActorEventWaker::new({
+                    let signal = self.loop_signal.clone();
+                    move || signal.wakeup()
+                })),
                 ..brood_wasm::ComponentActorConfig::default()
             },
         ))?;

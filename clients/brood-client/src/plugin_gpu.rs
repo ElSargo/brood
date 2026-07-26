@@ -649,40 +649,51 @@ impl GpuCanvasRenderer {
             return Ok(false);
         }
         let started = Instant::now();
-        clear_target(encoder, &scene.root, "plugin GPU canvas clear root");
-        let mut target_stack = vec![TargetId::Root];
-        for op in &scene.ops {
-            match op {
-                CanvasOp::Draw(draw) => {
-                    let target = *target_stack
-                        .last()
-                        .context("plugin GPU canvas lost current target")?;
-                    self.encode_draw(encoder, scene, target, draw)?;
-                }
-                CanvasOp::BeginLayer(layer) => {
-                    let target = scene
-                        .layers
-                        .get(*layer)
-                        .context("plugin GPU canvas lost layer target")?;
-                    clear_target(encoder, target, "plugin GPU canvas clear layer");
-                    target_stack.push(TargetId::Layer(*layer));
-                }
-                CanvasOp::EndLayer { layer, draw } => {
-                    let popped = target_stack
-                        .pop()
-                        .context("plugin GPU canvas layer stack underflow")?;
-                    if popped != TargetId::Layer(*layer) {
-                        return Err(anyhow!("plugin GPU canvas layer order changed"));
+        let simple = scene.ops.iter().all(|op| {
+            matches!(
+                op,
+                CanvasOp::Draw(draw)
+                    if draw.clips.is_empty() && !is_advanced_blend(draw.blend_mode)
+            )
+        });
+        if simple {
+            self.encode_simple_scene(encoder, scene)?;
+        } else {
+            clear_target(encoder, &scene.root, "plugin GPU canvas clear root");
+            let mut target_stack = vec![TargetId::Root];
+            for op in &scene.ops {
+                match op {
+                    CanvasOp::Draw(draw) => {
+                        let target = *target_stack
+                            .last()
+                            .context("plugin GPU canvas lost current target")?;
+                        self.encode_draw(encoder, scene, target, draw)?;
                     }
-                    let target = *target_stack
-                        .last()
-                        .context("plugin GPU canvas layer lost parent")?;
-                    self.encode_draw(encoder, scene, target, draw)?;
+                    CanvasOp::BeginLayer(layer) => {
+                        let target = scene
+                            .layers
+                            .get(*layer)
+                            .context("plugin GPU canvas lost layer target")?;
+                        clear_target(encoder, target, "plugin GPU canvas clear layer");
+                        target_stack.push(TargetId::Layer(*layer));
+                    }
+                    CanvasOp::EndLayer { layer, draw } => {
+                        let popped = target_stack
+                            .pop()
+                            .context("plugin GPU canvas layer stack underflow")?;
+                        if popped != TargetId::Layer(*layer) {
+                            return Err(anyhow!("plugin GPU canvas layer order changed"));
+                        }
+                        let target = *target_stack
+                            .last()
+                            .context("plugin GPU canvas layer lost parent")?;
+                        self.encode_draw(encoder, scene, target, draw)?;
+                    }
                 }
             }
-        }
-        if target_stack != [TargetId::Root] {
-            return Err(anyhow!("plugin GPU canvas layer stack remained open"));
+            if target_stack != [TargetId::Root] {
+                return Err(anyhow!("plugin GPU canvas layer stack remained open"));
+            }
         }
         scene.dirty = false;
         let elapsed = started.elapsed();
@@ -695,6 +706,49 @@ impl GpuCanvasRenderer {
             );
         }
         Ok(true)
+    }
+
+    fn encode_simple_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &GpuCanvasScene,
+    ) -> Result<()> {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("plugin GPU canvas simple scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &scene.root.multisample_view,
+                resolve_target: Some(&scene.root.view),
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &scene.stencil.view,
+                depth_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_vertex_buffer(0, scene.vertex_buffer.slice(..));
+        pass.set_index_buffer(scene.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_stencil_reference(0);
+        for op in &scene.ops {
+            let CanvasOp::Draw(draw) = op else {
+                return Err(anyhow!("simple plugin scene contains a layer"));
+            };
+            pass.set_pipeline(self.pipeline(draw.blend_mode));
+            pass.set_bind_group(0, self.source_bind_group(scene, &draw.source)?, &[]);
+            pass.draw_indexed(draw.geometry.indices.clone(), 0, 0..1);
+        }
+        drop(pass);
+        Ok(())
     }
 
     fn encode_draw(

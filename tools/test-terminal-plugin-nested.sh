@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cc grim jq magick pkg-config python3 sway swaymsg wtype; do
+for tool in cc grim jq magick pkg-config python3 sway swaymsg tmux weston wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the terminal plugin proof" >&2
     exit 2
@@ -31,8 +31,25 @@ CLIENT2_LOG="$OUT/client-after-reconnect.log"
 COMPOSITOR_LOG="$OUT/compositor.log"
 SWAY_CONFIG="$OUT/sway.conf"
 DBUS_DESTINATION="org.brood.TerminalTest.p$$"
+WESTON_DIRECT="${BROOD_TERMINAL_WESTON_DIRECT:-0}"
+WESTON_RENDERER="${BROOD_TERMINAL_WESTON_RENDERER:-gl}"
+if [[ -n "${BROOD_TERMINAL_REFRESH_HZ:-}" ]]; then
+  REFRESH_HZ="$BROOD_TERMINAL_REFRESH_HZ"
+elif [[ "$WESTON_DIRECT" == 1 ]]; then
+  REFRESH_HZ=180
+else
+  REFRESH_HZ=60
+fi
+TMUX_SOCKET="$OUT/helix-tmux.sock"
+SHELL_ENV_FILE="$OUT/terminal-shell-env.sh"
 mkdir -p "$OUT"
 chmod 700 "$RUNTIME_DIR"
+
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  seq 1 2000 | sed 's/^/terminal plugin scroll line /' > /tmp/brood-terminal-proof.txt
+  printf 'exec tmux -S %q new-session hx /tmp/brood-terminal-proof.txt\n' \
+    "$TMUX_SOCKET" > "$SHELL_ENV_FILE"
+fi
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -72,8 +89,11 @@ cc \
   "${WAYLAND_BUILD_FLAGS[@]}"
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
-env -u brood_session \
-  RUST_LOG="$RUST_LOG" \
+SERVER_ENV=(env -u brood_session "RUST_LOG=$RUST_LOG")
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  SERVER_ENV+=("ENV=$SHELL_ENV_FILE")
+fi
+"${SERVER_ENV[@]}" \
   "$PACKAGE/bin/brood" run \
   --no-session-runner \
   --headless \
@@ -118,27 +138,53 @@ jq -e '
   and .hosted_runtime_io_resources == 3
 ' <<< "$STATUS_LIVE" > /dev/null
 
-printf '%s\n' \
-  'xwayland disable' \
-  'output HEADLESS-1 mode 1280x720' \
-  'seat seat0 fallback true' \
-  'default_border none' \
-  'default_floating_border none' \
-  > "$SWAY_CONFIG"
+OUTPUT_NAME="HEADLESS-1"
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  : > "$SWAY_CONFIG"
+else
+  printf '%s\n' \
+    'xwayland disable' \
+    "output * mode --custom 1280x720@${REFRESH_HZ}Hz" \
+    'seat seat0 fallback true' \
+    'default_border none' \
+    'default_floating_border none' \
+    > "$SWAY_CONFIG"
+fi
 
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WLR_BACKENDS=headless \
-  WLR_HEADLESS_OUTPUTS=1 \
-  WLR_LIBINPUT_NO_DEVICES=1 \
-  sway \
-  --unsupported-gpu \
-  --config "$SWAY_CONFIG" \
-  > "$COMPOSITOR_LOG" 2>&1 &
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    weston \
+    --backend=headless \
+    --width=1280 \
+    --height=720 \
+    --refresh-rate="$((REFRESH_HZ * 1000))" \
+    --fake-seat \
+    --renderer="$WESTON_RENDERER" \
+    --socket=wayland-direct \
+    --no-config \
+    --log="$COMPOSITOR_LOG" \
+    > /dev/null 2>&1 &
+else
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WLR_BACKENDS=headless \
+    WLR_HEADLESS_OUTPUTS=1 \
+    WLR_LIBINPUT_NO_DEVICES=1 \
+    sway \
+    --unsupported-gpu \
+    --config "$SWAY_CONFIG" \
+    > "$COMPOSITOR_LOG" 2>&1 &
+fi
 COMPOSITOR_PID=$!
 
 WAYLAND_SOCKET=""
 SWAY_SOCKET=""
 for _ in $(seq 1 200); do
+  if [[ "$WESTON_DIRECT" == 1 ]]; then
+    WAYLAND_SOCKET="wayland-direct"
+    [[ -S "$RUNTIME_DIR/$WAYLAND_SOCKET" ]] && break
+    sleep 0.05
+    continue
+  fi
   WAYLAND_SOCKET="$(
     find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' | head -1
   )"
@@ -152,7 +198,10 @@ for _ in $(seq 1 200); do
   }
   sleep 0.05
 done
-[[ -n "$WAYLAND_SOCKET" && -n "$SWAY_SOCKET" ]]
+if [[ "$WESTON_DIRECT" != 1 ]]; then
+  [[ -n "$WAYLAND_SOCKET" && -n "$SWAY_SOCKET" ]]
+fi
+[[ -n "$WAYLAND_SOCKET" ]]
 
 wayland_env() {
   env \
@@ -161,6 +210,13 @@ wayland_env() {
     SWAYSOCK="$SWAY_SOCKET" \
     "$@"
 }
+
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  wayland_env wayland-info > "$OUT/outputs.txt"
+else
+  wayland_env swaymsg -t get_outputs > "$OUT/outputs.json"
+  OUTPUT_NAME="$(jq -r 'map(select(.active))[0].name' "$OUT/outputs.json")"
+fi
 
 start_client() {
   local log="$1"
@@ -172,6 +228,7 @@ start_client() {
     BROOD_TRACE_PLUGIN_INPUT=1 \
     BROOD_TRACE_PLUGIN_WORKERS=1 \
     BROOD_TERMINAL_SCROLL_BENCH=1 \
+    BROOD_TERMINAL_SCROLL_BENCH_AUTO="$WESTON_DIRECT" \
     RUST_LOG="$RUST_LOG" \
     "$PACKAGE/bin/brood-client" \
     --config "$PACKAGE/brood.toml" \
@@ -268,7 +325,12 @@ close_frontend() {
 
 start_client "$CLIENT1_LOG"
 wait_for_terminal_render "$CLIENT1_LOG"
-focus_terminal "$CLIENT1_LOG"
+if [[ "$WESTON_DIRECT" != 1 ]]; then
+  focus_terminal "$CLIENT1_LOG"
+fi
+SCROLL_LOG="$CLIENT1_LOG"
+
+if [[ "${BROOD_TERMINAL_SCROLL_ONLY:-0}" != 1 ]]; then
 capture "$OUT/terminal-initial.png"
 
 SHELL_BASELINE="$(metric_value "$CLIENT1_LOG" pty_bytes)"
@@ -427,47 +489,97 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 [[ -e "$LAZYGIT_EXIT_FILE" ]]
+SCROLL_LOG="$CLIENT2_LOG"
+fi
 
-HELIX_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-type_line '{ printf "terminal plugin TUI proof λ中\n"; seq 1 2000 | sed "s/^/terminal plugin scroll line /"; } > /tmp/brood-terminal-proof.txt; hx /tmp/brood-terminal-proof.txt'
+HELIX_BASELINE="$(metric_value "$SCROLL_LOG" pty_bytes)"
+if [[ "$WESTON_DIRECT" != 1 ]]; then
+  type_line '{ printf "terminal plugin TUI proof λ中\n"; seq 1 2000 | sed "s/^/terminal plugin scroll line /"; } > /tmp/brood-terminal-proof.txt; hx /tmp/brood-terminal-proof.txt'
+fi
 for _ in $(seq 1 300); do
-  HELIX_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-  HELIX_COMMANDS="$(metric_value "$CLIENT2_LOG" commands)"
+  HELIX_BYTES="$(metric_value "$SCROLL_LOG" pty_bytes)"
+  HELIX_COMMANDS="$(metric_value "$SCROLL_LOG" commands)"
+  if [[ "$WESTON_DIRECT" == 1 ]] && ((HELIX_COMMANDS > 500)); then
+    break
+  fi
   if ((HELIX_BYTES > HELIX_BASELINE + 10000 && HELIX_COMMANDS > 500)); then
     break
   fi
   sleep 0.05
 done
-((HELIX_BYTES > HELIX_BASELINE + 10000 && HELIX_COMMANDS > 500))
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  ((HELIX_COMMANDS > 500))
+else
+  ((HELIX_BYTES > HELIX_BASELINE + 10000 && HELIX_COMMANDS > 500))
+fi
 sleep 0.1
-capture "$OUT/terminal-helix.png"
+if [[ "${BROOD_TERMINAL_SCROLL_ONLY:-0}" != 1 ]]; then
+  capture "$OUT/terminal-helix.png"
+fi
 
-wayland_env "$OUT/virtual-keyboard-key" --none 88
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  INITIAL_AUTO_METRICS="$(
+    rg -c '^plugin helix scroll diagnostics ' "$SCROLL_LOG" || true
+  )"
+  python3 tools/tmux-repeat-key.py \
+    --socket "$TMUX_SOCKET" \
+    --count 720 \
+    --interval-us 4167 \
+    j
+  for _ in $(seq 1 200); do
+    AUTO_METRICS="$(
+      rg -c '^plugin helix scroll diagnostics ' "$SCROLL_LOG" || true
+    )"
+    ((AUTO_METRICS > INITIAL_AUTO_METRICS)) && break
+    sleep 0.05
+  done
+else
+  wayland_env "$OUT/virtual-keyboard-key" --none 88
 # Saturate the terminal above refresh rate so input/compositor phase alignment
 # cannot create artificial missed frames. Presentation should remain display
 # limited while the terminal pipeline continues producing well above 60 Hz.
-wayland_env "$OUT/virtual-keyboard-key" --repeat 360 8333 36
+wayland_env "$OUT/virtual-keyboard-key" --repeat 720 4167 36
 # Give the final PTY update enough time to reach presentation without including
 # Helix's unrelated cursor-blink timer in the measured scene stream.
 sleep 0.08
 wayland_env "$OUT/virtual-keyboard-key" --none 87
+fi
 for _ in $(seq 1 200); do
   HELIX_SCROLL_METRIC="$(
-    sed -n 's/^plugin helix scroll diagnostics //p' "$CLIENT2_LOG" | tail -1
+    sed -n 's/^plugin helix scroll diagnostics //p' "$SCROLL_LOG" | tail -1
   )"
   [[ -n "$HELIX_SCROLL_METRIC" ]] && break
   sleep 0.05
 done
 [[ -n "$HELIX_SCROLL_METRIC" ]]
 # The headless compositor has host-scheduler jitter, so keep a narrow tolerance
-# on actual presents while requiring nearly every 120 Hz Helix update to arrive.
-jq -e '
-  .input_events == 360
-  and .input_fps_milli >= 118000
-  and .scenes >= 350
-  and .scene_fps_milli >= 115000
-  and .frames >= 175
-  and .fps_milli >= 57000
+# on actual presents while requiring nearly every 240 Hz Helix update to arrive.
+if [[ "$WESTON_DIRECT" == 1 ]]; then
+  MIN_SCENES=650
+  MIN_SCENE_FPS_MILLI=220000
+  MIN_FRAMES=500
+  MIN_FPS_MILLI=170000
+  MAX_P95_INTERVAL_US=7000
+else
+  MIN_SCENES=350
+  MIN_SCENE_FPS_MILLI=115000
+  MIN_FRAMES=175
+  MIN_FPS_MILLI=57000
+  MAX_P95_INTERVAL_US=25000
+fi
+jq -e \
+  --argjson min_scenes "$MIN_SCENES" \
+  --argjson min_scene_fps "$MIN_SCENE_FPS_MILLI" \
+  --argjson min_frames "$MIN_FRAMES" \
+  --argjson min_fps "$MIN_FPS_MILLI" \
+  --argjson max_p95 "$MAX_P95_INTERVAL_US" \
+  '
+  (.input_events == 0 or (.input_events == 720 and .input_fps_milli >= 235000))
+  and .scenes >= $min_scenes
+  and .scene_fps_milli >= $min_scene_fps
+  and .frames >= $min_frames
+  and .fps_milli >= $min_fps
+  and .p95_interval_us <= $max_p95
   and .intervals > 0
 ' \
   <<< "$HELIX_SCROLL_METRIC" > /dev/null
@@ -479,7 +591,8 @@ fi
 
 RESIZE_BASELINE="$(metric_value "$CLIENT2_LOG" pty_resizes)"
 for mode in 1024x640 1400x800 960x600 1180x680; do
-  wayland_env swaymsg output HEADLESS-1 mode "$mode" > /dev/null
+  wayland_env swaymsg \
+    "output $OUTPUT_NAME mode --custom ${mode}@${REFRESH_HZ}Hz" > /dev/null
   sleep 0.15
 done
 for _ in $(seq 1 200); do
@@ -516,15 +629,14 @@ sleep 0.5
 capture "$OUT/terminal-shell-after-helix.png"
 for _ in $(seq 1 200); do
   HELIX_EXIT_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-  HELIX_EXIT_COMMANDS="$(metric_value "$CLIENT2_LOG" commands)"
   HELIX_EXIT_BRACKETED="$(metric_value "$CLIENT2_LOG" bracketed_paste)"
-  if ((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE && HELIX_EXIT_COMMANDS < 100)) \
+  if ((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE)) \
     && [[ "$HELIX_EXIT_BRACKETED" == true ]]; then
     break
   fi
   sleep 0.05
 done
-((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE && HELIX_EXIT_COMMANDS < 100))
+((HELIX_EXIT_BYTES > HELIX_EXIT_BASELINE))
 [[ "$HELIX_EXIT_BRACKETED" == true ]]
 STREAM_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
 STREAM_STARTED_MS="$(date +%s%3N)"

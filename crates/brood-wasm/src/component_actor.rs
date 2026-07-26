@@ -189,6 +189,25 @@ pub struct ComponentActorMailboxStats {
     pub capacity: usize,
 }
 
+#[derive(Clone)]
+pub struct ComponentActorEventWaker(Arc<dyn Fn() + Send + Sync>);
+
+impl ComponentActorEventWaker {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for ComponentActorEventWaker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ComponentActorEventWaker")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ComponentActorConfig {
     pub filesystem: Option<FilesystemGrant>,
@@ -224,6 +243,9 @@ pub struct ComponentActorConfig {
     /// Admit explicitly addressed session-to-presentation actor messages.
     /// Presentation actors never receive this cross-placement capability.
     pub presentation_messaging: bool,
+    /// Wake the owning host loop when the actor emits an event that must be
+    /// routed outside the actor runtime.
+    pub event_waker: Option<ComponentActorEventWaker>,
     /// Admit typed session catalogue commands. Presentation clients set this
     /// for client-realm Component actors only.
     pub session_control: bool,
@@ -258,6 +280,7 @@ impl Default for ComponentActorConfig {
             app_management: false,
             session_messaging: false,
             presentation_messaging: false,
+            event_waker: None,
             session_control: false,
             epoch_tick_interval: Duration::from_millis(2),
             epoch_yield_ticks: 1,
@@ -2412,6 +2435,9 @@ async fn run_component_event_loop(
                                                     body: request.body,
                                                 })
                                                 .context("presentation actor message request queue is full")?;
+                                            if let Some(waker) = config.event_waker.as_ref() {
+                                                waker.wake();
+                                            }
                                         }
                                         abi::Command::SessionCommand(request) => {
                                             ensure!(

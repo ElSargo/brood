@@ -49,8 +49,8 @@ pub use completion_io::{
     FilesystemGrant, OperationId,
 };
 pub use component_actor::{
-    ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorMailboxStats,
-    ComponentAppEvent, ComponentChildEvent, WorkerId,
+    ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
+    ComponentActorMailboxStats, ComponentAppEvent, ComponentChildEvent, WorkerId,
 };
 pub use coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, CoordinationStats,

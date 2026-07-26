@@ -1399,6 +1399,7 @@ struct Application {
     plugin_last_key_to_present_us: u128,
     plugin_max_key_to_present_us: u128,
     plugin_scroll_benchmark: Option<PluginScrollBenchmark>,
+    plugin_scroll_auto_last_scene: Option<(u64, Instant)>,
 }
 
 struct PluginScrollBenchmark {
@@ -1414,6 +1415,13 @@ struct PluginScrollBenchmark {
     last_presented: Option<Instant>,
     intervals_us: Vec<u128>,
     input_events: u64,
+    redraws: u64,
+    skipped: u64,
+    reconfigures: u64,
+    acquire_us: u128,
+    encode_us: u128,
+    submit_us: u128,
+    present_us: u128,
     frames: u64,
     pending_scene: bool,
 }
@@ -1433,6 +1441,13 @@ impl PluginScrollBenchmark {
             last_presented: None,
             intervals_us: Vec::with_capacity(256),
             input_events: 0,
+            redraws: 0,
+            skipped: 0,
+            reconfigures: 0,
+            acquire_us: 0,
+            encode_us: 0,
+            submit_us: 0,
+            present_us: 0,
             frames: 0,
             pending_scene: false,
         }
@@ -1458,7 +1473,7 @@ impl PluginScrollBenchmark {
         self.pending_scene = true;
     }
 
-    fn record_present(&mut self, now: Instant) {
+    fn record_present(&mut self, now: Instant, timings: RenderTimings) {
         if !self.pending_scene {
             return;
         }
@@ -1469,7 +1484,23 @@ impl PluginScrollBenchmark {
             &mut self.last_presented,
             &mut self.intervals_us,
         );
+        self.acquire_us = self.acquire_us.saturating_add(timings.acquire_us);
+        self.encode_us = self.encode_us.saturating_add(timings.encode_us);
+        self.submit_us = self.submit_us.saturating_add(timings.submit_us);
+        self.present_us = self.present_us.saturating_add(timings.present_us);
         self.frames = self.frames.saturating_add(1);
+    }
+
+    fn record_redraw(&mut self) {
+        self.redraws = self.redraws.saturating_add(1);
+    }
+
+    fn record_skipped(&mut self) {
+        self.skipped = self.skipped.saturating_add(1);
+    }
+
+    fn record_reconfigure(&mut self) {
+        self.reconfigures = self.reconfigures.saturating_add(1);
     }
 
     fn diagnostics(mut self) -> String {
@@ -1499,8 +1530,13 @@ impl PluginScrollBenchmark {
             .iter()
             .filter(|interval| **interval <= 16_667)
             .count();
+        let within_180hz_budget = self
+            .intervals_us
+            .iter()
+            .filter(|interval| **interval <= 5_556)
+            .count();
         format!(
-            "{{\"pane\":{},\"input_events\":{},\"input_fps_milli\":{},\"input_mean_interval_us\":{},\"input_p95_interval_us\":{},\"scenes\":{},\"scene_fps_milli\":{},\"scene_mean_interval_us\":{},\"scene_p95_interval_us\":{},\"frames\":{},\"elapsed_us\":{},\"span_us\":{},\"fps_milli\":{},\"mean_interval_us\":{},\"p95_interval_us\":{},\"p99_interval_us\":{},\"max_interval_us\":{},\"within_16_667_us\":{},\"intervals\":{}}}",
+            "{{\"pane\":{},\"input_events\":{},\"input_fps_milli\":{},\"input_mean_interval_us\":{},\"input_p95_interval_us\":{},\"scenes\":{},\"scene_fps_milli\":{},\"scene_mean_interval_us\":{},\"scene_p95_interval_us\":{},\"redraws\":{},\"skipped\":{},\"reconfigures\":{},\"frames\":{},\"acquire_mean_us\":{},\"encode_mean_us\":{},\"submit_mean_us\":{},\"present_mean_us\":{},\"elapsed_us\":{},\"span_us\":{},\"fps_milli\":{},\"mean_interval_us\":{},\"p95_interval_us\":{},\"p99_interval_us\":{},\"max_interval_us\":{},\"within_5_556_us\":{},\"within_16_667_us\":{},\"intervals\":{}}}",
             self.pane,
             self.input_events,
             input.fps_milli,
@@ -1510,7 +1546,14 @@ impl PluginScrollBenchmark {
             scene.fps_milli,
             scene.mean_interval_us,
             scene.p95_interval_us,
+            self.redraws,
+            self.skipped,
+            self.reconfigures,
             self.frames,
+            self.acquire_us / u128::from(self.frames.max(1)),
+            self.encode_us / u128::from(self.frames.max(1)),
+            self.submit_us / u128::from(self.frames.max(1)),
+            self.present_us / u128::from(self.frames.max(1)),
             self.started.elapsed().as_micros(),
             presented.span_us,
             presented.fps_milli,
@@ -1518,9 +1561,16 @@ impl PluginScrollBenchmark {
             presented.p95_interval_us,
             presented.p99_interval_us,
             presented.max_interval_us,
+            within_180hz_budget,
             within_budget,
             presented.intervals,
         )
+    }
+
+    fn scene_count(&self) -> u64 {
+        u64::try_from(self.scene_intervals_us.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(self.first_scene.is_some()))
     }
 }
 
@@ -2407,6 +2457,22 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 && benchmark.pane == pane
                             {
                                 benchmark.record_scene(Instant::now());
+                            } else if std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO").as_deref()
+                                == Ok("1")
+                            {
+                                let now = Instant::now();
+                                if let Some((previous_pane, previous)) =
+                                    self.plugin_scroll_auto_last_scene
+                                    && previous_pane == pane
+                                    && now.duration_since(previous) <= Duration::from_millis(10)
+                                {
+                                    let mut benchmark = PluginScrollBenchmark::new(pane);
+                                    benchmark.record_scene(previous);
+                                    benchmark.record_scene(now);
+                                    self.plugin_scroll_benchmark = Some(benchmark);
+                                    PLUGIN_SCROLL_BENCH_ACTIVE.store(true, Ordering::Relaxed);
+                                }
+                                self.plugin_scroll_auto_last_scene = Some((pane, now));
                             }
                             if let Some(change) = change
                                 && let Err(error) = dispatch_focus_change(
@@ -2625,6 +2691,27 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.wasm_runtime.as_ref(),
             &mut self.pending_plugin_pointer_motion,
         );
+        if std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO").as_deref() == Ok("1")
+            && self
+                .plugin_scroll_benchmark
+                .as_ref()
+                .is_some_and(|benchmark| {
+                    benchmark.input_events == 0
+                        && benchmark
+                            .last_scene
+                            .is_some_and(|last| last.elapsed() >= Duration::from_millis(80))
+                })
+        {
+            if let Some(benchmark) = self.plugin_scroll_benchmark.take()
+                && benchmark.scene_count() >= 30
+            {
+                eprintln!(
+                    "plugin helix scroll diagnostics {}",
+                    benchmark.diagnostics()
+                );
+            }
+            PLUGIN_SCROLL_BENCH_ACTIVE.store(false, Ordering::Relaxed);
+        }
         if input_backpressured || actor_message_backpressured {
             // The shared-memory consumer already has a wakeup for the records
             // which filled its ring. Poll until it frees a slot so input state
@@ -3056,52 +3143,69 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                 }
             }
-            WindowEvent::RedrawRequested => match renderer.render() {
-                RenderOutcome::Presented {
-                    sequence,
-                    reconfigure,
-                } => {
-                    self.renderer_recoveries = 0;
-                    if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
-                        benchmark.record_present(Instant::now());
+            WindowEvent::RedrawRequested => {
+                if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
+                    benchmark.record_redraw();
+                }
+                match renderer.render() {
+                    RenderOutcome::Presented {
+                        sequence,
+                        reconfigure,
+                        timings,
+                    } => {
+                        self.renderer_recoveries = 0;
+                        if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
+                            benchmark.record_present(Instant::now(), timings);
+                        }
+                        if self.pending_plugin_scene
+                            && let Some(started) = self.pending_plugin_input.take()
+                        {
+                            let elapsed = started.elapsed().as_micros();
+                            self.plugin_key_to_present_samples =
+                                self.plugin_key_to_present_samples.saturating_add(1);
+                            self.plugin_last_key_to_present_us = elapsed;
+                            self.plugin_max_key_to_present_us =
+                                self.plugin_max_key_to_present_us.max(elapsed);
+                            self.pending_plugin_scene = false;
+                        }
+                        if reconfigure {
+                            renderer.reconfigure();
+                        }
+                        if let Some(sequence) = sequence
+                            && self.last_presented_sequence != Some(sequence)
+                            && let Some(sender) = self.input_sender.as_mut()
+                        {
+                            if send_input(
+                                sender,
+                                ClientMessage::Lifecycle(ClientLifecycle::FramePresented {
+                                    sequence,
+                                }),
+                            ) {
+                                self.last_presented_sequence = Some(sequence);
+                            } else {
+                                renderer.window.request_redraw();
+                            }
+                        }
                     }
-                    if self.pending_plugin_scene
-                        && let Some(started) = self.pending_plugin_input.take()
-                    {
-                        let elapsed = started.elapsed().as_micros();
-                        self.plugin_key_to_present_samples =
-                            self.plugin_key_to_present_samples.saturating_add(1);
-                        self.plugin_last_key_to_present_us = elapsed;
-                        self.plugin_max_key_to_present_us =
-                            self.plugin_max_key_to_present_us.max(elapsed);
-                        self.pending_plugin_scene = false;
+                    RenderOutcome::Skipped => {
+                        if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
+                            benchmark.record_skipped();
+                        }
                     }
-                    if reconfigure {
+                    RenderOutcome::Reconfigure => {
+                        if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
+                            benchmark.record_reconfigure();
+                        }
                         renderer.reconfigure();
                     }
-                    if let Some(sequence) = sequence
-                        && self.last_presented_sequence != Some(sequence)
-                        && let Some(sender) = self.input_sender.as_mut()
-                    {
-                        if send_input(
-                            sender,
-                            ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence }),
-                        ) {
-                            self.last_presented_sequence = Some(sequence);
-                        } else {
-                            renderer.window.request_redraw();
+                    RenderOutcome::Failed(message) => {
+                        let generation = renderer.generation;
+                        if let Err(error) = self.recover_renderer(generation, message) {
+                            self.fail(event_loop, error);
                         }
                     }
                 }
-                RenderOutcome::Skipped => {}
-                RenderOutcome::Reconfigure => renderer.reconfigure(),
-                RenderOutcome::Failed(message) => {
-                    let generation = renderer.generation;
-                    if let Err(error) = self.recover_renderer(generation, message) {
-                        self.fail(event_loop, error);
-                    }
-                }
-            },
+            }
             _ => {}
         }
     }
@@ -4305,8 +4409,12 @@ impl Renderer {
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
         surface.configure(&device, &config);
         eprintln!(
-            "configured presentation surface format={:?} color_space={:?}",
-            config.format, config.color_space
+            "configured presentation surface format={:?} color_space={:?} \
+             present_mode={:?} maximum_frame_latency={}",
+            config.format,
+            config.color_space,
+            config.present_mode,
+            config.desired_maximum_frame_latency,
         );
         Ok(Self {
             generation,
@@ -5074,6 +5182,7 @@ impl Renderer {
     }
 
     fn render(&mut self) -> RenderOutcome {
+        let started = Instant::now();
         let (frame, reconfigure) = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
             CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -5087,6 +5196,7 @@ impl Renderer {
                 return RenderOutcome::Failed("wgpu surface validation failed");
             }
         };
+        let acquired = Instant::now();
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -5196,7 +5306,9 @@ impl Renderer {
             drop(render_pass);
         }
 
+        let encoded = Instant::now();
         let submission = self.queue.submit([encoder.finish()]);
+        let submitted = Instant::now();
         if self.current_sequence.is_some()
             && self
                 .device
@@ -5208,10 +5320,18 @@ impl Renderer {
         {
             return RenderOutcome::Failed("timed out waiting for composed frame consumption");
         }
+        self.window.pre_present_notify();
         self.queue.present(frame);
+        let presented = Instant::now();
         RenderOutcome::Presented {
             sequence: self.current_sequence,
             reconfigure,
+            timings: RenderTimings {
+                acquire_us: acquired.duration_since(started).as_micros(),
+                encode_us: encoded.duration_since(acquired).as_micros(),
+                submit_us: submitted.duration_since(encoded).as_micros(),
+                present_us: presented.duration_since(submitted).as_micros(),
+            },
         }
     }
 
@@ -5390,10 +5510,19 @@ fn scaled_viewport(
 }
 
 #[derive(Clone, Copy)]
+struct RenderTimings {
+    acquire_us: u128,
+    encode_us: u128,
+    submit_us: u128,
+    present_us: u128,
+}
+
+#[derive(Clone, Copy)]
 enum RenderOutcome {
     Presented {
         sequence: Option<u64>,
         reconfigure: bool,
+        timings: RenderTimings,
     },
     Reconfigure,
     Skipped,
