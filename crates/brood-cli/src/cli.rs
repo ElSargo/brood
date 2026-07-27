@@ -50,11 +50,26 @@ pub struct TestArgs {
 pub enum TestCommand {
     /// Run the external-client nested terminal workload.
     Nested(NestedTestArgs),
+    /// Deploy to an SSH host and verify one client against local and remote backends.
+    Ssh(SshTestArgs),
 }
 
 #[derive(Debug, Clone, Parser, Default)]
 pub struct NestedTestArgs {
     /// Directory which receives screenshots, logs, and structured metrics.
+    #[arg(long = "out-dir", value_name = "DIR")]
+    pub out_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct SshTestArgs {
+    /// SSH destination understood by the local OpenSSH configuration.
+    #[arg(value_name = "USER@HOST")]
+    pub target: String,
+    /// Host or IP carrying the QUIC connection. Defaults to the SSH hostname.
+    #[arg(long = "connect-host", value_name = "HOST")]
+    pub connect_host: Option<String>,
+    /// Directory which receives the screenshot, logs, and structured proof.
     #[arg(long = "out-dir", value_name = "DIR")]
     pub out_dir: Option<PathBuf>,
 }
@@ -280,6 +295,13 @@ pub struct ClientArgs {
         conflicts_with_all = ["dbus_name", "dbus_address", "server"]
     )]
     pub no_server: bool,
+    /// Also attach the normal local session backend when remote backends are configured.
+    #[arg(
+        long = "include-local",
+        requires = "remote_connect",
+        conflicts_with = "no_server"
+    )]
+    pub include_local: bool,
     /// `DBus` destination name for the session server.
     #[arg(long = "dbus-destination", alias = "dbus-name")]
     pub dbus_name: Option<String>,
@@ -297,10 +319,11 @@ pub struct ClientArgs {
         default_value_t = FrameTransportArg::Auto
     )]
     pub frame_transport: FrameTransportArg,
-    /// Connect to a remote presentation relay instead of local `DBus`.
+    /// Connect to one or more remote presentation relays.
     #[arg(
         long = "remote-connect",
         value_name = "ADDRESS",
+        num_args = 1..,
         requires_all = [
             "remote_server_certificate",
             "remote_client_certificate",
@@ -310,11 +333,10 @@ pub struct ClientArgs {
             "no_server",
             "dbus_name",
             "dbus_address",
-            "server",
-            "frame_transport"
+            "server"
         ]
     )]
-    pub remote_connect: Option<SocketAddr>,
+    pub remote_connect: Vec<SocketAddr>,
     /// TLS server name expected from the remote presentation relay.
     #[arg(long = "remote-server-name", default_value = "localhost")]
     pub remote_server_name: String,

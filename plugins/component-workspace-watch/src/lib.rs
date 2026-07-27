@@ -3,8 +3,8 @@ wit_bindgen::generate!({
     world: "brood-plugin",
 });
 
-use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
 use brood::plugin::host;
+use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
 
 const WORKER: u64 = 1;
 const REPORT: &str = ".brood/component-workspace-watch.md";

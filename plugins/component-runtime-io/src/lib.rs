@@ -3,10 +3,10 @@ wit_bindgen::generate!({
     world: "brood-plugin",
 });
 
+use brood::plugin::host;
 use exports::brood::plugin::actor::{
     Command, Event, Guest, WorkerEvent, WorkerFinished, WorkerRequest,
 };
-use brood::plugin::host;
 
 const WORKER: u64 = 1;
 const REPORT: &str = ".brood/runtime-io-transcript.md";

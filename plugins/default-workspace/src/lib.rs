@@ -1135,9 +1135,10 @@ fn focused_terminal_plugin(state: &PolicyState) -> bool {
     let Some(focused) = state.focused_pane else {
         return false;
     };
-    state.app_panes.iter().any(|item| {
-        item.pane == focused && item.app_id.as_bytes().starts_with(b"terminal-ui")
-    })
+    state
+        .app_panes
+        .iter()
+        .any(|item| item.pane == focused && item.app_id.as_bytes().starts_with(b"terminal-ui"))
 }
 
 fn pane_for_app_id_in_list(app_panes: &[AppPane], app_id: &[u8]) -> Option<u64> {

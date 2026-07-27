@@ -78,8 +78,14 @@ impl Guest for ExampleInitActor {
                         "client init actor has no bound session".to_string(),
                     ))];
                 };
+                let Some(backend_id) = context.backend_id else {
+                    return vec![Command::LifecycleComplete(Err(
+                        "client init actor has no bound backend".to_string(),
+                    ))];
+                };
                 vec![
                     Command::SendSessionMessage(SessionActorMessage {
+                        backend_id,
                         session_id,
                         actor: "init".to_string(),
                         body: CROSS_REALM_PROOF.to_vec(),
@@ -133,6 +139,7 @@ fn start_agent(id: &str) -> Command {
             "filesystem:workspace-write".to_string(),
             "subprocess:codex".to_string(),
         ],
+        backend_id: None,
         session_id: None,
     })
 }
@@ -142,6 +149,7 @@ fn start_terminal(id: &str) -> Command {
         id: id.to_string(),
         path: TERMINAL_SESSION_COMPONENT_FILE.to_string(),
         capabilities: vec!["pty".to_string(), "subprocess:sh".to_string()],
+        backend_id: None,
         session_id: None,
     })
 }

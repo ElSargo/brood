@@ -152,6 +152,7 @@ pub enum ComponentActorEvent {
         id: String,
         path: String,
         capabilities: Vec<String>,
+        backend_id: Option<u64>,
         session_id: Option<u64>,
     },
     ActorStopRequested {
@@ -162,11 +163,13 @@ pub enum ComponentActorEvent {
         argv: Vec<String>,
     },
     SessionMessageRequested {
+        backend_id: u64,
         session_id: u64,
         actor: String,
         body: Vec<u8>,
     },
     DaemonMessageRequested {
+        backend_id: u64,
         actor: String,
         body: Vec<u8>,
     },
@@ -2376,6 +2379,7 @@ async fn run_component_event_loop(
                                                     id: request.id,
                                                     path: request.path,
                                                     capabilities: request.capabilities,
+                                                    backend_id: request.backend_id,
                                                     session_id: request.session_id,
                                                 })
                                                 .context("realm init actor request queue is full")?;
@@ -2412,6 +2416,7 @@ async fn run_component_event_loop(
                                             );
                                             event_observer
                                                 .try_send(ComponentActorEvent::SessionMessageRequested {
+                                                    backend_id: request.backend_id,
                                                     session_id: request.session_id,
                                                     actor: request.actor,
                                                     body: request.body,
@@ -2429,6 +2434,7 @@ async fn run_component_event_loop(
                                             );
                                             event_observer
                                                 .try_send(ComponentActorEvent::DaemonMessageRequested {
+                                                    backend_id: request.backend_id,
                                                     actor: request.actor,
                                                     body: request.body,
                                                 })
@@ -2652,6 +2658,7 @@ fn component_lifecycle_to_guest(event: PluginLifecycleEvent) -> GuestEvent {
                 instance_id: context.instance_id,
                 generation: context.generation,
                 reason,
+                backend_id: context.backend_id,
                 session_id: context.session_id,
                 workspace_root: context.workspace_root,
                 data: context
@@ -2772,6 +2779,7 @@ fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
 
     let event = match event {
         SessionEvent::Snapshot(snapshot) => abi::SessionEvent::Snapshot(abi::SessionSnapshot {
+            backend_id: snapshot.backend_id,
             revision: snapshot.revision,
             active: snapshot.active,
             sessions: snapshot
@@ -2794,6 +2802,7 @@ fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
         }),
         SessionEvent::CommandCompleted(completion) => {
             abi::SessionEvent::CommandCompleted(abi::SessionCommandCompleted {
+                backend_id: completion.backend_id,
                 request: completion.request,
                 operation: component_session_operation_to_guest(completion.operation),
                 success: completion.success,
@@ -2840,10 +2849,12 @@ fn component_session_command_from_guest(
         ),
     }
     Ok(SessionCommandRequest {
+        backend_id: request.backend_id,
         request: request.request,
         operation,
         session: request.session,
         name: request.name,
+        directory: request.directory,
     })
 }
 

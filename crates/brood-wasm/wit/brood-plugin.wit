@@ -312,6 +312,8 @@ interface actor {
     /// `actor` is either `init` for the blessed root or a child ID published
     /// by that root. The client host supplies and authenticates placement.
     record session-actor-message {
+        /// Presentation-client registry identity of the destination backend.
+        backend-id: u64,
         session-id: u64,
         actor: string,
         body: list<u8>,
@@ -320,6 +322,8 @@ interface actor {
     /// Explicit address for an actor in the daemon realm. `actor` is either
     /// `init` for the blessed root or a child ID published by that root.
     record daemon-actor-message {
+        /// Presentation-client registry identity of the destination backend.
+        backend-id: u64,
         actor: string,
         body: list<u8>,
     }
@@ -387,6 +391,9 @@ interface actor {
         instance-id: string,
         generation: u64,
         reason: start-reason,
+        /// Backend association for a presentation child. `none` denotes
+        /// presentation-global state.
+        backend-id: option<u64>,
         session-id: option<u64>,
         workspace-root: string,
         data: list<lifecycle-entry>,
@@ -410,6 +417,7 @@ interface actor {
         /// default pane. `none` denotes presentation-global state. Session
         /// realm hosts already supply their enclosing session and ignore this
         /// presentation-only association.
+        backend-id: option<u64>,
         session-id: option<u64>,
     }
     record actor-started { id: string, generation: u64 }
@@ -505,6 +513,7 @@ interface actor {
     }
 
     record session-snapshot {
+        backend-id: u64,
         revision: u64,
         active: u64,
         sessions: list<session-summary>,
@@ -519,13 +528,16 @@ interface actor {
     }
 
     record session-command {
+        backend-id: u64,
         request: u64,
         operation: session-operation,
         session: option<u64>,
         name: option<string>,
+        directory: option<string>,
     }
 
     record session-command-completed {
+        backend-id: u64,
         request: u64,
         operation: session-operation,
         success: bool,

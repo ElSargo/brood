@@ -8,10 +8,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 19;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 20;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
+
+/// Stable identity of one independently controlled session backend.
+///
+/// Pane and session numbers are only unique within a backend. Presentation
+/// clients must retain this identity whenever they cache or route backend
+/// state, even when a connection currently carries only one backend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct BackendId(pub u64);
 
 /// Version of the content-addressed artifact manifest contract.
 pub const ARTIFACT_ABI_VERSION: u32 = 1;
@@ -292,6 +300,7 @@ pub struct UnsupportedFramePixelFormat(pub u32);
 /// One complete revisioned managed-window catalog.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogSnapshot {
+    pub backend: BackendId,
     pub revision: u64,
     pub active_session: u64,
     pub sessions: Vec<CatalogSession>,
@@ -612,6 +621,7 @@ pub enum BackendOperation {
         operation: SessionOperation,
         session: Option<u64>,
         name: Option<String>,
+        directory: Option<String>,
     },
 }
 
@@ -674,6 +684,7 @@ pub struct WindowFrame {
 /// One atomic collection of independently transported managed-window frames.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FrameScene {
+    pub backend: BackendId,
     pub sequence: u64,
     pub extent: [u32; 2],
     pub windows: Vec<WindowFrame>,

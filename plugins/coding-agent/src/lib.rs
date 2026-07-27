@@ -41,6 +41,7 @@ const RED: Color = Color::rgba(0.800, 0.141, 0.114, 1.0);
 struct WireMessage {
     kind: String,
     action: String,
+    backend_id: u64,
     session_id: u64,
     agent: String,
     prompt: String,
@@ -85,6 +86,7 @@ struct TextLayoutKey {
 
 struct RootState {
     client: bool,
+    backend_id: u64,
     session_id: u64,
     agents: Vec<WireAgent>,
     subscribers: Vec<Subscriber>,
@@ -151,6 +153,7 @@ struct UiState {
     pane: u64,
     width: f32,
     height: f32,
+    backend_id: u64,
     session_id: u64,
     agents: Vec<String>,
     views: BTreeMap<String, AgentView>,
@@ -171,6 +174,7 @@ impl UiState {
             pane: 0,
             width: 900.0,
             height: 700.0,
+            backend_id: 0,
             session_id: 0,
             agents: Vec::new(),
             views: BTreeMap::new(),
@@ -227,15 +231,17 @@ impl Guest for CodingAgentPlugin {
 fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
     match event {
         LifecycleEvent::Start(context) if context.instance_id == CLIENT_INIT_ID => {
+            let backend_id = context.backend_id.unwrap_or_default();
             let session_id = context.session_id.unwrap_or_default();
-            set_root_state(true, session_id);
+            set_root_state(true, backend_id, session_id);
             vec![
-                start_ui_command(UI_ID, session_id),
+                start_ui_command(UI_ID, backend_id, session_id),
                 ActorCommand::LifecycleComplete(Ok(())),
             ]
         }
         LifecycleEvent::Start(context) if context.instance_id.starts_with("coding-agent-ui") => {
             let mut ui = UiState::new();
+            ui.backend_id = context.backend_id.unwrap_or_default();
             ui.session_id = context.session_id.unwrap_or_default();
             if let Ok(mut state) = STATE.lock() {
                 *state = RoleState::Ui(ui);
@@ -250,7 +256,7 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
         }
         LifecycleEvent::Start(context) => {
             let session_id = context.session_id.unwrap_or_default();
-            set_root_state(false, session_id);
+            set_root_state(false, 0, session_id);
             vec![
                 start_agent_command(FIRST_AGENT),
                 ActorCommand::LifecycleComplete(Ok(())),
@@ -260,12 +266,13 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
     }
 }
 
-fn set_root_state(client: bool, session_id: u64) {
+fn set_root_state(client: bool, backend_id: u64, session_id: u64) {
     let Ok(mut state) = STATE.lock() else {
         return;
     };
     *state = RoleState::Root(RootState {
         client,
+        backend_id,
         session_id,
         agents: Vec::new(),
         subscribers: Vec::new(),
@@ -274,11 +281,12 @@ fn set_root_state(client: bool, session_id: u64) {
     });
 }
 
-fn start_ui_command(id: &str, session_id: u64) -> ActorCommand {
+fn start_ui_command(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
         id: id.to_string(),
         path: COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
+        backend_id: Some(backend_id),
         session_id: Some(session_id),
     })
 }
@@ -291,6 +299,7 @@ fn start_agent_command(id: &str) -> ActorCommand {
             "filesystem:workspace-write".to_string(),
             "subprocess:codex".to_string(),
         ],
+        backend_id: None,
         session_id: None,
     })
 }
@@ -309,6 +318,7 @@ fn handle_child(event: ChildEvent) -> Vec<ActorCommand> {
         {
             let message = WireMessage {
                 kind: "bind".to_string(),
+                backend_id: root.backend_id,
                 session_id: root.session_id,
                 ..WireMessage::default()
             };
@@ -383,7 +393,7 @@ fn handle_root_message(
             ("coding-agent-action", "new-ui") if sender == "key-policy" => {
                 let id = format!("coding-agent-ui-{}", root.next_ui);
                 root.next_ui = root.next_ui.saturating_add(1);
-                vec![start_ui_command(&id, root.session_id)]
+                vec![start_ui_command(&id, root.backend_id, root.session_id)]
             }
             _ => Vec::new(),
         };
@@ -652,9 +662,15 @@ fn presentation_message(actor: &str, message: &WireMessage) -> Option<ActorComma
     })
 }
 
-fn session_message(session_id: u64, actor: &str, message: &WireMessage) -> Option<ActorCommand> {
+fn session_message(
+    backend_id: u64,
+    session_id: u64,
+    actor: &str,
+    message: &WireMessage,
+) -> Option<ActorCommand> {
     serde_json::to_vec(message).ok().map(|body| {
         ActorCommand::SendSessionMessage(SessionActorMessage {
+            backend_id,
             session_id,
             actor: actor.to_string(),
             body,
@@ -733,6 +749,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
 fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
     match message.kind.as_str() {
         "bind" => {
+            ui.backend_id = message.backend_id;
             ui.session_id = message.session_id;
             ui.preferred_agent = (!message.agent.is_empty()).then_some(message.agent);
         }
@@ -809,6 +826,7 @@ fn subscribe_commands(ui: &UiState) -> Vec<ActorCommand> {
     }
     let mut commands = Vec::new();
     if let Some(command) = session_message(
+        ui.backend_id,
         ui.session_id,
         "init",
         &WireMessage {
@@ -825,15 +843,16 @@ fn subscribe_commands(ui: &UiState) -> Vec<ActorCommand> {
 fn subscribe_agent_commands(ui: &UiState) -> Vec<ActorCommand> {
     let mut commands = Vec::new();
     for agent in &ui.agents {
-        if let Some(command) = subscribe_agent(ui.session_id, agent) {
+        if let Some(command) = subscribe_agent(ui.backend_id, ui.session_id, agent) {
             commands.push(command);
         }
     }
     commands
 }
 
-fn subscribe_agent(session_id: u64, agent: &str) -> Option<ActorCommand> {
+fn subscribe_agent(backend_id: u64, session_id: u64, agent: &str) -> Option<ActorCommand> {
     session_message(
+        backend_id,
         session_id,
         agent,
         &WireMessage {
@@ -889,6 +908,7 @@ fn submit_prompt(ui: &mut UiState) -> Option<ActorCommand> {
     let view = ui.views.get(&agent)?;
     let prompt = std::mem::take(&mut ui.prompt);
     session_message(
+        ui.backend_id,
         ui.session_id,
         &agent,
         &WireMessage {
@@ -904,6 +924,7 @@ fn submit_prompt(ui: &mut UiState) -> Option<ActorCommand> {
 
 fn create_agent(ui: &UiState) -> Option<ActorCommand> {
     session_message(
+        ui.backend_id,
         ui.session_id,
         "init",
         &WireMessage {
@@ -933,6 +954,7 @@ fn configure_selected(ui: &mut UiState, model: bool) -> Option<ActorCommand> {
         .to_string();
     }
     session_message(
+        ui.backend_id,
         ui.session_id,
         &agent,
         &WireMessage {
@@ -948,6 +970,7 @@ fn configure_selected(ui: &mut UiState, model: bool) -> Option<ActorCommand> {
 fn cancel_selected(ui: &UiState) -> Option<ActorCommand> {
     let agent = ui.selected_agent()?.to_string();
     session_message(
+        ui.backend_id,
         ui.session_id,
         &agent,
         &WireMessage {

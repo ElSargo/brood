@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     mem::size_of,
+    net::ToSocketAddrs,
     os::fd::AsFd,
     path::PathBuf,
     sync::{
@@ -35,12 +36,12 @@ use brood_layout::{
     LocalPoint, ResolvedLayout,
 };
 use brood_protocol::{
-    ArtifactManifest, ArtifactRealm, BackendActorRealm, ClientLifecycle, ClientMessage, InputEvent,
-    PanePosition,
+    ArtifactManifest, ArtifactRealm, BackendActorRealm, BackendId, ClientLifecycle, ClientMessage,
+    FrameTransportKind, InputEvent, PanePosition,
 };
 use clap::Parser;
 use num_traits::ToPrimitive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -52,6 +53,7 @@ use winit::{
 };
 
 mod actor_runtime;
+mod backend_registry;
 mod clipboard;
 mod key_policy;
 mod layout;
@@ -60,6 +62,7 @@ mod plugin_graphics;
 mod remote;
 
 use actor_runtime::{ActorIdentity, PresentationWasmRuntime};
+use backend_registry::{BackendRegistry, QualifiedPane};
 use brood_wasm::{
     GlobalKeyDecision, HostMessage, PresentationEvent, SessionCommandCompletion,
     SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
@@ -120,7 +123,7 @@ fn main() -> Result<()> {
         let mut runtime = PresentationWasmRuntime::start(
             &wasm_actor_specs,
             init_actor.as_deref(),
-            Some(1),
+            Some((BackendId(1), 1)),
             None,
             None,
         )?;
@@ -295,6 +298,18 @@ fn main() -> Result<()> {
     let event_proxy = event_loop.create_proxy();
     let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
     let clipboard = ClipboardBridge::start();
+    let mut backend_registry = BackendRegistry::default();
+    let mut remote_config_template = None;
+    let local_server_template = if args.no_server {
+        None
+    } else {
+        let mut server = ServerLaunch::discover()?;
+        server.config = Some(config_path.clone());
+        if let Some(executable) = args.server.clone() {
+            server.executable = executable;
+        }
+        Some(server)
+    };
     let (
         input_sender,
         actor_message_sender,
@@ -302,11 +317,11 @@ fn main() -> Result<()> {
         fast_path_enabled,
         backend_connected,
         bound_session_id,
-        mut remote_connection,
+        remote_connections,
     ) = if args.no_server {
         eprintln!("starting Brood presentation without a backend");
-        (None, None, None, false, false, None, None)
-    } else if let Some(connect) = args.remote_connect {
+        (None, None, None, false, false, None, Vec::new())
+    } else if !args.remote_connect.is_empty() {
         let mut artifact_offers = args
             .remote_offer_session_artifacts
             .iter()
@@ -318,44 +333,202 @@ fn main() -> Result<()> {
                 ArtifactRealm::Session,
             )?);
         }
-        let mut connection = remote::RemoteConnection::start(
-            remote::RemoteConfig {
-                connect,
-                server_name: args.remote_server_name.clone(),
-                server_certificate: args
-                    .remote_server_certificate
-                    .clone()
-                    .context("--remote-server-certificate is required for remote transport")?,
-                client_certificate: args
-                    .remote_client_certificate
-                    .clone()
-                    .context("--remote-client-certificate is required for remote transport")?,
-                client_private_key: args
-                    .remote_client_private_key
-                    .clone()
-                    .context("--remote-client-private-key is required for remote transport")?,
-                artifact_offers,
-                allowed_client_artifacts: args.remote_allow_client_artifacts.clone(),
-                artifact_cache: args
-                    .remote_artifact_cache
-                    .clone()
-                    .unwrap_or_else(brood_transport::default_artifact_cache),
-            },
-            &event_proxy,
-        )?;
-        eprintln!(
-            "selected presentation transport carrier={:?} frames={:?} generation={} peer={connect}",
-            connection.profile.carrier, connection.profile.frames, connection.generation
-        );
-        let (input, actor_messages, backend_commands) = connection.take_lanes()?;
+        remote_config_template = Some(remote::RemoteConfig {
+            backend: BackendId(0),
+            connect: args.remote_connect[0],
+            server_name: args.remote_server_name.clone(),
+            server_certificate: args
+                .remote_server_certificate
+                .clone()
+                .context("--remote-server-certificate is required for remote transport")?,
+            client_certificate: args
+                .remote_client_certificate
+                .clone()
+                .context("--remote-client-certificate is required for remote transport")?,
+            client_private_key: args
+                .remote_client_private_key
+                .clone()
+                .context("--remote-client-private-key is required for remote transport")?,
+            artifact_offers: artifact_offers.clone(),
+            allowed_client_artifacts: args.remote_allow_client_artifacts.clone(),
+            artifact_cache: args
+                .remote_artifact_cache
+                .clone()
+                .unwrap_or_else(brood_transport::default_artifact_cache),
+        });
+        let mut remote_connections = Vec::new();
+        let mut input_lanes = BTreeMap::new();
+        let mut actor_lanes = BTreeMap::new();
+        let mut command_lanes = BTreeMap::new();
+        for connect in args.remote_connect {
+            let backend = backend_registry.allocate(None);
+            let mut connection =
+                remote::RemoteConnection::start(
+                    remote::RemoteConfig {
+                        backend,
+                        connect,
+                        server_name: args.remote_server_name.clone(),
+                        server_certificate: args.remote_server_certificate.clone().context(
+                            "--remote-server-certificate is required for remote transport",
+                        )?,
+                        client_certificate: args.remote_client_certificate.clone().context(
+                            "--remote-client-certificate is required for remote transport",
+                        )?,
+                        client_private_key: args.remote_client_private_key.clone().context(
+                            "--remote-client-private-key is required for remote transport",
+                        )?,
+                        artifact_offers: artifact_offers.clone(),
+                        allowed_client_artifacts: args.remote_allow_client_artifacts.clone(),
+                        artifact_cache: args
+                            .remote_artifact_cache
+                            .clone()
+                            .unwrap_or_else(brood_transport::default_artifact_cache),
+                    },
+                    &event_proxy,
+                )?;
+            eprintln!(
+                "selected presentation backend={:?} transport carrier={:?} frames={:?} generation={} peer={connect}",
+                connection.backend,
+                connection.profile.carrier,
+                connection.profile.frames,
+                connection.generation
+            );
+            anyhow::ensure!(
+                connection.backend == backend,
+                "remote connection changed its assigned backend identity"
+            );
+            let (input, actor_messages, backend_commands) = connection.take_lanes()?;
+            anyhow::ensure!(
+                input_lanes
+                    .insert(backend, Box::new(InputLane::Remote(input)))
+                    .is_none(),
+                "remote connections reported the duplicate backend identity {backend:?}"
+            );
+            actor_lanes.insert(backend, Box::new(ActorMessageLane::Remote(actor_messages)));
+            command_lanes.insert(
+                backend,
+                Box::new(BackendCommandLane::Remote(backend_commands)),
+            );
+            remote_connections.push(connection);
+        }
+        let mut fast_path_enabled = false;
+        let mut bound_session_id = None;
+        if args.include_local {
+            let target = resolve_control_target(args.dbus_name, args.dbus_address);
+            let mut server = ServerLaunch::discover()?;
+            server.config = Some(config_path.clone());
+            if let Some(executable) = args.server.clone() {
+                server.executable = executable;
+            }
+            let _handshake = connect_or_spawn(&target, &server)?;
+            let fast_path =
+                open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
+            let backend = backend_registry.allocate(Some(fast_path.generation));
+            let session_id = if fast_path.active_session != 0 {
+                fast_path.active_session
+            } else {
+                create_surface_session(&target, String::new())?
+            };
+            let dmabuf_import_enabled =
+                fast_path.profile.frames == brood_protocol::FrameTransportKind::Dmabuf;
+            let input =
+                brood_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
+            let frames =
+                brood_ipc::CriticalConsumer::map(fast_path.frame_fd.as_fd(), fast_path.generation)?;
+            let catalog = brood_ipc::CriticalConsumer::map(
+                fast_path.catalog_fd.as_fd(),
+                fast_path.generation,
+            )?;
+            spawn_frame_updates(
+                target.clone(),
+                frames,
+                brood_ipc::EventNotifier::from_owned_fd(fast_path.frame_notify_fd),
+                fast_path.generation,
+                fast_path.profile,
+                backend,
+                event_loop.create_proxy(),
+            )?;
+            spawn_catalog_updates(
+                catalog,
+                brood_ipc::EventNotifier::from_owned_fd(fast_path.catalog_notify_fd),
+                backend,
+                event_loop.create_proxy(),
+            )?;
+            spawn_actor_message_updates(
+                brood_ipc::ActorMessageConsumer::map(
+                    fast_path.presentation_message_fd.as_fd(),
+                    fast_path.generation,
+                )?,
+                brood_ipc::EventNotifier::from_owned_fd(fast_path.presentation_message_notify_fd),
+                backend,
+                event_loop.create_proxy(),
+            )?;
+            anyhow::ensure!(
+                input_lanes
+                    .insert(
+                        backend,
+                        Box::new(InputLane::Local(LocalInputLane {
+                            producer: input,
+                            notifications: brood_ipc::EventNotifier::from_owned_fd(
+                                fast_path.input_notify_fd,
+                            ),
+                            generation: fast_path.generation,
+                            sequence: 0,
+                            deferred: VecDeque::new(),
+                            deferred_high_water: 0,
+                            coalesced_motion: 0,
+                            pane_routes: BTreeMap::new(),
+                        })),
+                    )
+                    .is_none(),
+                "local backend identity collides with a remote backend: {backend:?}"
+            );
+            actor_lanes.insert(
+                backend,
+                Box::new(ActorMessageLane::Local(LocalActorMessageLane {
+                    producer: brood_ipc::ActorMessageProducer::map(
+                        fast_path.actor_message_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    notifications: brood_ipc::EventNotifier::from_owned_fd(
+                        fast_path.actor_message_notify_fd,
+                    ),
+                    generation: fast_path.generation,
+                    sequence: 0,
+                    deferred: VecDeque::new(),
+                })),
+            );
+            command_lanes.insert(
+                backend,
+                Box::new(BackendCommandLane::Local(LocalBackendCommandLane::start(
+                    target,
+                    event_loop.create_proxy(),
+                )?)),
+            );
+            fast_path_enabled = dmabuf_import_enabled;
+            bound_session_id = Some((backend, session_id));
+        }
+        let default_backend = bound_session_id
+            .map(|(backend, _session)| backend)
+            .or_else(|| input_lanes.keys().next().copied());
         (
-            Some(InputLane::Remote(input)),
-            Some(ActorMessageLane::Remote(actor_messages)),
-            Some(BackendCommandLane::Remote(backend_commands)),
-            false,
+            Some(InputLane::Multi {
+                lanes: input_lanes,
+                routes: BTreeMap::new(),
+                default: default_backend,
+            }),
+            Some(ActorMessageLane::Multi {
+                lanes: actor_lanes,
+                default: default_backend,
+            }),
+            Some(BackendCommandLane::Multi {
+                lanes: command_lanes,
+                default: default_backend,
+            }),
+            fast_path_enabled,
             true,
-            None,
-            Some(connection),
+            bound_session_id,
+            remote_connections,
         )
     } else {
         let target = resolve_control_target(args.dbus_name, args.dbus_address);
@@ -370,6 +543,7 @@ fn main() -> Result<()> {
             handshake.server_pid, handshake.protocol_version
         );
         let fast_path = open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
+        let backend = backend_registry.allocate(Some(fast_path.generation));
         eprintln!(
             "selected presentation transport carrier={:?} frames={:?}",
             fast_path.profile.carrier, fast_path.profile.frames
@@ -407,18 +581,25 @@ fn main() -> Result<()> {
                 frame_notifications,
                 fast_path.generation,
                 fast_path.profile,
+                backend,
                 event_loop.create_proxy(),
             )?;
-            spawn_catalog_updates(catalog, catalog_notifications, event_loop.create_proxy())?;
+            spawn_catalog_updates(
+                catalog,
+                catalog_notifications,
+                backend,
+                event_loop.create_proxy(),
+            )?;
             spawn_actor_message_updates(
                 brood_ipc::ActorMessageConsumer::map(
                     fast_path.presentation_message_fd.as_fd(),
                     fast_path.generation,
                 )?,
                 brood_ipc::EventNotifier::from_owned_fd(fast_path.presentation_message_notify_fd),
+                backend,
                 event_loop.create_proxy(),
             )?;
-            let input_sender = InputLane::Local(LocalInputLane {
+            let local_input = LocalInputLane {
                 producer: input,
                 notifications: brood_ipc::EventNotifier::from_owned_fd(fast_path.input_notify_fd),
                 generation: fast_path.generation,
@@ -426,8 +607,9 @@ fn main() -> Result<()> {
                 deferred: VecDeque::new(),
                 deferred_high_water: 0,
                 coalesced_motion: 0,
-            });
-            let actor_message_sender = ActorMessageLane::Local(LocalActorMessageLane {
+                pane_routes: BTreeMap::new(),
+            };
+            let local_actor = LocalActorMessageLane {
                 producer: brood_ipc::ActorMessageProducer::map(
                     fast_path.actor_message_fd.as_fd(),
                     fast_path.generation,
@@ -438,21 +620,40 @@ fn main() -> Result<()> {
                 generation: fast_path.generation,
                 sequence: 0,
                 deferred: VecDeque::new(),
-            });
-            (Some(input_sender), Some(actor_message_sender))
+            };
+            (
+                Some(InputLane::Multi {
+                    lanes: BTreeMap::from([(backend, Box::new(InputLane::Local(local_input)))]),
+                    routes: BTreeMap::new(),
+                    default: Some(backend),
+                }),
+                Some(ActorMessageLane::Multi {
+                    lanes: BTreeMap::from([(
+                        backend,
+                        Box::new(ActorMessageLane::Local(local_actor)),
+                    )]),
+                    default: Some(backend),
+                }),
+            )
         };
-        let backend_commands = Some(BackendCommandLane::Local(LocalBackendCommandLane::start(
-            target,
-            event_loop.create_proxy(),
-        )?));
+        let backend_commands = Some(BackendCommandLane::Multi {
+            lanes: BTreeMap::from([(
+                backend,
+                Box::new(BackendCommandLane::Local(LocalBackendCommandLane::start(
+                    target,
+                    event_loop.create_proxy(),
+                )?)),
+            )]),
+            default: Some(backend),
+        });
         (
             input_sender,
             actor_message_sender,
             backend_commands,
             dmabuf_import_enabled,
             true,
-            Some(session_id),
-            None,
+            Some((backend, session_id)),
+            Vec::new(),
         )
     };
     let mut application = Application {
@@ -473,6 +674,10 @@ fn main() -> Result<()> {
         backend_connected,
         window_focused: true,
         event_proxy: Some(event_proxy),
+        remote_config_template,
+        remote_connections,
+        local_server_template,
+        backend_registry,
         ..Application::default()
     };
 
@@ -480,7 +685,7 @@ fn main() -> Result<()> {
         .run_app(&mut application)
         .context("run event loop");
 
-    if remote_connection.is_none()
+    if application.remote_connections.is_empty()
         && let Some(sender) = application.input_sender.as_mut()
     {
         let _ = send_input(
@@ -518,9 +723,10 @@ fn main() -> Result<()> {
         .as_mut()
         .map_or(Ok(()), BackendCommandLane::shutdown)
         .context("stop presentation backend command worker");
-    let remote_shutdown_result = remote_connection
-        .as_mut()
-        .map_or(Ok(()), remote::RemoteConnection::shutdown)
+    let remote_shutdown_result = application
+        .remote_connections
+        .iter_mut()
+        .try_for_each(remote::RemoteConnection::shutdown)
         .context("stop remote presentation transport");
     let error = application.error.take();
     drop(application);
@@ -538,6 +744,7 @@ fn main() -> Result<()> {
 #[derive(Debug)]
 enum ClientEvent {
     SceneFrame {
+        backend: BackendId,
         sequence: u64,
         width: u32,
         height: u32,
@@ -546,6 +753,10 @@ enum ClientEvent {
     FocusPresentation,
     ClosePresentation,
     TransportError(String),
+    BackendDisconnected {
+        backend: BackendId,
+        message: String,
+    },
     RemoteArtifactInstalled {
         manifest: ArtifactManifest,
         path: PathBuf,
@@ -564,6 +775,7 @@ enum ClientEvent {
         result: Result<String, String>,
     },
     BackendSnapshot {
+        backend: BackendId,
         session: Option<SessionSnapshot>,
         active_session: u64,
         windows: Vec<PresentationWindowSummary>,
@@ -574,6 +786,7 @@ enum ClientEvent {
     },
     ActorHostMessagesReady,
     BackendActorMessage {
+        backend: BackendId,
         realm: BackendActorRealm,
         sender: String,
         recipient: String,
@@ -581,8 +794,38 @@ enum ClientEvent {
     },
 }
 
+#[derive(Serialize)]
+struct BackendSessionsMessage {
+    kind: &'static str,
+    can_create_local: bool,
+    can_connect_remote: bool,
+    backends: Vec<BackendSessionsView>,
+}
+
+#[derive(Serialize)]
+struct BackendSessionsView {
+    backend: u64,
+    label: String,
+    sessions: Vec<BackendSessionView>,
+}
+
+#[derive(Serialize)]
+struct BackendSessionView {
+    id: u64,
+    name: String,
+    active: bool,
+    windows: u64,
+    working_directory: Option<String>,
+    project_id: String,
+    project_name: String,
+    branch: Option<String>,
+    worktree: bool,
+    git: bool,
+}
+
 #[derive(Debug)]
 struct SceneWindowUpdate {
+    backend: BackendId,
     window_id: u64,
     resource_id: u64,
     rect: [i32; 4],
@@ -645,6 +888,7 @@ struct PendingCatalog {
 fn spawn_catalog_updates(
     mut catalog: brood_ipc::CriticalConsumer,
     notifications: brood_ipc::EventNotifier,
+    backend: BackendId,
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let _worker = thread::Builder::new()
@@ -770,7 +1014,9 @@ fn spawn_catalog_updates(
                             );
                             if proxy
                                 .send_event(ClientEvent::BackendSnapshot {
+                                    backend,
                                     session: Some(SessionSnapshot {
+                                        backend_id: backend.0,
                                         revision: snapshot.revision,
                                         active: decoded.active_session,
                                         sessions,
@@ -798,6 +1044,7 @@ fn spawn_frame_updates(
     notifications: brood_ipc::EventNotifier,
     generation: u64,
     profile: brood_protocol::TransportProfile,
+    backend: BackendId,
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let _worker = thread::Builder::new()
@@ -859,6 +1106,7 @@ fn spawn_frame_updates(
                             let (x, y) = unpack_i32_pair(record.arguments[2]);
                             let (width, height) = unpack_i32_pair(record.arguments[3]);
                             scene.windows.push(SceneWindowUpdate {
+                                backend,
                                 window_id: record.arguments[0],
                                 resource_id,
                                 rect: [x, y, width, height],
@@ -911,6 +1159,7 @@ fn spawn_frame_updates(
                             let (x, y) = unpack_i32_pair(record.arguments[2]);
                             let (width, height) = unpack_i32_pair(record.arguments[3]);
                             scene.windows.push(SceneWindowUpdate {
+                                backend,
                                 window_id: record.arguments[0],
                                 resource_id,
                                 rect: [x, y, width, height],
@@ -936,6 +1185,7 @@ fn spawn_frame_updates(
                             }
                             if proxy
                                 .send_event(ClientEvent::SceneFrame {
+                                    backend,
                                     sequence: scene.sequence,
                                     width: scene.width,
                                     height: scene.height,
@@ -964,6 +1214,7 @@ fn spawn_frame_updates(
 fn spawn_actor_message_updates(
     mut messages: brood_ipc::ActorMessageConsumer,
     notifications: brood_ipc::EventNotifier,
+    backend: BackendId,
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let _worker = thread::Builder::new()
@@ -977,6 +1228,7 @@ fn spawn_actor_message_updates(
                     let decoded = (|| {
                         Ok::<_, brood_ipc::ActorMessageLaneError>(
                             ClientEvent::BackendActorMessage {
+                                backend,
                                 realm: message.realm()?,
                                 sender: message.sender()?.to_string(),
                                 recipient: message.recipient()?.to_string(),
@@ -1021,6 +1273,11 @@ fn unpack_i32_pair(value: u64) -> (i32, i32) {
 enum InputLane {
     Local(LocalInputLane),
     Remote(remote::RemoteInputLane),
+    Multi {
+        lanes: BTreeMap<BackendId, Box<Self>>,
+        routes: BTreeMap<u64, BackendId>,
+        default: Option<BackendId>,
+    },
 }
 
 struct LocalInputLane {
@@ -1031,11 +1288,16 @@ struct LocalInputLane {
     deferred: VecDeque<brood_ipc::CriticalRecord>,
     deferred_high_water: usize,
     coalesced_motion: u64,
+    pane_routes: BTreeMap<u64, u64>,
 }
 
 enum ActorMessageLane {
     Local(LocalActorMessageLane),
     Remote(remote::RemoteActorMessageLane),
+    Multi {
+        lanes: BTreeMap<BackendId, Box<Self>>,
+        default: Option<BackendId>,
+    },
 }
 
 struct LocalActorMessageLane {
@@ -1097,10 +1359,50 @@ impl LocalActorMessageLane {
 }
 
 impl ActorMessageLane {
+    fn remove_backend(&mut self, backend: BackendId) -> bool {
+        let Self::Multi { lanes, default, .. } = self else {
+            return false;
+        };
+        let removed = lanes.remove(&backend).is_some();
+        if removed && *default == Some(backend) {
+            *default = lanes.keys().next().copied();
+        }
+        removed
+    }
+
+    fn insert_local(&mut self, backend: BackendId, lane: LocalActorMessageLane) -> Result<()> {
+        let Self::Multi { lanes, .. } = self else {
+            anyhow::bail!("dynamic backend attachment requires multi-backend mode");
+        };
+        anyhow::ensure!(lanes.insert(backend, Box::new(Self::Local(lane))).is_none());
+        Ok(())
+    }
+
+    fn insert_remote(
+        &mut self,
+        backend: BackendId,
+        lane: remote::RemoteActorMessageLane,
+    ) -> Result<()> {
+        let Self::Multi { lanes, .. } = self else {
+            anyhow::bail!("dynamic backend attachment requires multi-backend mode");
+        };
+        anyhow::ensure!(
+            lanes
+                .insert(backend, Box::new(Self::Remote(lane)))
+                .is_none(),
+            "backend identity is already connected"
+        );
+        Ok(())
+    }
+
     fn send(&mut self, message: &actor_runtime::BackendActorMessageRequest) -> Result<()> {
         match self {
             Self::Local(lane) => lane.send(message),
             Self::Remote(lane) => lane.send(message),
+            Self::Multi { lanes, .. } => lanes
+                .get_mut(&message.backend)
+                .context("actor message destination backend is not connected")?
+                .send(message),
         }
     }
 
@@ -1108,6 +1410,11 @@ impl ActorMessageLane {
         match self {
             Self::Local(lane) => lane.flush_deferred(),
             Self::Remote(lane) => lane.flush_deferred(),
+            Self::Multi { lanes, .. } => {
+                for lane in lanes.values_mut() {
+                    lane.flush_deferred();
+                }
+            }
         }
     }
 
@@ -1115,6 +1422,13 @@ impl ActorMessageLane {
         match self {
             Self::Local(lane) => lane.has_deferred(),
             Self::Remote(lane) => lane.has_deferred(),
+            Self::Multi { lanes, .. } => lanes.values().any(|lane| lane.has_deferred()),
+        }
+    }
+
+    const fn set_default_backend(&mut self, backend: BackendId) {
+        if let Self::Multi { default, .. } = self {
+            *default = Some(backend);
         }
     }
 }
@@ -1190,10 +1504,123 @@ impl LocalInputLane {
 }
 
 impl InputLane {
-    fn send(&mut self, message: ClientMessage) -> bool {
+    fn backend_count(&self) -> usize {
         match self {
-            Self::Local(lane) => lane.send(message),
-            Self::Remote(lane) => lane.send(message),
+            Self::Multi { lanes, .. } => lanes.len(),
+            Self::Local(_) | Self::Remote(_) => 1,
+        }
+    }
+
+    fn remove_backend(&mut self, backend: BackendId) -> bool {
+        let Self::Multi {
+            lanes,
+            routes,
+            default,
+        } = self
+        else {
+            return false;
+        };
+        let removed = lanes.remove(&backend).is_some();
+        if removed {
+            routes.retain(|_pane, owner| *owner != backend);
+            if *default == Some(backend) {
+                *default = lanes.keys().next().copied();
+            }
+        }
+        removed
+    }
+
+    fn insert_local(&mut self, backend: BackendId, lane: LocalInputLane) -> Result<()> {
+        let Self::Multi { lanes, .. } = self else {
+            anyhow::bail!("dynamic backend attachment requires multi-backend mode");
+        };
+        anyhow::ensure!(lanes.insert(backend, Box::new(Self::Local(lane))).is_none());
+        Ok(())
+    }
+
+    fn insert_remote(&mut self, backend: BackendId, lane: remote::RemoteInputLane) -> Result<()> {
+        let Self::Multi { lanes, .. } = self else {
+            anyhow::bail!("dynamic backend attachment requires multi-backend mode");
+        };
+        anyhow::ensure!(
+            lanes
+                .insert(backend, Box::new(Self::Remote(lane)))
+                .is_none(),
+            "backend identity is already connected"
+        );
+        Ok(())
+    }
+
+    fn send(&mut self, message: ClientMessage) -> bool {
+        let mut message = message;
+        match self {
+            Self::Local(lane) => {
+                translate_input_panes(&mut message, &lane.pane_routes);
+                lane.send(message)
+            }
+            Self::Remote(lane) => {
+                translate_input_panes(&mut message, &lane.pane_routes());
+                lane.send(message)
+            }
+            Self::Multi {
+                lanes,
+                routes,
+                default,
+            } => {
+                if let Some(backend) = input_backend(&message, routes) {
+                    return lanes
+                        .get_mut(&backend)
+                        .is_some_and(|lane| lane.send(message));
+                }
+                if let Some(lane) = default.and_then(|backend| lanes.get_mut(&backend)) {
+                    return lane.send(message);
+                }
+                lanes
+                    .values_mut()
+                    .next()
+                    .is_some_and(|lane| lane.send(message))
+            }
+        }
+    }
+
+    fn set_pane_routes(&mut self, routes: Vec<(u64, BackendId, u64)>) {
+        match self {
+            Self::Local(lane) => {
+                lane.pane_routes = routes
+                    .into_iter()
+                    .map(|(view, _backend, pane)| (view, pane))
+                    .collect();
+            }
+            Self::Remote(lane) => {
+                lane.set_pane_routes(
+                    routes
+                        .into_iter()
+                        .map(|(view, _backend, pane)| (view, pane))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Self::Multi {
+                lanes,
+                routes: table,
+                ..
+            } => {
+                table.clear();
+                let mut per_backend = BTreeMap::<BackendId, Vec<(u64, u64)>>::new();
+                for (view, backend, pane) in routes {
+                    table.insert(view, backend);
+                    per_backend.entry(backend).or_default().push((view, pane));
+                }
+                for (backend, lane) in lanes {
+                    lane.set_pane_routes(
+                        per_backend
+                            .remove(backend)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(view, pane)| (view, *backend, pane))
+                            .collect(),
+                    );
+                }
+            }
         }
     }
 
@@ -1201,6 +1628,11 @@ impl InputLane {
         match self {
             Self::Local(lane) => lane.flush_deferred(),
             Self::Remote(lane) => lane.flush_deferred(),
+            Self::Multi { lanes, .. } => {
+                for lane in lanes.values_mut() {
+                    lane.flush_deferred();
+                }
+            }
         }
     }
 
@@ -1208,13 +1640,61 @@ impl InputLane {
         match self {
             Self::Local(lane) => lane.has_deferred(),
             Self::Remote(lane) => lane.has_deferred(),
+            Self::Multi { lanes, .. } => lanes.values().any(|lane| lane.has_deferred()),
         }
     }
+
+    fn send_to(&mut self, backend: BackendId, message: ClientMessage) -> bool {
+        match self {
+            Self::Multi { lanes, .. } => lanes
+                .get_mut(&backend)
+                .is_some_and(|lane| lane.send(message)),
+            Self::Local(_) | Self::Remote(_) => self.send(message),
+        }
+    }
+
+    fn broadcast(&mut self, message: ClientMessage) -> bool {
+        match self {
+            Self::Multi { lanes, .. } => {
+                let mut sent = true;
+                for lane in lanes.values_mut() {
+                    sent &= lane.send(message.clone());
+                }
+                sent
+            }
+            Self::Local(_) | Self::Remote(_) => self.send(message),
+        }
+    }
+
+    const fn set_default_backend(&mut self, backend: BackendId) {
+        if let Self::Multi { default, .. } = self {
+            *default = Some(backend);
+        }
+    }
+}
+
+fn input_backend(message: &ClientMessage, routes: &BTreeMap<u64, BackendId>) -> Option<BackendId> {
+    let ClientMessage::Input(input) = message else {
+        return None;
+    };
+    let pane = match input {
+        InputEvent::WindowFocus { pane } | InputEvent::WindowResize { pane, .. } => Some(*pane),
+        InputEvent::PointerMotion { position }
+        | InputEvent::PointerButton { position, .. }
+        | InputEvent::PointerAxis { position, .. }
+        | InputEvent::PointerWheel { position, .. } => Some(position.pane),
+        _ => None,
+    }?;
+    routes.get(&pane).copied()
 }
 
 enum BackendCommandLane {
     Local(LocalBackendCommandLane),
     Remote(remote::RemoteBackendCommandLane),
+    Multi {
+        lanes: BTreeMap<BackendId, Box<Self>>,
+        default: Option<BackendId>,
+    },
 }
 
 struct LocalBackendCommandLane {
@@ -1309,11 +1789,55 @@ impl LocalBackendCommandLane {
 }
 
 impl BackendCommandLane {
+    fn remove_backend(&mut self, backend: BackendId) -> Result<bool> {
+        let Self::Multi { lanes, default, .. } = self else {
+            return Ok(false);
+        };
+        let Some(mut lane) = lanes.remove(&backend) else {
+            return Ok(false);
+        };
+        lane.shutdown()?;
+        if *default == Some(backend) {
+            *default = lanes.keys().next().copied();
+        }
+        Ok(true)
+    }
+
+    fn insert_local(&mut self, backend: BackendId, lane: LocalBackendCommandLane) -> Result<()> {
+        let Self::Multi { lanes, .. } = self else {
+            anyhow::bail!("dynamic backend attachment requires multi-backend mode");
+        };
+        anyhow::ensure!(lanes.insert(backend, Box::new(Self::Local(lane))).is_none());
+        Ok(())
+    }
+
+    fn insert_remote(
+        &mut self,
+        backend: BackendId,
+        lane: remote::RemoteBackendCommandLane,
+    ) -> Result<()> {
+        let Self::Multi { lanes, .. } = self else {
+            anyhow::bail!("dynamic backend attachment requires multi-backend mode");
+        };
+        anyhow::ensure!(
+            lanes
+                .insert(backend, Box::new(Self::Remote(lane)))
+                .is_none(),
+            "backend identity is already connected"
+        );
+        Ok(())
+    }
+
     fn try_send(&self, description: impl Into<String>, argv: Vec<String>) -> Result<()> {
         let description = description.into();
         match self {
             Self::Local(lane) => lane.try_send(description, argv),
             Self::Remote(lane) => lane.try_send(description, argv),
+            Self::Multi { lanes, default } => default
+                .and_then(|backend| lanes.get(&backend))
+                .or_else(|| lanes.values().next())
+                .context("no backend is available for backend command")?
+                .try_send(description, argv),
         }
     }
 
@@ -1321,6 +1845,25 @@ impl BackendCommandLane {
         match self {
             Self::Local(lane) => lane.try_send_session(command),
             Self::Remote(lane) => lane.try_send_session(command),
+            Self::Multi { lanes, default } => default
+                .and_then(|backend| lanes.get(&backend))
+                .or_else(|| lanes.values().next())
+                .context("no backend is available for session command")?
+                .try_send_session(command),
+        }
+    }
+
+    fn try_send_session_to(
+        &self,
+        backend: BackendId,
+        command: actor_runtime::SessionCommandEnvelope,
+    ) -> Result<()> {
+        match self {
+            Self::Multi { lanes, .. } => lanes
+                .get(&backend)
+                .context("requested backend is not connected")?
+                .try_send_session(command),
+            Self::Local(_) | Self::Remote(_) => self.try_send_session(command),
         }
     }
 
@@ -1328,6 +1871,18 @@ impl BackendCommandLane {
         match self {
             Self::Local(lane) => lane.shutdown(),
             Self::Remote(_) => Ok(()),
+            Self::Multi { lanes, .. } => {
+                for lane in lanes.values_mut() {
+                    lane.shutdown()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    const fn set_default_backend(&mut self, backend: BackendId) {
+        if let Self::Multi { default, .. } = self {
+            *default = Some(backend);
         }
     }
 }
@@ -1337,6 +1892,7 @@ fn execute_session_command(
     request: SessionCommandRequest,
 ) -> SessionCommandCompletion {
     let request_id = request.request;
+    let backend_id = request.backend_id;
     let operation = request.operation;
     let session = request.session;
     let name = request.name;
@@ -1350,9 +1906,27 @@ fn execute_session_command(
                     Ok(Some(session))
                 })
             }),
-        SessionOperation::Create => {
-            create_surface_session(target, name.unwrap_or_default()).map(Some)
-        }
+        SessionOperation::Create => (|| -> Result<Option<u64>> {
+            if let Some(directory) = request.directory {
+                let mut argv = vec![
+                    "surface-session".to_string(),
+                    "dir-new".to_string(),
+                    directory,
+                    "default".to_string(),
+                ];
+                if let Some(name) = name {
+                    argv.push(name);
+                }
+                let response = request_dbus_command(target, &argv, false)?;
+                let active = response
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix("active=")?.parse().ok())
+                    .context("directory session creation returned no active session")?;
+                Ok(Some(active))
+            } else {
+                create_surface_session(target, name.unwrap_or_default()).map(Some)
+            }
+        })(),
         SessionOperation::Rename => session
             .context("rename request is missing a session ID")
             .and_then(|session| {
@@ -1373,6 +1947,7 @@ fn execute_session_command(
     };
     match result {
         Ok(session) => SessionCommandCompletion {
+            backend_id,
             request: request_id,
             operation,
             success: true,
@@ -1380,6 +1955,7 @@ fn execute_session_command(
             message: String::new(),
         },
         Err(error) => SessionCommandCompletion {
+            backend_id,
             request: request_id,
             operation,
             success: false,
@@ -1397,10 +1973,15 @@ struct Application {
     actor_message_sender: Option<ActorMessageLane>,
     fast_path_enabled: bool,
     backend_connected: bool,
-    pending_frame: Option<ClientEvent>,
-    pending_backend_snapshot: Option<(u64, Vec<PresentationWindowSummary>)>,
-    latest_session_snapshot: Option<SessionSnapshot>,
-    last_presented_sequence: Option<u64>,
+    backend_registry: BackendRegistry,
+    backend_sessions: BTreeMap<BackendId, SessionSnapshot>,
+    remote_config_template: Option<remote::RemoteConfig>,
+    remote_connections: Vec<remote::RemoteConnection>,
+    local_server_template: Option<ServerLaunch>,
+    next_dynamic_local: u64,
+    pending_frames: BTreeMap<BackendId, ClientEvent>,
+    pending_backend_snapshots: BTreeMap<BackendId, (u64, Vec<PresentationWindowSummary>)>,
+    last_presented_sequences: BTreeMap<BackendId, u64>,
     modifiers: ModifiersState,
     window_focused: bool,
     cursor_position: Option<(f64, f64)>,
@@ -1427,6 +2008,293 @@ struct Application {
     plugin_max_key_to_present_us: u128,
     plugin_scroll_benchmark: Option<PluginScrollBenchmark>,
     plugin_scroll_auto_last_scene: Option<(u64, Instant)>,
+}
+
+impl Application {
+    fn disconnect_remote_backend(
+        &mut self,
+        backend: BackendId,
+        message: &str,
+    ) -> Result<Option<FocusChange>> {
+        let remaining = self
+            .input_sender
+            .as_ref()
+            .map_or(0, InputLane::backend_count);
+        anyhow::ensure!(
+            remaining > 1,
+            "the only connected backend stopped: {message}"
+        );
+        if let Some(runtime) = self.wasm_runtime.as_mut() {
+            runtime.disconnect_backend(backend)?;
+            runtime.drain_events()?;
+            runtime.discard_backend_requests(backend);
+        }
+        anyhow::ensure!(
+            self.input_sender
+                .as_mut()
+                .is_some_and(|lane| lane.remove_backend(backend)),
+            "disconnected backend has no input lane"
+        );
+        if let Some(lane) = self.actor_message_sender.as_mut() {
+            let _removed = lane.remove_backend(backend);
+        }
+        if let Some(lane) = self.backend_commands.as_mut() {
+            let _removed = lane.remove_backend(backend)?;
+        }
+        self.backend_registry.replace_panes(backend, None, []);
+        self.backend_sessions.remove(&backend);
+        self.pending_frames.remove(&backend);
+        self.pending_backend_snapshots.remove(&backend);
+        self.last_presented_sequences.remove(&backend);
+        if let Some(sender) = self.input_sender.as_mut() {
+            sender.set_pane_routes(self.backend_registry.all_view_routes());
+        }
+        let focus_change = self
+            .renderer
+            .as_mut()
+            .and_then(|renderer| renderer.disconnect_backend(backend));
+        if let Some(position) = self
+            .remote_connections
+            .iter()
+            .position(|connection| connection.backend == backend)
+        {
+            let mut connection = self.remote_connections.remove(position);
+            if let Err(error) = connection.reap() {
+                eprintln!("remote backend {backend:?} stopped: {error:#}");
+            }
+        }
+        self.backend_connected = self
+            .input_sender
+            .as_ref()
+            .is_some_and(|lane| lane.backend_count() != 0);
+        self.publish_backend_sessions()?;
+        self.notify_backend_connection_failed(message)?;
+        eprintln!("detached failed remote backend={backend:?}: {message}");
+        Ok(focus_change)
+    }
+
+    fn connect_local_backend(&mut self) -> Result<()> {
+        let launch = self
+            .local_server_template
+            .clone()
+            .context("dynamic local backends are unavailable without a server configuration")?;
+        self.next_dynamic_local = self.next_dynamic_local.saturating_add(1).max(1);
+        let destination = format!(
+            "org.brood.Session.dynamic.{}.{}",
+            std::process::id(),
+            self.next_dynamic_local
+        );
+        let target = ControlTarget::new(destination, None);
+        let _handshake = connect_or_spawn(&target, &launch)?;
+        let fast_path = open_presentation_fast_path(&target, &[FrameTransportKind::SharedMemory])?;
+        let backend = self.backend_registry.allocate(Some(fast_path.generation));
+        let session_id = if fast_path.active_session != 0 {
+            fast_path.active_session
+        } else {
+            create_surface_session(&target, String::new())?
+        };
+        let input =
+            brood_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
+        let frames =
+            brood_ipc::CriticalConsumer::map(fast_path.frame_fd.as_fd(), fast_path.generation)?;
+        let catalog =
+            brood_ipc::CriticalConsumer::map(fast_path.catalog_fd.as_fd(), fast_path.generation)?;
+        spawn_frame_updates(
+            target.clone(),
+            frames,
+            brood_ipc::EventNotifier::from_owned_fd(fast_path.frame_notify_fd),
+            fast_path.generation,
+            fast_path.profile,
+            backend,
+            self.event_proxy
+                .clone()
+                .context("event loop proxy is unavailable")?,
+        )?;
+        spawn_catalog_updates(
+            catalog,
+            brood_ipc::EventNotifier::from_owned_fd(fast_path.catalog_notify_fd),
+            backend,
+            self.event_proxy
+                .clone()
+                .context("event loop proxy is unavailable")?,
+        )?;
+        spawn_actor_message_updates(
+            brood_ipc::ActorMessageConsumer::map(
+                fast_path.presentation_message_fd.as_fd(),
+                fast_path.generation,
+            )?,
+            brood_ipc::EventNotifier::from_owned_fd(fast_path.presentation_message_notify_fd),
+            backend,
+            self.event_proxy
+                .clone()
+                .context("event loop proxy is unavailable")?,
+        )?;
+        self.input_sender
+            .as_mut()
+            .context("presentation input lane is unavailable")?
+            .insert_local(
+                backend,
+                LocalInputLane {
+                    producer: input,
+                    notifications: brood_ipc::EventNotifier::from_owned_fd(
+                        fast_path.input_notify_fd,
+                    ),
+                    generation: fast_path.generation,
+                    sequence: 0,
+                    deferred: VecDeque::new(),
+                    deferred_high_water: 0,
+                    coalesced_motion: 0,
+                    pane_routes: BTreeMap::new(),
+                },
+            )?;
+        self.actor_message_sender
+            .as_mut()
+            .context("presentation actor lane is unavailable")?
+            .insert_local(
+                backend,
+                LocalActorMessageLane {
+                    producer: brood_ipc::ActorMessageProducer::map(
+                        fast_path.actor_message_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    notifications: brood_ipc::EventNotifier::from_owned_fd(
+                        fast_path.actor_message_notify_fd,
+                    ),
+                    generation: fast_path.generation,
+                    sequence: 0,
+                    deferred: VecDeque::new(),
+                },
+            )?;
+        self.backend_commands
+            .as_mut()
+            .context("presentation command lane is unavailable")?
+            .insert_local(
+                backend,
+                LocalBackendCommandLane::start(
+                    target,
+                    self.event_proxy
+                        .clone()
+                        .context("event loop proxy is unavailable")?,
+                )?,
+            )?;
+        self.backend_registry
+            .observe(backend, Some(fast_path.generation));
+        self.notify_backend_connected(backend)?;
+        eprintln!("started dynamic local backend={backend:?} session={session_id}");
+        Ok(())
+    }
+
+    fn connect_remote_backend(&mut self, address: String) -> Result<()> {
+        let connect = address
+            .to_socket_addrs()
+            .with_context(|| format!("resolve remote backend address {address:?}"))?
+            .next()
+            .context("remote backend address resolved to no socket addresses")?;
+        let mut config = self.remote_config_template.clone().context(
+            "dynamic remote connections are unavailable without remote transport configuration",
+        )?;
+        let backend = self.backend_registry.allocate(None);
+        config.backend = backend;
+        config.connect = connect;
+        let proxy = self
+            .event_proxy
+            .as_ref()
+            .context("presentation event loop proxy is unavailable")?;
+        let mut connection = remote::RemoteConnection::start(config, proxy)?;
+        anyhow::ensure!(
+            connection.backend == backend,
+            "remote connection changed its assigned backend identity"
+        );
+        let (input, actor_messages, backend_commands) = connection.take_lanes()?;
+        self.input_sender
+            .as_mut()
+            .context("presentation input lane is unavailable")?
+            .insert_remote(backend, input)?;
+        self.actor_message_sender
+            .as_mut()
+            .context("presentation actor lane is unavailable")?
+            .insert_remote(backend, actor_messages)?;
+        self.backend_commands
+            .as_mut()
+            .context("presentation command lane is unavailable")?
+            .insert_remote(backend, backend_commands)?;
+        self.backend_registry
+            .observe(backend, Some(connection.generation));
+        self.remote_connections.push(connection);
+        self.notify_backend_connected(backend)?;
+        eprintln!("connected dynamic remote backend={backend:?} address={address}");
+        Ok(())
+    }
+
+    fn notify_backend_connected(&self, backend: BackendId) -> Result<()> {
+        let Some(runtime) = self.wasm_runtime.as_ref() else {
+            return Ok(());
+        };
+        runtime.send_actor_message(
+            "session-switcher",
+            "client".to_string(),
+            format!(
+                "{{\"kind\":\"backend-connected\",\"backend\":{}}}",
+                backend.0
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn notify_backend_connection_failed(&self, message: &str) -> Result<()> {
+        let Some(runtime) = self.wasm_runtime.as_ref() else {
+            return Ok(());
+        };
+        runtime.send_actor_message(
+            "session-switcher",
+            "client".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "backend-connection-failed",
+                "message": message,
+            }))
+            .context("encode backend connection failure")?,
+        )
+    }
+
+    fn publish_backend_sessions(&self) -> Result<()> {
+        let Some(runtime) = self.wasm_runtime.as_ref() else {
+            return Ok(());
+        };
+        let message = BackendSessionsMessage {
+            kind: "backend-sessions",
+            can_create_local: self.local_server_template.is_some(),
+            can_connect_remote: self.remote_config_template.is_some(),
+            backends: self
+                .backend_sessions
+                .iter()
+                .map(|(backend, snapshot)| BackendSessionsView {
+                    backend: backend.0,
+                    label: format!("Backend {}", backend.0),
+                    sessions: snapshot
+                        .sessions
+                        .iter()
+                        .map(|session| BackendSessionView {
+                            id: session.id,
+                            name: session.name.clone(),
+                            active: session.active,
+                            windows: session.windows,
+                            working_directory: session.working_directory.clone(),
+                            project_id: session.project_id.clone(),
+                            project_name: session.project_name.clone(),
+                            branch: session.branch.clone(),
+                            worktree: session.worktree,
+                            git: session.git,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        runtime.send_actor_message(
+            "session-switcher",
+            "client".to_string(),
+            serde_json::to_vec(&message).context("encode backend session catalogue")?,
+        )
+    }
 }
 
 struct PluginScrollBenchmark {
@@ -1664,14 +2532,31 @@ fn cadence_diagnostics(
 
 impl Application {
     fn accept_frame(&mut self, event: ClientEvent) -> Result<()> {
-        let (sequence, width, height, windows) = match event {
+        let (backend, sequence, width, height, windows) = match event {
             ClientEvent::SceneFrame {
+                backend,
                 sequence,
                 width,
                 height,
                 windows,
-            } => (sequence, width, height, windows),
+            } => {
+                let mut windows = windows;
+                for window in &mut windows {
+                    window.window_id = self.backend_registry.view_pane(QualifiedPane {
+                        backend,
+                        pane: window.window_id,
+                    });
+                }
+                if let Some(sender) = self.input_sender.as_mut() {
+                    sender.set_pane_routes(self.backend_registry.all_view_routes());
+                }
+                self.backend_registry.observe(backend, None);
+                (backend, sequence, width, height, windows)
+            }
             ClientEvent::TransportError(message) => return Err(anyhow!(message)),
+            ClientEvent::BackendDisconnected { .. } => {
+                return Err(anyhow!("backend disconnect reached scene transport path"));
+            }
             ClientEvent::RemoteArtifactInstalled { .. } => {
                 return Err(anyhow!(
                     "remote artifact event reached scene transport path"
@@ -1715,15 +2600,19 @@ impl Application {
             }
         };
         let Some(renderer) = self.renderer.as_mut() else {
-            self.pending_frame = Some(ClientEvent::SceneFrame {
-                sequence,
-                width,
-                height,
-                windows,
-            });
+            self.pending_frames.insert(
+                backend,
+                ClientEvent::SceneFrame {
+                    backend,
+                    sequence,
+                    width,
+                    height,
+                    windows,
+                },
+            );
             return Ok(());
         };
-        let focus_change = renderer.select_scene(sequence, width, height, windows)?;
+        let focus_change = renderer.select_scene(backend, sequence, width, height, windows)?;
         renderer.sync_plugin_graphics_extents()?;
         if self
             .pointer_grab
@@ -2144,6 +3033,75 @@ impl Application {
                     }
                     focus_change
                 }
+                HostMessage::BackendSession {
+                    backend,
+                    request,
+                    operation,
+                    session,
+                    name,
+                    directory,
+                } => {
+                    let operation = match operation.as_str() {
+                        "refresh" => SessionOperation::Refresh,
+                        "activate" => SessionOperation::Activate,
+                        "create" => SessionOperation::Create,
+                        "rename" => SessionOperation::Rename,
+                        "close" => SessionOperation::Close,
+                        other => {
+                            eprintln!("rejected unknown backend session operation {other:?}");
+                            continue;
+                        }
+                    };
+                    let actor_id = actor_message
+                        .sender
+                        .as_ref()
+                        .map(|sender| sender.name.clone())
+                        .unwrap_or_else(|| "session-switcher".to_string());
+                    let command = actor_runtime::SessionCommandEnvelope {
+                        actor_id,
+                        request: SessionCommandRequest {
+                            backend_id: backend,
+                            request,
+                            operation,
+                            session,
+                            name,
+                            directory,
+                        },
+                    };
+                    self.backend_commands
+                        .as_ref()
+                        .context("backend session command requires a connected backend")?
+                        .try_send_session_to(BackendId(backend), command)?;
+                    None
+                }
+                HostMessage::ConnectRemoteBackend { address } => {
+                    if let Err(error) = self.connect_remote_backend(address) {
+                        eprintln!("could not connect dynamic remote backend: {error:#}");
+                        if let Err(notify_error) =
+                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                        {
+                            eprintln!(
+                                "could not notify session switcher about remote backend failure: \
+                                 {notify_error:#}"
+                            );
+                        }
+                    }
+                    None
+                }
+                HostMessage::CreateLocalBackend => {
+                    if let Err(error) = self.connect_local_backend() {
+                        eprintln!("could not start dynamic local backend: {error:#}");
+                        if let Err(notify_error) =
+                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                        {
+                            eprintln!(
+                                "could not notify session switcher about local backend failure: \
+                                 {notify_error:#}"
+                            );
+                        }
+                    }
+                    None
+                }
                 message => {
                     let Some(renderer) = self.renderer.as_mut() else {
                         continue;
@@ -2187,9 +3145,9 @@ impl Application {
                 return Ok(());
             };
             runtime.drain_events()?;
-            let pane_sessions = runtime.pane_sessions().collect::<Vec<_>>();
+            let pane_sessions = runtime.pane_realms().collect::<Vec<_>>();
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_plugin_pane_sessions(&pane_sessions);
+                renderer.set_plugin_pane_realms(&pane_sessions);
             }
             if let Some(renderer) = self.renderer.as_ref() {
                 let (width, height, scale) = renderer.logical_extent();
@@ -2225,7 +3183,7 @@ impl Application {
                     .as_ref()
                     .context("presentation actor requested session control without a backend")?;
                 for command in commands {
-                    lane.try_send_session(command)?;
+                    lane.try_send_session_to(BackendId(command.request.backend_id), command)?;
                 }
             }
             if !messages.is_empty() {
@@ -2261,6 +3219,24 @@ impl Application {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(error);
         event_loop.exit();
+    }
+
+    fn sync_default_backend_target(&mut self) {
+        let Some(pane) = self.renderer.as_ref().and_then(Renderer::focused_pane_id) else {
+            return;
+        };
+        let Some(qualified) = self.backend_registry.backend_pane(pane) else {
+            return;
+        };
+        if let Some(commands) = self.backend_commands.as_mut() {
+            commands.set_default_backend(qualified.backend);
+        }
+        if let Some(input) = self.input_sender.as_mut() {
+            input.set_default_backend(qualified.backend);
+        }
+        if let Some(messages) = self.actor_message_sender.as_mut() {
+            messages.set_default_backend(qualified.backend);
+        }
     }
 
     fn allocate_renderer_generation(&mut self) -> Result<u64> {
@@ -2371,24 +3347,28 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let (Some(runtime), Some(renderer)) =
                     (self.wasm_runtime.as_ref(), self.renderer.as_mut())
                 {
-                    let sessions = runtime.pane_sessions().collect::<Vec<_>>();
-                    renderer.set_plugin_pane_sessions(&sessions);
+                    let sessions = runtime.pane_realms().collect::<Vec<_>>();
+                    renderer.set_plugin_pane_realms(&sessions);
                 }
-                if let Some((active_session, windows)) = self.pending_backend_snapshot.take()
-                    && let Some(renderer) = self.renderer.as_mut()
-                {
-                    let _focus_change = renderer.select_backend_snapshot(active_session, windows);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    for (backend, (active_session, windows)) in
+                        std::mem::take(&mut self.pending_backend_snapshots)
+                    {
+                        let _focus_change =
+                            renderer.select_backend_snapshot(backend, active_session, windows);
+                    }
                 }
                 if let (Some(sender), Some(renderer)) =
                     (self.input_sender.as_mut(), self.renderer.as_ref())
                 {
                     send_presentation_configuration(sender, renderer);
                 }
-                if let Some(frame) = self.pending_frame.take()
-                    && let Err(error) = self.accept_frame(frame)
-                {
-                    self.error = Some(error);
-                    event_loop.exit();
+                for frame in std::mem::take(&mut self.pending_frames).into_values() {
+                    if let Err(error) = self.accept_frame(frame) {
+                        self.error = Some(error);
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 if let Some(renderer) = self.renderer.as_ref() {
                     let (width, height, scale) = renderer.logical_extent();
@@ -2475,6 +3455,27 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             ClientEvent::ClosePresentation => event_loop.exit(),
+            ClientEvent::BackendDisconnected { backend, message } => {
+                match self.disconnect_remote_backend(backend, &message) {
+                    Ok(focus_change) => {
+                        if let Some(change) = focus_change
+                            && let Err(error) = dispatch_focus_change(
+                                self.wasm_runtime.as_ref(),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            )
+                        {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                        if let Err(error) = self.publish_layout_state() {
+                            self.fail(event_loop, error);
+                        }
+                    }
+                    Err(error) => self.fail(event_loop, error),
+                }
+            }
             ClientEvent::PluginGraphicsChanged { pane, sequence } => {
                 let mut failure = None;
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -2552,14 +3553,44 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             },
             ClientEvent::BackendSnapshot {
+                backend,
                 session,
                 active_session,
                 windows,
             } => {
+                let local_panes = windows.iter().map(|window| window.pane).collect::<Vec<_>>();
+                let first_local_pane = local_panes.first().copied();
+                self.backend_registry
+                    .replace_panes(backend, None, local_panes);
+                let windows = windows
+                    .into_iter()
+                    .map(|mut window| {
+                        window.pane = self.backend_registry.view_pane(QualifiedPane {
+                            backend,
+                            pane: window.pane,
+                        });
+                        window
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(sender) = self.input_sender.as_mut() {
+                    sender.set_pane_routes(self.backend_registry.all_view_routes());
+                }
+                if let (Some(window), Some(first_local_pane)) = (windows.first(), first_local_pane)
+                {
+                    debug_assert_eq!(
+                        self.backend_registry.backend_pane(window.pane),
+                        Some(QualifiedPane {
+                            backend,
+                            pane: first_local_pane,
+                        })
+                    );
+                }
+                let _backend_count = self.backend_registry.backend_count();
                 let focus_change = if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.select_backend_snapshot(active_session, windows)
+                    renderer.select_backend_snapshot(backend, active_session, windows)
                 } else {
-                    self.pending_backend_snapshot = Some((active_session, windows));
+                    self.pending_backend_snapshots
+                        .insert(backend, (active_session, windows));
                     None
                 };
                 if let Some(change) = focus_change
@@ -2574,7 +3605,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     return;
                 }
                 if let Some(snapshot) = session {
-                    self.latest_session_snapshot = Some(snapshot.clone());
+                    self.backend_sessions.insert(backend, snapshot.clone());
                     if let Some(runtime) = self.wasm_runtime.as_mut() {
                         runtime.bind_session_snapshot(&snapshot);
                         if let Err(error) = runtime
@@ -2585,6 +3616,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                         runtime.stop_actors_for_closed_sessions(&snapshot);
                     }
+                }
+                if let Err(error) = self.publish_backend_sessions() {
+                    eprintln!("could not publish backend session catalogue: {error:#}");
                 }
             }
             ClientEvent::SessionCommandCompleted {
@@ -2611,9 +3645,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                     })
                     .and(completion.session)
                     .and_then(|session| {
-                        self.renderer
-                            .as_mut()
-                            .and_then(|renderer| renderer.select_active_session(session))
+                        self.renderer.as_mut().and_then(|renderer| {
+                            renderer
+                                .select_active_session(BackendId(completion.backend_id), session)
+                        })
                     });
                 if let Some(change) = focus_change
                     && let Err(error) = dispatch_focus_change(
@@ -2629,7 +3664,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Some(runtime) = self.wasm_runtime.as_ref()
                     && completion.success
                     && completion.operation == SessionOperation::Refresh
-                    && let Some(snapshot) = self.latest_session_snapshot.clone()
+                    && let Some(snapshot) = self
+                        .backend_sessions
+                        .get(&BackendId(completion.backend_id))
+                        .cloned()
                     && let Err(error) =
                         runtime.send_session_event(&actor_id, SessionEvent::Snapshot(snapshot))
                 {
@@ -2652,29 +3690,33 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             ClientEvent::BackendActorMessage {
+                backend,
                 realm,
                 sender,
                 recipient,
                 body,
             } => {
+                self.backend_registry.observe(backend, None);
                 if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
                     && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
                 {
                     if body.starts_with(b"BTRM") {
                         eprintln!(
-                            "backend actor message realm={realm:?} sender={sender} recipient={recipient} terminal_snapshot_bytes={}",
+                            "backend actor message backend={} realm={realm:?} sender={sender} recipient={recipient} terminal_snapshot_bytes={}",
+                            backend.0,
                             body.len()
                         );
                     } else {
                         eprintln!(
-                            "backend actor message realm={realm:?} sender={sender} recipient={recipient} body={}",
+                            "backend actor message backend={} realm={realm:?} sender={sender} recipient={recipient} body={}",
+                            backend.0,
                             String::from_utf8_lossy(&body)
                         );
                     }
                 }
                 if let Some(runtime) = self.wasm_runtime.as_ref()
-                    && let Err(error) =
-                        runtime.send_backend_actor_message(realm, &recipient, &sender, body)
+                    && let Err(error) = runtime
+                        .send_backend_actor_message(backend, realm, &recipient, &sender, body)
                 {
                     eprintln!(
                         "dropped backend actor message for unavailable presentation actor \
@@ -2694,6 +3736,7 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
+        self.sync_default_backend_target();
         if let Err(error) = self.publish_layout_state() {
             self.fail(event_loop, error);
             return;
@@ -3202,19 +4245,23 @@ impl ApplicationHandler<ClientEvent> for Application {
                         if reconfigure {
                             renderer.reconfigure();
                         }
-                        if let Some(sequence) = sequence
-                            && self.last_presented_sequence != Some(sequence)
+                        if sequence.is_some()
                             && let Some(sender) = self.input_sender.as_mut()
                         {
-                            if send_input(
-                                sender,
-                                ClientMessage::Lifecycle(ClientLifecycle::FramePresented {
-                                    sequence,
-                                }),
-                            ) {
-                                self.last_presented_sequence = Some(sequence);
-                            } else {
-                                renderer.window.request_redraw();
+                            for (backend, sequence) in renderer.frame_sequences() {
+                                if self.last_presented_sequences.get(&backend) == Some(&sequence) {
+                                    continue;
+                                }
+                                if sender.send_to(
+                                    backend,
+                                    ClientMessage::Lifecycle(ClientLifecycle::FramePresented {
+                                        sequence,
+                                    }),
+                                ) {
+                                    self.last_presented_sequences.insert(backend, sequence);
+                                } else {
+                                    renderer.window.request_redraw();
+                                }
                             }
                         }
                     }
@@ -3295,13 +4342,18 @@ struct Renderer {
     placeholder_pipeline: wgpu::RenderPipeline,
     plugin_canvas: GpuCanvasRenderer,
     imported_frames: HashMap<u64, ImportedFrame>,
+    frame_keys: BTreeMap<(BackendId, u64), u64>,
+    next_frame_key: u64,
     available_windows: Vec<AvailableWindow>,
     active_session: u64,
+    active_backend: Option<BackendId>,
+    active_sessions: BTreeMap<BackendId, u64>,
     current_windows: Vec<SceneWindow>,
     current_sequence: Option<u64>,
+    current_sequences: BTreeMap<BackendId, u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_panes: BTreeMap<u64, PluginPaneTexture>,
-    plugin_pane_sessions: BTreeMap<u64, Option<u64>>,
+    plugin_pane_realms: BTreeMap<u64, Option<(BackendId, u64)>>,
     focused_pane: Option<FocusedPane>,
     pending_focus_pane: Option<u64>,
     accepted_layout: ResolvedLayout,
@@ -3373,6 +4425,7 @@ struct FocusChange {
 }
 
 struct SceneWindow {
+    backend: BackendId,
     window_id: u64,
     resource_id: u64,
     source_rect: [i32; 4],
@@ -3382,6 +4435,7 @@ struct SceneWindow {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 struct AvailableWindow {
+    backend: BackendId,
     pane: u64,
     session: u64,
     app_id: String,
@@ -3494,7 +4548,42 @@ fn flush_renderer_plugin_resize_events(
 }
 
 fn send_input(lane: &mut InputLane, message: ClientMessage) -> bool {
-    lane.send(message)
+    if matches!(
+        message,
+        ClientMessage::Lifecycle(ClientLifecycle::Disconnect)
+            | ClientMessage::Input(
+                InputEvent::KeyboardReset
+                    | InputEvent::PresentationSize { .. }
+                    | InputEvent::PresentationFocus { .. }
+            )
+    ) {
+        lane.broadcast(message)
+    } else {
+        lane.send(message)
+    }
+}
+
+fn translate_input_panes(message: &mut ClientMessage, routes: &BTreeMap<u64, u64>) {
+    let ClientMessage::Input(input) = message else {
+        return;
+    };
+    let map = |pane: &mut u64| {
+        if let Some(backend_pane) = routes.get(pane) {
+            *pane = *backend_pane;
+        }
+    };
+    match input {
+        InputEvent::WindowFocus { pane } | InputEvent::WindowResize { pane, .. } => map(pane),
+        InputEvent::PointerMotion { position }
+        | InputEvent::PointerButton { position, .. }
+        | InputEvent::PointerAxis { position, .. }
+        | InputEvent::PointerWheel { position, .. } => map(&mut position.pane),
+        InputEvent::KeyboardKey { .. }
+        | InputEvent::KeyboardReset
+        | InputEvent::PresentationSize { .. }
+        | InputEvent::PresentationFocus { .. }
+        | InputEvent::PointerLeave => {}
+    }
 }
 
 fn send_window_focus(lane: &mut InputLane, window_id: u64) {
@@ -3650,7 +4739,11 @@ fn apply_key_policy_host_message(
             )?;
             None
         }
-        HostMessage::ToggleShortcutPassthrough | HostMessage::SetShortcutPassthrough { .. } => None,
+        HostMessage::ToggleShortcutPassthrough
+        | HostMessage::SetShortcutPassthrough { .. }
+        | HostMessage::BackendSession { .. }
+        | HostMessage::ConnectRemoteBackend { .. }
+        | HostMessage::CreateLocalBackend => None,
         HostMessage::SetClipboard { text } => {
             clipboard
                 .context("presentation clipboard service is unavailable")?
@@ -4480,13 +5573,18 @@ impl Renderer {
             placeholder_pipeline,
             plugin_canvas,
             imported_frames: HashMap::new(),
+            frame_keys: BTreeMap::new(),
+            next_frame_key: 1,
             available_windows: Vec::new(),
             active_session: 0,
+            active_backend: None,
+            active_sessions: BTreeMap::new(),
             current_windows: Vec::new(),
             current_sequence: None,
+            current_sequences: BTreeMap::new(),
             plugin_graphics,
             plugin_panes: BTreeMap::new(),
-            plugin_pane_sessions: BTreeMap::new(),
+            plugin_pane_realms: BTreeMap::new(),
             focused_pane: None,
             pending_focus_pane: None,
             accepted_layout: ResolvedLayout::empty(),
@@ -4508,18 +5606,28 @@ impl Renderer {
 
     fn select_backend_snapshot(
         &mut self,
+        backend: BackendId,
         active_session: u64,
         windows: Vec<PresentationWindowSummary>,
     ) -> Option<FocusChange> {
         let previous_inventory = self
             .available_windows
             .iter()
-            .map(|window| (window.pane, window.session, window.app_id.clone()))
+            .filter(|window| window.backend == backend)
+            .map(|window| {
+                (
+                    window.backend,
+                    window.pane,
+                    window.session,
+                    window.app_id.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        let previous_active = self.active_session;
+        let previous_active = self.active_sessions.clone();
         let mut available_windows = windows
             .into_iter()
             .map(|window| AvailableWindow {
+                backend,
                 pane: window.pane,
                 session: window.session,
                 app_id: window.app_id,
@@ -4528,26 +5636,97 @@ impl Renderer {
         available_windows.sort_by_key(|window| window.pane);
         let inventory = available_windows
             .iter()
-            .map(|window| (window.pane, window.session, window.app_id.clone()))
+            .map(|window| {
+                (
+                    window.backend,
+                    window.pane,
+                    window.session,
+                    window.app_id.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        if previous_inventory == inventory && previous_active == active_session {
+        let mut merged_windows = self
+            .available_windows
+            .iter()
+            .filter(|window| window.backend != backend)
+            .cloned()
+            .collect::<Vec<_>>();
+        merged_windows.extend(available_windows);
+        merged_windows.sort_by_key(|window| (window.backend, window.pane));
+        if previous_inventory == inventory
+            && previous_active.get(&backend).copied() == Some(active_session)
+        {
             return None;
         }
 
-        self.available_windows = available_windows;
-        self.active_session = active_session;
+        self.available_windows = merged_windows;
+        self.active_sessions.insert(backend, active_session);
+        if self.active_backend.is_none() || self.active_backend == Some(backend) {
+            self.active_backend = Some(backend);
+            self.active_session = active_session;
+        }
         self.layout_state_dirty = true;
         if self.layout_source == LayoutSource::NativeFallback {
-            return self.apply_default_session_layout(active_session);
+            return self.apply_default_session_layout(self.active_session);
         }
         self.window.request_redraw();
         self.reconcile_layout()
     }
 
-    fn select_active_session(&mut self, active_session: u64) -> Option<FocusChange> {
-        if self.active_session == active_session {
+    fn disconnect_backend(&mut self, backend: BackendId) -> Option<FocusChange> {
+        let previous_focus = self.focused_pane;
+        let removed_panes = self
+            .available_windows
+            .iter()
+            .filter(|window| window.backend == backend)
+            .map(|window| window.pane)
+            .collect::<HashSet<_>>();
+        self.available_windows
+            .retain(|window| window.backend != backend);
+        self.current_windows
+            .retain(|window| window.backend != backend);
+        self.current_sequences.remove(&backend);
+        self.active_sessions.remove(&backend);
+        let removed_resources = self
+            .frame_keys
+            .iter()
+            .filter(|((owner, _resource), _key)| *owner == backend)
+            .map(|(_qualified, key)| *key)
+            .collect::<Vec<_>>();
+        self.frame_keys
+            .retain(|(owner, _resource), _key| *owner != backend);
+        for resource in removed_resources {
+            self.imported_frames.remove(&resource);
+        }
+        if self
+            .focused_pane_id()
+            .is_some_and(|pane| removed_panes.contains(&pane))
+        {
+            self.focused_pane = None;
+        }
+        if self.active_backend == Some(backend) {
+            self.active_backend = self.active_sessions.keys().next().copied();
+            self.active_session = self
+                .active_backend
+                .and_then(|active| self.active_sessions.get(&active).copied())
+                .unwrap_or_default();
+        }
+        self.layout_state_dirty = true;
+        self.window.request_redraw();
+        self.reconcile_layout()
+            .or_else(|| focus_change_between(previous_focus, self.focused_pane))
+    }
+
+    fn select_active_session(
+        &mut self,
+        backend: BackendId,
+        active_session: u64,
+    ) -> Option<FocusChange> {
+        if self.active_sessions.get(&backend).copied() == Some(active_session) {
             return None;
         }
+        self.active_backend = Some(backend);
+        self.active_sessions.insert(backend, active_session);
         if self.layout_source == LayoutSource::Actor {
             self.active_session = active_session;
             self.layout_state_dirty = true;
@@ -4573,6 +5752,7 @@ impl Renderer {
 
     fn select_scene(
         &mut self,
+        backend: BackendId,
         sequence: u64,
         _width: u32,
         _height: u32,
@@ -4587,11 +5767,18 @@ impl Renderer {
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
         for window in windows {
+            anyhow::ensure!(
+                window.backend == backend,
+                "scene window backend identity does not match its scene"
+            );
             let previous_rect = self
                 .current_windows
                 .iter()
-                .find(|current| current.window_id == window.window_id)
+                .find(|current| {
+                    current.backend == window.backend && current.window_id == window.window_id
+                })
                 .map_or(window.rect, |current| current.rect);
+            let resource_key = self.resource_key(backend, window.resource_id);
             if let Some(frame) = window.resource {
                 let imported = ImportedFrame::new(
                     &self.device,
@@ -4599,21 +5786,22 @@ impl Renderer {
                     &self.frame_bind_group_layout,
                     &self.frame_sampler,
                     window.window_id,
-                    window.resource_id,
+                    resource_key,
                     sequence,
                     frame,
                 )?;
-                self.imported_frames.insert(window.resource_id, imported);
+                self.imported_frames.insert(resource_key, imported);
             }
-            if let Some(imported) = self.imported_frames.get(&window.resource_id) {
+            if let Some(imported) = self.imported_frames.get(&resource_key) {
                 imported.update(&self.queue, sequence)?;
             }
             if window.active {
                 backend_focus = Some(window.window_id);
             }
             scene_windows.push(SceneWindow {
+                backend,
                 window_id: window.window_id,
-                resource_id: window.resource_id,
+                resource_id: resource_key,
                 source_rect: window.rect,
                 rect: previous_rect,
                 active: window.active,
@@ -4624,8 +5812,13 @@ impl Renderer {
             .iter()
             .all(|window| self.imported_frames.contains_key(&window.resource_id))
         {
-            self.current_windows = scene_windows;
+            self.current_windows
+                .retain(|window| window.backend != backend);
+            self.current_windows.extend(scene_windows);
+            self.current_windows
+                .sort_by_key(|window| (window.backend, window.window_id));
             self.current_sequence = Some(sequence);
+            self.current_sequences.insert(backend, sequence);
             let managed_panes = self
                 .current_windows
                 .iter()
@@ -4664,6 +5857,23 @@ impl Renderer {
         Ok(None)
     }
 
+    fn resource_key(&mut self, backend: BackendId, resource: u64) -> u64 {
+        if let Some(key) = self.frame_keys.get(&(backend, resource)) {
+            return *key;
+        }
+        let key = self.next_frame_key.max(1);
+        self.next_frame_key = key.saturating_add(1);
+        self.frame_keys.insert((backend, resource), key);
+        key
+    }
+
+    fn frame_sequences(&self) -> Vec<(BackendId, u64)> {
+        self.current_sequences
+            .iter()
+            .map(|(backend, sequence)| (*backend, *sequence))
+            .collect()
+    }
+
     const fn focused_plugin_pane(&self) -> Option<u64> {
         match self.focused_pane {
             Some(FocusedPane::Plugin(pane)) => Some(pane),
@@ -4700,13 +5910,18 @@ impl Renderer {
             managed_panes: self
                 .available_windows
                 .iter()
-                .filter(|window| window.session == self.active_session)
+                .filter(|window| {
+                    self.active_sessions.get(&window.backend).copied() == Some(window.session)
+                })
                 .map(|window| window.pane)
                 .collect(),
             app_panes: self
                 .available_windows
                 .iter()
-                .filter(|window| window.session == self.active_session && !window.app_id.is_empty())
+                .filter(|window| {
+                    self.active_sessions.get(&window.backend).copied() == Some(window.session)
+                        && !window.app_id.is_empty()
+                })
                 .map(|window| KeyPolicyAppPane {
                     pane: window.pane,
                     app_id: window.app_id.clone(),
@@ -4741,6 +5956,15 @@ impl Renderer {
             return None;
         }
         self.focused_pane = Some(target);
+        if let FocusedPane::Managed(pane) = target
+            && let Some(window) = self
+                .available_windows
+                .iter()
+                .find(|window| window.pane == pane)
+        {
+            self.active_backend = Some(window.backend);
+            self.active_session = window.session;
+        }
         self.layout_state_dirty = true;
         let target = self.focused_pane?;
         if previous == Some(target) {
@@ -5017,11 +6241,17 @@ impl Renderer {
     }
 
     fn default_visible_pane_inventory(&self) -> Vec<u64> {
-        default_visible_panes(
-            self.visible_plugin_panes(),
-            &self.available_windows,
-            self.active_session,
-        )
+        self.visible_plugin_panes()
+            .into_iter()
+            .chain(
+                self.available_windows
+                    .iter()
+                    .filter(|window| {
+                        self.active_sessions.get(&window.backend).copied() == Some(window.session)
+                    })
+                    .map(|window| window.pane),
+            )
+            .collect()
     }
 
     fn visible_plugin_panes(&self) -> Vec<u64> {
@@ -5029,17 +6259,19 @@ impl Renderer {
             .keys()
             .copied()
             .filter(|pane| {
-                self.plugin_pane_sessions.get(pane).is_none_or(|session| {
-                    session.is_none_or(|session| session == self.active_session)
+                self.plugin_pane_realms.get(pane).is_none_or(|realm| {
+                    realm.is_none_or(|(backend, session)| {
+                        self.active_sessions.get(&backend).copied() == Some(session)
+                    })
                 })
             })
             .collect()
     }
 
-    fn set_plugin_pane_sessions(&mut self, sessions: &[(u64, Option<u64>)]) {
+    fn set_plugin_pane_realms(&mut self, sessions: &[(u64, Option<(BackendId, u64)>)]) {
         let updated = sessions.iter().copied().collect::<BTreeMap<_, _>>();
-        if self.plugin_pane_sessions != updated {
-            self.plugin_pane_sessions = updated;
+        if self.plugin_pane_realms != updated {
+            self.plugin_pane_realms = updated;
             self.layout_state_dirty = true;
             self.window.request_redraw();
         }
@@ -5164,7 +6396,7 @@ impl Renderer {
 
     fn remove_plugin_pane(&mut self, pane: u64) -> Option<FocusChange> {
         let removed = self.plugin_panes.remove(&pane).is_some();
-        self.plugin_pane_sessions.remove(&pane);
+        self.plugin_pane_realms.remove(&pane);
         self.sent_plugin_sizes.remove(&pane);
         if !removed {
             return None;
@@ -5430,6 +6662,7 @@ impl Renderer {
     }
 }
 
+#[cfg(test)]
 fn default_visible_panes(
     plugin_panes: impl IntoIterator<Item = u64>,
     windows: &[AvailableWindow],
@@ -5598,6 +6831,7 @@ mod tests {
 
     fn available(pane: u64, session: u64) -> AvailableWindow {
         AvailableWindow {
+            backend: BackendId(1),
             pane,
             session,
             app_id: format!("app-{pane}"),
@@ -5633,5 +6867,141 @@ mod tests {
         assert!(managed_pane_uses_placeholder(true, false));
         assert!(!managed_pane_uses_placeholder(true, true));
         assert!(!managed_pane_uses_placeholder(false, false));
+    }
+
+    #[test]
+    fn input_translation_targets_backend_local_panes() {
+        let mut message = ClientMessage::Input(InputEvent::PointerMotion {
+            position: PanePosition {
+                pane: 900,
+                x: 1.0,
+                y: 2.0,
+            },
+        });
+        let routes = BTreeMap::from([(900, 7)]);
+        translate_input_panes(&mut message, &routes);
+        assert!(matches!(
+            message,
+            ClientMessage::Input(InputEvent::PointerMotion {
+                position: PanePosition { pane: 7, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn disconnecting_one_backend_keeps_other_input_routes_live() {
+        let first = BackendId(1);
+        let second = BackendId(2);
+        let empty_lane = || InputLane::Multi {
+            lanes: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            default: None,
+        };
+        let mut lane = InputLane::Multi {
+            lanes: BTreeMap::from([
+                (first, Box::new(empty_lane())),
+                (second, Box::new(empty_lane())),
+            ]),
+            routes: BTreeMap::from([(10, first), (20, second)]),
+            default: Some(first),
+        };
+
+        assert_eq!(lane.backend_count(), 2);
+        assert!(lane.remove_backend(first));
+        if let InputLane::Multi {
+            lanes,
+            routes,
+            default,
+        } = lane
+        {
+            assert_eq!(lanes.keys().copied().collect::<Vec<_>>(), [second]);
+            assert_eq!(routes, BTreeMap::from([(20, second)]));
+            assert_eq!(default, Some(second));
+        } else {
+            assert!(false, "test lane stopped being multi-backend");
+        }
+    }
+
+    #[test]
+    fn remote_failure_detaches_only_that_backend() {
+        let local = BackendId(1);
+        let remote = BackendId(2);
+        let input_leaf = || InputLane::Multi {
+            lanes: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            default: None,
+        };
+        let actor_leaf = || ActorMessageLane::Multi {
+            lanes: BTreeMap::new(),
+            default: None,
+        };
+        let command_leaf = || BackendCommandLane::Multi {
+            lanes: BTreeMap::new(),
+            default: None,
+        };
+        let mut application = Application {
+            input_sender: Some(InputLane::Multi {
+                lanes: BTreeMap::from([
+                    (local, Box::new(input_leaf())),
+                    (remote, Box::new(input_leaf())),
+                ]),
+                routes: BTreeMap::from([(10, local), (20, remote)]),
+                default: Some(remote),
+            }),
+            actor_message_sender: Some(ActorMessageLane::Multi {
+                lanes: BTreeMap::from([
+                    (local, Box::new(actor_leaf())),
+                    (remote, Box::new(actor_leaf())),
+                ]),
+                default: Some(remote),
+            }),
+            backend_commands: Some(BackendCommandLane::Multi {
+                lanes: BTreeMap::from([
+                    (local, Box::new(command_leaf())),
+                    (remote, Box::new(command_leaf())),
+                ]),
+                default: Some(remote),
+            }),
+            ..Application::default()
+        };
+        application.backend_registry.replace_panes(local, None, [1]);
+        application
+            .backend_registry
+            .replace_panes(remote, None, [1]);
+        let local_view = application.backend_registry.view_pane(QualifiedPane {
+            backend: local,
+            pane: 1,
+        });
+        application.backend_registry.view_pane(QualifiedPane {
+            backend: remote,
+            pane: 1,
+        });
+        application.backend_sessions.insert(
+            remote,
+            SessionSnapshot {
+                backend_id: remote.0,
+                revision: 1,
+                active: 1,
+                sessions: Vec::new(),
+            },
+        );
+
+        assert!(
+            application
+                .disconnect_remote_backend(remote, "test disconnect")
+                .is_ok()
+        );
+        assert_eq!(
+            application
+                .input_sender
+                .as_ref()
+                .map(InputLane::backend_count),
+            Some(1)
+        );
+        assert!(!application.backend_sessions.contains_key(&remote));
+        assert_eq!(
+            application.backend_registry.all_view_routes(),
+            vec![(local_view, local, 1)]
+        );
     }
 }

@@ -1595,6 +1595,7 @@ impl Brood {
                     id,
                     path,
                     capabilities,
+                    backend_id: _,
                     session_id: _,
                 } => {
                     if let Some(session) = self.realm_init_root_session(&actor_name) {
@@ -4798,6 +4799,7 @@ impl Brood {
             instance_id: actor_name.to_string(),
             generation: actor.generation(),
             reason,
+            backend_id: None,
             session_id: session.map(SurfaceSessionId::raw),
             workspace_root: ".".to_string(),
             data: lifecycle

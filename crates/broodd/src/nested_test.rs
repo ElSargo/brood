@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result, bail};
-use brood_cli::{NestedTestArgs, TestArgs, TestCommand};
+use brood_cli::{NestedTestArgs, SshTestArgs, TestArgs, TestCommand};
 
 pub fn run(args: TestArgs) -> Result<()> {
     match args
@@ -9,6 +9,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         .unwrap_or_else(|| TestCommand::Nested(NestedTestArgs::default()))
     {
         TestCommand::Nested(args) => run_nested(args),
+        TestCommand::Ssh(args) => run_ssh(args),
     }
 }
 
@@ -25,6 +26,26 @@ fn run_nested(args: NestedTestArgs) -> Result<()> {
         .with_context(|| format!("run {}", script.display()))?;
     if !status.success() {
         bail!("nested terminal proof exited with {status}");
+    }
+    Ok(())
+}
+
+fn run_ssh(args: SshTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let script = root.join("tools/test-ssh-multi-backend.sh");
+    let mut command = Command::new("bash");
+    command.arg(&script).arg(&args.target).current_dir(&root);
+    if let Some(connect_host) = args.connect_host {
+        command.arg("--connect-host").arg(connect_host);
+    }
+    if let Some(out_dir) = args.out_dir {
+        command.env("BROOD_SSH_MULTI_BACKEND_OUT", out_dir);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("SSH multi-backend proof exited with {status}");
     }
     Ok(())
 }

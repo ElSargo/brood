@@ -2,7 +2,7 @@
 status: current
 type: workflow
 authority: product
-last-reviewed: 2026-07-26
+last-reviewed: 2026-07-27
 code-links:
   - crates/brood-remote/src/ssh.rs
   - crates/brood-remote/src/main.rs
@@ -41,6 +41,17 @@ while retaining the SSH host for deployment and lifecycle control.
 Closing the local presentation stops the remote backend session. Verified
 artifact content and deployment identity remain in per-host caches, so repeated
 deployments reuse local builds and remote artifact state.
+
+For an offscreen acceptance proof of the same packaged workflow, including the
+ordinary local backend, run:
+
+```sh
+nix develop --command cargo run -- test ssh sargo@luna
+```
+
+The retained proof contains the combined presentation, distinct backend actor
+realms, their client frontends, and clean remote-session shutdown. A target
+other than Luna can be supplied without changing the harness.
 
 Exact command options and parser behavior are defined by
 `crates/brood-remote/src/ssh.rs`.

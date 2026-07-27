@@ -49,10 +49,12 @@ const RED: Color = Color::rgba(0.800, 0.141, 0.114, 1.0);
 
 #[derive(Clone)]
 struct ViewSession {
+    backend: u64,
     id: u64,
     name: String,
     active: bool,
     windows: u64,
+    working_directory: Option<String>,
     project_id: String,
     project_name: String,
     branch: Option<String>,
@@ -63,12 +65,57 @@ struct ViewSession {
 #[derive(Clone, Eq, PartialEq)]
 enum EditMode {
     Search,
-    Rename(u64),
-    CreateWorktree(u64),
+    Rename(u64, u64),
+    CreateWorktree(u64, u64),
+    ConnectRemote,
+}
+
+#[derive(Clone, Deserialize)]
+struct BackendSessionsMessage {
+    kind: serde_json_core::heapless::String<32>,
+    #[serde(default)]
+    can_create_local: bool,
+    #[serde(default)]
+    can_connect_remote: bool,
+    backends: Vec<BackendView>,
+}
+
+#[derive(Deserialize)]
+struct BackendConnectedMessage {
+    kind: serde_json_core::heapless::String<32>,
+    backend: u64,
+}
+
+#[derive(Deserialize)]
+struct BackendConnectionFailedMessage {
+    kind: serde_json_core::heapless::String<32>,
+    message: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct BackendView {
+    backend: u64,
+    label: String,
+    sessions: Vec<BackendSession>,
+}
+
+#[derive(Clone, Deserialize)]
+struct BackendSession {
+    id: u64,
+    name: String,
+    active: bool,
+    windows: u64,
+    working_directory: Option<String>,
+    project_id: String,
+    project_name: String,
+    branch: Option<String>,
+    worktree: bool,
+    git: bool,
 }
 
 #[derive(Clone)]
 struct ProjectGroup {
+    backend: u64,
     id: String,
     name: String,
     source_session: u64,
@@ -83,14 +130,18 @@ enum ListItem {
 }
 
 struct SwitcherState {
+    is_root: bool,
+    can_create_local: bool,
+    can_connect_remote: bool,
     pane: u64,
+    backend_id: u64,
     session_id: u64,
     sidebar_visible: bool,
     width: f32,
     height: f32,
     sessions: Vec<ViewSession>,
     collapsed_projects: BTreeSet<String>,
-    selected: Option<u64>,
+    selected: Option<(u64, u64)>,
     query: String,
     mode: EditMode,
     scroll: usize,
@@ -104,7 +155,7 @@ struct SwitcherState {
     agents: Vec<WireAgent>,
     agent_picker_pending: bool,
     diff_viewers: BTreeSet<String>,
-    terminal_uis: BTreeMap<String, u64>,
+    terminal_uis: BTreeMap<String, (u64, u64)>,
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
@@ -129,7 +180,9 @@ struct LayoutStateMessage {
 
 #[derive(Clone, Copy, Deserialize)]
 struct AvailableWindow {
+    backend: u64,
     pane: u64,
+    session: u64,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -231,6 +284,12 @@ struct SessionPickerValue {
     #[serde(default)]
     session: Option<u64>,
     #[serde(default)]
+    backend: Option<u64>,
+    #[serde(default)]
+    action: Option<serde_json_core::heapless::String<32>>,
+    #[serde(default)]
+    directory: Option<String>,
+    #[serde(default)]
     agent: Option<String>,
 }
 
@@ -262,24 +321,31 @@ struct WorktreeSessionCompletion {
 }
 
 #[derive(Serialize)]
-struct SessionPickerRequest<'a> {
+struct SessionPickerRequest {
     #[serde(rename = "type")]
     message_type: &'static str,
     title: &'static str,
     placeholder: &'static str,
-    items: Vec<SessionPickerItem<'a>>,
+    items: Vec<SessionPickerItem>,
 }
 
 #[derive(Serialize)]
-struct SessionPickerItem<'a> {
-    label: &'a str,
+struct SessionPickerItem {
+    label: String,
     detail: String,
     value: SessionPickerValueWire,
 }
 
 #[derive(Serialize)]
 struct SessionPickerValueWire {
-    session: u64,
+    #[serde(default)]
+    backend: Option<u64>,
+    #[serde(default)]
+    session: Option<u64>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    directory: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -306,7 +372,11 @@ struct AgentPickerValue<'a> {
 impl SwitcherState {
     const fn new() -> Self {
         Self {
+            is_root: false,
+            can_create_local: false,
+            can_connect_remote: false,
             pane: 0,
+            backend_id: 0,
             session_id: 0,
             sidebar_visible: true,
             width: 320.0,
@@ -349,19 +419,22 @@ impl SwitcherState {
         for (index, session) in self.sessions.iter().enumerate() {
             if let Some(group) = groups
                 .iter_mut()
-                .find(|group| group.id == session.project_id)
+                .find(|group| group.backend == session.backend && group.id == session.project_id)
             {
                 group.sessions.push(index);
                 let source_is_worktree = self
                     .sessions
                     .iter()
-                    .find(|candidate| candidate.id == group.source_session)
+                    .find(|candidate| {
+                        candidate.backend == group.backend && candidate.id == group.source_session
+                    })
                     .is_some_and(|candidate| candidate.worktree);
                 if source_is_worktree && !session.worktree {
                     group.source_session = session.id;
                 }
             } else {
                 groups.push(ProjectGroup {
+                    backend: session.backend,
                     id: session.project_id.clone(),
                     name: session.project_name.clone(),
                     source_session: session.id,
@@ -403,7 +476,8 @@ impl SwitcherState {
             if group.sessions.is_empty() {
                 continue;
             }
-            let expanded = query.is_some() || !self.collapsed_projects.contains(&group.id);
+            let project_key = format!("{}:{}", group.backend, group.id);
+            let expanded = query.is_some() || !self.collapsed_projects.contains(&project_key);
             items.push(ListItem::Project(group.clone()));
             if expanded {
                 items.extend(group.sessions.into_iter().map(ListItem::Session));
@@ -430,10 +504,11 @@ impl SwitcherState {
     }
 
     fn ensure_selection(&mut self) {
-        if self
-            .selected
-            .is_some_and(|id| self.sessions.iter().any(|session| session.id == id))
-        {
+        if self.selected.is_some_and(|selected| {
+            self.sessions
+                .iter()
+                .any(|session| (session.backend, session.id) == selected)
+        }) {
             return;
         }
         self.selected = self
@@ -441,7 +516,7 @@ impl SwitcherState {
             .iter()
             .find(|session| session.active)
             .or_else(|| self.sessions.first())
-            .map(|session| session.id);
+            .map(|session| (session.backend, session.id));
     }
 
     fn ensure_selected_visible(&mut self) {
@@ -449,7 +524,7 @@ impl SwitcherState {
         let Some(position) = self.selected.and_then(|selected| {
             items
                 .iter()
-                .position(|item| matches!(item, ListItem::Session(index) if self.sessions[*index].id == selected))
+                .position(|item| matches!(item, ListItem::Session(index) if (self.sessions[*index].backend, self.sessions[*index].id) == selected))
         }) else {
             self.scroll = self.scroll.min(items.len().saturating_sub(1));
             return;
@@ -466,7 +541,9 @@ impl SwitcherState {
 
     fn selected_session(&self) -> Option<&ViewSession> {
         let selected = self.selected?;
-        self.sessions.iter().find(|session| session.id == selected)
+        self.sessions
+            .iter()
+            .find(|session| (session.backend, session.id) == selected)
     }
 }
 
@@ -480,30 +557,47 @@ impl Guest for SessionSwitcher {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 if context.instance_id == INIT_ACTOR_ID {
                     if let Ok(mut state) = STATE.lock() {
+                        state.is_root = true;
+                        state.backend_id = context.backend_id.unwrap_or_default();
                         state.session_id = context.session_id.unwrap_or_default();
+                        if let (Some(backend_id), Some(session_id)) =
+                            (context.backend_id, context.session_id)
+                        {
+                            state
+                                .terminal_uis
+                                .insert(TERMINAL_UI_ID.to_string(), (backend_id, session_id));
+                        }
                     }
-                    vec![
+                    let mut commands = vec![
                         ActorCommand::StartActor(ActorStartRequest {
                             id: CHILD_ACTOR_ID.to_string(),
                             path: COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
+                            backend_id: None,
                             session_id: None,
                         }),
                         ActorCommand::StartActor(ActorStartRequest {
                             id: PICKER_ACTOR_ID.to_string(),
                             path: PICKER_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
+                            backend_id: None,
                             session_id: None,
                         }),
-                        ActorCommand::StartActor(ActorStartRequest {
+                    ];
+                    if let (Some(backend_id), Some(session_id)) =
+                        (context.backend_id, context.session_id)
+                    {
+                        commands.push(ActorCommand::StartActor(ActorStartRequest {
                             id: TERMINAL_UI_ID.to_string(),
                             path: TERMINAL_UI_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
-                            session_id: context.session_id,
-                        }),
-                        subscribe_agent_registry(context.session_id.unwrap_or_default()),
-                        ActorCommand::LifecycleComplete(Ok(())),
-                    ]
+                            backend_id: Some(backend_id),
+                            session_id: Some(session_id),
+                        }));
+                        commands.push(subscribe_agent_registry(backend_id, session_id));
+                    }
+                    commands.push(ActorCommand::LifecycleComplete(Ok(())));
+                    commands
                 } else {
                     vec![ActorCommand::LifecycleComplete(Ok(()))]
                 }
@@ -520,11 +614,12 @@ impl Guest for SessionSwitcher {
                 Vec::new()
             }
             Event::Child(ChildEvent::Started(started))
-                if started.id == TERMINAL_UI_ID || started.id.starts_with("terminal-ui-s") =>
+                if started.id == TERMINAL_UI_ID || started.id.starts_with("terminal-ui-b") =>
             {
                 if let Ok(mut state) = STATE.lock() {
-                    let session = actor_session(&started.id).unwrap_or(state.session_id);
-                    state.terminal_uis.insert(started.id, session);
+                    let realm =
+                        actor_realm(&started.id).unwrap_or((state.backend_id, state.session_id));
+                    state.terminal_uis.insert(started.id, realm);
                 }
                 Vec::new()
             }
@@ -539,9 +634,12 @@ impl Guest for SessionSwitcher {
                     state.coding_agent_uis.push(started.id.clone());
                 }
                 let target = state.coding_agent_targets.remove(&started.id);
+                let (backend, session) =
+                    actor_realm(&started.id).unwrap_or((state.backend_id, state.session_id));
                 vec![bind_coding_agent_ui(
                     &started.id,
-                    actor_session(&started.id).unwrap_or(state.session_id),
+                    backend,
+                    session,
                     target.as_deref(),
                 )]
             }
@@ -555,12 +653,14 @@ impl Guest for SessionSwitcher {
                 state
                     .terminal_uis
                     .remove(&id)
-                    .map_or_else(Vec::new, |session| {
+                    .map_or_else(Vec::new, |(backend, session)| {
                         state
                             .sessions
                             .iter()
-                            .any(|candidate| candidate.id == session)
-                            .then(|| stop_terminal_command(session, &id))
+                            .any(|candidate| {
+                                candidate.backend == backend && candidate.id == session
+                            })
+                            .then(|| stop_terminal_command(backend, session, &id))
                             .flatten()
                             .into_iter()
                             .collect()
@@ -576,7 +676,9 @@ impl Guest for SessionSwitcher {
                 let stop = state
                     .terminal_uis
                     .remove(&failed.id)
-                    .and_then(|session| stop_terminal_command(session, &failed.id));
+                    .and_then(|(backend, session)| {
+                        stop_terminal_command(backend, session, &failed.id)
+                    });
                 state.error = true;
                 state.status = format!("Plugin pane failed: {}", failed.message);
                 stop.into_iter().collect()
@@ -592,11 +694,13 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
                 handle_picker_message(&message.body)
             }
-            Event::Mailbox(message) if message.sender.starts_with("session:") => {
-                handle_session_message(&message.body)
+            Event::Mailbox(message)
+                if message.sender.starts_with("session:") || message.sender == "client" =>
+            {
+                handle_session_message(&message.sender, &message.body)
             }
             Event::Mailbox(message) if message.sender.starts_with("daemon:") => {
-                handle_daemon_message(&message.body)
+                handle_daemon_message(&message.sender, &message.body)
             }
             _ => Vec::new(),
         }
@@ -613,17 +717,50 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
     };
     let commands = match event {
         SessionEvent::Snapshot(snapshot) => {
-            let active_changed = state.session_id != snapshot.active;
-            state.session_id = snapshot.active;
-            apply_snapshot(&mut state, snapshot);
-            if active_changed {
-                state.agents.clear();
-                vec![subscribe_agent_registry(state.session_id)]
+            let backend = snapshot.backend_id;
+            let active = snapshot.active;
+            let previous_realm = (state.backend_id, state.session_id);
+            apply_snapshot(&mut state, backend, snapshot);
+            if active != 0 && (state.backend_id == 0 || state.backend_id == backend) {
+                state.backend_id = backend;
+                state.session_id = active;
+            } else if active == 0 && state.backend_id == backend {
+                let fallback = state
+                    .sessions
+                    .iter()
+                    .find(|session| session.active)
+                    .or_else(|| state.sessions.first())
+                    .map(|session| (session.backend, session.id))
+                    .unwrap_or_default();
+                state.backend_id = fallback.0;
+                state.session_id = fallback.1;
+            }
+            let mut commands = if state.is_root {
+                ensure_default_terminal_ui(&mut state, backend, active)
+                    .into_iter()
+                    .collect()
             } else {
                 Vec::new()
+            };
+            if previous_realm != (state.backend_id, state.session_id) {
+                state.agents.clear();
+                if state.backend_id != 0 && state.session_id != 0 {
+                    commands.push(subscribe_agent_registry(state.backend_id, state.session_id));
+                }
             }
+            commands
         }
         SessionEvent::CommandCompleted(completion) => {
+            if completion.success
+                && matches!(
+                    completion.operation,
+                    SessionOperation::Activate | SessionOperation::Create
+                )
+                && let Some(session) = completion.session
+            {
+                state.backend_id = completion.backend_id;
+                state.session_id = session;
+            }
             apply_completion(&mut state, completion);
             Vec::new()
         }
@@ -632,36 +769,77 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
     commands
 }
 
-fn apply_snapshot(state: &mut SwitcherState, snapshot: SessionSnapshot) {
-    state.sessions = snapshot
+fn apply_snapshot(state: &mut SwitcherState, backend: u64, snapshot: SessionSnapshot) {
+    state.sessions.retain(|session| session.backend != backend);
+    state
         .sessions
-        .into_iter()
-        .map(|session| ViewSession {
+        .extend(snapshot.sessions.into_iter().map(|session| ViewSession {
+            backend,
             id: session.id,
             name: session.name,
             active: session.active,
             windows: session.windows,
+            working_directory: session.working_directory,
             project_id: session.project_id,
             project_name: session.project_name,
             branch: session.branch,
             worktree: session.worktree,
             git: session.git,
-        })
-        .collect();
+        }));
     state.sessions.sort_by(|left, right| {
         left.project_name
             .to_lowercase()
             .cmp(&right.project_name.to_lowercase())
+            .then_with(|| left.backend.cmp(&right.backend))
             .then_with(|| left.id.cmp(&right.id))
     });
     let projects = state
         .sessions
         .iter()
-        .map(|session| session.project_id.clone())
+        .map(|session| format!("{}:{}", session.backend, session.project_id))
         .collect::<BTreeSet<_>>();
     state
         .collapsed_projects
         .retain(|project| projects.contains(project));
+    state.ensure_selection();
+    state.ensure_selected_visible();
+}
+
+fn apply_backend_sessions(state: &mut SwitcherState, message: BackendSessionsMessage) {
+    if message.kind.as_str() != "backend-sessions" {
+        return;
+    }
+    state.can_create_local = message.can_create_local;
+    state.can_connect_remote = message.can_connect_remote;
+    state.sessions = message
+        .backends
+        .into_iter()
+        .flat_map(|backend| {
+            backend
+                .sessions
+                .into_iter()
+                .map(move |session| ViewSession {
+                    backend: backend.backend,
+                    id: session.id,
+                    name: session.name,
+                    active: session.active,
+                    windows: session.windows,
+                    working_directory: session.working_directory,
+                    project_id: session.project_id,
+                    project_name: if backend.label.is_empty() {
+                        session.project_name
+                    } else {
+                        format!("{} · {}", backend.label, session.project_name)
+                    },
+                    branch: session.branch,
+                    worktree: session.worktree,
+                    git: session.git,
+                })
+        })
+        .collect();
+    state
+        .sessions
+        .sort_by_key(|session| (session.backend, session.id));
     state.ensure_selection();
     state.ensure_selected_visible();
 }
@@ -677,7 +855,13 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
             SessionOperation::Activate | SessionOperation::Create | SessionOperation::Rename
         ) && let Some(session) = completion.session
         {
-            state.selected = Some(session);
+            state.selected = state
+                .sessions
+                .iter()
+                .find(|candidate| {
+                    candidate.backend == completion.backend_id && candidate.id == session
+                })
+                .map(|candidate| (candidate.backend, candidate.id));
         }
         state.status = match completion.operation {
             SessionOperation::Refresh => "Sessions refreshed".to_string(),
@@ -698,7 +882,7 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
     }
 }
 
-fn handle_daemon_message(bytes: &[u8]) -> Vec<ActorCommand> {
+fn handle_daemon_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok((completion, consumed)) =
         serde_json_core::from_slice::<WorktreeSessionCompletion>(bytes)
     else {
@@ -715,8 +899,13 @@ fn handle_daemon_message(bytes: &[u8]) -> Vec<ActorCommand> {
     }
     state.error = !completion.success;
     if completion.success {
+        let backend = backend_from_sender(sender).unwrap_or(state.backend_id);
         if let Some(session) = completion.session {
-            state.selected = Some(session);
+            state.selected = state
+                .sessions
+                .iter()
+                .find(|candidate| candidate.backend == backend && candidate.id == session)
+                .map(|candidate| (candidate.backend, candidate.id));
         }
         state.status = "Created worktree session".to_string();
         state.query.clear();
@@ -741,11 +930,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.width = created.width.max(240.0);
             state.height = created.height.max(240.0);
             redraw_or_record_error(&mut state);
-            let request = state.next_request();
-            vec![
-                ActorCommand::SendHostMessage(br#"{"type":"claim-root-layout"}"#.to_vec()),
-                session_command(request, SessionOperation::Refresh, None, None),
-            ]
+            vec![ActorCommand::SendHostMessage(
+                br#"{"type":"claim-root-layout"}"#.to_vec(),
+            )]
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(240.0);
@@ -823,6 +1010,23 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if message.focused_pane != Some(state.pane) && message.focused_pane != state.picker_pane {
         state.workspace_focus = message.focused_pane;
     }
+    let focused_realm = message.focused_pane.and_then(|focused| {
+        message
+            .available_windows
+            .iter()
+            .find(|window| window.pane == focused)
+            .map(|window| (window.backend, window.session))
+            .filter(|(backend, session)| *backend != 0 && *session != 0)
+    });
+    let realm_changed =
+        focused_realm.is_some_and(|realm| realm != (state.backend_id, state.session_id));
+    if let Some((backend, session)) = focused_realm {
+        state.backend_id = backend;
+        state.session_id = session;
+        if realm_changed {
+            state.agents.clear();
+        }
+    }
     state.layout = Some(LayoutContext {
         revision: message.revision,
         lease: message.lease,
@@ -832,7 +1036,11 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         size: message.size,
         rest: message.rest,
     });
-    publish_layout(&state, true, message.focused_pane)
+    let mut commands = publish_layout(&state, true, message.focused_pane);
+    if realm_changed {
+        commands.push(subscribe_agent_registry(state.backend_id, state.session_id));
+    }
+    commands
 }
 
 fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -846,7 +1054,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         };
         if state.agents.is_empty() {
             state.agent_picker_pending = true;
-            return vec![subscribe_agent_registry(state.session_id)];
+            return vec![subscribe_agent_registry(state.backend_id, state.session_id)];
         }
         return open_agent_picker(&mut state);
     }
@@ -858,7 +1066,10 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         let Ok(mut state) = STATE.lock() else {
             return Vec::new();
         };
-        let id = format!("{DIFF_VIEWER_ID_PREFIX}{}", state.session_id);
+        let id = format!(
+            "{DIFF_VIEWER_ID_PREFIX}b{}-s{}",
+            state.backend_id, state.session_id
+        );
         return if state.diff_viewers.contains(&id) {
             vec![ActorCommand::SendLocalMessage(LocalActorMessage {
                 actor: id,
@@ -866,7 +1077,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
             })]
         } else {
             state.diff_viewers.insert(id.clone());
-            vec![start_diff_viewer(&id, state.session_id)]
+            vec![start_diff_viewer(&id, state.backend_id, state.session_id)]
         };
     }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
@@ -881,6 +1092,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
             return Vec::new();
         }
         return vec![ActorCommand::SendSessionMessage(SessionActorMessage {
+            backend_id: state.backend_id,
             session_id: state.session_id,
             actor: "init".to_string(),
             body: br#"{"kind":"create-terminal"}"#.to_vec(),
@@ -901,6 +1113,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let requested_focus = match message.action.as_str() {
+        "new" => return open_creation_backend_picker(&mut state),
         "picker" => return open_session_picker(&mut state),
         "show" => {
             state.sidebar_visible = true;
@@ -926,7 +1139,39 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     publish_layout(&state, false, requested_focus)
 }
 
-fn handle_session_message(bytes: &[u8]) -> Vec<ActorCommand> {
+fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Ok((message, consumed)) =
+        serde_json_core::from_slice::<BackendConnectionFailedMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "backend-connection-failed"
+    {
+        if let Ok(mut state) = STATE.lock() {
+            state.mode = EditMode::Search;
+            state.error = true;
+            state.status = message.message;
+            redraw_or_record_error(&mut state);
+        }
+        return Vec::new();
+    }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<BackendConnectedMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "backend-connected"
+    {
+        if let Ok(mut state) = STATE.lock() {
+            return open_directory_picker(&mut state, message.backend);
+        }
+        return Vec::new();
+    }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<BackendSessionsMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "backend-sessions"
+    {
+        if let Ok(mut state) = STATE.lock() {
+            apply_backend_sessions(&mut state, message);
+            redraw_or_record_error(&mut state);
+        }
+        return Vec::new();
+    }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<AgentRegistryMessage>(bytes)
         && consumed == bytes.len()
         && message.kind.as_str() == "registry"
@@ -934,7 +1179,9 @@ fn handle_session_message(bytes: &[u8]) -> Vec<ActorCommand> {
         let Ok(mut state) = STATE.lock() else {
             return Vec::new();
         };
-        if message.session_id != state.session_id {
+        if message.session_id != state.session_id
+            || backend_from_sender(sender) != Some(state.backend_id)
+        {
             return Vec::new();
         }
         state.agents = message.agents;
@@ -943,10 +1190,10 @@ fn handle_session_message(bytes: &[u8]) -> Vec<ActorCommand> {
         }
         return Vec::new();
     }
-    handle_terminal_lifecycle(bytes)
+    handle_terminal_lifecycle(sender, bytes)
 }
 
-fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
+fn handle_terminal_lifecycle(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalLifecycleMessage>(bytes)
     else {
         return Vec::new();
@@ -968,14 +1215,26 @@ fn handle_terminal_lifecycle(bytes: &[u8]) -> Vec<ActorCommand> {
     } else {
         message.session_id
     };
-    let id = format!("terminal-ui-s{session_id}-{suffix}");
-    state.terminal_uis.insert(id.clone(), session_id);
+    let backend_id = backend_from_sender(sender).unwrap_or(state.backend_id);
+    let id = format!("terminal-ui-b{backend_id}-s{session_id}-{suffix}");
+    state
+        .terminal_uis
+        .insert(id.clone(), (backend_id, session_id));
     vec![ActorCommand::StartActor(ActorStartRequest {
         id,
         path: TERMINAL_UI_COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
+        backend_id: Some(backend_id),
         session_id: Some(session_id),
     })]
+}
+
+fn backend_from_sender(sender: &str) -> Option<u64> {
+    let mut parts = sender.split(':');
+    match parts.next()? {
+        "session" | "daemon" => parts.next()?.parse().ok(),
+        _ => None,
+    }
 }
 
 fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -1052,13 +1311,62 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
         return Vec::new();
     };
     if let Some(session) = message.result.value.session {
+        let backend = message.result.value.backend.unwrap_or_default();
         let request = state.next_request();
-        return vec![session_command(
+        return vec![backend_session_command(
             request,
-            SessionOperation::Activate,
+            backend,
+            "activate",
             Some(session),
             None,
+            None,
         )];
+    }
+    if let Some(action) = message.result.value.action {
+        match action.as_str() {
+            "choose-directory" => {
+                if let Some(backend) = message.result.value.backend {
+                    return open_directory_picker(&mut state, backend);
+                }
+            }
+            "create-directory" => {
+                let Some(backend) = message.result.value.backend else {
+                    return Vec::new();
+                };
+                let Some(directory) = message.result.value.directory else {
+                    return Vec::new();
+                };
+                let request = state.next_request();
+                let name = directory
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string);
+                return vec![backend_session_command(
+                    request,
+                    backend,
+                    "create",
+                    None,
+                    name,
+                    Some(directory),
+                )];
+            }
+            "create-local" => {
+                state.status = "Starting local backend…".to_string();
+                return vec![ActorCommand::SendHostMessage(
+                    br#"{"type":"create-local-backend"}"#.to_vec(),
+                )];
+            }
+            "create-remote" => {
+                state.query.clear();
+                state.mode = EditMode::ConnectRemote;
+                state.status = "Remote address (host:port): Enter to connect".to_string();
+                redraw_or_record_error(&mut state);
+                return Vec::new();
+            }
+            _ => {}
+        }
     }
     let Some(agent) = message.result.value.agent else {
         return Vec::new();
@@ -1069,12 +1377,16 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let id = format!(
-        "coding-agent-ui-s{}-{}",
-        state.session_id, state.next_coding_agent_ui
+        "coding-agent-ui-b{}-s{}-{}",
+        state.backend_id, state.session_id, state.next_coding_agent_ui
     );
     state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
     state.coding_agent_targets.insert(id.clone(), agent);
-    vec![start_coding_agent_ui(&id, state.session_id)]
+    vec![start_coding_agent_ui(
+        &id,
+        state.backend_id,
+        state.session_id,
+    )]
 }
 
 fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
@@ -1082,14 +1394,17 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
         .sessions
         .iter()
         .map(|session| SessionPickerItem {
-            label: &session.name,
+            label: session.name.clone(),
             detail: if session.windows == 1 {
                 "1 window".to_string()
             } else {
                 format!("{} windows", session.windows)
             },
             value: SessionPickerValueWire {
-                session: session.id,
+                backend: Some(session.backend),
+                session: Some(session.id),
+                action: None,
+                directory: None,
             },
         })
         .collect::<Vec<_>>();
@@ -1102,6 +1417,111 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     let Ok(body) = serde_json::to_vec(&request) else {
         state.error = true;
         state.status = "Could not encode the session picker".to_string();
+        redraw_or_record_error(state);
+        return Vec::new();
+    };
+    vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body,
+    })]
+}
+
+fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    let mut items = state
+        .sessions
+        .iter()
+        .map(|session| session.backend)
+        .collect::<Vec<_>>();
+    items.sort_unstable();
+    items.dedup();
+    let mut picker_items = Vec::new();
+    for backend in items {
+        let label = format!("Backend {backend}");
+        picker_items.push(SessionPickerItem {
+            label,
+            detail: "Create a session on this backend".to_string(),
+            value: SessionPickerValueWire {
+                backend: Some(backend),
+                session: None,
+                action: Some("choose-directory".to_string()),
+                directory: None,
+            },
+        });
+    }
+    if state.can_create_local {
+        picker_items.push(SessionPickerItem {
+            label: "Create local backend".to_string(),
+            detail: "Start another local session server".to_string(),
+            value: SessionPickerValueWire {
+                backend: None,
+                session: None,
+                action: Some("create-local".to_string()),
+                directory: None,
+            },
+        });
+    }
+    if state.can_connect_remote {
+        picker_items.push(SessionPickerItem {
+            label: "Connect remote backend".to_string(),
+            detail: "Connect another backend by address".to_string(),
+            value: SessionPickerValueWire {
+                backend: None,
+                session: None,
+                action: Some("create-remote".to_string()),
+                directory: None,
+            },
+        });
+    }
+    let request = SessionPickerRequest {
+        message_type: "picker-create",
+        title: "Choose backend",
+        placeholder: "Fuzzy-match a backend or create a connection…",
+        items: picker_items,
+    };
+    let Ok(body) = serde_json::to_vec(&request) else {
+        state.error = true;
+        state.status = "Could not encode the backend picker".to_string();
+        redraw_or_record_error(state);
+        return Vec::new();
+    };
+    vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body,
+    })]
+}
+
+fn open_directory_picker(state: &mut SwitcherState, backend: u64) -> Vec<ActorCommand> {
+    let mut directories = state
+        .sessions
+        .iter()
+        .filter(|session| session.backend == backend)
+        .filter_map(|session| session.working_directory.clone())
+        .collect::<Vec<_>>();
+    directories.push("/".to_string());
+    directories.sort();
+    directories.dedup();
+    let items = directories
+        .into_iter()
+        .map(|directory| SessionPickerItem {
+            label: directory.clone(),
+            detail: "Create a new session here".to_string(),
+            value: SessionPickerValueWire {
+                backend: Some(backend),
+                session: None,
+                action: Some("create-directory".to_string()),
+                directory: Some(directory),
+            },
+        })
+        .collect();
+    let request = SessionPickerRequest {
+        message_type: "picker-create",
+        title: "Choose directory",
+        placeholder: "Fuzzy-match a directory…",
+        items,
+    };
+    let Ok(body) = serde_json::to_vec(&request) else {
+        state.error = true;
+        state.status = "Could not encode the directory picker".to_string();
         redraw_or_record_error(state);
         return Vec::new();
     };
@@ -1139,7 +1559,7 @@ fn open_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     })]
 }
 
-fn start_diff_viewer(id: &str, session_id: u64) -> ActorCommand {
+fn start_diff_viewer(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
         id: id.to_string(),
         path: DIFF_VIEWER_COMPONENT_FILE.to_string(),
@@ -1147,51 +1567,90 @@ fn start_diff_viewer(id: &str, session_id: u64) -> ActorCommand {
             "filesystem:workspace-read".to_string(),
             "subprocess:git".to_string(),
         ],
+        backend_id: Some(backend_id),
         session_id: Some(session_id),
     })
 }
 
-fn start_coding_agent_ui(id: &str, session_id: u64) -> ActorCommand {
+fn start_coding_agent_ui(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
     ActorCommand::StartActor(ActorStartRequest {
         id: id.to_string(),
         path: CODING_AGENT_COMPONENT_FILE.to_string(),
         capabilities: Vec::new(),
+        backend_id: Some(backend_id),
         session_id: Some(session_id),
     })
 }
 
-fn bind_coding_agent_ui(id: &str, session_id: u64, agent: Option<&str>) -> ActorCommand {
+fn bind_coding_agent_ui(
+    id: &str,
+    backend_id: u64,
+    session_id: u64,
+    agent: Option<&str>,
+) -> ActorCommand {
     ActorCommand::SendLocalMessage(LocalActorMessage {
         actor: id.to_string(),
         body: format!(
-            r#"{{"kind":"bind","session_id":{session_id},"agent":"{}"}}"#,
+            r#"{{"kind":"bind","backend_id":{backend_id},"session_id":{session_id},"agent":"{}"}}"#,
             agent.unwrap_or_default()
         )
         .into_bytes(),
     })
 }
 
-fn subscribe_agent_registry(session_id: u64) -> ActorCommand {
+fn subscribe_agent_registry(backend_id: u64, session_id: u64) -> ActorCommand {
     ActorCommand::SendSessionMessage(SessionActorMessage {
+        backend_id,
         session_id,
         actor: "init".to_string(),
         body: br#"{"kind":"registry-subscribe"}"#.to_vec(),
     })
 }
 
-fn actor_session(actor: &str) -> Option<u64> {
-    actor
-        .split("-s")
-        .nth(1)
-        .and_then(|suffix| suffix.split('-').next())
-        .and_then(|session| session.parse().ok())
+fn ensure_default_terminal_ui(
+    state: &mut SwitcherState,
+    backend_id: u64,
+    session_id: u64,
+) -> Option<ActorCommand> {
+    if backend_id == 0
+        || session_id == 0
+        || state
+            .terminal_uis
+            .values()
+            .any(|realm| *realm == (backend_id, session_id))
+    {
+        return None;
+    }
+    let id = if state.terminal_uis.is_empty() {
+        TERMINAL_UI_ID.to_string()
+    } else {
+        format!("terminal-ui-b{backend_id}-s{session_id}")
+    };
+    state
+        .terminal_uis
+        .insert(id.clone(), (backend_id, session_id));
+    Some(ActorCommand::StartActor(ActorStartRequest {
+        id,
+        path: TERMINAL_UI_COMPONENT_FILE.to_string(),
+        capabilities: Vec::new(),
+        backend_id: Some(backend_id),
+        session_id: Some(session_id),
+    }))
 }
 
-fn stop_terminal_command(session_id: u64, ui_actor: &str) -> Option<ActorCommand> {
-    let terminal = if ui_actor == TERMINAL_UI_ID {
+fn actor_realm(actor: &str) -> Option<(u64, u64)> {
+    let backend = actor.split("-b").nth(1)?.split('-').next()?.parse().ok()?;
+    let session = actor.split("-s").nth(1)?.split('-').next()?.parse().ok()?;
+    Some((backend, session))
+}
+
+fn stop_terminal_command(backend_id: u64, session_id: u64, ui_actor: &str) -> Option<ActorCommand> {
+    let terminal = if ui_actor == TERMINAL_UI_ID
+        || ui_actor == format!("terminal-ui-b{backend_id}-s{session_id}")
+    {
         "terminal-session".to_string()
     } else {
-        let suffix = ui_actor.strip_prefix("terminal-ui-s")?.split_once('-')?.1;
+        let suffix = ui_actor.splitn(5, '-').nth(4)?;
         format!("terminal-session-{suffix}")
     };
     let body = serde_json::to_vec(&serde_json::json!({
@@ -1200,6 +1659,7 @@ fn stop_terminal_command(session_id: u64, ui_actor: &str) -> Option<ActorCommand
     }))
     .ok()?;
     Some(ActorCommand::SendSessionMessage(SessionActorMessage {
+        backend_id,
         session_id,
         actor: "init".to_string(),
         body,
@@ -1314,7 +1774,7 @@ fn handle_pointer_button(
     button: u32,
 ) -> Vec<ActorCommand> {
     if y < 96.0 && x >= state.width - 76.0 && button == LEFT_BUTTON {
-        return submit(state);
+        return open_creation_backend_picker(state);
     }
     if y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
         return Vec::new();
@@ -1336,8 +1796,11 @@ fn handle_pointer_button(
         }
         if x >= state.width - 48.0 && project.git {
             begin_worktree(state, &project);
-        } else if !state.collapsed_projects.remove(&project.id) {
-            state.collapsed_projects.insert(project.id);
+        } else {
+            let project_key = format!("{}:{}", project.backend, project.id);
+            if !state.collapsed_projects.remove(&project_key) {
+                state.collapsed_projects.insert(project_key);
+            }
             state.scroll = state.scroll.min(state.list_items().len().saturating_sub(1));
         }
         state.ensure_selected_visible();
@@ -1347,7 +1810,7 @@ fn handle_pointer_button(
         return Vec::new();
     };
     let session = state.sessions[index].clone();
-    state.selected = Some(session.id);
+    state.selected = Some((session.backend, session.id));
     if button == RIGHT_BUTTON {
         begin_rename(state, &session);
         return Vec::new();
@@ -1359,10 +1822,12 @@ fn handle_pointer_button(
         return close_selected(state);
     }
     let request = state.next_request();
-    vec![session_command(
+    vec![backend_session_command(
         request,
-        SessionOperation::Activate,
+        session.backend,
+        "activate",
         Some(session.id),
+        None,
         None,
     )]
 }
@@ -1409,7 +1874,8 @@ fn handle_key(state: &mut SwitcherState, logical_key: &str) -> Vec<ActorCommand>
 }
 
 fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
-    if let EditMode::Rename(session) = &state.mode {
+    if let EditMode::Rename(backend, session) = &state.mode {
+        let backend = *backend;
         let session = *session;
         let name = state.query.trim().to_string();
         if name.is_empty() {
@@ -1418,14 +1884,17 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
             return Vec::new();
         }
         let request = state.next_request();
-        return vec![session_command(
+        return vec![backend_session_command(
             request,
-            SessionOperation::Rename,
+            backend,
+            "rename",
             Some(session),
             Some(name),
+            None,
         )];
     }
-    if let EditMode::CreateWorktree(session) = &state.mode {
+    if let EditMode::CreateWorktree(backend, session) = &state.mode {
+        let backend = *backend;
         let session = *session;
         let branch = state.query.trim().to_string();
         if branch.is_empty() {
@@ -1446,26 +1915,43 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
             return Vec::new();
         };
         return vec![ActorCommand::SendDaemonMessage(DaemonActorMessage {
+            backend_id: backend,
             actor: "init".to_string(),
             body,
         })];
+    }
+    if state.mode == EditMode::ConnectRemote {
+        let address = state.query.trim().to_string();
+        if address.is_empty() {
+            state.error = true;
+            state.status = "Enter a remote host and port".to_string();
+            return Vec::new();
+        }
+        state.next_request();
+        return vec![ActorCommand::SendHostMessage(
+            format!("{{\"type\":\"connect-remote-backend\",\"address\":{address:?}}}").into_bytes(),
+        )];
     }
     let visible_sessions = state
         .list_items()
         .into_iter()
         .filter_map(|item| match item {
             ListItem::Project(_) => None,
-            ListItem::Session(index) => Some(state.sessions[index].id),
+            ListItem::Session(index) => {
+                Some((state.sessions[index].backend, state.sessions[index].id))
+            }
         })
         .collect::<Vec<_>>();
     if let Some(selected) = state.selected
         && visible_sessions.contains(&selected)
     {
         let request = state.next_request();
-        return vec![session_command(
+        return vec![backend_session_command(
             request,
-            SessionOperation::Activate,
-            Some(selected),
+            selected.0,
+            "activate",
+            Some(selected.1),
+            None,
             None,
         )];
     }
@@ -1480,16 +1966,26 @@ fn create_from_query(state: &mut SwitcherState) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let request = state.next_request();
-    vec![session_command(
+    let backend = state
+        .selected_session()
+        .map_or(state.backend_id, |session| session.backend);
+    if backend == 0 {
+        state.error = true;
+        state.status = "No backend is available for the new session".to_string();
+        return Vec::new();
+    }
+    vec![backend_session_command(
         request,
-        SessionOperation::Create,
+        backend,
+        "create",
         None,
         Some(name),
+        None,
     )]
 }
 
 fn close_selected(state: &mut SwitcherState) -> Vec<ActorCommand> {
-    let Some(session) = state.selected else {
+    let Some((backend, session)) = state.selected else {
         return Vec::new();
     };
     if state.sessions.len() <= 1 {
@@ -1498,23 +1994,25 @@ fn close_selected(state: &mut SwitcherState) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let request = state.next_request();
-    vec![session_command(
+    vec![backend_session_command(
         request,
-        SessionOperation::Close,
+        backend,
+        "close",
         Some(session),
+        None,
         None,
     )]
 }
 
 fn begin_rename(state: &mut SwitcherState, session: &ViewSession) {
-    state.mode = EditMode::Rename(session.id);
+    state.mode = EditMode::Rename(session.backend, session.id);
     state.query.clone_from(&session.name);
     state.status = "Rename: Enter to save, Escape to cancel".to_string();
     state.error = false;
 }
 
 fn begin_worktree(state: &mut SwitcherState, project: &ProjectGroup) {
-    state.mode = EditMode::CreateWorktree(project.source_session);
+    state.mode = EditMode::CreateWorktree(project.backend, project.source_session);
     state.query.clear();
     state.status = format!("New branch in {}: Enter to create", project.name);
     state.error = false;
@@ -1536,9 +2034,9 @@ fn move_selection(state: &mut SwitcherState, delta: isize) {
     let current = state
         .selected
         .and_then(|selected| {
-            visible
-                .iter()
-                .position(|index| state.sessions[*index].id == selected)
+            visible.iter().position(|index| {
+                (state.sessions[*index].backend, state.sessions[*index].id) == selected
+            })
         })
         .unwrap_or(0);
     let next = if delta < 0 {
@@ -1546,29 +2044,55 @@ fn move_selection(state: &mut SwitcherState, delta: isize) {
     } else {
         (current + delta as usize).min(visible.len() - 1)
     };
-    state.selected = Some(state.sessions[visible[next]].id);
+    state.selected = Some((
+        state.sessions[visible[next]].backend,
+        state.sessions[visible[next]].id,
+    ));
     state.ensure_selected_visible();
 }
 
 fn select_first_filtered(state: &mut SwitcherState) {
     state.selected = state.list_items().into_iter().find_map(|item| match item {
         ListItem::Project(_) => None,
-        ListItem::Session(index) => Some(state.sessions[index].id),
+        ListItem::Session(index) => Some((state.sessions[index].backend, state.sessions[index].id)),
     });
 }
 
 fn session_command(
+    backend_id: u64,
     request: u64,
     operation: SessionOperation,
     session: Option<u64>,
     name: Option<String>,
+    directory: Option<String>,
 ) -> ActorCommand {
     ActorCommand::SessionCommand(SessionCommand {
+        backend_id,
         request,
         operation,
         session,
         name,
+        directory,
     })
+}
+
+fn backend_session_command(
+    request: u64,
+    backend: u64,
+    operation: &str,
+    session: Option<u64>,
+    name: Option<String>,
+    directory: Option<String>,
+) -> ActorCommand {
+    let operation = match operation {
+        "refresh" => SessionOperation::Refresh,
+        "activate" => SessionOperation::Activate,
+        "create" => SessionOperation::Create,
+        "rename" => SessionOperation::Rename,
+        "close" => SessionOperation::Close,
+        _ => return ActorCommand::LifecycleComplete(Err("unknown session operation".to_string())),
+    };
+    session_command(backend, request, operation, session, name, directory)
 }
 
 fn redraw_or_record_error(state: &mut SwitcherState) {
@@ -1622,8 +2146,9 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
     let prompt = if state.query.is_empty() {
         match &state.mode {
             EditMode::Search => "Search or create…".to_string(),
-            EditMode::Rename(_) => "New session name…".to_string(),
-            EditMode::CreateWorktree(_) => "Branch name…".to_string(),
+            EditMode::Rename(..) => "New session name…".to_string(),
+            EditMode::CreateWorktree(..) => "Branch name…".to_string(),
+            EditMode::ConnectRemote => "host:port…".to_string(),
         }
     } else {
         format!("{}▏", state.query)
@@ -1684,7 +2209,9 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                     rect: Rect::new(0.0, y, state.width, PROJECT_ROW_HEIGHT),
                     color: PANEL_DARK,
                 });
-                let collapsed = state.collapsed_projects.contains(&project.id);
+                let collapsed = state
+                    .collapsed_projects
+                    .contains(&format!("{}:{}", project.backend, project.id));
                 add_text(
                     state,
                     &mut packet,
@@ -1734,7 +2261,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             }
             ListItem::Session(index) => {
                 let session = state.sessions[*index].clone();
-                let selected = state.selected == Some(session.id);
+                let selected = state.selected == Some((session.backend, session.id));
                 if session.active || selected {
                     packet.push(Command::FillRoundedRect {
                         rect: Rect::new(
@@ -1920,3 +2447,25 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 export!(SessionSwitcher with_types_in self);
+
+#[cfg(test)]
+mod tests {
+    use super::{ActorCommand, SwitcherState, ensure_default_terminal_ui};
+
+    #[test]
+    fn each_backend_active_session_gets_one_default_terminal_frontend() {
+        let mut state = SwitcherState::new();
+        let Some(ActorCommand::StartActor(first)) = ensure_default_terminal_ui(&mut state, 1, 7)
+        else {
+            panic!("first backend did not start a terminal frontend");
+        };
+        assert_eq!(first.id, "terminal-ui");
+
+        let Some(ActorCommand::StartActor(second)) = ensure_default_terminal_ui(&mut state, 2, 7)
+        else {
+            panic!("second backend did not start a terminal frontend");
+        };
+        assert_eq!(second.id, "terminal-ui-b2-s7");
+        assert!(ensure_default_terminal_ui(&mut state, 2, 7).is_none());
+    }
+}

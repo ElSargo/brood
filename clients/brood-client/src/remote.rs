@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_protocol::{
-    ActorMessage, ArtifactMessage, ArtifactRealm, BackendOperation, BackendRequest,
+    ActorMessage, ArtifactMessage, ArtifactRealm, BackendId, BackendOperation, BackendRequest,
     BackendResponseValue, ClientLifecycle, ClientMessage, EndpointCapabilities, FramePixelFormat,
     FrameScene, InputEvent, Lane, ServerMessage,
 };
@@ -37,7 +37,9 @@ const INPUT_CAPACITY: usize = 512;
 const RELIABLE_CAPACITY: usize = 128;
 const MAX_PENDING_SCENES: usize = 4;
 
+#[derive(Clone)]
 pub struct RemoteConfig {
+    pub backend: BackendId,
     pub connect: SocketAddr,
     pub server_name: String,
     pub server_certificate: PathBuf,
@@ -49,6 +51,7 @@ pub struct RemoteConfig {
 }
 
 pub struct RemoteConnection {
+    pub backend: BackendId,
     pub profile: brood_protocol::TransportProfile,
     pub generation: u64,
     input: Option<RemoteInputLane>,
@@ -60,10 +63,13 @@ pub struct RemoteConnection {
 
 impl RemoteConnection {
     pub fn start(config: RemoteConfig, proxy: &EventLoopProxy<ClientEvent>) -> Result<Self> {
+        let configured_backend = config.backend;
         let (input_sender, input_receiver) = tokio_mpsc::channel(INPUT_CAPACITY);
         let (reliable_sender, reliable_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker_proxy = proxy.clone();
+        let established = Arc::new(AtomicBool::new(false));
+        let worker_established = Arc::clone(&established);
         let worker = thread::Builder::new()
             .name("brood-network-transport".to_string())
             .spawn(move || {
@@ -78,11 +84,15 @@ impl RemoteConnection {
                     input_receiver,
                     reliable_receiver,
                     ready_sender,
+                    worker_established,
                 ));
-                if let Err(error) = &result {
-                    let _send_result = worker_proxy.send_event(ClientEvent::TransportError(
-                        format!("remote presentation transport stopped: {error:#}"),
-                    ));
+                if let Err(error) = &result
+                    && established.load(Ordering::Acquire)
+                {
+                    let _send_result = worker_proxy.send_event(ClientEvent::BackendDisconnected {
+                        backend: configured_backend,
+                        message: format!("remote presentation transport stopped: {error:#}"),
+                    });
                 }
                 result
             })
@@ -91,6 +101,7 @@ impl RemoteConnection {
             .recv()
             .context("remote presentation worker stopped before handshake")??;
         Ok(Self {
+            backend: ready.backend,
             profile: ready.profile,
             generation: ready.generation,
             input: Some(RemoteInputLane::new(input_sender.clone())),
@@ -135,9 +146,19 @@ impl RemoteConnection {
         }
         Ok(())
     }
+
+    pub fn reap(&mut self) -> Result<()> {
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_panic| anyhow!("remote presentation worker panicked"))??;
+        }
+        Ok(())
+    }
 }
 
 struct RemoteReady {
+    backend: BackendId,
     profile: brood_protocol::TransportProfile,
     generation: u64,
 }
@@ -148,6 +169,7 @@ async fn run_connection(
     input_receiver: tokio_mpsc::Receiver<ClientMessage>,
     reliable_receiver: tokio_mpsc::Receiver<ReliableCommand>,
     ready_sender: mpsc::SyncSender<Result<RemoteReady>>,
+    established: Arc<AtomicBool>,
 ) -> Result<()> {
     let result = connect_and_split(&config).await;
     let (endpoint, mut network) = match result {
@@ -159,6 +181,7 @@ async fn run_connection(
         }
     };
     let profile = network.profile;
+    let backend = network.backend;
     let generation = network.connection_generation;
     let (critical_send, critical_receive) = network.take_lane(Lane::Critical)?.split();
     let (reliable_send, reliable_receive) = network.take_lane(Lane::Reliable)?.split();
@@ -167,10 +190,12 @@ async fn run_connection(
     let (_frame_send, frame_receive) = network.take_lane(Lane::FrameResource)?.split();
     ready_sender
         .send(Ok(RemoteReady {
+            backend,
             profile,
             generation,
         }))
         .map_err(|_error| anyhow!("remote presentation startup receiver stopped"))?;
+    established.store(true, Ordering::Release);
 
     let disconnect_acknowledged = Arc::new(tokio::sync::Notify::new());
     let mut input_task = tokio::spawn(send_input_messages(
@@ -189,8 +214,14 @@ async fn run_connection(
         reliable_receive,
         reliable_receiver,
         proxy.clone(),
+        backend,
     ));
-    let mut frame_task = tokio::spawn(receive_scenes(latest_receive, frame_receive, proxy.clone()));
+    let mut frame_task = tokio::spawn(receive_scenes(
+        latest_receive,
+        frame_receive,
+        proxy.clone(),
+        backend,
+    ));
     let artifact_exchange = ArtifactExchange::new(
         ArtifactRealm::Client,
         config.allowed_client_artifacts,
@@ -250,6 +281,7 @@ async fn connect_and_split(
         &endpoint,
         config.connect,
         &config.server_name,
+        config.backend,
         EndpointCapabilities::remote(),
     )
     .await?;
@@ -347,6 +379,7 @@ async fn exchange_reliable_messages(
     receive: NetworkReceiveLane,
     mut outbound: tokio_mpsc::Receiver<ReliableCommand>,
     proxy: EventLoopProxy<ClientEvent>,
+    backend: BackendId,
 ) -> Result<()> {
     let (incoming_sender, mut incoming) = tokio_mpsc::channel(32);
     let receive_task = tokio::spawn(receive_reliable_messages(receive, incoming_sender));
@@ -380,7 +413,7 @@ async fn exchange_reliable_messages(
                 let Some(message) = message else {
                     break Err(anyhow!("remote reliable receive task stopped"));
                 };
-                handle_reliable_message(message?, &mut pending, &proxy)?;
+        handle_reliable_message(message?, &mut pending, &proxy, backend)?;
             }
         }
     };
@@ -408,9 +441,14 @@ fn handle_reliable_message(
     message: ServerMessage,
     pending: &mut HashMap<u64, PendingBackend>,
     proxy: &EventLoopProxy<ClientEvent>,
+    backend: BackendId,
 ) -> Result<()> {
     let event = match message {
         ServerMessage::Catalog(catalog) => {
+            ensure!(
+                catalog.backend == backend,
+                "remote catalog backend identity does not match its connection"
+            );
             let sessions = catalog
                 .sessions
                 .into_iter()
@@ -438,7 +476,9 @@ fn handle_reliable_message(
                 })
                 .collect();
             ClientEvent::BackendSnapshot {
+                backend,
                 session: Some(SessionSnapshot {
+                    backend_id: backend.0,
                     revision: catalog.revision,
                     active: catalog.active_session,
                     sessions,
@@ -448,6 +488,7 @@ fn handle_reliable_message(
             }
         }
         ServerMessage::Actor(message) => ClientEvent::BackendActorMessage {
+            backend,
             realm: message.realm,
             sender: message.sender,
             recipient: message.recipient,
@@ -487,6 +528,7 @@ fn handle_reliable_message(
                     ClientEvent::SessionCommandCompleted {
                         actor_id,
                         completion: SessionCommandCompletion {
+                            backend_id: backend.0,
                             request: request.request,
                             operation: request.operation,
                             success,
@@ -579,6 +621,7 @@ async fn receive_scenes(
     latest: NetworkReceiveLane,
     frames: NetworkReceiveLane,
     proxy: EventLoopProxy<ClientEvent>,
+    backend: BackendId,
 ) -> Result<()> {
     let (sender, mut events) = tokio_mpsc::channel(16);
     let scene_task = tokio::spawn(receive_scene_messages(latest, sender.clone()));
@@ -604,7 +647,7 @@ async fn receive_scenes(
                 pending_frames.insert((frame.sequence, frame.resource), frame);
             }
         }
-        publish_ready_scenes(&mut pending_scenes, &mut pending_frames, &proxy)?;
+        publish_ready_scenes(&mut pending_scenes, &mut pending_frames, &proxy, backend)?;
     };
     scene_task.abort();
     frame_task.abort();
@@ -655,6 +698,7 @@ fn publish_ready_scenes(
     scenes: &mut BTreeMap<u64, FrameScene>,
     frames: &mut HashMap<(u64, u64), NetworkFramePacket>,
     proxy: &EventLoopProxy<ClientEvent>,
+    backend: BackendId,
 ) -> Result<()> {
     loop {
         let Some((&sequence, scene)) = scenes.first_key_value() else {
@@ -670,6 +714,10 @@ fn publish_ready_scenes(
         let scene = scenes
             .remove(&sequence)
             .context("ready remote scene disappeared")?;
+        ensure!(
+            scene.backend == backend,
+            "remote scene backend identity does not match its connection"
+        );
         let mut windows = Vec::with_capacity(scene.windows.len());
         for window in scene.windows {
             let resource = window.resource.id();
@@ -684,6 +732,7 @@ fn publish_ready_scenes(
             );
             let pixels = packet.pixels()?;
             windows.push(SceneWindowUpdate {
+                backend,
                 window_id: window.pane,
                 resource_id: resource,
                 rect: window.source,
@@ -701,6 +750,7 @@ fn publish_ready_scenes(
         }
         proxy
             .send_event(ClientEvent::SceneFrame {
+                backend,
                 sequence,
                 width: scene.extent[0],
                 height: scene.extent[1],
@@ -727,6 +777,7 @@ pub struct RemoteInputLane {
     deferred: VecDeque<ClientMessage>,
     deferred_high_water: usize,
     coalesced_motion: u64,
+    pane_routes: BTreeMap<u64, u64>,
 }
 
 impl RemoteInputLane {
@@ -736,7 +787,16 @@ impl RemoteInputLane {
             deferred: VecDeque::new(),
             deferred_high_water: 0,
             coalesced_motion: 0,
+            pane_routes: BTreeMap::new(),
         }
+    }
+
+    pub fn set_pane_routes(&mut self, routes: impl IntoIterator<Item = (u64, u64)>) {
+        self.pane_routes = routes.into_iter().collect();
+    }
+
+    pub fn pane_routes(&self) -> BTreeMap<u64, u64> {
+        self.pane_routes.clone()
     }
 
     pub fn send(&mut self, message: ClientMessage) -> bool {
@@ -905,6 +965,7 @@ impl RemoteBackendCommandLane {
                 operation,
                 session: command.request.session,
                 name: command.request.name.clone(),
+                directory: command.request.directory.clone(),
             },
             PendingBackend::Session {
                 actor_id: command.actor_id,

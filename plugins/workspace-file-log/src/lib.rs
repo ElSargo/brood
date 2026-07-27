@@ -1063,11 +1063,7 @@ pub extern "C" fn actor_error(_unused: u32) -> u32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn brood_worker_reserve_v1(
-    stack_bytes: u32,
-    tls_bytes: u32,
-    tls_align: u32,
-) -> u64 {
+pub extern "C" fn brood_worker_reserve_v1(stack_bytes: u32, tls_bytes: u32, tls_align: u32) -> u64 {
     let Some(layout) = worker_layout(stack_bytes, tls_bytes, tls_align) else {
         return 0;
     };

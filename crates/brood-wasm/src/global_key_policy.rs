@@ -69,6 +69,18 @@ pub enum HostMessage {
     },
     SwitchActiveSessionNext,
     CreateAndAttachSession,
+    BackendSession {
+        backend: u64,
+        request: u64,
+        operation: String,
+        session: Option<u64>,
+        name: Option<String>,
+        directory: Option<String>,
+    },
+    ConnectRemoteBackend {
+        address: String,
+    },
+    CreateLocalBackend,
     ToggleShortcutPassthrough,
     SetShortcutPassthrough {
         enabled: bool,

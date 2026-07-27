@@ -28,6 +28,14 @@ workloads and retains initial and reconnected client frames:
 nix run .#software-e2e-capture -- --out-dir /tmp/brood-software-e2e
 ```
 
+`brood test ssh USER@HOST` builds and deploys the current source to an SSH
+host, then starts one offscreen presentation connected to both that remote
+backend and an ordinary local backend. The proof requires realm-qualified
+actor traffic and a default terminal frontend from both backends, captures the
+combined presentation, and verifies that closing it also stops the remote
+session. Use `--connect-host` when QUIC should use a different address from the
+SSH destination.
+
 These are the retained acceptance paths because they exercise current,
 externally visible behavior through a real presentation client. Presentation
 proofs use frontend-owned layout state, real input, and client capture. Server

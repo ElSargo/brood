@@ -276,12 +276,13 @@ carry sender, target, slot, generation, and causal identity. Workers report
 through their owning actor rather than adding another public addressing layer.
 
 Cross-placement delivery is bidirectional, addressed by realm, and
-connection-scoped. A presentation actor may address either the daemon realm or
-a session realm. A session-associated presentation actor may address its own
-session; a presentation-global actor may address a known session when its
-application protocol requires it. Daemon and session actors may reply to a
-presentation actor on the subscribed connection. The transport authenticates
-the source placement and never infers a realm from an actor name.
+connection-scoped. A presentation actor addresses a backend-qualified daemon
+realm or session realm. A session-associated presentation actor may address
+only its own backend and session; a presentation-global actor may address a
+known backend realm when its application protocol requires it. Daemon and
+session actors may reply to a presentation actor on the subscribed connection.
+The transport authenticates the source placement and never infers a backend or
+realm from an actor name.
 
 Disconnecting a presentation removes its return route without changing a
 daemon or session actor's identity or lifecycle. Subscription, replay,

@@ -581,12 +581,6 @@ pub fn connect_or_spawn(target: &ControlTarget, launch: &ServerLaunch) -> Result
     if let Ok(handshake) = handshake(target) {
         return Ok(handshake);
     }
-    ensure!(
-        target.destination == DEFAULT_BROOD_DBUS_NAME && target.address.is_none(),
-        "cannot auto-start a server for non-default DBus target {}",
-        target.destination
-    );
-
     let (log_path, mut child) = spawn_server(target, launch)?;
     for _ in 0..SERVER_START_ATTEMPTS {
         if let Ok(handshake) = handshake(target) {

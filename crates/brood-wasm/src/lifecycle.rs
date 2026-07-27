@@ -25,6 +25,7 @@ pub struct PluginStartContext {
     pub instance_id: String,
     pub generation: u64,
     pub reason: PluginStartReason,
+    pub backend_id: Option<u64>,
     pub session_id: Option<u64>,
     pub workspace_root: String,
     pub data: Vec<PluginLifecycleEntry>,

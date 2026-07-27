@@ -774,7 +774,7 @@ capture "$OUT/terminal-shell-exited.png"
 
 SPAWN_STARTED_MS="$(date +%s%3N)"
 wayland_env "$OUT/virtual-keyboard-key" 20
-DYNAMIC_UI="terminal-ui-s1-2"
+DYNAMIC_UI="terminal-ui-b1-s1-2"
 for _ in $(seq 1 300); do
   STATUS_SPAWNED="$(ctl status-json)"
   DYNAMIC_METRIC="$(last_actor_metric "$CLIENT2_LOG" "$DYNAMIC_UI")"
@@ -959,7 +959,7 @@ jq -n \
       presentation_reconnect: true,
       ctrl_alt_t_spawn: {
         session_actor: "terminal-session-2",
-        presentation_actor: "terminal-ui-s1-2",
+        presentation_actor: "terminal-ui-b1-s1-2",
         spawn_to_present_ms: $spawn_present_ms,
         pty_bytes: $shortcut_terminal.pty_bytes,
         child_exit: $shortcut_terminal.exited
@@ -1023,7 +1023,7 @@ cat > "$OUT/proof.md" <<EOF
 - shell: real allowlisted sh PTY in $ROOT
 - terminal environment: xterm-256color with truecolor intent, rendered by guest-parsed ANSI runs
 - input: real Wayland key/text/pointer events through the focused external presentation client
-- product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-s1-2 actors, focused the new session-scoped pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
+- product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-b1-s1-2 actors, focused the new backend/session-scoped pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
 - keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
 - color policy: the controlled PTY profile removed ambient NO_COLOR, retained xterm-256color/truecolor, and rendered a real lazygit screen in terminal-lazygit-color.png
 - managed GUI descendants: the terminal shell inherited the backend Wayland socket and isolated session bus; a real Ghostty child mapped inside Brood in terminal-ghostty-managed.png instead of opening through the host Ghostty instance

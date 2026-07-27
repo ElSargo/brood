@@ -184,6 +184,7 @@ pub struct SessionSummary {
 /// Latest-state session catalogue delivered by the presentation client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSnapshot {
+    pub backend_id: u64,
     pub revision: u64,
     pub active: u64,
     pub sessions: Vec<SessionSummary>,
@@ -201,15 +202,19 @@ pub enum SessionOperation {
 /// One actor-owned request to mutate or refresh the session catalogue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionCommandRequest {
+    pub backend_id: u64,
     pub request: u64,
     pub operation: SessionOperation,
     pub session: Option<u64>,
     pub name: Option<String>,
+    /// Optional directory used by backend-qualified session creation.
+    pub directory: Option<String>,
 }
 
 /// Terminal result for a [`SessionCommandRequest`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionCommandCompletion {
+    pub backend_id: u64,
     pub request: u64,
     pub operation: SessionOperation,
     pub success: bool,

@@ -317,6 +317,7 @@ async fn relay(
         &fast_path.catalog_fd,
         fast_path.catalog_notify_fd,
         fast_path.generation,
+        network.backend,
         outbound.clone(),
     )?;
     spawn_frame_forwarder(
@@ -324,6 +325,7 @@ async fn relay(
         &fast_path.frame_fd,
         fast_path.frame_notify_fd,
         fast_path.generation,
+        network.backend,
         outbound.clone(),
     )?;
     spawn_actor_forwarder(
@@ -367,7 +369,7 @@ async fn relay(
     tokio::spawn(send_server_messages(latest_send, latest_rx));
     tokio::spawn(send_network_frames(frame_send, frame_rx));
 
-    let (disconnect_tx, disconnect_rx) = oneshot::channel();
+    let (disconnect_tx, mut disconnect_rx) = oneshot::channel();
     let critical_input_tx = local_input_tx.clone();
     let disconnect_critical_tx = critical_tx;
     tokio::spawn(async move {
@@ -408,13 +410,31 @@ async fn relay(
     ));
 
     let result = tokio::select! {
-        disconnect = disconnect_rx => {
+        disconnect = &mut disconnect_rx => {
             disconnect.context("remote client disconnected without a lifecycle message")
         }
         artifact = &mut artifact_task => {
-            match artifact.context("join remote artifact exchange")? {
-                Ok(()) => Err(anyhow!("remote artifact exchange stopped unexpectedly")),
-                Err(error) => Err(error.context("remote artifact exchange failed")),
+            let artifact = match artifact {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!(error).context("join remote artifact exchange")),
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                &mut disconnect_rx,
+            ).await {
+                Ok(disconnect) => {
+                    if let Err(error) = &artifact {
+                        eprintln!(
+                            "remote artifact lane stopped while the client disconnected: \
+                             {error:#}"
+                        );
+                    }
+                    disconnect.context("remote client disconnected without a lifecycle message")
+                }
+                Err(_elapsed) => match artifact {
+                    Ok(()) => Err(anyhow!("remote artifact exchange stopped unexpectedly")),
+                    Err(error) => Err(error.context("remote artifact exchange failed")),
+                },
             }
         }
     };
@@ -817,7 +837,8 @@ fn execute_backend_request(target: &ControlTarget, request: BackendRequest) -> B
             operation,
             session,
             name,
-        } => execute_session_operation(target, operation, session, name)
+            directory,
+        } => execute_session_operation(target, operation, session, name, directory)
             .map(BackendResponseValue::Session)
             .map_err(|error| format!("{error:#}")),
     };
@@ -832,6 +853,7 @@ fn execute_session_operation(
     operation: SessionOperation,
     session: Option<u64>,
     name: Option<String>,
+    directory: Option<String>,
 ) -> Result<Option<u64>> {
     match operation {
         SessionOperation::Refresh => Ok(None),
@@ -844,7 +866,25 @@ fn execute_session_operation(
             Ok(Some(session))
         }
         SessionOperation::Create => {
-            create_surface_session(target, name.unwrap_or_default()).map(Some)
+            if let Some(directory) = directory {
+                let mut argv = vec![
+                    "surface-session".to_string(),
+                    "dir-new".to_string(),
+                    directory,
+                    "default".to_string(),
+                ];
+                if let Some(name) = name {
+                    argv.push(name);
+                }
+                let response = request_dbus_command(target, &argv, false)?;
+                let active = response
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix("active=")?.parse().ok())
+                    .context("remote directory session creation returned no active session")?;
+                Ok(Some(active))
+            } else {
+                create_surface_session(target, name.unwrap_or_default()).map(Some)
+            }
         }
         SessionOperation::Rename => {
             let session = session.context("rename request is missing a session ID")?;
@@ -966,6 +1006,7 @@ fn spawn_catalog_forwarder(
     fd: &std::os::fd::OwnedFd,
     notify_fd: std::os::fd::OwnedFd,
     generation: u64,
+    backend: brood_protocol::BackendId,
     outbound: Outbound,
 ) -> Result<()> {
     let mut consumer = brood_ipc::CriticalConsumer::map(fd.as_fd(), generation)?;
@@ -1027,6 +1068,7 @@ fn spawn_catalog_forwarder(
                             if outbound
                                 .reliable
                                 .send(ServerMessage::Catalog(CatalogSnapshot {
+                                    backend,
                                     revision,
                                     active_session: catalog.active_session,
                                     sessions: catalog.sessions,
@@ -1051,6 +1093,7 @@ fn spawn_frame_forwarder(
     fd: &std::os::fd::OwnedFd,
     notify_fd: std::os::fd::OwnedFd,
     generation: u64,
+    backend: brood_protocol::BackendId,
     outbound: Outbound,
 ) -> Result<()> {
     let mut consumer = brood_ipc::CriticalConsumer::map(fd.as_fd(), generation)?;
@@ -1144,6 +1187,7 @@ fn spawn_frame_forwarder(
                             if outbound
                                 .latest
                                 .send(ServerMessage::Scene(FrameScene {
+                                    backend,
                                     sequence: scene.sequence,
                                     extent: scene.extent,
                                     windows,
@@ -1260,6 +1304,7 @@ async fn probe(
         &endpoint,
         connect,
         server_name,
+        brood_protocol::BackendId(1),
         EndpointCapabilities::remote(),
     )
     .await?;

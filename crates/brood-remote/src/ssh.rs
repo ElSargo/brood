@@ -82,6 +82,7 @@ pub fn deploy(args: &SshArgs) -> Result<()> {
     let client_result = Command::new(&client)
         .arg("--remote-connect")
         .arg(connect.to_string())
+        .arg("--include-local")
         .arg("--remote-server-name")
         .arg("localhost")
         .arg("--remote-server-certificate")

@@ -107,8 +107,8 @@ Presentation actors run in the client for local and remote deployments. Their
 mailbox traffic, layout updates, UI state, animations, and drawing remain local.
 Only explicitly addressed operations and daemon- or session-realm actor
 messages cross the connection. A presentation child records its optional
-session association at creation; the client does not derive ownership from the
-active session or from an actor ID.
+backend-and-session association at creation; the client does not derive
+ownership from the active session, focused backend, or actor ID.
 
 ## Connection And Lease Lifecycle
 

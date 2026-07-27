@@ -38,6 +38,7 @@ struct TerminalUi;
 
 struct UiState {
     pane: u64,
+    backend_id: u64,
     session_id: u64,
     session_actor: String,
     width: f32,
@@ -71,10 +72,11 @@ struct UiState {
 }
 
 impl UiState {
-    fn new(session_id: u64, instance_id: &str) -> Self {
+    fn new(backend_id: u64, session_id: u64, instance_id: &str) -> Self {
         let session_actor = terminal_session_actor(instance_id);
         Self {
             pane: 0,
+            backend_id,
             session_id,
             session_actor,
             width: 640.0,
@@ -120,6 +122,7 @@ impl UiState {
 
     fn session_message(&self, body: Vec<u8>) -> Command {
         Command::SendSessionMessage(SessionActorMessage {
+            backend_id: self.backend_id,
             session_id: self.session_id,
             actor: self.session_actor.clone(),
             body,
@@ -164,6 +167,15 @@ impl UiState {
 }
 
 fn terminal_session_actor(instance_id: &str) -> String {
+    if let Some(scoped) = instance_id.strip_prefix("terminal-ui-b")
+        && let Some((_backend, session_and_suffix)) = scoped.split_once('-')
+        && let Some(session_and_suffix) = session_and_suffix.strip_prefix('s')
+    {
+        return session_and_suffix.split_once('-').map_or_else(
+            || "terminal-session".to_string(),
+            |(_session, suffix)| format!("terminal-session-{suffix}"),
+        );
+    }
     if let Some(scoped) = instance_id.strip_prefix("terminal-ui-s")
         && let Some((_session, suffix)) = scoped.split_once('-')
     {
@@ -270,13 +282,18 @@ impl Guest for TerminalUi {
     fn dispatch(event: Event) -> Vec<Command> {
         match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
+                let Some(backend_id) = context.backend_id else {
+                    return vec![Command::LifecycleComplete(Err(
+                        "terminal UI requires a backend association".to_string(),
+                    ))];
+                };
                 let Some(session_id) = context.session_id else {
                     return vec![Command::LifecycleComplete(Err(
                         "terminal UI has no bound session".to_string(),
                     ))];
                 };
                 if let Ok(mut state) = STATE.lock() {
-                    *state = Some(UiState::new(session_id, &context.instance_id));
+                    *state = Some(UiState::new(backend_id, session_id, &context.instance_id));
                 }
                 vec![Command::LifecycleComplete(Ok(()))]
             }
@@ -347,9 +364,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             vec![state.resize_command()]
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
-            state.suppressed_text =
-                ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0 && key.logical_key.chars().count() == 1)
-                    .then(|| key.logical_key.clone());
+            state.suppressed_text = ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0
+                && key.logical_key.chars().count() == 1)
+                .then(|| key.logical_key.clone());
             let copy_shortcut = key.modifiers & (MOD_CTRL | MOD_SHIFT) == (MOD_CTRL | MOD_SHIFT)
                 && key.logical_key.eq_ignore_ascii_case("c");
             if copy_shortcut {
@@ -360,8 +377,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     .into_iter()
                     .collect();
             }
-            let paste_shortcut = (key.modifiers & (MOD_CTRL | MOD_SHIFT)
-                == (MOD_CTRL | MOD_SHIFT)
+            let paste_shortcut = (key.modifiers & (MOD_CTRL | MOD_SHIFT) == (MOD_CTRL | MOD_SHIFT)
                 && key.logical_key.eq_ignore_ascii_case("v"))
                 || (key.modifiers & MOD_SHIFT != 0 && key.logical_key == "Insert");
             if paste_shortcut {
@@ -432,10 +448,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .is_some_and(|snapshot| snapshot.bracketed_paste);
             state.selection = None;
             state.requested_viewport = 0;
-            vec![state.session_message(input_body(&paste_bytes(
-                &paste.text,
-                bracketed,
-            )))]
+            vec![state.session_message(input_body(&paste_bytes(&paste.text, bracketed)))]
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
             if state
@@ -549,13 +562,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 let button = if clicks > 0 { 64 } else { 65 };
                 let mut bytes = Vec::new();
                 for _ in 0..clicks.unsigned_abs().min(64) {
-                    if let Some(report) = mouse_report(
-                        point,
-                        button,
-                        true,
-                        scroll.modifiers,
-                        snapshot.mouse_sgr,
-                    ) {
+                    if let Some(report) =
+                        mouse_report(point, button, true, scroll.modifiers, snapshot.mouse_sgr)
+                    {
                         bytes.extend_from_slice(&report);
                     }
                 }
@@ -614,10 +623,10 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 fn pointer_cell(state: &UiState, x: f32, y: f32) -> CellPoint {
-    let (rows, cols) = state
-        .latest
-        .as_ref()
-        .map_or_else(|| state.grid_size(), |snapshot| (snapshot.rows, snapshot.cols));
+    let (rows, cols) = state.latest.as_ref().map_or_else(
+        || state.grid_size(),
+        |snapshot| (snapshot.rows, snapshot.cols),
+    );
     let row = ((y - PADDING) / state.line_height)
         .floor()
         .clamp(0.0, f32::from(rows.saturating_sub(1))) as u16;
@@ -1353,3 +1362,24 @@ fn rgb_channels(value: u32) -> [f32; 3] {
 }
 
 export!(TerminalUi);
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_session_actor;
+
+    #[test]
+    fn backend_scoped_default_ui_targets_default_terminal() {
+        assert_eq!(
+            terminal_session_actor("terminal-ui-b2-s7"),
+            "terminal-session"
+        );
+    }
+
+    #[test]
+    fn backend_scoped_dynamic_ui_retains_terminal_suffix() {
+        assert_eq!(
+            terminal_session_actor("terminal-ui-b2-s7-4"),
+            "terminal-session-4"
+        );
+    }
+}

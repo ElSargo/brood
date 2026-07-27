@@ -83,17 +83,23 @@ const LANES: [Lane; 5] = [
     Lane::Bulk,
     Lane::FrameResource,
 ];
-const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+// Artifact transfer is chunked at the protocol layer, but a remote backend
+// may still emit a large compressed frame resource. Keep the carrier ceiling
+// above the largest valid artifact/package exchange while retaining a hard
+// bound against untrusted length prefixes.
+const MAX_WIRE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// First authenticated application message sent by the remote client.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {
+    pub backend: brood_protocol::BackendId,
     pub capabilities: EndpointCapabilities,
 }
 
 /// Server-selected immutable profile and connection generation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServerHello {
+    pub backend: brood_protocol::BackendId,
     pub profile: TransportProfile,
     pub connection_generation: u64,
     pub capabilities: EndpointCapabilities,
@@ -324,6 +330,7 @@ async fn receive_value<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<
 pub struct NetworkConnection {
     _connection: Connection,
     lanes: HashMap<Lane, NetworkLane>,
+    pub backend: brood_protocol::BackendId,
     pub profile: TransportProfile,
     pub connection_generation: u64,
     pub peer_capabilities: EndpointCapabilities,
@@ -399,6 +406,7 @@ pub async fn connect_network(
     endpoint: &Endpoint,
     server_address: SocketAddr,
     server_name: &str,
+    backend: brood_protocol::BackendId,
     capabilities: EndpointCapabilities,
 ) -> Result<NetworkConnection> {
     ensure!(
@@ -417,6 +425,7 @@ pub async fn connect_network(
     write_serialized(
         &mut handshake_send,
         &ClientHello {
+            backend,
             capabilities: capabilities.clone(),
         },
     )
@@ -426,10 +435,15 @@ pub async fn connect_network(
         hello.profile == TransportProfile::REMOTE,
         "server selected a non-network profile for a remote connection"
     );
+    ensure!(
+        hello.backend == backend,
+        "server did not retain the client-assigned backend identity"
+    );
     let lanes = open_lanes(&connection).await?;
     Ok(NetworkConnection {
         _connection: connection,
         lanes,
+        backend: hello.backend,
         profile: hello.profile,
         connection_generation: hello.connection_generation,
         peer_capabilities: hello.capabilities,
@@ -459,6 +473,7 @@ pub async fn accept_network_connection(
     write_serialized(
         &mut handshake_send,
         &ServerHello {
+            backend: hello.backend,
             profile,
             connection_generation,
             capabilities: capabilities.clone(),
@@ -469,6 +484,7 @@ pub async fn accept_network_connection(
     Ok(NetworkConnection {
         _connection: connection,
         lanes,
+        backend: hello.backend,
         profile,
         connection_generation,
         peer_capabilities: hello.capabilities,
@@ -852,6 +868,7 @@ mod tests {
             &client_endpoint,
             address,
             "localhost",
+            brood_protocol::BackendId(7),
             EndpointCapabilities::remote(),
         )
         .await
@@ -991,6 +1008,7 @@ mod tests {
                 &client,
                 address,
                 "localhost",
+                brood_protocol::BackendId(7),
                 EndpointCapabilities::remote(),
             )
             .await
