@@ -12,7 +12,7 @@ use brood::plugin::host;
 use brood_graphics::{Color, Command as DrawCommand, Packet, Rect};
 use exports::brood::plugin::actor::{
     Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
-    WorkerFinished, WorkerRequest,
+    WorkerRequest,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -31,6 +31,8 @@ const MIDDLE_BUTTON: u32 = 0x112;
 const SCROLL_PIXELS_PER_LINE: f32 = 5.0;
 const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
+const RESIZE_DEBOUNCE_MS: u64 = 24;
+const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
 
 static STATE: Mutex<Option<UiState>> = Mutex::new(None);
 
@@ -69,6 +71,8 @@ struct UiState {
     scroll_accumulator: f32,
     mouse_wheel_accumulator: f32,
     suppressed_text: Option<String>,
+    resize_worker_pending: bool,
+    last_sent_grid_size: Option<(u16, u16)>,
 }
 
 impl UiState {
@@ -107,6 +111,8 @@ impl UiState {
             scroll_accumulator: 0.0,
             mouse_wheel_accumulator: 0.0,
             suppressed_text: None,
+            resize_worker_pending: false,
+            last_sent_grid_size: None,
         }
     }
 
@@ -129,12 +135,50 @@ impl UiState {
         })
     }
 
-    fn resize_command(&self) -> Command {
-        let (rows, cols) = self.grid_size();
+    fn resize_command(
+        rows: u16,
+        cols: u16,
+        backend_id: u64,
+        session_id: u64,
+        actor: String,
+    ) -> Command {
         let mut body = vec![b'R'];
         body.extend_from_slice(&rows.to_le_bytes());
         body.extend_from_slice(&cols.to_le_bytes());
-        self.session_message(body)
+        Command::SendSessionMessage(SessionActorMessage {
+            backend_id,
+            session_id,
+            actor,
+            body,
+        })
+    }
+
+    fn send_resize_if_changed(&mut self) -> Option<Command> {
+        let grid_size = self.grid_size();
+        if self.last_sent_grid_size == Some(grid_size) {
+            return None;
+        }
+        self.last_sent_grid_size = Some(grid_size);
+        Some(Self::resize_command(
+            grid_size.0,
+            grid_size.1,
+            self.backend_id,
+            self.session_id,
+            self.session_actor.clone(),
+        ))
+    }
+
+    fn schedule_resize(&mut self) -> Option<Command> {
+        if self.resize_worker_pending {
+            return None;
+        }
+        self.resize_worker_pending = true;
+        let worker = self.next_worker;
+        self.next_worker = self.next_worker.saturating_add(1).max(1);
+        Some(Command::SpawnWorker(WorkerRequest {
+            worker,
+            payload: RESIZE_WORKER_PAYLOAD.to_vec(),
+        }))
     }
 
     fn viewport_command(&self, offset: usize) -> Command {
@@ -307,13 +351,29 @@ impl Guest for TerminalUi {
             {
                 handle_snapshot_chunk(&message.body)
             }
-            Event::Worker(WorkerEvent::Finished(WorkerFinished { .. }))
-            | Event::Worker(WorkerEvent::Failed(_)) => Vec::new(),
+            Event::Worker(WorkerEvent::Finished(finished))
+                if finished.output == RESIZE_WORKER_PAYLOAD =>
+            {
+                finish_resize_debounce()
+            }
+            Event::Worker(WorkerEvent::Failed(failed))
+                if failed.message.starts_with("terminal resize debounce:") =>
+            {
+                finish_resize_debounce()
+            }
+            Event::Worker(WorkerEvent::Finished(_)) | Event::Worker(WorkerEvent::Failed(_)) => {
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
 
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        if payload == RESIZE_WORKER_PAYLOAD {
+            wait_timer(RESIZE_DEBOUNCE_MS)
+                .await
+                .map_err(|error| format!("terminal resize debounce: {error}"))?;
+        }
         Ok(payload)
     }
 }
@@ -355,13 +415,15 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     format!(r#"{{"type":"focus-pane","pane":{}}}"#, state.pane).into_bytes(),
                 ),
                 state.session_message(vec![b'A']),
-                state.resize_command(),
+                state
+                    .send_resize_if_changed()
+                    .expect("new terminal pane must have an initial grid size"),
             ]
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(1.0);
             state.height = resized.height.max(1.0);
-            vec![state.resize_command()]
+            state.schedule_resize().into_iter().collect()
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
             state.suppressed_text = ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0
@@ -592,6 +654,39 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         }
         _ => Vec::new(),
     }
+}
+
+fn finish_resize_debounce() -> Vec<Command> {
+    let Ok(mut guard) = STATE.lock() else {
+        return Vec::new();
+    };
+    let Some(state) = guard.as_mut() else {
+        return Vec::new();
+    };
+    state.resize_worker_pending = false;
+    state.send_resize_if_changed().into_iter().collect()
+}
+
+async fn wait_timer(duration_ms: u64) -> Result<(), String> {
+    let timer =
+        host::timer_create(duration_ms).map_err(|error| format!("create timer: {error:?}"))?;
+    let notification = host::timer_notification(timer)
+        .map_err(|error| format!("timer notification: {error:?}"))?;
+    let mut generation = 0;
+    while host::timer_status(timer).map_err(|error| format!("timer status: {error:?}"))?
+        == host::TimerState::Pending
+    {
+        let pollable = host::notification_pollable(notification, generation)
+            .map_err(|error| format!("create timer pollable: {error:?}"))?;
+        let ready = host::worker_wait_any(vec![pollable], None, host::WaitMode::Fair)
+            .await
+            .map_err(|error| format!("wait for timer: {error:?}"));
+        let _ = host::pollable_drop(pollable);
+        generation = ready?.generation;
+    }
+    host::timer_drop(timer)
+        .await
+        .map_err(|error| format!("drop timer: {error:?}"))
 }
 
 fn set_clipboard_command(text: String) -> Option<Command> {

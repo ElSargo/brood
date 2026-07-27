@@ -96,10 +96,13 @@ The host sends `layout-state` after lease grant, pane inventory, viewport size,
 application identity, or focus changes. Delivery is queued and bounded like any
 other actor message; the client remains responsive while an actor processes it.
 Each snapshot includes the selected session, the lease's available managed
-windows with their session and application identities, and `visible_panes` as
-the client's default session-filtered subset. The available set defines layout
-authority; `visible_panes` is a convenience policy input, not a validation
-boundary.
+windows with their session and application identities, the backend/session
+realm for every realm-bound managed or client-local pane, and `visible_panes`
+as the client's default session-filtered subset. The available set defines
+layout authority; `visible_panes` is a convenience policy input, not a
+validation boundary. The default workspace keeps each backend in a disjoint
+top-level column and arranges that backend's panes within its column, so panes
+from separate local or remote computers never enter the same anonymous stack.
 
 Other actors and the key lane may address ordinary commands such as
 `layout-action` to the layout actor. A result reaches the host only as a

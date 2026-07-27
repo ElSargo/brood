@@ -225,8 +225,8 @@ pub struct ComponentActorConfig {
     pub max_filesystem_watch_events: usize,
     pub command_capacity: usize,
     /// Bounded queue for pane input and presentation lifecycle events.
-    /// Pointer motion may coalesce; key, text, button, focus, and resize
-    /// events are never silently discarded.
+    /// Consecutive pointer motion and resize state for one pane may coalesce;
+    /// key, text, button, and focus transitions are never silently discarded.
     pub presentation_backlog: usize,
     pub mailbox_backlog: usize,
     pub max_workers: usize,
@@ -2976,17 +2976,34 @@ fn enqueue_presentation_dispatch(
     capacity: usize,
     event: PresentationEvent,
 ) -> Result<()> {
-    if let PresentationEvent::PointerMoved { pane, .. } = &event {
-        if let Some(queued) = queue.back_mut()
-            && matches!(queued, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
-        {
-            *queued = event;
+    match &event {
+        PresentationEvent::PointerMoved { pane, .. } => {
+            if let Some(queued) = queue.back_mut()
+                && matches!(queued, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
+            {
+                *queued = event;
+                return Ok(());
+            }
+            if queue.len() < capacity {
+                queue.push_back(event);
+            }
             return Ok(());
         }
-        if queue.len() < capacity {
-            queue.push_back(event);
+        PresentationEvent::PaneResized { pane, .. } => {
+            if let Some(queued) = queue.back_mut()
+                && matches!(queued, PresentationEvent::PaneResized { pane: queued_pane, .. } if *queued_pane == *pane)
+            {
+                *queued = event;
+                return Ok(());
+            }
         }
-        return Ok(());
+        PresentationEvent::PaneCreated { .. }
+        | PresentationEvent::PaneFocused { .. }
+        | PresentationEvent::PointerButton { .. }
+        | PresentationEvent::PointerScroll { .. }
+        | PresentationEvent::Key { .. }
+        | PresentationEvent::Text { .. }
+        | PresentationEvent::Paste { .. } => {}
     }
 
     if queue.len() >= capacity {
@@ -3289,6 +3306,39 @@ mod tests {
                     text: "b".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn presentation_backlog_retains_only_the_latest_consecutive_resize() {
+        let mut queue = VecDeque::from([PresentationEvent::PaneResized {
+            pane: 7,
+            width: 640.0,
+            height: 480.0,
+            scale: 1.0,
+        }]);
+
+        assert!(
+            enqueue_presentation_dispatch(
+                &mut queue,
+                1,
+                PresentationEvent::PaneResized {
+                    pane: 7,
+                    width: 1280.0,
+                    height: 720.0,
+                    scale: 1.25,
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            [PresentationEvent::PaneResized {
+                pane: 7,
+                width: 1280.0,
+                height: 720.0,
+                scale: 1.25,
+            }]
         );
     }
 }

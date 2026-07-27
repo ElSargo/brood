@@ -32,6 +32,7 @@ anyhow.workspace = true
 calloop.workspace = true
 calloop-wayland-source.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 image.workspace = true
 brood-cli.workspace = true
 brood-ipc.workspace = true

@@ -5,6 +5,10 @@ use core::{ptr, slice};
 use serde::Deserialize;
 use serde_json_core::heapless::{String as FixedString, Vec as FixedVec};
 
+mod backend_layout;
+
+use backend_layout::pane_placement;
+
 const HEAP_BYTES: usize = 256 * 1024;
 const RESPONSE_BYTES: usize = 64 * 1024;
 const OUTBOX_BYTES: usize = 64 * 1024;
@@ -61,6 +65,7 @@ static mut RESPONSE_DESC: [i32; 4] = [0; 4];
 static mut OUTBOX: [u8; OUTBOX_BYTES] = [0; OUTBOX_BYTES];
 static mut WORKSPACE_INPUT_MODE: i32 = INPUT_MODE_PASSTHROUGH;
 static mut LAYOUT_PANES: [u64; 64] = [0; 64];
+static mut LAYOUT_PANE_BACKENDS: [u64; 64] = [0; 64];
 static mut LAYOUT_PANE_COUNT: usize = 0;
 static mut LAYOUT_FOCUS: u64 = 0;
 static mut LAYOUT_HAS_FOCUS: bool = false;
@@ -100,6 +105,8 @@ struct WorkspaceMessage {
     #[serde(default)]
     visible_panes: PaneList,
     #[serde(default)]
+    pane_realms: FixedVec<PaneRealm, MAX_PANES>,
+    #[serde(default)]
     focused_pane: Option<u64>,
     #[serde(default)]
     pane_app_ids: AppPaneList,
@@ -107,6 +114,12 @@ struct WorkspaceMessage {
     revision: Option<u64>,
     #[serde(default)]
     lease: Option<LayoutLeaseToken>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct PaneRealm {
+    pane: u64,
+    backend: u64,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -348,18 +361,21 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
     if message.message_type == "layout-state" {
         store_layout_actor_state(
             &message.visible_panes,
+            &message.pane_realms,
             message.focused_pane,
             message.lease,
             message.revision,
         );
+        let (panes, pane_backends, focus, fullscreen, lease, revision) = layout_actor_state();
         let len = write_layout_actor_outbox(
             output,
             &message.pane_app_ids,
-            &message.visible_panes,
-            message.focused_pane,
-            layout_actor_fullscreen(),
-            message.lease,
-            message.revision,
+            panes,
+            pane_backends,
+            focus,
+            fullscreen,
+            lease,
+            revision,
         );
         if len <= 0 {
             return -2;
@@ -371,8 +387,16 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
         return 0;
     }
     apply_layout_actor_action(message.action.as_deref().unwrap_or(""));
-    let (panes, focus, fullscreen, lease, revision) = layout_actor_state();
-    let len = write_layout_actor_update_outbox(output, panes, focus, fullscreen, lease, revision);
+    let (panes, pane_backends, focus, fullscreen, lease, revision) = layout_actor_state();
+    let len = write_layout_actor_update_outbox(
+        output,
+        panes,
+        pane_backends,
+        focus,
+        fullscreen,
+        lease,
+        revision,
+    );
     if len <= 0 {
         return -2;
     }
@@ -588,6 +612,7 @@ fn write_layout_actor_outbox(
     output: &mut [u8],
     app_panes: &[AppPane],
     panes: &[u64],
+    pane_backends: &[u64],
     focus: Option<u64>,
     fullscreen: bool,
     lease: Option<LayoutLeaseToken>,
@@ -596,7 +621,15 @@ fn write_layout_actor_outbox(
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
-    write_set_resolved_layout_payload(&mut payload, panes, focus, fullscreen, lease, revision);
+    write_set_resolved_layout_payload(
+        &mut payload,
+        panes,
+        pane_backends,
+        focus,
+        fullscreen,
+        lease,
+        revision,
+    );
     writer.bytes(br#"]}],"publications":[{"payload":["#);
     let mut publication = PayloadWriter::new(&mut writer);
     publication.bytes(br#"{"kind":"workspace-state","mode":"#);
@@ -657,6 +690,7 @@ fn write_layout_actor_outbox(
 fn write_layout_actor_update_outbox(
     output: &mut [u8],
     panes: &[u64],
+    pane_backends: &[u64],
     focus: Option<u64>,
     fullscreen: bool,
     lease: Option<LayoutLeaseToken>,
@@ -665,13 +699,22 @@ fn write_layout_actor_update_outbox(
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
-    write_set_resolved_layout_payload(&mut payload, panes, focus, fullscreen, lease, revision);
+    write_set_resolved_layout_payload(
+        &mut payload,
+        panes,
+        pane_backends,
+        focus,
+        fullscreen,
+        lease,
+        revision,
+    );
     writer.bytes(br#"]}]}"#);
     writer.finish()
 }
 
 fn store_layout_actor_state(
     panes: &[u64],
+    pane_realms: &[PaneRealm],
     focus: Option<u64>,
     lease: Option<LayoutLeaseToken>,
     revision: Option<u64>,
@@ -682,6 +725,14 @@ fn store_layout_actor_state(
         let mut index = 0;
         while index < pane_count {
             target.add(index).write(panes[index]);
+            let backend = pane_realms
+                .iter()
+                .find(|realm| realm.pane == panes[index])
+                .map_or(0, |realm| realm.backend);
+            ptr::addr_of_mut!(LAYOUT_PANE_BACKENDS)
+                .cast::<u64>()
+                .add(index)
+                .write(backend);
             index += 1;
         }
         LAYOUT_PANE_COUNT = pane_count;
@@ -704,11 +755,8 @@ fn store_layout_actor_state(
     }
 }
 
-fn layout_actor_fullscreen() -> bool {
-    unsafe { LAYOUT_FULLSCREEN }
-}
-
 fn layout_actor_state() -> (
+    &'static [u64],
     &'static [u64],
     Option<u64>,
     bool,
@@ -718,13 +766,24 @@ fn layout_actor_state() -> (
     unsafe {
         let pane_count = LAYOUT_PANE_COUNT.min(64);
         let panes = slice::from_raw_parts(ptr::addr_of!(LAYOUT_PANES).cast::<u64>(), pane_count);
+        let pane_backends = slice::from_raw_parts(
+            ptr::addr_of!(LAYOUT_PANE_BACKENDS).cast::<u64>(),
+            pane_count,
+        );
         let focus = LAYOUT_HAS_FOCUS.then_some(LAYOUT_FOCUS);
         let lease = LAYOUT_HAS_LEASE.then_some(LayoutLeaseToken {
             id: LAYOUT_LEASE_ID,
             generation: LAYOUT_LEASE_GENERATION,
         });
         let revision = LAYOUT_HAS_LEASE.then_some(LAYOUT_REVISION);
-        (panes, focus, LAYOUT_FULLSCREEN, lease, revision)
+        (
+            panes,
+            pane_backends,
+            focus,
+            LAYOUT_FULLSCREEN,
+            lease,
+            revision,
+        )
     }
 }
 
@@ -786,6 +845,7 @@ fn write_app_pane(
 fn write_set_resolved_layout_payload(
     payload: &mut PayloadWriter<'_, '_>,
     panes: &[u64],
+    pane_backends: &[u64],
     focus: Option<u64>,
     fullscreen: bool,
     lease: Option<LayoutLeaseToken>,
@@ -807,22 +867,21 @@ fn write_set_resolved_layout_payload(
             .filter(|focus| panes.contains(focus))
             .unwrap_or(panes[0]);
         write_pane_item_payload(payload, pane, 0.0, -1.0, -1.0, 2.0, 2.0);
-    } else if pane_count == 1 {
-        write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, 2.0, 2.0);
-    } else if pane_count > 1 {
-        write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, 1.0, 2.0);
-        let each = 2.0 / ((pane_count - 1) as f32);
-        let mut index = 1;
+    } else {
+        let mut index = 0;
         while index < pane_count {
-            payload.byte(b',');
+            if index > 0 {
+                payload.byte(b',');
+            }
+            let placement = pane_placement(index, panes, pane_backends);
             write_pane_item_payload(
                 payload,
                 panes[index],
                 index as f32,
-                0.0,
-                -1.0 + each * ((index - 1) as f32),
-                1.0,
-                each,
+                placement.offset_u,
+                placement.offset_v,
+                placement.size_u,
+                placement.size_v,
             );
             index += 1;
         }

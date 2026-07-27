@@ -11,7 +11,12 @@ fi
 
 if [[ "$action" == "stop" ]]; then
   if [[ -r "$state/session.pid" ]]; then
-    kill "$(cat "$state/session.pid")" 2>/dev/null || true
+    recorded_pid="$(cat "$state/session.pid")"
+    kill "$recorded_pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+      kill -0 "$recorded_pid" 2>/dev/null || break
+      sleep 0.05
+    done
   fi
   exit 0
 fi
@@ -34,6 +39,16 @@ relay_pid=""
 
 mkdir -p "$runtime" "$state/artifacts"
 chmod 700 "$state" "$runtime"
+if [[ -r "$pid_file" ]]; then
+  previous_pid="$(cat "$pid_file")"
+  if kill -0 "$previous_pid" 2>/dev/null; then
+    kill "$previous_pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+      kill -0 "$previous_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+  fi
+fi
 printf '%s\n' "$$" >"$pid_file"
 export XDG_RUNTIME_DIR="$runtime"
 
@@ -48,7 +63,9 @@ cleanup() {
       wait "$child" 2>/dev/null || true
     fi
   done
-  rm -f "$pid_file"
+  if [[ -r "$pid_file" && "$(cat "$pid_file")" == "$$" ]]; then
+    rm -f "$pid_file"
+  fi
 }
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
@@ -67,8 +84,8 @@ fi
 
 "$backend/bin/brood-sessiond" \
   --headless \
-  --no-init \
   --no-default-modules \
+  --config "$backend/brood.toml" \
   --dbus-destination "$dbus_destination" \
   >"$server_log" 2>&1 &
 session_pid=$!

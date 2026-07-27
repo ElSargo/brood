@@ -147,6 +147,7 @@ struct SwitcherState {
     scroll: usize,
     request: u64,
     pending: Option<u64>,
+    pending_directory_backend: Option<u64>,
     status: String,
     error: bool,
     next_coding_agent_ui: u64,
@@ -203,7 +204,6 @@ struct LayoutContext {
     revision: u64,
     lease: LayoutLeaseToken,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
-    available_windows: serde_json_core::heapless::Vec<AvailableWindow, 64>,
     focused_pane: Option<u64>,
     size: LayoutStateSize,
     rest: bool,
@@ -308,6 +308,25 @@ struct WorktreeSessionRequest<'a> {
     branch: &'a str,
 }
 
+#[derive(Serialize)]
+struct DirectoryListRequest {
+    kind: &'static str,
+    request: u64,
+    roots: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectoryListCompletion {
+    #[serde(rename = "type")]
+    message_type: String,
+    request: u64,
+    success: bool,
+    #[serde(default)]
+    directories: Vec<String>,
+    #[serde(default)]
+    message: String,
+}
+
 #[derive(Deserialize)]
 struct WorktreeSessionCompletion {
     #[serde(rename = "type")]
@@ -389,6 +408,7 @@ impl SwitcherState {
             scroll: 0,
             request: 0,
             pending: None,
+            pending_directory_backend: None,
             status: String::new(),
             error: false,
             next_coding_agent_ui: 2,
@@ -883,6 +903,31 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
 }
 
 fn handle_daemon_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Ok(completion) = serde_json::from_slice::<DirectoryListCompletion>(bytes)
+        && completion.message_type == "directory-list"
+    {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        if state.pending != Some(completion.request) {
+            return Vec::new();
+        }
+        state.pending = None;
+        if !completion.success {
+            state.error = true;
+            state.status = if completion.message.is_empty() {
+                "The backend could not list its directories".to_string()
+            } else {
+                completion.message
+            };
+            redraw_or_record_error(&mut state);
+            return Vec::new();
+        }
+        let backend = backend_from_sender(sender).unwrap_or(state.backend_id);
+        state.error = false;
+        state.status.clear();
+        return show_directory_picker(&mut state, backend, completion.directories);
+    }
     let Ok((completion, consumed)) =
         serde_json_core::from_slice::<WorktreeSessionCompletion>(bytes)
     else {
@@ -1031,7 +1076,6 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         revision: message.revision,
         lease: message.lease,
         visible_panes: message.visible_panes,
-        available_windows: message.available_windows,
         focused_pane: message.focused_pane,
         size: message.size,
         rest: message.rest,
@@ -1147,6 +1191,7 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     {
         if let Ok(mut state) = STATE.lock() {
             state.mode = EditMode::Search;
+            state.pending_directory_backend = None;
             state.error = true;
             state.status = message.message;
             redraw_or_record_error(&mut state);
@@ -1158,7 +1203,9 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
         && message.kind.as_str() == "backend-connected"
     {
         if let Ok(mut state) = STATE.lock() {
-            return open_directory_picker(&mut state, message.backend);
+            state.pending_directory_backend = Some(message.backend);
+            state.status = format!("Waiting for backend {} inventory…", message.backend);
+            redraw_or_record_error(&mut state);
         }
         return Vec::new();
     }
@@ -1168,6 +1215,14 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     {
         if let Ok(mut state) = STATE.lock() {
             apply_backend_sessions(&mut state, message);
+            if let Some(backend) = state.pending_directory_backend
+                && state
+                    .sessions
+                    .iter()
+                    .any(|session| session.backend == backend)
+            {
+                return open_directory_picker(&mut state, backend);
+            }
             redraw_or_record_error(&mut state);
         }
         return Vec::new();
@@ -1361,7 +1416,7 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
             "create-remote" => {
                 state.query.clear();
                 state.mode = EditMode::ConnectRemote;
-                state.status = "Remote address (host:port): Enter to connect".to_string();
+                state.status = "SSH target (user@host): Enter to deploy and connect".to_string();
                 redraw_or_record_error(&mut state);
                 return Vec::new();
             }
@@ -1463,7 +1518,7 @@ fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> 
     if state.can_connect_remote {
         picker_items.push(SessionPickerItem {
             label: "Connect remote backend".to_string(),
-            detail: "Connect another backend by address".to_string(),
+            detail: "Deploy and connect through your OpenSSH configuration".to_string(),
             value: SessionPickerValueWire {
                 backend: None,
                 session: None,
@@ -1491,12 +1546,46 @@ fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> 
 }
 
 fn open_directory_picker(state: &mut SwitcherState, backend: u64) -> Vec<ActorCommand> {
-    let mut directories = state
+    state.pending_directory_backend = None;
+    let roots = state
         .sessions
         .iter()
         .filter(|session| session.backend == backend)
         .filter_map(|session| session.working_directory.clone())
         .collect::<Vec<_>>();
+    let request = state.next_request();
+    state.status = format!("Loading directories from backend {backend}…");
+    let Ok(body) = serde_json::to_vec(&DirectoryListRequest {
+        kind: "list-directories",
+        request,
+        roots,
+    }) else {
+        state.pending = None;
+        state.error = true;
+        state.status = "Could not encode the directory request".to_string();
+        redraw_or_record_error(state);
+        return Vec::new();
+    };
+    redraw_or_record_error(state);
+    vec![ActorCommand::SendDaemonMessage(DaemonActorMessage {
+        backend_id: backend,
+        actor: "init".to_string(),
+        body,
+    })]
+}
+
+fn show_directory_picker(
+    state: &mut SwitcherState,
+    backend: u64,
+    mut directories: Vec<String>,
+) -> Vec<ActorCommand> {
+    directories.extend(
+        state
+            .sessions
+            .iter()
+            .filter(|session| session.backend == backend)
+            .filter_map(|session| session.working_directory.clone()),
+    );
     directories.push("/".to_string());
     directories.sort();
     directories.dedup();
@@ -1504,7 +1593,7 @@ fn open_directory_picker(state: &mut SwitcherState, backend: u64) -> Vec<ActorCo
         .into_iter()
         .map(|directory| SessionPickerItem {
             label: directory.clone(),
-            detail: "Create a new session here".to_string(),
+            detail: format!("Create a session on backend {backend}"),
             value: SessionPickerValueWire {
                 backend: Some(backend),
                 session: None,
@@ -1681,7 +1770,6 @@ fn publish_layout(
         .iter()
         .copied()
         .filter(|visible| *visible != pane && Some(*visible) != picker_pane)
-        .chain(message.available_windows.iter().map(|window| window.pane))
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
                 panes.push(candidate);
@@ -1924,12 +2012,14 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
         let address = state.query.trim().to_string();
         if address.is_empty() {
             state.error = true;
-            state.status = "Enter a remote host and port".to_string();
+            state.status = "Enter an SSH target such as user@host".to_string();
             return Vec::new();
         }
+        state.error = false;
+        state.status = format!("Deploying {address} over SSH…");
         state.next_request();
         return vec![ActorCommand::SendHostMessage(
-            format!("{{\"type\":\"connect-remote-backend\",\"address\":{address:?}}}").into_bytes(),
+            format!("{{\"type\":\"deploy-ssh-backend\",\"target\":{address:?}}}").into_bytes(),
         )];
     }
     let visible_sessions = state
@@ -2148,7 +2238,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             EditMode::Search => "Search or create…".to_string(),
             EditMode::Rename(..) => "New session name…".to_string(),
             EditMode::CreateWorktree(..) => "Branch name…".to_string(),
-            EditMode::ConnectRemote => "host:port…".to_string(),
+            EditMode::ConnectRemote => "user@host…".to_string(),
         }
     } else {
         format!("{}▏", state.query)

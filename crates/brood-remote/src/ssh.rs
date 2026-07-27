@@ -2,7 +2,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     env, fs,
     hash::{Hash, Hasher},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     os::unix::{
         ffi::OsStringExt,
@@ -18,6 +18,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
+use serde::Serialize;
 use tempfile::TempDir;
 
 const REMOTE_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,14 +49,131 @@ pub struct SshArgs {
     client_args: Vec<std::ffi::OsString>,
 }
 
+#[derive(Serialize)]
+struct SshAttachReady<'a> {
+    connect: SocketAddr,
+    server_name: &'static str,
+    server_certificate: &'a Path,
+    client_certificate: &'a Path,
+    client_private_key: &'a Path,
+    session_package: &'a str,
+    session_root: &'a Path,
+}
+
+struct StartedDeployment {
+    target: String,
+    remote_backend: String,
+    remote_state: String,
+    remote: Child,
+    connect: SocketAddr,
+    package: String,
+    root: PathBuf,
+    certificates: Certificates,
+}
+
+impl StartedDeployment {
+    fn stop(&mut self) {
+        stop_remote_backend(
+            &self.target,
+            &self.remote_backend,
+            &self.remote_state,
+            &mut self.remote,
+        );
+    }
+}
+
 pub fn deploy(args: &SshArgs) -> Result<()> {
+    let source = DeploymentSource::prepare(&args.flake)?;
+    let client = resolve_client(args.client.as_deref(), &source)?;
+    let mut deployment = start_deployment(args, &source, &client)?;
+    let client_result = Command::new(&client)
+        .arg("--remote-connect")
+        .arg(deployment.connect.to_string())
+        .arg("--include-local")
+        .arg("--remote-server-name")
+        .arg("localhost")
+        .arg("--remote-server-certificate")
+        .arg(&deployment.certificates.server_certificate)
+        .arg("--remote-client-certificate")
+        .arg(&deployment.certificates.client_certificate)
+        .arg("--remote-client-private-key")
+        .arg(&deployment.certificates.client_private_key)
+        .arg("--remote-offer-session-package")
+        .arg(format!(
+            "{}={}",
+            deployment.package,
+            deployment.root.display()
+        ))
+        .args(&args.client_args)
+        .status()
+        .with_context(|| format!("launch local presentation client {}", client.display()));
+
+    deployment.stop();
+    let status = client_result?;
+    ensure!(
+        status.success(),
+        "local presentation client exited with {status}"
+    );
+    Ok(())
+}
+
+/// Publish connection material for an existing client and retain ownership of
+/// the remote deployment until that client's pipe closes.
+pub fn attach(args: &SshArgs) -> Result<()> {
+    validate_ssh_target(&args.target)?;
+    let client = args
+        .client
+        .as_deref()
+        .context("SSH attachment requires the requesting brood-client path")?
+        .canonicalize()
+        .context("resolve requesting brood-client")?;
+    let source = if args.backend.is_none() && env::var_os("BROOD_SSH_BACKEND").is_none() {
+        Some(DeploymentSource::prepare(&args.flake)?)
+    } else {
+        None
+    };
+    let mut deployment = start_deployment_optional_source(args, source.as_ref(), &client)?;
+    let ready = SshAttachReady {
+        connect: deployment.connect,
+        server_name: "localhost",
+        server_certificate: &deployment.certificates.server_certificate,
+        client_certificate: &deployment.certificates.client_certificate,
+        client_private_key: &deployment.certificates.client_private_key,
+        session_package: &deployment.package,
+        session_root: &deployment.root,
+    };
+    let publish_result = (|| -> Result<()> {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        serde_json::to_writer(&mut stdout, &ready).context("encode SSH attachment details")?;
+        writeln!(stdout).context("publish SSH attachment details")?;
+        stdout.flush().context("flush SSH attachment details")?;
+        std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink())
+            .context("wait for presentation client SSH attachment lifetime")?;
+        Ok(())
+    })();
+    deployment.stop();
+    publish_result
+}
+
+fn start_deployment(
+    args: &SshArgs,
+    source: &DeploymentSource,
+    client: &Path,
+) -> Result<StartedDeployment> {
+    start_deployment_optional_source(args, Some(source), client)
+}
+
+fn start_deployment_optional_source(
+    args: &SshArgs,
+    source: Option<&DeploymentSource>,
+    client: &Path,
+) -> Result<StartedDeployment> {
     validate_ssh_target(&args.target)?;
     let remote_system = remote_system(&args.target)?;
-    let source = DeploymentSource::prepare(&args.flake)?;
-    let backend = resolve_backend(args, &remote_system, &source)?;
-    let client = resolve_client(args.client.as_deref(), &source)?;
+    let backend = resolve_backend(args, &remote_system, source)?;
     let (package, root) = args.session_package.as_deref().map_or_else(
-        || resolve_default_session_package(&client),
+        || resolve_default_session_package(client),
         parse_session_package,
     )?;
 
@@ -78,32 +196,16 @@ pub fn deploy(args: &SshArgs) -> Result<()> {
         "ssh-deploy=ready target={} backend={} connect={} package={}",
         args.target, remote_backend, connect, package
     );
-
-    let client_result = Command::new(&client)
-        .arg("--remote-connect")
-        .arg(connect.to_string())
-        .arg("--include-local")
-        .arg("--remote-server-name")
-        .arg("localhost")
-        .arg("--remote-server-certificate")
-        .arg(&certificates.server_certificate)
-        .arg("--remote-client-certificate")
-        .arg(&certificates.client_certificate)
-        .arg("--remote-client-private-key")
-        .arg(&certificates.client_private_key)
-        .arg("--remote-offer-session-package")
-        .arg(format!("{package}={}", root.display()))
-        .args(&args.client_args)
-        .status()
-        .with_context(|| format!("launch local presentation client {}", client.display()));
-
-    stop_remote_backend(&args.target, &remote_backend, &remote_state, &mut remote);
-    let status = client_result?;
-    ensure!(
-        status.success(),
-        "local presentation client exited with {status}"
-    );
-    Ok(())
+    Ok(StartedDeployment {
+        target: args.target.clone(),
+        remote_backend,
+        remote_state,
+        remote,
+        connect,
+        package,
+        root,
+        certificates,
+    })
 }
 
 fn validate_ssh_target(target: &str) -> Result<()> {
@@ -295,13 +397,24 @@ impl DeploymentSource {
 fn resolve_backend(
     args: &SshArgs,
     remote_system: &str,
-    source: &DeploymentSource,
+    source: Option<&DeploymentSource>,
 ) -> Result<PathBuf> {
     if let Some(backend) = &args.backend {
         return backend
             .canonicalize()
             .with_context(|| format!("resolve SSH backend {}", backend.display()));
     }
+    let packaged_system = env::var("BROOD_SSH_BACKEND_SYSTEM").ok();
+    if packaged_system
+        .as_deref()
+        .is_none_or(|system| system == remote_system)
+        && let Some(backend) = env::var_os("BROOD_SSH_BACKEND")
+    {
+        return PathBuf::from(backend)
+            .canonicalize()
+            .context("resolve BROOD_SSH_BACKEND");
+    }
+    let source = source.context("SSH backend build requires a deployment source")?;
     build_flake_package(&source.path, remote_system, "ssh-backend", "remote backend")
 }
 
@@ -353,10 +466,11 @@ fn copy_backend(target: &str, backend: &Path, remote_state: &str) -> Result<()> 
         "preparing backend directory on {target} failed"
     );
     let destination = format!("{target}:{remote_backend}/");
+    let source = format!("{}/.", backend.display());
     let status = Command::new("scp")
         .arg("-q")
         .arg("-r")
-        .arg(backend.join("bin"))
+        .arg(source)
         .arg(destination)
         .status()
         .with_context(|| format!("copy portable backend to {target}"))?;

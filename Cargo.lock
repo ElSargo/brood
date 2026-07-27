@@ -620,6 +620,7 @@ dependencies = [
  "calloop 0.14.4",
  "calloop-wayland-source 0.4.1",
  "clap",
+ "getrandom 0.3.4",
  "image",
  "num-traits",
  "serde",

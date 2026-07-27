@@ -306,6 +306,13 @@ Publications are host-owned immutable latest-state frames written by actors and
 read by policy providers. They are not queues and never contain pointers into
 mutable actor memory.
 
+Presentation delivery makes the same state/transition distinction. Consecutive
+pointer positions and pane sizes for one pane retain only the newest value
+before guest dispatch, while keys, text, buttons, and focus transitions remain
+lossless. A failed init-owned presentation actor is removed from pane routing
+before queued local messages are delivered, so one closed child mailbox cannot
+terminate the presentation client while the init actor replaces it.
+
 ## Resource Ceilings
 
 Every actor generation has two complementary forms of backpressure. Item

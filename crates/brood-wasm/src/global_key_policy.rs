@@ -80,6 +80,9 @@ pub enum HostMessage {
     ConnectRemoteBackend {
         address: String,
     },
+    DeploySshBackend {
+        target: String,
+    },
     CreateLocalBackend,
     ToggleShortcutPassthrough,
     SetShortcutPassthrough {

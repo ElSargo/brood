@@ -240,6 +240,9 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             if rows == 0 || cols == 0 {
                 return Vec::new();
             }
+            if state.screen.rows == rows && state.screen.cols == cols {
+                return Vec::new();
+            }
             state.screen.resize(rows, cols);
             if let Some(child) = state.child
                 && let Err(error) = host::pty_resize(child, rows, cols)

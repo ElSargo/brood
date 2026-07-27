@@ -3758,7 +3758,12 @@ impl Brood {
             Some(&(lifecycle.clone(), brood_wasm::PluginStartReason::Initial)),
             ConfiguredPluginResources::default(),
             brood_wasm::RuntimeIoCapabilities {
-                commands: vec!["git".to_string(), "mkdir".to_string(), "rm".to_string()],
+                commands: vec![
+                    "find".to_string(),
+                    "git".to_string(),
+                    "mkdir".to_string(),
+                    "rm".to_string(),
+                ],
                 ..brood_wasm::RuntimeIoCapabilities::default()
             },
             true,
@@ -3783,6 +3788,8 @@ impl Brood {
             serde_json::to_vec(&serde_json::json!({
                 "kind": "bootstrap",
                 "records": load_managed_worktree_records(),
+                "home_directory": std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).to_string_lossy().into_owned()),
             }))
             .context("encode backend worktree bootstrap")?,
         )?;
@@ -5814,23 +5821,29 @@ fn dispatch_wayland_clients(
 }
 
 fn default_surface_session_name(session: SurfaceSessionId) -> String {
-    let n = session.raw().saturating_sub(1) as usize;
+    let mut entropy = [0_u8; 8];
+    if getrandom::fill(&mut entropy).is_err() {
+        let fallback = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos() as u64)
+            ^ u64::from(std::process::id()).rotate_left(17)
+            ^ session.raw().rotate_left(37);
+        entropy = fallback.to_le_bytes();
+    }
     let adjective = SESSION_NAME_ADJECTIVES
-        .get(n % SESSION_NAME_ADJECTIVES.len())
+        .get(usize::from(entropy[0]) % SESSION_NAME_ADJECTIVES.len())
         .copied()
         .unwrap_or("quiet");
     let noun = SESSION_NAME_NOUNS
-        .get((n / SESSION_NAME_ADJECTIVES.len()) % SESSION_NAME_NOUNS.len())
+        .get(usize::from(entropy[1]) % SESSION_NAME_NOUNS.len())
         .copied()
         .unwrap_or("workspace");
     let action = SESSION_NAME_ACTIONS
-        .get(
-            (n / (SESSION_NAME_ADJECTIVES.len() * SESSION_NAME_NOUNS.len()))
-                % SESSION_NAME_ACTIONS.len(),
-        )
+        .get(usize::from(entropy[2]) % SESSION_NAME_ACTIONS.len())
         .copied()
         .unwrap_or("working");
-    format!("{adjective}-{noun}-{action}")
+    let suffix = u16::from_le_bytes([entropy[3], entropy[4]]);
+    format!("{adjective}-{noun}-{action}-{suffix:04x}")
 }
 
 fn session_init_actor_id(session: SurfaceSessionId) -> String {

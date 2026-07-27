@@ -5,7 +5,8 @@ wit_bindgen::generate!({
 
 use brood::plugin::host;
 use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, WorkerEvent, WorkerFinished, WorkerRequest,
+    Command, Event, Guest, LifecycleEvent, PresentationActorMessage, WorkerEvent, WorkerFinished,
+    WorkerRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,6 +25,11 @@ enum HostRequest {
         request: u64,
         source_session: u64,
         branch: String,
+    },
+    ListDirectories {
+        request: u64,
+        #[serde(default)]
+        roots: Vec<String>,
     },
     Acquire {
         request: u64,
@@ -46,6 +52,8 @@ enum HostRequest {
     },
     Bootstrap {
         records: Vec<WorktreeRecord>,
+        #[serde(default)]
+        home_directory: Option<String>,
     },
     Maintenance {
         now: u64,
@@ -77,6 +85,10 @@ enum WorkerInput {
     Cleanup {
         record: WorktreeRecord,
     },
+    ListDirectories {
+        request: u64,
+        roots: Vec<String>,
+    },
     Timer,
 }
 
@@ -86,6 +98,8 @@ struct WorkerOutput {
     message: String,
     request: Option<u64>,
     record: Option<WorktreeRecord>,
+    #[serde(default)]
+    directories: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +107,7 @@ enum Job {
     Provision { request: u64, path: String },
     Persist,
     Cleanup { path: String },
+    ListDirectories { request: u64, actor: String },
     Timer,
 }
 
@@ -102,6 +117,7 @@ struct ManagerState {
     records: BTreeMap<String, WorktreeRecord>,
     request_paths: BTreeMap<u64, String>,
     acquiring: BTreeSet<String>,
+    home_directory: Option<String>,
     timer_pending: bool,
 }
 
@@ -113,6 +129,7 @@ impl ManagerState {
             records: BTreeMap::new(),
             request_paths: BTreeMap::new(),
             acquiring: BTreeSet::new(),
+            home_directory: None,
             timer_pending: false,
         }
     }
@@ -173,12 +190,14 @@ impl Guest for WorktreeManager {
                     message: String::new(),
                     request: Some(request),
                     record: Some(record),
+                    directories: Vec::new(),
                 },
                 Err(message) => WorkerOutput {
                     success: false,
                     message,
                     request: Some(request),
                     record: None,
+                    directories: Vec::new(),
                 },
             },
             WorkerInput::Persist { record } => WorkerOutput {
@@ -186,6 +205,7 @@ impl Guest for WorktreeManager {
                 message: String::new(),
                 request: None,
                 record: Some(record),
+                directories: Vec::new(),
             },
             WorkerInput::Cleanup { record } => match cleanup_worktree(&record).await {
                 Ok(()) => WorkerOutput {
@@ -193,14 +213,34 @@ impl Guest for WorktreeManager {
                     message: String::new(),
                     request: None,
                     record: Some(record),
+                    directories: Vec::new(),
                 },
                 Err(message) => WorkerOutput {
                     success: false,
                     message,
                     request: None,
                     record: Some(record),
+                    directories: Vec::new(),
                 },
             },
+            WorkerInput::ListDirectories { request, roots } => {
+                match list_directories(&roots).await {
+                    Ok(directories) => WorkerOutput {
+                        success: true,
+                        message: String::new(),
+                        request: Some(request),
+                        record: None,
+                        directories,
+                    },
+                    Err(message) => WorkerOutput {
+                        success: false,
+                        message,
+                        request: Some(request),
+                        record: None,
+                        directories: Vec::new(),
+                    },
+                }
+            }
             WorkerInput::Timer => {
                 wait_timer(MAINTENANCE_INTERVAL_MS).await?;
                 WorkerOutput {
@@ -208,6 +248,7 @@ impl Guest for WorktreeManager {
                     message: String::new(),
                     request: None,
                     record: None,
+                    directories: Vec::new(),
                 }
             }
         };
@@ -220,7 +261,10 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
         return Vec::new();
     };
     let authorized = match (&request, sender) {
-        (HostRequest::CreateWorktreeSession { .. }, sender) => sender.starts_with("presentation:"),
+        (
+            HostRequest::CreateWorktreeSession { .. } | HostRequest::ListDirectories { .. },
+            sender,
+        ) => sender.starts_with("presentation:"),
         (HostRequest::Acquire { .. }, "host:control")
         | (HostRequest::Attached { .. } | HostRequest::Released { .. }, "host:session")
         | (HostRequest::Bootstrap { .. }, "host")
@@ -251,6 +295,26 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
             serde_json::to_vec(&value)
                 .ok()
                 .map(Command::SendHostMessage)
+                .into_iter()
+                .collect()
+        }
+        HostRequest::ListDirectories { request, mut roots } => {
+            roots.push("/".to_string());
+            if let Some(home) = state.home_directory.clone() {
+                roots.push(home);
+            }
+            roots.retain(|root| root.starts_with('/'));
+            roots.sort();
+            roots.dedup();
+            let actor = sender
+                .strip_prefix("presentation:")
+                .unwrap_or(sender)
+                .to_string();
+            state
+                .spawn(
+                    Job::ListDirectories { request, actor },
+                    WorkerInput::ListDirectories { request, roots },
+                )
                 .into_iter()
                 .collect()
         }
@@ -316,7 +380,11 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
                 .filter_map(|record| state.persist(record))
                 .collect()
         }
-        HostRequest::Bootstrap { records } => {
+        HostRequest::Bootstrap {
+            records,
+            home_directory,
+        } => {
+            state.home_directory = home_directory;
             for record in records {
                 state.records.insert(record.path.clone(), record);
             }
@@ -388,6 +456,13 @@ fn handle_worker_finished(finished: WorkerFinished) -> Vec<Command> {
             }
             Vec::new()
         }
+        Job::ListDirectories { request, actor } => directory_list_response(
+            &actor,
+            output.request.unwrap_or(request),
+            output.success,
+            output.directories,
+            &output.message,
+        ),
         Job::Timer => {
             state.timer_pending = false;
             vec![Command::SendHostMessage(
@@ -409,12 +484,40 @@ fn handle_worker_failed(worker: u64, message: &str) -> Vec<Command> {
             state.acquiring.remove(&path);
             host_message("worktree-failed", request, None, Some(message))
         }
+        Job::ListDirectories { request, actor } => {
+            directory_list_response(&actor, request, false, Vec::new(), message)
+        }
         Job::Timer => {
             state.timer_pending = false;
             Vec::new()
         }
         Job::Persist | Job::Cleanup { .. } => Vec::new(),
     }
+}
+
+fn directory_list_response(
+    actor: &str,
+    request: u64,
+    success: bool,
+    directories: Vec<String>,
+    message: &str,
+) -> Vec<Command> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": "directory-list",
+        "request": request,
+        "success": success,
+        "directories": directories,
+        "message": message,
+    }))
+    .ok()
+    .map(|body| {
+        Command::SendPresentationMessage(PresentationActorMessage {
+            actor: actor.to_string(),
+            body,
+        })
+    })
+    .into_iter()
+    .collect()
 }
 
 fn host_message(
@@ -550,6 +653,111 @@ async fn cleanup_worktree(record: &WorktreeRecord) -> Result<(), String> {
     let metadata_removed =
         run_command("rm", &["-f".to_string(), record.metadata_path.clone()]).await?;
     ensure_success(&metadata_removed, "remove managed worktree metadata")
+}
+
+async fn list_directories(roots: &[String]) -> Result<Vec<String>, String> {
+    // Presentation actor mailboxes are deliberately small. Keep the complete
+    // worker result and the eventual cross-realm reply below that boundary.
+    const DIRECTORY_RESULT_BYTES: usize = 12 * 1024;
+    const DIRECTORY_RESULT_COUNT: usize = 256;
+
+    let preferred_roots = roots
+        .iter()
+        .filter(|root| root.as_str() != "/" && root.starts_with('/'))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut directories = BTreeSet::new();
+    let mut failures = Vec::new();
+    for root in roots {
+        if !root.starts_with('/') {
+            continue;
+        }
+        let depth = if root == "/" { "2" } else { "3" };
+        let output = run_command(
+            "find",
+            &[
+                root.clone(),
+                "-maxdepth".to_string(),
+                depth.to_string(),
+                "-type".to_string(),
+                "d".to_string(),
+                "-print".to_string(),
+            ],
+        )
+        .await?;
+        let before = directories.len();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let path = line.trim_end_matches('/');
+            if path.is_empty()
+                || !path.starts_with('/')
+                || directory_is_implementation_noise(path)
+            {
+                continue;
+            }
+            directories.insert(path.to_string());
+        }
+        if output.status != 0 && directories.len() == before {
+            failures.push(command_error(&output, &format!("enumerate {root}")));
+        }
+    }
+    if directories.is_empty() {
+        return Err(if failures.is_empty() {
+            "backend returned no selectable directories".to_string()
+        } else {
+            failures.join("; ")
+        });
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by(|left, right| {
+        let hidden_components = |path: &str| {
+            path.split('/')
+                .filter(|component| component.starts_with('.'))
+                .count()
+        };
+        let depth = |path: &str| path.split('/').filter(|component| !component.is_empty()).count();
+        let preferred = |path: &str| {
+            !preferred_roots
+                .iter()
+                .any(|root| path_is_within(path, root))
+        };
+        preferred(left)
+            .cmp(&preferred(right))
+            .then_with(|| hidden_components(left).cmp(&hidden_components(right)))
+            .then_with(|| depth(left).cmp(&depth(right)))
+            .then_with(|| left.cmp(right))
+    });
+    let mut selected = Vec::new();
+    let mut bytes: usize = 0;
+    for directory in directories {
+        let next_bytes = directory.len().saturating_add(4);
+        if selected.len() >= DIRECTORY_RESULT_COUNT
+            || bytes.saturating_add(next_bytes) > DIRECTORY_RESULT_BYTES
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(next_bytes);
+        selected.push(directory);
+    }
+    Ok(selected)
+}
+
+fn path_is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn directory_is_implementation_noise(path: &str) -> bool {
+    ["/dev", "/proc", "/run", "/sys", "/nix/store"]
+        .iter()
+        .any(|root| path_is_within(path, root))
+        || path.ends_with("/.git")
+        || path.contains("/.git/")
+        || path.ends_with("/node_modules")
+        || path.contains("/node_modules/")
+        || path.ends_with("/target")
+        || path.contains("/target/")
 }
 
 struct GitOutput {

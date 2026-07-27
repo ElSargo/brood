@@ -32,6 +32,15 @@ focused pane's backend connection. A missing or reconnecting backend leaves a
 stable placeholder in the accepted layout while its catalogue and frame
 resources recover.
 
+Layout-state snapshots retain the backend and session realm for managed and
+client-local panes. The default workspace maps only presentation-global panes
+and panes belonging to the one selected `(BackendId, session)` pair. Attaching
+another backend does not make its active session part of the default view, and
+switching sessions removes the previous session's terminal and other
+realm-bound panes without stopping their actors. A custom layout actor may
+deliberately compose several sessions or backends from the global catalogue,
+but it never needs to infer ownership from numeric pane or session IDs.
+
 During the ABI migration, the client assigns each qualified managed pane a
 stable presentation-local view handle. Existing layout and WASM messages may
 continue to carry their `u64` handle, while the input boundary translates it
@@ -72,26 +81,34 @@ The migration order is:
 
 The sidebar's `New` action is backend-aware. It opens the fuzzy picker with
 the currently attached backends plus the backend-creation actions supported by
-the current client launch. A direct remote-connect action appears only when
-the client has authenticated transport configuration to reuse. Selecting an
-attached backend opens a second picker containing directories reported by
-that backend; selecting a directory sends the create operation to that
-backend, where the backend owns session creation and returns the new session
-identity.
+the current client installation. The remote action accepts an OpenSSH target,
+deploys and starts the remote backend asynchronously, and attaches its
+authenticated transport to the running presentation. Selecting an attached
+backend asks its daemon actor to enumerate a bounded directory catalogue rooted
+at the backend user's home, filesystem root, and known session directories.
+The returned paths populate the same fuzzy picker; selecting one sends the
+create operation to that backend, where the backend owns session creation and
+returns the new session identity.
+
+When no name is supplied, the owning backend generates a random readable name
+with an entropy suffix. Session numbers do not seed names, so independently
+started local and remote backends do not deterministically present the same
+initial name.
 
 Creating a local backend attaches another session-server connection to the
-same presentation. Connecting a remote backend attaches a direct transport
-endpoint supplied through the picker. Both paths publish the resulting backend
-and its session inventory through the same registry, so the view does not need
-a separate local or remote creation path.
+same presentation. Connecting a remote backend starts a packaged SSH deployer
+whose lifetime pipe belongs to the client, then attaches the returned
+authenticated endpoint. Closing the client or disconnecting that backend
+closes the pipe and stops the remote session. Both paths publish the resulting
+backend and its session inventory through the same registry, so the view does
+not need a separate local or remote creation path.
 
-The packaged SSH deployment workflow starts the client with both the deployed
-remote backend and the ordinary local backend. This makes the default
-operator path a simultaneous local-and-remote presentation; a direct client
-invocation may still choose a remote-only topology for focused testing.
-Each connected backend's active session receives a realm-bound frontend for
-the default terminal actor, so attaching a backend does not leave its
-session-local terminal running without a client pane.
+The packaged SSH deployment workflow keeps both the deployed remote backend
+and the ordinary local backend connected. Each connected backend's active
+session receives a realm-bound frontend for the default terminal actor, but
+only the globally selected session's frontend participates in the default
+layout. Switching back restores the preserved frontend; explicit multi-session
+layout actors remain free to map several connected backends at once.
 
 The exact message shapes and parser behavior remain defined by
 `crates/brood-protocol/src/lib.rs`; this document records ownership and

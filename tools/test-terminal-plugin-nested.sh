@@ -614,12 +614,39 @@ for mode in 1024x640 1400x800 960x600 1180x680; do
     "output $OUTPUT_NAME mode --custom ${mode}@${REFRESH_HZ}Hz" > /dev/null
   sleep 0.15
 done
+# A compositor drag can publish hundreds of output sizes faster than a
+# terminal guest can redraw. Exercise that burst explicitly: the client and
+# actor runtime must retain the latest size without filling a lossless mailbox
+# or terminating the terminal actor.
+wayland_env swaymsg "output $OUTPUT_NAME scale 1.25" > /dev/null
+for iteration in $(seq 1 160); do
+  if ((iteration == 81)); then
+    wayland_env swaymsg "output $OUTPUT_NAME scale 1.0" > /dev/null
+  fi
+  if ((iteration % 2 == 0)); then
+    mode=1180x680
+  else
+    mode=960x600
+  fi
+  wayland_env swaymsg \
+    "output $OUTPUT_NAME mode --custom ${mode}@${REFRESH_HZ}Hz" > /dev/null
+done
+wayland_env swaymsg "output $OUTPUT_NAME scale 1.0" > /dev/null
+wayland_env swaymsg \
+  "output $OUTPUT_NAME mode --custom 1180x680@${REFRESH_HZ}Hz" > /dev/null
 for _ in $(seq 1 200); do
   RESIZES="$(metric_value "$CLIENT2_LOG" pty_resizes)"
   ((RESIZES >= RESIZE_BASELINE + 4)) && break
   sleep 0.05
 done
 ((RESIZES >= RESIZE_BASELINE + 4))
+kill -0 "$CLIENT_PID" 2> /dev/null
+if rg -q \
+  'actor presentation dispatch backlog is full|component actor mailbox rejected message: channel closed|Error: stop presentation WASM runtime' \
+  "$CLIENT2_LOG"; then
+  echo "ERR rapid resize terminated or disconnected a presentation actor" >&2
+  exit 1
+fi
 capture "$OUT/terminal-helix-resized.png"
 
 # Let Helix consume the last PTY resize and finish its redraw before measuring

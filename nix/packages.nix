@@ -486,6 +486,8 @@ let
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
           --prefix GI_TYPELIB_PATH : "${gtkTypelibPath}" \
           --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \
+          --set BROOD_SSH_BACKEND "${sshBackend}" \
+          --set BROOD_SSH_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
           --run 'export GSETTINGS_SCHEMA_DIR="''${GSETTINGS_SCHEMA_DIR:-${gsettingsSchemaDir}}"' \
           --run 'export BROOD_CONFIG="''${BROOD_CONFIG:-'"$out"'/brood.toml}"'
       done
@@ -507,7 +509,9 @@ let
         nativeBuildInputs = [ pkgs.patchelf ];
       }
       ''
-        mkdir -p "$out/bin"
+        mkdir -p \
+          "$out/bin" \
+          "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release"
         for program in brood brood-remote brood-sessiond brood-runner-exec; do
           cp ${broodd}/bin/"$program" "$out/bin/$program"
           chmod u+w "$out/bin/$program"
@@ -518,6 +522,13 @@ let
         done
         install -m 0755 ${../tools/brood-ssh-backend-session.sh} \
           "$out/bin/brood-ssh-backend-session"
+        install -m 0555 \
+          ${wasmModules}/plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm \
+          "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"
+        printf '%s\n' \
+          '[init]' \
+          'backend = "plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"' \
+          > "$out/brood.toml"
       '';
 
   desktopActions = pkgs.writeShellApplication {

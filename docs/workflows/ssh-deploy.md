@@ -42,6 +42,15 @@ Closing the local presentation stops the remote backend session. Verified
 artifact content and deployment identity remain in per-host caches, so repeated
 deployments reuse local builds and remote artifact state.
 
+An already-running normal client exposes the same operation through
+`New -> Connect remote backend`. Enter an OpenSSH target such as
+`sargo@luna`; deployment runs in the background and the directory picker opens
+when the new backend is authenticated and its daemon actor has returned the
+remote directory catalogue. Typing filters real paths on the remote host; the
+filesystem root is a fallback rather than the only synthetic choice. The
+packaged client carries the portable backend needed by this flow, so it does
+not require a source checkout or a remote build.
+
 For an offscreen acceptance proof of the same packaged workflow, including the
 ordinary local backend, run:
 

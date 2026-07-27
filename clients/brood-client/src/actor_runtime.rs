@@ -39,6 +39,7 @@ pub struct PresentationWasmRuntime {
     event_proxy: Option<EventLoopProxy<ClientEvent>>,
     graphics: Option<PluginGraphicsBridge>,
     init: Option<PresentationInitState>,
+    failed_init_children: BTreeSet<String>,
     outbound_backend_messages: VecDeque<BackendActorMessageRequest>,
     outbound_session_commands: VecDeque<SessionCommandEnvelope>,
     outbound_host_messages: VecDeque<HostActorMessage>,
@@ -126,6 +127,7 @@ impl PresentationWasmRuntime {
             event_proxy,
             graphics: graphics.cloned(),
             init: None,
+            failed_init_children: BTreeSet::new(),
             outbound_backend_messages: VecDeque::new(),
             outbound_session_commands: VecDeque::new(),
             outbound_host_messages: VecDeque::new(),
@@ -433,9 +435,10 @@ impl PresentationWasmRuntime {
                         "presentation init child actor failed id={actor_id} message={message}"
                     );
                     self.send_init_child_event(ComponentChildEvent::Failed {
-                        id: actor_id,
+                        id: actor_id.clone(),
                         message,
                     });
+                    self.remove_failed_init_child(&actor_id);
                     continue;
                 }
                 Err(message) => {
@@ -471,9 +474,10 @@ impl PresentationWasmRuntime {
                         "presentation init child actor failed id={actor_id} message={message}"
                     );
                     self.send_init_child_event(ComponentChildEvent::Failed {
-                        id: actor_id,
+                        id: actor_id.clone(),
                         message,
                     });
+                    self.remove_failed_init_child(&actor_id);
                 }
                 ComponentActorEvent::DispatcherFailed { message } => {
                     anyhow::bail!("presentation actor {actor_id:?} dispatcher failed: {message}")
@@ -595,7 +599,16 @@ impl PresentationWasmRuntime {
                         });
                 }
                 ComponentActorEvent::LocalMessageRequested { actor, body } => {
-                    self.send_actor_message(&actor, actor_id, body)?;
+                    if let Err(error) = self.send_actor_message(&actor, actor_id, body) {
+                        if self.is_init_child(&actor) {
+                            eprintln!(
+                                "dropped local message to failed presentation child \
+                                 actor={actor:?}: {error:#}"
+                            );
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     // The recipient can enqueue its reply after this drain pass
                     // has already sampled every actor. Wake the client loop so
                     // actor-to-actor message chains continue without requiring
@@ -668,6 +681,7 @@ impl PresentationWasmRuntime {
         self.init
             .as_ref()
             .is_some_and(|init| init.children.contains(id))
+            || self.failed_init_children.contains(id)
     }
 
     fn handle_init_start(
@@ -811,6 +825,7 @@ impl PresentationWasmRuntime {
         if let Some(init) = self.init.as_mut() {
             init.children.insert(id.to_string());
         }
+        self.failed_init_children.remove(id);
         if let HostedWasmActor::Component(actor) = &self
             .actors
             .get(id)
@@ -863,6 +878,7 @@ impl PresentationWasmRuntime {
         if let Some(init) = self.init.as_mut() {
             init.children.remove(&id);
         }
+        self.failed_init_children.remove(&id);
         match result {
             Ok(()) => {
                 if let Some(pane) = removed_pane {
@@ -878,6 +894,25 @@ impl PresentationWasmRuntime {
                 id,
                 message: format!("{error:#}"),
             }),
+        }
+    }
+
+    fn remove_failed_init_child(&mut self, id: &str) {
+        let Some(mut actor) = self.actors.remove(id) else {
+            return;
+        };
+        if let Some(init) = self.init.as_mut() {
+            init.children.remove(id);
+        }
+        self.failed_init_children.insert(id.to_string());
+        if actor.pane != 0 {
+            self.pending_pane_removals.push_back(actor.pane);
+        }
+        if let Err(error) = self.executor.block_on(actor.actor.shutdown()) {
+            eprintln!("joined failed presentation init child id={id}: {error:#}");
+        }
+        if let Some(proxy) = &self.event_proxy {
+            drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
         }
     }
 

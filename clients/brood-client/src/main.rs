@@ -7,10 +7,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    io::{BufRead, BufReader},
     mem::size_of,
     net::ToSocketAddrs,
     os::fd::AsFd,
     path::PathBuf,
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -60,6 +62,10 @@ mod layout;
 mod plugin_gpu;
 mod plugin_graphics;
 mod remote;
+
+#[cfg(test)]
+#[path = "../../../plugins/default-workspace/src/backend_layout.rs"]
+mod default_workspace_backend_layout;
 
 use actor_runtime::{ActorIdentity, PresentationWasmRuntime};
 use backend_registry::{BackendRegistry, QualifiedPane};
@@ -298,6 +304,7 @@ fn main() -> Result<()> {
     let event_proxy = event_loop.create_proxy();
     let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
     let clipboard = ClipboardBridge::start();
+    let ssh_deployer = ssh_deployer_path();
     let mut backend_registry = BackendRegistry::default();
     let mut remote_config_template = None;
     let local_server_template = if args.no_server {
@@ -676,6 +683,7 @@ fn main() -> Result<()> {
         event_proxy: Some(event_proxy),
         remote_config_template,
         remote_connections,
+        ssh_deployer,
         local_server_template,
         backend_registry,
         ..Application::default()
@@ -728,12 +736,18 @@ fn main() -> Result<()> {
         .iter_mut()
         .try_for_each(remote::RemoteConnection::shutdown)
         .context("stop remote presentation transport");
+    let ssh_shutdown_result = application
+        .ssh_deployments
+        .iter_mut()
+        .try_for_each(SshBackendDeployment::shutdown)
+        .context("stop dynamically deployed SSH backends");
     let error = application.error.take();
     drop(application);
     run_result?;
     shutdown_result?;
     backend_shutdown_result?;
     remote_shutdown_result?;
+    ssh_shutdown_result?;
     if let Some(error) = error {
         return Err(error);
     }
@@ -784,6 +798,8 @@ enum ClientEvent {
         actor_id: String,
         completion: SessionCommandCompletion,
     },
+    SshBackendReady(SshBackendDeployment),
+    SshBackendFailed(String),
     ActorHostMessagesReady,
     BackendActorMessage {
         backend: BackendId,
@@ -792,6 +808,42 @@ enum ClientEvent {
         recipient: String,
         body: Vec<u8>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct SshAttachReady {
+    connect: std::net::SocketAddr,
+    server_name: String,
+    server_certificate: PathBuf,
+    client_certificate: PathBuf,
+    client_private_key: PathBuf,
+    session_package: String,
+    session_root: PathBuf,
+}
+
+#[derive(Debug)]
+struct SshBackendDeployment {
+    target: String,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    ready: SshAttachReady,
+    backend: Option<BackendId>,
+}
+
+impl SshBackendDeployment {
+    fn shutdown(&mut self) -> Result<()> {
+        drop(self.stdin.take());
+        let status = self
+            .child
+            .wait()
+            .with_context(|| format!("wait for SSH backend deployment {}", self.target))?;
+        anyhow::ensure!(
+            status.success(),
+            "SSH backend deployment {} exited with {status}",
+            self.target
+        );
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -821,6 +873,107 @@ struct BackendSessionView {
     branch: Option<String>,
     worktree: bool,
     git: bool,
+}
+
+fn ssh_deployer_path() -> Option<PathBuf> {
+    let configured = std::env::var_os("BROOD_REMOTE_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|executable| executable.with_file_name("brood-remote"))
+                .filter(|deployer| deployer.is_file())
+        })
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join("brood-remote"))
+                    .find(|deployer| deployer.is_file())
+            })
+        })?;
+    configured.is_file().then_some(configured)
+}
+
+fn start_ssh_backend_deployment(
+    deployer: &std::path::Path,
+    target: String,
+    proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
+) -> Result<()> {
+    let client = std::env::current_exe().context("resolve running brood-client executable")?;
+    let mut command = Command::new(deployer);
+    command
+        .arg("attach-ssh")
+        .arg(&target)
+        .arg("--client")
+        .arg(client);
+    if let Some(connect_host) =
+        std::env::var_os("BROOD_SSH_CONNECT_HOST").filter(|host| !host.is_empty())
+    {
+        command.arg("--connect-host").arg(connect_host);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("start SSH backend deployment for {target}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("SSH backend deployment stdin was not captured")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("SSH backend deployment stdout was not captured")?;
+    thread::Builder::new()
+        .name("brood-client-ssh-deploy".to_string())
+        .spawn(move || {
+            let mut child = child;
+            let mut stdin = Some(stdin);
+            let ready = (|| -> Result<SshAttachReady> {
+                let mut line = String::new();
+                let bytes = BufReader::new(stdout)
+                    .read_line(&mut line)
+                    .context("read SSH backend attachment details")?;
+                anyhow::ensure!(
+                    bytes > 0,
+                    "SSH backend deployer exited before publishing connection details"
+                );
+                serde_json::from_str(line.trim_end())
+                    .context("decode SSH backend attachment details")
+            })();
+            match ready {
+                Ok(ready) => {
+                    let deployment = SshBackendDeployment {
+                        target: target.clone(),
+                        child,
+                        stdin: stdin.take(),
+                        ready,
+                        backend: None,
+                    };
+                    if let Err(winit::event_loop::EventLoopClosed(event)) =
+                        proxy.send_event(ClientEvent::SshBackendReady(deployment))
+                        && let ClientEvent::SshBackendReady(mut deployment) = event
+                    {
+                        drop(deployment.stdin.take());
+                        drop(deployment.child.wait());
+                    }
+                }
+                Err(error) => {
+                    drop(stdin.take());
+                    let status = child.wait();
+                    let message = match status {
+                        Ok(status) => format!("{error:#}; deployer exited with {status}"),
+                        Err(wait_error) => {
+                            format!("{error:#}; could not wait for deployer: {wait_error}")
+                        }
+                    };
+                    drop(proxy.send_event(ClientEvent::SshBackendFailed(message)));
+                }
+            }
+        })
+        .context("spawn SSH backend deployment reader")?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1977,6 +2130,8 @@ struct Application {
     backend_sessions: BTreeMap<BackendId, SessionSnapshot>,
     remote_config_template: Option<remote::RemoteConfig>,
     remote_connections: Vec<remote::RemoteConnection>,
+    ssh_deployer: Option<PathBuf>,
+    ssh_deployments: Vec<SshBackendDeployment>,
     local_server_template: Option<ServerLaunch>,
     next_dynamic_local: u64,
     pending_frames: BTreeMap<BackendId, ClientEvent>,
@@ -2061,6 +2216,16 @@ impl Application {
             let mut connection = self.remote_connections.remove(position);
             if let Err(error) = connection.reap() {
                 eprintln!("remote backend {backend:?} stopped: {error:#}");
+            }
+        }
+        if let Some(position) = self
+            .ssh_deployments
+            .iter()
+            .position(|deployment| deployment.backend == Some(backend))
+        {
+            let mut deployment = self.ssh_deployments.remove(position);
+            if let Err(error) = deployment.shutdown() {
+                eprintln!("SSH deployment for backend {backend:?} stopped: {error:#}");
             }
         }
         self.backend_connected = self
@@ -2193,9 +2358,18 @@ impl Application {
         let mut config = self.remote_config_template.clone().context(
             "dynamic remote connections are unavailable without remote transport configuration",
         )?;
+        config.connect = connect;
+        self.connect_remote_backend_config(config)?;
+        eprintln!("connected dynamic remote backend address={address}");
+        Ok(())
+    }
+
+    fn connect_remote_backend_config(
+        &mut self,
+        mut config: remote::RemoteConfig,
+    ) -> Result<BackendId> {
         let backend = self.backend_registry.allocate(None);
         config.backend = backend;
-        config.connect = connect;
         let proxy = self
             .event_proxy
             .as_ref()
@@ -2222,8 +2396,60 @@ impl Application {
             .observe(backend, Some(connection.generation));
         self.remote_connections.push(connection);
         self.notify_backend_connected(backend)?;
-        eprintln!("connected dynamic remote backend={backend:?} address={address}");
+        Ok(backend)
+    }
+
+    fn connect_ssh_backend(&mut self, mut deployment: SshBackendDeployment) -> Result<()> {
+        let result = (|| -> Result<BackendId> {
+            let offer = format!(
+                "{}={}",
+                deployment.ready.session_package,
+                deployment.ready.session_root.display()
+            );
+            let config = remote::RemoteConfig {
+                backend: BackendId(0),
+                connect: deployment.ready.connect,
+                server_name: deployment.ready.server_name.clone(),
+                server_certificate: deployment.ready.server_certificate.clone(),
+                client_certificate: deployment.ready.client_certificate.clone(),
+                client_private_key: deployment.ready.client_private_key.clone(),
+                artifact_offers: brood_transport::package_offers(&offer, ArtifactRealm::Session)?,
+                allowed_client_artifacts: Vec::new(),
+                artifact_cache: brood_transport::default_artifact_cache(),
+            };
+            self.connect_remote_backend_config(config)
+        })();
+        let backend = match result {
+            Ok(backend) => backend,
+            Err(error) => {
+                if let Err(shutdown_error) = deployment.shutdown() {
+                    eprintln!(
+                        "could not stop failed SSH deployment {}: {shutdown_error:#}",
+                        deployment.target
+                    );
+                }
+                return Err(error);
+            }
+        };
+        deployment.backend = Some(backend);
+        eprintln!(
+            "connected in-client SSH backend={backend:?} target={}",
+            deployment.target
+        );
+        self.ssh_deployments.push(deployment);
         Ok(())
+    }
+
+    fn start_ssh_backend(&self, target: String) -> Result<()> {
+        let deployer = self
+            .ssh_deployer
+            .as_deref()
+            .context("the brood-remote SSH deployer is unavailable")?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .context("presentation event loop proxy is unavailable")?;
+        start_ssh_backend_deployment(deployer, target, proxy)
     }
 
     fn notify_backend_connected(&self, backend: BackendId) -> Result<()> {
@@ -2263,7 +2489,7 @@ impl Application {
         let message = BackendSessionsMessage {
             kind: "backend-sessions",
             can_create_local: self.local_server_template.is_some(),
-            can_connect_remote: self.remote_config_template.is_some(),
+            can_connect_remote: self.ssh_deployer.is_some(),
             backends: self
                 .backend_sessions
                 .iter()
@@ -2289,6 +2515,16 @@ impl Application {
                 })
                 .collect(),
         };
+        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+            for backend in &message.backends {
+                if let Some(active) = backend.sessions.iter().find(|session| session.active) {
+                    eprintln!(
+                        "backend session catalogue backend={} active={} name={:?}",
+                        backend.backend, active.id, active.name
+                    );
+                }
+            }
+        }
         runtime.send_actor_message(
             "session-switcher",
             "client".to_string(),
@@ -2590,6 +2826,11 @@ impl Application {
             ClientEvent::BackendSnapshot { .. } | ClientEvent::SessionCommandCompleted { .. } => {
                 return Err(anyhow!("backend event reached scene transport path"));
             }
+            ClientEvent::SshBackendReady(_) | ClientEvent::SshBackendFailed(_) => {
+                return Err(anyhow!(
+                    "SSH backend deployment event reached scene transport path"
+                ));
+            }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
             }
@@ -2809,6 +3050,19 @@ impl Application {
                 },
                 self.layout_leases.has_rest(lease).unwrap_or(false),
             );
+            if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                let mut backends = message
+                    .pane_realms
+                    .iter()
+                    .map(|realm| realm.backend.0)
+                    .collect::<Vec<_>>();
+                backends.sort_unstable();
+                backends.dedup();
+                eprintln!(
+                    "layout-state backend groups lease={} actor={} backends={backends:?}",
+                    lease.id.0, holder.name
+                );
+            }
             let payload =
                 serde_json::to_vec(&message).context("encode client layout-state message")?;
             let result = self.wasm_runtime.as_ref().map_or(Ok(()), |runtime| {
@@ -3082,6 +3336,20 @@ impl Application {
                         {
                             eprintln!(
                                 "could not notify session switcher about remote backend failure: \
+                                 {notify_error:#}"
+                            );
+                        }
+                    }
+                    None
+                }
+                HostMessage::DeploySshBackend { target } => {
+                    if let Err(error) = self.start_ssh_backend(target) {
+                        eprintln!("could not start in-client SSH backend: {error:#}");
+                        if let Err(notify_error) =
+                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                        {
+                            eprintln!(
+                                "could not notify session switcher about SSH backend failure: \
                                  {notify_error:#}"
                             );
                         }
@@ -3476,6 +3744,27 @@ impl ApplicationHandler<ClientEvent> for Application {
                     Err(error) => self.fail(event_loop, error),
                 }
             }
+            ClientEvent::SshBackendReady(deployment) => {
+                if let Err(error) = self.connect_ssh_backend(deployment) {
+                    eprintln!("could not attach deployed SSH backend: {error:#}");
+                    if let Err(notify_error) =
+                        self.notify_backend_connection_failed(&format!("{error:#}"))
+                    {
+                        eprintln!(
+                            "could not notify session switcher about SSH backend failure: \
+                             {notify_error:#}"
+                        );
+                    }
+                }
+            }
+            ClientEvent::SshBackendFailed(message) => {
+                eprintln!("in-client SSH backend deployment failed: {message}");
+                if let Err(error) = self.notify_backend_connection_failed(&message) {
+                    eprintln!(
+                        "could not notify session switcher about SSH backend failure: {error:#}"
+                    );
+                }
+            }
             ClientEvent::PluginGraphicsChanged { pane, sequence } => {
                 let mut failure = None;
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -3741,6 +4030,13 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.fail(event_loop, error);
             return;
         }
+        if let Some(renderer) = self.renderer.as_mut()
+            && let Err(error) =
+                flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)
+        {
+            self.fail(event_loop, error);
+            return;
+        }
         let input_backpressured = self.input_sender.as_mut().is_some_and(|lane| {
             lane.flush_deferred();
             lane.has_deferred()
@@ -3824,12 +4120,6 @@ impl ApplicationHandler<ClientEvent> for Application {
                         change,
                         self.window_focused,
                     )
-                {
-                    self.fail(event_loop, error);
-                    return;
-                }
-                if let Err(error) =
-                    flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)
                 {
                     self.fail(event_loop, error);
                     return;
@@ -4441,6 +4731,13 @@ struct AvailableWindow {
     app_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+struct LayoutPaneRealm {
+    pane: u64,
+    backend: BackendId,
+    session: u64,
+}
+
 #[derive(serde::Serialize)]
 struct LayoutStateMessage {
     #[serde(rename = "type")]
@@ -4450,6 +4747,7 @@ struct LayoutStateMessage {
     visible_panes: Vec<u64>,
     active_session: u64,
     available_windows: Vec<AvailableWindow>,
+    pane_realms: Vec<LayoutPaneRealm>,
     focused_pane: Option<u64>,
     pane_app_ids: Vec<KeyPolicyAppPane>,
     size: LayoutStateSize,
@@ -4460,6 +4758,33 @@ struct LayoutStateMessage {
 struct LayoutStateSize {
     w: i32,
     h: i32,
+}
+
+fn layout_pane_realms(
+    available_windows: &[AvailableWindow],
+    plugin_pane_realms: &BTreeMap<u64, Option<(BackendId, u64)>>,
+    owned_panes: &[u64],
+) -> Vec<LayoutPaneRealm> {
+    let mut pane_realms = available_windows
+        .iter()
+        .filter(|window| owned_panes.contains(&window.pane))
+        .map(|window| LayoutPaneRealm {
+            pane: window.pane,
+            backend: window.backend,
+            session: window.session,
+        })
+        .chain(plugin_pane_realms.iter().filter_map(|(pane, realm)| {
+            let (backend, session) = (*realm)?;
+            owned_panes.contains(pane).then_some(LayoutPaneRealm {
+                pane: *pane,
+                backend,
+                session,
+            })
+        }))
+        .collect::<Vec<_>>();
+    pane_realms.sort_by_key(|realm| realm.pane);
+    pane_realms.dedup_by_key(|realm| realm.pane);
+    pane_realms
 }
 
 struct ImportedFrame {
@@ -4743,6 +5068,7 @@ fn apply_key_policy_host_message(
         | HostMessage::SetShortcutPassthrough { .. }
         | HostMessage::BackendSession { .. }
         | HostMessage::ConnectRemoteBackend { .. }
+        | HostMessage::DeploySshBackend { .. }
         | HostMessage::CreateLocalBackend => None,
         HostMessage::SetClipboard { text } => {
             clipboard
@@ -5722,7 +6048,12 @@ impl Renderer {
         backend: BackendId,
         active_session: u64,
     ) -> Option<FocusChange> {
-        if self.active_sessions.get(&backend).copied() == Some(active_session) {
+        let backend_was_already_active =
+            self.active_sessions.get(&backend).copied() == Some(active_session);
+        if backend_was_already_active
+            && self.active_backend == Some(backend)
+            && self.active_session == active_session
+        {
             return None;
         }
         self.active_backend = Some(backend);
@@ -5910,16 +6241,14 @@ impl Renderer {
             managed_panes: self
                 .available_windows
                 .iter()
-                .filter(|window| {
-                    self.active_sessions.get(&window.backend).copied() == Some(window.session)
-                })
+                .filter(|window| self.selected_session_is(window.backend, window.session))
                 .map(|window| window.pane)
                 .collect(),
             app_panes: self
                 .available_windows
                 .iter()
                 .filter(|window| {
-                    self.active_sessions.get(&window.backend).copied() == Some(window.session)
+                    self.selected_session_is(window.backend, window.session)
                         && !window.app_id.is_empty()
                 })
                 .map(|window| KeyPolicyAppPane {
@@ -6214,6 +6543,11 @@ impl Renderer {
                 .filter(|window| owned_panes.contains(&window.pane))
                 .cloned()
                 .collect(),
+            pane_realms: layout_pane_realms(
+                &self.available_windows,
+                &self.plugin_pane_realms,
+                owned_panes,
+            ),
             focused_pane,
             pane_app_ids: self
                 .available_windows
@@ -6246,12 +6580,14 @@ impl Renderer {
             .chain(
                 self.available_windows
                     .iter()
-                    .filter(|window| {
-                        self.active_sessions.get(&window.backend).copied() == Some(window.session)
-                    })
+                    .filter(|window| self.selected_session_is(window.backend, window.session))
                     .map(|window| window.pane),
             )
             .collect()
+    }
+
+    fn selected_session_is(&self, backend: BackendId, session: u64) -> bool {
+        self.active_backend == Some(backend) && self.active_session == session
     }
 
     fn visible_plugin_panes(&self) -> Vec<u64> {
@@ -6260,9 +6596,8 @@ impl Renderer {
             .copied()
             .filter(|pane| {
                 self.plugin_pane_realms.get(pane).is_none_or(|realm| {
-                    realm.is_none_or(|(backend, session)| {
-                        self.active_sessions.get(&backend).copied() == Some(session)
-                    })
+                    realm
+                        .is_none_or(|(backend, session)| self.selected_session_is(backend, session))
                 })
             })
             .collect()
@@ -6666,6 +7001,7 @@ impl Renderer {
 fn default_visible_panes(
     plugin_panes: impl IntoIterator<Item = u64>,
     windows: &[AvailableWindow],
+    active_backend: BackendId,
     active_session: u64,
 ) -> Vec<u64> {
     plugin_panes
@@ -6673,7 +7009,9 @@ fn default_visible_panes(
         .chain(
             windows
                 .iter()
-                .filter(|window| window.session == active_session)
+                .filter(|window| {
+                    window.backend == active_backend && window.session == active_session
+                })
                 .map(|window| window.pane),
         )
         .collect()
@@ -6828,6 +7166,7 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use default_workspace_backend_layout::{PanePlacement, pane_placement};
 
     fn available(pane: u64, session: u64) -> AvailableWindow {
         AvailableWindow {
@@ -6839,15 +7178,108 @@ mod tests {
     }
 
     #[test]
-    fn session_selection_filters_default_view_without_reducing_layout_authority() {
-        let windows = vec![available(10, 1), available(20, 2), available(30, 2)];
+    fn layout_separates_backend_groups_into_columns() {
+        let panes = [10, 20, 11];
+        let backends = [1, 2, 1];
         assert_eq!(
-            default_visible_panes([u64::MAX], &windows, 1),
+            pane_placement(0, &panes, &backends),
+            PanePlacement {
+                offset_u: -1.0,
+                offset_v: -1.0,
+                size_u: 1.0,
+                size_v: 1.0,
+            }
+        );
+        assert_eq!(
+            pane_placement(1, &panes, &backends),
+            PanePlacement {
+                offset_u: 0.0,
+                offset_v: -1.0,
+                size_u: 1.0,
+                size_v: 2.0,
+            }
+        );
+        assert_eq!(
+            pane_placement(2, &panes, &backends),
+            PanePlacement {
+                offset_u: -1.0,
+                offset_v: 0.0,
+                size_u: 1.0,
+                size_v: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn one_backend_keeps_the_existing_primary_and_stack_layout() {
+        let panes = [10, 11, 12];
+        let backends = [7, 7, 7];
+        assert_eq!(
+            pane_placement(0, &panes, &backends),
+            PanePlacement {
+                offset_u: -1.0,
+                offset_v: -1.0,
+                size_u: 1.0,
+                size_v: 2.0,
+            }
+        );
+        assert_eq!(
+            pane_placement(2, &panes, &backends),
+            PanePlacement {
+                offset_u: 0.0,
+                offset_v: 0.0,
+                size_u: 1.0,
+                size_v: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn layout_state_qualifies_managed_and_plugin_panes_by_backend() {
+        let windows = vec![AvailableWindow {
+            backend: BackendId(1),
+            pane: 10,
+            session: 4,
+            app_id: "managed".to_string(),
+        }];
+        let plugin_realms = BTreeMap::from([
+            (20, Some((BackendId(2), 7))),
+            (30, None),
+            (40, Some((BackendId(3), 9))),
+        ]);
+
+        assert_eq!(
+            layout_pane_realms(&windows, &plugin_realms, &[10, 20, 30]),
+            [
+                LayoutPaneRealm {
+                    pane: 10,
+                    backend: BackendId(1),
+                    session: 4,
+                },
+                LayoutPaneRealm {
+                    pane: 20,
+                    backend: BackendId(2),
+                    session: 7,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_selection_filters_default_view_without_reducing_layout_authority() {
+        let mut windows = vec![available(10, 1), available(20, 2), available(30, 2)];
+        windows[2].backend = BackendId(2);
+        assert_eq!(
+            default_visible_panes([u64::MAX], &windows, BackendId(1), 1),
             [u64::MAX, 10]
         );
         assert_eq!(
-            default_visible_panes([u64::MAX], &windows, 2),
-            [u64::MAX, 20, 30]
+            default_visible_panes([u64::MAX], &windows, BackendId(1), 2),
+            [u64::MAX, 20]
+        );
+        assert_eq!(
+            default_visible_panes([u64::MAX], &windows, BackendId(2), 2),
+            [u64::MAX, 30]
         );
 
         let inventory = windows.iter().map(|window| window.pane).collect::<Vec<_>>();
@@ -6863,7 +7295,7 @@ mod tests {
     #[test]
     fn mapping_readiness_is_not_part_of_default_layout_input() {
         let windows = vec![available(41, 7), available(42, 8)];
-        assert_eq!(default_visible_panes([], &windows, 7), [41]);
+        assert_eq!(default_visible_panes([], &windows, BackendId(1), 7), [41]);
         assert!(managed_pane_uses_placeholder(true, false));
         assert!(!managed_pane_uses_placeholder(true, true));
         assert!(!managed_pane_uses_placeholder(false, false));

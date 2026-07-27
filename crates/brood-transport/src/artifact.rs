@@ -83,6 +83,14 @@ fn collect_wasm_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let file_type = entry.file_type().with_context(|| {
             format!("inspect artifact package member {}", entry.path().display())
         })?;
+        if file_type.is_dir() && entry.file_name() == "deps" {
+            // A source-checkout package root commonly points into Cargo's
+            // `target/<triple>/release` directory. The adjacent `deps`
+            // directory contains compiler copies of those same WASM files,
+            // not actor package members; cataloguing both would advertise one
+            // content digest twice and reject the connection.
+            continue;
+        }
         if file_type.is_dir() {
             collect_wasm_files(&entry.path(), files)?;
         } else if file_type.is_file()
@@ -902,6 +910,32 @@ mod tests {
                 digest: child_digest
             }]
         );
+        drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn package_catalog_excludes_cargo_dependency_copies() {
+        let root = test_root("package-cargo-deps");
+        let deps = root.join("deps");
+        fs::create_dir_all(&deps).unwrap_or_else(|error| unreachable!("{error}"));
+        let init_path = root.join("init.component.wasm");
+        fs::write(&init_path, b"\0asm init").unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(deps.join("init.component.wasm"), b"\0asm init")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let offers = package_offers(
+            &format!("workspace={}", init_path.display()),
+            ArtifactRealm::Session,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(offers.len(), 1);
+        ArtifactExchange::new(
+            ArtifactRealm::Client,
+            Vec::<String>::new(),
+            root.join("cache"),
+            offers,
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
         drop(fs::remove_dir_all(root));
     }
 

@@ -54,6 +54,8 @@ enum Command {
     },
     /// Build, copy, and start a backend over SSH, then launch the local client.
     Ssh(ssh::SshArgs),
+    /// Start an SSH backend for an already-running presentation client.
+    AttachSsh(ssh::SshArgs),
     /// Relay one local session connection over authenticated QUIC.
     Relay {
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -154,6 +156,7 @@ async fn main() -> Result<()> {
             private_key,
         } => generate_certificate(&server_name, &certificate, &private_key),
         Command::Ssh(args) => ssh::deploy(&args),
+        Command::AttachSsh(args) => ssh::attach(&args),
         Command::Relay {
             listen,
             certificate,

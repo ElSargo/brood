@@ -110,6 +110,13 @@ messages cross the connection. A presentation child records its optional
 backend-and-session association at creation; the client does not derive
 ownership from the active session, focused backend, or actor ID.
 
+The default visible set contains presentation-global actors plus actors and
+managed windows associated with the one selected backend/session pair.
+Connections retain their independent active-session catalogues for routing and
+reconnection, but those per-backend values do not make every backend's terminal
+frontend visible. Layout actors that intentionally implement multi-session
+views consume the qualified global catalogue explicitly.
+
 ## Connection And Lease Lifecycle
 
 DBus is the local discovery, authentication, descriptor broker, and public
