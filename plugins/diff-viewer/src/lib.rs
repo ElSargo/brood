@@ -9,7 +9,7 @@ use std::{
 };
 
 use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
+use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use exports::brood::plugin::actor::{
     Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
     WorkerRequest,
@@ -30,31 +30,20 @@ const SCROLLBAR_THUMB_WIDTH: f32 = 5.0;
 const MAX_DIFF_BYTES: usize = 900 * 1024;
 const MAX_UNTRACKED_FILES: usize = 128;
 
-// Zed One Dark tokens, with diff backgrounds derived from its version-control
-// colors at the same subtle opacity used by the editor.
-const BG: Color = rgb(0x28, 0x2c, 0x33);
-const SURFACE: Color = rgb(0x2f, 0x34, 0x3e);
-const ACTIVE: Color = rgb(0x45, 0x4a, 0x56);
-const BORDER: Color = rgb(0x46, 0x4b, 0x57);
-const FG: Color = rgb(0xac, 0xb2, 0xbe);
-const TEXT: Color = rgb(0xdc, 0xe0, 0xe5);
-const MUTED: Color = rgb(0x87, 0x8a, 0x98);
-const LINE_NUMBER: Color = rgb(0x4e, 0x5a, 0x5f);
-const ADDED: Color = rgb(0x27, 0xa6, 0x57);
-const DELETED: Color = rgb(0xe0, 0x6c, 0x76);
-const MODIFIED: Color = rgb(0xd3, 0xb0, 0x20);
-const ADDED_BG: Color = Color::rgba(0.153, 0.651, 0.341, 0.16);
-const DELETED_BG: Color = Color::rgba(0.878, 0.424, 0.463, 0.16);
-const EMPTY_BG: Color = Color::rgba(0.18, 0.20, 0.24, 0.72);
-
-const fn rgb(red: u8, green: u8, blue: u8) -> Color {
-    Color::rgba(
-        red as f32 / 255.0,
-        green as f32 / 255.0,
-        blue as f32 / 255.0,
-        1.0,
-    )
-}
+const BG: Color = ashen::BACKGROUND;
+const SURFACE: Color = ashen::SURFACE;
+const ACTIVE: Color = ashen::CURSOR_LINE;
+const BORDER: Color = ashen::BORDER;
+const FG: Color = ashen::TEXT;
+const TEXT: Color = ashen::TEXT_STRONG;
+const MUTED: Color = ashen::MUTED;
+const LINE_NUMBER: Color = ashen::SUBTLE;
+const ADDED: Color = ashen::DIFF_ADDED;
+const DELETED: Color = ashen::DIFF_DELETED;
+const MODIFIED: Color = ashen::DIFF_MODIFIED;
+const ADDED_BG: Color = ashen::DIFF_ADDED_BG;
+const DELETED_BG: Color = ashen::DIFF_DELETED_BG;
+const EMPTY_BG: Color = ashen::DIFF_EMPTY_BG;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChangeKind {

@@ -9,7 +9,7 @@ use std::{
 };
 
 use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
+use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest,
     LifecycleEvent, LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
@@ -30,22 +30,23 @@ const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
 const DIFF_VIEWER_ID_PREFIX: &str = "diff-viewer-s";
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
-const HEADER_HEIGHT: f32 = 104.0;
-const FOOTER_HEIGHT: f32 = 58.0;
-const ROW_HEIGHT: f32 = 46.0;
-const PROJECT_ROW_HEIGHT: f32 = 38.0;
+const HEADER_HEIGHT: f32 = 52.0;
+const FOOTER_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = 30.0;
+const PROJECT_ROW_HEIGHT: f32 = 34.0;
 const SIDE_MARGIN: f32 = 14.0;
 const SIDEBAR_WIDTH: f64 = 320.0;
 
-const BG: Color = Color::rgba(0.157, 0.157, 0.157, 1.0);
-const PANEL: Color = Color::rgba(0.235, 0.220, 0.204, 1.0);
-const PANEL_DARK: Color = Color::rgba(0.118, 0.118, 0.118, 1.0);
-const FG: Color = Color::rgba(0.922, 0.859, 0.698, 1.0);
-const MUTED: Color = Color::rgba(0.659, 0.600, 0.518, 1.0);
-const YELLOW: Color = Color::rgba(0.843, 0.600, 0.129, 1.0);
-const BLUE: Color = Color::rgba(0.271, 0.522, 0.533, 1.0);
-const GREEN: Color = Color::rgba(0.596, 0.592, 0.102, 1.0);
-const RED: Color = Color::rgba(0.800, 0.141, 0.114, 1.0);
+const BG: Color = ashen::BACKGROUND;
+const SURFACE: Color = ashen::SURFACE;
+const SURFACE_RAISED: Color = ashen::SURFACE_RAISED;
+const ACTIVE: Color = ashen::CURSOR_LINE;
+const BORDER: Color = ashen::BORDER;
+const FG: Color = ashen::TEXT;
+const TEXT: Color = ashen::TEXT_STRONG;
+const MUTED: Color = ashen::MUTED;
+const YELLOW: Color = ashen::ACCENT;
+const RED: Color = ashen::ERROR;
 
 #[derive(Clone)]
 struct ViewSession {
@@ -1861,7 +1862,8 @@ fn handle_pointer_button(
     y: f32,
     button: u32,
 ) -> Vec<ActorCommand> {
-    if y < 96.0 && x >= state.width - 76.0 && button == LEFT_BUTTON {
+    let header = header_geometry(state.width);
+    if y < HEADER_HEIGHT && x >= header.button_x && button == LEFT_BUTTON {
         return open_creation_backend_picker(state);
     }
     if y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
@@ -2202,39 +2204,49 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: BG,
     });
+    packet.push(Command::FillRect {
+        rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
+        color: SURFACE,
+    });
+    packet.push(Command::FillRect {
+        rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, state.width, 1.0),
+        color: BORDER,
+    });
 
+    let header = header_geometry(state.width);
     add_text(
         state,
         &mut packet,
         &mut resources,
-        "Sessions",
-        22.0,
-        FG,
+        if header.narrow_title { "S" } else { "Sessions" },
+        17.0,
+        TEXT,
         SIDE_MARGIN,
-        12.0,
-        state.width - 28.0,
+        14.0,
+        (header.input_x - SIDE_MARGIN * 2.0).max(12.0),
     )?;
 
     let input_color = if state.error {
         RED
     } else if state.mode == EditMode::Search {
-        PANEL
+        BORDER
     } else {
-        BLUE
+        YELLOW
     };
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(SIDE_MARGIN, 50.0, state.width - 104.0, 40.0),
-        radius: 7.0,
-        color: PANEL_DARK,
+        rect: Rect::new(header.input_x, 10.0, header.input_width, 32.0),
+        radius: 4.0,
+        color: SURFACE_RAISED,
     });
     packet.push(Command::StrokeRoundedRect {
-        rect: Rect::new(SIDE_MARGIN, 50.0, state.width - 104.0, 40.0),
-        radius: 7.0,
+        rect: Rect::new(header.input_x, 10.0, header.input_width, 32.0),
+        radius: 4.0,
         color: input_color,
-        width: 1.5,
+        width: 1.0,
     });
     let prompt = if state.query.is_empty() {
         match &state.mode {
+            EditMode::Search if header.input_width < 132.0 => "Search…".to_string(),
             EditMode::Search => "Search or create…".to_string(),
             EditMode::Rename(..) => "New session name…".to_string(),
             EditMode::CreateWorktree(..) => "Branch name…".to_string(),
@@ -2247,19 +2259,19 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         state,
         &mut packet,
         &mut resources,
-        &prompt,
-        15.0,
+        &truncate_to_width(&prompt, header.input_width - 16.0, 14.0),
+        14.0,
         if state.query.is_empty() { MUTED } else { FG },
-        SIDE_MARGIN + 10.0,
-        58.0,
-        state.width - 124.0,
+        header.input_x + 8.0,
+        16.0,
+        header.input_width - 16.0,
     )?;
 
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(state.width - 78.0, 50.0, 64.0, 40.0),
-        radius: 7.0,
+        rect: Rect::new(header.button_x, 10.0, header.button_width, 32.0),
+        radius: 4.0,
         color: if state.pending.is_some() {
-            PANEL
+            SURFACE_RAISED
         } else {
             YELLOW
         },
@@ -2271,15 +2283,15 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         if state.pending.is_some() {
             "…"
         } else if state.mode == EditMode::Search {
-            "+ New"
+            if header.compact_button { "+" } else { "+ New" }
         } else {
-            "Create"
+            if header.compact_button { "+" } else { "Create" }
         },
-        14.0,
-        PANEL_DARK,
-        state.width - 68.0,
-        59.0,
-        48.0,
+        11.0,
+        if state.pending.is_some() { MUTED } else { BG },
+        header.button_x + 5.0,
+        16.0,
+        header.button_width - 10.0,
     )?;
 
     let items = state.list_items();
@@ -2297,7 +2309,11 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             ListItem::Project(project) => {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, state.width, PROJECT_ROW_HEIGHT),
-                    color: PANEL_DARK,
+                    color: SURFACE,
+                });
+                packet.push(Command::FillRect {
+                    rect: Rect::new(0.0, y + PROJECT_ROW_HEIGHT - 1.0, state.width, 1.0),
+                    color: BORDER,
                 });
                 let collapsed = state
                     .collapsed_projects
@@ -2307,20 +2323,20 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                     &mut packet,
                     &mut resources,
                     if collapsed { "▸" } else { "▾" },
-                    14.0,
+                    12.0,
                     MUTED,
                     SIDE_MARGIN,
                     y + 8.0,
-                    14.0,
+                    12.0,
                 )?;
                 add_text(
                     state,
                     &mut packet,
                     &mut resources,
-                    &truncate(&project.name, 22),
-                    14.0,
-                    FG,
-                    SIDE_MARGIN + 18.0,
+                    &truncate_to_width(&project.name, state.width - 126.0, 13.0),
+                    13.0,
+                    TEXT,
+                    SIDE_MARGIN + 16.0,
                     y + 8.0,
                     state.width - 126.0,
                 )?;
@@ -2329,7 +2345,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                     &mut packet,
                     &mut resources,
                     &project.sessions.len().to_string(),
-                    12.0,
+                    10.0,
                     MUTED,
                     state.width - 76.0,
                     y + 9.0,
@@ -2341,10 +2357,10 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                         &mut packet,
                         &mut resources,
                         "+",
-                        20.0,
+                        16.0,
                         YELLOW,
                         state.width - 36.0,
-                        y + 4.0,
+                        y + 5.0,
                         20.0,
                     )?;
                 }
@@ -2352,71 +2368,74 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             ListItem::Session(index) => {
                 let session = state.sessions[*index].clone();
                 let selected = state.selected == Some((session.backend, session.id));
+                let name_x = SIDE_MARGIN + 12.0;
+                let close_x = state.width - 38.0;
+                let show_window_count = state.width >= 220.0;
+                let count_x = state.width - 116.0;
+                let name_right = if show_window_count {
+                    count_x - 8.0
+                } else {
+                    close_x - 8.0
+                };
+                let name_width = (name_right - name_x).max(1.0);
                 if session.active || selected {
-                    packet.push(Command::FillRoundedRect {
-                        rect: Rect::new(
-                            SIDE_MARGIN + 12.0,
-                            y + 3.0,
-                            state.width - 40.0,
-                            ROW_HEIGHT - 6.0,
-                        ),
-                        radius: 6.0,
+                    packet.push(Command::FillRect {
+                        rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
                         color: if session.active {
-                            Color::rgba(BLUE.r, BLUE.g, BLUE.b, 0.46)
+                            ashen::SELECTION
                         } else {
-                            Color::rgba(PANEL.r, PANEL.g, PANEL.b, 0.72)
+                            ACTIVE
                         },
                     });
-                }
-                if selected {
-                    packet.push(Command::StrokeRoundedRect {
-                        rect: Rect::new(
-                            SIDE_MARGIN + 12.0,
-                            y + 3.0,
-                            state.width - 40.0,
-                            ROW_HEIGHT - 6.0,
-                        ),
-                        radius: 6.0,
+                    packet.push(Command::FillRect {
+                        rect: Rect::new(0.0, y, 3.0, ROW_HEIGHT),
                         color: YELLOW,
-                        width: 1.5,
                     });
                 }
+                packet.push(Command::FillRect {
+                    rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
+                    color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.38),
+                });
                 add_text(
                     state,
                     &mut packet,
                     &mut resources,
-                    &truncate(&session.name, 24),
-                    16.0,
+                    &truncate_to_width(&session.name, name_width, 13.0),
+                    13.0,
                     FG,
-                    SIDE_MARGIN + 22.0,
-                    y + 8.0,
-                    state.width - 158.0,
+                    name_x,
+                    y + 5.0,
+                    name_width,
                 )?;
-                let count = if session.windows == 1 {
-                    "1 window".to_string()
-                } else {
-                    format!("{} windows", session.windows)
-                };
-                add_text(
-                    state,
-                    &mut packet,
-                    &mut resources,
-                    &count,
-                    12.0,
-                    if session.active { GREEN } else { MUTED },
-                    state.width - 116.0,
-                    y + 11.0,
-                    70.0,
-                )?;
+                if show_window_count {
+                    let count = if state.width < 300.0 {
+                        format!("{} win", session.windows)
+                    } else if session.windows == 1 {
+                        "1 window".to_string()
+                    } else {
+                        format!("{} windows", session.windows)
+                    };
+                    add_text(
+                        state,
+                        &mut packet,
+                        &mut resources,
+                        &count,
+                        10.0,
+                        if session.active { TEXT } else { MUTED },
+                        count_x,
+                        y + 6.0,
+                        70.0,
+                    )?;
+                }
                 add_text(
                     state,
                     &mut packet,
                     &mut resources,
                     "×",
-                    18.0,
+                    16.0,
                     RED,
-                    state.width - 38.0,
-                    y + 7.0,
+                    close_x,
+                    y + 2.0,
                     20.0,
                 )?;
             }
@@ -2435,7 +2454,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         packet.push(Command::FillRoundedRect {
             rect: Rect::new(state.width - 5.0, thumb_y, 3.0, thumb_height),
             radius: 1.5,
-            color: MUTED,
+            color: Color::rgba(FG.r, FG.g, FG.b, 0.42),
         });
     }
 
@@ -2446,7 +2465,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             state.width,
             FOOTER_HEIGHT,
         ),
-        color: PANEL_DARK,
+        color: SURFACE,
     });
     let footer = if !state.status.is_empty() {
         state.status.clone()
@@ -2459,15 +2478,11 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         state,
         &mut packet,
         &mut resources,
-        &if state.error {
-            truncate(&footer, 150)
-        } else {
-            truncate(&footer, 48)
-        },
-        12.0,
+        &truncate_to_width(&footer, state.width - 28.0, 10.0),
+        10.0,
         if state.error { RED } else { MUTED },
         SIDE_MARGIN,
-        state.height - FOOTER_HEIGHT + 8.0,
+        state.height - 21.0,
         state.width - 28.0,
     )?;
 
@@ -2479,6 +2494,33 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
     }
     state.text_resources = resources;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeaderGeometry {
+    input_x: f32,
+    input_width: f32,
+    button_x: f32,
+    button_width: f32,
+    compact_button: bool,
+    narrow_title: bool,
+}
+
+fn header_geometry(width: f32) -> HeaderGeometry {
+    let compact_button = width < 260.0;
+    let narrow_title = width < 220.0;
+    let button_width = if compact_button { 32.0 } else { 42.0 };
+    let button_x = (width - SIDE_MARGIN - button_width).max(SIDE_MARGIN);
+    let input_x = if narrow_title { 36.0 } else { 94.0 };
+    let input_width = (button_x - input_x - 8.0).max(1.0);
+    HeaderGeometry {
+        input_x,
+        input_width,
+        button_x,
+        button_width,
+        compact_button,
+        narrow_title,
+    }
 }
 
 const fn item_height(item: &ListItem) -> f32 {
@@ -2518,12 +2560,28 @@ fn add_text(
     )
     .map_err(|error| format!("layout session switcher text: {error:?}"))?;
     resources.push(layout.handle);
+    packet.push(Command::Save);
+    packet.push(Command::ClipRect(Rect::new(
+        x,
+        y,
+        max_width.max(1.0),
+        size + 4.0,
+    )));
     packet.push(Command::DrawTextLayout {
         layout: layout.handle,
         x,
         y,
     });
+    packet.push(Command::Restore);
     Ok(())
+}
+
+fn truncate_to_width(text: &str, max_width: f32, font_size: f32) -> String {
+    if max_width < font_size {
+        return String::new();
+    }
+    let max_chars = (max_width / (font_size * 0.64)).floor().max(2.0) as usize;
+    truncate(text, max_chars)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -2540,7 +2598,26 @@ export!(SessionSwitcher with_types_in self);
 
 #[cfg(test)]
 mod tests {
-    use super::{ActorCommand, SwitcherState, ensure_default_terminal_ui};
+    use super::{
+        ActorCommand, SwitcherState, ensure_default_terminal_ui, header_geometry, truncate_to_width,
+    };
+
+    #[test]
+    fn narrow_header_geometry_never_overlaps_the_action_button() {
+        for width in [180.0, 220.0, 252.0, 320.0] {
+            let header = header_geometry(width);
+            assert!(header.input_width > 0.0);
+            assert!(header.input_x + header.input_width <= header.button_x);
+        }
+    }
+
+    #[test]
+    fn narrow_session_names_are_ellipsized_to_one_row() {
+        assert_eq!(
+            truncate_to_width("drift-bay-pulse-909d", 92.0, 13.0),
+            "drift-bay-p…"
+        );
+    }
 
     #[test]
     fn each_backend_active_session_gets_one_default_terminal_frontend() {

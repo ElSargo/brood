@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo grim magick pkg-config sway wasm-tools wtype; do
+for tool in cargo cc grim magick pkg-config sway wasm-tools wayland-scanner wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the coding-agent proof" >&2
     exit 2
@@ -95,6 +95,26 @@ cargo build \
   --target wasm32-unknown-unknown \
   --release \
   --locked
+read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client)"
+VIRTUAL_POINTER_XML="$(
+  pkg-config --variable=pkgdatadir wlr-protocols
+)/unstable/wlr-virtual-pointer-unstable-v1.xml"
+wayland-scanner client-header \
+  "$VIRTUAL_POINTER_XML" \
+  "$OUT/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+wayland-scanner private-code \
+  "$VIRTUAL_POINTER_XML" \
+  "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -I "$OUT" \
+  tools/virtual-pointer-click.c \
+  "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c" \
+  -o "$OUT/virtual-pointer-click" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
 target/debug/brood-client \
   --no-server \
   --wasm-key-policy workspace \
@@ -169,6 +189,12 @@ for _ in $(seq 1 100); do
 done
 [[ -n "$WAYLAND_SOCKET" ]]
 
+click_at() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-click" "$1" "$2" 1280 720
+}
+
 env -u brood_session \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
@@ -220,7 +246,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype -s 100 -k Return
 
-AGENT_UI="coding-agent-ui-s1-2"
+AGENT_UI="coding-agent-ui-b1-s1-2"
 
 second_agent_ui_focused() {
   rg -q "presentation key policy requested pane focus.*focused=Some.*changed=true" \
@@ -235,7 +261,7 @@ second_agent_ui_focused() {
 for _ in $(seq 1 300); do
   if rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
     && rg -q "started presentation WASM actor id=$AGENT_UI" "$CLIENT_LOG" \
-    && rg -q "presentation actor message sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
+    && rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
       "$CLIENT_LOG" \
     && second_agent_ui_focused; then
     break
@@ -248,17 +274,18 @@ for _ in $(seq 1 300); do
 done
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
 rg -q "started presentation WASM actor id=$AGENT_UI" "$CLIENT_LOG"
-rg -q "presentation actor message sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
+rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
   "$CLIENT_LOG"
 second_agent_ui_focused
 
+click_at 480 360
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -s 100 -k F2
 
 for _ in $(seq 1 300); do
   if rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG" \
-    && rg -q 'session actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"; then
+    && rg -q 'backend actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -268,8 +295,8 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG"
-rg -q 'session actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"
-rg -q "presentation actor message sender=$AGENT_UI recipient=init.*\"kind\":\"create-agent\"" \
+rg -q 'backend actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"
+rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"create-agent\"" \
   "$CLIENT_LOG"
 
 capture() {
@@ -282,17 +309,18 @@ capture() {
 capture "$OUT/agent-idle.png"
 
 PROMPT='create .brood/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
+click_at 480 360
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -k Tab -s 100 "$PROMPT" -s 100 -k Return
 
 for _ in $(seq 1 300); do
-  if rg -q 'presentation actor message.*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"; then
+  if rg -q 'presentation actor message .*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
-rg -q 'presentation actor message.*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"
+rg -q 'presentation actor message .*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"
 
 for _ in $(seq 1 900); do
   if [[ -f "$WORKSPACE/.brood/agent-actor-proof.txt" ]] \
@@ -309,7 +337,7 @@ rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt"
 
 for _ in $(seq 1 600); do
   idle_updates="$(
-    rg -c 'session actor message.*"status":"idle"' "$CLIENT_LOG" || true
+    rg -c 'backend actor message.*"status":"idle"' "$CLIENT_LOG" || true
   )"
   if rg -q "component actor worker finished" "$SERVER_LOG" \
     && ((idle_updates >= 3)); then
@@ -322,20 +350,21 @@ for _ in $(seq 1 600); do
   sleep 0.2
 done
 rg -q "component actor worker finished" "$SERVER_LOG"
-idle_updates="$(rg -c 'session actor message.*"status":"idle"' "$CLIENT_LOG" || true)"
+idle_updates="$(rg -c 'backend actor message.*"status":"idle"' "$CLIENT_LOG" || true)"
 ((idle_updates >= 3))
 
+click_at 480 360
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -s 100 -k F6
 for _ in $(seq 1 300); do
-  if rg -q "presentation actor message sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
+  if rg -q "presentation actor message .*sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
     "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
-rg -q "presentation actor message sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
+rg -q "presentation actor message .*sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
   "$CLIENT_LOG"
 if rg -q "presentation init child actor failed|component actor mailbox rejected message: channel closed" \
   "$CLIENT_LOG"; then

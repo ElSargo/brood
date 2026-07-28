@@ -9,7 +9,7 @@ use std::{
 };
 
 use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
+use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use exports::brood::plugin::actor::{
     ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
     LocalActorMessage, PresentationActorMessage, PresentationEvent, SessionActorMessage,
@@ -26,15 +26,15 @@ const UPDATE_NOTIFICATION_TOKEN: u64 = 0x434f_4445_5841_4745;
 const LEFT_BUTTON: u32 = 0x110;
 const MAX_LOG_LINES: usize = 96;
 
-const BG: Color = Color::rgba(0.157, 0.157, 0.157, 1.0);
-const PANEL: Color = Color::rgba(0.118, 0.118, 0.118, 1.0);
-const PANEL_LIGHT: Color = Color::rgba(0.235, 0.220, 0.204, 1.0);
-const FG: Color = Color::rgba(0.922, 0.859, 0.698, 1.0);
-const MUTED: Color = Color::rgba(0.659, 0.600, 0.518, 1.0);
-const YELLOW: Color = Color::rgba(0.843, 0.600, 0.129, 1.0);
-const BLUE: Color = Color::rgba(0.271, 0.522, 0.533, 1.0);
-const GREEN: Color = Color::rgba(0.596, 0.592, 0.102, 1.0);
-const RED: Color = Color::rgba(0.800, 0.141, 0.114, 1.0);
+const BG: Color = ashen::BACKGROUND;
+const PANEL: Color = ashen::SURFACE;
+const PANEL_LIGHT: Color = ashen::SURFACE_RAISED;
+const FG: Color = ashen::TEXT;
+const MUTED: Color = ashen::MUTED;
+const YELLOW: Color = ashen::WARNING;
+const BLUE: Color = ashen::ACCENT;
+const GREEN: Color = ashen::INFO;
+const RED: Color = ashen::ERROR;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]

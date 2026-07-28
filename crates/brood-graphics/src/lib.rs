@@ -2,6 +2,8 @@
 
 use std::{error::Error, fmt};
 
+pub mod theme;
+
 pub const PACKET_VERSION: u16 = 1;
 pub const MAX_PACKET_BYTES: usize = 1024 * 1024;
 pub const MAX_COMMANDS: usize = 16_384;

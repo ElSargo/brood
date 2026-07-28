@@ -9,7 +9,7 @@ use std::{
 };
 
 use brood::plugin::host;
-use brood_graphics::{Color, Command as DrawCommand, Packet, Rect};
+use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
 use exports::brood::plugin::actor::{
     Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
     WorkerRequest,
@@ -22,9 +22,9 @@ const SNAPSHOT_FULL: u8 = 1;
 const FONT_SIZE: f32 = 16.0;
 const REQUESTED_LINE_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
-const DEFAULT_BG: u32 = 0x1d2021;
-const CURSOR: u32 = 0x928374;
-const SELECTION_BG: u32 = 0x504945;
+const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
+const CURSOR: u32 = ashen::CURSOR_RGB;
+const SELECTION_BG: u32 = ashen::SELECTION_RGB;
 const MOD_CTRL: u32 = 1;
 const MOD_ALT: u32 = 2;
 const MOD_SHIFT: u32 = 4;
@@ -1317,7 +1317,7 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
     if snapshot.exited {
         packet.push(DrawCommand::FillRect {
             rect: Rect::new(0.0, height - 3.0, width, 3.0),
-            color: rgb(0xcc241d),
+            color: rgb(ashen::ERROR_RGB),
         });
     }
     if snapshot.max_viewport_offset > 0 {

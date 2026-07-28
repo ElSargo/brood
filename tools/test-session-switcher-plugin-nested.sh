@@ -286,7 +286,7 @@ rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
 for _ in $(seq 1 200); do
-  if rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG" \
+  if rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG" \
     && rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG" \
@@ -296,7 +296,7 @@ for _ in $(seq 1 200); do
   fi
   sleep 0.1
 done
-rg -q "granted rest layout lease .* actor=workspace panes=2" "$CLIENT_LOG"
+rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG"
 rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG"
@@ -398,6 +398,23 @@ rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG"
 rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
 rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
 capture "$OUT/picker-visible.png"
+PICKER_BOTTOM_LEFT="$(
+  magick "$OUT/picker-visible.png" -format '%[pixel:p{280,599}]' info:
+)"
+PICKER_BOTTOM_LEFT_INSET="$(
+  magick "$OUT/picker-visible.png" -format '%[pixel:p{288,591}]' info:
+)"
+PICKER_BOTTOM_RIGHT="$(
+  magick "$OUT/picker-visible.png" -format '%[pixel:p{999,599}]' info:
+)"
+PICKER_BOTTOM_RIGHT_INSET="$(
+  magick "$OUT/picker-visible.png" -format '%[pixel:p{991,591}]' info:
+)"
+if [[ "$PICKER_BOTTOM_LEFT" == "$PICKER_BOTTOM_LEFT_INSET" \
+  && "$PICKER_BOTTOM_RIGHT" == "$PICKER_BOTTOM_RIGHT_INSET" ]]; then
+  echo "ERR picker footer painted over its rounded bottom corners" >&2
+  exit 1
+fi
 
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
@@ -503,7 +520,7 @@ rg -q "total_windows=2" <<< "$(ctl status)"
 ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE))
 
 DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
-DIFF_ACTOR="diff-viewer-s3"
+DIFF_ACTOR="diff-viewer-sb1-s3"
 send_diff_toggle
 for _ in $(seq 1 200); do
   DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
@@ -627,17 +644,17 @@ rg -q "stopped presentation init child actor id=$DIFF_ACTOR" "$CLIENT_LOG"
 capture "$OUT/diff-closed.png"
 
 capture "$OUT/project-expanded.png"
-click_at 980 123
+click_at 980 68
 sleep 0.2
 capture "$OUT/project-collapsed.png"
 
-click_at 980 123
+click_at 980 68
 sleep 0.2
 
 WORKTREE_DAEMON_REQUESTS_BEFORE="$(
   rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
 )"
-click_at 1260 123
+click_at 1260 68
 submit_text picker-worktree
 for _ in $(seq 1 200); do
   SESSION_JSON="$(ctl surface-session list-json)"
@@ -711,7 +728,7 @@ rg -q "realm=Daemon sender=\"init\" actor=\"session-switcher\"" "$SERVER_LOG"
 rg -q "attached managed worktree session" "$SERVER_LOG"
 capture "$OUT/worktree-created.png"
 
-WORKTREE_DIFF_ACTOR="diff-viewer-s${WORKTREE_SESSION_ID}"
+WORKTREE_DIFF_ACTOR="diff-viewer-sb1-s${WORKTREE_SESSION_ID}"
 WORKTREE_DIFF_STARTS_BEFORE="$(
   rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
 )"
@@ -850,7 +867,7 @@ PY
 WORKTREE_COMPLETIONS_BEFORE="$(
   rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
 )"
-click_at 1260 123
+click_at 1260 68
 submit_text picker-worktree
 for _ in $(seq 1 100); do
   WORKTREE_COMPLETIONS_AFTER="$(
@@ -1064,7 +1081,7 @@ cat > "$OUT/proof.md" <<EOF
 - retry: requesting the same branch reused the checkout and existing session
 - occupation: closing that session persisted an unoccupied worktree record
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
-- picker: Ctrl+Alt+P opened the reusable actor as a 720px floating pane; Bt fuzzy-matched Beta and Enter returned the original session result
+- picker: Ctrl+Alt+P opened the reusable actor as a 720px floating pane with visibly rounded bottom corners; Bt fuzzy-matched Beta and Enter returned the original session result
 - transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar

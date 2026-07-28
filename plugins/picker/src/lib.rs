@@ -6,7 +6,7 @@ wit_bindgen::generate!({
 use std::{collections::VecDeque, sync::Mutex};
 
 use brood::plugin::host;
-use brood_graphics::{Color, Command, Packet, Rect};
+use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use exports::brood::plugin::actor::{
     Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
 };
@@ -15,19 +15,22 @@ use serde_json::Value;
 
 const LAYOUT_ACTOR_ID: &str = "session-switcher";
 const LEFT_BUTTON: u32 = 0x110;
-const HEADER_HEIGHT: f32 = 92.0;
-const FOOTER_HEIGHT: f32 = 36.0;
-const ROW_HEIGHT: f32 = 48.0;
-const SIDE_MARGIN: f32 = 16.0;
+const HEADER_HEIGHT: f32 = 52.0;
+const FOOTER_HEIGHT: f32 = 28.0;
+const ROW_HEIGHT: f32 = 30.0;
+const SIDE_MARGIN: f32 = 14.0;
+const CONTAINER_RADIUS: f32 = 8.0;
+const QUERY_X: f32 = 150.0;
 
-const BG: Color = Color::rgba(0.118, 0.118, 0.118, 1.0);
-const PANEL: Color = Color::rgba(0.157, 0.157, 0.157, 1.0);
-const PANEL_LIGHT: Color = Color::rgba(0.235, 0.220, 0.204, 1.0);
-const FG: Color = Color::rgba(0.922, 0.859, 0.698, 1.0);
-const MUTED: Color = Color::rgba(0.659, 0.600, 0.518, 1.0);
-const YELLOW: Color = Color::rgba(0.843, 0.600, 0.129, 1.0);
-const BLUE: Color = Color::rgba(0.271, 0.522, 0.533, 1.0);
-const RED: Color = Color::rgba(0.800, 0.141, 0.114, 1.0);
+const BG: Color = ashen::BACKGROUND;
+const PANEL: Color = ashen::SURFACE;
+const PANEL_RAISED: Color = ashen::SURFACE_RAISED;
+const PANEL_LIGHT: Color = ashen::BORDER;
+const FG: Color = ashen::TEXT;
+const TEXT: Color = ashen::TEXT_STRONG;
+const MUTED: Color = ashen::MUTED;
+const YELLOW: Color = ashen::ACCENT;
+const RED: Color = ashen::ERROR;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -785,14 +788,26 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
     let mut resources = Vec::new();
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
-        radius: 10.0,
+        radius: CONTAINER_RADIUS,
         color: BG,
     });
-    packet.push(Command::StrokeRoundedRect {
-        rect: Rect::new(1.0, 1.0, state.width - 2.0, state.height - 2.0),
-        radius: 10.0,
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
+        radius: CONTAINER_RADIUS,
+        color: PANEL,
+    });
+    packet.push(Command::FillRect {
+        rect: Rect::new(
+            0.0,
+            CONTAINER_RADIUS,
+            state.width,
+            HEADER_HEIGHT - CONTAINER_RADIUS,
+        ),
+        color: PANEL,
+    });
+    packet.push(Command::FillRect {
+        rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, state.width, 1.0),
         color: PANEL_LIGHT,
-        width: 1.0,
     });
 
     if let Some(active) = state.active.as_ref() {
@@ -801,27 +816,34 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
         } else {
             &active.title
         };
+        let query_x = if state.width < 360.0 {
+            (state.width * 0.38).clamp(44.0, QUERY_X)
+        } else {
+            QUERY_X
+        };
+        let title_width = (query_x - SIDE_MARGIN * 2.0).max(1.0);
         add_text(
             state,
             &mut packet,
             &mut resources,
-            title,
+            &truncate_to_width(title, title_width, 17.0),
             17.0,
-            FG,
+            TEXT,
             SIDE_MARGIN,
-            10.0,
-            state.width - SIDE_MARGIN * 2.0,
+            14.0,
+            title_width,
         )?;
+        let query_width = (state.width - query_x - SIDE_MARGIN).max(1.0);
         packet.push(Command::FillRoundedRect {
-            rect: Rect::new(SIDE_MARGIN, 42.0, state.width - SIDE_MARGIN * 2.0, 38.0),
-            radius: 6.0,
-            color: PANEL,
+            rect: Rect::new(query_x, 10.0, query_width, 32.0),
+            radius: 4.0,
+            color: PANEL_RAISED,
         });
         packet.push(Command::StrokeRoundedRect {
-            rect: Rect::new(SIDE_MARGIN, 42.0, state.width - SIDE_MARGIN * 2.0, 38.0),
-            radius: 6.0,
-            color: BLUE,
-            width: 1.5,
+            rect: Rect::new(query_x, 10.0, query_width, 32.0),
+            radius: 4.0,
+            color: YELLOW,
+            width: 1.0,
         });
         let query = if active.query.is_empty() {
             if active.placeholder.is_empty() {
@@ -836,12 +858,12 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
             state,
             &mut packet,
             &mut resources,
-            &query,
-            15.0,
+            &truncate_to_width(&query, query_width - 16.0, 14.0),
+            14.0,
             if active.query.is_empty() { MUTED } else { FG },
-            SIDE_MARGIN + 10.0,
-            49.0,
-            state.width - SIDE_MARGIN * 2.0 - 20.0,
+            query_x + 8.0,
+            16.0,
+            query_width - 16.0,
         )?;
 
         let filtered = active.filtered_indices();
@@ -864,50 +886,41 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
             let y = HEADER_HEIGHT + row as f32 * ROW_HEIGHT;
             let selected = active.selected == Some(item.index);
             if selected {
-                packet.push(Command::FillRoundedRect {
-                    rect: Rect::new(
-                        SIDE_MARGIN,
-                        y + 3.0,
-                        state.width - SIDE_MARGIN * 2.0,
-                        ROW_HEIGHT - 6.0,
-                    ),
-                    radius: 6.0,
-                    color: Color::rgba(BLUE.r, BLUE.g, BLUE.b, 0.48),
+                packet.push(Command::FillRect {
+                    rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
+                    color: ashen::SELECTION,
                 });
-                packet.push(Command::StrokeRoundedRect {
-                    rect: Rect::new(
-                        SIDE_MARGIN,
-                        y + 3.0,
-                        state.width - SIDE_MARGIN * 2.0,
-                        ROW_HEIGHT - 6.0,
-                    ),
-                    radius: 6.0,
+                packet.push(Command::FillRect {
+                    rect: Rect::new(0.0, y, 3.0, ROW_HEIGHT),
                     color: YELLOW,
-                    width: 1.2,
                 });
             }
+            packet.push(Command::FillRect {
+                rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
+                color: Color::rgba(PANEL_LIGHT.r, PANEL_LIGHT.g, PANEL_LIGHT.b, 0.28),
+            });
             add_text(
                 state,
                 &mut packet,
                 &mut resources,
-                &truncate(&item.label, 58),
-                15.0,
+                &truncate_to_width(&item.label, state.width - SIDE_MARGIN * 2.0, 13.0),
+                13.0,
                 FG,
-                SIDE_MARGIN + 10.0,
-                y + 6.0,
-                state.width - SIDE_MARGIN * 2.0 - 20.0,
+                SIDE_MARGIN,
+                if item.detail.is_some() { y } else { y + 6.0 },
+                state.width - SIDE_MARGIN * 2.0,
             )?;
             if let Some(detail) = item.detail.as_deref() {
                 add_text(
                     state,
                     &mut packet,
                     &mut resources,
-                    &truncate(detail, 72),
-                    11.0,
+                    &truncate_to_width(detail, state.width - SIDE_MARGIN * 2.0, 10.0),
+                    10.0,
                     MUTED,
-                    SIDE_MARGIN + 10.0,
-                    y + 26.0,
-                    state.width - SIDE_MARGIN * 2.0 - 20.0,
+                    SIDE_MARGIN,
+                    y + 16.0,
+                    state.width - SIDE_MARGIN * 2.0,
                 )?;
             }
         }
@@ -919,11 +932,11 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
                 &mut packet,
                 &mut resources,
                 "No matching items",
-                15.0,
+                13.0,
                 MUTED,
-                SIDE_MARGIN + 10.0,
-                HEADER_HEIGHT + 16.0,
-                state.width - SIDE_MARGIN * 2.0 - 20.0,
+                SIDE_MARGIN,
+                HEADER_HEIGHT + 9.0,
+                state.width - SIDE_MARGIN * 2.0,
             )?;
         }
 
@@ -935,27 +948,35 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
         } else {
             state.status.clone()
         };
+        let footer_y = state.height - FOOTER_HEIGHT;
+        packet.push(Command::FillRoundedRect {
+            rect: Rect::new(0.0, footer_y, state.width, FOOTER_HEIGHT),
+            radius: CONTAINER_RADIUS,
+            color: PANEL,
+        });
         packet.push(Command::FillRect {
-            rect: Rect::new(
-                0.0,
-                state.height - FOOTER_HEIGHT,
-                state.width,
-                FOOTER_HEIGHT,
-            ),
+            rect: Rect::new(0.0, footer_y, state.width, CONTAINER_RADIUS + 1.0),
             color: PANEL,
         });
         add_text(
             state,
             &mut packet,
             &mut resources,
-            &truncate(&footer, 76),
-            11.0,
+            &truncate_to_width(&footer, state.width - SIDE_MARGIN * 2.0, 10.0),
+            10.0,
             if state.error { RED } else { MUTED },
             SIDE_MARGIN,
-            state.height - 26.0,
+            state.height - 21.0,
             state.width - SIDE_MARGIN * 2.0,
         )?;
     }
+
+    packet.push(Command::StrokeRoundedRect {
+        rect: Rect::new(0.5, 0.5, state.width - 1.0, state.height - 1.0),
+        radius: CONTAINER_RADIUS,
+        color: PANEL_LIGHT,
+        width: 1.0,
+    });
 
     let bytes = packet.encode().map_err(|error| error.to_string())?;
     host::graphics_submit_draw_packet(state.pane, &bytes)
@@ -997,12 +1018,28 @@ fn add_text(
     )
     .map_err(|error| format!("layout picker text: {error:?}"))?;
     resources.push(layout.handle);
+    packet.push(Command::Save);
+    packet.push(Command::ClipRect(Rect::new(
+        x,
+        y,
+        max_width.max(1.0),
+        size + 4.0,
+    )));
     packet.push(Command::DrawTextLayout {
         layout: layout.handle,
         x,
         y,
     });
+    packet.push(Command::Restore);
     Ok(())
+}
+
+fn truncate_to_width(text: &str, max_width: f32, font_size: f32) -> String {
+    if max_width < font_size {
+        return String::new();
+    }
+    let max_chars = (max_width / (font_size * 0.64)).floor().max(2.0) as usize;
+    truncate(text, max_chars)
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {

@@ -6,6 +6,7 @@ wit_bindgen::generate!({
 use std::{collections::VecDeque, sync::Mutex};
 
 use brood::plugin::host;
+use brood_graphics::theme::ashen;
 use exports::brood::plugin::actor::{
     Command, Event, Guest, LifecycleEvent, NotificationEvent, PresentationActorMessage,
     WorkerEvent, WorkerRequest,
@@ -25,8 +26,8 @@ const BULK_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
 const SNAPSHOT_VERSION: u8 = 4;
 const SNAPSHOT_FULL: u8 = 1;
-const DEFAULT_FG: u32 = 0xebdbb2;
-const DEFAULT_BG: u32 = 0x1d2021;
+const DEFAULT_FG: u32 = ashen::TEXT_RGB;
+const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
 
 static STATE: Mutex<Option<SessionState>> = Mutex::new(None);
 
@@ -1273,14 +1274,12 @@ impl Perform for Screen {
 }
 
 fn ansi_color(index: u16, bright: bool) -> u32 {
-    const NORMAL: [u32; 8] = [
-        0x282828, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
-    ];
-    const BRIGHT: [u32; 8] = [
-        0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
-    ];
     let index = usize::from(index.min(7));
-    if bright { BRIGHT[index] } else { NORMAL[index] }
+    if bright {
+        ashen::ANSI_BRIGHT[index]
+    } else {
+        ashen::ANSI_NORMAL[index]
+    }
 }
 
 fn indexed_color(index: u16) -> u32 {

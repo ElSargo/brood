@@ -14,6 +14,14 @@ Root-level target-shape Brood plugins live here.
 
 These crates are currently standalone because `brood-wasm` is host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest SDK instead of hand-writing ABI exports and JSON envelopes.
 
+## Visual language
+
+Native plugin canvases use the shared Ashen-derived tokens in
+`brood_graphics::theme::ashen`. New surfaces should map semantic roles to those
+tokens instead of defining a separate palette. Dense utility surfaces follow
+the diff viewer's layout language: compact headers and footers, flat list rows,
+subtle separators, and a narrow accent stripe for selection.
+
 `component-workspace-watch` is the Component Model filesystem-watch proof. It
 contains the current small guest-side typed-resource wrapper and maintains a
 human-readable workspace change artifact with reversible native path-byte
