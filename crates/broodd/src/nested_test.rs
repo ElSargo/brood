@@ -9,6 +9,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         .unwrap_or_else(|| TestCommand::Nested(NestedTestArgs::default()))
     {
         TestCommand::Nested(args) => run_nested(args),
+        TestCommand::Editor(args) => run_editor(args),
         TestCommand::Ssh(args) => run_ssh(args),
     }
 }
@@ -26,6 +27,23 @@ fn run_nested(args: NestedTestArgs) -> Result<()> {
         .with_context(|| format!("run {}", script.display()))?;
     if !status.success() {
         bail!("nested terminal proof exited with {status}");
+    }
+    Ok(())
+}
+
+fn run_editor(args: NestedTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let script = root.join("tools/test-editor-plugin-nested.sh");
+    let mut command = Command::new("bash");
+    command.arg(&script).current_dir(&root);
+    if let Some(out_dir) = args.out_dir {
+        command.env("BROOD_EDITOR_OUT", out_dir);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("nested editor proof exited with {status}");
     }
     Ok(())
 }
@@ -61,5 +79,5 @@ fn find_checkout_root() -> Result<PathBuf> {
                 && candidate.join("flake.nix").is_file()
         })
         .map(PathBuf::from)
-        .context("run `brood test nested` from a Brood source checkout")
+        .context("run `brood test` from a Brood source checkout")
 }

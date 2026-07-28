@@ -33,6 +33,12 @@ Nix store. The backend runs directly against the target's normal Linux ABI and
 user namespace rather than a bundle sandbox, so normal host paths such as
 `/bin/bash` remain visible.
 
+The portable backend also carries Neovim, its runtime, and `brood-nvim`. Its
+launcher puts the deployed backend `bin` directory first on `PATH`, so the
+session editor actor resolves the packaged editor even when the remote host has
+no Neovim installation. The wrapper retains the remote user's normal Neovim
+configuration and loads the Brood bridge in addition to it.
+
 QUIC uses UDP and therefore does not travel through OpenSSH's TCP forwarding.
 The relay exposes one mutually authenticated UDP port. By default the local
 client resolves the SSH hostname; use `--connect-host` to select a LAN address

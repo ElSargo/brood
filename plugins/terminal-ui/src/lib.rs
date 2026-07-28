@@ -35,6 +35,8 @@ const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
 const RESIZE_DEBOUNCE_MS: u64 = 24;
 const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
+const CLIENT_INIT_ID: &str = "brood.client-init";
+const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 
 static STATE: Mutex<Option<UiState>> = Mutex::new(None);
 
@@ -232,6 +234,9 @@ impl UiState {
 }
 
 fn terminal_session_actor(instance_id: &str) -> String {
+    if instance_id == "neovim-ui" || instance_id.starts_with("neovim-ui-") {
+        return "neovim-session".to_string();
+    }
     if let Some(scoped) = instance_id.strip_prefix("terminal-ui-b")
         && let Some((_backend, session_and_suffix)) = scoped.split_once('-')
         && let Some(session_and_suffix) = session_and_suffix.strip_prefix('s')
@@ -460,6 +465,7 @@ impl Guest for TerminalUi {
             {
                 handle_snapshot_chunk(&message.body)
             }
+            Event::Mailbox(message) => focus_commands_for_mailbox(&message.sender, &message.body),
             Event::Worker(WorkerEvent::Finished(finished))
                 if finished.output == RESIZE_WORKER_PAYLOAD =>
             {
@@ -485,6 +491,32 @@ impl Guest for TerminalUi {
         }
         Ok(payload)
     }
+}
+
+fn focus_commands_for_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
+    if sender != CLIENT_INIT_ID || body != FOCUS_MESSAGE {
+        return Vec::new();
+    }
+    let Ok(mut guard) = STATE.lock() else {
+        return Vec::new();
+    };
+    let Some(state) = guard.as_mut().filter(|state| state.pane != 0) else {
+        return Vec::new();
+    };
+    let (rows, cols) = state.grid_size();
+    vec![
+        Command::SendHostMessage(
+            format!(r#"{{"type":"focus-pane","pane":{}}}"#, state.pane).into_bytes(),
+        ),
+        state.session_message(vec![b'A']),
+        UiState::resize_command(
+            rows,
+            cols,
+            state.backend_id,
+            state.session_id,
+            state.session_actor.clone(),
+        ),
+    ]
 }
 
 fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
@@ -1611,7 +1643,10 @@ export!(TerminalUi);
 
 #[cfg(test)]
 mod tests {
-    use super::{terminal_session_actor, terminal_text_clusters};
+    use super::{
+        Command, FOCUS_MESSAGE, STATE, UiState, focus_commands_for_mailbox, paste_bytes,
+        terminal_session_actor, terminal_text_clusters,
+    };
 
     #[test]
     fn backend_scoped_default_ui_targets_default_terminal() {
@@ -1626,6 +1661,51 @@ mod tests {
         assert_eq!(
             terminal_session_actor("terminal-ui-b2-s7-4"),
             "terminal-session-4"
+        );
+    }
+
+    #[test]
+    fn every_neovim_ui_id_targets_the_editor_session() {
+        assert_eq!(terminal_session_actor("neovim-ui"), "neovim-session");
+        assert_eq!(terminal_session_actor("neovim-ui-b2-s7"), "neovim-session");
+    }
+
+    #[test]
+    fn only_client_init_can_focus_an_existing_editor_pane() {
+        *STATE.lock().expect("terminal UI state") = Some(UiState::new(2, 7, "neovim-ui-b2-s7"));
+        STATE
+            .lock()
+            .expect("terminal UI state")
+            .as_mut()
+            .unwrap()
+            .pane = 42;
+        let commands = focus_commands_for_mailbox("brood.client-init", FOCUS_MESSAGE);
+        assert!(matches!(
+            commands.first(),
+            Some(Command::SendHostMessage(body))
+                if body == br#"{"type":"focus-pane","pane":42}"#
+        ));
+        assert!(
+            matches!(commands.get(1), Some(Command::SendSessionMessage(message)) if message.body == b"A")
+        );
+        assert!(
+            matches!(commands.get(2), Some(Command::SendSessionMessage(message)) if message.body.starts_with(b"R"))
+        );
+        assert!(focus_commands_for_mailbox("untrusted", FOCUS_MESSAGE).is_empty());
+        STATE
+            .lock()
+            .expect("terminal UI state")
+            .as_mut()
+            .unwrap()
+            .pane = 0;
+        assert!(focus_commands_for_mailbox("brood.client-init", FOCUS_MESSAGE).is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_has_exactly_one_delimiter_pair() {
+        assert_eq!(
+            paste_bytes("one\r\ntwo", true),
+            b"\x1b[200~one\ntwo\x1b[201~"
         );
     }
 

@@ -14,6 +14,10 @@ const CROSS_REALM_PROOF: &[u8] = b"client-to-session-actor-proof";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const TERMINAL_SESSION_COMPONENT_FILE: &str = "brood_terminal_session_plugin.component.wasm";
 const FIRST_AGENT: &str = "coding-agent-1";
+const NEOVIM_SESSION: &str = "neovim-session";
+const MAX_TERMINAL_COMMAND_BYTES: usize = 8 * 1024;
+const MAX_EDITOR_PATH_BYTES: usize = 4 * 1024;
+const MAX_PENDING_EDITORS: usize = 32;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -22,6 +26,12 @@ struct WireMessage {
     session_id: u64,
     agents: Vec<WireAgent>,
     terminal: Option<String>,
+    editor: Option<String>,
+    command: String,
+    message: String,
+    path: String,
+    line: Option<u32>,
+    column: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -42,6 +52,21 @@ enum Subscriber {
 struct PendingTerminal {
     id: String,
     subscriber: Subscriber,
+    command: String,
+}
+
+struct PendingEditor {
+    subscriber: Subscriber,
+    open: Option<EditorOpen>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct EditorOpen {
+    kind: String,
+    path: String,
+    line: Option<u32>,
+    column: Option<u32>,
 }
 
 struct InitState {
@@ -51,6 +76,9 @@ struct InitState {
     next_agent: u64,
     next_terminal: u64,
     pending_terminals: Vec<PendingTerminal>,
+    editor_actor_started: bool,
+    editor_started: bool,
+    pending_editors: Vec<PendingEditor>,
 }
 
 static STATE: Mutex<InitState> = Mutex::new(InitState {
@@ -60,6 +88,9 @@ static STATE: Mutex<InitState> = Mutex::new(InitState {
     next_agent: 2,
     next_terminal: 2,
     pending_terminals: Vec::new(),
+    editor_actor_started: false,
+    editor_started: false,
+    pending_editors: Vec::new(),
 });
 
 struct ExampleInitActor;
@@ -154,6 +185,20 @@ fn start_terminal(id: &str) -> Command {
     })
 }
 
+fn start_editor() -> Command {
+    Command::StartActor(ActorStartRequest {
+        id: NEOVIM_SESSION.to_string(),
+        path: TERMINAL_SESSION_COMPONENT_FILE.to_string(),
+        capabilities: vec![
+            "pty".to_string(),
+            "subprocess:brood-nvim".to_string(),
+            "subprocess:nvim".to_string(),
+        ],
+        backend_id: None,
+        session_id: None,
+    })
+}
+
 fn handle_child(event: ChildEvent) -> Vec<Command> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
@@ -166,12 +211,24 @@ fn handle_child(event: ChildEvent) -> Vec<Command> {
                 .position(|pending| pending.id == started.id)
             {
                 let pending = state.pending_terminals.remove(index);
-                return terminal_reply(
+                let mut commands = Vec::new();
+                if let Some(body) = terminal_command_body(&pending.command) {
+                    commands.push(Command::SendLocalMessage(LocalActorMessage {
+                        actor: pending.id.clone(),
+                        body,
+                    }));
+                }
+                commands.extend(terminal_reply(
                     &pending.subscriber,
                     "terminal-started",
                     &pending.id,
                     state.session_id,
-                );
+                ));
+                return commands;
+            }
+            if started.id == NEOVIM_SESSION {
+                state.editor_actor_started = true;
+                return Vec::new();
             }
             if !started.id.starts_with("coding-agent-") {
                 return Vec::new();
@@ -186,6 +243,15 @@ fn handle_child(event: ChildEvent) -> Vec<Command> {
             }
         }
         ChildEvent::Stopped(id) => {
+            if id == NEOVIM_SESSION {
+                state.editor_actor_started = false;
+                state.editor_started = false;
+                if !state.pending_editors.is_empty() {
+                    state.editor_actor_started = true;
+                    return vec![start_editor()];
+                }
+                return Vec::new();
+            }
             if !id.starts_with("coding-agent-") {
                 return Vec::new();
             }
@@ -205,6 +271,17 @@ fn handle_child(event: ChildEvent) -> Vec<Command> {
                     state.session_id,
                 );
             }
+            if failed.id == NEOVIM_SESSION {
+                state.editor_actor_started = false;
+                state.editor_started = false;
+                let session_id = state.session_id;
+                return std::mem::take(&mut state.pending_editors)
+                    .into_iter()
+                    .flat_map(|pending| {
+                        editor_reply(&pending.subscriber, "editor-failed", session_id)
+                    })
+                    .collect();
+            }
             if !failed.id.starts_with("coding-agent-") {
                 return Vec::new();
             }
@@ -223,6 +300,38 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
+    if sender == NEOVIM_SESSION {
+        match message.kind.as_str() {
+            "editor-ready" => {
+                state.editor_actor_started = true;
+                state.editor_started = true;
+                return complete_pending_editors(&mut state);
+            }
+            "editor-stopped" => {
+                state.editor_started = false;
+                return vec![Command::StopActor(NEOVIM_SESSION.to_string())];
+            }
+            "editor-failed" => {
+                state.editor_started = false;
+                let session_id = state.session_id;
+                return std::mem::take(&mut state.pending_editors)
+                    .into_iter()
+                    .flat_map(|pending| {
+                        editor_reply_with_message(
+                            &pending.subscriber,
+                            "editor-failed",
+                            session_id,
+                            &message.message,
+                        )
+                    })
+                    .chain(std::iter::once(Command::StopActor(
+                        NEOVIM_SESSION.to_string(),
+                    )))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
     match message.kind.as_str() {
         "registry-subscribe" => {
             let subscriber = subscriber_from_sender(sender);
@@ -237,11 +346,16 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             vec![start_agent(&id)]
         }
         "create-terminal" => {
+            if message.command.len() > MAX_TERMINAL_COMMAND_BYTES || message.command.contains('\0')
+            {
+                return Vec::new();
+            }
             let id = format!("terminal-session-{}", state.next_terminal);
             state.next_terminal = state.next_terminal.saturating_add(1);
             state.pending_terminals.push(PendingTerminal {
                 id: id.clone(),
                 subscriber: subscriber_from_sender(sender),
+                command: message.command,
             });
             vec![start_terminal(&id)]
         }
@@ -253,6 +367,63 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             .map(Command::StopActor)
             .into_iter()
             .collect(),
+        "create-editor" | "editor-status" | "open-editor" => {
+            let subscriber = subscriber_from_sender(sender);
+            let open = (message.kind == "open-editor")
+                .then(|| EditorOpen {
+                    kind: "editor-open".to_string(),
+                    path: message.path,
+                    line: message.line,
+                    column: message.column,
+                })
+                .filter(valid_editor_open);
+            if message.kind == "open-editor" && open.is_none() {
+                return Vec::new();
+            }
+            if state.editor_started {
+                let mut commands = open
+                    .and_then(editor_open_command)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                commands.extend(editor_reply(
+                    &subscriber,
+                    if message.kind == "editor-status" {
+                        "editor-present"
+                    } else {
+                        "editor-started"
+                    },
+                    state.session_id,
+                ));
+                return commands;
+            }
+            if message.kind == "editor-status" {
+                return Vec::new();
+            }
+            if state.pending_editors.len() >= MAX_PENDING_EDITORS {
+                return editor_reply_with_message(
+                    &subscriber,
+                    "editor-failed",
+                    state.session_id,
+                    "editor startup request queue reached its bounded capacity",
+                );
+            }
+            state
+                .pending_editors
+                .push(PendingEditor { subscriber, open });
+            (!state.editor_actor_started)
+                .then(|| {
+                    state.editor_actor_started = true;
+                    start_editor()
+                })
+                .into_iter()
+                .collect()
+        }
+        "stop-editor" => {
+            state.editor_actor_started = false;
+            state.editor_started = false;
+            state.pending_editors.clear();
+            vec![Command::StopActor(NEOVIM_SESSION.to_string())]
+        }
         _ => Vec::new(),
     }
 }
@@ -276,7 +447,7 @@ fn registry_commands(state: &InitState) -> Vec<Command> {
         kind: "registry".to_string(),
         session_id: state.session_id,
         agents: state.agents.clone(),
-        terminal: None,
+        ..WireMessage::default()
     }) else {
         return Vec::new();
     };
@@ -307,8 +478,8 @@ fn terminal_reply(
     let Ok(body) = serde_json::to_vec(&WireMessage {
         kind: kind.to_string(),
         session_id,
-        agents: Vec::new(),
         terminal: Some(terminal.to_string()),
+        ..WireMessage::default()
     }) else {
         return Vec::new();
     };
@@ -324,6 +495,121 @@ fn terminal_reply(
             })
         }
     }]
+}
+
+fn terminal_command_body(command: &str) -> Option<Vec<u8>> {
+    if command.is_empty() {
+        return None;
+    }
+    let mut body = Vec::with_capacity(command.len().saturating_add(10));
+    body.push(b'I');
+    body.extend_from_slice(&0_u64.to_le_bytes());
+    body.extend_from_slice(command.as_bytes());
+    if !command.ends_with('\n') {
+        body.push(b'\n');
+    }
+    Some(body)
+}
+
+fn valid_editor_open(open: &EditorOpen) -> bool {
+    !open.path.is_empty()
+        && open.path.len() <= MAX_EDITOR_PATH_BYTES
+        && !open.path.contains('\0')
+        && open.line.unwrap_or(1) > 0
+        && open.column.unwrap_or(1) > 0
+}
+
+fn editor_open_command(open: EditorOpen) -> Option<Command> {
+    valid_editor_open(&open).then(|| {
+        serde_json::to_vec(&open).ok().map(|body| {
+            Command::SendLocalMessage(LocalActorMessage {
+                actor: NEOVIM_SESSION.to_string(),
+                body,
+            })
+        })
+    })?
+}
+
+fn complete_pending_editors(state: &mut InitState) -> Vec<Command> {
+    let session_id = state.session_id;
+    std::mem::take(&mut state.pending_editors)
+        .into_iter()
+        .flat_map(|pending| {
+            let mut commands = pending
+                .open
+                .and_then(editor_open_command)
+                .into_iter()
+                .collect::<Vec<_>>();
+            commands.extend(editor_reply(
+                &pending.subscriber,
+                "editor-started",
+                session_id,
+            ));
+            commands
+        })
+        .collect()
+}
+
+fn editor_reply(subscriber: &Subscriber, kind: &str, session_id: u64) -> Vec<Command> {
+    editor_reply_with_message(subscriber, kind, session_id, "")
+}
+
+fn editor_reply_with_message(
+    subscriber: &Subscriber,
+    kind: &str,
+    session_id: u64,
+    message: &str,
+) -> Vec<Command> {
+    let Ok(body) = serde_json::to_vec(&WireMessage {
+        kind: kind.to_string(),
+        session_id,
+        editor: Some(NEOVIM_SESSION.to_string()),
+        message: message.chars().take(2_048).collect(),
+        ..WireMessage::default()
+    }) else {
+        return Vec::new();
+    };
+    vec![match subscriber {
+        Subscriber::Local(actor) => Command::SendLocalMessage(LocalActorMessage {
+            actor: actor.clone(),
+            body,
+        }),
+        Subscriber::Presentation(actor) => {
+            Command::SendPresentationMessage(PresentationActorMessage {
+                actor: actor.clone(),
+                body,
+            })
+        }
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EditorOpen, terminal_command_body, valid_editor_open};
+
+    #[test]
+    fn terminal_command_is_one_sequenced_input_message() {
+        let body = terminal_command_body("cargo test").expect("terminal command");
+        assert_eq!(body[0], b'I');
+        assert_eq!(&body[1..9], &0_u64.to_le_bytes());
+        assert_eq!(&body[9..], b"cargo test\n");
+    }
+
+    #[test]
+    fn editor_open_requires_a_bounded_positive_location() {
+        assert!(valid_editor_open(&EditorOpen {
+            kind: "editor-open".to_string(),
+            path: "src/main.rs".to_string(),
+            line: Some(4),
+            column: Some(2),
+        }));
+        assert!(!valid_editor_open(&EditorOpen {
+            kind: "editor-open".to_string(),
+            path: "../\0escape".to_string(),
+            line: Some(0),
+            column: None,
+        }));
+    }
 }
 
 export!(ExampleInitActor with_types_in self);

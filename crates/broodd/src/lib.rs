@@ -79,7 +79,7 @@ pub fn run_cli() -> Result<CommandOutcome> {
             .context("send control command")
             .map(|()| CommandOutcome::Completed),
         Command::Test(args) => nested_test::run(args)
-            .context("run nested behavior proof")
+            .context("run checked-in behavior proof")
             .map(|()| CommandOutcome::Completed),
     }
 }

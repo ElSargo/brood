@@ -37,6 +37,7 @@ const KEY_4: i32 = 13;
 const KEY_5: i32 = 14;
 const KEY_ENTER: i32 = 36;
 const KEY_A: i32 = 38;
+const KEY_E: i32 = 26;
 const KEY_O: i32 = 32;
 const KEY_B: i32 = 56;
 const KEY_M: i32 = 58;
@@ -213,7 +214,7 @@ pub extern "C" fn brood_policy_provider_key_workspace(
 
     if input.modifiers & MOD_CTRL != 0
         && input.modifiers & MOD_ALT == 0
-        && focused_terminal_plugin(&state)
+        && focused_raw_control_plugin(&state)
     {
         return OUTPUT_ABSTAIN;
     }
@@ -249,6 +250,15 @@ pub extern "C" fn brood_policy_provider_key_workspace(
             write_consume(output, &[])
         } else {
             write_consume(output, &[Message::TerminalAction("new")])
+        };
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_E
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::EditorAction("open")])
         };
     }
 
@@ -606,6 +616,7 @@ enum Message<'a> {
     CodingAgentAction(&'a str),
     DiffViewerAction(&'a str),
     TerminalAction(&'a str),
+    EditorAction(&'a str),
 }
 
 fn write_layout_actor_outbox(
@@ -931,7 +942,8 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::SessionSwitcherAction(_) => "session-switcher",
             Message::CodingAgentAction(_)
             | Message::DiffViewerAction(_)
-            | Message::TerminalAction(_) => "brood.client-init",
+            | Message::TerminalAction(_)
+            | Message::EditorAction(_) => "brood.client-init",
             _ => "host",
         };
         writer.bytes(br#"{"actor":""#);
@@ -993,6 +1005,12 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             }
             Message::TerminalAction(action) => {
                 payload.bytes(br#"{"kind":"terminal-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
+            Message::EditorAction(action) => {
+                payload.bytes(br#"{"kind":"editor-action","action":"#);
                 payload.byte(b'"');
                 payload.quoted_body(action.as_bytes());
                 payload.bytes(br#""}"#);
@@ -1190,14 +1208,15 @@ fn pane_for_app_id(state: &PolicyState, app_id: &[u8]) -> Option<u64> {
     pane_for_app_id_in_list(&state.app_panes, app_id)
 }
 
-fn focused_terminal_plugin(state: &PolicyState) -> bool {
+fn focused_raw_control_plugin(state: &PolicyState) -> bool {
     let Some(focused) = state.focused_pane else {
         return false;
     };
-    state
-        .app_panes
-        .iter()
-        .any(|item| item.pane == focused && item.app_id.as_bytes().starts_with(b"terminal-ui"))
+    state.app_panes.iter().any(|item| {
+        item.pane == focused
+            && (item.app_id.as_bytes().starts_with(b"terminal-ui")
+                || item.app_id.as_bytes().starts_with(b"neovim-ui"))
+    })
 }
 
 fn pane_for_app_id_in_list(app_panes: &[AppPane], app_id: &[u8]) -> Option<u64> {

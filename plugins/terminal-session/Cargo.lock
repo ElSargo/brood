@@ -29,6 +29,7 @@ name = "brood-terminal-session-plugin"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
+ "serde_json",
  "unicode-width",
  "vte",
  "wit-bindgen",

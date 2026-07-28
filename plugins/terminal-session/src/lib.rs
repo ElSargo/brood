@@ -8,18 +8,35 @@ use std::{collections::VecDeque, sync::Mutex};
 use brood::plugin::host;
 use brood_graphics::theme::ashen;
 use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, NotificationEvent, PresentationActorMessage,
-    WorkerEvent, WorkerRequest,
+    Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
+    PresentationActorMessage, WorkerEvent, WorkerRequest,
 };
+use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
 const WORKER: u64 = 1;
+const EDITOR_PROBE_WORKER: u64 = 2;
+const FIRST_EDITOR_CONTROL_WORKER: u64 = 3;
 const SNAPSHOT_TOKEN: u64 = 1;
 const STREAM_TOKEN: u64 = 2;
+const EDITOR_SESSION_ID: &str = "neovim-session";
+const CLIENT_INIT_ID: &str = "brood.client-init";
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
+const MAX_PENDING_EDITOR_CONTROLS: usize = 32;
+const MAX_EDITOR_PATH_BYTES: usize = 4 * 1024;
+const MAX_EDITOR_OSC_JSON_BYTES: usize = 8 * 1024;
+const MAX_EDITOR_OSC_QUEUE_BYTES: usize = 32 * 1024;
+const MAX_EDITOR_OSC_ACTIONS: usize = 32;
+const MAX_EDITOR_TARGET_BYTES: usize = 128;
+const MAX_EDITOR_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_EDITOR_ACTION_FIELD_BYTES: usize = 8 * 1024;
+const MAX_EDITOR_PROCESS_OUTPUT: usize = 16 * 1024;
+const EDITOR_REMOTE_ATTEMPTS: usize = 40;
+const EDITOR_REMOTE_RETRY_MS: u64 = 50;
+const EDITOR_REMOTE_ATTEMPT_TIMEOUT_MS: u64 = 1_000;
 const MAX_SCROLLBACK: usize = 2_000;
 const MAX_SNAPSHOT_BODY: usize = 12 * 1024;
 const BULK_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
@@ -38,8 +55,17 @@ struct PendingInputBoundary {
     remaining: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorOpen {
+    path: String,
+    line: Option<u32>,
+    column: Option<u32>,
+}
+
 struct SessionState {
     session_id: u64,
+    editor_role: bool,
+    editor_socket: Option<String>,
     subscriber: Option<String>,
     snapshot_notification: u64,
     snapshot_generation: u64,
@@ -51,6 +77,11 @@ struct SessionState {
     pending_input_boundaries: VecDeque<PendingInputBoundary>,
     last_written_input_sequence: u64,
     snapshot_input_sequence: u64,
+    pending_editor_controls: VecDeque<EditorOpen>,
+    active_editor_control: Option<(u64, EditorOpen)>,
+    editor_probe_pending: bool,
+    editor_ready: bool,
+    next_editor_control_worker: u64,
     interactive_flush_pending: bool,
     screen: Screen,
     viewport_offset: usize,
@@ -70,9 +101,16 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn new(session_id: u64, snapshot_notification: u64) -> Self {
+    fn new(
+        session_id: u64,
+        snapshot_notification: u64,
+        editor_role: bool,
+        editor_socket: Option<String>,
+    ) -> Self {
         Self {
             session_id,
+            editor_role,
+            editor_socket,
             subscriber: None,
             snapshot_notification,
             snapshot_generation: 0,
@@ -84,8 +122,13 @@ impl SessionState {
             pending_input_boundaries: VecDeque::new(),
             last_written_input_sequence: 0,
             snapshot_input_sequence: 0,
+            pending_editor_controls: VecDeque::new(),
+            active_editor_control: None,
+            editor_probe_pending: false,
+            editor_ready: false,
+            next_editor_control_worker: FIRST_EDITOR_CONTROL_WORKER,
             interactive_flush_pending: false,
-            screen: Screen::new(INITIAL_ROWS, INITIAL_COLS),
+            screen: Screen::new(INITIAL_ROWS, INITIAL_COLS, editor_role),
             viewport_offset: 0,
             revision: 1,
             chunks_read: 0,
@@ -186,20 +229,128 @@ impl SessionState {
     }
 
     fn snapshot_commands(&mut self) -> Vec<Command> {
-        let Some(actor) = self.subscriber.clone() else {
-            return Vec::new();
-        };
-        let chunks = encode_snapshot(self);
-        self.snapshots_published = self.snapshots_published.saturating_add(chunks.len() as u64);
-        chunks
+        let mut commands = self
+            .screen
+            .take_editor_actions()
             .into_iter()
-            .map(|body| {
+            .flat_map(|payload| route_editor_action(self.session_id, &payload))
+            .collect::<Vec<_>>();
+        if let Some(actor) = self.subscriber.clone() {
+            let chunks = encode_snapshot(self);
+            self.snapshots_published = self.snapshots_published.saturating_add(chunks.len() as u64);
+            commands.extend(chunks.into_iter().map(|body| {
                 Command::SendPresentationMessage(PresentationActorMessage {
                     actor: actor.clone(),
                     body,
                 })
+            }));
+        }
+        commands
+    }
+
+    fn queue_editor_open(&mut self, request: EditorOpen) -> Vec<Command> {
+        if !self.editor_role {
+            return Vec::new();
+        }
+        let queued =
+            self.pending_editor_controls.len() + usize::from(self.active_editor_control.is_some());
+        if queued >= MAX_PENDING_EDITOR_CONTROLS {
+            let failure = "editor control queue reached its bounded capacity".to_string();
+            self.error = Some(failure.clone());
+            self.mark_changed();
+            let mut commands = self.snapshot_commands();
+            commands.push(editor_open_failure_message(
+                self.session_id,
+                &request,
+                &failure,
+            ));
+            return commands;
+        }
+        self.pending_editor_controls.push_back(request);
+        self.start_next_editor_control().into_iter().collect()
+    }
+
+    fn start_editor_probe(&mut self) -> Option<Command> {
+        if !self.editor_role
+            || self.editor_ready
+            || self.editor_probe_pending
+            || self.child.is_none()
+        {
+            return None;
+        }
+        let socket = self.editor_socket.as_ref()?;
+        self.editor_probe_pending = true;
+        encode_editor_probe(socket).map(|payload| {
+            Command::SpawnWorker(WorkerRequest {
+                worker: EDITOR_PROBE_WORKER,
+                payload,
             })
-            .collect()
+        })
+    }
+
+    fn finish_editor_probe(&mut self, failure: Option<String>) -> Vec<Command> {
+        if !self.editor_probe_pending {
+            return Vec::new();
+        }
+        self.editor_probe_pending = false;
+        if let Some(failure) = failure {
+            self.error = Some(failure.clone());
+            self.mark_changed();
+            let mut commands = self.snapshot_commands();
+            commands.push(editor_lifecycle_message(
+                "editor-failed",
+                self.session_id,
+                Some(&failure),
+            ));
+            return commands;
+        }
+        self.editor_ready = true;
+        let mut commands = vec![editor_lifecycle_message(
+            "editor-ready",
+            self.session_id,
+            None,
+        )];
+        commands.extend(self.start_next_editor_control());
+        commands
+    }
+
+    fn start_next_editor_control(&mut self) -> Option<Command> {
+        if !self.editor_ready || self.active_editor_control.is_some() {
+            return None;
+        }
+        let socket = self.editor_socket.as_ref()?;
+        let request = self.pending_editor_controls.pop_front()?;
+        let worker = self.next_editor_control_worker;
+        self.next_editor_control_worker = self
+            .next_editor_control_worker
+            .saturating_add(1)
+            .max(FIRST_EDITOR_CONTROL_WORKER);
+        let payload = encode_editor_control(socket, &request)?;
+        self.active_editor_control = Some((worker, request));
+        Some(Command::SpawnWorker(WorkerRequest { worker, payload }))
+    }
+
+    fn finish_editor_control(&mut self, worker: u64, failure: Option<String>) -> Vec<Command> {
+        let Some((active_worker, request)) = self.active_editor_control.take() else {
+            return Vec::new();
+        };
+        if active_worker != worker {
+            self.active_editor_control = Some((active_worker, request));
+            return Vec::new();
+        }
+        let mut commands = Vec::new();
+        if let Some(failure) = failure {
+            self.error = Some(failure.clone());
+            self.mark_changed();
+            commands.extend(self.snapshot_commands());
+            commands.push(editor_open_failure_message(
+                self.session_id,
+                &request,
+                &failure,
+            ));
+        }
+        commands.extend(self.start_next_editor_control());
+        commands
     }
 }
 
@@ -220,8 +371,16 @@ impl Guest for TerminalSession {
                         )))];
                     }
                 };
+                let editor_role = is_editor_session_instance(&context.instance_id);
+                let editor_socket = editor_role
+                    .then(|| editor_socket_path(session_id, notification, &context.instance_id));
                 if let Ok(mut state) = STATE.lock() {
-                    *state = Some(SessionState::new(session_id, notification));
+                    *state = Some(SessionState::new(
+                        session_id,
+                        notification,
+                        editor_role,
+                        editor_socket,
+                    ));
                 }
                 let _ = host::notification_watch_actor(notification, 0, SNAPSHOT_TOKEN);
                 vec![
@@ -237,6 +396,30 @@ impl Guest for TerminalSession {
             }
             Event::Mailbox(message) => handle_mailbox(&message.sender, &message.body),
             Event::Notification(event) => handle_notification(event),
+            Event::Worker(WorkerEvent::Finished(finished)) if finished.worker == WORKER => STATE
+                .lock()
+                .ok()
+                .and_then(|state| state.as_ref().and_then(editor_worker_finished_message))
+                .into_iter()
+                .collect(),
+            Event::Worker(WorkerEvent::Finished(finished))
+                if finished.worker == EDITOR_PROBE_WORKER =>
+            {
+                let Ok(mut guard) = STATE.lock() else {
+                    return Vec::new();
+                };
+                guard
+                    .as_mut()
+                    .map_or_else(Vec::new, |state| state.finish_editor_probe(None))
+            }
+            Event::Worker(WorkerEvent::Finished(finished)) if finished.worker != WORKER => {
+                let Ok(mut guard) = STATE.lock() else {
+                    return Vec::new();
+                };
+                guard.as_mut().map_or_else(Vec::new, |state| {
+                    state.finish_editor_control(finished.worker, None)
+                })
+            }
             Event::Worker(WorkerEvent::Failed(failed)) if failed.worker == WORKER => {
                 let Ok(mut guard) = STATE.lock() else {
                     return Vec::new();
@@ -247,13 +430,42 @@ impl Guest for TerminalSession {
                 state.error = Some(failed.message);
                 state.exited = true;
                 state.mark_changed();
-                state.snapshot_commands()
+                let editor_role = state.editor_role;
+                let session_id = state.session_id;
+                let mut commands = state.snapshot_commands();
+                if editor_role {
+                    commands.push(editor_lifecycle_message(
+                        "editor-failed",
+                        session_id,
+                        state.error.as_deref(),
+                    ));
+                }
+                commands
+            }
+            Event::Worker(WorkerEvent::Failed(failed)) if failed.worker == EDITOR_PROBE_WORKER => {
+                let Ok(mut guard) = STATE.lock() else {
+                    return Vec::new();
+                };
+                guard.as_mut().map_or_else(Vec::new, |state| {
+                    state.finish_editor_probe(Some(failed.message))
+                })
+            }
+            Event::Worker(WorkerEvent::Failed(failed)) => {
+                let Ok(mut guard) = STATE.lock() else {
+                    return Vec::new();
+                };
+                guard.as_mut().map_or_else(Vec::new, |state| {
+                    state.finish_editor_control(failed.worker, Some(failed.message))
+                })
             }
             _ => Vec::new(),
         }
     }
 
-    async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+    async fn worker_run(worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        if worker != WORKER {
+            return run_editor_control(&payload).await;
+        }
         let notification = payload
             .get(..8)
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
@@ -276,7 +488,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             state.force_full_snapshot = true;
             state.snapshot_commands()
         }
-        Some(b'I') if sender.starts_with("presentation:") => {
+        Some(b'I') if trusted_input_sender(sender) => {
             let revision = state.revision;
             state.viewport_offset = 0;
             let (sequence, bytes) = if let Some(encoded) = body.get(1..9)
@@ -328,8 +540,327 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             state.mark_changed();
             state.snapshot_commands()
         }
+        Some(b'{') if state.editor_role => parse_editor_open(body)
+            .map(|request| state.queue_editor_open(request))
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+fn trusted_input_sender(sender: &str) -> bool {
+    sender == "init" || sender.starts_with("presentation:")
+}
+
+fn editor_socket_path(session_id: u64, notification: u64, instance_id: &str) -> String {
+    let instance_hash = instance_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            hash.wrapping_mul(0x100_0000_01b3) ^ u64::from(*byte)
+        });
+    format!("/tmp/brood-nvim-s{session_id:x}-n{notification:x}-{instance_hash:x}.sock")
+}
+
+fn is_editor_session_instance(instance_id: &str) -> bool {
+    instance_id == EDITOR_SESSION_ID
+        || instance_id
+            .strip_suffix(EDITOR_SESSION_ID)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn parse_editor_open(body: &[u8]) -> Option<EditorOpen> {
+    if body.len() > MAX_EDITOR_MESSAGE_BYTES {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let object = value.as_object()?;
+    if object.get("kind")?.as_str()? != "editor-open" {
+        return None;
+    }
+    let path = object.get("path")?.as_str()?;
+    if path.is_empty() || path.len() > MAX_EDITOR_PATH_BYTES || path.contains('\0') {
+        return None;
+    }
+    let line = parse_editor_position(object.get("line"))?;
+    let column = parse_editor_position(object.get("column"))?;
+    Some(EditorOpen {
+        path: path.to_string(),
+        line: line.or_else(|| column.map(|_| 1)),
+        column,
+    })
+}
+
+fn parse_editor_position(value: Option<&Value>) -> Option<Option<u32>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some),
+    }
+}
+
+fn route_editor_action(session_id: u64, payload: &[u8]) -> Vec<Command> {
+    if payload.len() > MAX_EDITOR_OSC_JSON_BYTES {
+        return Vec::new();
+    }
+    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(payload) else {
+        return Vec::new();
+    };
+    let Some(action) = object.get("action").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    match action {
+        "diff" | "terminal" | "agent" => {
+            let mut forwarded = Map::new();
+            forwarded.insert(
+                "kind".to_string(),
+                Value::String("editor-action".to_string()),
+            );
+            forwarded.insert("action".to_string(), Value::String(action.to_string()));
+            forwarded.insert("session_id".to_string(), Value::from(session_id));
+            for field in ["command", "prompt", "agent"] {
+                if let Some(value) = object.get(field)
+                    && bounded_json_value(value, MAX_EDITOR_ACTION_FIELD_BYTES)
+                {
+                    forwarded.insert(field.to_string(), value.clone());
+                }
+            }
+            serde_json::to_vec(&Value::Object(forwarded))
+                .ok()
+                .filter(|body| body.len() <= MAX_EDITOR_MESSAGE_BYTES)
+                .map(|body| {
+                    Command::SendPresentationMessage(PresentationActorMessage {
+                        actor: CLIENT_INIT_ID.to_string(),
+                        body,
+                    })
+                })
+                .into_iter()
+                .collect()
+        }
+        "message" => route_editor_message(&object).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn editor_lifecycle_message(kind: &str, session_id: u64, message: Option<&str>) -> Command {
+    let message = message
+        .map(|message| message.chars().take(2_048).collect::<String>())
+        .unwrap_or_default();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "kind": kind,
+        "session_id": session_id,
+        "message": message,
+    }))
+    .unwrap_or_default();
+    Command::SendLocalMessage(LocalActorMessage {
+        actor: "init".to_string(),
+        body,
+    })
+}
+
+fn editor_worker_finished_message(state: &SessionState) -> Option<Command> {
+    if !state.editor_role {
+        return None;
+    }
+    if state.editor_ready && state.exit_code == Some(0) {
+        return Some(editor_lifecycle_message(
+            "editor-stopped",
+            state.session_id,
+            None,
+        ));
+    }
+    let failure = state.error.clone().unwrap_or_else(|| {
+        if state.editor_ready {
+            format!(
+                "Neovim exited unexpectedly with status {:?}",
+                state.exit_code
+            )
+        } else {
+            format!(
+                "Neovim exited before its RPC server became ready with status {:?}",
+                state.exit_code
+            )
+        }
+    });
+    Some(editor_lifecycle_message(
+        "editor-failed",
+        state.session_id,
+        Some(&failure),
+    ))
+}
+
+fn editor_open_failure_message(session_id: u64, request: &EditorOpen, failure: &str) -> Command {
+    let failure = failure.chars().take(2_048).collect::<String>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "kind": "editor-open-failed",
+        "session_id": session_id,
+        "path": request.path,
+        "message": failure,
+    }))
+    .unwrap_or_default();
+    Command::SendPresentationMessage(PresentationActorMessage {
+        actor: CLIENT_INIT_ID.to_string(),
+        body,
+    })
+}
+
+fn bounded_json_value(value: &Value, limit: usize) -> bool {
+    !value.is_null() && serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= limit)
+}
+
+fn route_editor_message(object: &Map<String, Value>) -> Option<Command> {
+    let target = object.get("target")?.as_str()?;
+    if target.is_empty() || target.len() > MAX_EDITOR_TARGET_BYTES {
+        return None;
+    }
+    let body = match object.get("body")? {
+        Value::String(body) => body.as_bytes().to_vec(),
+        body => serde_json::to_vec(body).ok()?,
+    };
+    if body.len() > MAX_EDITOR_MESSAGE_BYTES {
+        return None;
+    }
+    if let Some(actor) = target.strip_prefix("presentation:") {
+        return valid_actor_target(actor)
+            .then_some(actor)
+            .filter(|actor| !matches!(*actor, CLIENT_INIT_ID | "session-switcher"))
+            .map(|actor| {
+                Command::SendPresentationMessage(PresentationActorMessage {
+                    actor: actor.to_string(),
+                    body,
+                })
+            });
+    }
+    let actor = target.strip_prefix("session:").unwrap_or(target);
+    valid_actor_target(actor).then(|| {
+        Command::SendLocalMessage(LocalActorMessage {
+            actor: actor.to_string(),
+            body,
+        })
+    })
+}
+
+fn valid_actor_target(actor: &str) -> bool {
+    !actor.is_empty()
+        && actor.len() <= MAX_EDITOR_TARGET_BYTES
+        && actor
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn decode_hex(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        decoded.push((high << 4) | low);
+    }
+    Some(decoded)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn encode_editor_control(socket: &str, request: &EditorOpen) -> Option<Vec<u8>> {
+    let mut value = serde_json::json!({
+        "kind": "editor-open-control",
+        "socket": socket,
+        "path": request.path,
+    });
+    let object = value.as_object_mut()?;
+    if let Some(line) = request.line {
+        object.insert("line".to_string(), Value::from(line));
+    }
+    if let Some(column) = request.column {
+        object.insert("column".to_string(), Value::from(column));
+    }
+    serde_json::to_vec(&value)
+        .ok()
+        .filter(|payload| payload.len() <= MAX_EDITOR_MESSAGE_BYTES)
+}
+
+fn encode_editor_probe(socket: &str) -> Option<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "kind": "editor-probe-control",
+        "socket": socket,
+    }))
+    .ok()
+    .filter(|payload| payload.len() <= MAX_EDITOR_MESSAGE_BYTES)
+}
+
+fn decode_editor_probe(payload: &[u8]) -> Option<String> {
+    if payload.len() > MAX_EDITOR_MESSAGE_BYTES {
+        return None;
+    }
+    let Value::Object(object) = serde_json::from_slice::<Value>(payload).ok()? else {
+        return None;
+    };
+    if object.get("kind")?.as_str()? != "editor-probe-control" {
+        return None;
+    }
+    let socket = object.get("socket")?.as_str()?;
+    (!socket.is_empty() && socket.len() <= MAX_EDITOR_PATH_BYTES && !socket.contains('\0'))
+        .then(|| socket.to_string())
+}
+
+fn decode_editor_control(payload: &[u8]) -> Option<(String, EditorOpen)> {
+    if payload.len() > MAX_EDITOR_MESSAGE_BYTES {
+        return None;
+    }
+    let Value::Object(object) = serde_json::from_slice::<Value>(payload).ok()? else {
+        return None;
+    };
+    if object.get("kind")?.as_str()? != "editor-open-control" {
+        return None;
+    }
+    let socket = object.get("socket")?.as_str()?;
+    if socket.is_empty() || socket.len() > MAX_EDITOR_PATH_BYTES || socket.contains('\0') {
+        return None;
+    }
+    let open = parse_editor_open(
+        &serde_json::to_vec(&serde_json::json!({
+            "kind": "editor-open",
+            "path": object.get("path")?,
+            "line": object.get("line"),
+            "column": object.get("column"),
+        }))
+        .ok()?,
+    )?;
+    Some((socket.to_string(), open))
+}
+
+fn editor_remote_arguments(socket: &str, request: &EditorOpen) -> Vec<String> {
+    let mut arguments = vec![
+        "--server".to_string(),
+        socket.to_string(),
+        "--remote".to_string(),
+    ];
+    let path = if request.path.starts_with(['-', '+']) {
+        format!("./{}", request.path)
+    } else {
+        request.path.clone()
+    };
+    arguments.push(path);
+    arguments
+}
+
+fn editor_cursor_arguments(socket: &str, request: &EditorOpen) -> Option<Vec<String>> {
+    let line = request.line?;
+    let column = request.column.unwrap_or(1);
+    Some(vec![
+        "--server".to_string(),
+        socket.to_string(),
+        "--remote-expr".to_string(),
+        format!("cursor({line},{column})"),
+    ])
 }
 
 fn handle_notification(event: NotificationEvent) -> Vec<Command> {
@@ -342,7 +873,8 @@ fn handle_notification(event: NotificationEvent) -> Vec<Command> {
     match event.token {
         SNAPSHOT_TOKEN if event.notification == state.snapshot_notification => {
             state.snapshot_generation = state.snapshot_generation.max(event.generation);
-            let commands = state.snapshot_commands();
+            let mut commands = state.snapshot_commands();
+            commands.extend(state.start_editor_probe());
             let _ = host::notification_watch_actor(
                 state.snapshot_notification,
                 state.snapshot_generation,
@@ -359,26 +891,228 @@ fn handle_notification(event: NotificationEvent) -> Vec<Command> {
     }
 }
 
+struct EditorProcessOutput {
+    state: host::ChildState,
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_editor_control(payload: &[u8]) -> Result<Vec<u8>, String> {
+    if let Some(socket) = decode_editor_probe(payload) {
+        let arguments = vec![
+            "--server".to_string(),
+            socket,
+            "--remote-expr".to_string(),
+            "1".to_string(),
+        ];
+        run_editor_remote_with_retry(&arguments, "probe Neovim server").await?;
+        return Ok(br#"{"kind":"editor-ready"}"#.to_vec());
+    }
+    let (socket, request) = decode_editor_control(payload)
+        .ok_or_else(|| "editor control payload is invalid".to_string())?;
+    let arguments = editor_remote_arguments(&socket, &request);
+    let mut attempt =
+        run_editor_remote_with_retry(&arguments, &format!("open {}", request.path)).await?;
+    if let Some(arguments) = editor_cursor_arguments(&socket, &request) {
+        attempt = attempt.max(
+            run_editor_remote_with_retry(&arguments, &format!("position {}", request.path)).await?,
+        );
+    }
+    Ok(format!(
+        "{{\"kind\":\"editor-opened\",\"path\":{},\"attempt\":{attempt}}}",
+        serde_json::to_string(&request.path).unwrap_or_else(|_| "\"<invalid>\"".to_string()),
+    )
+    .into_bytes())
+}
+
+async fn run_editor_remote_with_retry(
+    arguments: &[String],
+    operation: &str,
+) -> Result<usize, String> {
+    let mut last_failure = String::new();
+    for attempt in 0..EDITOR_REMOTE_ATTEMPTS {
+        match run_editor_remote_once(arguments).await {
+            Ok(output) if output.state == host::ChildState::Exited && output.code == Some(0) => {
+                return Ok(attempt + 1);
+            }
+            Ok(output) => {
+                last_failure = editor_process_failure(&output);
+            }
+            Err(error) => last_failure = error,
+        }
+        if attempt + 1 < EDITOR_REMOTE_ATTEMPTS {
+            wait_duration(EDITOR_REMOTE_RETRY_MS).await?;
+        }
+    }
+    Err(format!(
+        "{operation} failed after {} attempts: {}",
+        EDITOR_REMOTE_ATTEMPTS, last_failure
+    ))
+}
+
+async fn run_editor_remote_once(arguments: &[String]) -> Result<EditorProcessOutput, String> {
+    let process = host::subprocess_spawn("nvim", arguments)
+        .map_err(|error| format!("spawn nvim remote client: {error:?}"))?;
+    let result = match host::stream_close_write(process.stdin) {
+        Ok(()) => drain_editor_process(&process).await,
+        Err(error) => Err(format!("close nvim remote stdin: {error:?}")),
+    };
+    let _ = host::stream_drop(process.stdin).await;
+    let _ = host::stream_drop(process.stdout).await;
+    let _ = host::stream_drop(process.stderr).await;
+    let _ = host::child_drop(process.child).await;
+    result
+}
+
+async fn drain_editor_process(process: &host::ProcessIo) -> Result<EditorProcessOutput, String> {
+    let timer = host::timer_create(EDITOR_REMOTE_ATTEMPT_TIMEOUT_MS)
+        .map_err(|error| format!("create Neovim remote deadline: {error:?}"))?;
+    let result = drain_editor_process_until(process, timer).await;
+    let _ = host::timer_drop(timer).await;
+    result
+}
+
+async fn drain_editor_process_until(
+    process: &host::ProcessIo,
+    timer: u64,
+) -> Result<EditorProcessOutput, String> {
+    let stdout_notification = host::stream_notification(process.stdout)
+        .map_err(|error| format!("nvim stdout notification: {error:?}"))?;
+    let stderr_notification = host::stream_notification(process.stderr)
+        .map_err(|error| format!("nvim stderr notification: {error:?}"))?;
+    let child_notification = host::child_notification(process.child)
+        .map_err(|error| format!("nvim child notification: {error:?}"))?;
+    let timer_notification = host::timer_notification(timer)
+        .map_err(|error| format!("Neovim remote deadline notification: {error:?}"))?;
+    let mut stdout_generation = 0;
+    let mut stderr_generation = 0;
+    let mut child_generation = 0;
+    let mut timer_generation = 0;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    loop {
+        stdout_eof |= drain_editor_stream(process.stdout, &mut stdout)?;
+        stderr_eof |= drain_editor_stream(process.stderr, &mut stderr)?;
+        let (state, code) = host::child_status(process.child)
+            .map_err(|error| format!("nvim child status: {error:?}"))?;
+        if state != host::ChildState::Running && stdout_eof && stderr_eof {
+            return Ok(EditorProcessOutput {
+                state,
+                code,
+                stdout,
+                stderr,
+            });
+        }
+        let stdout_pollable = host::notification_pollable(stdout_notification, stdout_generation)
+            .map_err(|error| format!("nvim stdout pollable: {error:?}"))?;
+        let stderr_pollable = host::notification_pollable(stderr_notification, stderr_generation)
+            .map_err(|error| format!("nvim stderr pollable: {error:?}"))?;
+        let child_pollable = host::notification_pollable(child_notification, child_generation)
+            .map_err(|error| format!("nvim child pollable: {error:?}"))?;
+        let timer_pollable = host::notification_pollable(timer_notification, timer_generation)
+            .map_err(|error| format!("Neovim remote deadline pollable: {error:?}"))?;
+        let ready = host::worker_wait_any(
+            vec![
+                stdout_pollable,
+                stderr_pollable,
+                child_pollable,
+                timer_pollable,
+            ],
+            None,
+            host::WaitMode::Fair,
+        )
+        .await;
+        let _ = host::pollable_drop(stdout_pollable);
+        let _ = host::pollable_drop(stderr_pollable);
+        let _ = host::pollable_drop(child_pollable);
+        let _ = host::pollable_drop(timer_pollable);
+        match ready {
+            Ok(ready) if ready.index == 0 => stdout_generation = ready.generation,
+            Ok(ready) if ready.index == 1 => stderr_generation = ready.generation,
+            Ok(ready) if ready.index == 2 => child_generation = ready.generation,
+            Ok(ready) => {
+                timer_generation = ready.generation;
+                if host::timer_status(timer)
+                    .map_err(|error| format!("Neovim remote deadline status: {error:?}"))?
+                    == host::TimerState::Expired
+                {
+                    return Err(format!(
+                        "Neovim remote control timed out after {EDITOR_REMOTE_ATTEMPT_TIMEOUT_MS}ms"
+                    ));
+                }
+            }
+            Err(host::WaitError::Cancelled) => {
+                return Err("Neovim remote control was cancelled".to_string());
+            }
+            Err(error) => return Err(format!("wait for Neovim remote control: {error:?}")),
+        }
+    }
+}
+
+fn drain_editor_stream(stream: u64, output: &mut Vec<u8>) -> Result<bool, String> {
+    loop {
+        match host::stream_read(stream, 4096)
+            .map_err(|error| format!("read Neovim remote stream: {error:?}"))?
+        {
+            host::StreamReadResult::Data(bytes) => {
+                let remaining = MAX_EDITOR_PROCESS_OUTPUT.saturating_sub(output.len());
+                output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            }
+            host::StreamReadResult::WouldBlock => return Ok(false),
+            host::StreamReadResult::Eof => return Ok(true),
+        }
+    }
+}
+
+fn editor_process_failure(output: &EditorProcessOutput) -> String {
+    let detail = if output.stderr.is_empty() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let detail = String::from_utf8_lossy(detail);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("state {:?}, status {:?}", output.state, output.code)
+    } else {
+        format!(
+            "state {:?}, status {:?}: {detail}",
+            output.state, output.code
+        )
+    }
+}
+
 async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
-    let (rows, cols) = {
+    let (rows, cols, editor_socket) = {
         let guard = STATE
             .lock()
             .map_err(|_| "terminal state is poisoned".to_string())?;
         let state = guard
             .as_ref()
             .ok_or_else(|| "terminal state is unavailable".to_string())?;
-        (state.screen.rows, state.screen.cols)
+        (
+            state.screen.rows,
+            state.screen.cols,
+            state.editor_socket.clone(),
+        )
     };
+    let (command, arguments) = editor_socket.map_or_else(
+        || ("sh", vec!["-i".to_string()]),
+        |socket| ("brood-nvim", vec!["--listen".to_string(), socket]),
+    );
     let pty = host::pty_spawn(
-        "sh",
-        &["-i".to_string()],
+        command,
+        &arguments,
         host::PtySpawnOptions {
             rows,
             cols,
             terminal_profile: host::TerminalProfile::Xterm256color,
         },
     )
-    .map_err(|error| format!("spawn terminal shell: {error:?}"))?;
+    .map_err(|error| format!("spawn terminal role {command}: {error:?}"))?;
     let stream_notification = host::stream_notification(pty.terminal)
         .map_err(|error| format!("terminal stream notification: {error:?}"))?;
     {
@@ -391,6 +1125,7 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         state.child = Some(pty.child);
         state.terminal = Some(pty.terminal);
         state.stream_notification = Some(stream_notification);
+        state.flush_input();
         state.signal_changed();
     }
 
@@ -577,6 +1312,16 @@ async fn wait_timer(timer: u64) -> Result<(), String> {
     Ok(())
 }
 
+async fn wait_duration(duration_ms: u64) -> Result<(), String> {
+    let timer = host::timer_create(duration_ms)
+        .map_err(|error| format!("create duration timer: {error:?}"))?;
+    let result = wait_timer(timer).await;
+    let dropped = host::timer_drop(timer)
+        .await
+        .map_err(|error| format!("drop duration timer: {error:?}"));
+    result.and(dropped)
+}
+
 async fn write_worker_bytes(stream: u64, mut bytes: &[u8]) -> Result<(), String> {
     let notification = host::stream_notification(stream)
         .map_err(|error| format!("stream notification: {error:?}"))?;
@@ -682,10 +1427,13 @@ struct Screen {
     mouse_tracking: u8,
     mouse_sgr: bool,
     responses: Vec<u8>,
+    editor_osc_enabled: bool,
+    editor_actions: VecDeque<Vec<u8>>,
+    editor_action_bytes: usize,
 }
 
 impl Screen {
-    fn new(rows: u16, cols: u16) -> Self {
+    fn new(rows: u16, cols: u16, editor_osc_enabled: bool) -> Self {
         Self {
             rows,
             cols,
@@ -707,7 +1455,44 @@ impl Screen {
             mouse_tracking: 0,
             mouse_sgr: false,
             responses: Vec::new(),
+            editor_osc_enabled,
+            editor_actions: VecDeque::new(),
+            editor_action_bytes: 0,
         }
+    }
+
+    fn capture_editor_action(&mut self, encoded: &[u8]) {
+        if !self.editor_osc_enabled
+            || encoded.len() > MAX_EDITOR_OSC_JSON_BYTES.saturating_mul(2)
+            || !encoded.len().is_multiple_of(2)
+            || self.editor_actions.len() >= MAX_EDITOR_OSC_ACTIONS
+        {
+            return;
+        }
+        let Some(decoded) = decode_hex(encoded) else {
+            return;
+        };
+        if self.editor_action_bytes.saturating_add(decoded.len()) > MAX_EDITOR_OSC_QUEUE_BYTES {
+            return;
+        }
+        self.editor_action_bytes = self.editor_action_bytes.saturating_add(decoded.len());
+        self.editor_actions.push_back(decoded);
+    }
+
+    fn take_editor_actions(&mut self) -> Vec<Vec<u8>> {
+        self.editor_action_bytes = 0;
+        self.editor_actions.drain(..).collect()
+    }
+
+    fn reset(&mut self) {
+        let rows = self.rows;
+        let cols = self.cols;
+        let editor_osc_enabled = self.editor_osc_enabled;
+        let editor_actions = std::mem::take(&mut self.editor_actions);
+        let editor_action_bytes = self.editor_action_bytes;
+        *self = Self::new(rows, cols, editor_osc_enabled);
+        self.editor_actions = editor_actions;
+        self.editor_action_bytes = editor_action_bytes;
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -1095,7 +1880,23 @@ impl Perform for Screen {
 
     fn unhook(&mut self) {}
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        match params {
+            [b"11", b"?"] => {
+                let red = (DEFAULT_BG >> 16) & 0xff;
+                let green = (DEFAULT_BG >> 8) & 0xff;
+                let blue = DEFAULT_BG & 0xff;
+                self.responses.extend_from_slice(
+                    format!(
+                        "\x1b]11;rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}\x1b\\"
+                    )
+                    .as_bytes(),
+                );
+            }
+            [b"777", b"brood", encoded] => self.capture_editor_action(encoded),
+            _ => {}
+        }
+    }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let values = Self::params(params);
@@ -1177,7 +1978,7 @@ impl Perform for Screen {
             },
             'm' => self.set_sgr(&values),
             's' => self.saved_cursor = (self.cursor_row, self.cursor_col),
-            'u' => (self.cursor_row, self.cursor_col) = self.saved_cursor,
+            'u' if !private => (self.cursor_row, self.cursor_col) = self.saved_cursor,
             'r' => {
                 let top = first.saturating_sub(1).min(self.rows.saturating_sub(1));
                 let bottom = Self::parameter(&values, 1, self.rows)
@@ -1263,11 +2064,7 @@ impl Perform for Screen {
                 self.newline();
             }
             b'M' => self.reverse_index(),
-            b'c' => {
-                let rows = self.rows;
-                let cols = self.cols;
-                *self = Self::new(rows, cols);
-            }
+            b'c' => self.reset(),
             _ => {}
         }
     }
@@ -1422,7 +2219,15 @@ fn encode_row(screen: &Screen, viewport_offset: usize, row: u16) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SNAPSHOT_FULL, SNAPSHOT_VERSION, SessionState, encode_snapshot};
+    use super::{
+        EditorOpen, MAX_PENDING_EDITOR_CONTROLS, SNAPSHOT_FULL, SNAPSHOT_VERSION, Screen,
+        SessionState, decode_editor_control, editor_cursor_arguments, editor_remote_arguments,
+        editor_socket_path, editor_worker_finished_message, encode_snapshot,
+        is_editor_session_instance, parse_editor_open, route_editor_action, trusted_input_sender,
+    };
+    use crate::exports::brood::plugin::actor::Command;
+    use serde_json::Value;
+    use vte::{Parser, Perform};
 
     fn row_range(chunk: &[u8]) -> (u16, u16) {
         (
@@ -1433,7 +2238,7 @@ mod tests {
 
     #[test]
     fn snapshots_bootstrap_fully_then_send_only_changed_rows() {
-        let mut state = SessionState::new(1, 1);
+        let mut state = SessionState::new(1, 1, false, None);
         let initial = encode_snapshot(&mut state);
         assert_eq!(initial[0][4], SNAPSHOT_VERSION);
         assert_eq!(initial[0][5], SNAPSHOT_FULL);
@@ -1461,7 +2266,7 @@ mod tests {
 
     #[test]
     fn snapshot_acknowledges_only_fully_written_terminal_inputs() -> Result<(), String> {
-        let mut state = SessionState::new(1, 1);
+        let mut state = SessionState::new(1, 1, false, None);
         state.queue_input(7, b"ab");
         state.queue_input(8, b"c");
         state.record_written_input(2);
@@ -1480,6 +2285,268 @@ mod tests {
             .map_err(|_| "second snapshot acknowledgement is truncated")?;
         assert_eq!(u64::from_le_bytes(second_ack), 8);
         Ok(())
+    }
+
+    #[test]
+    fn editor_socket_names_are_short_and_generation_unique() {
+        let first = editor_socket_path(7, 11, "neovim-session");
+        let second = editor_socket_path(7, 12, "neovim-session");
+        assert_ne!(first, second);
+        assert!(first.starts_with("/tmp/brood-nvim-s7-"));
+        assert!(first.len() < 100);
+    }
+
+    #[test]
+    fn editor_role_accepts_realm_scoped_instance_id() {
+        assert!(is_editor_session_instance("neovim-session"));
+        assert!(is_editor_session_instance("brood.session.7.neovim-session"));
+        assert!(!is_editor_session_instance("terminal-session"));
+        assert!(!is_editor_session_instance("not-neovim-session"));
+    }
+
+    #[test]
+    fn editor_exit_before_readiness_or_with_failure_is_not_clean() {
+        let mut state =
+            SessionState::new(7, 1, true, Some("/tmp/brood-nvim-test.sock".to_string()));
+        state.exit_code = Some(0);
+        let Command::SendLocalMessage(message) =
+            editor_worker_finished_message(&state).expect("editor lifecycle message")
+        else {
+            panic!("editor completion must use the local init mailbox");
+        };
+        let body: Value = serde_json::from_slice(&message.body).expect("lifecycle JSON");
+        assert_eq!(body["kind"], "editor-failed");
+
+        state.editor_ready = true;
+        state.exit_code = Some(1);
+        let Command::SendLocalMessage(message) =
+            editor_worker_finished_message(&state).expect("editor lifecycle message")
+        else {
+            panic!("editor completion must use the local init mailbox");
+        };
+        let body: Value = serde_json::from_slice(&message.body).expect("lifecycle JSON");
+        assert_eq!(body["kind"], "editor-failed");
+
+        state.exit_code = Some(0);
+        let Command::SendLocalMessage(message) =
+            editor_worker_finished_message(&state).expect("editor lifecycle message")
+        else {
+            panic!("editor completion must use the local init mailbox");
+        };
+        let body: Value = serde_json::from_slice(&message.body).expect("lifecycle JSON");
+        assert_eq!(body["kind"], "editor-stopped");
+    }
+
+    #[test]
+    fn editor_open_is_typed_bounded_and_builds_remote_arguments() {
+        let request = parse_editor_open(
+            br#"{"kind":"editor-open","path":"/work/src/main.rs","line":12,"column":4}"#,
+        )
+        .expect("valid editor-open");
+        assert_eq!(
+            request,
+            EditorOpen {
+                path: "/work/src/main.rs".to_string(),
+                line: Some(12),
+                column: Some(4),
+            }
+        );
+        assert_eq!(
+            editor_remote_arguments("/tmp/editor.sock", &request),
+            vec![
+                "--server",
+                "/tmp/editor.sock",
+                "--remote",
+                "/work/src/main.rs",
+            ]
+        );
+        assert_eq!(
+            editor_cursor_arguments("/tmp/editor.sock", &request),
+            Some(vec![
+                "--server".to_string(),
+                "/tmp/editor.sock".to_string(),
+                "--remote-expr".to_string(),
+                "cursor(12,4)".to_string(),
+            ])
+        );
+        assert!(parse_editor_open(br#"{"kind":"editor-open","path":"","line":1}"#).is_none());
+        assert!(parse_editor_open(br#"{"kind":"editor-open","path":"/tmp/a","line":0}"#).is_none());
+        assert_eq!(
+            editor_remote_arguments(
+                "/tmp/editor.sock",
+                &EditorOpen {
+                    path: "-option-like".to_string(),
+                    line: None,
+                    column: None,
+                }
+            ),
+            vec!["--server", "/tmp/editor.sock", "--remote", "./-option-like",]
+        );
+    }
+
+    #[test]
+    fn editor_controls_are_serial_and_bounded() {
+        let mut state =
+            SessionState::new(7, 1, true, Some("/tmp/brood-nvim-test.sock".to_string()));
+        state.editor_ready = true;
+        let request = EditorOpen {
+            path: "/tmp/a".to_string(),
+            line: Some(3),
+            column: None,
+        };
+        let first = state.queue_editor_open(request.clone());
+        assert!(matches!(first.as_slice(), [Command::SpawnWorker(_)]));
+        for _ in 1..MAX_PENDING_EDITOR_CONTROLS {
+            assert!(state.queue_editor_open(request.clone()).is_empty());
+        }
+        let rejected = state.queue_editor_open(request);
+        assert!(matches!(
+            rejected.as_slice(),
+            [Command::SendPresentationMessage(message)]
+                if message.actor == super::CLIENT_INIT_ID
+        ));
+        assert_eq!(
+            state.pending_editor_controls.len(),
+            MAX_PENDING_EDITOR_CONTROLS - 1
+        );
+        let payload = match &first[0] {
+            Command::SpawnWorker(request) => &request.payload,
+            _ => unreachable!(),
+        };
+        let (socket, decoded) = decode_editor_control(payload).expect("encoded editor control");
+        assert_eq!(socket, "/tmp/brood-nvim-test.sock");
+        assert_eq!(decoded.path, "/tmp/a");
+    }
+
+    #[test]
+    fn editor_readiness_waits_for_a_successful_server_probe() {
+        let mut state =
+            SessionState::new(7, 1, true, Some("/tmp/brood-nvim-test.sock".to_string()));
+        state.child = Some(9);
+        let queued = state.queue_editor_open(EditorOpen {
+            path: "/tmp/a".to_string(),
+            line: None,
+            column: None,
+        });
+        assert!(queued.is_empty());
+        assert!(!state.editor_ready);
+        assert!(matches!(
+            state.start_editor_probe(),
+            Some(Command::SpawnWorker(request))
+                if request.worker == super::EDITOR_PROBE_WORKER
+        ));
+        let ready = state.finish_editor_probe(None);
+        assert!(state.editor_ready);
+        assert!(matches!(
+            ready.as_slice(),
+            [Command::SendLocalMessage(message), Command::SpawnWorker(_)]
+                if message.actor == "init"
+        ));
+    }
+
+    #[test]
+    fn private_editor_osc_is_role_gated_and_routes_to_client_init() {
+        let json = br#"{"action":"terminal","command":"cargo test","agent":"ignored"}"#;
+        let encoded = json
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let params = [b"777".as_slice(), b"brood".as_slice(), encoded.as_bytes()];
+
+        let mut normal = Screen::new(4, 8, false);
+        normal.osc_dispatch(&params, false);
+        assert!(normal.take_editor_actions().is_empty());
+
+        let mut editor = Screen::new(4, 8, true);
+        editor.osc_dispatch(&params, false);
+        let captured = editor.take_editor_actions();
+        assert_eq!(captured, vec![json.to_vec()]);
+        let commands = route_editor_action(44, &captured[0]);
+        let Command::SendPresentationMessage(message) = &commands[0] else {
+            panic!("editor action did not target the presentation realm");
+        };
+        assert_eq!(message.actor, "brood.client-init");
+        let forwarded: Value =
+            serde_json::from_slice(&message.body).expect("forwarded editor action JSON");
+        assert_eq!(forwarded["kind"], "editor-action");
+        assert_eq!(forwarded["action"], "terminal");
+        assert_eq!(forwarded["session_id"], 44);
+        assert_eq!(forwarded["command"], "cargo test");
+    }
+
+    #[test]
+    fn generic_editor_messages_only_use_actor_message_commands() {
+        let local = route_editor_action(
+            1,
+            br#"{"action":"message","target":"session:terminal","body":"ls"}"#,
+        );
+        assert!(matches!(
+            local.as_slice(),
+            [Command::SendLocalMessage(message)]
+                if message.actor == "terminal" && message.body == b"ls"
+        ));
+        let presentation = route_editor_action(
+            1,
+            br#"{"action":"message","target":"presentation:diff-viewer","body":{"kind":"focus"}}"#,
+        );
+        assert!(matches!(
+            presentation.as_slice(),
+            [Command::SendPresentationMessage(message)]
+                if message.actor == "diff-viewer"
+        ));
+        assert!(
+            route_editor_action(
+                1,
+                br#"{"action":"message","target":"presentation:../../host","body":"no"}"#,
+            )
+            .is_empty()
+        );
+        for actor in ["brood.client-init", "session-switcher"] {
+            let payload = format!(
+                r#"{{"action":"message","target":"presentation:{actor}","body":{{"kind":"editor-action","session_id":99}}}}"#
+            );
+            assert!(route_editor_action(1, payload.as_bytes()).is_empty());
+        }
+    }
+
+    #[test]
+    fn osc_background_query_answers_neovim_and_private_u_does_not_restore_cursor() {
+        let mut screen = Screen::new(8, 16, true);
+        let mut parser = Parser::new();
+        parser.advance(&mut screen, b"\x1b]11;?\x1b\\");
+        assert_eq!(
+            screen.responses,
+            format!(
+                "\x1b]11;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x1b\\",
+                (super::DEFAULT_BG >> 16) & 0xff,
+                (super::DEFAULT_BG >> 8) & 0xff,
+                super::DEFAULT_BG & 0xff,
+            )
+            .into_bytes()
+        );
+
+        screen.saved_cursor = (1, 2);
+        screen.cursor_row = 5;
+        screen.cursor_col = 6;
+        parser.advance(&mut screen, b"\x1b[?u");
+        assert_eq!((screen.cursor_row, screen.cursor_col), (5, 6));
+        parser.advance(&mut screen, b"\x1b[u");
+        assert_eq!((screen.cursor_row, screen.cursor_col), (1, 2));
+    }
+
+    #[test]
+    fn csi_vertical_relative_position_advances_once() {
+        let mut screen = Screen::new(8, 16, false);
+        let mut parser = Parser::new();
+        parser.advance(&mut screen, b"\x1b[2e");
+        assert_eq!(screen.cursor_row, 2);
+    }
+
+    #[test]
+    fn init_and_presentation_can_send_terminal_input() {
+        assert!(trusted_input_sender("init"));
+        assert!(trusted_input_sender("presentation:terminal-ui"));
+        assert!(!trusted_input_sender("other-session-actor"));
     }
 }
 

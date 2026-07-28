@@ -155,6 +155,8 @@ shortcuts or wrapper arguments:
   session-scoped coding-agent UI for it;
 - `Ctrl+Alt+T` asks the client- and session-init actors to create a fresh paired
   terminal presentation and session actor;
+- `Ctrl+Alt+E` opens or focuses the active session's persistent Neovim editor
+  pane;
 - `Ctrl+Alt+P` opens the reusable fuzzy session picker;
 - `Ctrl+Alt+D` opens or focuses the active session's single project-diff pane;
 - `Ctrl+Alt+Q` closes the focused managed or plugin pane;
@@ -166,6 +168,10 @@ These chords are guest policy. Switcher visibility remains actor-owned:
 `Ctrl+Alt+M` sends an ordinary sidebar action to the switcher, which republishes
 its root layout fragment. The client validates the resulting layout and focus
 request; it has no switcher-specific visibility command.
+
+When a terminal or Neovim pane is focused, ordinary Ctrl chords remain pane
+input so shell and Vim bindings retain their normal meaning. Ctrl+Alt product
+actions remain available through the global policy.
 
 ## Action Registry
 

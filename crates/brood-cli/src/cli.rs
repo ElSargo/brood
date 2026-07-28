@@ -50,6 +50,8 @@ pub struct TestArgs {
 pub enum TestCommand {
     /// Run the external-client nested terminal workload.
     Nested(NestedTestArgs),
+    /// Run the external-client Neovim editor workload.
+    Editor(NestedTestArgs),
     /// Deploy to an SSH host and verify one client against local and remote backends.
     Ssh(SshTestArgs),
 }

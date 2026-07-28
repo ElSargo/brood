@@ -11,8 +11,11 @@ Root-level target-shape Brood plugins live here.
 - `session-switcher/` is the default client-realm shell plugin: its init actor starts a native plugin pane which renders the live session catalogue and performs typed create, switch, rename, and close operations.
 - `picker/` is the reusable client-realm fuzzy picker actor. It serializes concurrent requests, accepts streamed items through stable IDs, and returns the original selected result and index.
 - `diff-viewer/` is the session-scoped project-diff pane: it renders every changed file in one continuous split diff, loads Git state in a worker, and relies on ordinary workspace placement.
+- `neovim/` is the packaged real-Neovim bridge. It retains the user's Vim configuration and editing model while exposing bounded commands and `<Plug>` mappings for diff, terminal, agent, and addressed actor-message workflows.
 
-These crates are currently standalone because `brood-wasm` is host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest SDK instead of hand-writing ABI exports and JSON envelopes.
+The WASM crates are currently standalone because `brood-wasm` is
+host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest
+SDK instead of hand-writing ABI exports and JSON envelopes.
 
 ## Visual language
 

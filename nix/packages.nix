@@ -3,6 +3,7 @@
 let
   lib = pkgs.lib;
   profiles = import ./profiles.nix { inherit pkgs; };
+  sourceRoot = toString ../.;
 
   appToolPath = lib.makeBinPath profiles.appTools;
   fullDevToolPath = lib.makeBinPath (
@@ -18,8 +19,9 @@ let
       path: type:
       let
         base = baseNameOf path;
+        relative = lib.removePrefix "${sourceRoot}/" (toString path);
       in
-      base != "target";
+      base != "target" && relative != "nix" && !lib.hasPrefix "nix/" relative;
   };
   nativePkgConfigPath = lib.concatStringsSep ":" [
     (lib.makeSearchPathOutput "dev" "lib/pkgconfig" profiles.nativeLibs)
@@ -466,16 +468,24 @@ let
 
     if [[ -d ${wasmModules}/plugins ]]; then
       cp -R ${wasmModules}/plugins "$out/plugins"
+      chmod u+w "$out/plugins"
     else
       echo "ERR packaged WASM modules did not include a plugins directory" >&2
       exit 2
     fi
+
+    install -D -m 0444 ${../plugins/neovim/init.lua} \
+      "$out/plugins/neovim/init.lua"
+    install -D -m 0444 ${../plugins/neovim/README.md} \
+      "$out/plugins/neovim/README.md"
   '';
 
   brood = pkgs.symlinkJoin {
     name = "brood";
     paths = [
       broodd
+      profiles.broodNvim
+      pkgs.neovim
       runtimeFiles
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -511,6 +521,9 @@ let
       ''
         mkdir -p \
           "$out/bin" \
+          "$out/lib" \
+          "$out/libexec" \
+          "$out/plugins/neovim" \
           "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release"
         for program in brood brood-remote brood-sessiond brood-runner-exec; do
           cp ${broodd}/bin/"$program" "$out/bin/$program"
@@ -520,8 +533,107 @@ let
             --remove-rpath \
             "$out/bin/$program"
         done
+
+        install -m 0755 ${pkgs.neovim-unwrapped}/bin/nvim "$out/libexec/nvim"
+        cp -R ${pkgs.neovim-unwrapped}/share "$out/share"
+        chmod u+w "$out/share"
+        cp -R ${pkgs.luajit}/share/lua "$out/share/lua"
+        cp -RL ${pkgs.neovim-unwrapped}/lib/nvim "$out/lib/nvim"
+        chmod -R u+w "$out/lib/nvim"
+
+        mapfile -t nvim_dependencies < <(
+          {
+            ${pkgs.glibc.bin}/bin/ldd "$out/libexec/nvim"
+            find "$out/lib/nvim/parser" -type f -name '*.so' \
+              -exec ${pkgs.glibc.bin}/bin/ldd {} +
+          } \
+            | awk '
+                /=> \/nix\/store\// { print $3 }
+                /^[[:space:]]*\/nix\/store\// && $1 !~ /:$/ { print $1 }
+              ' \
+            | sort -u
+        )
+        for dependency in "''${nvim_dependencies[@]}"; do
+          library="$(basename "$dependency")"
+          case "$library" in
+            ld-linux-*.so.*|libc.so.*|libdl.so.*|libm.so.*|libpthread.so.*|librt.so.*|libutil.so.*)
+              continue
+              ;;
+          esac
+          install -m 0755 "$dependency" "$out/lib/$library"
+        done
+
+        patchelf \
+          --set-interpreter ${lib.escapeShellArg dynamicLinker} \
+          --set-rpath '$ORIGIN/../lib' \
+          "$out/libexec/nvim"
+        for object in "$out/libexec/nvim" "$out/lib/"*.so*; do
+          while IFS= read -r dependency; do
+            case "$dependency" in
+              /nix/store/*)
+                patchelf \
+                  --replace-needed "$dependency" "$(basename "$dependency")" \
+                  "$object"
+                ;;
+            esac
+          done < <(patchelf --print-needed "$object")
+          if [[ "$object" != "$out/libexec/nvim" ]]; then
+            patchelf --set-rpath '$ORIGIN' "$object"
+          fi
+        done
+        while IFS= read -r -d "" parser; do
+          patchelf --set-rpath '$ORIGIN/../..' "$parser"
+        done < <(find "$out/lib/nvim/parser" -type f -name '*.so' -print0)
+
+        install -m 0444 ${../plugins/neovim/init.lua} \
+          "$out/plugins/neovim/init.lua"
+        cat >"$out/bin/nvim" <<'EOF'
+        #!/bin/sh
+        set -eu
+        case "$0" in
+          */*) script_dir=''${0%/*} ;;
+          *) script_dir=. ;;
+        esac
+        root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+        export VIMRUNTIME="$root/share/nvim/runtime"
+        export LUA_PATH="$root/share/lua/5.1/?.lua;$root/share/lua/5.1/?/init.lua;''${LUA_PATH:-;}"
+        export LUA_CPATH="$root/lib/?.so;''${LUA_CPATH:-;}"
+        exec "$root/libexec/nvim" \
+          --cmd "set runtimepath^=$root/lib/nvim" \
+          "$@"
+        EOF
+        chmod 0755 "$out/bin/nvim"
+
+        cat >"$out/bin/brood-nvim" <<'EOF'
+        #!/bin/sh
+        set -eu
+        umask 077
+        case "$0" in
+          */*) script_dir=''${0%/*} ;;
+          *) script_dir=. ;;
+        esac
+        root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+        exec "$root/bin/nvim" \
+          --cmd "luafile $root/plugins/neovim/init.lua" \
+          "$@"
+        EOF
+        chmod 0755 "$out/bin/brood-nvim"
+
         install -m 0755 ${../tools/brood-ssh-backend-session.sh} \
-          "$out/bin/brood-ssh-backend-session"
+          "$out/libexec/brood-ssh-backend-session"
+        cat >"$out/bin/brood-ssh-backend-session" <<'EOF'
+        #!/bin/sh
+        set -eu
+        case "$0" in
+          */*) script_dir=''${0%/*} ;;
+          *) script_dir=. ;;
+        esac
+        root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+        export PATH="$root/bin:''${PATH:-/usr/bin:/bin}"
+        exec "$root/libexec/brood-ssh-backend-session" "$@"
+        EOF
+        chmod 0755 "$out/bin/brood-ssh-backend-session"
+
         install -m 0555 \
           ${wasmModules}/plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm \
           "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"
@@ -997,6 +1109,7 @@ let
 in
 {
   default = broodWithDesktop;
+  "brood-nvim" = profiles.broodNvim;
   "dev-workflow" = devWorkflowWithRuntime;
   "dev-workflow-full" = devWorkflowFullWithRuntime;
   "dev-env" = devEnv;
@@ -1012,6 +1125,7 @@ in
   "wasm-modules" = wasmModules;
   "wasm-examples" = wasmModules;
   inherit formatter linter;
+  broodNvim = profiles.broodNvim;
 
   inherit
     cargoArtifacts

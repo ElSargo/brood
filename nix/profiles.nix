@@ -74,24 +74,48 @@ let
     ]
   );
 
+  broodNvimInit = pkgs.writeText "brood-nvim-init.lua" (builtins.readFile ../plugins/neovim/init.lua);
+
+  broodNvim = pkgs.writeShellApplication {
+    name = "brood-nvim";
+    runtimeInputs = [
+      pkgs.neovim
+      pkgs.ripgrep
+      pkgs.wl-clipboard
+    ];
+    text = ''
+      umask 077
+      exec ${pkgs.neovim}/bin/nvim \
+        --cmd ${pkgs.lib.escapeShellArg "luafile ${broodNvimInit}"} \
+        "$@"
+    '';
+  };
+
   appTools = [
+    broodNvim
     pkgs.coreutils
     pkgs.findutils
     pkgs.foot
     pkgs.git
+    pkgs.neovim
+    pkgs.ripgrep
     sessionSwitcherPython
     pkgs.util-linux
+    pkgs.wl-clipboard
   ];
 
   devToolsFor = rust: [
     pkgs.bashInteractive
+    broodNvim
     pkgs.coreutils
     pkgs.findutils
     pkgs.git
+    pkgs.neovim
     pkgs.pkg-config
     sessionSwitcherPython
     pkgs.ripgrep
     rust
+    pkgs.wl-clipboard
   ];
 
   fullDevExtras = [
@@ -126,6 +150,8 @@ in
 {
   inherit
     appTools
+    broodNvim
+    broodNvimInit
     fullDevExtras
     gtkRuntime
     nativeLibs

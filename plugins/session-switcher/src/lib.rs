@@ -26,6 +26,8 @@ const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.w
 const DIFF_VIEWER_COMPONENT_FILE: &str = "brood_diff_viewer_plugin.component.wasm";
 const TERMINAL_UI_COMPONENT_FILE: &str = "brood_terminal_ui_plugin.component.wasm";
 const TERMINAL_UI_ID: &str = "terminal-ui";
+const NEOVIM_UI_ID_PREFIX: &str = "neovim-ui-b";
+const NEOVIM_SESSION_ID: &str = "neovim-session";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
 const DIFF_VIEWER_ID_PREFIX: &str = "diff-viewer-s";
 const LEFT_BUTTON: u32 = 0x110;
@@ -158,6 +160,7 @@ struct SwitcherState {
     agent_picker_pending: bool,
     diff_viewers: BTreeSet<String>,
     terminal_uis: BTreeMap<String, (u64, u64)>,
+    neovim_uis: BTreeMap<(u64, u64), String>,
     text_resources: Vec<u64>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
@@ -235,6 +238,20 @@ struct TerminalLifecycleMessage {
     #[serde(default)]
     session_id: u64,
     terminal: Option<serde_json_core::heapless::String<64>>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct EditorMessage {
+    kind: String,
+    action: String,
+    session_id: u64,
+    editor: Option<String>,
+    command: String,
+    message: String,
+    path: String,
+    prompt: String,
+    agent: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -419,6 +436,7 @@ impl SwitcherState {
             agent_picker_pending: false,
             diff_viewers: BTreeSet::new(),
             terminal_uis: BTreeMap::new(),
+            neovim_uis: BTreeMap::new(),
             text_resources: Vec::new(),
             layout: None,
             workspace_focus: None,
@@ -616,6 +634,7 @@ impl Guest for SessionSwitcher {
                             session_id: Some(session_id),
                         }));
                         commands.push(subscribe_agent_registry(backend_id, session_id));
+                        commands.push(query_editor_status(backend_id, session_id));
                     }
                     commands.push(ActorCommand::LifecycleComplete(Ok(())));
                     commands
@@ -641,6 +660,16 @@ impl Guest for SessionSwitcher {
                     let realm =
                         actor_realm(&started.id).unwrap_or((state.backend_id, state.session_id));
                     state.terminal_uis.insert(started.id, realm);
+                }
+                Vec::new()
+            }
+            Event::Child(ChildEvent::Started(started))
+                if started.id.starts_with(NEOVIM_UI_ID_PREFIX) =>
+            {
+                if let Some(realm) = actor_realm(&started.id)
+                    && let Ok(mut state) = STATE.lock()
+                {
+                    state.neovim_uis.insert(realm, started.id);
                 }
                 Vec::new()
             }
@@ -671,6 +700,7 @@ impl Guest for SessionSwitcher {
                 state.coding_agent_uis.retain(|actor| actor != &id);
                 state.coding_agent_targets.remove(&id);
                 state.diff_viewers.remove(&id);
+                state.neovim_uis.retain(|_, actor| actor != &id);
                 state
                     .terminal_uis
                     .remove(&id)
@@ -694,6 +724,7 @@ impl Guest for SessionSwitcher {
                 state.coding_agent_uis.retain(|actor| actor != &failed.id);
                 state.coding_agent_targets.remove(&failed.id);
                 state.diff_viewers.remove(&failed.id);
+                state.neovim_uis.retain(|_, actor| actor != &failed.id);
                 let stop = state
                     .terminal_uis
                     .remove(&failed.id)
@@ -763,6 +794,9 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
             } else {
                 Vec::new()
             };
+            if state.is_root && backend != 0 && active != 0 {
+                commands.push(query_editor_status(backend, active));
+            }
             if previous_realm != (state.backend_id, state.session_id) {
                 state.agents.clear();
                 if state.backend_id != 0 && state.session_id != 0 {
@@ -1111,19 +1145,9 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         let Ok(mut state) = STATE.lock() else {
             return Vec::new();
         };
-        let id = format!(
-            "{DIFF_VIEWER_ID_PREFIX}b{}-s{}",
-            state.backend_id, state.session_id
-        );
-        return if state.diff_viewers.contains(&id) {
-            vec![ActorCommand::SendLocalMessage(LocalActorMessage {
-                actor: id,
-                body: br#"{"kind":"focus"}"#.to_vec(),
-            })]
-        } else {
-            state.diff_viewers.insert(id.clone());
-            vec![start_diff_viewer(&id, state.backend_id, state.session_id)]
-        };
+        let backend_id = state.backend_id;
+        let session_id = state.session_id;
+        return show_diff(&mut state, backend_id, session_id);
     }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
         && consumed == bytes.len()
@@ -1142,6 +1166,23 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
             actor: "init".to_string(),
             body: br#"{"kind":"create-terminal"}"#.to_vec(),
         })];
+    }
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
+        && consumed == bytes.len()
+        && message.kind.as_str() == "editor-action"
+        && message.action.as_str() == "open"
+    {
+        let Ok(state) = STATE.lock() else {
+            return Vec::new();
+        };
+        if state.backend_id == 0 || state.session_id == 0 {
+            return Vec::new();
+        }
+        return vec![request_editor(
+            state.backend_id,
+            state.session_id,
+            "create-editor",
+        )];
     }
     let Ok((message, consumed)) = serde_json_core::from_slice::<SidebarActionMessage>(bytes) else {
         return Vec::new();
@@ -1185,6 +1226,15 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
 }
 
 fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Ok(message) = serde_json::from_slice::<EditorMessage>(bytes)
+        && (message.kind == "editor-started"
+            || message.kind == "editor-present"
+            || message.kind == "editor-failed"
+            || message.kind == "editor-open-failed"
+            || message.kind == "editor-action")
+    {
+        return handle_editor_message(sender, message);
+    }
     if let Ok((message, consumed)) =
         serde_json_core::from_slice::<BackendConnectionFailedMessage>(bytes)
         && consumed == bytes.len()
@@ -1291,6 +1341,196 @@ fn backend_from_sender(sender: &str) -> Option<u64> {
         "session" | "daemon" => parts.next()?.parse().ok(),
         _ => None,
     }
+}
+
+fn handle_editor_message(sender: &str, message: EditorMessage) -> Vec<ActorCommand> {
+    let Some(backend_id) = backend_from_sender(sender) else {
+        return Vec::new();
+    };
+    if message.session_id == 0 {
+        return Vec::new();
+    }
+    let session_id = message.session_id;
+    match message.kind.as_str() {
+        "editor-started" | "editor-present"
+            if sender_actor_is(sender, "init")
+                && message.editor.as_deref() == Some(NEOVIM_SESSION_ID) =>
+        {
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            if let Some(actor) = state.neovim_uis.get(&(backend_id, session_id)) {
+                return (message.kind == "editor-started")
+                    .then(|| {
+                        ActorCommand::SendLocalMessage(LocalActorMessage {
+                            actor: actor.clone(),
+                            body: br#"{"kind":"focus"}"#.to_vec(),
+                        })
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            let id = neovim_ui_id(backend_id, session_id);
+            state
+                .neovim_uis
+                .insert((backend_id, session_id), id.clone());
+            vec![ActorCommand::StartActor(ActorStartRequest {
+                id,
+                path: TERMINAL_UI_COMPONENT_FILE.to_string(),
+                capabilities: Vec::new(),
+                backend_id: Some(backend_id),
+                session_id: Some(session_id),
+            })]
+        }
+        "editor-failed" if sender_actor_is(sender, "init") => {
+            if let Ok(mut state) = STATE.lock() {
+                state.error = true;
+                state.status = if message.message.is_empty() {
+                    "Neovim editor failed to start".to_string()
+                } else {
+                    format!("Neovim editor failed to start: {}", message.message)
+                };
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        "editor-open-failed" if sender_actor_is(sender, NEOVIM_SESSION_ID) => {
+            if let Ok(mut state) = STATE.lock() {
+                state.error = true;
+                state.status = if message.path.is_empty() {
+                    format!("Neovim open failed: {}", message.message)
+                } else {
+                    format!(
+                        "Neovim could not open {}: {}",
+                        message.path, message.message
+                    )
+                };
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        "editor-action"
+            if sender_actor_is(sender, NEOVIM_SESSION_ID)
+                && message.command.len() <= 8 * 1024
+                && message.prompt.len() <= 8 * 1024
+                && !message.command.contains('\0')
+                && !message.prompt.contains('\0') =>
+        {
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            match message.action.as_str() {
+                "diff" => show_diff(&mut state, backend_id, session_id),
+                "terminal" => {
+                    let Ok(body) = serde_json::to_vec(&serde_json::json!({
+                        "kind": "create-terminal",
+                        "command": message.command,
+                    })) else {
+                        return Vec::new();
+                    };
+                    vec![ActorCommand::SendSessionMessage(SessionActorMessage {
+                        backend_id,
+                        session_id,
+                        actor: "init".to_string(),
+                        body,
+                    })]
+                }
+                "agent" if !message.prompt.trim().is_empty() => start_editor_agent_work(
+                    &mut state,
+                    backend_id,
+                    session_id,
+                    &message.agent,
+                    &message.prompt,
+                ),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn sender_actor_is(sender: &str, expected: &str) -> bool {
+    sender.rsplit(':').next() == Some(expected)
+}
+
+fn show_diff(state: &mut SwitcherState, backend_id: u64, session_id: u64) -> Vec<ActorCommand> {
+    let id = format!("{DIFF_VIEWER_ID_PREFIX}b{backend_id}-s{session_id}");
+    if state.diff_viewers.contains(&id) {
+        vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+            actor: id,
+            body: br#"{"kind":"focus"}"#.to_vec(),
+        })]
+    } else {
+        state.diff_viewers.insert(id.clone());
+        vec![start_diff_viewer(&id, backend_id, session_id)]
+    }
+}
+
+fn start_editor_agent_work(
+    state: &mut SwitcherState,
+    backend_id: u64,
+    session_id: u64,
+    requested_agent: &str,
+    prompt: &str,
+) -> Vec<ActorCommand> {
+    let agent = if requested_agent.is_empty() {
+        "coding-agent-1"
+    } else {
+        requested_agent
+    };
+    let (model, reasoning) = if (state.backend_id, state.session_id) == (backend_id, session_id) {
+        state
+            .agents
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .map(|candidate| (candidate.model.clone(), candidate.reasoning.clone()))
+            .unwrap_or_else(|| ("default".to_string(), "medium".to_string()))
+    } else {
+        ("default".to_string(), "medium".to_string())
+    };
+    let Ok(body) = serde_json::to_vec(&serde_json::json!({
+        "kind": "prompt",
+        "agent": agent,
+        "prompt": prompt,
+        "model": model,
+        "reasoning": reasoning,
+    })) else {
+        return Vec::new();
+    };
+    let id = format!(
+        "coding-agent-ui-b{backend_id}-s{session_id}-{}",
+        state.next_coding_agent_ui
+    );
+    state.next_coding_agent_ui = state.next_coding_agent_ui.saturating_add(1);
+    state
+        .coding_agent_targets
+        .insert(id.clone(), agent.to_string());
+    vec![
+        ActorCommand::SendSessionMessage(SessionActorMessage {
+            backend_id,
+            session_id,
+            actor: agent.to_string(),
+            body,
+        }),
+        start_coding_agent_ui(&id, backend_id, session_id),
+    ]
+}
+
+fn neovim_ui_id(backend_id: u64, session_id: u64) -> String {
+    format!("{NEOVIM_UI_ID_PREFIX}{backend_id}-s{session_id}")
+}
+
+fn request_editor(backend_id: u64, session_id: u64, kind: &str) -> ActorCommand {
+    ActorCommand::SendSessionMessage(SessionActorMessage {
+        backend_id,
+        session_id,
+        actor: "init".to_string(),
+        body: format!(r#"{{"kind":"{kind}"}}"#).into_bytes(),
+    })
+}
+
+fn query_editor_status(backend_id: u64, session_id: u64) -> ActorCommand {
+    request_editor(backend_id, session_id, "editor-status")
 }
 
 fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -2599,7 +2839,8 @@ export!(SessionSwitcher with_types_in self);
 #[cfg(test)]
 mod tests {
     use super::{
-        ActorCommand, SwitcherState, ensure_default_terminal_ui, header_geometry, truncate_to_width,
+        ActorCommand, SwitcherState, actor_realm, ensure_default_terminal_ui, header_geometry,
+        neovim_ui_id, request_editor, sender_actor_is, show_diff, truncate_to_width,
     };
 
     #[test]
@@ -2634,5 +2875,46 @@ mod tests {
         };
         assert_eq!(second.id, "terminal-ui-b2-s7");
         assert!(ensure_default_terminal_ui(&mut state, 2, 7).is_none());
+    }
+
+    #[test]
+    fn neovim_frontend_identity_round_trips_its_backend_realm() {
+        let id = neovim_ui_id(4, 27);
+        assert_eq!(id, "neovim-ui-b4-s27");
+        assert_eq!(actor_realm(&id), Some((4, 27)));
+    }
+
+    #[test]
+    fn editor_lifecycle_sender_must_be_the_session_init_actor() {
+        assert!(sender_actor_is("session:4:init", "init"));
+        assert!(!sender_actor_is("session:4:terminal-session", "init"));
+        assert!(!sender_actor_is("session:4:not-init", "init"));
+    }
+
+    #[test]
+    fn editor_request_targets_the_selected_session_init_actor() {
+        let ActorCommand::SendSessionMessage(message) = request_editor(8, 13, "create-editor")
+        else {
+            panic!("editor request did not use the session mailbox");
+        };
+        assert_eq!(message.backend_id, 8);
+        assert_eq!(message.session_id, 13);
+        assert_eq!(message.actor, "init");
+        assert_eq!(message.body, br#"{"kind":"create-editor"}"#);
+    }
+
+    #[test]
+    fn editor_diff_request_reuses_one_session_scoped_viewer() {
+        let mut state = SwitcherState::new();
+        let first = show_diff(&mut state, 3, 9);
+        let [ActorCommand::StartActor(started)] = first.as_slice() else {
+            panic!("first diff request did not start a viewer");
+        };
+        assert_eq!(started.id, "diff-viewer-sb3-s9");
+        let second = show_diff(&mut state, 3, 9);
+        let [ActorCommand::SendLocalMessage(focus)] = second.as_slice() else {
+            panic!("second diff request did not focus the viewer");
+        };
+        assert_eq!(focus.actor, "diff-viewer-sb3-s9");
     }
 }
