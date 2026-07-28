@@ -23,12 +23,19 @@ const MAX_SCROLLBACK: usize = 2_000;
 const MAX_SNAPSHOT_BODY: usize = 12 * 1024;
 const BULK_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
+const SNAPSHOT_VERSION: u8 = 4;
+const SNAPSHOT_FULL: u8 = 1;
 const DEFAULT_FG: u32 = 0xebdbb2;
 const DEFAULT_BG: u32 = 0x1d2021;
 
 static STATE: Mutex<Option<SessionState>> = Mutex::new(None);
 
 struct TerminalSession;
+
+struct PendingInputBoundary {
+    sequence: u64,
+    remaining: usize,
+}
 
 struct SessionState {
     session_id: u64,
@@ -40,6 +47,10 @@ struct SessionState {
     child: Option<u64>,
     terminal: Option<u64>,
     pending_input: VecDeque<u8>,
+    pending_input_boundaries: VecDeque<PendingInputBoundary>,
+    last_written_input_sequence: u64,
+    snapshot_input_sequence: u64,
+    interactive_flush_pending: bool,
     screen: Screen,
     viewport_offset: usize,
     revision: u64,
@@ -48,6 +59,10 @@ struct SessionState {
     resizes: u64,
     resize_output_batches: u8,
     snapshots_published: u64,
+    published_rows: Vec<Vec<u8>>,
+    force_full_snapshot: bool,
+    interactive_flushes: u64,
+    batch_waits: u64,
     exited: bool,
     exit_code: Option<i32>,
     error: Option<String>,
@@ -65,6 +80,10 @@ impl SessionState {
             child: None,
             terminal: None,
             pending_input: VecDeque::new(),
+            pending_input_boundaries: VecDeque::new(),
+            last_written_input_sequence: 0,
+            snapshot_input_sequence: 0,
+            interactive_flush_pending: false,
             screen: Screen::new(INITIAL_ROWS, INITIAL_COLS),
             viewport_offset: 0,
             revision: 1,
@@ -73,6 +92,10 @@ impl SessionState {
             resizes: 0,
             resize_output_batches: 0,
             snapshots_published: 0,
+            published_rows: Vec::new(),
+            force_full_snapshot: true,
+            interactive_flushes: 0,
+            batch_waits: 0,
             exited: false,
             exit_code: None,
             error: None,
@@ -89,10 +112,19 @@ impl SessionState {
         let _ = host::notification_signal(self.snapshot_notification, self.snapshot_generation);
     }
 
-    fn queue_input(&mut self, bytes: &[u8]) {
+    fn queue_input(&mut self, sequence: u64, bytes: &[u8]) {
         let available = MAX_PENDING_INPUT.saturating_sub(self.pending_input.len());
+        let accepted = bytes.len().min(available);
         self.pending_input
-            .extend(bytes.iter().copied().take(available));
+            .extend(bytes.iter().copied().take(accepted));
+        if accepted > 0 {
+            self.pending_input_boundaries
+                .push_back(PendingInputBoundary {
+                    sequence,
+                    remaining: accepted,
+                });
+        }
+        self.interactive_flush_pending |= accepted > 0;
         if available < bytes.len() {
             self.error = Some("terminal input queue reached its bounded capacity".to_string());
             self.mark_changed();
@@ -110,7 +142,9 @@ impl SessionState {
             let contiguous = self.pending_input.make_contiguous();
             match host::stream_write(terminal, contiguous) {
                 Ok(written) if written > 0 => {
-                    self.pending_input.drain(..written as usize);
+                    let written = written as usize;
+                    self.pending_input.drain(..written);
+                    self.record_written_input(written);
                 }
                 Ok(_) | Err(host::RuntimeIoError::WouldBlock) => {
                     self.watch_stream();
@@ -119,9 +153,26 @@ impl SessionState {
                 Err(error) => {
                     self.error = Some(format!("terminal input failed: {error:?}"));
                     self.pending_input.clear();
+                    self.pending_input_boundaries.clear();
                     self.mark_changed();
                     return;
                 }
+            }
+        }
+    }
+
+    fn record_written_input(&mut self, mut written: usize) {
+        while written > 0 {
+            let Some(boundary) = self.pending_input_boundaries.front_mut() else {
+                return;
+            };
+            let consumed = written.min(boundary.remaining);
+            boundary.remaining = boundary.remaining.saturating_sub(consumed);
+            written = written.saturating_sub(consumed);
+            if boundary.remaining == 0 {
+                self.last_written_input_sequence =
+                    self.last_written_input_sequence.max(boundary.sequence);
+                self.pending_input_boundaries.pop_front();
             }
         }
     }
@@ -221,12 +272,23 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
     match body.first().copied() {
         Some(b'A') if sender.starts_with("presentation:") => {
             state.subscriber = sender.strip_prefix("presentation:").map(str::to_string);
+            state.force_full_snapshot = true;
             state.snapshot_commands()
         }
         Some(b'I') if sender.starts_with("presentation:") => {
             let revision = state.revision;
             state.viewport_offset = 0;
-            state.queue_input(body.get(1..).unwrap_or_default());
+            let (sequence, bytes) = if let Some(encoded) = body.get(1..9)
+                && let Ok(encoded) = <[u8; 8]>::try_from(encoded)
+            {
+                (
+                    u64::from_le_bytes(encoded),
+                    body.get(9..).unwrap_or_default(),
+                )
+            } else {
+                (0, body.get(1..).unwrap_or_default())
+            };
+            state.queue_input(sequence, bytes);
             state.flush_input();
             if state.revision != revision {
                 state.snapshot_commands()
@@ -244,6 +306,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
                 return Vec::new();
             }
             state.screen.resize(rows, cols);
+            state.force_full_snapshot = true;
             if let Some(child) = state.child
                 && let Err(error) = host::pty_resize(child, rows, cols)
             {
@@ -338,10 +401,13 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         {
             host::StreamReadResult::Data(bytes) => {
                 consume_terminal_bytes(&mut parser, &bytes)?;
-                if bytes.len() >= BULK_OUTPUT_CHUNK_BYTES
-                    || !alternate_screen_active()?
-                    || take_resize_output_batch()?
+                let interactive_flush = take_interactive_flush()?;
+                if !interactive_flush
+                    && (bytes.len() >= BULK_OUTPUT_CHUNK_BYTES
+                        || !alternate_screen_active()?
+                        || take_resize_output_batch()?)
                 {
+                    record_batch_wait()?;
                     let timer = host::timer_create(8)
                         .map_err(|error| format!("create snapshot timer: {error:?}"))?;
                     wait_timer(timer).await?;
@@ -392,11 +458,13 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         state.stream_notification = None;
         state.signal_changed();
         format!(
-            "{{\"session\":{},\"chunks\":{},\"bytes\":{},\"revision\":{},\"exit\":\"{:?}\",\"code\":{}}}",
+            "{{\"session\":{},\"chunks\":{},\"bytes\":{},\"revision\":{},\"interactive_flushes\":{},\"batch_waits\":{},\"exit\":\"{:?}\",\"code\":{}}}",
             state.session_id,
             state.chunks_read,
             state.bytes_read,
             state.revision,
+            state.interactive_flushes,
+            state.batch_waits,
             exit_state,
             exit_code.map_or_else(|| "null".to_string(), |code| code.to_string()),
         )
@@ -404,6 +472,31 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
     let _ = host::stream_drop(pty.terminal).await;
     let _ = host::child_drop(pty.child).await;
     Ok(metrics.into_bytes())
+}
+
+fn take_interactive_flush() -> Result<bool, String> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|_| "terminal state is poisoned".to_string())?;
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "terminal state is unavailable".to_string())?;
+    let pending = std::mem::take(&mut state.interactive_flush_pending);
+    if pending {
+        state.interactive_flushes = state.interactive_flushes.saturating_add(1);
+    }
+    Ok(pending)
+}
+
+fn record_batch_wait() -> Result<(), String> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|_| "terminal state is poisoned".to_string())?;
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| "terminal state is unavailable".to_string())?;
+    state.batch_waits = state.batch_waits.saturating_add(1);
+    Ok(())
 }
 
 fn take_resize_output_batch() -> Result<bool, String> {
@@ -450,6 +543,9 @@ fn consume_terminal_bytes(parser: &mut Parser, bytes: &[u8]) -> Result<(), Strin
     }
     state.chunks_read = state.chunks_read.saturating_add(1);
     state.bytes_read = state.bytes_read.saturating_add(bytes.len() as u64);
+    state.snapshot_input_sequence = state
+        .snapshot_input_sequence
+        .max(state.last_written_input_sequence);
     Ok(())
 }
 
@@ -1212,20 +1308,35 @@ fn indexed_color(index: u16) -> u32 {
     (gray << 16) | (gray << 8) | gray
 }
 
-fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
+fn encode_snapshot(state: &mut SessionState) -> Vec<Vec<u8>> {
     let mut row_blobs = Vec::with_capacity(usize::from(state.screen.rows));
     for row in 0..state.screen.rows {
         row_blobs.push(encode_row(&state.screen, state.viewport_offset, row));
     }
+    let full = state.force_full_snapshot || state.published_rows.len() != row_blobs.len();
+    let changed_rows = row_blobs
+        .iter()
+        .enumerate()
+        .filter(|(row, blob)| full || state.published_rows.get(*row) != Some(*blob))
+        .map(|(row, blob)| (row as u16, blob.clone()))
+        .collect::<Vec<_>>();
+    state.published_rows = row_blobs;
+    state.force_full_snapshot = false;
+
     let mut groups = Vec::<(u16, Vec<Vec<u8>>)>::new();
     let mut start = 0_u16;
     let mut current = Vec::new();
-    let mut current_bytes = 72_usize;
-    for (row, blob) in row_blobs.into_iter().enumerate() {
-        if !current.is_empty() && current_bytes.saturating_add(blob.len()) > MAX_SNAPSHOT_BODY {
+    let mut current_bytes = 81_usize;
+    for (row, blob) in changed_rows {
+        let contiguous = row == start.saturating_add(current.len() as u16);
+        if !current.is_empty()
+            && (!contiguous || current_bytes.saturating_add(blob.len()) > MAX_SNAPSHOT_BODY)
+        {
             groups.push((start, std::mem::take(&mut current)));
-            start = row as u16;
-            current_bytes = 72;
+            current_bytes = 81;
+        }
+        if current.is_empty() {
+            start = row;
         }
         current_bytes = current_bytes.saturating_add(blob.len());
         current.push(blob);
@@ -1236,10 +1347,12 @@ fn encode_snapshot(state: &SessionState) -> Vec<Vec<u8>> {
         .into_iter()
         .enumerate()
         .map(|(index, (row_start, rows))| {
-            let mut bytes = Vec::with_capacity(72 + rows.iter().map(Vec::len).sum::<usize>());
+            let mut bytes = Vec::with_capacity(80 + rows.iter().map(Vec::len).sum::<usize>());
             bytes.extend_from_slice(SNAPSHOT_MAGIC);
-            bytes.push(2);
+            bytes.push(SNAPSHOT_VERSION);
+            bytes.push(if full { SNAPSHOT_FULL } else { 0 });
             bytes.extend_from_slice(&state.revision.to_le_bytes());
+            bytes.extend_from_slice(&state.snapshot_input_sequence.to_le_bytes());
             bytes.extend_from_slice(&state.screen.rows.to_le_bytes());
             bytes.extend_from_slice(&state.screen.cols.to_le_bytes());
             bytes.extend_from_slice(&state.screen.cursor_row.to_le_bytes());
@@ -1306,6 +1419,69 @@ fn encode_row(screen: &Screen, viewport_offset: usize, row: u16) -> Vec<u8> {
     run_count = run_count.saturating_add(1);
     bytes[..2].copy_from_slice(&run_count.to_le_bytes());
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SNAPSHOT_FULL, SNAPSHOT_VERSION, SessionState, encode_snapshot};
+
+    fn row_range(chunk: &[u8]) -> (u16, u16) {
+        (
+            u16::from_le_bytes([chunk[41], chunk[42]]),
+            u16::from_le_bytes([chunk[43], chunk[44]]),
+        )
+    }
+
+    #[test]
+    fn snapshots_bootstrap_fully_then_send_only_changed_rows() {
+        let mut state = SessionState::new(1, 1);
+        let initial = encode_snapshot(&mut state);
+        assert_eq!(initial[0][4], SNAPSHOT_VERSION);
+        assert_eq!(initial[0][5], SNAPSHOT_FULL);
+        assert_eq!(row_range(&initial[0]), (0, 24));
+
+        state.revision += 1;
+        let unchanged = encode_snapshot(&mut state);
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0][5], 0);
+        assert_eq!(row_range(&unchanged[0]), (0, 0));
+
+        state.screen.cells[2][3].text = "x".to_string();
+        state.revision += 1;
+        let changed = encode_snapshot(&mut state);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0][5], 0);
+        assert_eq!(row_range(&changed[0]), (2, 1));
+
+        state.force_full_snapshot = true;
+        state.revision += 1;
+        let replacement = encode_snapshot(&mut state);
+        assert_eq!(replacement[0][5], SNAPSHOT_FULL);
+        assert_eq!(row_range(&replacement[0]), (0, 24));
+    }
+
+    #[test]
+    fn snapshot_acknowledges_only_fully_written_terminal_inputs() -> Result<(), String> {
+        let mut state = SessionState::new(1, 1);
+        state.queue_input(7, b"ab");
+        state.queue_input(8, b"c");
+        state.record_written_input(2);
+        state.snapshot_input_sequence = state.last_written_input_sequence;
+        let first = encode_snapshot(&mut state);
+        let first_ack = first[0][14..22]
+            .try_into()
+            .map_err(|_| "first snapshot acknowledgement is truncated")?;
+        assert_eq!(u64::from_le_bytes(first_ack), 7);
+
+        state.record_written_input(1);
+        state.snapshot_input_sequence = state.last_written_input_sequence;
+        let second = encode_snapshot(&mut state);
+        let second_ack = second[0][14..22]
+            .try_into()
+            .map_err(|_| "second snapshot acknowledgement is truncated")?;
+        assert_eq!(u64::from_le_bytes(second_ack), 8);
+        Ok(())
+    }
 }
 
 struct EncodedRun {

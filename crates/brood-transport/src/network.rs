@@ -2,11 +2,11 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use brood_protocol::{
-    CarrierKind, ClientMessage, EndpointCapabilities, FrameColorSpace, FramePixelFormat, Lane,
-    ServerMessage, TransportProfile, negotiate_profile,
+    BackendActorRealm, CarrierKind, ClientMessage, EndpointCapabilities, FrameColorSpace,
+    FramePixelFormat, Lane, ServerMessage, TransportProfile, negotiate_profile,
 };
 use quinn::{
-    Connection, Endpoint, Incoming, RecvStream, SendStream,
+    AckFrequencyConfig, Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -73,11 +73,21 @@ pub fn client_endpoint(
 fn network_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config.keep_alive_interval(Some(Duration::from_secs(10)));
+    let mut acknowledgements = AckFrequencyConfig::default();
+    acknowledgements
+        .ack_eliciting_threshold(VarInt::from_u32(0))
+        .max_ack_delay(Some(Duration::from_millis(2)));
+    config.ack_frequency_config(Some(acknowledgements));
     config
 }
 
-const LANES: [Lane; 5] = [
+const LANES: [Lane; 10] = [
     Lane::Critical,
+    Lane::InteractiveSession0,
+    Lane::InteractiveSession1,
+    Lane::InteractiveSession2,
+    Lane::InteractiveSession3,
+    Lane::InteractiveDaemon,
     Lane::Reliable,
     Lane::LatestState,
     Lane::Bulk,
@@ -336,7 +346,32 @@ pub struct NetworkConnection {
     pub peer_capabilities: EndpointCapabilities,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct NetworkDiagnostics {
+    pub rtt_us: u128,
+    pub congestion_window: u64,
+    pub congestion_events: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub sent_packets: u64,
+    pub mtu: u16,
+}
+
 impl NetworkConnection {
+    #[must_use]
+    pub fn diagnostics(&self) -> NetworkDiagnostics {
+        let stats = self._connection.stats();
+        NetworkDiagnostics {
+            rtt_us: stats.path.rtt.as_micros(),
+            congestion_window: stats.path.cwnd,
+            congestion_events: stats.path.congestion_events,
+            lost_packets: stats.path.lost_packets,
+            lost_bytes: stats.path.lost_bytes,
+            sent_packets: stats.path.sent_packets,
+            mtu: stats.path.current_mtu,
+        }
+    }
+
     /// Detach one semantic lane for an independent I/O task.
     pub fn take_lane(&mut self, lane: Lane) -> Result<NetworkLane> {
         self.lanes
@@ -498,6 +533,8 @@ async fn open_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLane
             .open_bi()
             .await
             .with_context(|| format!("open {lane:?} presentation stream"))?;
+        send.set_priority(lane_priority(lane))
+            .with_context(|| format!("prioritize {lane:?} presentation stream"))?;
         send.write_all(&[lane_code(lane)])
             .await
             .with_context(|| format!("identify {lane:?} presentation stream"))?;
@@ -527,6 +564,8 @@ async fn accept_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLa
             .await
             .context("read presentation lane identity")?;
         let lane = lane_from_code(code[0])?;
+        send.set_priority(lane_priority(lane))
+            .with_context(|| format!("prioritize {lane:?} presentation stream"))?;
         ensure!(
             lanes
                 .insert(
@@ -591,20 +630,45 @@ async fn read_frame(stream: &mut RecvStream) -> Result<Vec<u8>> {
 const fn lane_code(lane: Lane) -> u8 {
     match lane {
         Lane::Critical => 1,
-        Lane::Reliable => 2,
-        Lane::LatestState => 3,
-        Lane::Bulk => 4,
-        Lane::FrameResource => 5,
+        Lane::InteractiveSession0 => 2,
+        Lane::Reliable => 3,
+        Lane::LatestState => 4,
+        Lane::Bulk => 5,
+        Lane::FrameResource => 6,
+        Lane::InteractiveDaemon => 7,
+        Lane::InteractiveSession1 => 8,
+        Lane::InteractiveSession2 => 9,
+        Lane::InteractiveSession3 => 10,
+    }
+}
+
+const fn lane_priority(lane: Lane) -> i32 {
+    match lane {
+        Lane::Critical => 20,
+        Lane::InteractiveSession0
+        | Lane::InteractiveSession1
+        | Lane::InteractiveSession2
+        | Lane::InteractiveSession3 => 15,
+        Lane::InteractiveDaemon => 15,
+        Lane::Reliable => 10,
+        Lane::LatestState => 5,
+        Lane::Bulk => -10,
+        Lane::FrameResource => -20,
     }
 }
 
 fn lane_from_code(code: u8) -> Result<Lane> {
     match code {
         1 => Ok(Lane::Critical),
-        2 => Ok(Lane::Reliable),
-        3 => Ok(Lane::LatestState),
-        4 => Ok(Lane::Bulk),
-        5 => Ok(Lane::FrameResource),
+        2 => Ok(Lane::InteractiveSession0),
+        3 => Ok(Lane::Reliable),
+        4 => Ok(Lane::LatestState),
+        5 => Ok(Lane::Bulk),
+        6 => Ok(Lane::FrameResource),
+        7 => Ok(Lane::InteractiveDaemon),
+        8 => Ok(Lane::InteractiveSession1),
+        9 => Ok(Lane::InteractiveSession2),
+        10 => Ok(Lane::InteractiveSession3),
         _ => bail!("peer opened an unknown presentation lane"),
     }
 }
@@ -614,22 +678,32 @@ const fn client_message_lane(message: &ClientMessage) -> Lane {
         ClientMessage::Input(input) => input.lane(),
         ClientMessage::Lifecycle(_) => Lane::Critical,
         ClientMessage::Artifact(_) => Lane::Bulk,
-        ClientMessage::Actor(_)
-        | ClientMessage::BackendRequest(_)
-        | ClientMessage::ReleaseResource { .. } => Lane::Reliable,
+        ClientMessage::Actor(message) => actor_message_lane(message.realm),
+        ClientMessage::BackendRequest(_) | ClientMessage::ReleaseResource { .. } => Lane::Reliable,
     }
 }
 
 const fn server_message_lane(message: &ServerMessage) -> Lane {
     match message {
-        ServerMessage::Catalog(_) | ServerMessage::Actor(_) | ServerMessage::BackendResponse(_) => {
-            Lane::Reliable
-        }
+        ServerMessage::Actor(message) => actor_message_lane(message.realm),
+        ServerMessage::Catalog(_) | ServerMessage::BackendResponse(_) => Lane::Reliable,
         ServerMessage::Scene(_) => Lane::LatestState,
         ServerMessage::Artifact(_) => Lane::Bulk,
         ServerMessage::FocusPresentation
         | ServerMessage::ClosePresentation
         | ServerMessage::DisconnectAcknowledged => Lane::Critical,
+    }
+}
+
+const fn actor_message_lane(realm: BackendActorRealm) -> Lane {
+    match realm {
+        BackendActorRealm::Daemon => Lane::InteractiveDaemon,
+        BackendActorRealm::Session(session) => match session % 4 {
+            0 => Lane::InteractiveSession0,
+            1 => Lane::InteractiveSession1,
+            2 => Lane::InteractiveSession2,
+            _ => Lane::InteractiveSession3,
+        },
     }
 }
 
@@ -724,18 +798,67 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use brood_protocol::{
-        ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
-        BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, ClientMessage,
-        EndpointCapabilities, FrameColorSpace, FramePixelFormat, InputEvent, Lane,
-        MAX_ARTIFACT_CHUNK_BYTES, PanePosition, ServerMessage,
+        ARTIFACT_ABI_VERSION, ActorMessage, ArtifactKind, ArtifactManifest, ArtifactMessage,
+        ArtifactRealm, BackendActorRealm, BackendOperation, BackendRequest, BackendResponse,
+        BackendResponseValue, ClientMessage, EndpointCapabilities, FrameColorSpace,
+        FramePixelFormat, InputEvent, Lane, MAX_ARTIFACT_CHUNK_BYTES, PanePosition, ServerMessage,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
 
     use super::{
-        NetworkFramePacket, accept_network_connection, client_endpoint, connect_network,
-        server_endpoint,
+        NetworkFramePacket, accept_network_connection, client_endpoint, client_message_lane,
+        connect_network, lane_priority, server_endpoint,
     };
+
+    #[test]
+    fn semantic_lane_priorities_protect_interactive_traffic() {
+        for interactive in [
+            Lane::InteractiveSession0,
+            Lane::InteractiveSession1,
+            Lane::InteractiveSession2,
+            Lane::InteractiveSession3,
+            Lane::InteractiveDaemon,
+        ] {
+            assert!(lane_priority(Lane::Critical) > lane_priority(interactive));
+            assert!(lane_priority(interactive) > lane_priority(Lane::Reliable));
+        }
+        assert!(lane_priority(Lane::Reliable) > lane_priority(Lane::LatestState));
+        assert!(lane_priority(Lane::LatestState) > lane_priority(Lane::Bulk));
+        assert!(lane_priority(Lane::Bulk) > lane_priority(Lane::FrameResource));
+    }
+
+    #[test]
+    fn actor_mailboxes_are_isolated_by_realm_and_session_shard() {
+        let message = |realm| {
+            ClientMessage::Actor(ActorMessage {
+                realm,
+                sender: "terminal-ui".to_string(),
+                recipient: "terminal-session".to_string(),
+                body: vec![1],
+            })
+        };
+        assert_eq!(
+            client_message_lane(&message(BackendActorRealm::Daemon)),
+            Lane::InteractiveDaemon
+        );
+        assert_eq!(
+            client_message_lane(&message(BackendActorRealm::Session(4))),
+            Lane::InteractiveSession0
+        );
+        assert_eq!(
+            client_message_lane(&message(BackendActorRealm::Session(5))),
+            Lane::InteractiveSession1
+        );
+        assert_eq!(
+            client_message_lane(&message(BackendActorRealm::Session(6))),
+            Lane::InteractiveSession2
+        );
+        assert_eq!(
+            client_message_lane(&message(BackendActorRealm::Session(7))),
+            Lane::InteractiveSession3
+        );
+    }
 
     fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
         let CertifiedKey {

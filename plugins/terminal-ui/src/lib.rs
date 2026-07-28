@@ -17,6 +17,8 @@ use exports::brood::plugin::actor::{
 use unicode_width::UnicodeWidthChar;
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
+const SNAPSHOT_VERSION: u8 = 4;
+const SNAPSHOT_FULL: u8 = 1;
 const FONT_SIZE: f32 = 16.0;
 const REQUESTED_LINE_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
@@ -56,6 +58,10 @@ struct UiState {
     layouts_dropped: u64,
     packets: u64,
     snapshots_received: u64,
+    snapshot_chunks_received: u64,
+    snapshot_bytes_received: u64,
+    snapshot_rows_received: u64,
+    full_snapshots_received: u64,
     metric_application_cursor: Option<bool>,
     metric_bracketed_paste: Option<bool>,
     metric_resizes: u64,
@@ -73,6 +79,7 @@ struct UiState {
     suppressed_text: Option<String>,
     resize_worker_pending: bool,
     last_sent_grid_size: Option<(u16, u16)>,
+    next_input_sequence: u64,
 }
 
 impl UiState {
@@ -96,6 +103,10 @@ impl UiState {
             layouts_dropped: 0,
             packets: 0,
             snapshots_received: 0,
+            snapshot_chunks_received: 0,
+            snapshot_bytes_received: 0,
+            snapshot_rows_received: 0,
+            full_snapshots_received: 0,
             metric_application_cursor: None,
             metric_bracketed_paste: None,
             metric_resizes: 0,
@@ -113,6 +124,7 @@ impl UiState {
             suppressed_text: None,
             resize_worker_pending: false,
             last_sent_grid_size: None,
+            next_input_sequence: 0,
         }
     }
 
@@ -133,6 +145,15 @@ impl UiState {
             actor: self.session_actor.clone(),
             body,
         })
+    }
+
+    fn input_command(&mut self, bytes: &[u8]) -> Command {
+        self.next_input_sequence = self.next_input_sequence.saturating_add(1).max(1);
+        let mut body = Vec::with_capacity(bytes.len() + 9);
+        body.push(b'I');
+        body.extend_from_slice(&self.next_input_sequence.to_le_bytes());
+        body.extend_from_slice(bytes);
+        self.session_message(body)
     }
 
     fn resize_command(
@@ -233,6 +254,7 @@ fn terminal_session_actor(instance_id: &str) -> String {
 
 struct Snapshot {
     revision: u64,
+    input_sequence: u64,
     rows: u16,
     cols: u16,
     cursor_row: u16,
@@ -262,6 +284,8 @@ type SnapshotRowsChunk = Vec<(u16, Vec<Run>)>;
 #[derive(Clone, Copy)]
 struct SnapshotHeader {
     revision: u64,
+    input_sequence: u64,
+    full: bool,
     rows: u16,
     cols: u16,
     cursor_row: u16,
@@ -320,6 +344,91 @@ struct RunKey {
 struct CachedLayout {
     handle: u64,
     last_used_revision: u64,
+}
+
+fn terminal_text_clusters(text: &str) -> Vec<(u16, u16, String)> {
+    let mut clusters = Vec::<(u16, u16, String)>::new();
+    let mut cell = 0_u16;
+    for character in text.trim_end().chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(1) as u16;
+        if width == 0
+            && let Some((_, _, cluster)) = clusters.last_mut()
+        {
+            cluster.push(character);
+            continue;
+        }
+        let width = width.max(1);
+        clusters.push((cell, width, character.to_string()));
+        cell = cell.saturating_add(width);
+    }
+    clusters
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "terminal text style and geometry define one immutable cached layout"
+)]
+fn terminal_text_layout(
+    cache: &mut HashMap<RunKey, CachedLayout>,
+    pane: u64,
+    run: &Run,
+    text: String,
+    cells: u16,
+    cell_width: f32,
+    line_height: f32,
+    revision: u64,
+    created: &mut u64,
+    reused: &mut u64,
+) -> Result<u64, String> {
+    let key = RunKey {
+        cells,
+        fg: run.fg,
+        bold: run.bold,
+        faint: run.faint,
+        italic: run.italic,
+        text: text.clone(),
+    };
+    match cache.entry(key) {
+        Entry::Occupied(mut entry) => {
+            *reused = reused.saturating_add(1);
+            entry.get_mut().last_used_revision = revision;
+            Ok(entry.get().handle)
+        }
+        Entry::Vacant(entry) => {
+            let color = rgb_channels(run.fg);
+            let layout = host::graphics_layout_text(
+                pane,
+                &text,
+                host::TextLayoutOptions {
+                    font_intent: host::FontIntent::Monospace,
+                    font_weight: if run.bold {
+                        host::FontWeight::Bold
+                    } else {
+                        host::FontWeight::Normal
+                    },
+                    font_style: if run.italic {
+                        host::FontStyle::Italic
+                    } else {
+                        host::FontStyle::Normal
+                    },
+                    font_size: FONT_SIZE,
+                    max_width: (f32::from(cells) * cell_width).max(cell_width),
+                    line_height,
+                    red: color[0],
+                    green: color[1],
+                    blue: color[2],
+                    alpha: if run.faint { 0.6 } else { 1.0 },
+                },
+            )
+            .map_err(|error| format!("layout terminal text: {error:?}"))?;
+            entry.insert(CachedLayout {
+                handle: layout.handle,
+                last_used_revision: revision,
+            });
+            *created = created.saturating_add(1);
+            Ok(layout.handle)
+        }
+    }
 }
 
 impl Guest for TerminalUi {
@@ -477,7 +586,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .map(|bytes| {
                     state.selection = None;
                     state.requested_viewport = 0;
-                    state.session_message(input_body(&bytes))
+                    state.input_command(&bytes)
                 })
                 .into_iter()
                 .collect()
@@ -500,7 +609,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             } else {
                 state.selection = None;
                 state.requested_viewport = 0;
-                vec![state.session_message(input_body(printable.as_bytes()))]
+                vec![state.input_command(printable.as_bytes())]
             }
         }
         PresentationEvent::Paste(paste) if paste.pane == state.pane && !paste.text.is_empty() => {
@@ -510,7 +619,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .is_some_and(|snapshot| snapshot.bracketed_paste);
             state.selection = None;
             state.requested_viewport = 0;
-            vec![state.session_message(input_body(&paste_bytes(&paste.text, bracketed)))]
+            vec![state.input_command(&paste_bytes(&paste.text, bracketed))]
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
             if state
@@ -546,7 +655,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 state.mouse_modifiers,
                 snapshot.mouse_sgr,
             )
-            .map(|bytes| state.session_message(input_body(&bytes)))
+            .map(|bytes| state.input_command(&bytes))
             .into_iter()
             .collect()
         }
@@ -605,7 +714,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 button.modifiers,
                 mouse_sgr,
             )
-            .map(|bytes| state.session_message(input_body(&bytes)))
+            .map(|bytes| state.input_command(&bytes))
             .into_iter()
             .collect()
         }
@@ -631,7 +740,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     }
                 }
                 return (!bytes.is_empty())
-                    .then(|| state.session_message(input_body(&bytes)))
+                    .then(|| state.input_command(&bytes))
                     .into_iter()
                     .collect();
             }
@@ -846,13 +955,6 @@ fn selection_columns(selection: Selection, row: u16, cols: u16) -> Option<(u16, 
     Some((first.min(cols), last.saturating_add(1).min(cols)))
 }
 
-fn input_body(bytes: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(bytes.len() + 1);
-    body.push(b'I');
-    body.extend_from_slice(bytes);
-    body
-}
-
 fn key_bytes(logical: &str, modifiers: u32, application_cursor: bool) -> Option<Vec<u8>> {
     let modifier = 1
         + u8::from(modifiers & MOD_SHIFT != 0)
@@ -954,10 +1056,17 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
     let Some(state) = guard.as_mut() else {
         return Vec::new();
     };
+    state.snapshot_chunks_received = state.snapshot_chunks_received.saturating_add(1);
+    state.snapshot_bytes_received = state
+        .snapshot_bytes_received
+        .saturating_add(body.len() as u64);
+    state.snapshot_rows_received = state
+        .snapshot_rows_received
+        .saturating_add(rows.len() as u64);
     if state
         .latest
         .as_ref()
-        .is_some_and(|snapshot| snapshot.revision > header.revision)
+        .is_some_and(|snapshot| snapshot.revision >= header.revision)
     {
         return Vec::new();
     }
@@ -966,6 +1075,14 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         .as_ref()
         .is_none_or(|assembly| assembly.header.revision != header.revision)
     {
+        if !header.full
+            && state
+                .latest
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.rows != header.rows || snapshot.cols != header.cols)
+        {
+            return Vec::new();
+        }
         state.assembly = Some(SnapshotAssembly {
             header,
             chunks: vec![None; usize::from(chunk_count)],
@@ -992,16 +1109,31 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
     let Some(assembly) = state.assembly.take() else {
         return Vec::new();
     };
-    let mut rows_data = vec![Vec::new(); usize::from(header.rows)];
+    let mut rows_data = if header.full {
+        vec![Vec::new(); usize::from(header.rows)]
+    } else {
+        state
+            .latest
+            .as_ref()
+            .map(|snapshot| snapshot.rows_data.clone())
+            .unwrap_or_default()
+    };
+    let mut updated = vec![false; usize::from(header.rows)];
     for chunk in assembly.chunks.into_iter().flatten() {
         for (row, runs) in chunk {
-            if let Some(target) = rows_data.get_mut(usize::from(row)) {
+            let row = usize::from(row);
+            if let Some(target) = rows_data.get_mut(row) {
                 *target = runs;
+                updated[row] = true;
             }
         }
     }
+    if header.full && updated.iter().any(|updated| !updated) {
+        return Vec::new();
+    }
     state.latest = Some(Arc::new(Snapshot {
         revision: header.revision,
+        input_sequence: header.input_sequence,
         rows: header.rows,
         cols: header.cols,
         cursor_row: header.cursor_row,
@@ -1021,6 +1153,9 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         rows_data,
     }));
     state.snapshots_received = state.snapshots_received.saturating_add(1);
+    state.full_snapshots_received = state
+        .full_snapshots_received
+        .saturating_add(u64::from(header.full));
     state.requested_viewport = header.viewport_offset;
     drop(guard);
 
@@ -1097,63 +1232,59 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
                     });
                 }
             }
-            if run.text.trim_end().is_empty() {
+            let text = run.text.trim_end();
+            if text.is_empty() {
                 continue;
             }
-            let key = RunKey {
-                cells: run.cells,
-                fg: run.fg,
-                bold: run.bold,
-                faint: run.faint,
-                italic: run.italic,
-                text: run.text.clone(),
-            };
-            let handle = match cache.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    reused = reused.saturating_add(1);
-                    entry.get_mut().last_used_revision = snapshot.revision;
-                    entry.get().handle
-                }
-                Entry::Vacant(entry) => {
-                    let color = rgb_channels(run.fg);
-                    let layout = host::graphics_layout_text(
+            if row as u16 == snapshot.cursor_row {
+                for (offset, cells, text) in terminal_text_clusters(text) {
+                    if text == " " {
+                        continue;
+                    }
+                    let handle = terminal_text_layout(
+                        &mut cache,
                         pane,
-                        &run.text,
-                        host::TextLayoutOptions {
-                            font_intent: host::FontIntent::Monospace,
-                            font_weight: if run.bold {
-                                host::FontWeight::Bold
-                            } else {
-                                host::FontWeight::Normal
-                            },
-                            font_style: if run.italic {
-                                host::FontStyle::Italic
-                            } else {
-                                host::FontStyle::Normal
-                            },
-                            font_size: FONT_SIZE,
-                            max_width: run_width.max(cell_width),
-                            line_height,
-                            red: color[0],
-                            green: color[1],
-                            blue: color[2],
-                            alpha: if run.faint { 0.6 } else { 1.0 },
-                        },
+                        run,
+                        text,
+                        cells,
+                        cell_width,
+                        line_height,
+                        snapshot.revision,
+                        &mut created,
+                        &mut reused,
                     )
-                    .map_err(|error| format!("layout terminal run: {error:?}"))?;
-                    entry.insert(CachedLayout {
-                        handle: layout.handle,
-                        last_used_revision: snapshot.revision,
+                    .map_err(|error| format!("layout terminal cursor row: {error}"))?;
+                    packet.push(DrawCommand::DrawTextLayout {
+                        layout: handle,
+                        x: x + f32::from(offset) * cell_width,
+                        y,
                     });
-                    created = created.saturating_add(1);
-                    layout.handle
                 }
-            };
-            packet.push(DrawCommand::DrawTextLayout {
-                layout: handle,
-                x,
-                y,
-            });
+            } else {
+                let cells = text
+                    .chars()
+                    .map(|character| UnicodeWidthChar::width(character).unwrap_or(1))
+                    .sum::<usize>()
+                    .max(1)
+                    .min(usize::from(run.cells)) as u16;
+                let handle = terminal_text_layout(
+                    &mut cache,
+                    pane,
+                    run,
+                    text.to_string(),
+                    cells,
+                    cell_width,
+                    line_height,
+                    snapshot.revision,
+                    &mut created,
+                    &mut reused,
+                )?;
+                packet.push(DrawCommand::DrawTextLayout {
+                    layout: handle,
+                    x,
+                    y,
+                });
+            }
             if run.underline {
                 packet.push(DrawCommand::FillRect {
                     rect: Rect::new(x, y + line_height - 2.0, run_width, 1.0),
@@ -1235,6 +1366,10 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         dropped_total,
         packets_total,
         snapshots_received,
+        snapshot_chunks_received,
+        snapshot_bytes_received,
+        snapshot_rows_received,
+        full_snapshots_received,
         cache_entries,
     ) = {
         let mut guard = STATE
@@ -1256,13 +1391,18 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
             state.layouts_dropped,
             state.packets,
             state.snapshots_received,
+            state.snapshot_chunks_received,
+            state.snapshot_bytes_received,
+            state.snapshot_rows_received,
+            state.full_snapshots_received,
             state.cache.len(),
         )
     };
     let snapshots_coalesced = snapshots_received.saturating_sub(packets_total);
     Ok(format!(
-        "{{\"revision\":{},\"rows\":{},\"cols\":{},\"packet_bytes\":{},\"commands\":{},\"layouts_created\":{},\"layouts_reused\":{},\"layouts_dropped\":{},\"layouts_created_total\":{},\"layouts_reused_total\":{},\"layouts_dropped_total\":{},\"layout_cache_entries\":{},\"packets_total\":{},\"snapshots_received\":{},\"snapshots_coalesced\":{},\"pty_chunks\":{},\"pty_bytes\":{},\"pty_resizes\":{},\"viewport_offset\":{},\"max_viewport_offset\":{},\"application_cursor\":{},\"bracketed_paste\":{},\"mouse_tracking\":{},\"mouse_sgr\":{},\"exited\":{},\"exit_code\":{}}}",
+        "{{\"revision\":{},\"input_sequence\":{},\"rows\":{},\"cols\":{},\"packet_bytes\":{},\"commands\":{},\"layouts_created\":{},\"layouts_reused\":{},\"layouts_dropped\":{},\"layouts_created_total\":{},\"layouts_reused_total\":{},\"layouts_dropped_total\":{},\"layout_cache_entries\":{},\"packets_total\":{},\"snapshots_received\":{},\"snapshots_coalesced\":{},\"snapshot_chunks_received\":{},\"snapshot_bytes_received\":{},\"snapshot_rows_received\":{},\"full_snapshots_received\":{},\"pty_chunks\":{},\"pty_bytes\":{},\"pty_resizes\":{},\"viewport_offset\":{},\"max_viewport_offset\":{},\"application_cursor\":{},\"bracketed_paste\":{},\"mouse_tracking\":{},\"mouse_sgr\":{},\"exited\":{},\"exit_code\":{}}}",
         snapshot.revision,
+        snapshot.input_sequence,
         snapshot.rows,
         snapshot.cols,
         bytes.len(),
@@ -1277,6 +1417,10 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         packets_total,
         snapshots_received,
         snapshots_coalesced,
+        snapshot_chunks_received,
+        snapshot_bytes_received,
+        snapshot_rows_received,
+        full_snapshots_received,
         snapshot.chunks_read,
         snapshot.bytes_read,
         snapshot.resizes,
@@ -1298,10 +1442,15 @@ type DecodedChunk = (SnapshotHeader, u16, u16, u16, Vec<Vec<Run>>);
 
 fn decode_chunk(bytes: &[u8]) -> Result<DecodedChunk, ()> {
     let mut reader = Reader::new(bytes);
-    if reader.take(4)? != SNAPSHOT_MAGIC || reader.u8()? != 2 {
+    if reader.take(4)? != SNAPSHOT_MAGIC || reader.u8()? != SNAPSHOT_VERSION {
+        return Err(());
+    }
+    let snapshot_flags = reader.u8()?;
+    if snapshot_flags & !SNAPSHOT_FULL != 0 {
         return Err(());
     }
     let revision = reader.u64()?;
+    let input_sequence = reader.u64()?;
     let rows = reader.u16()?;
     let cols = reader.u16()?;
     let cursor_row = reader.u16()?;
@@ -1365,6 +1514,8 @@ fn decode_chunk(bytes: &[u8]) -> Result<DecodedChunk, ()> {
     Ok((
         SnapshotHeader {
             revision,
+            input_sequence,
+            full: snapshot_flags & SNAPSHOT_FULL != 0,
             rows,
             cols,
             cursor_row,
@@ -1460,7 +1611,7 @@ export!(TerminalUi);
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_session_actor;
+    use super::{terminal_session_actor, terminal_text_clusters};
 
     #[test]
     fn backend_scoped_default_ui_targets_default_terminal() {
@@ -1475,6 +1626,18 @@ mod tests {
         assert_eq!(
             terminal_session_actor("terminal-ui-b2-s7-4"),
             "terminal-session-4"
+        );
+    }
+
+    #[test]
+    fn cursor_row_clusters_reuse_glyphs_without_laying_out_padding() {
+        assert_eq!(
+            terminal_text_clusters("a界e\u{301}  "),
+            vec![
+                (0, 1, "a".to_string()),
+                (1, 2, "界".to_string()),
+                (3, 1, "e\u{301}".to_string()),
+            ]
         );
     }
 }

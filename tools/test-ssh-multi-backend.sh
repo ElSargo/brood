@@ -49,16 +49,48 @@ TREE_JSON="$OUT/presentation-tree.json"
 SCREENSHOT="$OUT/session-scoped-local.png"
 DIRECTORY_SCREENSHOT="$OUT/remote-directory-filtered.png"
 PROOF="$OUT/proof.json"
+PROFILE="${BROOD_SSH_MULTI_BACKEND_PROFILE:-0}"
+CLIENT_PROCESS_BEFORE="$OUT/client-process-before.txt"
+CLIENT_PROCESS_AFTER="$OUT/client-process-after.txt"
+REMOTE_PROCESS_BEFORE="$OUT/remote-process-before.txt"
+REMOTE_PROCESS_AFTER="$OUT/remote-process-after.txt"
+CLIENT_PERF_STAT="$OUT/client-perf-stat.csv"
+CLIENT_PERF_DATA="$OUT/client-perf.data"
+CLIENT_PERF_REPORT="$OUT/client-perf-report.txt"
+ROUTE_PING="$OUT/route-ping.log"
 mkdir -p "$OUT" "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"
 
 COMPOSITOR_PID=""
 DEPLOY_PID=""
+PROFILE_PERF_PID=""
+PROFILE_RECORD_PID=""
+PROFILE_PING_PID=""
 
 presentation_ids() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" SWAYSOCK="$SWAYSOCK" \
     swaymsg -t get_tree -r 2>/dev/null |
     jq -r '.. | objects | select(.type? == "con" and .pid? != null) | .id'
+}
+
+process_profile_snapshot() {
+  local process_id="$1"
+  echo "pid=$process_id"
+  awk '
+    { runtime += $1; wait += $2; slices += $3 }
+    END {
+      printf "task_schedstat=%d %d %d\n", runtime, wait, slices
+    }
+  ' "/proc/$process_id"/task/*/schedstat
+  awk '
+    $1 == "voluntary_ctxt_switches:" { voluntary += $2 }
+    $1 == "nonvoluntary_ctxt_switches:" { involuntary += $2 }
+    END {
+      printf "task_context_switches=%d %d\n", voluntary, involuntary
+    }
+  ' "/proc/$process_id"/task/*/status
+  sed -n '/^VmRSS:/p; /^Threads:/p' "/proc/$process_id/status"
+  echo "stat=$(<"/proc/$process_id/stat")"
 }
 
 close_presentation() {
@@ -103,6 +135,18 @@ cleanup() {
     kill "$COMPOSITOR_PID" >/dev/null 2>&1 || true
     wait "$COMPOSITOR_PID" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$PROFILE_PERF_PID" ]] && kill -0 "$PROFILE_PERF_PID" 2>/dev/null; then
+    kill "$PROFILE_PERF_PID" >/dev/null 2>&1 || true
+    wait "$PROFILE_PERF_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$PROFILE_RECORD_PID" ]] && kill -0 "$PROFILE_RECORD_PID" 2>/dev/null; then
+    kill "$PROFILE_RECORD_PID" >/dev/null 2>&1 || true
+    wait "$PROFILE_RECORD_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$PROFILE_PING_PID" ]] && kill -0 "$PROFILE_PING_PID" 2>/dev/null; then
+    kill "$PROFILE_PING_PID" >/dev/null 2>&1 || true
+    wait "$PROFILE_PING_PID" >/dev/null 2>&1 || true
+  fi
   if ((result != 0)); then
     echo "deploy_log=$DEPLOY_LOG" >&2
     tail -n 240 "$DEPLOY_LOG" >&2 || true
@@ -125,7 +169,35 @@ REMOTE_HOME="$(
   exit 1
 }
 
-cargo build -p brood-client -p brood-remote -p broodd --bins --locked
+cargo build --release -p brood-client -p brood-remote -p broodd --bins --locked
+cargo build \
+  --release \
+  --target wasm32-unknown-unknown \
+  --manifest-path plugins/terminal-session/Cargo.toml \
+  --locked
+[[ ! -e plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm ]] \
+  || chmod u+w plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm
+wasm-tools component new \
+  plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.wasm \
+  --output \
+  plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm
+install -D \
+  plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.component.wasm
+cargo build \
+  --release \
+  --target wasm32-unknown-unknown \
+  --manifest-path plugins/terminal-ui/Cargo.toml \
+  --locked
+[[ ! -e plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm ]] \
+  || chmod u+w plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm
+wasm-tools component new \
+  plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.wasm \
+  --output \
+  plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm
+install -D \
+  plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm
 cargo build \
   --release \
   --target wasm32-unknown-unknown \
@@ -216,10 +288,10 @@ env \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
   BROOD_TRACE_PLUGIN_INPUT=1 \
-  BROOD_REMOTE_BIN="$ROOT/target/debug/brood-remote" \
+  BROOD_REMOTE_BIN="$ROOT/target/release/brood-remote" \
   BROOD_SSH_CONNECT_HOST="$CONNECT_HOST" \
   RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}" \
-  target/debug/brood-client \
+  target/release/brood-client \
   > "$DEPLOY_LOG" 2>&1 &
 DEPLOY_PID=$!
 
@@ -468,6 +540,85 @@ sed -n \
   | rg -a -q 'sent plugin pane resize .* logical_size=960x720 '
 sleep 0.2
 
+# Exercise steady-state printable echo through the actual remote terminal actor
+# at a rate below the display refresh. This produces backend-qualified
+# key-to-present samples without collapsing many keys into one frame.
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-pointer-input" drag 100 100 100 100 1 1280 720
+if [[ "$PROFILE" == 1 ]]; then
+  process_profile_snapshot "$DEPLOY_PID" > "$CLIENT_PROCESS_BEFORE"
+  ssh -T -o BatchMode=yes "$TARGET" '
+    process_id="$(pgrep -n -x brood-remote || true)"
+    echo "pid=$process_id"
+    if [[ -n "$process_id" ]]; then
+      echo "schedstat=$(<"/proc/$process_id/schedstat")"
+      sed -n \
+        "/^voluntary_ctxt_switches:/p; /^nonvoluntary_ctxt_switches:/p; /^VmRSS:/p; /^Threads:/p" \
+        "/proc/$process_id/status"
+      echo "stat=$(<"/proc/$process_id/stat")"
+    fi
+  ' > "$REMOTE_PROCESS_BEFORE"
+  PROFILE_TIDS="$(
+    printf '%s\n' "/proc/$DEPLOY_PID"/task/* |
+      sed 's|.*/||' |
+      paste -sd,
+  )"
+  perf stat \
+    -x, \
+    -o "$CLIENT_PERF_STAT" \
+    -e task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions \
+    -t "$PROFILE_TIDS" \
+    -- sleep 4 &
+  PROFILE_PERF_PID=$!
+  if [[ "${BROOD_SSH_MULTI_BACKEND_PERF_RECORD:-0}" == 1 ]]; then
+    perf record \
+      -q \
+      -o "$CLIENT_PERF_DATA" \
+      -g \
+      --call-graph dwarf \
+      -t "$PROFILE_TIDS" \
+      -- sleep 4 &
+    PROFILE_RECORD_PID=$!
+  fi
+  ROUTE_HOST="$(
+    sed -n 's/.* connect=\([^: ]*\):[0-9][0-9]* .*/\1/p' <<< "$READY"
+  )"
+  ping -D -n -i 0.01 -c 400 "$ROUTE_HOST" > "$ROUTE_PING" 2>&1 &
+  PROFILE_PING_PID=$!
+fi
+REMOTE_LATENCY_TEXT="$(printf 'a%.0s' {1..80})"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype -d "${BROOD_SSH_MULTI_BACKEND_KEY_DELAY_MS:-30}" "$REMOTE_LATENCY_TEXT"
+sleep 0.5
+if [[ "$PROFILE" == 1 ]]; then
+  wait "$PROFILE_PERF_PID"
+  PROFILE_PERF_PID=""
+  if [[ -n "$PROFILE_RECORD_PID" ]]; then
+    wait "$PROFILE_RECORD_PID"
+    PROFILE_RECORD_PID=""
+    perf report \
+      -i "$CLIENT_PERF_DATA" \
+      --stdio \
+      --no-children \
+      --percent-limit 0.1 \
+      > "$CLIENT_PERF_REPORT"
+  fi
+  wait "$PROFILE_PING_PID"
+  PROFILE_PING_PID=""
+  process_profile_snapshot "$DEPLOY_PID" > "$CLIENT_PROCESS_AFTER"
+  ssh -T -o BatchMode=yes "$TARGET" '
+    process_id="$(pgrep -n -x brood-remote || true)"
+    echo "pid=$process_id"
+    if [[ -n "$process_id" ]]; then
+      echo "schedstat=$(<"/proc/$process_id/schedstat")"
+      sed -n \
+        "/^voluntary_ctxt_switches:/p; /^nonvoluntary_ctxt_switches:/p; /^VmRSS:/p; /^Threads:/p" \
+        "/proc/$process_id/status"
+      echo "stat=$(<"/proc/$process_id/stat")"
+    fi
+  ' > "$REMOTE_PROCESS_AFTER"
+fi
+
 LOCAL_SESSION_NAME="$(
   printf '%s\n' "${SESSION_ROWS[@]}" |
     awk -v backend="$LOCAL_BACKEND" '$1 == backend { print $2; exit }'
@@ -571,6 +722,55 @@ DEPLOY_PID=""
   exit 1
 }
 
+INPUT_METRIC="$(
+  sed -n 's/^plugin input diagnostics //p' "$DEPLOY_LOG" |
+    tail -1
+)"
+REMOTE_BACKEND_METRIC="$(
+  jq -c \
+    --argjson backend "$REMOTE_BACKEND" \
+    '.by_backend[] | select(.backend == $backend)' \
+    <<< "$INPUT_METRIC"
+)"
+REMOTE_INPUT_METRIC="$(jq -c '.latency' <<< "$REMOTE_BACKEND_METRIC")"
+REMOTE_STAGE_METRIC="$(jq -c '.stages' <<< "$REMOTE_BACKEND_METRIC")"
+REMOTE_TRACE_METRIC="$(jq -c '.traces' <<< "$REMOTE_BACKEND_METRIC")"
+REMOTE_RELAY_METRIC="$(
+  sed -n 's/.*remote terminal relay diagnostics //p' "$DEPLOY_LOG" |
+    tail -1
+)"
+REMOTE_QUIC_METRIC="$(
+  sed -n 's/.*remote relay QUIC diagnostics //p' "$DEPLOY_LOG" |
+    tail -1
+)"
+REMOTE_RELAY_METRIC="${REMOTE_RELAY_METRIC:-null}"
+REMOTE_QUIC_METRIC="${REMOTE_QUIC_METRIC:-null}"
+if [[ "$PROFILE" != 1 ]]; then
+  jq -e '
+  .key_to_present_samples >= 20
+  and .p95_key_to_present_us > 0
+  and .p95_key_to_present_us <= 20000
+  and .p99_key_to_present_us > 0
+  and .p99_key_to_present_us <= 25000
+  and .stddev_key_to_present_us >= 0
+  and .stddev_key_to_present_us <= 6000
+  ' <<< "$REMOTE_INPUT_METRIC" > /dev/null
+  jq -e '
+  .remote_round_trip.samples >= 20
+  and .remote_round_trip.p95_us <= 12000
+  and .remote_round_trip.p99_us <= 20000
+  and .remote_round_trip.stddev_us <= 5000
+  and .plugin_render.samples >= 20
+  and .plugin_render.p95_us <= 15000
+  and .plugin_render.p99_us <= 17000
+  and .plugin_render.stddev_us <= 6000
+  and .presentation.samples >= 20
+  and .presentation.p95_us <= 8000
+  and .presentation.p99_us <= 16667
+  and .presentation.stddev_us <= 4000
+  ' <<< "$REMOTE_STAGE_METRIC" > /dev/null
+fi
+
 jq -n \
   --arg target "$TARGET" \
   --arg ready "$READY" \
@@ -582,6 +782,14 @@ jq -n \
   --argjson backend_ids "$BACKEND_JSON" \
   --argjson session_names "$SESSION_NAMES_JSON" \
   --argjson presentation_actors "$ACTORS" \
+  --argjson remote_terminal_latency "$REMOTE_INPUT_METRIC" \
+  --argjson remote_terminal_stages "$REMOTE_STAGE_METRIC" \
+  --argjson remote_terminal_traces "$REMOTE_TRACE_METRIC" \
+  --argjson remote_relay_stages "$REMOTE_RELAY_METRIC" \
+  --argjson remote_quic "$REMOTE_QUIC_METRIC" \
+  --arg profile "$PROFILE" \
+  --arg client_perf_stat "$CLIENT_PERF_STAT" \
+  --arg route_ping "$ROUTE_PING" \
   '{
     target: $target,
     deployment_ready: $ready,
@@ -590,6 +798,11 @@ jq -n \
     local_backend_id: $local_backend_id,
     session_names: $session_names,
     presentation_actors: $presentation_actors,
+    remote_terminal_latency: $remote_terminal_latency,
+    remote_terminal_stages: $remote_terminal_stages,
+    remote_terminal_traces: $remote_terminal_traces,
+    remote_relay_stages: $remote_relay_stages,
+    remote_quic: $remote_quic,
     local_and_remote_actor_messages: ($backend_ids | length >= 2),
     realm_scoped_frontends: ($presentation_actors | length >= 2),
     in_client_ssh_connection: true,
@@ -599,6 +812,9 @@ jq -n \
     randomized_session_names: true,
     rejected_backend_actor_messages: false,
     clean_remote_shutdown: true,
+    profiling: ($profile == "1"),
+    client_perf_stat: $client_perf_stat,
+    route_ping: $route_ping,
     screenshot: $screenshot,
     directory_screenshot: $directory_screenshot
   }' > "$PROOF"

@@ -39,10 +39,15 @@ remain the correctness fallback.
 
 Remote clients use the same transport-independent semantic lanes over a
 mutually certificate-authenticated QUIC carrier. Each semantic lane has an
-independent ordered stream pair. Remote surface subscriptions use network frame
-resources rather than DMA-BUF. A losslessly compressed full-window image is
-the correctness baseline; damage, video, and GPU-aware codecs remain subject
-to workload testing.
+independent ordered stream pair. Interactive actor traffic has distinct daemon
+and session-sharded streams, preserving order within a mailbox without letting
+large inventory or unrelated mailbox messages dominate terminal input tails.
+Each stream also has independent send and receive task ownership; multiplexing
+independent streams behind one blocking application sender would recreate the
+same head-of-line dependency above QUIC.
+Remote surface subscriptions use network frame resources rather than DMA-BUF.
+A losslessly compressed full-window image is the correctness baseline; damage,
+video, and GPU-aware codecs remain subject to workload testing.
 
 Presentation actors run in the client for both local and remote connections.
 Their local mailboxes, policy decisions, viewport state, SDK component state,
@@ -52,8 +57,8 @@ capability operations are asynchronous protocol traffic.
 
 ## Consequences
 
-- The protocol model defines semantic critical, reliable, latest-state, bulk,
-  and frame-resource lanes independently of their carrier.
+- The protocol model defines semantic critical, interactive actor, reliable,
+  latest-state, bulk, and frame-resource lanes independently of their carrier.
 - Carrier and frame transport are independent capability axes. The standard
   profiles are local shared memory plus DMA-BUF, local shared memory plus
   shared images, and network plus network images.

@@ -5,7 +5,7 @@ security-boundary: process-and-network
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-26
+last-reviewed: 2026-07-28
 code-links:
   - crates/brood-protocol/src/lib.rs
   - crates/brood-transport/src/artifact.rs
@@ -64,13 +64,16 @@ The client advertises the catalogue when the connection opens, but the relay
 requests only the root bytes initially.
 
 The relay materializes the verified root in a package directory and installs it
-as the backend's blessed session init actor. Actor management remains a backend
-operation. When the init actor asks to start a relative path which is not
-present, the backend suspends that start and emits a package-member request. The
-relay resolves the path against the authenticated client's catalogue, fetches
-the corresponding digest over the bulk lane, atomically materializes it under
-the same package root, and completes the suspended request. The backend then
-revalidates the path and requested capabilities before starting the child.
+as the backend's blessed session init actor. The directory identity covers the
+complete advertised catalogue: every member path, content digest, and root
+designation. Changing a lazily loaded sibling therefore creates a fresh package
+root even when the init module itself is unchanged. Actor management remains a
+backend operation. When the init actor asks to start a relative path which is
+not present, the backend suspends that start and emits a package-member request.
+The relay resolves the path against the authenticated client's catalogue,
+fetches the corresponding digest over the bulk lane, atomically materializes it
+under the same package root, and completes the suspended request. The backend
+then revalidates the path and requested capabilities before starting the child.
 
 Init actors therefore use the same relative-path actor API whether their package
 was preinstalled, eagerly copied over SSH, or hydrated on demand. They do not

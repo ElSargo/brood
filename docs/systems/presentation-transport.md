@@ -5,7 +5,7 @@ security-boundary: process-and-network
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-25
+last-reviewed: 2026-07-28
 code-links:
   - crates/brood-protocol/src/lib.rs
   - crates/brood-ipc/src/local_protocol.rs
@@ -48,7 +48,11 @@ crates encode these types; they do not define parallel message models.
 Traffic is assigned to semantic lanes:
 
 - `Critical` carries lossless latency-sensitive transitions and lifecycle.
-- `Reliable` carries ordered catalog, actor, and resource transitions.
+- `InteractiveSession` shards carry ordered session-actor traffic. One
+  session's large mailbox message cannot block unrelated interactive sessions.
+- `InteractiveDaemon` carries daemon-actor traffic independently from session
+  interaction.
+- `Reliable` carries ordered catalog and resource transitions.
 - `LatestState` carries supersedable pointer, viewport, resize, and scene state.
 - `Bulk` carries bounded content-addressed artifact exchange.
 - `FrameResource` carries frame content independently from scene publication.
@@ -56,7 +60,10 @@ Traffic is assigned to semantic lanes:
 Independent flow control is required. A large or stalled frame may reduce
 visual freshness, but it must not delay a key transition, disconnect, or
 resource-lifecycle message. Every payload is bounded before allocation or
-decode.
+decode. Carrier scheduling gives critical first priority, then interactive
+actor streams, then reliable inventory, ahead of latest-state, bulk, and
+frame-resource streams. Separate streams without explicit scheduler priority
+are not sufficient under congestion.
 
 Connection establishment compares immutable endpoint capabilities and selects
 one profile for the connection generation. Failure to agree on protocol
@@ -95,7 +102,11 @@ in-flight ownership rules.
 The network carrier uses a mutually authenticated TLS-over-QUIC connection.
 Each endpoint validates the other's configured certificate. Each semantic lane
 owns an independently ordered stream pair, so transport-level head-of-line
-blocking is contained to that lane. A handshake exchanges capabilities,
+blocking is contained to that lane. Actor traffic is additionally isolated by
+daemon realm and a fixed set of session shards while preserving order within
+each session mailbox. Every interactive stream owns its sender and receiver
+task; a task blocked writing one stream must not become application-level
+head-of-line blocking for the others. A handshake exchanges capabilities,
 selects the remote profile, and assigns the server's connection generation
 before ordinary traffic begins. Transport keepalives preserve an otherwise
 idle static desktop. Stream readers remain owned by dedicated receive tasks so
@@ -107,17 +118,21 @@ window image with explicit pane, resource, sequence, extent, stride, pixel
 format, and color space. It establishes correctness and portability. Future
 damage, video, or GPU-aware codecs may replace that payload after negotiation;
 they must preserve scene/resource lifecycle and must not introduce a second
-presentation model.
+presentation model. The relay retains at most one complete not-yet-sent scene,
+so a slow link converges on current pixels instead of accumulating an
+ever-older visual queue. It may finish a scene already being written, but
+superseded queued scenes do not consume unbounded memory or tail latency.
 
 A relay may adapt a local session-server connection into the network carrier.
 The relay is a transport endpoint: it neither computes layout nor hosts
 presentation actors. It may verify and stage an authorized session-realm
 artifact before asking the local backend to instantiate it. The native remote
 client remains responsible for client actors, input policy, final composition,
-and acknowledgements. Catalog and actor traffic retain their normal reliable
-ordering. Client backend and session operations use correlated request/response
-messages on that same reliable lane, so a remote presentation never reaches
-back to the server's local DBus address.
+and acknowledgements. Catalog traffic retains reliable ordering and each actor
+mailbox retains order within its realm/session shard. Client backend and
+session operations use correlated request/response messages on the reliable
+lane, so a remote presentation never reaches back to the server's local DBus
+address.
 
 Either endpoint may offer a content-addressed WASM artifact on the independent
 bulk lane. Destination realm, allowlist, digest verification, caching, and

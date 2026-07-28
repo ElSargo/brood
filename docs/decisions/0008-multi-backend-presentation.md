@@ -20,10 +20,12 @@ that connection without invalidating unrelated backends. Session and pane
 numbers are backend-local, so the view model must use `(BackendId, id)` keys.
 
 The semantic protocol remains shared by every carrier. Each connection keeps
-its critical, reliable, latest-state, bulk, and frame-resource lanes
-independent. Backend A never addresses backend B through a guest-supplied
-identifier; the registry selects the destination connection and stamps the
-connection-owned identity on inbound events.
+its critical, interactive actor, reliable, latest-state, bulk, and
+frame-resource lanes independent. Actor streams isolate daemon traffic and
+session shards while preserving order within a session mailbox. Backend A
+never addresses backend B through a guest-supplied identifier; the registry
+selects the destination connection and stamps the connection-owned identity on
+inbound events.
 
 The view maintains a global pane catalogue with backend-qualified pane keys.
 Layouts consume that catalogue and may compose panes from any subset of

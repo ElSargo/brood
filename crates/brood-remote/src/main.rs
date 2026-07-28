@@ -1,11 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     mem::size_of,
     net::{Ipv4Addr, SocketAddr},
     os::fd::AsFd,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     thread,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -17,10 +19,11 @@ use brood_cli::control::{
     take_realm_artifact_requests,
 };
 use brood_protocol::{
-    ActorMessage, ArtifactDigest, ArtifactMessage, ArtifactRealm, BackendOperation, BackendRequest,
-    BackendResponse, BackendResponseValue, CatalogSession, CatalogSnapshot, CatalogWindow,
-    ClientLifecycle, ClientMessage, EndpointCapabilities, FrameResourceRef, FrameScene,
-    FrameTransportKind, InputEvent, Lane, ServerMessage, SessionOperation, WindowFrame,
+    ActorMessage, ArtifactDigest, ArtifactMessage, ArtifactRealm, BackendActorRealm,
+    BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, CatalogSession,
+    CatalogSnapshot, CatalogWindow, ClientLifecycle, ClientMessage, EndpointCapabilities,
+    FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane, ServerMessage,
+    SessionOperation, WindowFrame,
 };
 use brood_transport::{
     ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, NetworkFramePacket, NetworkReceiveLane,
@@ -33,6 +36,8 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 mod ssh;
+
+const ACTOR_LANE_CAPACITY: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(about = "Brood remote presentation transport")]
@@ -116,9 +121,208 @@ enum Command {
 #[derive(Clone)]
 struct Outbound {
     critical: mpsc::UnboundedSender<CriticalOutbound>,
+    actors: mpsc::UnboundedSender<ServerMessage>,
     reliable: mpsc::UnboundedSender<ServerMessage>,
-    latest: mpsc::UnboundedSender<ServerMessage>,
-    frames: mpsc::UnboundedSender<NetworkFramePacket>,
+    scenes: tokio::sync::watch::Sender<Option<Arc<NetworkScene>>>,
+}
+
+struct NetworkScene {
+    frames: Vec<NetworkFramePacket>,
+    scene: FrameScene,
+}
+
+#[derive(Clone, Default)]
+struct TerminalRelayLatency(Arc<Mutex<TerminalRelayLatencyState>>);
+
+#[derive(Default)]
+struct TerminalRelayLatencyState {
+    pending: BTreeMap<(u64, u64), TerminalInputTrace>,
+    network_to_ipc_samples: VecDeque<u128>,
+    backend_turnaround_samples: VecDeque<u128>,
+    ipc_to_snapshot_samples: VecDeque<u128>,
+    pending_reliable_send: VecDeque<Instant>,
+    reliable_send_samples: VecDeque<u128>,
+}
+
+struct TerminalInputTrace {
+    received: Instant,
+    ipc_sent: Option<Instant>,
+}
+
+impl TerminalRelayLatency {
+    fn record_input(&self, message: &ActorMessage) {
+        let Some(key) = terminal_input_trace_key(message) else {
+            return;
+        };
+        if let Ok(mut state) = self.0.lock() {
+            state.pending.insert(
+                key,
+                TerminalInputTrace {
+                    received: Instant::now(),
+                    ipc_sent: None,
+                },
+            );
+            while state.pending.len() > 4_096 {
+                let Some(key) = state.pending.keys().next().copied() else {
+                    break;
+                };
+                state.pending.remove(&key);
+            }
+        }
+    }
+
+    fn record_input_ipc_sent(&self, message: &ActorMessage) {
+        let Some(key) = terminal_input_trace_key(message) else {
+            return;
+        };
+        let now = Instant::now();
+        if let Ok(mut state) = self.0.lock() {
+            let sample = state.pending.get_mut(&key).map(|trace| {
+                trace.ipc_sent = Some(now);
+                now.duration_since(trace.received).as_micros()
+            });
+            if let Some(sample) = sample {
+                push_latency_sample(&mut state.network_to_ipc_samples, sample);
+            }
+        }
+    }
+
+    fn record_snapshot(&self, message: &ActorMessage) {
+        let Some((session, acknowledged)) = terminal_snapshot_trace_key(message) else {
+            return;
+        };
+        let now = Instant::now();
+        if let Ok(mut state) = self.0.lock() {
+            let completed = state
+                .pending
+                .range((session, 0)..=(session, acknowledged))
+                .map(|(key, _trace)| *key)
+                .collect::<Vec<_>>();
+            for key in completed {
+                let Some(trace) = state.pending.remove(&key) else {
+                    continue;
+                };
+                push_latency_sample(
+                    &mut state.backend_turnaround_samples,
+                    now.duration_since(trace.received).as_micros(),
+                );
+                if let Some(ipc_sent) = trace.ipc_sent {
+                    push_latency_sample(
+                        &mut state.ipc_to_snapshot_samples,
+                        now.duration_since(ipc_sent).as_micros(),
+                    );
+                }
+            }
+            state.pending_reliable_send.push_back(now);
+            if state.pending_reliable_send.len() > 4_096 {
+                state.pending_reliable_send.pop_front();
+            }
+        }
+    }
+
+    fn record_snapshot_sent(&self) {
+        let now = Instant::now();
+        if let Ok(mut state) = self.0.lock()
+            && let Some(queued) = state.pending_reliable_send.pop_front()
+        {
+            state
+                .reliable_send_samples
+                .push_back(now.duration_since(queued).as_micros());
+            while state.reliable_send_samples.len() > 4_096 {
+                state.reliable_send_samples.pop_front();
+            }
+        }
+    }
+
+    fn diagnostics(&self) -> serde_json::Value {
+        let Ok(state) = self.0.lock() else {
+            return serde_json::Value::Null;
+        };
+        let network_to_ipc = latency_summary(&state.network_to_ipc_samples);
+        let backend_turnaround = latency_summary(&state.backend_turnaround_samples);
+        let ipc_to_snapshot = latency_summary(&state.ipc_to_snapshot_samples);
+        let reliable_send_queue = latency_summary(&state.reliable_send_samples);
+        serde_json::json!({
+            "network_to_ipc": network_to_ipc,
+            "backend_turnaround": backend_turnaround,
+            "ipc_to_snapshot": ipc_to_snapshot,
+            "reliable_send_queue": reliable_send_queue,
+            "pending": state.pending.len(),
+            "pending_reliable_send": state.pending_reliable_send.len(),
+        })
+    }
+}
+
+fn push_latency_sample(samples: &mut VecDeque<u128>, sample: u128) {
+    samples.push_back(sample);
+    while samples.len() > 4_096 {
+        samples.pop_front();
+    }
+}
+
+fn terminal_input_trace_key(message: &ActorMessage) -> Option<(u64, u64)> {
+    if !message.sender.starts_with("terminal-ui")
+        || !message.recipient.starts_with("terminal-session")
+        || message.body.first() != Some(&b'I')
+    {
+        return None;
+    }
+    let BackendActorRealm::Session(session) = message.realm else {
+        return None;
+    };
+    let encoded = <[u8; 8]>::try_from(message.body.get(1..9)?).ok()?;
+    Some((session, u64::from_le_bytes(encoded)))
+}
+
+fn terminal_snapshot_trace_key(message: &ActorMessage) -> Option<(u64, u64)> {
+    if !message.sender.starts_with("terminal-session")
+        || !message.recipient.starts_with("terminal-ui")
+        || message.body.get(..4) != Some(b"BTRM")
+        || message.body.get(4) != Some(&4)
+    {
+        return None;
+    }
+    let BackendActorRealm::Session(session) = message.realm else {
+        return None;
+    };
+    let encoded = <[u8; 8]>::try_from(message.body.get(14..22)?).ok()?;
+    Some((session, u64::from_le_bytes(encoded)))
+}
+
+fn latency_summary(samples: &VecDeque<u128>) -> serde_json::Value {
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mean = sorted.iter().map(|sample| *sample as f64).sum::<f64>() / sorted.len().max(1) as f64;
+    let standard_deviation = (sorted
+        .iter()
+        .map(|sample| {
+            let distance = *sample as f64 - mean;
+            distance * distance
+        })
+        .sum::<f64>()
+        / sorted.len().max(1) as f64)
+        .sqrt();
+    let percentile = |percentile: usize| {
+        sorted
+            .get(
+                sorted
+                    .len()
+                    .saturating_mul(percentile)
+                    .div_ceil(100)
+                    .saturating_sub(1),
+            )
+            .copied()
+            .unwrap_or_default()
+    };
+    serde_json::json!({
+        "samples": sorted.len(),
+        "mean_us": mean,
+        "p50_us": percentile(50),
+        "p95_us": percentile(95),
+        "p99_us": percentile(99),
+        "max_us": sorted.last().copied().unwrap_or_default(),
+        "stddev_us": standard_deviation,
+    })
 }
 
 enum CriticalOutbound {
@@ -147,7 +351,7 @@ struct PendingWindow {
     active: bool,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     match Args::parse().command {
         Command::GenerateCertificate {
@@ -304,17 +508,17 @@ async fn relay(
         fast_path.generation,
     )
     .await?;
-
     let (critical_tx, critical_rx) = mpsc::unbounded_channel();
+    let (actor_tx, actor_rx) = mpsc::unbounded_channel();
     let (reliable_tx, reliable_rx) = mpsc::unbounded_channel();
-    let (latest_tx, latest_rx) = mpsc::unbounded_channel();
-    let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+    let (scene_tx, scene_rx) = tokio::sync::watch::channel(None);
     let outbound = Outbound {
         critical: critical_tx.clone(),
+        actors: actor_tx,
         reliable: reliable_tx,
-        latest: latest_tx,
-        frames: frame_tx,
+        scenes: scene_tx,
     };
+    let terminal_latency = TerminalRelayLatency::default();
 
     spawn_catalog_forwarder(
         &fast_path.catalog_fd,
@@ -336,6 +540,7 @@ async fn relay(
         fast_path.presentation_message_notify_fd,
         fast_path.generation,
         outbound.clone(),
+        terminal_latency.clone(),
     )?;
 
     let input = brood_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
@@ -359,18 +564,29 @@ async fn relay(
         actor_notifications,
         fast_path.generation,
         local_actor_rx,
+        terminal_latency.clone(),
     ));
 
     let (critical_send, mut critical_receive) = network.take_lane(Lane::Critical)?.split();
+    let (session0_send, session0_receive) = network.take_lane(Lane::InteractiveSession0)?.split();
+    let (session1_send, session1_receive) = network.take_lane(Lane::InteractiveSession1)?.split();
+    let (session2_send, session2_receive) = network.take_lane(Lane::InteractiveSession2)?.split();
+    let (session3_send, session3_receive) = network.take_lane(Lane::InteractiveSession3)?.split();
+    let (daemon_send, daemon_receive) = network.take_lane(Lane::InteractiveDaemon)?.split();
     let (reliable_send, reliable_receive) = network.take_lane(Lane::Reliable)?.split();
     let (latest_send, latest_receive) = network.take_lane(Lane::LatestState)?.split();
     let (bulk_send, bulk_receive) = network.take_lane(Lane::Bulk)?.split();
     let (frame_send, _frame_receive) = network.take_lane(Lane::FrameResource)?.split();
 
     tokio::spawn(send_critical_messages(critical_send, critical_rx));
-    tokio::spawn(send_server_messages(reliable_send, reliable_rx));
-    tokio::spawn(send_server_messages(latest_send, latest_rx));
-    tokio::spawn(send_network_frames(frame_send, frame_rx));
+    tokio::spawn(send_server_messages(
+        [session0_send, session1_send, session2_send, session3_send],
+        daemon_send,
+        actor_rx,
+        terminal_latency.clone(),
+    ));
+    tokio::spawn(send_reliable_messages(reliable_send, reliable_rx));
+    tokio::spawn(send_network_scenes(frame_send, latest_send, scene_rx));
 
     let (disconnect_tx, mut disconnect_rx) = oneshot::channel();
     let critical_input_tx = local_input_tx.clone();
@@ -397,9 +613,25 @@ async fn relay(
         }
     });
     tokio::spawn(receive_latest_input(latest_receive, local_input_tx));
+    for receive in [
+        session0_receive,
+        session1_receive,
+        session2_receive,
+        session3_receive,
+    ] {
+        tokio::spawn(receive_actor_input(
+            receive,
+            local_actor_tx.clone(),
+            terminal_latency.clone(),
+        ));
+    }
+    tokio::spawn(receive_actor_input(
+        daemon_receive,
+        local_actor_tx,
+        terminal_latency.clone(),
+    ));
     tokio::spawn(receive_reliable_input(
         reliable_receive,
-        local_actor_tx,
         target.clone(),
         outbound,
     ));
@@ -442,6 +674,21 @@ async fn relay(
         }
     };
     artifact_task.abort();
+    eprintln!(
+        "remote terminal relay diagnostics {}",
+        terminal_latency.diagnostics()
+    );
+    let diagnostics = network.diagnostics();
+    eprintln!(
+        "remote relay QUIC diagnostics {{\"rtt_us\":{},\"congestion_window\":{},\"congestion_events\":{},\"lost_packets\":{},\"lost_bytes\":{},\"sent_packets\":{},\"mtu\":{}}}",
+        diagnostics.rtt_us,
+        diagnostics.congestion_window,
+        diagnostics.congestion_events,
+        diagnostics.lost_packets,
+        diagnostics.lost_bytes,
+        diagnostics.sent_packets,
+        diagnostics.mtu,
+    );
     result
 }
 
@@ -557,9 +804,16 @@ async fn apply_session_artifact_update(
             ArtifactExchangeEvent::Installed(artifact) => {
                 let digest = artifact.manifest.digest;
                 let waiting = waiting_by_digest.remove(&digest).unwrap_or_default();
+                let package_digest = artifact
+                    .manifest
+                    .package
+                    .as_ref()
+                    .filter(|member| member.root)
+                    .and_then(|member| exchange.package_digest(&member.package));
                 let install_result = install_session_artifact(
                     target,
                     &artifact,
+                    package_digest,
                     package_cache,
                     &waiting,
                     active_package_roots,
@@ -629,6 +883,7 @@ async fn apply_session_artifact_update(
 async fn install_session_artifact(
     target: &ControlTarget,
     artifact: &brood_transport::InstalledArtifact,
+    package_digest: Option<ArtifactDigest>,
     package_cache: &Path,
     waiting: &[u64],
     active_package_roots: &mut HashMap<String, PathBuf>,
@@ -644,9 +899,9 @@ async fn install_session_artifact(
                 waiting.is_empty(),
                 "session package root unexpectedly satisfied a child request"
             );
-            let package_root = package_cache
-                .join(&member.package)
-                .join(digest_hex(artifact.manifest.digest));
+            let package_root = package_cache.join(&member.package).join(digest_hex(
+                package_digest.context("session package catalogue is incomplete")?,
+            ));
             let path = materialize_package_member(&package_root, artifact)?;
             let install_target = target.clone();
             let installed = tokio::task::spawn_blocking(move || {
@@ -800,17 +1055,34 @@ async fn receive_latest_input(
     }
 }
 
-async fn receive_reliable_input(
+async fn receive_actor_input(
     mut lane: brood_transport::NetworkReceiveLane,
     sender: mpsc::UnboundedSender<ActorMessage>,
+    terminal_latency: TerminalRelayLatency,
+) -> Result<()> {
+    loop {
+        let ClientMessage::Actor(message) = lane.receive_client_message().await? else {
+            bail!("non-actor client message reached the interactive lane");
+        };
+        if message.sender.starts_with("terminal-ui")
+            && message.recipient.starts_with("terminal-session")
+            && message.body.first() == Some(&b'I')
+        {
+            terminal_latency.record_input(&message);
+        }
+        sender
+            .send(message)
+            .map_err(|_error| anyhow!("local actor writer stopped"))?;
+    }
+}
+
+async fn receive_reliable_input(
+    mut lane: brood_transport::NetworkReceiveLane,
     target: ControlTarget,
     outbound: Outbound,
 ) -> Result<()> {
     loop {
         match lane.receive_client_message().await? {
-            ClientMessage::Actor(message) => sender
-                .send(message)
-                .map_err(|_error| anyhow!("local actor writer stopped"))?,
             ClientMessage::BackendRequest(request) => {
                 let request_target = target.clone();
                 let response = tokio::task::spawn_blocking(move || {
@@ -824,7 +1096,10 @@ async fn receive_reliable_input(
                     .map_err(|_error| anyhow!("remote reliable sender stopped"))?;
             }
             ClientMessage::ReleaseResource { .. } => {}
-            ClientMessage::Input(_) | ClientMessage::Lifecycle(_) | ClientMessage::Artifact(_) => {
+            ClientMessage::Actor(_)
+            | ClientMessage::Input(_)
+            | ClientMessage::Lifecycle(_)
+            | ClientMessage::Artifact(_) => {
                 bail!("critical client message reached the reliable lane");
             }
         }
@@ -910,6 +1185,85 @@ fn execute_session_operation(
 }
 
 async fn send_server_messages(
+    session_lanes: [NetworkSendLane; 4],
+    daemon_lane: NetworkSendLane,
+    mut receiver: mpsc::UnboundedReceiver<ServerMessage>,
+    terminal_latency: TerminalRelayLatency,
+) -> Result<()> {
+    let mut senders = Vec::with_capacity(5);
+    let mut tasks = tokio::task::JoinSet::new();
+    for lane in session_lanes {
+        let (sender, lane_receiver) = mpsc::channel(ACTOR_LANE_CAPACITY);
+        senders.push(sender);
+        tasks.spawn(send_server_actor_lane(
+            lane,
+            lane_receiver,
+            terminal_latency.clone(),
+        ));
+    }
+    let (daemon_sender, daemon_receiver) = mpsc::channel(ACTOR_LANE_CAPACITY);
+    senders.push(daemon_sender);
+    tasks.spawn(send_server_actor_lane(
+        daemon_lane,
+        daemon_receiver,
+        terminal_latency,
+    ));
+
+    loop {
+        tokio::select! {
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                return completed
+                    .context("remote actor sender set is empty")?
+                    .context("remote actor sender panicked")?;
+            }
+            message = receiver.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                let lane = match &message {
+                    ServerMessage::Actor(message) => match message.realm {
+                        brood_protocol::BackendActorRealm::Daemon => 4,
+                        brood_protocol::BackendActorRealm::Session(session) => {
+                            usize::try_from(session % 4).unwrap_or_default()
+                        }
+                    },
+                    _ => 0,
+                };
+                senders[lane]
+                    .try_send(message)
+                    .map_err(|_error| anyhow!("remote actor sender is full or stopped"))?;
+            }
+        }
+    }
+    drop(senders);
+    while let Some(completed) = tasks.join_next().await {
+        completed.context("remote actor sender panicked")??;
+    }
+    Ok(())
+}
+
+async fn send_server_actor_lane(
+    mut lane: NetworkSendLane,
+    mut receiver: mpsc::Receiver<ServerMessage>,
+    terminal_latency: TerminalRelayLatency,
+) -> Result<()> {
+    while let Some(message) = receiver.recv().await {
+        let terminal_snapshot = matches!(
+            &message,
+            ServerMessage::Actor(message)
+                if message.sender.starts_with("terminal-session")
+                    && message.recipient.starts_with("terminal-ui")
+                    && message.body.starts_with(b"BTRM")
+        );
+        lane.send_server_message(&message).await?;
+        if terminal_snapshot {
+            terminal_latency.record_snapshot_sent();
+        }
+    }
+    Ok(())
+}
+
+async fn send_reliable_messages(
     mut lane: NetworkSendLane,
     mut receiver: mpsc::UnboundedReceiver<ServerMessage>,
 ) -> Result<()> {
@@ -940,14 +1294,26 @@ async fn send_critical_messages(
     Ok(())
 }
 
-async fn send_network_frames(
-    mut lane: NetworkSendLane,
-    mut receiver: mpsc::UnboundedReceiver<NetworkFramePacket>,
+async fn send_network_scenes(
+    mut frames: NetworkSendLane,
+    mut latest: NetworkSendLane,
+    mut receiver: tokio::sync::watch::Receiver<Option<Arc<NetworkScene>>>,
 ) -> Result<()> {
-    while let Some(frame) = receiver.recv().await {
-        lane.send_frame(&frame).await?;
+    loop {
+        receiver
+            .changed()
+            .await
+            .context("network scene forwarder stopped")?;
+        let Some(update) = receiver.borrow_and_update().clone() else {
+            continue;
+        };
+        latest
+            .send_server_message(&ServerMessage::Scene(update.scene.clone()))
+            .await?;
+        for frame in &update.frames {
+            frames.send_frame(frame).await?;
+        }
     }
-    Ok(())
 }
 
 async fn write_local_input(
@@ -979,6 +1345,7 @@ async fn write_local_actor_messages(
     notifications: brood_ipc::EventNotifier,
     generation: u64,
     mut receiver: mpsc::UnboundedReceiver<ActorMessage>,
+    terminal_latency: TerminalRelayLatency,
 ) -> Result<()> {
     let mut sequence = 0_u64;
     while let Some(message) = receiver.recv().await {
@@ -1001,6 +1368,7 @@ async fn write_local_actor_messages(
             }
         }
         notifications.notify()?;
+        terminal_latency.record_input_ipc_sent(&message);
     }
     Ok(())
 }
@@ -1155,6 +1523,7 @@ fn spawn_frame_forwarder(
                                 return;
                             }
                             let mut windows = Vec::with_capacity(scene.windows.len());
+                            let mut frames = Vec::with_capacity(scene.windows.len());
                             for window in scene.windows {
                                 let Some(frame) = resources.get(&window.resource) else {
                                     return;
@@ -1175,9 +1544,7 @@ fn spawn_frame_forwarder(
                                 ) else {
                                     return;
                                 };
-                                if outbound.frames.send(packet).is_err() {
-                                    return;
-                                }
+                                frames.push(packet);
                                 windows.push(WindowFrame {
                                     pane: window.pane,
                                     resource: FrameResourceRef::Network {
@@ -1188,13 +1555,16 @@ fn spawn_frame_forwarder(
                                 });
                             }
                             if outbound
-                                .latest
-                                .send(ServerMessage::Scene(FrameScene {
-                                    backend,
-                                    sequence: scene.sequence,
-                                    extent: scene.extent,
-                                    windows,
-                                }))
+                                .scenes
+                                .send(Some(Arc::new(NetworkScene {
+                                    frames,
+                                    scene: FrameScene {
+                                        backend,
+                                        sequence: scene.sequence,
+                                        extent: scene.extent,
+                                        windows,
+                                    },
+                                })))
                                 .is_err()
                             {
                                 return;
@@ -1229,6 +1599,7 @@ fn spawn_actor_forwarder(
     notify_fd: std::os::fd::OwnedFd,
     generation: u64,
     outbound: Outbound,
+    terminal_latency: TerminalRelayLatency,
 ) -> Result<()> {
     let mut consumer = brood_ipc::ActorMessageConsumer::map(fd.as_fd(), generation)?;
     let notifications = brood_ipc::EventNotifier::from_owned_fd(notify_fd);
@@ -1249,11 +1620,13 @@ fn spawn_actor_forwarder(
                     let Some(message) = message else {
                         continue;
                     };
-                    if outbound
-                        .reliable
-                        .send(ServerMessage::Actor(message))
-                        .is_err()
+                    if message.sender.starts_with("terminal-session")
+                        && message.recipient.starts_with("terminal-ui")
+                        && message.body.starts_with(b"BTRM")
                     {
+                        terminal_latency.record_snapshot(&message);
+                    }
+                    if outbound.actors.send(ServerMessage::Actor(message)).is_err() {
                         return;
                     }
                 }

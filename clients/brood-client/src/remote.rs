@@ -9,6 +9,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -65,6 +66,7 @@ impl RemoteConnection {
     pub fn start(config: RemoteConfig, proxy: &EventLoopProxy<ClientEvent>) -> Result<Self> {
         let configured_backend = config.backend;
         let (input_sender, input_receiver) = tokio_mpsc::channel(INPUT_CAPACITY);
+        let (actor_sender, actor_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
         let (reliable_sender, reliable_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker_proxy = proxy.clone();
@@ -75,6 +77,7 @@ impl RemoteConnection {
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .thread_name("brood-network")
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                     .context("start remote presentation runtime")?;
@@ -82,6 +85,7 @@ impl RemoteConnection {
                     config,
                     worker_proxy.clone(),
                     input_receiver,
+                    actor_receiver,
                     reliable_receiver,
                     ready_sender,
                     worker_established,
@@ -105,7 +109,7 @@ impl RemoteConnection {
             profile: ready.profile,
             generation: ready.generation,
             input: Some(RemoteInputLane::new(input_sender.clone())),
-            actor_messages: Some(RemoteActorMessageLane::new(reliable_sender.clone())),
+            actor_messages: Some(RemoteActorMessageLane::new(actor_sender)),
             backend_commands: Some(RemoteBackendCommandLane::new(reliable_sender)),
             shutdown_sender: input_sender,
             worker: Some(worker),
@@ -167,6 +171,7 @@ async fn run_connection(
     config: RemoteConfig,
     proxy: EventLoopProxy<ClientEvent>,
     input_receiver: tokio_mpsc::Receiver<ClientMessage>,
+    actor_receiver: tokio_mpsc::Receiver<ActorCommand>,
     reliable_receiver: tokio_mpsc::Receiver<ReliableCommand>,
     ready_sender: mpsc::SyncSender<Result<RemoteReady>>,
     established: Arc<AtomicBool>,
@@ -184,6 +189,11 @@ async fn run_connection(
     let backend = network.backend;
     let generation = network.connection_generation;
     let (critical_send, critical_receive) = network.take_lane(Lane::Critical)?.split();
+    let (session0_send, session0_receive) = network.take_lane(Lane::InteractiveSession0)?.split();
+    let (session1_send, session1_receive) = network.take_lane(Lane::InteractiveSession1)?.split();
+    let (session2_send, session2_receive) = network.take_lane(Lane::InteractiveSession2)?.split();
+    let (session3_send, session3_receive) = network.take_lane(Lane::InteractiveSession3)?.split();
+    let (daemon_send, daemon_receive) = network.take_lane(Lane::InteractiveDaemon)?.split();
     let (reliable_send, reliable_receive) = network.take_lane(Lane::Reliable)?.split();
     let (latest_send, latest_receive) = network.take_lane(Lane::LatestState)?.split();
     let (bulk_send, bulk_receive) = network.take_lane(Lane::Bulk)?.split();
@@ -208,6 +218,28 @@ async fn run_connection(
         critical_receive,
         proxy.clone(),
         disconnect_acknowledged,
+    ));
+    let mut actor_send_task = tokio::spawn(send_actor_messages(
+        [session0_send, session1_send, session2_send, session3_send],
+        daemon_send,
+        actor_receiver,
+        proxy.clone(),
+        backend,
+    ));
+    let mut actor_receive_task = tokio::spawn(receive_actor_messages_many(
+        vec![
+            session0_receive,
+            session1_receive,
+            session2_receive,
+            session3_receive,
+        ],
+        proxy.clone(),
+        backend,
+    ));
+    let mut daemon_receive_task = tokio::spawn(receive_actor_messages(
+        daemon_receive,
+        proxy.clone(),
+        backend,
     ));
     let mut reliable_task = tokio::spawn(exchange_reliable_messages(
         reliable_send,
@@ -239,15 +271,32 @@ async fn run_connection(
         biased;
         result = &mut input_task => join_transport_task("input", result),
         result = &mut critical_task => join_transport_task("critical", result),
+        result = &mut actor_send_task => join_transport_task("actor send", result),
+        result = &mut actor_receive_task => join_transport_task("actor receive", result),
+        result = &mut daemon_receive_task => join_transport_task("daemon actor receive", result),
         result = &mut reliable_task => join_transport_task("reliable", result),
         result = &mut frame_task => join_transport_task("frame", result),
         result = &mut artifact_task => join_transport_task("artifact", result),
     };
     input_task.abort();
     critical_task.abort();
+    actor_send_task.abort();
+    actor_receive_task.abort();
+    daemon_receive_task.abort();
     reliable_task.abort();
     frame_task.abort();
     artifact_task.abort();
+    let diagnostics = network.diagnostics();
+    eprintln!(
+        "remote client QUIC diagnostics {{\"rtt_us\":{},\"congestion_window\":{},\"congestion_events\":{},\"lost_packets\":{},\"lost_bytes\":{},\"sent_packets\":{},\"mtu\":{}}}",
+        diagnostics.rtt_us,
+        diagnostics.congestion_window,
+        diagnostics.congestion_events,
+        diagnostics.lost_packets,
+        diagnostics.lost_bytes,
+        diagnostics.sent_packets,
+        diagnostics.mtu,
+    );
     drop(network);
     drop(endpoint);
     result
@@ -356,8 +405,12 @@ async fn receive_critical_messages(
     }
 }
 
+struct ActorCommand {
+    message: ActorMessage,
+    queued_at: Instant,
+}
+
 enum ReliableCommand {
-    Actor(ActorMessage),
     Backend {
         request: BackendRequest,
         context: PendingBackend,
@@ -372,6 +425,125 @@ enum PendingBackend {
         actor_id: String,
         request: brood_wasm::SessionCommandRequest,
     },
+}
+
+async fn send_actor_messages(
+    session_sends: [NetworkSendLane; 4],
+    daemon_send: NetworkSendLane,
+    mut outbound: tokio_mpsc::Receiver<ActorCommand>,
+    proxy: EventLoopProxy<ClientEvent>,
+    backend: BackendId,
+) -> Result<()> {
+    let mut senders = Vec::with_capacity(5);
+    let mut tasks = tokio::task::JoinSet::new();
+    for send in session_sends {
+        let (sender, receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
+        senders.push(sender);
+        tasks.spawn(send_actor_lane(send, receiver, proxy.clone(), backend));
+    }
+    let (daemon_sender, daemon_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
+    senders.push(daemon_sender);
+    tasks.spawn(send_actor_lane(
+        daemon_send,
+        daemon_receiver,
+        proxy,
+        backend,
+    ));
+
+    loop {
+        tokio::select! {
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                return completed
+                    .context("interactive actor sender set is empty")?
+                    .context("interactive actor sender panicked")?;
+            }
+            command = outbound.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                let lane = match command.message.realm {
+                    brood_protocol::BackendActorRealm::Daemon => 4,
+                    brood_protocol::BackendActorRealm::Session(session) => {
+                        usize::try_from(session % 4).unwrap_or_default()
+                    }
+                };
+                senders[lane]
+                    .try_send(command)
+                    .map_err(|_error| anyhow!("interactive actor sender is full or stopped"))?;
+            }
+        }
+    }
+    drop(senders);
+    while let Some(completed) = tasks.join_next().await {
+        completed.context("interactive actor sender panicked")??;
+    }
+    Ok(())
+}
+
+async fn send_actor_lane(
+    mut send: NetworkSendLane,
+    mut outbound: tokio_mpsc::Receiver<ActorCommand>,
+    proxy: EventLoopProxy<ClientEvent>,
+    backend: BackendId,
+) -> Result<()> {
+    while let Some(ActorCommand { message, queued_at }) = outbound.recv().await {
+        let terminal_input = message.sender.starts_with("terminal-ui")
+            && message.recipient.starts_with("terminal-session")
+            && crate::terminal_input_sequence(&message.body).is_some();
+        let trace_sequence = crate::terminal_input_sequence(&message.body);
+        send.send_client_message(&ClientMessage::Actor(message))
+            .await?;
+        if terminal_input && let Some(trace_sequence) = trace_sequence {
+            proxy
+                .send_event(ClientEvent::RemoteTerminalInputSent {
+                    backend,
+                    trace_sequence,
+                    queued_at,
+                    sent_at: Instant::now(),
+                })
+                .map_err(|_error| anyhow!("presentation event loop stopped"))?;
+        }
+    }
+    Ok(())
+}
+
+async fn receive_actor_messages_many(
+    receives: Vec<NetworkReceiveLane>,
+    proxy: EventLoopProxy<ClientEvent>,
+    backend: BackendId,
+) -> Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for receive in receives {
+        tasks.spawn(receive_actor_messages(receive, proxy.clone(), backend));
+    }
+    let result = tasks
+        .join_next()
+        .await
+        .context("interactive actor receiver set is empty")?;
+    tasks.abort_all();
+    result.context("interactive actor receiver panicked")?
+}
+
+async fn receive_actor_messages(
+    mut receive: NetworkReceiveLane,
+    proxy: EventLoopProxy<ClientEvent>,
+    backend: BackendId,
+) -> Result<()> {
+    loop {
+        let ServerMessage::Actor(message) = receive.receive_server_message().await? else {
+            bail!("non-actor server message reached the interactive lane");
+        };
+        proxy
+            .send_event(ClientEvent::BackendActorMessage {
+                backend,
+                realm: message.realm,
+                sender: message.sender,
+                recipient: message.recipient,
+                body: message.body,
+                received_at: Instant::now(),
+            })
+            .map_err(|_error| anyhow!("presentation event loop stopped"))?;
+    }
 }
 
 async fn exchange_reliable_messages(
@@ -391,9 +563,6 @@ async fn exchange_reliable_messages(
                     break Ok(());
                 };
                 match command {
-                    ReliableCommand::Actor(message) => {
-                        send.send_client_message(&ClientMessage::Actor(message)).await?;
-                    }
                     ReliableCommand::Backend { request, context } => {
                         ensure!(
                             pending.insert(request.id, context).is_none(),
@@ -487,13 +656,7 @@ fn handle_reliable_message(
                 windows,
             }
         }
-        ServerMessage::Actor(message) => ClientEvent::BackendActorMessage {
-            backend,
-            realm: message.realm,
-            sender: message.sender,
-            recipient: message.recipient,
-            body: message.body,
-        },
+        ServerMessage::Actor(_) => bail!("actor message reached the reliable lane"),
         ServerMessage::BackendResponse(response) => {
             let context = pending
                 .remove(&response.id)
@@ -869,12 +1032,12 @@ const fn is_pointer_motion(message: &ClientMessage) -> bool {
 }
 
 pub struct RemoteActorMessageLane {
-    sender: tokio_mpsc::Sender<ReliableCommand>,
-    deferred: VecDeque<ReliableCommand>,
+    sender: tokio_mpsc::Sender<ActorCommand>,
+    deferred: VecDeque<ActorCommand>,
 }
 
 impl RemoteActorMessageLane {
-    const fn new(sender: tokio_mpsc::Sender<ReliableCommand>) -> Self {
+    const fn new(sender: tokio_mpsc::Sender<ActorCommand>) -> Self {
         Self {
             sender,
             deferred: VecDeque::new(),
@@ -883,12 +1046,15 @@ impl RemoteActorMessageLane {
 
     pub fn send(&mut self, message: &BackendActorMessageRequest) -> Result<()> {
         self.flush_deferred();
-        let command = ReliableCommand::Actor(ActorMessage {
-            realm: message.realm,
-            sender: message.sender.clone(),
-            recipient: message.actor.clone(),
-            body: message.body.clone(),
-        });
+        let command = ActorCommand {
+            message: ActorMessage {
+                realm: message.realm,
+                sender: message.sender.clone(),
+                recipient: message.actor.clone(),
+                body: message.body.clone(),
+            },
+            queued_at: Instant::now(),
+        };
         if self.has_deferred() {
             return self.defer(command);
         }
@@ -921,7 +1087,7 @@ impl RemoteActorMessageLane {
         !self.deferred.is_empty()
     }
 
-    fn defer(&mut self, command: ReliableCommand) -> Result<()> {
+    fn defer(&mut self, command: ActorCommand) -> Result<()> {
         ensure!(
             self.deferred.len() < 64,
             "remote actor-message backlog is full"

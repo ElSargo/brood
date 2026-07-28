@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 20;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 21;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
@@ -51,7 +51,14 @@ pub const MAX_ARTIFACT_REJECTION_BYTES: usize = 512;
 pub enum Lane {
     /// Lossless latency-sensitive state transitions such as key changes.
     Critical,
-    /// Lossless ordered messages such as inventory and actor traffic.
+    /// Lossless ordered session-actor traffic, sharded by session identity.
+    InteractiveSession0,
+    InteractiveSession1,
+    InteractiveSession2,
+    InteractiveSession3,
+    /// Lossless ordered daemon-actor traffic isolated from session interaction.
+    InteractiveDaemon,
+    /// Lossless ordered inventory and resource transitions.
     Reliable,
     /// Supersedable state where only the newest generation matters.
     LatestState,

@@ -19,7 +19,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -83,6 +83,181 @@ use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
 
 pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn latency_summary(
+    samples: &VecDeque<u128>,
+    total_samples: u64,
+    last: u128,
+    maximum: u128,
+) -> serde_json::Value {
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mean = sorted.iter().map(|sample| *sample as f64).sum::<f64>() / sorted.len().max(1) as f64;
+    let standard_deviation = (sorted
+        .iter()
+        .map(|sample| {
+            let distance = *sample as f64 - mean;
+            distance * distance
+        })
+        .sum::<f64>()
+        / sorted.len().max(1) as f64)
+        .sqrt();
+    let percentile = |percentile: usize| {
+        sorted
+            .get(
+                sorted
+                    .len()
+                    .saturating_mul(percentile)
+                    .div_ceil(100)
+                    .saturating_sub(1),
+            )
+            .copied()
+            .unwrap_or_default()
+    };
+    serde_json::json!({
+        "key_to_present_samples": total_samples,
+        "last_key_to_present_us": last,
+        "mean_key_to_present_us": mean,
+        "p50_key_to_present_us": percentile(50),
+        "p95_key_to_present_us": percentile(95),
+        "p99_key_to_present_us": percentile(99),
+        "max_key_to_present_us": maximum,
+        "stddev_key_to_present_us": standard_deviation,
+    })
+}
+
+fn stage_summary(samples: &VecDeque<u128>) -> serde_json::Value {
+    let summary = latency_summary(
+        samples,
+        samples.len() as u64,
+        samples.back().copied().unwrap_or_default(),
+        samples.iter().copied().max().unwrap_or_default(),
+    );
+    let field = |name| summary.get(name).cloned().unwrap_or_default();
+    serde_json::json!({
+        "samples": field("key_to_present_samples"),
+        "last_us": field("last_key_to_present_us"),
+        "mean_us": field("mean_key_to_present_us"),
+        "p50_us": field("p50_key_to_present_us"),
+        "p95_us": field("p95_key_to_present_us"),
+        "p99_us": field("p99_key_to_present_us"),
+        "max_us": field("max_key_to_present_us"),
+        "stddev_us": field("stddev_key_to_present_us"),
+    })
+}
+
+struct PendingPluginInput {
+    pane: u64,
+    backend: Option<BackendId>,
+    trace_sequence: Option<u64>,
+    started: Instant,
+    started_unix_us: u128,
+    transport_queued: Option<Instant>,
+    transport_sent: Option<Instant>,
+    transport_received: Option<Instant>,
+    snapshot_dispatched: Option<Instant>,
+    graphics_ready: Option<Instant>,
+    ready: bool,
+}
+
+#[derive(Default)]
+struct PluginLatencyStages {
+    input_to_transport_queue: VecDeque<u128>,
+    transport_send_queue: VecDeque<u128>,
+    remote_round_trip: VecDeque<u128>,
+    transport_round_trip: VecDeque<u128>,
+    client_dispatch: VecDeque<u128>,
+    plugin_render: VecDeque<u128>,
+    presentation: VecDeque<u128>,
+}
+
+impl PluginLatencyStages {
+    fn record(
+        &mut self,
+        started: Instant,
+        transport_queued: Option<Instant>,
+        transport_sent: Option<Instant>,
+        transport_received: Instant,
+        snapshot_dispatched: Instant,
+        graphics_ready: Instant,
+        presented: Instant,
+    ) {
+        if let (Some(transport_queued), Some(transport_sent)) = (transport_queued, transport_sent) {
+            push_bounded(
+                &mut self.input_to_transport_queue,
+                transport_queued.duration_since(started).as_micros(),
+            );
+            push_bounded(
+                &mut self.transport_send_queue,
+                transport_sent.duration_since(transport_queued).as_micros(),
+            );
+            push_bounded(
+                &mut self.remote_round_trip,
+                transport_received
+                    .duration_since(transport_sent)
+                    .as_micros(),
+            );
+        }
+        push_bounded(
+            &mut self.transport_round_trip,
+            transport_received.duration_since(started).as_micros(),
+        );
+        push_bounded(
+            &mut self.client_dispatch,
+            snapshot_dispatched
+                .duration_since(transport_received)
+                .as_micros(),
+        );
+        push_bounded(
+            &mut self.plugin_render,
+            graphics_ready
+                .duration_since(snapshot_dispatched)
+                .as_micros(),
+        );
+        push_bounded(
+            &mut self.presentation,
+            presented.duration_since(graphics_ready).as_micros(),
+        );
+    }
+}
+
+fn push_bounded(samples: &mut VecDeque<u128>, sample: u128) {
+    samples.push_back(sample);
+    if samples.len() > 4_096 {
+        samples.pop_front();
+    }
+}
+
+pub(crate) fn terminal_input_sequence(body: &[u8]) -> Option<u64> {
+    let encoded = <[u8; 8]>::try_from(body.get(1..9)?).ok()?;
+    (body.first() == Some(&b'I')).then(|| u64::from_le_bytes(encoded))
+}
+
+fn terminal_snapshot_input_sequence(body: &[u8]) -> Option<u64> {
+    if body.get(..4) != Some(b"BTRM") || body.get(4) != Some(&4) {
+        return None;
+    }
+    let encoded = <[u8; 8]>::try_from(body.get(14..22)?).ok()?;
+    Some(u64::from_le_bytes(encoded))
+}
+
+fn terminal_snapshot_completes_revision(body: &[u8]) -> bool {
+    let Some(chunk_index) = body
+        .get(37..39)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_le_bytes)
+    else {
+        return false;
+    };
+    let Some(chunk_count) = body
+        .get(39..41)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_le_bytes)
+    else {
+        return false;
+    };
+    chunk_count > 0 && chunk_index.saturating_add(1) == chunk_count
+}
 
 fn main() -> Result<()> {
     let args = ClientArgs::parse();
@@ -720,12 +895,63 @@ fn main() -> Result<()> {
             metrics.peak_text_layouts,
         );
     }
-    eprintln!(
-        "plugin input diagnostics {{\"key_to_present_samples\":{},\"last_key_to_present_us\":{},\"max_key_to_present_us\":{}}}",
+    let mut input_diagnostics = latency_summary(
+        &application.plugin_key_to_present_latencies,
         application.plugin_key_to_present_samples,
         application.plugin_last_key_to_present_us,
         application.plugin_max_key_to_present_us,
     );
+    let by_backend = serde_json::Value::Array(
+        application
+            .plugin_key_to_present_by_backend
+            .iter()
+            .map(|(backend, samples)| {
+                let stages = application.plugin_latency_stages_by_backend.get(backend);
+                serde_json::json!({
+                    "backend": backend.0,
+                    "latency": latency_summary(
+                        samples,
+                        samples.len() as u64,
+                        samples.back().copied().unwrap_or_default(),
+                        samples.iter().copied().max().unwrap_or_default(),
+                    ),
+                    "stages": {
+                        "input_to_transport_queue": stages
+                            .map(|stages| stage_summary(&stages.input_to_transport_queue))
+                            .unwrap_or_default(),
+                        "transport_send_queue": stages
+                            .map(|stages| stage_summary(&stages.transport_send_queue))
+                            .unwrap_or_default(),
+                        "remote_round_trip": stages
+                            .map(|stages| stage_summary(&stages.remote_round_trip))
+                            .unwrap_or_default(),
+                        "transport_round_trip": stages
+                            .map(|stages| stage_summary(&stages.transport_round_trip))
+                            .unwrap_or_default(),
+                        "client_dispatch": stages
+                            .map(|stages| stage_summary(&stages.client_dispatch))
+                            .unwrap_or_default(),
+                        "plugin_render": stages
+                            .map(|stages| stage_summary(&stages.plugin_render))
+                            .unwrap_or_default(),
+                        "presentation": stages
+                            .map(|stages| stage_summary(&stages.presentation))
+                            .unwrap_or_default(),
+                    },
+                    "traces": application
+                        .plugin_input_traces_by_backend
+                        .get(backend)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+            })
+            .collect(),
+    );
+    input_diagnostics
+        .as_object_mut()
+        .expect("latency summary must be a JSON object")
+        .insert("by_backend".to_string(), by_backend);
+    eprintln!("plugin input diagnostics {input_diagnostics}");
     let backend_shutdown_result = application
         .backend_commands
         .as_mut()
@@ -779,6 +1005,8 @@ enum ClientEvent {
     PluginGraphicsChanged {
         pane: u64,
         sequence: u64,
+        terminal_input_sequence: Option<u64>,
+        ready_at: Instant,
     },
     RendererFailed {
         generation: u64,
@@ -800,6 +1028,12 @@ enum ClientEvent {
     },
     SshBackendReady(SshBackendDeployment),
     SshBackendFailed(String),
+    RemoteTerminalInputSent {
+        backend: BackendId,
+        trace_sequence: u64,
+        queued_at: Instant,
+        sent_at: Instant,
+    },
     ActorHostMessagesReady,
     BackendActorMessage {
         backend: BackendId,
@@ -807,6 +1041,7 @@ enum ClientEvent {
         sender: String,
         recipient: String,
         body: Vec<u8>,
+        received_at: Instant,
     },
 }
 
@@ -1386,6 +1621,7 @@ fn spawn_actor_message_updates(
                                 sender: message.sender()?.to_string(),
                                 recipient: message.recipient()?.to_string(),
                                 body: message.body()?.to_vec(),
+                                received_at: Instant::now(),
                             },
                         )
                     })();
@@ -2156,11 +2392,14 @@ struct Application {
     root_layout_actor: Option<ActorIdentity>,
     layout_holders: BTreeMap<LayoutLeaseId, ActorIdentity>,
     layout_publications: BTreeMap<LayoutLeaseId, u64>,
-    pending_plugin_input: Option<Instant>,
-    pending_plugin_scene: bool,
+    pending_plugin_inputs: VecDeque<PendingPluginInput>,
     plugin_key_to_present_samples: u64,
     plugin_last_key_to_present_us: u128,
     plugin_max_key_to_present_us: u128,
+    plugin_key_to_present_latencies: VecDeque<u128>,
+    plugin_key_to_present_by_backend: BTreeMap<BackendId, VecDeque<u128>>,
+    plugin_latency_stages_by_backend: BTreeMap<BackendId, PluginLatencyStages>,
+    plugin_input_traces_by_backend: BTreeMap<BackendId, VecDeque<serde_json::Value>>,
     plugin_scroll_benchmark: Option<PluginScrollBenchmark>,
     plugin_scroll_auto_last_scene: Option<(u64, Instant)>,
 }
@@ -2831,6 +3070,11 @@ impl Application {
                     "SSH backend deployment event reached scene transport path"
                 ));
             }
+            ClientEvent::RemoteTerminalInputSent { .. } => {
+                return Err(anyhow!(
+                    "remote terminal timing event reached scene transport path"
+                ));
+            }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
             }
@@ -3455,11 +3699,25 @@ impl Application {
                 }
             }
             if !messages.is_empty() {
+                let actor_panes = runtime
+                    .pane_actor_ids()
+                    .map(|(pane, actor)| (actor.to_string(), pane))
+                    .collect::<HashMap<_, _>>();
                 let lane = self
                     .actor_message_sender
                     .as_mut()
                     .context("presentation actor requested a backend message without a backend")?;
                 for message in &messages {
+                    if let Some(trace_sequence) = terminal_input_sequence(&message.body)
+                        && let Some(pane) = actor_panes.get(&message.sender).copied()
+                        && let Some(input) = self.pending_plugin_inputs.iter_mut().find(|input| {
+                            input.pane == pane
+                                && input.backend == Some(message.backend)
+                                && input.trace_sequence.is_none()
+                        })
+                    {
+                        input.trace_sequence = Some(trace_sequence);
+                    }
                     if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
                         && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
                     {
@@ -3765,13 +4023,41 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                 }
             }
-            ClientEvent::PluginGraphicsChanged { pane, sequence } => {
+            ClientEvent::RemoteTerminalInputSent {
+                backend,
+                trace_sequence,
+                queued_at,
+                sent_at,
+            } => {
+                for input in &mut self.pending_plugin_inputs {
+                    if input.backend == Some(backend)
+                        && input.trace_sequence == Some(trace_sequence)
+                        && input.transport_sent.is_none()
+                    {
+                        input.transport_queued = Some(queued_at);
+                        input.transport_sent = Some(sent_at);
+                    }
+                }
+            }
+            ClientEvent::PluginGraphicsChanged {
+                pane,
+                sequence,
+                terminal_input_sequence,
+                ready_at,
+            } => {
                 let mut failure = None;
                 if let Some(renderer) = self.renderer.as_mut() {
                     match renderer.refresh_plugin_graphics(pane, sequence) {
                         Ok(change) => {
-                            if self.pending_plugin_input.is_some() {
-                                self.pending_plugin_scene = true;
+                            for input in &mut self.pending_plugin_inputs {
+                                if input.pane == pane
+                                    && input.snapshot_dispatched.is_some()
+                                    && input.trace_sequence.is_some()
+                                    && input.trace_sequence <= terminal_input_sequence
+                                {
+                                    input.graphics_ready = Some(ready_at);
+                                    input.ready = true;
+                                }
                             }
                             if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut()
                                 && benchmark.pane == pane
@@ -3984,8 +4270,43 @@ impl ApplicationHandler<ClientEvent> for Application {
                 sender,
                 recipient,
                 body,
+                received_at,
             } => {
                 self.backend_registry.observe(backend, None);
+                if body.starts_with(b"BTRM")
+                    && sender.starts_with("terminal-session")
+                    && let Some(pane) = self.wasm_runtime.as_ref().and_then(|runtime| {
+                        runtime
+                            .pane_actor_ids()
+                            .find_map(|(pane, actor)| (actor == recipient).then_some(pane))
+                    })
+                {
+                    let dispatched = Instant::now();
+                    let acknowledged = terminal_snapshot_completes_revision(&body)
+                        .then(|| terminal_snapshot_input_sequence(&body))
+                        .flatten();
+                    if let Some(acknowledged) = acknowledged
+                        && let Some(plugin_graphics) = self.plugin_graphics.as_ref()
+                        && let Err(error) =
+                            plugin_graphics.expect_terminal_snapshot(pane, acknowledged)
+                    {
+                        eprintln!(
+                            "could not correlate terminal snapshot with plugin graphics \
+                             pane={pane}: {error:#}"
+                        );
+                    }
+                    for input in &mut self.pending_plugin_inputs {
+                        if input.pane == pane
+                            && input.backend == Some(backend)
+                            && input.trace_sequence.is_some()
+                            && input.trace_sequence <= acknowledged
+                            && input.transport_received.is_none()
+                        {
+                            input.transport_received = Some(received_at);
+                            input.snapshot_dispatched = Some(dispatched);
+                        }
+                    }
+                }
                 if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
                     && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
                 {
@@ -4460,13 +4781,40 @@ impl ApplicationHandler<ClientEvent> for Application {
                         },
                     );
                     let delivered = sent.is_ok();
+                    let terminal_input = self.wasm_runtime.as_ref().is_some_and(|runtime| {
+                        runtime.pane_actor_ids().any(|(actor_pane, actor)| {
+                            actor_pane == pane && actor.starts_with("terminal-ui")
+                        })
+                    });
                     if let Err(error) = sent {
                         eprintln!("dropped plugin key event: {error:#}");
                     } else if event.state == ElementState::Pressed
-                        && self.pending_plugin_input.is_none()
+                        && event.text.as_ref().is_some_and(|text| !text.is_empty())
+                        && terminal_input
                     {
-                        self.pending_plugin_input = Some(Instant::now());
-                        self.pending_plugin_scene = false;
+                        self.pending_plugin_inputs.push_back(PendingPluginInput {
+                            pane,
+                            backend: renderer
+                                .plugin_pane_realms
+                                .get(&pane)
+                                .copied()
+                                .flatten()
+                                .map(|(backend, _session)| backend),
+                            trace_sequence: None,
+                            started: Instant::now(),
+                            started_unix_us: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_micros()),
+                            transport_queued: None,
+                            transport_sent: None,
+                            transport_received: None,
+                            snapshot_dispatched: None,
+                            graphics_ready: None,
+                            ready: false,
+                        });
+                        if self.pending_plugin_inputs.len() > 4_096 {
+                            self.pending_plugin_inputs.pop_front();
+                        }
                     }
                     if delivered
                         && event.state == ElementState::Pressed
@@ -4521,16 +4869,113 @@ impl ApplicationHandler<ClientEvent> for Application {
                         if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
                             benchmark.record_present(Instant::now(), timings);
                         }
-                        if self.pending_plugin_scene
-                            && let Some(started) = self.pending_plugin_input.take()
+                        let now = Instant::now();
+                        let mut completed_inputs = Vec::new();
+                        self.pending_plugin_inputs.retain(|input| {
+                            if input.ready {
+                                completed_inputs.push((
+                                    now.duration_since(input.started).as_micros(),
+                                    input.backend,
+                                    input.pane,
+                                    input.trace_sequence,
+                                    input.started,
+                                    input.started_unix_us,
+                                    input.transport_queued,
+                                    input.transport_sent,
+                                    input.transport_received,
+                                    input.snapshot_dispatched,
+                                    input.graphics_ready,
+                                ));
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        for (
+                            elapsed,
+                            backend,
+                            pane,
+                            trace_sequence,
+                            started,
+                            started_unix_us,
+                            transport_queued,
+                            transport_sent,
+                            transport_received,
+                            snapshot_dispatched,
+                            graphics_ready,
+                        ) in completed_inputs
                         {
-                            let elapsed = started.elapsed().as_micros();
                             self.plugin_key_to_present_samples =
                                 self.plugin_key_to_present_samples.saturating_add(1);
                             self.plugin_last_key_to_present_us = elapsed;
                             self.plugin_max_key_to_present_us =
                                 self.plugin_max_key_to_present_us.max(elapsed);
-                            self.pending_plugin_scene = false;
+                            self.plugin_key_to_present_latencies.push_back(elapsed);
+                            if self.plugin_key_to_present_latencies.len() > 4_096 {
+                                self.plugin_key_to_present_latencies.pop_front();
+                            }
+                            if let Some(backend) = backend {
+                                let samples = self
+                                    .plugin_key_to_present_by_backend
+                                    .entry(backend)
+                                    .or_default();
+                                push_bounded(samples, elapsed);
+                                if let (
+                                    Some(transport_received),
+                                    Some(snapshot_dispatched),
+                                    Some(graphics_ready),
+                                ) = (transport_received, snapshot_dispatched, graphics_ready)
+                                {
+                                    self.plugin_latency_stages_by_backend
+                                        .entry(backend)
+                                        .or_default()
+                                        .record(
+                                            started,
+                                            transport_queued,
+                                            transport_sent,
+                                            transport_received,
+                                            snapshot_dispatched,
+                                            graphics_ready,
+                                            now,
+                                        );
+                                    if let Some(trace_sequence) = trace_sequence
+                                        && let (Some(transport_queued), Some(transport_sent)) =
+                                            (transport_queued, transport_sent)
+                                    {
+                                        let traces = self
+                                            .plugin_input_traces_by_backend
+                                            .entry(backend)
+                                            .or_default();
+                                        traces.push_back(serde_json::json!({
+                                            "sequence": trace_sequence,
+                                            "pane": pane,
+                                            "started_unix_us": started_unix_us,
+                                            "total_us": elapsed,
+                                            "input_to_transport_queue_us": transport_queued
+                                                .duration_since(started)
+                                                .as_micros(),
+                                            "transport_send_queue_us": transport_sent
+                                                .duration_since(transport_queued)
+                                                .as_micros(),
+                                            "remote_round_trip_us": transport_received
+                                                .duration_since(transport_sent)
+                                                .as_micros(),
+                                            "client_dispatch_us": snapshot_dispatched
+                                                .duration_since(transport_received)
+                                                .as_micros(),
+                                            "plugin_render_us": graphics_ready
+                                                .duration_since(snapshot_dispatched)
+                                                .as_micros(),
+                                            "presentation_us": now
+                                                .duration_since(graphics_ready)
+                                                .as_micros(),
+                                        }));
+                                        if traces.len() > 4_096 {
+                                            traces.pop_front();
+                                        }
+                                    }
+                                }
+                            }
                         }
                         if reconfigure {
                             renderer.reconfigure();
@@ -7167,6 +7612,63 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 mod tests {
     use super::*;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    #[test]
+    fn latency_percentiles_use_nearest_rank_for_small_remote_samples() {
+        let samples = (1_u128..=14).collect::<VecDeque<_>>();
+        let summary = latency_summary(&samples, 14, 14, 14);
+        assert_eq!(summary.get("p50_key_to_present_us"), Some(&7.into()));
+        assert_eq!(summary.get("p95_key_to_present_us"), Some(&14.into()));
+        assert_eq!(summary.get("p99_key_to_present_us"), Some(&14.into()));
+    }
+
+    #[test]
+    fn terminal_trace_sequences_are_carried_by_input_and_snapshot_messages() {
+        let mut input = vec![b'I'];
+        input.extend_from_slice(&17_u64.to_le_bytes());
+        input.push(b'a');
+        assert_eq!(terminal_input_sequence(&input), Some(17));
+
+        let mut snapshot = vec![0_u8; 41];
+        snapshot[..4].copy_from_slice(b"BTRM");
+        snapshot[4] = 4;
+        snapshot[14..22].copy_from_slice(&17_u64.to_le_bytes());
+        snapshot[37..39].copy_from_slice(&1_u16.to_le_bytes());
+        snapshot[39..41].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(terminal_snapshot_input_sequence(&snapshot), Some(17));
+        assert!(terminal_snapshot_completes_revision(&snapshot));
+
+        snapshot[37..39].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(!terminal_snapshot_completes_revision(&snapshot));
+    }
+
+    #[test]
+    fn latency_stages_partition_one_key_to_present_sample() {
+        let started = Instant::now();
+        let queued = started + Duration::from_micros(1);
+        let sent = queued + Duration::from_micros(2);
+        let transport = sent + Duration::from_micros(5);
+        let snapshot = transport + Duration::from_micros(2);
+        let graphics = snapshot + Duration::from_micros(3);
+        let presented = graphics + Duration::from_micros(5);
+        let mut stages = PluginLatencyStages::default();
+        stages.record(
+            started,
+            Some(queued),
+            Some(sent),
+            transport,
+            snapshot,
+            graphics,
+            presented,
+        );
+        assert_eq!(stages.input_to_transport_queue, VecDeque::from([1]));
+        assert_eq!(stages.transport_send_queue, VecDeque::from([2]));
+        assert_eq!(stages.remote_round_trip, VecDeque::from([5]));
+        assert_eq!(stages.transport_round_trip, VecDeque::from([8]));
+        assert_eq!(stages.client_dispatch, VecDeque::from([2]));
+        assert_eq!(stages.plugin_render, VecDeque::from([3]));
+        assert_eq!(stages.presentation, VecDeque::from([5]));
+    }
 
     fn available(pane: u64, session: u64) -> AvailableWindow {
         AvailableWindow {

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{
         Arc, Mutex,
@@ -88,6 +88,7 @@ pub struct ImageResource {
 struct PaneScene {
     generation: u64,
     sequence: u64,
+    terminal_input_sequence: Option<u64>,
     packet: Packet,
 }
 
@@ -158,6 +159,7 @@ struct GraphicsState {
     next_sequence: u64,
     next_resource: u64,
     panes: BTreeMap<u64, PaneScene>,
+    pending_terminal_input_sequences: BTreeMap<u64, VecDeque<u64>>,
     images: BTreeMap<u64, ImageResource>,
     text_layouts: BTreeMap<u64, TextLayoutEntry>,
     accepted_packets: u64,
@@ -199,6 +201,19 @@ impl PluginGraphicsBridge {
             generation: AtomicU64::new(0),
             bridge: self.clone(),
         })
+    }
+
+    pub fn expect_terminal_snapshot(&self, pane: u64, input_sequence: u64) -> Result<()> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        state
+            .pending_terminal_input_sequences
+            .entry(pane)
+            .or_default()
+            .push_back(input_sequence);
+        Ok(())
     }
 
     pub fn snapshot(&self, pane: u64) -> Result<Option<GraphicsSnapshot>> {
@@ -317,15 +332,19 @@ fn finish_glyph_raster(
             return;
         }
         match referenced_resources(&state, request.pane, request.generation, &scene.packet) {
-            Ok(resources) if resources.ready => Some(scene.sequence),
+            Ok(resources) if resources.ready => {
+                Some((scene.sequence, scene.terminal_input_sequence))
+            }
             Ok(_) | Err(_) => None,
         }
     };
-    if let Some(sequence) = notification
+    if let Some((sequence, terminal_input_sequence)) = notification
         && proxy
             .send_event(ClientEvent::PluginGraphicsChanged {
                 pane: request.pane,
                 sequence,
+                terminal_input_sequence,
+                ready_at: Instant::now(),
             })
             .is_err()
     {
@@ -353,6 +372,7 @@ impl ActorPresentationHost {
             state
                 .text_layouts
                 .retain(|_, resource| resource.pane != self.pane);
+            state.pending_terminal_input_sequences.remove(&self.pane);
             state.text_layouts_dropped = state.text_layouts_dropped.saturating_add(
                 u64::try_from(previous_text_layouts.saturating_sub(state.text_layouts.len()))
                     .unwrap_or(u64::MAX),
@@ -379,6 +399,7 @@ impl Drop for ActorPresentationHost {
             state
                 .text_layouts
                 .retain(|_, resource| resource.pane != self.pane);
+            state.pending_terminal_input_sequences.remove(&self.pane);
             let removed = previous_text_layouts.saturating_sub(state.text_layouts.len());
             state.text_layouts_dropped = state
                 .text_layouts_dropped
@@ -422,7 +443,7 @@ impl PresentationHost for ActorPresentationHost {
         };
         crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
         let packet = candidate.packet;
-        let (sequence, previous, ready) = {
+        let (sequence, terminal_input_sequence, previous, ready) = {
             let mut state = self
                 .bridge
                 .shared
@@ -440,22 +461,32 @@ impl PresentationHost for ActorPresentationHost {
                 .checked_add(1)
                 .ok_or(PresentationError::LimitReached)?;
             let sequence = state.next_sequence;
+            let terminal_input_sequence = state
+                .pending_terminal_input_sequences
+                .get_mut(&pane)
+                .and_then(VecDeque::pop_front);
             let previous = state.panes.insert(
                 pane,
                 PaneScene {
                     generation: actor_generation,
                     sequence,
+                    terminal_input_sequence,
                     packet,
                 },
             );
             drop(state);
-            (sequence, previous, resources.ready)
+            (sequence, terminal_input_sequence, previous, resources.ready)
         };
         if ready
             && self
                 .bridge
                 .proxy
-                .send_event(ClientEvent::PluginGraphicsChanged { pane, sequence })
+                .send_event(ClientEvent::PluginGraphicsChanged {
+                    pane,
+                    sequence,
+                    terminal_input_sequence,
+                    ready_at: Instant::now(),
+                })
                 .is_err()
         {
             if let Ok(mut state) = self.bridge.shared.lock() {

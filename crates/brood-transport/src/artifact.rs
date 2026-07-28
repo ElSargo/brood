@@ -335,6 +335,40 @@ impl ArtifactExchange {
             .copied()
     }
 
+    /// Digest the advertised package catalogue, including every member path,
+    /// content digest, and root designation.
+    ///
+    /// Materialized package directories must use this identity rather than
+    /// only the init module digest. A sibling may change while the init module
+    /// remains byte-for-byte identical.
+    #[must_use]
+    pub fn package_digest(&self, package: &str) -> Option<ArtifactDigest> {
+        self.package_roots.get(package)?;
+        let mut members = self
+            .package_members
+            .iter()
+            .filter(|((member_package, _path), _digest)| member_package == package)
+            .map(|((_member_package, path), digest)| {
+                let root = self
+                    .available
+                    .get(digest)
+                    .and_then(|manifest| manifest.package.as_ref())
+                    .is_some_and(|member| member.root);
+                (path.as_str(), *digest, root)
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|(path, _, _)| *path);
+        let mut hasher = Sha256::new();
+        hasher.update((members.len() as u64).to_be_bytes());
+        for (path, digest, root) in members {
+            hasher.update((path.len() as u64).to_be_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(digest);
+            hasher.update([u8::from(root)]);
+        }
+        Some(hasher.finalize().into())
+    }
+
     fn handle_offer(&mut self, manifest: ArtifactManifest) -> Result<ArtifactExchangeUpdate> {
         if manifest.realm != self.accepted_realm {
             return Ok(rejection(
@@ -910,6 +944,54 @@ mod tests {
                 digest: child_digest
             }]
         );
+        drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn package_digest_changes_when_only_a_sibling_changes() {
+        let root = test_root("package-digest");
+        fs::create_dir_all(&root).unwrap_or_else(|error| unreachable!("{error}"));
+        let init_path = root.join("init.wasm");
+        let child_path = root.join("child.wasm");
+        fs::write(&init_path, b"\0asm unchanged init")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        fs::write(&child_path, b"\0asm child one").unwrap_or_else(|error| unreachable!("{error}"));
+
+        let catalogue_digest = || {
+            let offers = package_offers(
+                &format!("workspace={}", init_path.display()),
+                ArtifactRealm::Session,
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+            let sender = ArtifactExchange::new(
+                ArtifactRealm::Client,
+                Vec::<String>::new(),
+                root.join("sender-cache"),
+                offers,
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"));
+            let mut receiver = ArtifactExchange::new(
+                ArtifactRealm::Session,
+                Vec::<String>::new(),
+                root.join("receiver-cache"),
+                Vec::new(),
+            )
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .with_allowed_packages(["workspace".to_string()]);
+            for message in sender.initial_messages() {
+                receiver
+                    .handle(message)
+                    .unwrap_or_else(|error| unreachable!("{error}"));
+            }
+            receiver
+                .package_digest("workspace")
+                .unwrap_or_else(|| unreachable!("package was not catalogued"))
+        };
+
+        let first = catalogue_digest();
+        fs::write(&child_path, b"\0asm child two").unwrap_or_else(|error| unreachable!("{error}"));
+        let second = catalogue_digest();
+        assert_ne!(first, second);
         drop(fs::remove_dir_all(root));
     }
 

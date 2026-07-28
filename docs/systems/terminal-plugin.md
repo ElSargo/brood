@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-26
+last-reviewed: 2026-07-28
 ---
 
 # First-Party Terminal Plugin
@@ -26,11 +26,14 @@ matching `terminal-ui-N` only after the session actor reports ready. The new UI
 uses the general deferred pane-focus command while recursive layout catches up;
 the key policy does not spawn the process itself.
 
-PTY output is parsed in a session worker. The worker drains a short bounded
-burst and signals a changed generation. The actor publishes a chunked complete
-snapshot revision rather than converting each native read into a mailbox
-message. The presentation actor assembles one revision atomically and
-supersedes stale render work.
+PTY output is parsed in a session worker. The first output after terminal input
+is published without a batching delay; autonomous and sustained output drains a
+short bounded burst before signaling a changed generation. The actor publishes
+a chunked complete bootstrap followed by changed-row revisions rather than
+converting each native read into a mailbox message or repeatedly transporting
+an unchanged grid. The presentation actor assembles one revision atomically,
+applies deltas only to a compatible complete state, and supersedes stale render
+work.
 
 The PTY shell receives the same host-controlled nested display, surface-session
 identity, control identity, and isolated session bus as other managed backend
@@ -74,13 +77,18 @@ guest viewport without writing to the PTY. Any ordinary terminal input returns
 to the live bottom. The session actor retains scrollback and supplies only the
 requested visible rows.
 
-Rendering groups adjacent cells into guest-owned styled runs. The actor requests
-monospace native layouts with stable cell metrics, caches a bounded recent set
-of styled runs, draws backgrounds and decorations with normal canvas commands,
-and evicts least-recently-used inactive handles after replacing the packet. The
-client sees immutable text resources and drawing commands, never terminal
-cells. Snapshot, packet, cache-reuse, and eviction counts expose coalescing and
-churn directly; host presentation diagnostics supply key-to-present latency.
+Rendering groups adjacent cells into guest-owned styled runs. Static rows use
+run layouts, while the active cursor row uses reusable glyph-cluster layouts so
+each echoed character does not synchronously relayout the growing line. The
+actor requests monospace native layouts with stable cell metrics, caches a
+bounded recent set, draws backgrounds and decorations with normal canvas
+commands, and evicts least-recently-used inactive handles after replacing the
+packet. The client sees immutable text resources and drawing commands, never
+terminal cells. Snapshot byte, changed-row, full-bootstrap, packet,
+cache-reuse, and eviction counts expose transport volume, coalescing, and churn
+directly. Host presentation diagnostics report every covered terminal input,
+attributed by backend, with tail percentiles and standard deviation rather than
+only an easily misinterpreted maximum.
 
 ## Lifecycle
 

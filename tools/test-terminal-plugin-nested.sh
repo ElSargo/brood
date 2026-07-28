@@ -1023,6 +1023,10 @@ jq -n \
     render_pressure: {
       snapshots_received: $terminal.snapshots_received,
       snapshots_coalesced: $terminal.snapshots_coalesced,
+      snapshot_chunks_received: $terminal.snapshot_chunks_received,
+      snapshot_bytes_received: $terminal.snapshot_bytes_received,
+      snapshot_rows_received: $terminal.snapshot_rows_received,
+      full_snapshots_received: $terminal.full_snapshots_received,
       packets: $terminal.packets_total,
       cached_layouts: $terminal.layout_cache_entries,
       layouts_created: $terminal.layouts_created_total,

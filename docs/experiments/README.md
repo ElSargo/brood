@@ -20,3 +20,7 @@ Active experiments:
 
 - [[coding-agent-actors]] — independently addressed coding agents with a
   separate subscribing presentation UI.
+- [[network-carrier-latency]] — concurrent QUIC stream, QUIC DATAGRAM, and raw
+  UDP latency comparison.
+- [[terminal-latency-spike-profile]] — sequence-correlated remote terminal
+  latency attribution under interactive and burst input.
