@@ -3,6 +3,7 @@
 let
   lib = pkgs.lib;
   profiles = import ./profiles.nix { inherit pkgs; };
+  neovimWasm = import ./neovim-wasm.nix { inherit pkgs; };
   sourceRoot = toString ../.;
 
   appToolPath = lib.makeBinPath profiles.appTools;
@@ -62,6 +63,8 @@ let
         "${src}/plugins/coding-agent/Cargo.lock"
         "${src}/plugins/default-workspace/Cargo.lock"
         "${src}/plugins/diff-viewer/Cargo.lock"
+        "${src}/plugins/neovim-client/Cargo.lock"
+        "${src}/plugins/neovim-files/Cargo.lock"
         "${src}/plugins/picker/Cargo.lock"
         "${src}/plugins/session-switcher/Cargo.lock"
         "${src}/plugins/worktree-manager/Cargo.lock"
@@ -271,6 +274,36 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/neovim-files/Cargo.toml ]]; then
+        component_core="plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.wasm"
+        component_output="plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR Neovim backend file actor core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+        install -D "$component_output" \
+          examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.component.wasm
+      fi
+
+      if [[ -f plugins/neovim-client/Cargo.toml ]]; then
+        component_core="plugins/neovim-client/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.wasm"
+        component_output="plugins/neovim-client/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR Neovim presentation actor core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+        install -D "$component_output" \
+          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.component.wasm
+      fi
+
       component_core="plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm"
       component_output="plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.component.wasm"
       if [[ ! -s "$component_core" ]]; then
@@ -420,6 +453,12 @@ let
         if [[ "$wasm" == "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm" ]]; then
           continue
         fi
+        if [[ "$wasm" == "plugins/neovim-client/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.wasm" ]]; then
+          continue
+        fi
         if [[ "$wasm" == "plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.wasm" ]]; then
           continue
         fi
@@ -474,18 +513,21 @@ let
       exit 2
     fi
 
-    install -D -m 0444 ${../plugins/neovim/init.lua} \
-      "$out/plugins/neovim/init.lua"
-    install -D -m 0444 ${../plugins/neovim/README.md} \
-      "$out/plugins/neovim/README.md"
+    # The editor runtime belongs to the local client package only. Keep it
+    # outside wasmModules so consumers of a single backend component (notably
+    # the SSH bundle) do not inherit Node or the client-side Neovim runtime.
+    session_switcher_root="$out/plugins/session-switcher/target/wasm32-unknown-unknown/release"
+    chmod -R u+w "$out/plugins/session-switcher"
+    runtime_dir="$session_switcher_root/share/brood/neovim-wasm"
+    mkdir -p "$runtime_dir"
+    cp -R ${neovimWasm}/share/brood/neovim-wasm/. "$runtime_dir/"
+
   '';
 
   brood = pkgs.symlinkJoin {
     name = "brood";
     paths = [
       broodd
-      profiles.broodNvim
-      pkgs.neovim
       runtimeFiles
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -523,7 +565,6 @@ let
           "$out/bin" \
           "$out/lib" \
           "$out/libexec" \
-          "$out/plugins/neovim" \
           "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release"
         for program in brood brood-remote brood-sessiond brood-runner-exec; do
           cp ${broodd}/bin/"$program" "$out/bin/$program"
@@ -533,91 +574,6 @@ let
             --remove-rpath \
             "$out/bin/$program"
         done
-
-        install -m 0755 ${pkgs.neovim-unwrapped}/bin/nvim "$out/libexec/nvim"
-        cp -R ${pkgs.neovim-unwrapped}/share "$out/share"
-        chmod u+w "$out/share"
-        cp -R ${pkgs.luajit}/share/lua "$out/share/lua"
-        cp -RL ${pkgs.neovim-unwrapped}/lib/nvim "$out/lib/nvim"
-        chmod -R u+w "$out/lib/nvim"
-
-        mapfile -t nvim_dependencies < <(
-          {
-            ${pkgs.glibc.bin}/bin/ldd "$out/libexec/nvim"
-            find "$out/lib/nvim/parser" -type f -name '*.so' \
-              -exec ${pkgs.glibc.bin}/bin/ldd {} +
-          } \
-            | awk '
-                /=> \/nix\/store\// { print $3 }
-                /^[[:space:]]*\/nix\/store\// && $1 !~ /:$/ { print $1 }
-              ' \
-            | sort -u
-        )
-        for dependency in "''${nvim_dependencies[@]}"; do
-          library="$(basename "$dependency")"
-          case "$library" in
-            ld-linux-*.so.*|libc.so.*|libdl.so.*|libm.so.*|libpthread.so.*|librt.so.*|libutil.so.*)
-              continue
-              ;;
-          esac
-          install -m 0755 "$dependency" "$out/lib/$library"
-        done
-
-        patchelf \
-          --set-interpreter ${lib.escapeShellArg dynamicLinker} \
-          --set-rpath '$ORIGIN/../lib' \
-          "$out/libexec/nvim"
-        for object in "$out/libexec/nvim" "$out/lib/"*.so*; do
-          while IFS= read -r dependency; do
-            case "$dependency" in
-              /nix/store/*)
-                patchelf \
-                  --replace-needed "$dependency" "$(basename "$dependency")" \
-                  "$object"
-                ;;
-            esac
-          done < <(patchelf --print-needed "$object")
-          if [[ "$object" != "$out/libexec/nvim" ]]; then
-            patchelf --set-rpath '$ORIGIN' "$object"
-          fi
-        done
-        while IFS= read -r -d "" parser; do
-          patchelf --set-rpath '$ORIGIN/../..' "$parser"
-        done < <(find "$out/lib/nvim/parser" -type f -name '*.so' -print0)
-
-        install -m 0444 ${../plugins/neovim/init.lua} \
-          "$out/plugins/neovim/init.lua"
-        cat >"$out/bin/nvim" <<'EOF'
-        #!/bin/sh
-        set -eu
-        case "$0" in
-          */*) script_dir=''${0%/*} ;;
-          *) script_dir=. ;;
-        esac
-        root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
-        export VIMRUNTIME="$root/share/nvim/runtime"
-        export LUA_PATH="$root/share/lua/5.1/?.lua;$root/share/lua/5.1/?/init.lua;''${LUA_PATH:-;}"
-        export LUA_CPATH="$root/lib/?.so;''${LUA_CPATH:-;}"
-        exec "$root/libexec/nvim" \
-          --cmd "set runtimepath^=$root/lib/nvim" \
-          "$@"
-        EOF
-        chmod 0755 "$out/bin/nvim"
-
-        cat >"$out/bin/brood-nvim" <<'EOF'
-        #!/bin/sh
-        set -eu
-        umask 077
-        case "$0" in
-          */*) script_dir=''${0%/*} ;;
-          *) script_dir=. ;;
-        esac
-        root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
-        exec "$root/bin/nvim" \
-          --cmd "luafile $root/plugins/neovim/init.lua" \
-          "$@"
-        EOF
-        chmod 0755 "$out/bin/brood-nvim"
 
         install -m 0755 ${../tools/brood-ssh-backend-session.sh} \
           "$out/libexec/brood-ssh-backend-session"
@@ -1109,7 +1065,7 @@ let
 in
 {
   default = broodWithDesktop;
-  "brood-nvim" = profiles.broodNvim;
+  "neovim-wasm" = neovimWasm;
   "dev-workflow" = devWorkflowWithRuntime;
   "dev-workflow-full" = devWorkflowFullWithRuntime;
   "dev-env" = devEnv;
@@ -1125,7 +1081,6 @@ in
   "wasm-modules" = wasmModules;
   "wasm-examples" = wasmModules;
   inherit formatter linter;
-  broodNvim = profiles.broodNvim;
 
   inherit
     cargoArtifacts
@@ -1136,6 +1091,7 @@ in
     ciTools
     primeCargoTarget
     localCi
+    neovimWasm
     devWorkflow
     devWorkflowFullWithRuntime
     devWorkflowWithRuntime

@@ -33,11 +33,11 @@ Nix store. The backend runs directly against the target's normal Linux ABI and
 user namespace rather than a bundle sandbox, so normal host paths such as
 `/bin/bash` remain visible.
 
-The portable backend also carries Neovim, its runtime, and `brood-nvim`. Its
-launcher puts the deployed backend `bin` directory first on `PATH`, so the
-session editor actor resolves the packaged editor even when the remote host has
-no Neovim installation. The wrapper retains the remote user's normal Neovim
-configuration and loads the Brood bridge in addition to it.
+The portable backend does not carry or execute Neovim. The local presentation
+package carries the Wasm Neovim runtime and loads the local user's
+configuration. The session package sent to the remote backend contains only
+the bounded `neovim-files` actor; edits cross the authenticated actor-message
+lane as revisioned file snapshots and atomic replacements.
 
 QUIC uses UDP and therefore does not travel through OpenSSH's TCP forwarding.
 The relay exposes one mutually authenticated UDP port. By default the local

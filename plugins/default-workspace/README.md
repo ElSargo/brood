@@ -38,8 +38,8 @@ The normal config selects this provider for the presentation client. Its
 always-available workspace chords are `Ctrl+Alt+M` for the session-switcher
 pane, `Ctrl+Alt+P` for the session picker, `Ctrl+Alt+A` for the current
 session's agent picker, `Ctrl+Alt+D` for that session's project diff,
-`Ctrl+Alt+T` for a fresh first-party terminal, `Ctrl+Alt+E` for the persistent
-session Neovim editor, and `Ctrl+Alt+Q` to close the focused pane. `Ctrl+J` /
+`Ctrl+Alt+T` for a fresh first-party terminal, `Ctrl+Alt+E` for the
+client-local Wasm Neovim editor, and `Ctrl+Alt+Q` to close the focused pane. `Ctrl+J` /
 `Ctrl+K` cycle managed-window focus, and `Ctrl+O` opens a new `foot` window.
 Product chords emit ordinary action messages to their owning actors; the policy
 does not spawn processes or toggle client-owned pane state. The repository

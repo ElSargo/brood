@@ -23,11 +23,12 @@ artifacts.
 
 `brood test editor --out-dir DIR` builds the packaged editor integration and
 runs it on a private session bus with an external client under headless Sway.
-The proof opens the editor through the real Ctrl+Alt+E binding, edits and writes
-a fixture with Neovim input, opens another file through an addressed actor
-message, and exercises editor-to-diff-viewer, editor-to-terminal, and
-editor-to-agent routes. It retains screenshots, logs, written fixtures, and
-structured metrics in `DIR`.
+The proof opens the editor through the real Ctrl+Alt+E binding, confirms that
+the local Wasm runtime loaded a host Neovim config marker, edits and remotely
+writes a fixture with modal Neovim input, opens another file through an actor
+message, round-trips a file spanning more than 64 runner chunks, and exercises
+editor-to-diff-terminal, editor-to-terminal, and editor-to-agent routes. It
+retains screenshots, logs, written fixtures, and structured metrics in `DIR`.
 
 `software-e2e-capture.sh` runs the external WGPU client with real Wayland
 workloads and retains initial and reconnected client frames:

@@ -24,6 +24,7 @@ wasmtime-wasi.workspace = true
 wiggle.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 wit-component = "0.251.0"
 
 [lints.rust]

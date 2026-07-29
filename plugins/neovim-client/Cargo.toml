@@ -1,0 +1,22 @@
+[package]
+name = "brood-neovim-client-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brood-graphics = { path = "../../crates/brood-graphics" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+unicode-width = "0.2.2"
+wit-bindgen = "0.57.1"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[workspace]

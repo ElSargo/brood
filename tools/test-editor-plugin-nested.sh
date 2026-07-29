@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# The editor proof owns its bus and compositor. Never attach its service,
-# Neovim instance, or presentation client to the caller's desktop session.
+# The editor proof owns its bus and compositor. Never attach its backend,
+# presentation client, or local Neovim runtime to the caller's desktop.
 if [[ "${BROOD_EDITOR_PRIVATE_DBUS:-0}" != 1 ]]; then
   exec env \
     -u brood_session \
@@ -16,7 +16,7 @@ if [[ "${BROOD_EDITOR_PRIVATE_DBUS:-0}" != 1 ]]; then
     dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cc git grim jq magick nix pkg-config python3 rg sway wtype; do
+for tool in cc git grim jq magick nix pkg-config ps python3 rg sway wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the editor plugin proof" >&2
     exit 2
@@ -36,10 +36,33 @@ CONFIG_HOME="$OUT/config"
 DBUS_DESTINATION="org.brood.EditorTest.p$BASHPID"
 EDIT_FILE="$WORKSPACE/tracked.txt"
 INBOUND_FILE="$WORKSPACE/inbound.txt"
+LARGE_FILE="$WORKSPACE/large.txt"
 TERMINAL_MARKER="$WORKSPACE/terminal-command-routed"
-ACTIONS_FILE="$WORKSPACE/editor-actions.vim"
-mkdir -p "$OUT" "$DATA_HOME" "$CONFIG_HOME"
+HOST_CONFIG_MARKER="brood-host-config-$BASHPID"
+HOST_PLUGIN_LINE="BROOD_HOST_LUA_PLUGIN_LOADED_$BASHPID"
+HOST_CONFIG_DIR="$CONFIG_HOME/nvim"
+HOST_PLUGIN_DIR="$HOST_CONFIG_DIR/lua/brood_test_plugin"
+mkdir -p "$OUT" "$DATA_HOME" "$HOST_PLUGIN_DIR"
 chmod 700 "$RUNTIME_DIR"
+
+# This is the client's host Neovim configuration. A unique user command is
+# defined in a pure-Lua plugin under XDG_CONFIG_HOME/nvim/lua, so bytes written
+# by that command prove that the local Wasm Neovim loaded host configuration
+# and plugin code. A log line or package-presence assertion alone would not
+# prove this.
+printf '%s\n' \
+  'local M = {}' \
+  'function M.install()' \
+  '  vim.api.nvim_create_user_command("BroodHostPluginProof", function()' \
+  "    vim.api.nvim_put({ \"$HOST_PLUGIN_LINE\" }, \"l\", true, true)" \
+  '  end, { desc = "Brood host Lua plugin proof" })' \
+  'end' \
+  'return M' \
+  > "$HOST_PLUGIN_DIR/init.lua"
+printf '%s\n' \
+  "vim.g.brood_config_marker = \"$HOST_CONFIG_MARKER:\" .. (type(vim.brood) == \"table\" and \"bridge\" or \"no-bridge\")" \
+  'require("brood_test_plugin").install()' \
+  > "$HOST_CONFIG_DIR/init.lua"
 
 git -C "$WORKSPACE" init --quiet
 printf '%s\n' \
@@ -50,16 +73,20 @@ printf '%s\n' \
   'second inbound line' \
   'third inbound line' \
   > "$INBOUND_FILE"
-git -C "$WORKSPACE" add tracked.txt inbound.txt
+python3 - "$LARGE_FILE" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("w", encoding="utf-8", newline="\n") as output:
+    for index in range(1400):
+        output.write(f"stream-{index:04d} {'x' * 72}\n")
+PY
+git -C "$WORKSPACE" add tracked.txt inbound.txt large.txt
 git -C "$WORKSPACE" \
   -c user.name=Brood \
   -c user.email=brood@example.invalid \
   commit --quiet -m baseline
-printf '%s\n' \
-  "BroodTerminal touch $TERMINAL_MARKER" \
-  'BroodDiff' \
-  'BroodAgent Reply with editor-route-ready only; do not run tools or change files' \
-  > "$ACTIONS_FILE"
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -76,14 +103,17 @@ cleanup() {
   mkdir -p "$OUT/fixtures"
   [[ -f "$EDIT_FILE" ]] && cp "$EDIT_FILE" "$OUT/fixtures/tracked.txt"
   [[ -f "$INBOUND_FILE" ]] && cp "$INBOUND_FILE" "$OUT/fixtures/inbound.txt"
-  [[ -f "$ACTIONS_FILE" ]] && cp "$ACTIONS_FILE" "$OUT/fixtures/editor-actions.vim"
-  [[ -f "$TERMINAL_MARKER" ]] && cp "$TERMINAL_MARKER" "$OUT/fixtures/terminal-command-routed"
+  [[ -f "$LARGE_FILE" ]] && cp "$LARGE_FILE" "$OUT/fixtures/large.txt"
+  [[ -f "$TERMINAL_MARKER" ]] \
+    && cp "$TERMINAL_MARKER" "$OUT/fixtures/terminal-command-routed"
+  [[ -d "$HOST_CONFIG_DIR" && ! -e "$OUT/fixtures/host-nvim-config" ]] \
+    && cp -R "$HOST_CONFIG_DIR" "$OUT/fixtures/host-nvim-config"
   rm -rf -- "$RUNTIME_DIR" "$WORKSPACE"
   if ((result != 0)); then
     echo "client_log=$CLIENT_LOG" >&2
-    [[ -f "$CLIENT_LOG" ]] && tail -n 220 "$CLIENT_LOG" >&2
+    [[ -f "$CLIENT_LOG" ]] && tail -n 260 "$CLIENT_LOG" >&2
     echo "server_log=$SERVER_LOG" >&2
-    [[ -f "$SERVER_LOG" ]] && tail -n 180 "$SERVER_LOG" >&2
+    [[ -f "$SERVER_LOG" ]] && tail -n 220 "$SERVER_LOG" >&2
     echo "compositor_log=$COMPOSITOR_LOG" >&2
     [[ -f "$COMPOSITOR_LOG" ]] && tail -n 100 "$COMPOSITOR_LOG" >&2
   fi
@@ -101,9 +131,19 @@ fi
 [[ -x "$PACKAGE/bin/brood" ]]
 [[ -x "$PACKAGE/bin/brood-client" ]]
 [[ -x "$PACKAGE/bin/brood-sessiond" ]]
-[[ -x "$PACKAGE/bin/brood-nvim" ]]
-[[ -x "$PACKAGE/bin/nvim" ]]
 [[ -s "$PACKAGE/brood.toml" ]]
+
+CLIENT_RELEASE="$PACKAGE/plugins/session-switcher/target/wasm32-unknown-unknown/release"
+FILES_RELEASE="$PACKAGE/examples/wasm-init-actor/target/wasm32-unknown-unknown/release"
+CLIENT_COMPONENT="$CLIENT_RELEASE/brood_neovim_client_plugin.component.wasm"
+FILES_COMPONENT="$FILES_RELEASE/brood_neovim_files_plugin.component.wasm"
+CLIENT_RELEASE_REAL="$(dirname "$(readlink -f "$CLIENT_COMPONENT")")"
+WASM_RUNTIME="$CLIENT_RELEASE/share/brood/neovim-wasm"
+[[ -s "$CLIENT_COMPONENT" ]]
+[[ -s "$FILES_COMPONENT" ]]
+for artifact in runner.mjs brood.lua nvim.js nvim.wasm nvim.data; do
+  [[ -s "$WASM_RUNTIME/$artifact" ]]
+done
 
 read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
 cc \
@@ -210,6 +250,7 @@ env \
   XDG_CONFIG_HOME="$CONFIG_HOME" \
   WGPU_BACKEND=vulkan \
   BROOD_DMABUF_HAPPY_PATH=1 \
+  BROOD_TRACE_PLUGIN_GRAPHICS=1 \
   BROOD_TRACE_PLUGIN_INPUT=1 \
   BROOD_TRACE_PLUGIN_WORKERS=1 \
   RUST_LOG="$RUST_LOG" \
@@ -234,51 +275,6 @@ done
 rg -q 'started presentation WASM actor id=terminal-ui' "$CLIENT_LOG"
 rg -q 'accepted plugin draw packet' "$CLIENT_LOG"
 
-# Linux evdev key 18 is E. The helper adds Ctrl+Alt, and the presentation key
-# policy sees XKB keycode 26, exactly as it would from a physical keyboard.
-wayland_env "$OUT/virtual-keyboard-key" 18
-
-EDITOR_UI=""
-EDITOR_ACTOR=""
-EDITOR_METRIC=""
-for _ in {1..600}; do
-  EDITOR_UI="$(
-    sed -n \
-      's/.*started presentation WASM actor id=\(neovim-ui[^ ]*\).*/\1/p' \
-      "$CLIENT_LOG" \
-      | tail -1
-  )"
-  EDITOR_ACTOR="$(
-    ctl actors list 2> /dev/null \
-      | sed -n 's/^actor id=\([^ ]*neovim-session\) .*/\1/p' \
-      | head -1
-  )"
-  if [[ -n "$EDITOR_UI" ]]; then
-    EDITOR_METRIC="$(
-      sed -n \
-        "s/^presentation plugin worker metrics actor=${EDITOR_UI} //p" \
-        "$CLIENT_LOG" \
-        | tail -1
-    )"
-  fi
-  if [[ -n "$EDITOR_UI" && -n "$EDITOR_ACTOR" && -n "$EDITOR_METRIC" ]] \
-    && jq -e '.pty_bytes > 100 and .packets_total > 0' \
-      <<< "$EDITOR_METRIC" > /dev/null; then
-    break
-  fi
-  kill -0 "$CLIENT_PID" 2> /dev/null || {
-    echo "ERR presentation client exited before Neovim rendered" >&2
-    exit 1
-  }
-  sleep 0.05
-done
-[[ "$EDITOR_UI" == neovim-ui-* ]]
-[[ "$EDITOR_ACTOR" == *neovim-session ]]
-jq -e '.pty_bytes > 100 and .packets_total > 0' \
-  <<< "$EDITOR_METRIC" > /dev/null
-rg -q 'sent key-policy actor message actor=brood.client-init' "$CLIENT_LOG"
-ctl actors list > "$OUT/actors-editor-created.txt"
-
 capture() {
   wayland_env grim "$1"
   [[ -s "$1" ]]
@@ -288,138 +284,581 @@ press_plain_key() {
   wayland_env "$OUT/virtual-keyboard-key" --none "$1"
 }
 
+press_editor_shortcut() {
+  # Linux evdev key 18 is E. The helper adds Ctrl+Alt, and the presentation
+  # key policy sees the same event sequence as a physical keyboard.
+  wayland_env "$OUT/virtual-keyboard-key" 18
+}
+
+focus_editor() {
+  local before
+  local after
+  before="$(
+    rg -c "focused local plugin pane=$EDITOR_PANE" "$CLIENT_LOG" 2> /dev/null \
+      || true
+  )"
+  before="${before:-0}"
+  press_editor_shortcut
+  for _ in {1..200}; do
+    after="$(
+      rg -c "focused local plugin pane=$EDITOR_PANE" "$CLIENT_LOG" 2> /dev/null \
+        || true
+    )"
+    after="${after:-0}"
+    ((after > before)) && return
+    sleep 0.05
+  done
+  echo "ERR editor pane did not regain focus" >&2
+  return 1
+}
+
 nvim_command() {
   wayland_env wtype -s 5 ":$1" -s 20 -k Return
 }
 
-sleep 0.4
-capture "$OUT/editor-created.png"
+count_route_kind() {
+  local sender=$1
+  local recipient=$2
+  local kind=$3
+  local file=$4
+  local count
+  count="$(
+    rg -c \
+      "sender=$sender recipient=$recipient body=.*\"kind\":\"$kind\"" \
+      "$file" \
+      2> /dev/null \
+      || true
+  )"
+  printf '%s\n' "${count:-0}"
+}
 
-# Open a tracked fixture, then use ordinary Normal/Insert mode keys and :write.
-nvim_command "edit $EDIT_FILE"
-sleep 0.3
-wayland_env wtype -s 5 'GoBROOD_EDITOR_REAL_KEYS'
-press_plain_key 1
-nvim_command write
-for _ in {1..300}; do
-  [[ "$(tail -n 1 "$EDIT_FILE")" == 'BROOD_EDITOR_REAL_KEYS' ]] && break
-  sleep 0.05
-done
-[[ "$(tail -n 1 "$EDIT_FILE")" == 'BROOD_EDITOR_REAL_KEYS' ]]
-capture "$OUT/editor-edited.png"
+route_has_kind() {
+  local sender=$1
+  local recipient=$2
+  local kind=$3
+  local file=$4
+  rg -q \
+    "sender=$sender recipient=$recipient body=.*\"kind\":\"$kind\"" \
+    "$file"
+}
 
-# Address the durable session actor through the public actor control surface.
-# Wait for its remote-control worker rather than a PTY redraw: opening a buffer
-# may be visually equivalent and therefore emit no new terminal bytes. The
-# requested line/column is then proved by an actual Normal-mode append.
-INBOUND_BODY="$(
-  jq -cn \
-    --arg path "$INBOUND_FILE" \
-    '{kind:"editor-open", path:$path, line:2, column:3}'
-)"
-EDITOR_OPEN_WORKER_PATTERN='component actor worker finished actor=.*neovim-session worker=([3-9]|[1-9][0-9]+)$'
-EDITOR_OPEN_WORKERS_BEFORE="$(rg -c "$EDITOR_OPEN_WORKER_PATTERN" "$SERVER_LOG" || true)"
-ctl actors send "$EDITOR_ACTOR" "$INBOUND_BODY" \
-  | tee "$OUT/editor-open-send.txt"
-rg -q 'queued=true' "$OUT/editor-open-send.txt"
+local_open_completed() {
+  local sender=$1
+  local path=$2
+  local file=$3
+  rg -a -F \
+    "presentation local actor message sender=$sender recipient=brood.client-init body=" \
+    "$file" \
+    | rg -F '"kind":"editor-opened"' \
+    | rg -F -q "\"path\":\"$path\""
+}
 
-for _ in {1..400}; do
-  EDITOR_OPEN_WORKERS_AFTER="$(rg -c "$EDITOR_OPEN_WORKER_PATTERN" "$SERVER_LOG" || true)"
-  ((EDITOR_OPEN_WORKERS_AFTER > EDITOR_OPEN_WORKERS_BEFORE)) && break
-  sleep 0.05
-done
-((EDITOR_OPEN_WORKERS_AFTER > EDITOR_OPEN_WORKERS_BEFORE))
-sleep 0.3
-wayland_env wtype -s 5 'a__BROOD_INBOUND__'
-press_plain_key 1
-nvim_command write
-for _ in {1..300}; do
-  [[ "$(sed -n '2p' "$INBOUND_FILE")" == 'sec__BROOD_INBOUND__ond inbound line' ]] && break
-  sleep 0.05
-done
-[[ "$(sed -n '2p' "$INBOUND_FILE")" == 'sec__BROOD_INBOUND__ond inbound line' ]]
-capture "$OUT/editor-inbound-open.png"
-ctl actors list > "$OUT/actors-after-inbound.txt"
+actor_pane() {
+  local actor=$1
+  local file=$2
+  sed -n \
+    "s/.*started presentation WASM actor id=$actor kind=[^ ]* generation=[^ ]* pane=\\([0-9][0-9]*\\) .*/\\1/p" \
+    "$file" \
+    | tail -1
+}
 
-# Source all product commands in one Neovim turn so the asynchronous pane
-# creations cannot steal focus between them.
-nvim_command "source $ACTIONS_FILE"
-for _ in {1..600}; do
-  if [[ -f "$TERMINAL_MARKER" ]] \
-    && rg -q \
-      'backend actor message .*sender=.*neovim-session .*recipient=brood.client-init .*body=.*"action":"terminal"' \
+draw_sequence() {
+  local pane=$1
+  local file=$2
+  local sequence
+  sequence="$(
+    sed -n \
+      "s/.*accepted plugin draw packet pane=$pane sequence=\\([0-9][0-9]*\\) .*/\\1/p" \
+      "$file" \
+      | tail -1
+  )"
+  printf '%s\n' "${sequence:-0}"
+}
+
+terminal_snapshot_rendered() {
+  local actor=$1
+  local pane=$2
+  local file=$3
+  awk \
+    -v start="recipient=$actor terminal_snapshot_bytes=" \
+    -v draw="accepted plugin draw packet pane=$pane " \
+    '
+      index($0, start) { snapshot = 1 }
+      snapshot && index($0, draw) { found = 1; exit }
+      END { exit !found }
+    ' \
+    "$file"
+}
+
+actor_list() {
+  ctl actors list 2> /dev/null
+}
+
+DRAW_PACKETS_BEFORE="$(rg -c 'accepted plugin draw packet' "$CLIENT_LOG" || true)"
+press_editor_shortcut
+
+EDITOR_UI=""
+EDITOR_PANE=""
+EDITOR_FILES_ACTOR=""
+SESSION_INIT_ACTOR=""
+for _ in {1..1200}; do
+  EDITOR_UI="$(
+    sed -n \
+      's/.*started presentation WASM actor id=\(neovim-ui[^ ]*\).*/\1/p' \
       "$CLIENT_LOG" \
-    && rg -q \
-      'backend actor message .*sender=.*neovim-session .*recipient=brood.client-init .*body=.*"action":"diff"' \
-      "$CLIENT_LOG" \
-    && rg -q \
-      'backend actor message .*sender=.*neovim-session .*recipient=brood.client-init .*body=.*"action":"agent"' \
-      "$CLIENT_LOG" \
-    && rg -q 'started presentation WASM actor id=diff-viewer' "$CLIENT_LOG" \
-    && rg -q 'started presentation WASM actor id=coding-agent-ui-' "$CLIENT_LOG"; then
+      | tail -1
+  )"
+  if [[ "$EDITOR_UI" == neovim-ui-* ]]; then
+    EDITOR_PANE="$(actor_pane "$EDITOR_UI" "$CLIENT_LOG")"
+  fi
+  ACTORS="$(actor_list || true)"
+  EDITOR_FILES_ACTOR="$(
+    sed -n 's/^actor id=\([^ ]*\.neovim-files\) .*/\1/p' <<< "$ACTORS" | head -1
+  )"
+  SESSION_INIT_ACTOR="$(
+    sed -n 's/^actor id=\(brood\.session-init\.[0-9][0-9]*\) .*/\1/p' \
+      <<< "$ACTORS" \
+      | head -1
+  )"
+  DRAW_PACKETS_AFTER="$(rg -c 'accepted plugin draw packet' "$CLIENT_LOG" || true)"
+  if [[ "$EDITOR_UI" == neovim-ui-* \
+    && "$EDITOR_PANE" =~ ^[0-9]+$ \
+    && "$EDITOR_FILES_ACTOR" == *.neovim-files \
+    && "$SESSION_INIT_ACTOR" == brood.session-init.* ]] \
+    && ((DRAW_PACKETS_AFTER > DRAW_PACKETS_BEFORE)) \
+    && route_has_kind neovim-files "$EDITOR_UI" editor-client-authorized "$CLIENT_LOG" \
+    && route_has_kind "$EDITOR_UI" init editor-files-ready "$CLIENT_LOG"; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
-    echo "ERR presentation client exited during editor message routing" >&2
+    echo "ERR presentation client exited before local Wasm Neovim was ready" >&2
     exit 1
   }
   sleep 0.05
 done
-[[ -f "$TERMINAL_MARKER" ]]
-rg -q \
-  'backend actor message .*sender=.*neovim-session .*recipient=brood.client-init .*body=.*"action":"terminal"' \
-  "$CLIENT_LOG"
-rg -q \
-  'backend actor message .*sender=.*neovim-session .*recipient=brood.client-init .*body=.*"action":"diff"' \
-  "$CLIENT_LOG"
-rg -q \
-  'backend actor message .*sender=.*neovim-session .*recipient=brood.client-init .*body=.*"action":"agent"' \
-  "$CLIENT_LOG"
-rg -q 'backend actor message .*body=.*"kind":"editor-action"' "$CLIENT_LOG"
-rg -q 'started presentation WASM actor id=diff-viewer' "$CLIENT_LOG"
-rg -q 'started presentation WASM actor id=coding-agent-ui-' "$CLIENT_LOG"
-rg -q 'terminal-session-2' "$SERVER_LOG" "$CLIENT_LOG"
+[[ "$EDITOR_UI" == neovim-ui-* ]]
+[[ "$EDITOR_PANE" =~ ^[0-9]+$ ]]
+[[ "$EDITOR_FILES_ACTOR" == *.neovim-files ]]
+[[ "$SESSION_INIT_ACTOR" == brood.session-init.* ]]
+route_has_kind neovim-files "$EDITOR_UI" editor-client-authorized "$CLIENT_LOG"
+route_has_kind "$EDITOR_UI" init editor-files-ready "$CLIENT_LOG"
+actor_list > "$OUT/actors-editor-created.txt"
 
+# The Emscripten/Node process must be a child of the presentation client and
+# run from the packaged client actor directory. The backend must not own a
+# native Neovim subprocess.
+RUNNER_PID=""
+for _ in {1..600}; do
+  ps -eo pid=,ppid=,args= > "$OUT/processes.txt"
+  RUNNER_PID="$(
+    awk -v parent="$CLIENT_PID" \
+      '$2 == parent && $0 ~ /node .*share\/brood\/neovim-wasm\/runner\.mjs/ { print $1; exit }' \
+      "$OUT/processes.txt"
+  )"
+  [[ -n "$RUNNER_PID" ]] && break
+  sleep 0.05
+done
+[[ -n "$RUNNER_PID" ]]
+RUNNER_CWD="$(readlink -f "/proc/$RUNNER_PID/cwd")"
+[[ "$RUNNER_CWD" == "$CLIENT_RELEASE_REAL" ]]
+awk -v runner="$RUNNER_PID" -v client="$CLIENT_PID" -v server="$SERVER_PID" \
+  '$1 == runner || $1 == client || $1 == server' \
+  "$OUT/processes.txt" \
+  > "$OUT/editor-process-placement.txt"
+python3 - "$SERVER_PID" "$OUT/processes.txt" \
+  > "$OUT/backend-descendants.txt" <<'PY'
+import pathlib
+import sys
+
+root = int(sys.argv[1])
+records = {}
+children = {}
+for raw in pathlib.Path(sys.argv[2]).read_text().splitlines():
+    fields = raw.strip().split(maxsplit=2)
+    if len(fields) < 2:
+        continue
+    pid = int(fields[0])
+    parent = int(fields[1])
+    records[pid] = raw
+    children.setdefault(parent, []).append(pid)
+
+pending = list(children.get(root, ()))
+seen = set()
+while pending:
+    pid = pending.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    print(records[pid])
+    pending.extend(children.get(pid, ()))
+PY
+if rg -q '(^|[/ ])nvim( |$)|brood-nvim' "$OUT/backend-descendants.txt"; then
+  echo "ERR backend unexpectedly owns a native Neovim process" >&2
+  exit 1
+fi
+
+sleep 0.4
+capture "$OUT/editor-created.png"
+
+# Open a workspace-relative path by addressing the session init actor. The
+# init actor forwards the open to the client, which fetches bytes and revision
+# chunks from the backend neovim-files actor.
+OPEN_REQUESTS_BEFORE="$(
+  count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG"
+)"
+OPEN_REPLIES_BEFORE="$(
+  count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG"
+)"
+EDITOR_DRAW_BEFORE="$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")"
+EDIT_OPEN_BODY="$(
+  jq -cn \
+    '{kind:"open-editor", path:"tracked.txt", line:1, column:1}'
+)"
+ctl actors send "$SESSION_INIT_ACTOR" "$EDIT_OPEN_BODY" \
+  | tee "$OUT/editor-open-send.txt"
+rg -q 'queued=true' "$OUT/editor-open-send.txt"
+for _ in {1..600}; do
+  OPEN_REQUESTS_AFTER="$(
+    count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG"
+  )"
+  OPEN_REPLIES_AFTER="$(
+    count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG"
+  )"
+  EDITOR_DRAW_AFTER="$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")"
+  if ((OPEN_REQUESTS_AFTER > OPEN_REQUESTS_BEFORE \
+    && OPEN_REPLIES_AFTER > OPEN_REPLIES_BEFORE \
+    && EDITOR_DRAW_AFTER > EDITOR_DRAW_BEFORE)) \
+    && local_open_completed "$EDITOR_UI" tracked.txt "$CLIENT_LOG"; then
+    break
+  fi
+  kill -0 "$CLIENT_PID" 2> /dev/null || {
+    echo "ERR presentation client exited while opening the remote file" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+((OPEN_REQUESTS_AFTER > OPEN_REQUESTS_BEFORE))
+((OPEN_REPLIES_AFTER > OPEN_REPLIES_BEFORE))
+((EDITOR_DRAW_AFTER > EDITOR_DRAW_BEFORE))
+local_open_completed "$EDITOR_UI" tracked.txt "$CLIENT_LOG"
+sleep 0.1
+capture "$OUT/editor-opened.png"
+
+# The unique command exists only if the host config's Lua plugin loaded inside
+# Wasm Neovim. Ordinary Normal/Insert-mode keys then make a second edit.
+# A physical Backspace removes the trailing sentinel rather than inserting a
+# control character. :write must carry both changes through the
+# revision-checked backend actor.
+nvim_command BroodHostPluginProof
+sleep 0.2
+wayland_env wtype -s 5 'GoBROOD_EDITOR_REAL_KEYSX'
+press_plain_key 14
+press_plain_key 1
+SAVES_BEFORE="$(
+  count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG"
+)"
+nvim_command write
+for _ in {1..600}; do
+  if rg -F -q "$HOST_PLUGIN_LINE" "$EDIT_FILE" \
+    && [[ "$(tail -n 1 "$EDIT_FILE")" == 'BROOD_EDITOR_REAL_KEYS' ]] \
+    && (("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+rg -F -q "$HOST_PLUGIN_LINE" "$EDIT_FILE"
+[[ "$(tail -n 1 "$EDIT_FILE")" == 'BROOD_EDITOR_REAL_KEYS' ]]
+route_has_kind "$EDITOR_UI" neovim-files save-begin "$CLIENT_LOG"
+(("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE))
+capture "$OUT/editor-edited.png"
+
+# A second addressed open includes one-based line and column. The subsequent
+# append and backend save prove the requested cursor location in actual bytes.
+OPEN_REQUESTS_BEFORE="$(
+  count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG"
+)"
+OPEN_REPLIES_BEFORE="$(
+  count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG"
+)"
+EDITOR_DRAW_BEFORE="$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")"
+INBOUND_BODY="$(
+  jq -cn \
+    '{kind:"open-editor", path:"inbound.txt", line:2, column:3}'
+)"
+ctl actors send "$SESSION_INIT_ACTOR" "$INBOUND_BODY" \
+  | tee "$OUT/editor-inbound-send.txt"
+rg -q 'queued=true' "$OUT/editor-inbound-send.txt"
+for _ in {1..600}; do
+  OPEN_REQUESTS_AFTER="$(
+    count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG"
+  )"
+  OPEN_REPLIES_AFTER="$(
+    count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG"
+  )"
+  EDITOR_DRAW_AFTER="$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")"
+  if ((OPEN_REQUESTS_AFTER > OPEN_REQUESTS_BEFORE \
+    && OPEN_REPLIES_AFTER > OPEN_REPLIES_BEFORE \
+    && EDITOR_DRAW_AFTER > EDITOR_DRAW_BEFORE)) \
+    && local_open_completed "$EDITOR_UI" inbound.txt "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((OPEN_REQUESTS_AFTER > OPEN_REQUESTS_BEFORE))
+((OPEN_REPLIES_AFTER > OPEN_REPLIES_BEFORE))
+((EDITOR_DRAW_AFTER > EDITOR_DRAW_BEFORE))
+local_open_completed "$EDITOR_UI" inbound.txt "$CLIENT_LOG"
+sleep 0.1
+wayland_env wtype -s 5 'a__BROOD_INBOUND__'
+press_plain_key 1
+SAVES_BEFORE="$(
+  count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG"
+)"
+nvim_command write
+for _ in {1..600}; do
+  if [[ "$(sed -n '2p' "$INBOUND_FILE")" == 'sec__BROOD_INBOUND__ond inbound line' ]] \
+    && (("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+[[ "$(sed -n '2p' "$INBOUND_FILE")" == 'sec__BROOD_INBOUND__ond inbound line' ]]
+(("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE))
+capture "$OUT/editor-inbound-open.png"
+actor_list > "$OUT/actors-after-inbound.txt"
+
+# A file larger than 64 runner chunks proves that one coalesced actor
+# notification drains a multi-record upload across bounded worker turns. Its
+# subsequent write exercises the streamed save path in the opposite direction.
+OPEN_REQUESTS_BEFORE="$(
+  count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG"
+)"
+OPEN_REPLIES_BEFORE="$(
+  count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG"
+)"
+EDITOR_DRAW_BEFORE="$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")"
+LARGE_BODY="$(
+  jq -cn \
+    '{kind:"open-editor", path:"large.txt", line:1, column:1}'
+)"
+ctl actors send "$SESSION_INIT_ACTOR" "$LARGE_BODY" \
+  | tee "$OUT/editor-large-send.txt"
+rg -q 'queued=true' "$OUT/editor-large-send.txt"
+for _ in {1..800}; do
+  OPEN_REQUESTS_AFTER="$(
+    count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG"
+  )"
+  OPEN_REPLIES_AFTER="$(
+    count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG"
+  )"
+  EDITOR_DRAW_AFTER="$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")"
+  if ((OPEN_REQUESTS_AFTER > OPEN_REQUESTS_BEFORE \
+    && OPEN_REPLIES_AFTER > OPEN_REPLIES_BEFORE \
+    && EDITOR_DRAW_AFTER > EDITOR_DRAW_BEFORE)) \
+    && local_open_completed "$EDITOR_UI" large.txt "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((OPEN_REQUESTS_AFTER > OPEN_REQUESTS_BEFORE))
+((OPEN_REPLIES_AFTER > OPEN_REPLIES_BEFORE))
+((EDITOR_DRAW_AFTER > EDITOR_DRAW_BEFORE))
+local_open_completed "$EDITOR_UI" large.txt "$CLIENT_LOG"
+(("$(wc -c < "$LARGE_FILE")" > 64 * 1024))
+wayland_env wtype -s 5 'iZ'
+press_plain_key 1
+SAVES_BEFORE="$(
+  count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG"
+)"
+nvim_command write
+for _ in {1..800}; do
+  if [[ "$(head -c 1 "$LARGE_FILE")" == Z ]] \
+    && (("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+[[ "$(head -c 1 "$LARGE_FILE")" == Z ]]
+(("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE))
+capture "$OUT/editor-large-stream.png"
+
+# Exercise the typed outbound routes through actual Neovim commands. Terminal
+# and diff actions both create backend terminal actors; the first leaves a
+# filesystem marker and the second renders the real git diff. Ctrl+Alt+E
+# focuses the existing local editor between panes.
+DYNAMIC_TERMINALS_BEFORE="$(
+  actor_list | rg -c '\.terminal-session-[0-9]+ ' || true
+)"
+nvim_command "BroodTerminal touch terminal-command-routed"
+TERMINAL_ACTION_UI=""
+TERMINAL_ACTION_PANE=""
+for _ in {1..800}; do
+  DYNAMIC_TERMINALS_AFTER="$(
+    actor_list | rg -c '\.terminal-session-[0-9]+ ' || true
+  )"
+  TERMINAL_ACTION_UI="$(
+    sed -n \
+      's/.*started presentation WASM actor id=\(terminal-ui-b[^ ]*-s[^ ]*-[0-9][0-9]*\).*/\1/p' \
+      "$CLIENT_LOG" \
+      | tail -1
+  )"
+  if [[ -n "$TERMINAL_ACTION_UI" ]]; then
+    TERMINAL_ACTION_PANE="$(actor_pane "$TERMINAL_ACTION_UI" "$CLIENT_LOG")"
+  fi
+  if [[ -f "$TERMINAL_MARKER" && "$TERMINAL_ACTION_PANE" =~ ^[0-9]+$ ]] \
+    && terminal_snapshot_rendered \
+      "$TERMINAL_ACTION_UI" "$TERMINAL_ACTION_PANE" "$CLIENT_LOG" \
+    && ((DYNAMIC_TERMINALS_AFTER > DYNAMIC_TERMINALS_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+[[ -f "$TERMINAL_MARKER" ]]
+[[ -n "$TERMINAL_ACTION_UI" ]]
+[[ "$TERMINAL_ACTION_PANE" =~ ^[0-9]+$ ]]
+terminal_snapshot_rendered \
+  "$TERMINAL_ACTION_UI" "$TERMINAL_ACTION_PANE" "$CLIENT_LOG"
+((DYNAMIC_TERMINALS_AFTER > DYNAMIC_TERMINALS_BEFORE))
+rg -F -q '"command":"touch terminal-command-routed"' "$CLIENT_LOG"
+sleep 0.4
+capture "$OUT/editor-terminal-action.png"
+
+focus_editor
+DYNAMIC_TERMINALS_BEFORE="$DYNAMIC_TERMINALS_AFTER"
+nvim_command BroodDiff
+DIFF_TERMINAL_UI=""
+DIFF_TERMINAL_PANE=""
+for _ in {1..800}; do
+  DYNAMIC_TERMINALS_AFTER="$(
+    actor_list | rg -c '\.terminal-session-[0-9]+ ' || true
+  )"
+  DIFF_TERMINAL_UI="$(
+    sed -n \
+      's/.*started presentation WASM actor id=\(terminal-ui-b[^ ]*-s[^ ]*-[0-9][0-9]*\).*/\1/p' \
+      "$CLIENT_LOG" \
+      | tail -1
+  )"
+  if [[ -n "$DIFF_TERMINAL_UI" ]]; then
+    DIFF_TERMINAL_PANE="$(actor_pane "$DIFF_TERMINAL_UI" "$CLIENT_LOG")"
+  fi
+  if ((DYNAMIC_TERMINALS_AFTER > DYNAMIC_TERMINALS_BEFORE)) \
+    && [[ "$DIFF_TERMINAL_UI" != "$TERMINAL_ACTION_UI" \
+      && "$DIFF_TERMINAL_PANE" =~ ^[0-9]+$ ]] \
+    && terminal_snapshot_rendered \
+      "$DIFF_TERMINAL_UI" "$DIFF_TERMINAL_PANE" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((DYNAMIC_TERMINALS_AFTER > DYNAMIC_TERMINALS_BEFORE))
+[[ "$DIFF_TERMINAL_UI" != "$TERMINAL_ACTION_UI" ]]
+[[ "$DIFF_TERMINAL_PANE" =~ ^[0-9]+$ ]]
+terminal_snapshot_rendered \
+  "$DIFF_TERMINAL_UI" "$DIFF_TERMINAL_PANE" "$CLIENT_LOG"
+rg -F -q \
+  '"command":"git --no-pager diff --color=always --no-ext-diff"' \
+  "$CLIENT_LOG"
+sleep 0.8
+capture "$OUT/editor-diff-action.png"
+
+focus_editor
+AGENT_PROMPT='Reply with editor-route-ready only; do not change files'
+nvim_command "BroodAgent $AGENT_PROMPT"
+AGENT_UI=""
+AGENT_PANE=""
+for _ in {1..800}; do
+  AGENT_UI="$(
+    sed -n \
+      's/.*started presentation WASM actor id=\(coding-agent-ui-[^ ]*\).*/\1/p' \
+      "$CLIENT_LOG" \
+      | tail -1
+  )"
+  if [[ -n "$AGENT_UI" ]]; then
+    AGENT_PANE="$(actor_pane "$AGENT_UI" "$CLIENT_LOG")"
+  fi
+  if [[ "$AGENT_PANE" =~ ^[0-9]+$ ]] \
+    && (("$(draw_sequence "$AGENT_PANE" "$CLIENT_LOG")" > 0)) \
+    && rg -F -q "\"prompt\":\"$AGENT_PROMPT\"" "$CLIENT_LOG"; then
+    break
+  fi
+  kill -0 "$CLIENT_PID" 2> /dev/null || {
+    echo "ERR presentation client exited during editor action routing" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+[[ -n "$AGENT_UI" ]]
+[[ "$AGENT_PANE" =~ ^[0-9]+$ ]]
+(("$(draw_sequence "$AGENT_PANE" "$CLIENT_LOG")" > 0))
+rg -F -q "\"prompt\":\"$AGENT_PROMPT\"" "$CLIENT_LOG"
 sleep 0.5
-capture "$OUT/editor-actions.png"
-rg -a \
-  'neovim-session|editor-action|diff-viewer|terminal-session-2|coding-agent-ui-' \
-  "$SERVER_LOG" "$CLIENT_LOG" \
-  > "$OUT/editor-routes.log"
+capture "$OUT/editor-agent-action.png"
 
 STATUS="$(ctl status)"
 STATUS_JSON="$(ctl status-json)"
 rg -q 'presentation=Attached' <<< "$STATUS"
-ctl actors list > "$OUT/actors-final.txt"
-rg -q 'neovim-session' "$OUT/actors-final.txt"
-rg -q 'terminal-session-2' "$OUT/actors-final.txt"
+actor_list > "$OUT/actors-final.txt"
+rg -q '\.neovim-files ' "$OUT/actors-final.txt"
+rg -q '\.terminal-session-[0-9]+ ' "$OUT/actors-final.txt"
+if rg -q 'neovim-session' "$OUT/actors-final.txt" "$OUT/editor-process-placement.txt"; then
+  echo "ERR obsolete backend-native neovim-session is still active" >&2
+  exit 1
+fi
+
+rg -a \
+  'neovim-ui|neovim-files|editor-action|create-terminal|git --no-pager diff|coding-agent-ui|coding-agent-1' \
+  "$SERVER_LOG" "$CLIENT_LOG" \
+  > "$OUT/editor-routes.log"
 
 python3 - \
   "$OUT/editor-created.png" \
+  "$OUT/editor-opened.png" \
   "$OUT/editor-edited.png" \
   "$OUT/editor-inbound-open.png" \
-  "$OUT/editor-actions.png" <<'PY'
+  "$OUT/editor-large-stream.png" \
+  "$OUT/editor-terminal-action.png" \
+  "$OUT/editor-diff-action.png" \
+  "$OUT/editor-agent-action.png" \
+  > "$OUT/screenshot-metrics.json" <<'PY'
+import json
 import pathlib
 import subprocess
 import sys
 
-for value in sys.argv[1:]:
-    path = pathlib.Path(value)
+paths = [pathlib.Path(value) for value in sys.argv[1:]]
+captures = []
+for path in paths:
     data = path.read_bytes()
     if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 4096:
         raise SystemExit(f"invalid editor graphical proof: {path}")
-    colors = int(
-        subprocess.check_output(
-            ["magick", str(path), "-format", "%k", "info:"], text=True
-        )
-    )
+    identify = subprocess.check_output(
+        ["magick", str(path), "-format", "%wx%h %k", "info:"], text=True
+    ).split()
+    dimensions = identify[0]
+    colors = int(identify[1])
+    if dimensions != "1280x720":
+        raise SystemExit(f"unexpected editor capture dimensions: {path} {dimensions}")
     if colors < 40:
-        raise SystemExit(f"editor proof has too little rendered content: {path} colors={colors}")
+        raise SystemExit(
+            f"editor proof has too little rendered content: {path} colors={colors}"
+        )
+    captures.append(
+        {
+            "file": path.name,
+            "bytes": len(data),
+            "dimensions": dimensions,
+            "colors": colors,
+        }
+    )
 
-for first, second, minimum in [
-    (sys.argv[1], sys.argv[2], 0.001),
-    (sys.argv[2], sys.argv[3], 0.001),
-    (sys.argv[3], sys.argv[4], 0.002),
+comparisons = []
+for first, second in [
+    (paths[1], paths[2]),
+    (paths[2], paths[3]),
+    (paths[3], paths[4]),
+    (paths[4], paths[5]),
+    (paths[5], paths[6]),
+    (paths[6], paths[7]),
 ]:
     metric = subprocess.run(
         ["magick", "compare", "-metric", "RMSE", first, second, "null:"],
@@ -429,65 +868,108 @@ for first, second, minimum in [
         check=False,
     ).stderr
     normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
-    if normalized < minimum:
+    if normalized < 0.0005:
         raise SystemExit(
             f"editor captures are unexpectedly similar: {first} {second} RMSE={normalized}"
         )
-    print(f"editor_capture_rmse={normalized:.6f}")
+    comparisons.append(
+        {
+            "first": first.name,
+            "second": second.name,
+            "rmse": normalized,
+        }
+    )
+
+print(json.dumps({"captures": captures, "comparisons": comparisons}, indent=2))
 PY
 
-EDITOR_METRIC="$(
-  sed -n \
-    "s/^presentation plugin worker metrics actor=${EDITOR_UI} //p" \
-    "$CLIENT_LOG" \
-    | tail -1
-)"
+OPEN_REQUESTS="$(count_route_kind "$EDITOR_UI" neovim-files open "$CLIENT_LOG")"
+OPEN_REPLIES="$(count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG")"
+SAVE_BEGINS="$(count_route_kind "$EDITOR_UI" neovim-files save-begin "$CLIENT_LOG")"
+SAVE_COMPLETES="$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")"
+DRAW_PACKETS="$(rg -c 'accepted plugin draw packet' "$CLIENT_LOG" || true)"
+LARGE_BYTES="$(wc -c < "$LARGE_FILE")"
+SCREENSHOT_METRICS="$(< "$OUT/screenshot-metrics.json")"
 jq -n \
   --argjson status "$STATUS_JSON" \
-  --argjson editor "$EDITOR_METRIC" \
-  --arg editor_actor "$EDITOR_ACTOR" \
+  --argjson screenshots "$SCREENSHOT_METRICS" \
+  --arg editor_files_actor "$EDITOR_FILES_ACTOR" \
   --arg editor_ui "$EDITOR_UI" \
-  --arg edit_file "$EDIT_FILE" \
-  --arg inbound_file "$INBOUND_FILE" \
+  --arg runner_cwd "$RUNNER_CWD" \
+  --arg host_config_marker "$HOST_CONFIG_MARKER" \
+  --arg host_plugin_line "$HOST_PLUGIN_LINE" \
+  --argjson open_requests "$OPEN_REQUESTS" \
+  --argjson open_replies "$OPEN_REPLIES" \
+  --argjson save_begins "$SAVE_BEGINS" \
+  --argjson save_completes "$SAVE_COMPLETES" \
+  --argjson large_bytes "$LARGE_BYTES" \
+  --argjson draw_packets "$DRAW_PACKETS" \
   '{
-    editor_actor: $editor_actor,
-    editor_ui: $editor_ui,
+    placement: {
+      client_actor: $editor_ui,
+      backend_file_actor: $editor_files_actor,
+      local_runner_cwd: $runner_cwd,
+      backend_native_neovim: false
+    },
     workload: {
       ctrl_alt_e: true,
-      vim_normal_insert_write: true,
-      edited_file: $edit_file,
+      host_config_marker: $host_config_marker,
+      host_lua_plugin_effect: $host_plugin_line,
+      normal_insert_write: true,
+      remote_file_protocol: {
+        open_requests: $open_requests,
+        open_replies: $open_replies,
+        save_begins: $save_begins,
+        save_completes: $save_completes
+      },
       inbound_actor_message: {
-        kind: "editor-open",
-        file: $inbound_file,
+        kind: "open-editor",
+        path: "inbound.txt",
         line: 2,
         column: 3
       },
-      outbound_routes: ["diff", "terminal", "agent"],
-      terminal_command_marker: true
+      chunked_remote_file: {
+        path: "large.txt",
+        bytes: $large_bytes,
+        saved_prefix: "Z"
+      },
+      outbound_routes: {
+        terminal_command_marker: true,
+        diff_terminal: true,
+        agent_prompt: true
+      }
     },
-    render: $editor,
+    render: {
+      draw_packets: $draw_packets,
+      screenshots: $screenshots
+    },
     status: $status
   }' > "$OUT/proof.json"
 
-cat > "$OUT/proof.md" <<EOF
-# Brood Neovim editor proof
-
-- package: the Nix-built Brood package supplied brood, brood-client, brood-nvim, nvim, and the packaged actor Components
-- isolation: private DBus session and headless Sway; no presentation window was created on the host desktop
-- launch: a real Ctrl+Alt+E event created $EDITOR_ACTOR and rendered $EDITOR_UI
-- editing: Normal/Insert-mode keys and :write added BROOD_EDITOR_REAL_KEYS to tracked.txt
-- inbound messaging: actors send delivered editor-open with line 2, column 3; the subsequent Vim append produced sec__BROOD_INBOUND__ond inbound line
-- outbound messaging: :BroodTerminal ran a command in terminal-session-2, :BroodDiff opened the diff-viewer actor, and :BroodAgent routed a bounded harmless prompt into a coding-agent pane
-- screenshots: editor-created.png, editor-edited.png, editor-inbound-open.png, editor-actions.png
-- structured evidence: proof.json, editor-routes.log, actors-editor-created.txt, actors-after-inbound.txt, actors-final.txt
-- status: $STATUS
-EOF
+{
+  printf '%s\n' \
+    '# Brood client-local Wasm Neovim proof' \
+    '' \
+    "- package: $CLIENT_COMPONENT is the presentation actor, $FILES_COMPONENT is the backend file actor, and the packaged runtime contains nvim.js/nvim.wasm/nvim.data" \
+    '- isolation: private DBus session and headless Sway; no presentation window was created on the host desktop' \
+    "- placement: client PID $CLIENT_PID owns Node/Wasm runner PID $RUNNER_PID in $RUNNER_CWD; backend PID $SERVER_PID owns $EDITOR_FILES_ACTOR and no native Neovim process" \
+    "- host config: the temporary host XDG config loaded its pure-Lua plugin; :BroodHostPluginProof inserted $HOST_PLUGIN_LINE into the remote buffer" \
+    "- remote editing: workspace-relative open/read and revision-checked save messages crossed between $EDITOR_UI and $EDITOR_FILES_ACTOR; tracked.txt and inbound.txt contain the resulting bytes" \
+    '- inbound messaging: an addressed open-editor selected inbound.txt at line 2, column 3; the real key append produced sec__BROOD_INBOUND__ond inbound line' \
+    "- streaming: large.txt crossed more than 64 client-to-runner chunks and its Z-prefixed save returned through the backend file actor" \
+    '- outbound messaging: :BroodTerminal executed a backend command, :BroodDiff opened a backend git-diff terminal, and :BroodAgent routed a bounded prompt into a coding-agent pane' \
+    '- graphical proof: editor-created.png, editor-opened.png, editor-edited.png, editor-inbound-open.png, editor-large-stream.png, editor-terminal-action.png, editor-diff-action.png, editor-agent-action.png' \
+    '- structured evidence: proof.json, screenshot-metrics.json, editor-routes.log, editor-process-placement.txt, actors-editor-created.txt, actors-after-inbound.txt, actors-final.txt' \
+    '- scope: this built-in nested proof validates the client/backend actor boundary in one private offscreen process topology; cross-host transport remains covered by the separate SSH test path' \
+    "- status: $STATUS"
+} > "$OUT/proof.md"
 
 mkdir -p "$OUT/fixtures"
 cp "$EDIT_FILE" "$OUT/fixtures/tracked.txt"
 cp "$INBOUND_FILE" "$OUT/fixtures/inbound.txt"
-cp "$ACTIONS_FILE" "$OUT/fixtures/editor-actions.vim"
+cp "$LARGE_FILE" "$OUT/fixtures/large.txt"
 cp "$TERMINAL_MARKER" "$OUT/fixtures/terminal-command-routed"
+cp -R "$HOST_CONFIG_DIR" "$OUT/fixtures/host-nvim-config"
 
 ctl quit > /dev/null 2>&1 || true
 echo "editor_plugin_nested=verified"
@@ -496,4 +978,7 @@ echo "metrics=$OUT/proof.json"
 echo "created=$OUT/editor-created.png"
 echo "edited=$OUT/editor-edited.png"
 echo "inbound=$OUT/editor-inbound-open.png"
-echo "actions=$OUT/editor-actions.png"
+echo "stream=$OUT/editor-large-stream.png"
+echo "terminal=$OUT/editor-terminal-action.png"
+echo "diff=$OUT/editor-diff-action.png"
+echo "agent=$OUT/editor-agent-action.png"

@@ -385,10 +385,11 @@ impl PresentationWasmRuntime {
             presentation.bind_generation(actor.generation());
         }
         eprintln!(
-            "started presentation WASM actor id={} kind={} generation={} path={}",
+            "started presentation WASM actor id={} kind={} generation={} pane={} path={}",
             spec.id,
             actor.kind(),
             actor.generation(),
+            pane,
             spec.path.display()
         );
         self.actors.insert(
@@ -599,6 +600,14 @@ impl PresentationWasmRuntime {
                         });
                 }
                 ComponentActorEvent::LocalMessageRequested { actor, body } => {
+                    if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                        eprintln!(
+                            "presentation local actor message sender={} recipient={} body={}",
+                            actor_id,
+                            actor,
+                            String::from_utf8_lossy(&body)
+                        );
+                    }
                     if let Err(error) = self.send_actor_message(&actor, actor_id, body) {
                         if self.is_init_child(&actor) {
                             eprintln!(
@@ -1409,6 +1418,9 @@ fn presentation_actor_grants(
     workspace_root: &Path,
     requested: &[String],
 ) -> Result<(FilesystemGrant, RuntimeIoConfig)> {
+    let package_cwd = requested
+        .iter()
+        .any(|capability| capability == "runtime:package-cwd");
     let workspace_write = requested
         .iter()
         .any(|capability| capability == "filesystem:workspace-write");
@@ -1425,7 +1437,7 @@ fn presentation_actor_grants(
     let mut allow_loopback = false;
     for capability in requested {
         match capability.as_str() {
-            "filesystem:workspace-read" | "filesystem:workspace-write" => {}
+            "filesystem:workspace-read" | "filesystem:workspace-write" | "runtime:package-cwd" => {}
             "pty" => allow_pty = true,
             "network:loopback" => allow_loopback = true,
             _ => {
@@ -1468,7 +1480,17 @@ fn presentation_actor_grants(
             allow_pty,
             allow_loopback,
         },
-        working_directory: (!requested.is_empty()).then(|| workspace_root.to_path_buf()),
+        // A session-associated presentation actor may represent a workspace
+        // whose path exists only on a remote backend. Client-local runtimes
+        // must opt into their installed package directory instead of treating
+        // that remote identity as a local process cwd.
+        working_directory: (!requested.is_empty()).then(|| {
+            if package_cwd {
+                package_root.to_path_buf()
+            } else {
+                workspace_root.to_path_buf()
+            }
+        }),
         ..RuntimeIoConfig::default()
     };
     Ok((filesystem, runtime_io))
@@ -1530,6 +1552,22 @@ mod tests {
         )?;
         ensure!(filesystem.host_path == Path::new("/workspace"));
         ensure!(!filesystem.writable);
+        Ok(())
+    }
+
+    #[test]
+    fn presentation_child_can_run_a_client_local_package_runtime() -> Result<()> {
+        let (filesystem, runtime) = presentation_actor_grants(
+            Path::new("/package"),
+            Path::new("/remote/workspace"),
+            &[
+                "runtime:package-cwd".to_string(),
+                "subprocess:node".to_string(),
+            ],
+        )?;
+        ensure!(filesystem.host_path == Path::new("/package"));
+        ensure!(runtime.working_directory.as_deref() == Some(Path::new("/package")));
+        ensure!(runtime.capabilities.commands == ["node"]);
         Ok(())
     }
 

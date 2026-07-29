@@ -57,7 +57,7 @@ use crate::runtime_io::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
@@ -70,7 +70,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use cap_fs_ext::{FileTypeExt, OpenOptionsSyncExt};
+use cap_fs_ext::{FileTypeExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
@@ -86,6 +86,7 @@ use wasmtime::{
 };
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_REPLACE_TEMP: AtomicU64 = AtomicU64::new(1);
 
 /// An actor-private worker identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -232,6 +233,8 @@ pub struct ComponentActorConfig {
     pub max_workers: usize,
     pub max_outstanding_io: usize,
     pub max_completion_bytes: usize,
+    /// Maximum payload for one worker whole-file atomic replacement.
+    pub max_worker_replace_bytes: usize,
     pub max_notifications: usize,
     pub max_pollables: usize,
     pub max_wait_set: usize,
@@ -282,6 +285,7 @@ impl Default for ComponentActorConfig {
             max_workers: 64,
             max_outstanding_io: 64,
             max_completion_bytes: 1024 * 1024,
+            max_worker_replace_bytes: 8 * 1024 * 1024,
             max_notifications: 64,
             max_pollables: 256,
             max_wait_set: 64,
@@ -361,6 +365,102 @@ fn worker_write_file(
     u64::try_from(bytes.len()).context("convert write length")
 }
 
+fn read_worker_regular_file(
+    root: &Dir,
+    path: PathBuf,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    // O_NONBLOCK bounds special-file open behavior. The no-follow final
+    // component plus descriptor metadata check makes the regular-file
+    // decision apply to the object actually opened, without a path-stat race.
+    options.read(true).nonblock(true).follow(FollowSymlinks::No);
+    let mut file = root
+        .open_with(&path, &options)
+        .with_context(|| format!("open {path:?} for regular worker read"))?;
+    ensure!(
+        file.metadata()?.file_type().is_file(),
+        "worker regular reads require a regular file"
+    );
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seek {path:?} for regular worker read"))?;
+    let mut bytes = vec![0; max_bytes];
+    let count = file
+        .read(&mut bytes)
+        .with_context(|| format!("read {path:?} as a regular file"))?;
+    bytes.truncate(count);
+    Ok(bytes)
+}
+
+fn worker_replace_file(root: &Dir, writable: bool, path: PathBuf, bytes: Vec<u8>) -> Result<u64> {
+    ensure!(writable, "filesystem capability is read-only");
+    ensure!(
+        path.file_name().is_some(),
+        "worker replacement requires a regular-file path"
+    );
+
+    let existing_permissions = match root.symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "worker replacement requires a regular-file destination"
+            );
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {path:?} for worker replacement"));
+        }
+    };
+
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut temporary = None;
+    for _attempt in 0..32 {
+        let nonce = NEXT_REPLACE_TEMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".brood-replace-{}-{nonce}.tmp", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).nonblock(true);
+        match root.open_with(&candidate, &options) {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create sibling temporary file for {path:?}"));
+            }
+        }
+    }
+    let (temporary_path, mut temporary_file) =
+        temporary.context("could not allocate a sibling temporary file")?;
+
+    let replacement = (|| {
+        temporary_file
+            .write_all(&bytes)
+            .with_context(|| format!("write sibling temporary file for {path:?}"))?;
+        if let Some(permissions) = existing_permissions {
+            temporary_file
+                .set_permissions(permissions)
+                .with_context(|| format!("preserve permissions for {path:?}"))?;
+        }
+        temporary_file
+            .sync_all()
+            .with_context(|| format!("sync sibling temporary file for {path:?}"))?;
+        drop(temporary_file);
+        root.rename(&temporary_path, root, &path)
+            .with_context(|| format!("atomically replace {path:?}"))?;
+        Ok::<(), anyhow::Error>(())
+    })();
+
+    if replacement.is_err() {
+        let _ = root.remove_file(&temporary_path);
+    }
+    replacement?;
+    u64::try_from(bytes.len()).context("convert replacement length")
+}
+
 struct ActorStore {
     completion_io: CompletionIo,
     coordination: CoordinationHub,
@@ -381,6 +481,7 @@ struct WorkerFilesystem {
     root: Arc<Dir>,
     writable: bool,
     max_bytes: usize,
+    max_replace_bytes: usize,
 }
 
 #[derive(Default)]
@@ -1270,6 +1371,63 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
         }
     }
 
+    fn worker_read_regular_file(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        path: String,
+        offset: u64,
+        max_bytes: u64,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<Vec<u8>, bindings::brood::plugin::host::SubmitError>,
+        >,
+    > + Send {
+        let current = current_component_worker(accessor);
+        let (filesystem, blocking_io) = accessor.with(|mut access| {
+            let store = access.get();
+            (store.worker_filesystem.clone(), store.blocking_io.clone())
+        });
+        async move {
+            let (_worker, cancellation) = current?;
+            if cancellation.is_requested() {
+                return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
+            }
+            let Some(filesystem) = filesystem else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            };
+            let Ok(max_bytes) = usize::try_from(max_bytes) else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::InvalidArgument,
+                ));
+            };
+            if max_bytes > filesystem.max_bytes {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::InvalidArgument,
+                ));
+            }
+            let Ok(path) = validate_capability_path(Path::new(&path)) else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::InvalidArgument,
+                ));
+            };
+            let result = blocking_io
+                .spawn(move || {
+                    read_worker_regular_file(filesystem.root.as_ref(), path, offset, max_bytes)
+                })
+                .await;
+            if cancellation.is_requested() {
+                return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
+            }
+            match result {
+                Ok(Ok(bytes)) => Ok(Ok(bytes)),
+                Ok(Err(_)) | Err(_) => Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                )),
+            }
+        }
+    }
+
     fn worker_write_file(
         accessor: &wasmtime::component::Accessor<ActorStore, Self>,
         path: String,
@@ -1324,6 +1482,65 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             // A regular-file write may already have been delegated to a
             // blocking thread. Join it before reporting cancellation so no
             // worker-owned side effect can occur after the terminal event.
+            if cancellation.is_requested() {
+                return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
+            }
+            match result {
+                Ok(Ok(bytes_written)) => Ok(Ok(bytes_written)),
+                Ok(Err(_)) | Err(_) => Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                )),
+            }
+        }
+    }
+
+    fn worker_replace_file(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<u64, bindings::brood::plugin::host::SubmitError>,
+        >,
+    > + Send {
+        let current = current_component_worker(accessor);
+        let (filesystem, blocking_io) = accessor.with(|mut access| {
+            let store = access.get();
+            (store.worker_filesystem.clone(), store.blocking_io.clone())
+        });
+        async move {
+            let (_worker, cancellation) = current?;
+            if cancellation.is_requested() {
+                return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
+            }
+            let Some(filesystem) = filesystem else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            };
+            if !filesystem.writable {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
+            if bytes.len() > filesystem.max_replace_bytes {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::InvalidArgument,
+                ));
+            }
+            let Ok(path) = validate_capability_path(Path::new(&path)) else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::InvalidArgument,
+                ));
+            };
+            let result = blocking_io
+                .spawn(move || {
+                    worker_replace_file(filesystem.root.as_ref(), filesystem.writable, path, bytes)
+                })
+                .await;
+            // The replacement may already have reached the blocking pool.
+            // Join it before reporting cancellation so no worker-owned side
+            // effect can occur after the terminal event.
             if cancellation.is_requested() {
                 return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
             }
@@ -1625,6 +1842,10 @@ impl ComponentActor {
         ensure!(
             config.max_filesystem_watch_events > 0,
             "filesystem watch event limit must be non-zero"
+        );
+        ensure!(
+            config.max_worker_replace_bytes > 0,
+            "worker replacement byte limit must be non-zero"
         );
         ensure!(
             config.max_notifications > 0,
@@ -2074,6 +2295,7 @@ fn open_worker_filesystem(config: &ComponentActorConfig) -> Result<Option<Worker
                 ),
                 writable: grant.writable,
                 max_bytes: config.max_completion_bytes,
+                max_replace_bytes: config.max_worker_replace_bytes,
             })
         })
         .transpose()
@@ -3215,6 +3437,106 @@ fn completion_to_guest(completion: &ActorCompletion) -> GuestEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_replacement_is_atomic_and_rejects_symlink_destinations() -> Result<()> {
+        use std::{
+            fs,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+
+        let temporary = tempfile::tempdir()?;
+        let destination = temporary.path().join("tracked.txt");
+        fs::write(&destination, b"old contents")?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o640))?;
+        let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+
+        let written = worker_replace_file(
+            &root,
+            true,
+            PathBuf::from("tracked.txt"),
+            b"new contents".to_vec(),
+        )?;
+        ensure!(written == 12, "unexpected replacement byte count");
+        ensure!(
+            fs::read(&destination)? == b"new contents",
+            "replacement contents differ"
+        );
+        ensure!(
+            fs::metadata(&destination)?.permissions().mode() & 0o777 == 0o640,
+            "replacement did not preserve permissions"
+        );
+        ensure!(
+            fs::read_dir(temporary.path())?
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".brood-replace-")),
+            "replacement left a temporary file behind"
+        );
+
+        symlink("tracked.txt", temporary.path().join("link.txt"))?;
+        ensure!(
+            worker_replace_file(
+                &root,
+                true,
+                PathBuf::from("link.txt"),
+                b"must not follow".to_vec(),
+            )
+            .is_err(),
+            "replacement followed a symlink destination"
+        );
+        ensure!(
+            worker_replace_file(
+                &root,
+                false,
+                PathBuf::from("tracked.txt"),
+                b"must not write".to_vec(),
+            )
+            .is_err(),
+            "replacement ignored the read-only grant"
+        );
+        ensure!(
+            fs::read(&destination)? == b"new contents",
+            "rejected replacement changed the destination"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_regular_read_accepts_read_only_files_and_rejects_special_targets() -> Result<()> {
+        use std::{
+            fs,
+            os::unix::{
+                fs::{PermissionsExt, symlink},
+                net::UnixListener,
+            },
+        };
+
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("readonly.txt");
+        fs::write(&source, b"read-only contents")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o444))?;
+        fs::create_dir(temporary.path().join("directory"))?;
+        symlink("readonly.txt", temporary.path().join("link.txt"))?;
+        let _socket = UnixListener::bind(temporary.path().join("socket"))?;
+        let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+
+        ensure!(
+            read_worker_regular_file(&root, PathBuf::from("readonly.txt"), 5, 4)? == b"only",
+            "regular worker read returned the wrong slice"
+        );
+        for rejected in ["directory", "link.txt", "socket"] {
+            ensure!(
+                read_worker_regular_file(&root, PathBuf::from(rejected), 0, 16).is_err(),
+                "regular worker read accepted {rejected}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn presentation_backlog_never_discards_text() {

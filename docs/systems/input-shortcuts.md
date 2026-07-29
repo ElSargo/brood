@@ -155,7 +155,7 @@ shortcuts or wrapper arguments:
   session-scoped coding-agent UI for it;
 - `Ctrl+Alt+T` asks the client- and session-init actors to create a fresh paired
   terminal presentation and session actor;
-- `Ctrl+Alt+E` opens or focuses the active session's persistent Neovim editor
+- `Ctrl+Alt+E` opens or focuses the active session's client-local Wasm Neovim
   pane;
 - `Ctrl+Alt+P` opens the reusable fuzzy session picker;
 - `Ctrl+Alt+D` opens or focuses the active session's single project-diff pane;

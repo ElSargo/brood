@@ -108,27 +108,6 @@ therefore tears down its child and streams. Surviving session-actor replacement
 requires the explicitly supervised session-resource promotion described in
 [[plugin-io-and-resources]], not detached processes or host-owned emulation.
 
-## Editor Control Lane
-
-The same terminal component can take the editor role for a session-owned
-Neovim child. It remains a terminal: Neovim owns editing, buffers, modes, and
-screen behavior, while the existing session and presentation actors own the
-PTY and pane.
-
-In that role only, the parser recognizes the private Brood OSC family emitted
-by the packaged Neovim bridge. Bounded, hex-encoded JSON actions are removed
-from rendered output and converted to ordinary session or presentation actor
-messages. Typed actions request the diff viewer, a terminal, or agent work. A
-generic addressed action is restricted to named actors in the same session or
-its attached presentation; terminal control data cannot address the host, a
-different backend, or the presentation's privileged orchestration actors.
-
-Incoming file-open messages follow the opposite direction. The editor session
-actor serializes bounded requests and uses Neovim's private server socket to
-open the path in the existing process. Detaching or closing its presentation
-pane retains Neovim and its buffers; reopening attaches the terminal UI again.
-See [[editor-plugin]] for the product contract.
-
 ## Product Gaps And Required General Primitives
 
 The terminal workload exposes these remaining general host gaps:

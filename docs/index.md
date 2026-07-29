@@ -42,7 +42,9 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[systems/plugin-graphics]] specifies the base canvas draw-packet, native text, resource, submission, and replay contract.
 - [[systems/plugin-advanced-graphics]] records the separate future protocol direction for user geometry, shaders, pipelines, and other GPU-style facilities.
 - [[systems/terminal-plugin]] defines the bundled first-party terminal product, its guest-owned architecture, and the reusable host gaps exposed by the workload.
-- [[systems/editor-plugin]] defines the bundled real-Neovim editor, its session-owned process and pane composition, and its bounded bidirectional actor-message bridge.
+- [[systems/editor-plugin]] defines the client-local Wasm Neovim editor, its
+  remote backend file actor, and its bounded bidirectional actor-message
+  bridge.
 
 ## Core Concepts
 

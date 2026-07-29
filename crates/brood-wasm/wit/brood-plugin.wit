@@ -251,11 +251,34 @@ interface host {
         max-bytes: u64,
     ) -> result<list<u8>, submit-error>;
 
+    /// Worker-only bounded read from an existing regular file. The host opens
+    /// the destination read-only and rejects symlinks, directories, FIFOs,
+    /// sockets, devices, and other special files before reading bytes.
+    worker-read-regular-file: async func(
+        path: string,
+        offset: u64,
+        max-bytes: u64,
+    ) -> result<list<u8>, submit-error>;
+
     /// Worker-only blocking-looking file write. The host rejects this import
     /// outside a registered worker guest task.
     worker-write-file: async func(
         path: string,
         offset: u64,
+        bytes: list<u8>,
+    ) -> result<u64, submit-error>;
+
+    /// Worker-only whole-file replacement. The host writes and syncs a
+    /// capability-relative sibling temporary regular file, preserves the
+    /// destination permissions when it already exists, then renames the
+    /// temporary file over the destination. The rename is atomic on host
+    /// filesystems which provide atomic same-directory replacement.
+    ///
+    /// Existing symlinks, directories, and other special-file destinations
+    /// are rejected. The host rejects this import outside a registered worker
+    /// guest task.
+    worker-replace-file: async func(
+        path: string,
         bytes: list<u8>,
     ) -> result<u64, submit-error>;
 

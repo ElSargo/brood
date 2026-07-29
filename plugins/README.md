@@ -10,8 +10,15 @@ Root-level target-shape Brood plugins live here.
 - `default-workspace/` ports the existing prototype key handler and map/layout hook into the new `brood-wasm` ABI shape: exported policy providers plus guest arena allocation.
 - `session-switcher/` is the default client-realm shell plugin: its init actor starts a native plugin pane which renders the live session catalogue and performs typed create, switch, rename, and close operations.
 - `picker/` is the reusable client-realm fuzzy picker actor. It serializes concurrent requests, accepts streamed items through stable IDs, and returns the original selected result and index.
-- `diff-viewer/` is the session-scoped project-diff pane: it renders every changed file in one continuous split diff, loads Git state in a worker, and relies on ordinary workspace placement.
-- `neovim/` is the packaged real-Neovim bridge. It retains the user's Vim configuration and editing model while exposing bounded commands and `<Plug>` mappings for diff, terminal, agent, and addressed actor-message workflows.
+- `diff-viewer/` is the local-workspace project-diff pane. Remote editor diff
+  actions use a backend terminal until the viewer has its own split
+  backend/presentation protocol.
+- `neovim-client/` owns the presentation-local Wasm Neovim process, input,
+  rendering, and messaging bridge.
+- `neovim-files/` owns bounded, revision-checked workspace reads and atomic
+  saves on the selected backend.
+- `neovim-runtime/` contains the JSONL Node/Emscripten runner and injected Lua
+  bridge. It mirrors the client's Neovim config into the Wasm filesystem.
 
 The WASM crates are currently standalone because `brood-wasm` is
 host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest
