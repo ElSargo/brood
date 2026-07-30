@@ -131,6 +131,9 @@ pub enum PresentationEvent {
         x: f32,
         y: f32,
     },
+    PointerLeft {
+        pane: u64,
+    },
     PointerButton {
         pane: u64,
         x: f32,

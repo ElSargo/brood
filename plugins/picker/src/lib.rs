@@ -25,6 +25,8 @@ const QUERY_X: f32 = 150.0;
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
 const PANEL_RAISED: Color = ashen::SURFACE_RAISED;
+const HOVER: Color = ashen::INTERACTIVE_HOVER;
+const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
 const PANEL_LIGHT: Color = ashen::BORDER;
 const FG: Color = ashen::TEXT;
 const TEXT: Color = ashen::TEXT_STRONG;
@@ -205,6 +207,8 @@ struct PickerState {
     text_resources: Vec<u64>,
     status: String,
     error: bool,
+    hovered: Option<usize>,
+    pressed: Option<usize>,
 }
 
 impl PickerState {
@@ -219,6 +223,8 @@ impl PickerState {
             text_resources: Vec::new(),
             status: String::new(),
             error: false,
+            hovered: None,
+            pressed: None,
         }
     }
 
@@ -248,6 +254,8 @@ impl PickerState {
         self.active = self.queued.pop_front();
         self.status.clear();
         self.error = false;
+        self.hovered = None;
+        self.pressed = None;
         self.active.is_some()
     }
 }
@@ -352,6 +360,8 @@ fn create_picker(
         state.active = Some(picker);
         state.status.clear();
         state.error = false;
+        state.hovered = None;
+        state.pressed = None;
         redraw_or_record_error(&mut state);
     }
     let mut commands = vec![reply(
@@ -461,6 +471,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(320.0);
             state.height = resized.height.max(240.0);
+            state.hovered = None;
+            state.pressed = None;
             ensure_active_selection_visible(&mut state);
             redraw_or_record_error(&mut state);
             Vec::new()
@@ -480,13 +492,46 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 active.scroll = 0;
                 active.ensure_selection();
             }
+            state.hovered = None;
+            state.pressed = None;
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
+            let hovered = picker_target_at(&state, moved.y);
+            if state.hovered != hovered {
+                state.hovered = hovered;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
+            if state.hovered.take().is_some() || state.pressed.take().is_some() {
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
         PresentationEvent::PointerButton(button)
-            if button.pane == state.pane && button.pressed && button.button == LEFT_BUTTON =>
+            if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
-            let commands = handle_pointer(&mut state, button.y);
+            let target = picker_target_at(&state, button.y);
+            let commands = if button.pressed {
+                state.hovered = target;
+                state.pressed = target;
+                if let (Some(target), Some(active)) = (target, state.active.as_mut()) {
+                    active.selected = Some(target);
+                }
+                Vec::new()
+            } else {
+                let pressed = state.pressed.take();
+                state.hovered = target;
+                match (pressed, target) {
+                    (Some(pressed), Some(released)) if pressed == released => {
+                        select_picker_target(&mut state, pressed)
+                    }
+                    _ => Vec::new(),
+                }
+            };
             redraw_or_record_error(&mut state);
             commands
         }
@@ -500,6 +545,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     active.scroll = active.scroll.saturating_sub(1);
                 }
             }
+            state.hovered = None;
+            state.pressed = None;
             redraw_or_record_error(&mut state);
             Vec::new()
         }
@@ -531,19 +578,28 @@ fn handle_key(state: &mut PickerState, key: &str) -> Vec<ActorCommand> {
     }
 }
 
-fn handle_pointer(state: &mut PickerState, y: f32) -> Vec<ActorCommand> {
+fn picker_target_at(state: &PickerState, y: f32) -> Option<usize> {
+    if !y.is_finite() {
+        return None;
+    }
     if y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
-        return Vec::new();
+        return None;
     }
     let row = ((y - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(0.0) as usize;
+    let active = state.active.as_ref()?;
+    let filtered = active.filtered_indices();
+    let position = filtered.get(active.scroll + row).copied()?;
+    Some(active.items[position].index)
+}
+
+fn select_picker_target(state: &mut PickerState, target: usize) -> Vec<ActorCommand> {
     let Some(active) = state.active.as_mut() else {
         return Vec::new();
     };
-    let filtered = active.filtered_indices();
-    let Some(position) = filtered.get(active.scroll + row).copied() else {
+    if !active.items.iter().any(|item| item.index == target) {
         return Vec::new();
-    };
-    active.selected = Some(active.items[position].index);
+    }
+    active.selected = Some(target);
     select_active(state)
 }
 
@@ -606,6 +662,8 @@ fn finish_active(state: &mut PickerState, selected: bool) -> Vec<ActorCommand> {
     let Some(finished) = state.active.take() else {
         return Vec::new();
     };
+    state.hovered = None;
+    state.pressed = None;
     let mut commands = Vec::new();
     if !selected {
         commands.push(reply(
@@ -885,11 +943,21 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
             let item = &active.items[position];
             let y = HEADER_HEIGHT + row as f32 * ROW_HEIGHT;
             let selected = active.selected == Some(item.index);
-            if selected {
+            let pressed = state.pressed == Some(item.index);
+            let hovered = state.hovered == Some(item.index);
+            if pressed || hovered || selected {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
-                    color: ashen::SELECTION,
+                    color: if pressed {
+                        PRESSED
+                    } else if hovered {
+                        HOVER
+                    } else {
+                        ashen::SELECTION
+                    },
                 });
+            }
+            if selected {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, 3.0, ROW_HEIGHT),
                     color: YELLOW,
@@ -940,13 +1008,20 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
             )?;
         }
 
-        let footer = if state.status.is_empty() {
+        let footer = if !state.status.is_empty() {
+            state.status.clone()
+        } else if let Some(hovered) = state.hovered {
+            let label = active
+                .items
+                .iter()
+                .find(|item| item.index == hovered)
+                .map_or("item", |item| item.label.as_str());
+            format!("Click to select {}", truncate(label, 42))
+        } else {
             format!(
                 "{} matches  ·  ↑↓ move  ·  Enter select  ·  Esc cancel",
                 filtered.len()
             )
-        } else {
-            state.status.clone()
         };
         let footer_y = state.height - FOOTER_HEIGHT;
         packet.push(Command::FillRoundedRect {

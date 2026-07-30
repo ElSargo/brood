@@ -70,14 +70,23 @@ static uint32_t parse_coordinate(const char *value, const char *name) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: virtual-pointer-click X Y WIDTH HEIGHT\n");
+    if (argc != 5 && argc != 8) {
+        fprintf(
+            stderr,
+            "usage: virtual-pointer-click X Y WIDTH HEIGHT [HOLD_MS RELEASE_X RELEASE_Y]\n"
+        );
         return 2;
     }
     const uint32_t x = parse_coordinate(argv[1], "x");
     const uint32_t y = parse_coordinate(argv[2], "y");
     const uint32_t width = parse_coordinate(argv[3], "width");
     const uint32_t height = parse_coordinate(argv[4], "height");
+    const uint32_t hold_milliseconds =
+        argc == 8 ? parse_coordinate(argv[5], "hold milliseconds") : 0;
+    const uint32_t release_x =
+        argc == 8 ? parse_coordinate(argv[6], "release x") : x;
+    const uint32_t release_y =
+        argc == 8 ? parse_coordinate(argv[7], "release y") : y;
     if (width == 0 || height == 0) {
         fprintf(stderr, "pointer extents must be non-zero\n");
         return 2;
@@ -139,7 +148,32 @@ int main(int argc, char **argv) {
         wl_display_disconnect(display);
         return 1;
     }
-    zwlr_virtual_pointer_v1_button(pointer, time + 2, 0x110, 0);
+    if (hold_milliseconds != 0) {
+        const struct timespec hold = {
+            .tv_sec = hold_milliseconds / 1000,
+            .tv_nsec = (long)(hold_milliseconds % 1000) * 1000000,
+        };
+        nanosleep(&hold, NULL);
+        zwlr_virtual_pointer_v1_motion_absolute(
+            pointer,
+            monotonic_msec(),
+            release_x,
+            release_y,
+            width,
+            height
+        );
+        zwlr_virtual_pointer_v1_frame(pointer);
+        if (wl_display_roundtrip(display) < 0) {
+            fprintf(stderr, "virtual pointer release motion failed\n");
+            zwlr_virtual_pointer_v1_destroy(pointer);
+            zwlr_virtual_pointer_manager_v1_destroy(manager);
+            wl_seat_destroy(seat);
+            wl_registry_destroy(registry);
+            wl_display_disconnect(display);
+            return 1;
+        }
+    }
+    zwlr_virtual_pointer_v1_button(pointer, monotonic_msec(), 0x110, 0);
     zwlr_virtual_pointer_v1_frame(pointer);
     if (wl_display_roundtrip(display) < 0) {
         fprintf(stderr, "virtual pointer click failed\n");

@@ -44,6 +44,8 @@ const INBOX_WIDTH: f64 = 320.0;
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
 const SURFACE_RAISED: Color = ashen::SURFACE_RAISED;
+const HOVER: Color = ashen::INTERACTIVE_HOVER;
+const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
 const ACTIVE: Color = ashen::CURSOR_LINE;
 const BORDER: Color = ashen::BORDER;
 const FG: Color = ashen::TEXT;
@@ -134,6 +136,15 @@ enum ListItem {
     Session(usize),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SwitcherTarget {
+    NewSession,
+    ProjectToggle(u64, String),
+    ProjectWorktree(u64, String),
+    Session(u64, u64),
+    SessionClose(u64, u64),
+}
+
 struct SwitcherState {
     is_root: bool,
     can_create_local: bool,
@@ -169,6 +180,8 @@ struct SwitcherState {
     picker_pane: Option<u64>,
     picker_visible: bool,
     inbox_pane: Option<u64>,
+    hovered: Option<SwitcherTarget>,
+    pressed: Option<SwitcherTarget>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -457,6 +470,8 @@ impl SwitcherState {
             picker_pane: None,
             picker_visible: false,
             inbox_pane: None,
+            hovered: None,
+            pressed: None,
         }
     }
 
@@ -1086,6 +1101,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(240.0);
             state.height = resized.height.max(240.0);
+            state.hovered = None;
+            state.pressed = None;
             state.ensure_selected_visible();
             redraw_or_record_error(&mut state);
             Vec::new()
@@ -1100,10 +1117,52 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     workspace_focus
                 };
             }
+            if !focused.focused {
+                state.hovered = None;
+                state.pressed = None;
+                redraw_or_record_error(&mut state);
+            }
             Vec::new()
         }
-        PresentationEvent::PointerButton(button) if button.pane == state.pane && button.pressed => {
-            let commands = handle_pointer_button(&mut state, button.x, button.y, button.button);
+        PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
+            let hovered = switcher_target_at(&state, moved.x, moved.y);
+            if state.hovered != hovered {
+                state.hovered = hovered;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
+            if state.hovered.take().is_some() || state.pressed.take().is_some() {
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        PresentationEvent::PointerButton(button)
+            if button.pane == state.pane && button.button == LEFT_BUTTON =>
+        {
+            let target = switcher_target_at(&state, button.x, button.y);
+            let commands = if button.pressed {
+                state.hovered.clone_from(&target);
+                state.pressed = target;
+                Vec::new()
+            } else {
+                let pressed = state.pressed.take();
+                state.hovered.clone_from(&target);
+                match (pressed, target) {
+                    (Some(pressed), Some(released)) if pressed == released => {
+                        activate_switcher_target(&mut state, pressed)
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            redraw_or_record_error(&mut state);
+            commands
+        }
+        PresentationEvent::PointerButton(button)
+            if button.pane == state.pane && button.pressed && button.button == RIGHT_BUTTON =>
+        {
+            let commands = handle_secondary_click(&mut state, button.x, button.y);
             redraw_or_record_error(&mut state);
             commands
         }
@@ -2337,18 +2396,20 @@ fn publish_layout(
     commands
 }
 
-fn handle_pointer_button(
-    state: &mut SwitcherState,
-    x: f32,
-    y: f32,
-    button: u32,
-) -> Vec<ActorCommand> {
+fn switcher_target_at(state: &SwitcherState, x: f32, y: f32) -> Option<SwitcherTarget> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || x >= state.width {
+        return None;
+    }
     let header = header_geometry(state.width);
-    if y < HEADER_HEIGHT && x >= header.button_x && button == LEFT_BUTTON {
-        return open_creation_backend_picker(state);
+    if (10.0..42.0).contains(&y)
+        && x >= header.button_x
+        && x < header.button_x + header.button_width
+        && state.pending.is_none()
+    {
+        return Some(SwitcherTarget::NewSession);
     }
     if y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
-        return Vec::new();
+        return None;
     }
     let items = state.list_items();
     let mut item_y = HEADER_HEIGHT;
@@ -2358,49 +2419,96 @@ fn handle_pointer_button(
         item_y += height;
         hit
     });
-    let Some(item) = item.cloned() else {
-        return Vec::new();
-    };
+    let item = item.cloned()?;
     if let ListItem::Project(project) = item {
-        if button != LEFT_BUTTON {
-            return Vec::new();
-        }
         if x >= state.width - 48.0 && project.git {
-            begin_worktree(state, &project);
+            Some(SwitcherTarget::ProjectWorktree(project.backend, project.id))
         } else {
-            let project_key = format!("{}:{}", project.backend, project.id);
+            Some(SwitcherTarget::ProjectToggle(project.backend, project.id))
+        }
+    } else if let ListItem::Session(index) = item {
+        let session = state.sessions[index].clone();
+        if x >= state.width - 48.0 {
+            Some(SwitcherTarget::SessionClose(session.backend, session.id))
+        } else {
+            Some(SwitcherTarget::Session(session.backend, session.id))
+        }
+    } else {
+        None
+    }
+}
+
+fn activate_switcher_target(
+    state: &mut SwitcherState,
+    target: SwitcherTarget,
+) -> Vec<ActorCommand> {
+    match target {
+        SwitcherTarget::NewSession => open_creation_backend_picker(state),
+        SwitcherTarget::ProjectToggle(backend, project) => {
+            let project_key = format!("{backend}:{project}");
             if !state.collapsed_projects.remove(&project_key) {
                 state.collapsed_projects.insert(project_key);
             }
             state.scroll = state.scroll.min(state.list_items().len().saturating_sub(1));
+            state.ensure_selected_visible();
+            Vec::new()
         }
-        state.ensure_selected_visible();
-        return Vec::new();
+        SwitcherTarget::ProjectWorktree(backend, project) => {
+            if let Some(project) = state
+                .project_groups()
+                .into_iter()
+                .find(|candidate| candidate.backend == backend && candidate.id == project)
+            {
+                begin_worktree(state, &project);
+            }
+            Vec::new()
+        }
+        SwitcherTarget::Session(backend, session) => {
+            let Some(session) = state
+                .sessions
+                .iter()
+                .find(|candidate| candidate.backend == backend && candidate.id == session)
+                .cloned()
+            else {
+                return Vec::new();
+            };
+            state.selected = Some((session.backend, session.id));
+            let request = state.next_request();
+            vec![backend_session_command(
+                request,
+                session.backend,
+                "activate",
+                Some(session.id),
+                None,
+                None,
+            )]
+        }
+        SwitcherTarget::SessionClose(backend, session) => {
+            state.selected = Some((backend, session));
+            close_selected(state)
+        }
     }
-    let ListItem::Session(index) = item else {
+}
+
+fn handle_secondary_click(state: &mut SwitcherState, x: f32, y: f32) -> Vec<ActorCommand> {
+    let Some(target) = switcher_target_at(state, x, y) else {
         return Vec::new();
     };
-    let session = state.sessions[index].clone();
-    state.selected = Some((session.backend, session.id));
-    if button == RIGHT_BUTTON {
+    let (backend, session) = match target {
+        SwitcherTarget::Session(backend, session)
+        | SwitcherTarget::SessionClose(backend, session) => (backend, session),
+        _ => return Vec::new(),
+    };
+    if let Some(session) = state
+        .sessions
+        .iter()
+        .find(|candidate| candidate.backend == backend && candidate.id == session)
+        .cloned()
+    {
+        state.selected = Some((backend, session.id));
         begin_rename(state, &session);
-        return Vec::new();
     }
-    if button != LEFT_BUTTON {
-        return Vec::new();
-    }
-    if x >= state.width - 48.0 {
-        return close_selected(state);
-    }
-    let request = state.next_request();
-    vec![backend_session_command(
-        request,
-        session.backend,
-        "activate",
-        Some(session.id),
-        None,
-        None,
-    )]
+    Vec::new()
 }
 
 fn handle_key(state: &mut SwitcherState, logical_key: &str) -> Vec<ActorCommand> {
@@ -2748,11 +2856,18 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         header.input_width - 16.0,
     )?;
 
+    let new_target = SwitcherTarget::NewSession;
+    let new_pressed = state.pressed.as_ref() == Some(&new_target);
+    let new_hovered = state.hovered.as_ref() == Some(&new_target);
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(header.button_x, 10.0, header.button_width, 32.0),
         radius: 4.0,
         color: if state.pending.is_some() {
             SURFACE_RAISED
+        } else if new_pressed {
+            PRESSED
+        } else if new_hovered {
+            ashen::ACCENT_GLOW
         } else {
             YELLOW
         },
@@ -2771,7 +2886,7 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         11.0,
         if state.pending.is_some() { MUTED } else { BG },
         header.button_x + 5.0,
-        16.0,
+        if new_pressed { 17.0 } else { 16.0 },
         header.button_width - 10.0,
     )?;
 
@@ -2788,9 +2903,21 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
     for item in items.iter().skip(state.scroll).take(visible) {
         match item {
             ListItem::Project(project) => {
+                let toggle_target =
+                    SwitcherTarget::ProjectToggle(project.backend, project.id.clone());
+                let worktree_target =
+                    SwitcherTarget::ProjectWorktree(project.backend, project.id.clone());
+                let toggle_pressed = state.pressed.as_ref() == Some(&toggle_target);
+                let toggle_hovered = state.hovered.as_ref() == Some(&toggle_target);
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, state.width, PROJECT_ROW_HEIGHT),
-                    color: SURFACE,
+                    color: if toggle_pressed {
+                        PRESSED
+                    } else if toggle_hovered {
+                        HOVER
+                    } else {
+                        SURFACE
+                    },
                 });
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y + PROJECT_ROW_HEIGHT - 1.0, state.width, 1.0),
@@ -2833,6 +2960,15 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                     24.0,
                 )?;
                 if project.git {
+                    let worktree_pressed = state.pressed.as_ref() == Some(&worktree_target);
+                    let worktree_hovered = state.hovered.as_ref() == Some(&worktree_target);
+                    if worktree_pressed || worktree_hovered {
+                        packet.push(Command::FillRoundedRect {
+                            rect: Rect::new(state.width - 44.0, y + 4.0, 32.0, 26.0),
+                            radius: 4.0,
+                            color: if worktree_pressed { PRESSED } else { HOVER },
+                        });
+                    }
                     add_text(
                         state,
                         &mut packet,
@@ -2849,6 +2985,10 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             ListItem::Session(index) => {
                 let session = state.sessions[*index].clone();
                 let selected = state.selected == Some((session.backend, session.id));
+                let row_target = SwitcherTarget::Session(session.backend, session.id);
+                let close_target = SwitcherTarget::SessionClose(session.backend, session.id);
+                let row_pressed = state.pressed.as_ref() == Some(&row_target);
+                let row_hovered = state.hovered.as_ref() == Some(&row_target);
                 let name_x = SIDE_MARGIN + 12.0;
                 let close_x = state.width - 38.0;
                 let show_window_count = state.width >= 220.0;
@@ -2859,15 +2999,21 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                     close_x - 8.0
                 };
                 let name_width = (name_right - name_x).max(1.0);
-                if session.active || selected {
+                if row_pressed || row_hovered || session.active || selected {
                     packet.push(Command::FillRect {
                         rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
-                        color: if session.active {
+                        color: if row_pressed {
+                            PRESSED
+                        } else if row_hovered {
+                            HOVER
+                        } else if session.active {
                             ashen::SELECTION
                         } else {
                             ACTIVE
                         },
                     });
+                }
+                if session.active || selected {
                     packet.push(Command::FillRect {
                         rect: Rect::new(0.0, y, 3.0, ROW_HEIGHT),
                         color: YELLOW,
@@ -2877,6 +3023,15 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
                     rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
                     color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.38),
                 });
+                let close_pressed = state.pressed.as_ref() == Some(&close_target);
+                let close_hovered = state.hovered.as_ref() == Some(&close_target);
+                if close_pressed || close_hovered {
+                    packet.push(Command::FillRoundedRect {
+                        rect: Rect::new(close_x - 6.0, y + 3.0, 30.0, 24.0),
+                        radius: 4.0,
+                        color: if close_pressed { PRESSED } else { HOVER },
+                    });
+                }
                 add_text(
                     state,
                     &mut packet,
@@ -2950,6 +3105,16 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
     });
     let footer = if !state.status.is_empty() {
         state.status.clone()
+    } else if let Some(target) = state.hovered.as_ref() {
+        match target {
+            SwitcherTarget::NewSession => "Create or connect a session".to_string(),
+            SwitcherTarget::ProjectToggle(..) => "Expand or collapse this project".to_string(),
+            SwitcherTarget::ProjectWorktree(..) => {
+                "Create a worktree session in this project".to_string()
+            }
+            SwitcherTarget::Session(..) => "Click to open this session".to_string(),
+            SwitcherTarget::SessionClose(..) => "Close this session".to_string(),
+        }
     } else if items.is_empty() {
         "No match — Enter creates it".to_string()
     } else {

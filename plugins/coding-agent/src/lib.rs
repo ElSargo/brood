@@ -31,6 +31,8 @@ const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
 const PANEL_LIGHT: Color = ashen::SURFACE_RAISED;
+const HOVER: Color = ashen::INTERACTIVE_HOVER;
+const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
 const FG: Color = ashen::TEXT;
 const MUTED: Color = ashen::MUTED;
 const YELLOW: Color = ashen::WARNING;
@@ -157,6 +159,14 @@ impl AgentView {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UiTarget {
+    AgentTab(usize),
+    Model,
+    Reasoning,
+    Send,
+}
+
 struct UiState {
     pane: u64,
     width: f32,
@@ -174,6 +184,8 @@ struct UiState {
     draw_error: Option<String>,
     updates_since_draw: usize,
     error: String,
+    hovered: Option<UiTarget>,
+    pressed: Option<UiTarget>,
 }
 
 impl UiState {
@@ -195,6 +207,8 @@ impl UiState {
             draw_error: None,
             updates_since_draw: 0,
             error: String::new(),
+            hovered: None,
+            pressed: None,
         }
     }
 
@@ -760,6 +774,13 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         PresentationEvent::PaneResized(resized) if resized.pane == ui.pane => {
             ui.width = resized.width.max(480.0);
             ui.height = resized.height.max(360.0);
+            ui.hovered = None;
+            ui.pressed = None;
+            (Vec::new(), true)
+        }
+        PresentationEvent::PaneFocused(focused) if focused.pane == ui.pane && !focused.focused => {
+            ui.hovered = None;
+            ui.pressed = None;
             (Vec::new(), true)
         }
         PresentationEvent::Key(key) if key.pane == ui.pane => {
@@ -791,10 +812,35 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             (commands, true)
         }
+        PresentationEvent::PointerMoved(moved) if moved.pane == ui.pane => {
+            let hovered = ui_target_at(ui, moved.x, moved.y);
+            let changed = ui.hovered != hovered;
+            ui.hovered = hovered;
+            (Vec::new(), changed)
+        }
+        PresentationEvent::PointerLeft(left) if left.pane == ui.pane => {
+            let changed = ui.hovered.take().is_some() || ui.pressed.take().is_some();
+            (Vec::new(), changed)
+        }
         PresentationEvent::PointerButton(button)
-            if button.pane == ui.pane && button.pressed && button.button == LEFT_BUTTON =>
+            if button.pane == ui.pane && button.button == LEFT_BUTTON =>
         {
-            (handle_ui_click(ui, button.x, button.y), true)
+            let target = ui_target_at(ui, button.x, button.y);
+            if button.pressed {
+                ui.hovered.clone_from(&target);
+                ui.pressed = target;
+                (Vec::new(), true)
+            } else {
+                let pressed = ui.pressed.take();
+                ui.hovered.clone_from(&target);
+                let commands = match (pressed, target) {
+                    (Some(pressed), Some(released)) if pressed == released => {
+                        activate_ui_target(ui, pressed)
+                    }
+                    _ => Vec::new(),
+                };
+                (commands, true)
+            }
         }
         _ => (Vec::new(), false),
     };
@@ -944,18 +990,73 @@ fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool) -> Vec<ActorCommand
     }
 }
 
-fn handle_ui_click(ui: &mut UiState, x: f32, y: f32) -> Vec<ActorCommand> {
-    if y < 44.0 {
-        let index = ((x - 12.0) / 164.0).floor().max(0.0) as usize;
-        if index < ui.agents.len() {
-            ui.selected = index;
+fn ui_target_at(ui: &UiState, x: f32, y: f32) -> Option<UiTarget> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    for index in 0..ui.agents.len() {
+        if rect_contains(agent_tab_rect(ui, index), x, y) {
+            return Some(UiTarget::AgentTab(index));
         }
-        return Vec::new();
     }
-    if y > ui.height - 64.0 && x > ui.width - 112.0 {
-        return submit_prompt(ui).into_iter().collect();
+    let (model, reasoning) = toolbar_control_rects(ui.width);
+    if ui.selected_agent().is_some() && rect_contains(model, x, y) {
+        return Some(UiTarget::Model);
     }
-    Vec::new()
+    if ui.selected_agent().is_some() && rect_contains(reasoning, x, y) {
+        return Some(UiTarget::Reasoning);
+    }
+    if can_submit(ui) && rect_contains(send_button_rect(ui), x, y) {
+        return Some(UiTarget::Send);
+    }
+    None
+}
+
+fn activate_ui_target(ui: &mut UiState, target: UiTarget) -> Vec<ActorCommand> {
+    match target {
+        UiTarget::AgentTab(index) if index < ui.agents.len() => {
+            ui.selected = index;
+            Vec::new()
+        }
+        UiTarget::Model => configure_selected(ui, true).into_iter().collect(),
+        UiTarget::Reasoning => configure_selected(ui, false).into_iter().collect(),
+        UiTarget::Send => submit_prompt(ui).into_iter().collect(),
+        UiTarget::AgentTab(_) => Vec::new(),
+    }
+}
+
+fn agent_tab_width(ui: &UiState) -> f32 {
+    if ui.agents.is_empty() {
+        152.0
+    } else {
+        ((ui.width - 24.0) / ui.agents.len() as f32).clamp(48.0, 152.0)
+    }
+}
+
+fn agent_tab_rect(ui: &UiState, index: usize) -> Rect {
+    let width = agent_tab_width(ui);
+    Rect::new(12.0 + index as f32 * (width + 4.0), 8.0, width, 28.0)
+}
+
+fn toolbar_control_rects(width: f32) -> (Rect, Rect) {
+    let content_width = (width - 32.0).max(1.0);
+    let status_width = (content_width * 0.25).clamp(110.0, 190.0);
+    let control_width = ((content_width - status_width - 16.0) * 0.5).clamp(96.0, 250.0);
+    let model = Rect::new(16.0 + status_width + 8.0, 52.0, control_width, 32.0);
+    let reasoning = Rect::new(model.x + model.width + 8.0, 52.0, control_width, 32.0);
+    (model, reasoning)
+}
+
+fn send_button_rect(ui: &UiState) -> Rect {
+    Rect::new(ui.width - 104.0, ui.height - 68.0, 80.0, 38.0)
+}
+
+fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+fn can_submit(ui: &UiState) -> bool {
+    ui.session_id != 0 && ui.selected_agent().is_some() && !ui.prompt.trim().is_empty()
 }
 
 fn submit_prompt(ui: &mut UiState) -> Option<ActorCommand> {
@@ -1102,17 +1203,19 @@ fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
         color: PANEL,
     });
     let agents = ui.agents.clone();
-    let tab_width = if agents.is_empty() {
-        152.0
-    } else {
-        ((ui.width - 24.0) / agents.len() as f32).clamp(48.0, 152.0)
-    };
     for (index, agent) in agents.iter().enumerate() {
-        let x = 12.0 + index as f32 * (tab_width + 4.0);
+        let rect = agent_tab_rect(ui, index);
+        let target = UiTarget::AgentTab(index);
+        let pressed = ui.pressed.as_ref() == Some(&target);
+        let hovered = ui.hovered.as_ref() == Some(&target);
         packet.push(Command::FillRoundedRect {
-            rect: Rect::new(x, 8.0, tab_width, 28.0),
+            rect,
             radius: 5.0,
-            color: if index == ui.selected {
+            color: if pressed {
+                PRESSED
+            } else if hovered {
+                HOVER
+            } else if index == ui.selected {
                 BLUE
             } else {
                 PANEL_LIGHT
@@ -1122,10 +1225,10 @@ fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
             ui,
             packet,
             agent,
-            x + 7.0,
-            12.0,
+            rect.x + 7.0,
+            if pressed { 13.0 } else { 12.0 },
             14.0,
-            (tab_width - 14.0).max(24.0),
+            (rect.width - 14.0).max(24.0),
             FG,
         );
     }
@@ -1155,6 +1258,7 @@ fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
         rect: Rect::new(0.0, 44.0, ui.width, 48.0),
         color: PANEL_LIGHT,
     });
+    let (model_rect, reasoning_rect) = toolbar_control_rects(ui.width);
     draw_text(
         ui,
         packet,
@@ -1162,28 +1266,61 @@ fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
         16.0,
         59.0,
         14.0,
-        190.0,
+        (model_rect.x - 32.0).max(80.0),
         if status == "running" { GREEN } else { FG },
     );
-    draw_text(
+    draw_toolbar_button(
         ui,
         packet,
-        &format!("F6 model  {model}"),
-        220.0,
-        59.0,
-        14.0,
-        240.0,
+        UiTarget::Model,
+        model_rect,
+        &format!("Model  {model}"),
         BLUE,
     );
+    draw_toolbar_button(
+        ui,
+        packet,
+        UiTarget::Reasoning,
+        reasoning_rect,
+        &format!("Reasoning  {reasoning}"),
+        YELLOW,
+    );
+}
+
+fn draw_toolbar_button(
+    ui: &mut UiState,
+    packet: &mut Packet,
+    target: UiTarget,
+    rect: Rect,
+    label: &str,
+    label_color: Color,
+) {
+    let pressed = ui.pressed.as_ref() == Some(&target);
+    let hovered = ui.hovered.as_ref() == Some(&target);
+    packet.push(Command::FillRoundedRect {
+        rect,
+        radius: 5.0,
+        color: if pressed {
+            PRESSED
+        } else if hovered {
+            HOVER
+        } else {
+            PANEL
+        },
+    });
     draw_text(
         ui,
         packet,
-        &format!("F7 reasoning  {reasoning}"),
-        480.0,
-        59.0,
-        14.0,
-        260.0,
-        YELLOW,
+        label,
+        rect.x + 9.0,
+        rect.y + if pressed { 8.0 } else { 7.0 },
+        13.0,
+        rect.width - 18.0,
+        if ui.selected_agent().is_some() {
+            label_color
+        } else {
+            MUTED
+        },
     );
 }
 
@@ -1247,20 +1384,32 @@ fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
         (ui.width - 150.0).max(100.0),
         FG,
     );
+    let send_rect = send_button_rect(ui);
+    let send_pressed = ui.pressed.as_ref() == Some(&UiTarget::Send);
+    let send_hovered = ui.hovered.as_ref() == Some(&UiTarget::Send);
+    let send_enabled = can_submit(ui);
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(ui.width - 104.0, y + 10.0, 80.0, 38.0),
+        rect: send_rect,
         radius: 7.0,
-        color: GREEN,
+        color: if !send_enabled {
+            PANEL_LIGHT
+        } else if send_pressed {
+            PRESSED
+        } else if send_hovered {
+            ashen::ACCENT_GLOW
+        } else {
+            GREEN
+        },
     });
     draw_text(
         ui,
         packet,
-        "Enter",
+        if send_enabled { "Send" } else { "Enter" },
         ui.width - 88.0,
-        y + 19.0,
+        y + if send_pressed { 20.0 } else { 19.0 },
         14.0,
         56.0,
-        PANEL,
+        if send_enabled { PANEL } else { MUTED },
     );
 }
 

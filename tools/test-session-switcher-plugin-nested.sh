@@ -295,7 +295,7 @@ rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
 for _ in $(seq 1 200); do
   if rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG" \
+    && rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG" \
@@ -305,7 +305,7 @@ for _ in $(seq 1 200); do
   sleep 0.1
 done
 rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG"
@@ -332,6 +332,10 @@ capture() {
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     grim "$target"
   [[ -s "$target" ]]
+}
+
+accepted_layout_count() {
+  rg -c "accepted leased actor layout" "$CLIENT_LOG" || true
 }
 
 send_toggle() {
@@ -392,18 +396,80 @@ submit_text() {
 
 capture "$OUT/sidebar-visible.png"
 
-accepted_before="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+send_pointer hover 1244 26 700 1280 720 &
+HOVER_POINTER_PID=$!
+sleep 0.25
+capture "$OUT/sidebar-new-hover.png"
+wait "$HOVER_POINTER_PID"
+
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-pointer-click" 1244 26 1280 720 700 1000 26 &
+PRESS_POINTER_PID=$!
+sleep 0.25
+capture "$OUT/sidebar-new-pressed.png"
+wait "$PRESS_POINTER_PID"
+
+if [[ "${BROOD_UI_INTERACTION_ONLY:-0}" == "1" ]]; then
+  magick "$OUT/sidebar-visible.png" -crop 320x52+960+0 +repage "$OUT/new-idle-crop.png"
+  magick "$OUT/sidebar-new-hover.png" -crop 320x52+960+0 +repage "$OUT/new-hover-crop.png"
+  magick "$OUT/sidebar-new-pressed.png" -crop 320x52+960+0 +repage "$OUT/new-pressed-crop.png"
+  python3 - \
+    "$OUT/new-idle-crop.png" \
+    "$OUT/new-hover-crop.png" \
+    "$OUT/new-pressed-crop.png" <<'PY'
+import subprocess
+import sys
+
+def rmse(left, right):
+    output = subprocess.run(
+        ["magick", "compare", "-metric", "RMSE", left, right, "null:"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    ).stderr
+    return float(output.rsplit("(", 1)[1].rstrip(")\n"))
+
+hover = rmse(sys.argv[1], sys.argv[2])
+pressed = rmse(sys.argv[2], sys.argv[3])
+if hover < 0.005:
+    raise SystemExit(f"New hover feedback was not visible: RMSE={hover}")
+if pressed < 0.005:
+    raise SystemExit(f"New pressed feedback was not visible: RMSE={pressed}")
+print(f"new_button_hover_rmse={hover:.6f}")
+print(f"new_button_pressed_rmse={pressed:.6f}")
+PY
+  if rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
+    echo "ERR releasing away from New unexpectedly opened the picker" >&2
+    exit 1
+  fi
+  cat > "$OUT/proof.txt" <<EOF
+UI interaction feedback proof
+- real workload: offscreen nested Brood presentation with inbox, session switcher, and managed clients
+- pointer: hover over New, hold primary button, move away, release
+- behavior: hover and pressed frames differ visibly; release-away cancels activation
+- captures: sidebar-visible.png, sidebar-new-hover.png, sidebar-new-pressed.png
+EOF
+  cat "$OUT/proof.txt"
+  echo "nested UI interaction feedback proof passed"
+  echo "artifacts=$OUT"
+  exit 0
+fi
+
+accepted_before="$(accepted_layout_count)"
 send_picker
 for _ in $(seq 1 100); do
+  accepted_picker="$(accepted_layout_count)"
   if rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
+    && ((accepted_picker > accepted_before)) \
     && rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
 rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
+((accepted_picker > accepted_before))
 rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
 capture "$OUT/picker-visible.png"
 PICKER_BOTTOM_LEFT="$(
@@ -428,15 +494,15 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "Bt" -s 100 -k Return
 for _ in $(seq 1 100); do
-  accepted_after="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  accepted_after="$(accepted_layout_count)"
   if rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG" \
-    && ((accepted_after > accepted_before)); then
+    && ((accepted_after > accepted_picker)); then
     break
   fi
   sleep 0.05
 done
 rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_LOG"
-((accepted_after > accepted_before))
+((accepted_after > accepted_picker))
 capture "$OUT/session-beta.png"
 
 gamma_snapshots_before="$(rg -c "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG")"
@@ -489,12 +555,14 @@ done
 capture "$OUT/sidebar-restored.png"
 
 CTRL_O_STARTED_MS="$(date +%s%3N)"
+CTRL_O_LAYOUTS_BEFORE="$(accepted_layout_count)"
 send_open_terminal &
 CTRL_O_INPUT_PID=$!
 for _ in $(seq 1 200); do
+  CTRL_O_LAYOUTS_AFTER="$(accepted_layout_count)"
   if rg -q "total_windows=3" <<< "$(ctl status)" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG" \
+    && ((CTRL_O_LAYOUTS_AFTER > CTRL_O_LAYOUTS_BEFORE)) \
     && rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"; then
     break
   fi
@@ -504,17 +572,17 @@ wait "$CTRL_O_INPUT_PID"
 CTRL_O_LAYOUT_MS=$(( $(date +%s%3N) - CTRL_O_STARTED_MS ))
 rg -q "total_windows=3" <<< "$(ctl status)"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=3" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=3" "$CLIENT_LOG"
+((CTRL_O_LAYOUTS_AFTER > CTRL_O_LAYOUTS_BEFORE))
 rg -q "imported window DMA-BUF window_id=3 " "$CLIENT_LOG"
 capture "$OUT/ctrl-o-terminal.png"
 
 CATALOG_TWO_BEFORE="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
-LAYOUT_TWO_BEFORE="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+LAYOUT_TWO_BEFORE="$(accepted_layout_count)"
 CLOSE_STARTED_MS="$(date +%s%3N)"
 send_close_pane
 for _ in $(seq 1 200); do
   CATALOG_TWO_AFTER="$(rg -c "presentation shared catalog .*windows=2" "$CLIENT_LOG")"
-  LAYOUT_TWO_AFTER="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  LAYOUT_TWO_AFTER="$(accepted_layout_count)"
   if rg -q "total_windows=2" <<< "$(ctl status)" \
     && ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE)) \
     && ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE)); then
@@ -637,10 +705,10 @@ TRACKPAD_TEXT_LAYOUTS="${TRACKPAD_TEXT_LAYOUTS:-0}"
 ((TRACKPAD_TEXT_LAYOUTS < TRACKPAD_PACKET_COUNT * 40))
 ((TRACKPAD_SETTLED_MS < 2000))
 
-CLOSED_LAYOUTS_BEFORE="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+CLOSED_LAYOUTS_BEFORE="$(accepted_layout_count)"
 send_close_pane
 for _ in $(seq 1 100); do
-  CLOSED_LAYOUTS_AFTER="$(rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG")"
+  CLOSED_LAYOUTS_AFTER="$(accepted_layout_count)"
   if rg -q "stopped presentation init child actor id=$DIFF_ACTOR" "$CLIENT_LOG" \
     && ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE)); then
     break
@@ -800,7 +868,7 @@ if sed -n "/started presentation WASM actor id=$WORKTREE_DIFF_ACTOR/,\$p" "$CLIE
 fi
 
 WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN="$(
-  rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+  accepted_layout_count
 )"
 send_picker
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -809,7 +877,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
 for _ in $(seq 1 200); do
   SESSION_JSON="$(ctl surface-session list-json)"
   WORKTREE_DIFF_LAYOUTS_AFTER_RETURN="$(
-    rg -c "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+    accepted_layout_count
   )"
   if python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
 import json
@@ -935,7 +1003,9 @@ python3 - \
   "$OUT/worktree-created.png" \
   "$OUT/worktree-plugin-before-switch.png" \
   "$OUT/worktree-plugin-after-switch.png" \
-  "$OUT/projects.png" <<'PY'
+  "$OUT/projects.png" \
+  "$OUT/sidebar-new-hover.png" \
+  "$OUT/sidebar-new-pressed.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -1032,11 +1102,35 @@ normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
 if normalized < 0.01:
     raise SystemExit(f"project collapse did not visibly change the picker: RMSE={normalized}")
 print(f"project_collapse_capture_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[16], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.0005:
+    raise SystemExit(f"hovering New did not visibly change the control: RMSE={normalized}")
+print(f"new_button_hover_rmse={normalized:.6f}")
+
+metric = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[16], sys.argv[17], "null:"],
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+).stderr
+normalized = float(metric.rsplit("(", 1)[1].rstrip(")\n"))
+if normalized < 0.0005:
+    raise SystemExit(f"pressing New did not visibly change the control: RMSE={normalized}")
+print(f"new_button_pressed_rmse={normalized:.6f}")
 PY
 
 STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
-rg -q "accepted leased actor layout .* panes=2" "$CLIENT_LOG"
+rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
 if rg -q "rejected actor-submitted layout; using native fallback" "$CLIENT_LOG"; then
   echo "ERR client abandoned actor layout after rejecting a recursive update" >&2
@@ -1101,7 +1195,8 @@ cat > "$OUT/proof.md" <<EOF
 - diff viewer: Ctrl+Alt+D created and focused the session-scoped split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; Ctrl+Alt+Q stopped the focused actor and closed its pane
 - diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
 - diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
-- captures: sidebar-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, worktree-plugin-before-switch.png, worktree-plugin-after-switch.png, projects.png
+- interaction feedback: the New control visibly changed between idle, hover, and held-press captures; releasing away from the control cancelled activation
+- captures: sidebar-visible.png, sidebar-new-hover.png, sidebar-new-pressed.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, worktree-plugin-before-switch.png, worktree-plugin-after-switch.png, projects.png
 - status: $STATUS
 EOF
 

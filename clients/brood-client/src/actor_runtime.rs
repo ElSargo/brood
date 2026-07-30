@@ -1519,6 +1519,7 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::PaneResized { pane, .. }
         | PresentationEvent::PaneFocused { pane, .. }
         | PresentationEvent::PointerMoved { pane, .. }
+        | PresentationEvent::PointerLeft { pane }
         | PresentationEvent::PointerButton { pane, .. }
         | PresentationEvent::PointerScroll { pane, .. }
         | PresentationEvent::Key { pane, .. }

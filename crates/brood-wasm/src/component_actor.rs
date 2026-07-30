@@ -2941,6 +2941,9 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
         PresentationEvent::PointerMoved { pane, x, y } => {
             abi::PresentationEvent::PointerMoved(abi::PointerMoved { pane, x, y })
         }
+        PresentationEvent::PointerLeft { pane } => {
+            abi::PresentationEvent::PointerLeft(abi::PointerLeft { pane })
+        }
         PresentationEvent::PointerButton {
             pane,
             x,
@@ -3221,6 +3224,7 @@ fn enqueue_presentation_dispatch(
         }
         PresentationEvent::PaneCreated { .. }
         | PresentationEvent::PaneFocused { .. }
+        | PresentationEvent::PointerLeft { .. }
         | PresentationEvent::PointerButton { .. }
         | PresentationEvent::PointerScroll { .. }
         | PresentationEvent::Key { .. }

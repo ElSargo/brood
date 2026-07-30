@@ -232,22 +232,28 @@ int main(int argc, char **argv) {
     bool drag = argc == 9 && strcmp(argv[1], "drag") == 0;
     bool scroll = argc == 8 && strcmp(argv[1], "scroll") == 0;
     bool click = argc == 6 && strcmp(argv[1], "click") == 0;
-    if (!drag && !scroll && !click) {
+    bool hover = argc == 7 && strcmp(argv[1], "hover") == 0;
+    if (!drag && !scroll && !click && !hover) {
         fail(
             "usage: virtual-pointer-input drag <start-x> <start-y> <end-x> "
             "<end-y> <steps> <extent-x> <extent-y> | scroll <x> <y> "
             "<delta> <steps> <extent-x> <extent-y> | click <x> <y> "
-            "<extent-x> <extent-y>"
+            "<extent-x> <extent-y> | hover <x> <y> <hold-ms> <extent-x> "
+            "<extent-y>"
         );
     }
 
     uint32_t x = parse_u32(argv[2], "x");
     uint32_t y = parse_u32(argv[3], "y");
-    double end_or_delta = click ? 0.0 : parse_double(argv[4], drag ? "end-x" : "delta");
+    double end_or_delta =
+        click || hover ? 0.0 : parse_double(argv[4], drag ? "end-x" : "delta");
     uint32_t end_y = drag ? parse_u32(argv[5], "end-y") : 0;
-    uint32_t steps = click ? 1 : parse_u32(argv[drag ? 6 : 5], "steps");
-    uint32_t extent_x = parse_u32(argv[click ? 4 : (drag ? 7 : 6)], "extent-x");
-    uint32_t extent_y = parse_u32(argv[click ? 5 : (drag ? 8 : 7)], "extent-y");
+    uint32_t steps =
+        click || hover ? 1 : parse_u32(argv[drag ? 6 : 5], "steps");
+    uint32_t extent_x =
+        parse_u32(argv[click ? 4 : (hover ? 5 : (drag ? 7 : 6))], "extent-x");
+    uint32_t extent_y =
+        parse_u32(argv[click ? 5 : (hover ? 6 : (drag ? 8 : 7))], "extent-y");
     if (steps == 0 || extent_x == 0 || extent_y == 0) {
         fail("steps and extents must be non-zero");
     }
@@ -281,7 +287,10 @@ int main(int argc, char **argv) {
         fail("the compositor rejected initial pointer motion");
     }
     usleep(50000);
-    if (click) {
+    if (hover) {
+        uint32_t hold_milliseconds = parse_u32(argv[4], "hold milliseconds");
+        usleep((useconds_t)hold_milliseconds * 1000);
+    } else if (click) {
         pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer press");

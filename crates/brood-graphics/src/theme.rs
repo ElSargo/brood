@@ -20,6 +20,8 @@ pub mod ashen {
     pub const SURFACE: Color = rgb(0x1d, 0x1d, 0x1d);
     pub const SURFACE_RAISED: Color = rgb(0x21, 0x21, 0x21);
     pub const SURFACE_SUNKEN: Color = rgb(0x15, 0x15, 0x15);
+    pub const INTERACTIVE_HOVER: Color = rgb(0x29, 0x29, 0x29);
+    pub const INTERACTIVE_PRESSED: Color = rgb(0x3b, 0x2a, 0x22);
     pub const SELECTION: Color = rgb(0x32, 0x21, 0x19);
     pub const BORDER: Color = rgb(0x53, 0x53, 0x53);
 

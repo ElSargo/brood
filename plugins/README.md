@@ -32,7 +32,10 @@ Native plugin canvases use the shared Ashen-derived tokens in
 `brood_graphics::theme::ashen`. New surfaces should map semantic roles to those
 tokens instead of defining a separate palette. Dense utility surfaces follow
 the diff viewer's layout language: compact headers and footers, flat list rows,
-subtle separators, and a narrow accent stripe for selection.
+subtle separators, and a narrow accent stripe for selection. Pointer-driven
+controls expose the same interaction cycle everywhere: a raised hover surface,
+an accent-tinted pressed surface, and activation only when the primary button
+is released over the control that received the press.
 
 `component-workspace-watch` is the Component Model filesystem-watch proof. It
 contains the current small guest-side typed-resource wrapper and maintains a

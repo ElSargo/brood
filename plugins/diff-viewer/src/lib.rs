@@ -27,11 +27,14 @@ const LEFT_BUTTON: u32 = 0x110;
 const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
 const SCROLLBAR_INSET: f32 = 5.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 5.0;
+const REFRESH_BUTTON_WIDTH: f32 = 94.0;
 const MAX_DIFF_BYTES: usize = 900 * 1024;
 const MAX_UNTRACKED_FILES: usize = 128;
 
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
+const HOVER: Color = ashen::INTERACTIVE_HOVER;
+const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
 const ACTIVE: Color = ashen::CURSOR_LINE;
 const BORDER: Color = ashen::BORDER;
 const FG: Color = ashen::TEXT;
@@ -128,6 +131,9 @@ struct ViewerState {
     next_worker: u64,
     active_worker: Option<u64>,
     scrollbar_drag: Option<ScrollbarDrag>,
+    scrollbar_hovered: bool,
+    refresh_hovered: bool,
+    refresh_pressed: bool,
     text_layouts: BTreeMap<TextLayoutKey, u64>,
 }
 
@@ -150,6 +156,9 @@ impl ViewerState {
             next_worker: FIRST_WORKER,
             active_worker: None,
             scrollbar_drag: None,
+            scrollbar_hovered: false,
+            refresh_hovered: false,
+            refresh_pressed: false,
             text_layouts: BTreeMap::new(),
         }
     }
@@ -264,15 +273,41 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.width = width;
             state.height = height;
             state.scrollbar_drag = None;
+            state.scrollbar_hovered = false;
+            state.refresh_hovered = false;
+            state.refresh_pressed = false;
             state.clamp_scroll();
             redraw_or_record_error(&mut state);
             Vec::new()
         }
-        PresentationEvent::PointerMoved(moved)
-            if moved.pane == state.pane && state.scrollbar_drag.is_some() =>
-        {
-            let drag = state.scrollbar_drag.expect("drag checked above");
-            if set_scroll_from_thumb_pointer(&mut state, moved.y, drag.pointer_offset) {
+        PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
+            let refresh_hovered =
+                !state.loading && rect_contains(refresh_button_rect(&state), moved.x, moved.y);
+            let scrollbar_hovered = scrollbar_hit(&state, moved.x, moved.y);
+            let hover_changed = state.refresh_hovered != refresh_hovered
+                || state.scrollbar_hovered != scrollbar_hovered;
+            state.refresh_hovered = refresh_hovered;
+            state.scrollbar_hovered = scrollbar_hovered;
+            let scrolled = if let Some(drag) = state.scrollbar_drag {
+                set_scroll_from_thumb_pointer(&mut state, moved.y, drag.pointer_offset)
+            } else {
+                false
+            };
+            if hover_changed || scrolled {
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
+            let changed = state.refresh_hovered
+                || state.refresh_pressed
+                || state.scrollbar_hovered
+                || state.scrollbar_drag.is_some();
+            state.refresh_hovered = false;
+            state.refresh_pressed = false;
+            state.scrollbar_hovered = false;
+            state.scrollbar_drag = None;
+            if changed {
                 redraw_or_record_error(&mut state);
             }
             Vec::new()
@@ -281,9 +316,22 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
             if !button.pressed {
-                if state.scrollbar_drag.take().is_some() {
+                let refresh = state.refresh_pressed
+                    && !state.loading
+                    && rect_contains(refresh_button_rect(&state), button.x, button.y);
+                let changed = state.refresh_pressed || state.scrollbar_drag.take().is_some();
+                state.refresh_pressed = false;
+                state.refresh_hovered = refresh;
+                let command = if refresh { state.begin_refresh() } else { None };
+                if changed || command.is_some() {
                     redraw_or_record_error(&mut state);
                 }
+                return command.into_iter().collect();
+            }
+            if !state.loading && rect_contains(refresh_button_rect(&state), button.x, button.y) {
+                state.refresh_pressed = true;
+                state.refresh_hovered = true;
+                redraw_or_record_error(&mut state);
                 return Vec::new();
             }
             let Some(geometry) = scrollbar_geometry(&state) else {
@@ -304,6 +352,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 geometry.thumb_height * 0.5
             };
             state.scrollbar_drag = Some(ScrollbarDrag { pointer_offset });
+            state.scrollbar_hovered = true;
             set_scroll_from_thumb_pointer(&mut state, button.y, pointer_offset);
             redraw_or_record_error(&mut state);
             Vec::new()
@@ -433,6 +482,7 @@ fn redraw_with_layouts(
         14.0,
         180.0,
     )?;
+    let refresh_rect = refresh_button_rect(state);
     let summary = if state.loading {
         "Refreshing…".to_string()
     } else {
@@ -449,17 +499,34 @@ fn redraw_with_layouts(
         if state.loading { MODIFIED } else { MUTED },
         142.0,
         17.0,
-        (state.width - 390.0).max(120.0),
+        (refresh_rect.x - 154.0).max(80.0),
     )?;
+    packet.push(Command::FillRoundedRect {
+        rect: refresh_rect,
+        radius: 5.0,
+        color: if state.loading {
+            ACTIVE
+        } else if state.refresh_pressed {
+            PRESSED
+        } else if state.refresh_hovered {
+            HOVER
+        } else {
+            ashen::SURFACE_RAISED
+        },
+    });
     add_text(
         &mut packet,
         &mut text_resources,
-        "R refresh   Ctrl+Alt+Q close",
+        if state.loading {
+            "Refreshing…"
+        } else {
+            "↻  Refresh"
+        },
         12.0,
-        MUTED,
-        (state.width - 220.0).max(260.0),
-        18.0,
-        204.0,
+        if state.loading { MUTED } else { FG },
+        refresh_rect.x + 10.0,
+        refresh_rect.y + if state.refresh_pressed { 8.0 } else { 7.0 },
+        refresh_rect.width - 20.0,
     )?;
 
     let content_top = HEADER_HEIGHT;
@@ -773,8 +840,47 @@ fn draw_scrollbar(state: &ViewerState, packet: &mut Packet) {
             geometry.thumb_height,
         ),
         radius: SCROLLBAR_THUMB_WIDTH * 0.5,
-        color: Color::rgba(FG.r, FG.g, FG.b, if dragging { 0.72 } else { 0.42 }),
+        color: Color::rgba(
+            FG.r,
+            FG.g,
+            FG.b,
+            if dragging {
+                0.82
+            } else if state.scrollbar_hovered {
+                0.64
+            } else {
+                0.42
+            },
+        ),
     });
+}
+
+fn refresh_button_rect(state: &ViewerState) -> Rect {
+    Rect::new(
+        state.width - REFRESH_BUTTON_WIDTH - 14.0,
+        10.0,
+        REFRESH_BUTTON_WIDTH,
+        32.0,
+    )
+}
+
+fn scrollbar_hit(state: &ViewerState, x: f32, y: f32) -> bool {
+    let Some(geometry) = scrollbar_geometry(state) else {
+        return false;
+    };
+    x >= state.width - SCROLLBAR_HIT_WIDTH
+        && x <= state.width
+        && y >= geometry.track_top
+        && y <= geometry.track_top + geometry.track_height
+}
+
+fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    x.is_finite()
+        && y.is_finite()
+        && x >= rect.x
+        && x < rect.x + rect.width
+        && y >= rect.y
+        && y < rect.y + rect.height
 }
 
 fn scrollbar_geometry(state: &ViewerState) -> Option<ScrollbarGeometry> {

@@ -25,6 +25,8 @@ const SHOW_MESSAGE: &[u8] = br#"{"kind":"inbox-action","action":"show"}"#;
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
 const SURFACE_RAISED: Color = ashen::SURFACE_RAISED;
+const HOVER: Color = ashen::INTERACTIVE_HOVER;
+const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
 const BORDER: Color = ashen::BORDER;
 const TEXT: Color = ashen::TEXT_STRONG;
 const FG: Color = ashen::TEXT;
@@ -61,6 +63,8 @@ struct InboxState {
     scroll: usize,
     text_resources: Vec<u64>,
     error: String,
+    hovered: Option<usize>,
+    pressed: Option<usize>,
 }
 
 impl InboxState {
@@ -73,6 +77,8 @@ impl InboxState {
             scroll: 0,
             text_resources: Vec::new(),
             error: String::new(),
+            hovered: None,
+            pressed: None,
         }
     }
 }
@@ -124,6 +130,8 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
     };
     push_item(&mut state.items, item);
     state.scroll = 0;
+    state.hovered = None;
+    state.pressed = None;
     redraw_or_record_error(&mut state);
     Vec::new()
 }
@@ -182,27 +190,53 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(220.0);
             state.height = resized.height.max(160.0);
+            state.hovered = None;
+            state.pressed = None;
             clamp_scroll(&mut state);
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
+            let hovered = inbox_target_at(&state, moved.y);
+            if state.hovered != hovered {
+                state.hovered = hovered;
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
+        PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
+            if state.hovered.take().is_some() || state.pressed.take().is_some() {
+                redraw_or_record_error(&mut state);
+            }
+            Vec::new()
+        }
         PresentationEvent::PointerButton(button)
-            if button.pane == state.pane && button.pressed && button.button == LEFT_BUTTON =>
+            if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
-            let index = ((button.y - HEADER_HEIGHT) / ITEM_HEIGHT).floor() as isize;
-            if index < 0 {
+            let target = inbox_target_at(&state, button.y);
+            if button.pressed {
+                state.hovered = target;
+                state.pressed = target;
+                redraw_or_record_error(&mut state);
                 return Vec::new();
             }
-            let absolute_index = state.scroll + index as usize;
-            let Some(item) = state.items.remove(absolute_index) else {
-                return Vec::new();
+            let pressed = state.pressed.take();
+            state.hovered = target;
+            let commands = match (pressed, target) {
+                (Some(pressed), Some(released)) if pressed == released => {
+                    let Some(item) = state.items.remove(pressed) else {
+                        return Vec::new();
+                    };
+                    clamp_scroll(&mut state);
+                    vec![Command::SendLocalMessage(LocalActorMessage {
+                        actor: item.target_actor,
+                        body: br#"{"kind":"focus"}"#.to_vec(),
+                    })]
+                }
+                _ => Vec::new(),
             };
-            clamp_scroll(&mut state);
             redraw_or_record_error(&mut state);
-            vec![Command::SendLocalMessage(LocalActorMessage {
-                actor: item.target_actor,
-                body: br#"{"kind":"focus"}"#.to_vec(),
-            })]
+            commands
         }
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
             let maximum = state.items.len().saturating_sub(visible_item_count(&state));
@@ -211,6 +245,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             } else if scroll.vertical > 0.0 {
                 state.scroll = state.scroll.saturating_sub(1);
             }
+            state.hovered = None;
+            state.pressed = None;
             redraw_or_record_error(&mut state);
             Vec::new()
         }
@@ -222,6 +258,16 @@ fn visible_item_count(state: &InboxState) -> usize {
     ((state.height - HEADER_HEIGHT) / ITEM_HEIGHT)
         .floor()
         .max(1.0) as usize
+}
+
+fn inbox_target_at(state: &InboxState, y: f32) -> Option<usize> {
+    if !y.is_finite() || y < HEADER_HEIGHT || y >= state.height {
+        return None;
+    }
+    let row = ((y - HEADER_HEIGHT) / ITEM_HEIGHT).floor() as usize;
+    (row < visible_item_count(state))
+        .then_some(state.scroll + row)
+        .filter(|index| *index < state.items.len())
 }
 
 fn clamp_scroll(state: &mut InboxState) {
@@ -302,10 +348,19 @@ fn redraw(state: &mut InboxState) -> Result<(), String> {
             .enumerate()
         {
             let y = HEADER_HEIGHT + index as f32 * ITEM_HEIGHT;
+            let absolute_index = state.scroll + index;
+            let pressed = state.pressed == Some(absolute_index);
+            let hovered = state.hovered == Some(absolute_index);
             packet.push(DrawCommand::FillRoundedRect {
                 rect: Rect::new(8.0, y + 7.0, state.width - 16.0, ITEM_HEIGHT - 12.0),
                 radius: 5.0,
-                color: SURFACE_RAISED,
+                color: if pressed {
+                    PRESSED
+                } else if hovered {
+                    HOVER
+                } else {
+                    SURFACE_RAISED
+                },
             });
             packet.push(DrawCommand::FillRect {
                 rect: Rect::new(8.0, y + 7.0, 3.0, ITEM_HEIGHT - 12.0),
@@ -327,6 +382,19 @@ fn redraw(state: &mut InboxState) -> Result<(), String> {
                 y + 11.0,
                 state.width - 36.0,
             )?;
+            if hovered || pressed {
+                add_text(
+                    state.pane,
+                    &mut packet,
+                    &mut resources,
+                    if pressed { "Opening…" } else { "Open  ›" },
+                    10.0,
+                    ACCENT,
+                    (state.width - 74.0).max(18.0),
+                    y + 11.0,
+                    58.0,
+                )?;
+            }
             add_text(
                 state.pane,
                 &mut packet,

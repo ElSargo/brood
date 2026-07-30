@@ -487,6 +487,7 @@ interface actor {
 
     record pane-focused { pane: u64, focused: bool }
     record pointer-moved { pane: u64, x: f32, y: f32 }
+    record pointer-left { pane: u64 }
     record pointer-button {
         pane: u64,
         x: f32,
@@ -578,6 +579,7 @@ interface actor {
         pane-resized(pane-resized),
         pane-focused(pane-focused),
         pointer-moved(pointer-moved),
+        pointer-left(pointer-left),
         pointer-button(pointer-button),
         pointer-scroll(pointer-scroll),
         key(key-event),

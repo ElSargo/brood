@@ -2355,6 +2355,13 @@ fn execute_session_command(
 }
 
 #[derive(Default)]
+struct PointerRoutingState {
+    pending_plugin_motion: Option<(u64, f32, f32)>,
+    plugin_target: Option<u64>,
+    managed_target: Option<u64>,
+}
+
+#[derive(Default)]
 struct Application {
     renderer: Option<Renderer>,
     error: Option<anyhow::Error>,
@@ -2376,8 +2383,7 @@ struct Application {
     modifiers: ModifiersState,
     window_focused: bool,
     cursor_position: Option<(f64, f64)>,
-    pending_plugin_pointer_motion: Option<(u64, f32, f32)>,
-    managed_pointer_target: Option<u64>,
+    pointer_routing: PointerRoutingState,
     pointer_grab: Option<PointerGrab>,
     wasm_runtime: Option<PresentationWasmRuntime>,
     key_policy: Option<ClientKeyPolicy>,
@@ -3110,8 +3116,7 @@ impl Application {
             cancel_pointer_grab(
                 self.wasm_runtime.as_ref(),
                 self.input_sender.as_mut(),
-                &mut self.pending_plugin_pointer_motion,
-                &mut self.managed_pointer_target,
+                &mut self.pointer_routing,
                 &mut self.pointer_grab,
                 modifier_bits(self.modifiers),
             );
@@ -3119,9 +3124,9 @@ impl Application {
                 renderer,
                 self.cursor_position,
                 &mut self.pointer_grab,
+                self.wasm_runtime.as_ref(),
                 self.input_sender.as_mut(),
-                &mut self.pending_plugin_pointer_motion,
-                &mut self.managed_pointer_target,
+                &mut self.pointer_routing,
             );
         }
         if let Some(change) = focus_change {
@@ -4370,7 +4375,7 @@ impl ApplicationHandler<ClientEvent> for Application {
         // Motion is state, so intermediate samples are disposable.
         let _motion_result = flush_presentation_pointer_motion(
             self.wasm_runtime.as_ref(),
-            &mut self.pending_plugin_pointer_motion,
+            &mut self.pointer_routing.pending_plugin_motion,
         );
         if std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO").as_deref() == Ok("1")
             && self
@@ -4456,17 +4461,21 @@ impl ApplicationHandler<ClientEvent> for Application {
                     renderer,
                     self.cursor_position,
                     &mut self.pointer_grab,
+                    self.wasm_runtime.as_ref(),
                     self.input_sender.as_mut(),
-                    &mut self.pending_plugin_pointer_motion,
-                    &mut self.managed_pointer_target,
+                    &mut self.pointer_routing,
                 );
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_position = None;
-                self.pending_plugin_pointer_motion = None;
+                self.pointer_routing.pending_plugin_motion = None;
+                send_plugin_pointer_leave(
+                    self.wasm_runtime.as_ref(),
+                    &mut self.pointer_routing.plugin_target,
+                );
                 send_managed_pointer_leave(
                     self.input_sender.as_mut(),
-                    &mut self.managed_pointer_target,
+                    &mut self.pointer_routing.managed_target,
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -4517,8 +4526,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 send_pointer_button_to_target(
                     self.wasm_runtime.as_ref(),
                     self.input_sender.as_mut(),
-                    &mut self.pending_plugin_pointer_motion,
-                    &mut self.managed_pointer_target,
+                    &mut self.pointer_routing,
                     target,
                     PointerButtonState {
                         button: button_code,
@@ -4539,9 +4547,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                         renderer,
                         self.cursor_position,
                         &mut self.pointer_grab,
+                        self.wasm_runtime.as_ref(),
                         self.input_sender.as_mut(),
-                        &mut self.pending_plugin_pointer_motion,
-                        &mut self.managed_pointer_target,
+                        &mut self.pointer_routing,
                     );
                 }
             }
@@ -4571,7 +4579,12 @@ impl ApplicationHandler<ClientEvent> for Application {
                         };
                         send_managed_pointer_leave(
                             self.input_sender.as_mut(),
-                            &mut self.managed_pointer_target,
+                            &mut self.pointer_routing.managed_target,
+                        );
+                        set_plugin_pointer_target(
+                            self.wasm_runtime.as_ref(),
+                            &mut self.pointer_routing.plugin_target,
+                            pane,
                         );
                         if let Err(error) = send_presentation_event(
                             self.wasm_runtime.as_ref(),
@@ -4588,7 +4601,11 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                     }
                     PanePointerTarget::Managed { pane, x, y } => {
-                        self.pending_plugin_pointer_motion = None;
+                        self.pointer_routing.pending_plugin_motion = None;
+                        send_plugin_pointer_leave(
+                            self.wasm_runtime.as_ref(),
+                            &mut self.pointer_routing.plugin_target,
+                        );
                         if let Some(sender) = self.input_sender.as_mut() {
                             let sent = match delta {
                                 MouseScrollDelta::LineDelta(horizontal, vertical) => send_input(
@@ -4612,7 +4629,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 }
                             };
                             if sent {
-                                self.managed_pointer_target = Some(pane);
+                                self.pointer_routing.managed_target = Some(pane);
                             }
                         }
                     }
@@ -4636,16 +4653,19 @@ impl ApplicationHandler<ClientEvent> for Application {
                     cancel_pointer_grab(
                         self.wasm_runtime.as_ref(),
                         self.input_sender.as_mut(),
-                        &mut self.pending_plugin_pointer_motion,
-                        &mut self.managed_pointer_target,
+                        &mut self.pointer_routing,
                         &mut self.pointer_grab,
                         modifier_bits(self.modifiers),
                     );
                     self.cursor_position = None;
-                    self.pending_plugin_pointer_motion = None;
+                    self.pointer_routing.pending_plugin_motion = None;
+                    send_plugin_pointer_leave(
+                        self.wasm_runtime.as_ref(),
+                        &mut self.pointer_routing.plugin_target,
+                    );
                     send_managed_pointer_leave(
                         self.input_sender.as_mut(),
-                        &mut self.managed_pointer_target,
+                        &mut self.pointer_routing.managed_target,
                     );
                 }
                 if let Some(pane) = renderer.focused_plugin_pane()
@@ -5597,9 +5617,9 @@ fn route_pointer_motion(
     renderer: &Renderer,
     cursor_position: Option<(f64, f64)>,
     grab: &mut Option<PointerGrab>,
+    runtime: Option<&PresentationWasmRuntime>,
     input_sender: Option<&mut InputLane>,
-    pending_plugin_pointer_motion: &mut Option<(u64, f32, f32)>,
-    managed_pointer_target: &mut Option<u64>,
+    routing: &mut PointerRoutingState,
 ) {
     let target = pointer_target_for_cursor(renderer, cursor_position, grab.as_ref());
     if let (Some(grab), Some(target)) = (grab.as_mut(), target) {
@@ -5607,11 +5627,13 @@ fn route_pointer_motion(
     }
     match target {
         Some(PanePointerTarget::Plugin { pane, x, y }) => {
-            *pending_plugin_pointer_motion = Some((pane, x, y));
-            send_managed_pointer_leave(input_sender, managed_pointer_target);
+            set_plugin_pointer_target(runtime, &mut routing.plugin_target, pane);
+            routing.pending_plugin_motion = Some((pane, x, y));
+            send_managed_pointer_leave(input_sender, &mut routing.managed_target);
         }
         Some(PanePointerTarget::Managed { pane, x, y }) => {
-            *pending_plugin_pointer_motion = None;
+            routing.pending_plugin_motion = None;
+            send_plugin_pointer_leave(runtime, &mut routing.plugin_target);
             if let Some(sender) = input_sender
                 && send_input(
                     sender,
@@ -5620,12 +5642,13 @@ fn route_pointer_motion(
                     }),
                 )
             {
-                *managed_pointer_target = Some(pane);
+                routing.managed_target = Some(pane);
             }
         }
         None => {
-            *pending_plugin_pointer_motion = None;
-            send_managed_pointer_leave(input_sender, managed_pointer_target);
+            routing.pending_plugin_motion = None;
+            send_plugin_pointer_leave(runtime, &mut routing.plugin_target);
+            send_managed_pointer_leave(input_sender, &mut routing.managed_target);
         }
     }
 }
@@ -5633,15 +5656,15 @@ fn route_pointer_motion(
 fn send_pointer_button_to_target(
     runtime: Option<&PresentationWasmRuntime>,
     input_sender: Option<&mut InputLane>,
-    pending_plugin_pointer_motion: &mut Option<(u64, f32, f32)>,
-    managed_pointer_target: &mut Option<u64>,
+    routing: &mut PointerRoutingState,
     target: PanePointerTarget,
     button: PointerButtonState,
 ) {
     match target {
         PanePointerTarget::Plugin { pane, x, y } => {
-            *pending_plugin_pointer_motion = None;
-            send_managed_pointer_leave(input_sender, managed_pointer_target);
+            routing.pending_plugin_motion = None;
+            set_plugin_pointer_target(runtime, &mut routing.plugin_target, pane);
+            send_managed_pointer_leave(input_sender, &mut routing.managed_target);
             if let Err(error) = send_presentation_event(
                 runtime,
                 PresentationEvent::PointerButton {
@@ -5657,7 +5680,8 @@ fn send_pointer_button_to_target(
             }
         }
         PanePointerTarget::Managed { pane, x, y } => {
-            *pending_plugin_pointer_motion = None;
+            routing.pending_plugin_motion = None;
+            send_plugin_pointer_leave(runtime, &mut routing.plugin_target);
             if let Some(sender) = input_sender
                 && send_input(
                     sender,
@@ -5668,7 +5692,7 @@ fn send_pointer_button_to_target(
                     }),
                 )
             {
-                *managed_pointer_target = Some(pane);
+                routing.managed_target = Some(pane);
             }
         }
     }
@@ -5677,8 +5701,7 @@ fn send_pointer_button_to_target(
 fn cancel_pointer_grab(
     runtime: Option<&PresentationWasmRuntime>,
     input_sender: Option<&mut InputLane>,
-    pending_plugin_pointer_motion: &mut Option<(u64, f32, f32)>,
-    managed_pointer_target: &mut Option<u64>,
+    routing: &mut PointerRoutingState,
     grab: &mut Option<PointerGrab>,
     modifiers: u32,
 ) {
@@ -5690,8 +5713,7 @@ fn cancel_pointer_grab(
         send_pointer_button_to_target(
             runtime,
             input_sender.as_deref_mut(),
-            pending_plugin_pointer_motion,
-            managed_pointer_target,
+            routing,
             grab.target,
             PointerButtonState {
                 button,
@@ -5699,6 +5721,27 @@ fn cancel_pointer_grab(
                 modifiers,
             },
         );
+    }
+}
+
+fn set_plugin_pointer_target(
+    runtime: Option<&PresentationWasmRuntime>,
+    target: &mut Option<u64>,
+    pane: u64,
+) {
+    if *target == Some(pane) {
+        return;
+    }
+    send_plugin_pointer_leave(runtime, target);
+    *target = Some(pane);
+}
+
+fn send_plugin_pointer_leave(runtime: Option<&PresentationWasmRuntime>, target: &mut Option<u64>) {
+    let Some(pane) = target.take() else {
+        return;
+    };
+    if let Err(error) = send_presentation_event(runtime, PresentationEvent::PointerLeft { pane }) {
+        eprintln!("dropped plugin pointer leave: {error:#}");
     }
 }
 
