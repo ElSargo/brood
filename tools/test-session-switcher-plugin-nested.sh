@@ -122,6 +122,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/inbox/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm \
+  "$PACKAGE/brood_inbox_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/picker/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \

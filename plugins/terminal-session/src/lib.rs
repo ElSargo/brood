@@ -22,6 +22,7 @@ const SNAPSHOT_TOKEN: u64 = 1;
 const STREAM_TOKEN: u64 = 2;
 const EDITOR_SESSION_ID: &str = "neovim-session";
 const CLIENT_INIT_ID: &str = "brood.client-init";
+const INBOX_ID: &str = "inbox";
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
@@ -45,6 +46,8 @@ const SNAPSHOT_VERSION: u8 = 4;
 const SNAPSHOT_FULL: u8 = 1;
 const DEFAULT_FG: u32 = ashen::TEXT_RGB;
 const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
+const SHELL_INTEGRATION: &str =
+    r#"PS1='$(code=$?; printf "\033]777;brood-inbox;%s\007" "$code")$ '; export PS1; exec sh -i"#;
 
 static STATE: Mutex<Option<SessionState>> = Mutex::new(None);
 
@@ -162,6 +165,7 @@ impl SessionState {
         self.pending_input
             .extend(bytes.iter().copied().take(accepted));
         if accepted > 0 {
+            self.screen.record_submitted_input(&bytes[..accepted]);
             self.pending_input_boundaries
                 .push_back(PendingInputBoundary {
                     sequence,
@@ -235,6 +239,14 @@ impl SessionState {
             .into_iter()
             .flat_map(|payload| route_editor_action(self.session_id, &payload))
             .collect::<Vec<_>>();
+        let command_completions = self.screen.take_command_completions();
+        if let Some(actor) = self.subscriber.as_deref() {
+            commands.extend(
+                command_completions
+                    .into_iter()
+                    .map(|status| terminal_inbox_message(actor, status)),
+            );
+        }
         if let Some(actor) = self.subscriber.clone() {
             let chunks = encode_snapshot(self);
             self.snapshots_published = self.snapshots_published.saturating_add(chunks.len() as u64);
@@ -352,6 +364,23 @@ impl SessionState {
         commands.extend(self.start_next_editor_control());
         commands
     }
+}
+
+fn terminal_inbox_message(target_actor: &str, status: i32) -> Command {
+    let failed = status != 0;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "kind": "inbox-push",
+        "category": "terminal",
+        "title": if failed { "Command failed" } else { "Command finished" },
+        "detail": format!("exit status {status}"),
+        "target_actor": target_actor,
+        "status": if failed { "failed" } else { "completed" },
+    }))
+    .unwrap_or_else(|_| br#"{"kind":"inbox-push","title":"Command finished"}"#.to_vec());
+    Command::SendPresentationMessage(PresentationActorMessage {
+        actor: INBOX_ID.to_string(),
+        body,
+    })
 }
 
 impl Guest for TerminalSession {
@@ -1100,7 +1129,7 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
         )
     };
     let (command, arguments) = editor_socket.map_or_else(
-        || ("sh", vec!["-i".to_string()]),
+        || ("sh", vec!["-c".to_string(), SHELL_INTEGRATION.to_string()]),
         |socket| ("brood-nvim", vec!["--listen".to_string(), socket]),
     );
     let pty = host::pty_spawn(
@@ -1430,6 +1459,8 @@ struct Screen {
     editor_osc_enabled: bool,
     editor_actions: VecDeque<Vec<u8>>,
     editor_action_bytes: usize,
+    shell_command_pending: bool,
+    command_completions: VecDeque<i32>,
 }
 
 impl Screen {
@@ -1458,6 +1489,8 @@ impl Screen {
             editor_osc_enabled,
             editor_actions: VecDeque::new(),
             editor_action_bytes: 0,
+            shell_command_pending: false,
+            command_completions: VecDeque::new(),
         }
     }
 
@@ -1484,15 +1517,43 @@ impl Screen {
         self.editor_actions.drain(..).collect()
     }
 
+    fn capture_command_completion(&mut self, encoded: &[u8]) {
+        if !self.shell_command_pending {
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(encoded) else {
+            return;
+        };
+        let Ok(status) = text.parse::<i32>() else {
+            return;
+        };
+        self.shell_command_pending = false;
+        if self.command_completions.len() < 32 {
+            self.command_completions.push_back(status);
+        }
+    }
+
+    fn record_submitted_input(&mut self, bytes: &[u8]) {
+        self.shell_command_pending |= bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
+    }
+
+    fn take_command_completions(&mut self) -> Vec<i32> {
+        self.command_completions.drain(..).collect()
+    }
+
     fn reset(&mut self) {
         let rows = self.rows;
         let cols = self.cols;
         let editor_osc_enabled = self.editor_osc_enabled;
         let editor_actions = std::mem::take(&mut self.editor_actions);
         let editor_action_bytes = self.editor_action_bytes;
+        let shell_command_pending = self.shell_command_pending;
+        let command_completions = std::mem::take(&mut self.command_completions);
         *self = Self::new(rows, cols, editor_osc_enabled);
         self.editor_actions = editor_actions;
         self.editor_action_bytes = editor_action_bytes;
+        self.shell_command_pending = shell_command_pending;
+        self.command_completions = command_completions;
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -1894,6 +1955,7 @@ impl Perform for Screen {
                 );
             }
             [b"777", b"brood", encoded] => self.capture_editor_action(encoded),
+            [b"777", b"brood-inbox", status] => self.capture_command_completion(status),
             _ => {}
         }
     }
@@ -2472,6 +2534,62 @@ mod tests {
         assert_eq!(forwarded["action"], "terminal");
         assert_eq!(forwarded["session_id"], 44);
         assert_eq!(forwarded["command"], "cargo test");
+    }
+
+    #[test]
+    fn shell_prompt_markers_require_submitted_input_and_queue_command_statuses() {
+        let mut screen = Screen::new(4, 8, false);
+        screen.osc_dispatch(
+            &[
+                b"777".as_slice(),
+                b"brood-inbox".as_slice(),
+                b"0".as_slice(),
+            ],
+            true,
+        );
+        assert!(screen.take_command_completions().is_empty());
+
+        screen.osc_dispatch(
+            &[
+                b"777".as_slice(),
+                b"brood-inbox".as_slice(),
+                b"0".as_slice(),
+            ],
+            true,
+        );
+        assert!(screen.take_command_completions().is_empty());
+
+        screen.record_submitted_input(b"printf ok\r");
+        screen.osc_dispatch(
+            &[
+                b"777".as_slice(),
+                b"brood-inbox".as_slice(),
+                b"0".as_slice(),
+            ],
+            true,
+        );
+        assert_eq!(screen.take_command_completions(), vec![0]);
+
+        screen.osc_dispatch(
+            &[
+                b"777".as_slice(),
+                b"brood-inbox".as_slice(),
+                b"9".as_slice(),
+            ],
+            true,
+        );
+        assert!(screen.take_command_completions().is_empty());
+
+        screen.record_submitted_input(b"false\n");
+        screen.osc_dispatch(
+            &[
+                b"777".as_slice(),
+                b"brood-inbox".as_slice(),
+                b"17".as_slice(),
+            ],
+            true,
+        );
+        assert_eq!(screen.take_command_completions(), vec![17]);
     }
 
     #[test]

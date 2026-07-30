@@ -361,6 +361,89 @@ done
 ((SHELL_BYTES > SHELL_BASELINE + 40 && SHELL_QUIET >= 8))
 capture "$OUT/terminal-shell-ansi-unicode.png"
 
+INBOX_FOCUS_BASELINE="$(
+  rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
+    "$CLIENT1_LOG" || true
+)"
+TERMINAL_PANE="$(
+  sed -n \
+    's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT1_LOG" \
+    | head -1
+)"
+[[ -n "$TERMINAL_PANE" ]]
+wayland_env "$OUT/virtual-pointer-input" click 720 100 1280 720
+for _ in $(seq 1 100); do
+  INBOX_FOCUS_COUNT="$(
+    rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
+      "$CLIENT1_LOG" || true
+  )"
+  if ((INBOX_FOCUS_COUNT > INBOX_FOCUS_BASELINE)) \
+    && rg -a -q "presentation key policy requested pane focus pane=$TERMINAL_PANE .* changed=true deferred=false" \
+      "$CLIENT1_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((INBOX_FOCUS_COUNT > INBOX_FOCUS_BASELINE))
+rg -a -q "presentation key policy requested pane focus pane=$TERMINAL_PANE .* changed=true deferred=false" \
+  "$CLIENT1_LOG"
+capture "$OUT/inbox-click-focused-terminal.png"
+
+INBOX_PANE="$(
+  sed -n \
+    's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT1_LOG" \
+    | head -1
+)"
+[[ -n "$INBOX_PANE" ]]
+INBOX_SHORTCUT_BASELINE="$(
+  rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
+)"
+wayland_env "$OUT/virtual-keyboard-key" 23
+for _ in $(seq 1 100); do
+  INBOX_SHORTCUT_COUNT="$(
+    rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
+  )"
+  if ((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE)) \
+    && rg -a -q "presentation key policy requested pane focus pane=$INBOX_PANE focused=Some\\($TERMINAL_PANE\\) .* changed=true deferred=false" \
+      "$CLIENT1_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE))
+rg -a -q "presentation key policy requested pane focus pane=$INBOX_PANE focused=Some\\($TERMINAL_PANE\\) .* changed=true deferred=false" \
+  "$CLIENT1_LOG"
+capture "$OUT/inbox-ctrl-alt-i-focused.png"
+
+TERMINAL_POINTER_FOCUS_BASELINE="$(
+  rg -a -c "focused local plugin pane=$TERMINAL_PANE" "$CLIENT1_LOG" || true
+)"
+wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
+for _ in $(seq 1 100); do
+  TERMINAL_POINTER_FOCUS_COUNT="$(
+    rg -a -c "focused local plugin pane=$TERMINAL_PANE" "$CLIENT1_LOG" || true
+  )"
+  ((TERMINAL_POINTER_FOCUS_COUNT > TERMINAL_POINTER_FOCUS_BASELINE)) && break
+  sleep 0.05
+done
+((TERMINAL_POINTER_FOCUS_COUNT > TERMINAL_POINTER_FOCUS_BASELINE))
+
+if [[ "${BROOD_TERMINAL_INBOX_ONLY:-0}" == 1 ]]; then
+  cat > "$OUT/proof.md" <<EOF
+# Nested inbox shortcut proof
+
+- notification action: clicking a real command-completion card focused terminal-ui
+- shortcut input: real Ctrl+Alt+I through the nested Wayland keyboard
+- shortcut result: focus changed from terminal-ui to the presentation-global inbox pane
+- screenshot: inbox-ctrl-alt-i-focused.png
+EOF
+  echo "nested inbox shortcut proof passed"
+  echo "proof=$OUT/proof.md"
+  exit 0
+fi
+
 KEY_FILE="$OUT/key-sequences.bin"
 type_line "IFS= read -r key; printf %s \"\$key\" > '$KEY_FILE'; echo __KEY_SEQUENCE_OK__"
 wayland_env "$OUT/virtual-keyboard-key" --none 63
@@ -545,7 +628,7 @@ else
   [[ "$(metric_value "$SCROLL_LOG" mouse_tracking)" == 3 ]]
   [[ "$(metric_value "$SCROLL_LOG" mouse_sgr)" == true ]]
   MOUSE_SCROLL_BASELINE="$(metric_value "$SCROLL_LOG" pty_bytes)"
-  wayland_env "$OUT/virtual-pointer-input" scroll 640 360 2 12 1280 720
+  wayland_env "$OUT/virtual-pointer-input" scroll 240 360 2 12 1280 720
   for _ in $(seq 1 200); do
     MOUSE_SCROLL_BYTES="$(metric_value "$SCROLL_LOG" pty_bytes)"
     ((MOUSE_SCROLL_BYTES > MOUSE_SCROLL_BASELINE)) && break
@@ -748,14 +831,14 @@ capture "$OUT/terminal-streaming.png"
 
 MAX_VIEWPORT="$(metric_value "$CLIENT2_LOG" max_viewport_offset)"
 ((MAX_VIEWPORT > 0))
-wayland_env "$OUT/virtual-pointer-input" scroll 590 340 -2 12 1180 680
+wayland_env "$OUT/virtual-pointer-input" scroll 220 340 -2 12 1180 680
 for _ in $(seq 1 200); do
   VIEWPORT="$(metric_value "$CLIENT2_LOG" viewport_offset)"
   ((VIEWPORT > 0)) && break
   sleep 0.05
 done
 if ((VIEWPORT == 0)); then
-  wayland_env "$OUT/virtual-pointer-input" scroll 590 340 2 12 1180 680
+  wayland_env "$OUT/virtual-pointer-input" scroll 220 340 2 12 1180 680
   for _ in $(seq 1 200); do
     VIEWPORT="$(metric_value "$CLIENT2_LOG" viewport_offset)"
     ((VIEWPORT > 0)) && break
@@ -891,6 +974,7 @@ jq -e '.key_to_present_samples > 0 and .max_key_to_present_us > 0' \
 python3 - \
   "$OUT/terminal-initial.png" \
   "$OUT/terminal-shell-ansi-unicode.png" \
+  "$OUT/inbox-ctrl-alt-i-focused.png" \
   "$OUT/terminal-helix.png" \
   "$OUT/terminal-helix-mouse-scroll.png" \
   "$OUT/terminal-helix-resized.png" \
@@ -1055,6 +1139,7 @@ cat > "$OUT/proof.md" <<EOF
 - terminal environment: xterm-256color with truecolor intent, rendered by guest-parsed ANSI runs
 - input: real Wayland key/text/pointer events through the focused external presentation client
 - product shortcut: real Ctrl+Alt+T created paired terminal-session-2 and terminal-ui-b1-s1-2 actors, focused the new backend/session-scoped pane, accepted a Unicode shell command, and presented it in ${SPAWN_PRESENT_MS}ms
+- inbox shortcut: activating a command card returned focus to terminal-ui, then real Ctrl+Alt+I focused the presentation-global inbox pane
 - keyboard protocol: F5, Ctrl+Right, Shift+Tab, and DEC application-cursor Up were captured byte-for-byte from the PTY
 - color policy: the controlled PTY profile removed ambient NO_COLOR, retained xterm-256color/truecolor, and rendered a real lazygit screen in terminal-lazygit-color.png
 - managed GUI descendants: the terminal shell inherited the backend Wayland socket and isolated session bus; a real Ghostty child mapped inside Brood in terminal-ghostty-managed.png instead of opening through the host Ghostty instance

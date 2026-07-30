@@ -151,6 +151,7 @@ shortcuts or wrapper arguments:
 
 - `Ctrl+Alt+M` focuses the visible session switcher, hides it when invoked
   again while focused, and restores it on the next invocation;
+- `Ctrl+Alt+I` focuses the always-visible presentation-global inbox;
 - `Ctrl+Alt+A` fuzzy-picks a running agent in the active session and opens a
   session-scoped coding-agent UI for it;
 - `Ctrl+Alt+T` asks the client- and session-init actors to create a fresh paired
@@ -168,6 +169,10 @@ These chords are guest policy. Switcher visibility remains actor-owned:
 `Ctrl+Alt+M` sends an ordinary sidebar action to the switcher, which republishes
 its root layout fragment. The client validates the resulting layout and focus
 request; it has no switcher-specific visibility command.
+
+`Ctrl+Alt+I` similarly sends an ordinary show action to the inbox actor. The
+inbox requests focus for its own presentation-global pane; it does not change
+session state or toggle the rail.
 
 When a terminal or Neovim pane is focused, ordinary Ctrl chords remain pane
 input so shell and Vim bindings retain their normal meaning. Ctrl+Alt product

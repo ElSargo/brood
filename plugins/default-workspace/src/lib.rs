@@ -38,6 +38,7 @@ const KEY_5: i32 = 14;
 const KEY_ENTER: i32 = 36;
 const KEY_A: i32 = 38;
 const KEY_E: i32 = 26;
+const KEY_I: i32 = 31;
 const KEY_O: i32 = 32;
 const KEY_B: i32 = 56;
 const KEY_M: i32 = 58;
@@ -259,6 +260,15 @@ pub extern "C" fn brood_policy_provider_key_workspace(
             write_consume(output, &[])
         } else {
             write_consume(output, &[Message::EditorAction("open")])
+        };
+    }
+
+    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_I
+    {
+        return if input.key_state == KEY_RELEASED || input.repeat {
+            write_consume(output, &[])
+        } else {
+            write_consume(output, &[Message::InboxAction("show")])
         };
     }
 
@@ -615,6 +625,7 @@ enum Message<'a> {
     SessionSwitcherAction(&'a str),
     CodingAgentAction(&'a str),
     DiffViewerAction(&'a str),
+    InboxAction(&'a str),
     TerminalAction(&'a str),
     EditorAction(&'a str),
 }
@@ -940,6 +951,7 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             Message::LayoutAction("close-active-pane") => "host",
             Message::LayoutAction(_) => "workspace",
             Message::SessionSwitcherAction(_) => "session-switcher",
+            Message::InboxAction(_) => "inbox",
             Message::CodingAgentAction(_)
             | Message::DiffViewerAction(_)
             | Message::TerminalAction(_)
@@ -999,6 +1011,12 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             }
             Message::DiffViewerAction(action) => {
                 payload.bytes(br#"{"kind":"diff-viewer-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
+            Message::InboxAction(action) => {
+                payload.bytes(br#"{"kind":"inbox-action","action":"#);
                 payload.byte(b'"');
                 payload.quoted_body(action.as_bytes());
                 payload.bytes(br#""}"#);

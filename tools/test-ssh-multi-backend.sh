@@ -212,6 +212,17 @@ wasm-tools component new \
 cargo build \
   --release \
   --target wasm32-unknown-unknown \
+  --manifest-path plugins/inbox/Cargo.toml \
+  --locked
+[[ ! -e plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm ]] \
+  || chmod u+w plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm
+wasm-tools component new \
+  plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm \
+  --output \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm
+cargo build \
+  --release \
+  --target wasm32-unknown-unknown \
   --manifest-path plugins/worktree-manager/Cargo.toml \
   --locked
 [[ ! -e plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm ]] \

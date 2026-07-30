@@ -10,6 +10,8 @@ Root-level target-shape Brood plugins live here.
 - `default-workspace/` ports the existing prototype key handler and map/layout hook into the new `brood-wasm` ABI shape: exported policy providers plus guest arena allocation.
 - `session-switcher/` is the default client-realm shell plugin: its init actor starts a native plugin pane which renders the live session catalogue and performs typed create, switch, rename, and close operations.
 - `picker/` is the reusable client-realm fuzzy picker actor. It serializes concurrent requests, accepts streamed items through stable IDs, and returns the original selected result and index.
+- `inbox/` is the always-visible, presentation-global completion queue. It
+  activates the source presentation actor when a notification is clicked.
 - `diff-viewer/` is the local-workspace project-diff pane. Remote editor diff
   actions use a backend terminal until the viewer has its own split
   backend/presentation protocol.

@@ -29,6 +29,11 @@ also support editor panes, diff viewers, LSP bridges, automation, and other
 agents as peers. Those clients should use the same actor address and mailbox
 protocol rather than a privileged coding-agent host API.
 
+When a turn finishes or fails, the agent publishes to the presentation-global
+inbox with the UI actor that submitted the turn. The agent remains idle and
+reusable after successful completion; the notification is an attention event,
+not an ownership or cleanup boundary.
+
 ## Ownership
 
 ```text

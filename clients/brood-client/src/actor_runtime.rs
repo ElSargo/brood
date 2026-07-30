@@ -1047,6 +1047,7 @@ impl PresentationWasmRuntime {
                     br#"{"type":"picker-close"}"#.to_vec(),
                 )?;
             }
+            "inbox" => {}
             _ if self.is_init_child(&actor_id) => self.handle_init_stop(actor_id),
             _ => return Ok(false),
         }

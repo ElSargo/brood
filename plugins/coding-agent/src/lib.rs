@@ -20,11 +20,13 @@ use serde::{Deserialize, Serialize};
 const COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const CLIENT_INIT_ID: &str = "brood.client-init";
 const UI_ID: &str = "coding-agent-ui";
+const INBOX_ID: &str = "inbox";
 const FIRST_AGENT: &str = "coding-agent-1";
 const WORKER_ID: u64 = 1;
 const UPDATE_NOTIFICATION_TOKEN: u64 = 0x434f_4445_5841_4745;
 const LEFT_BUTTON: u32 = 0x110;
 const MAX_LOG_LINES: usize = 96;
+const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
@@ -50,6 +52,10 @@ struct WireMessage {
     status: String,
     log_kind: String,
     text: String,
+    category: String,
+    title: String,
+    detail: String,
+    target_actor: String,
     agents: Vec<WireAgent>,
 }
 
@@ -107,6 +113,7 @@ struct AgentState {
     status: String,
     subscribers: Vec<Subscriber>,
     active_worker: Option<u64>,
+    active_target: Option<String>,
     notification: u64,
     published_generation: u64,
     observed_generation: u64,
@@ -122,6 +129,7 @@ impl AgentState {
             status: "idle".to_string(),
             subscribers: Vec::new(),
             active_worker: None,
+            active_target: None,
             notification: 0,
             published_generation: 0,
             observed_generation: 0,
@@ -350,6 +358,22 @@ fn handle_child(event: ChildEvent) -> Vec<ActorCommand> {
 }
 
 fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<ActorCommand> {
+    if sender == INBOX_ID && body == FOCUS_MESSAGE {
+        let Ok(state) = STATE.lock() else {
+            return Vec::new();
+        };
+        let RoleState::Ui(ui) = &*state else {
+            return Vec::new();
+        };
+        return (ui.pane != 0)
+            .then(|| {
+                ActorCommand::SendHostMessage(
+                    format!("{{\"type\":\"focus-pane\",\"pane\":{}}}", ui.pane).into_bytes(),
+                )
+            })
+            .into_iter()
+            .collect();
+    }
     let Ok(message) = serde_json::from_slice::<WireMessage>(body) else {
         return Vec::new();
     };
@@ -450,7 +474,14 @@ fn handle_agent_message(
                 agent.id = message.agent;
             }
             if !agent.subscribers.contains(&subscriber) {
-                agent.subscribers.push(subscriber);
+                agent.subscribers.push(subscriber.clone());
+            }
+            if agent.active_worker.is_some()
+                && agent.active_target.is_none()
+                && let Subscriber::Presentation(actor) = &subscriber
+                && actor != CLIENT_INIT_ID
+            {
+                agent.active_target = Some(actor.clone());
             }
             agent_commands(
                 agent,
@@ -470,6 +501,10 @@ fn handle_agent_message(
             agent.reasoning = message.reasoning;
             agent.status = "running".to_string();
             agent.active_worker = Some(WORKER_ID);
+            agent.active_target = sender
+                .strip_prefix("presentation:")
+                .filter(|actor| *actor != CLIENT_INIT_ID)
+                .map(str::to_string);
             let request = TurnRequest {
                 agent: agent.id.clone(),
                 prompt: message.prompt,
@@ -571,7 +606,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
         WorkerEvent::Finished(finished) if finished.worker == WORKER_ID => {
             agent.active_worker = None;
             agent.status = "idle".to_string();
-            agent_commands(
+            let mut commands = agent_commands(
                 agent,
                 &WireMessage {
                     kind: "agent-state".to_string(),
@@ -579,12 +614,15 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
                     status: agent.status.clone(),
                     ..WireMessage::default()
                 },
-            )
+            );
+            commands.extend(agent_inbox_command(agent, false, "Agent finished"));
+            agent.active_target = None;
+            commands
         }
         WorkerEvent::Failed(failed) if failed.worker == WORKER_ID => {
             agent.active_worker = None;
             agent.status = "failed".to_string();
-            agent_commands(
+            let mut commands = agent_commands(
                 agent,
                 &WireMessage {
                     kind: "agent-state".to_string(),
@@ -594,11 +632,15 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
                     text: failed.message,
                     ..WireMessage::default()
                 },
-            )
+            );
+            commands.extend(agent_inbox_command(agent, true, "Agent failed"));
+            agent.active_target = None;
+            commands
         }
         WorkerEvent::Cancelled(worker) if worker == WORKER_ID => {
             agent.active_worker = None;
             agent.status = "idle".to_string();
+            agent.active_target = None;
             agent_commands(
                 agent,
                 &WireMessage {
@@ -613,6 +655,22 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
         }
         _ => Vec::new(),
     }
+}
+
+fn agent_inbox_command(agent: &AgentState, failed: bool, title: &str) -> Option<ActorCommand> {
+    let target_actor = agent.active_target.as_deref()?;
+    presentation_message(
+        INBOX_ID,
+        &WireMessage {
+            kind: "inbox-push".to_string(),
+            category: "agent".to_string(),
+            title: title.to_string(),
+            detail: agent.id.clone(),
+            target_actor: target_actor.to_string(),
+            status: if failed { "failed" } else { "completed" }.to_string(),
+            ..WireMessage::default()
+        },
+    )
 }
 
 fn agent_commands(agent: &AgentState, message: &WireMessage) -> Vec<ActorCommand> {

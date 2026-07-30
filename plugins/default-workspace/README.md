@@ -36,7 +36,8 @@ nix develop --command cargo run -- test nested --force-outer --inner-headless \
 
 The normal config selects this provider for the presentation client. Its
 always-available workspace chords are `Ctrl+Alt+M` for the session-switcher
-pane, `Ctrl+Alt+P` for the session picker, `Ctrl+Alt+A` for the current
+pane, `Ctrl+Alt+I` to focus the global inbox, `Ctrl+Alt+P` for the session
+picker, `Ctrl+Alt+A` for the current
 session's agent picker, `Ctrl+Alt+D` for that session's project diff,
 `Ctrl+Alt+T` for a fresh first-party terminal, `Ctrl+Alt+E` for the
 client-local Wasm Neovim editor, and `Ctrl+Alt+Q` to close the focused pane. `Ctrl+J` /

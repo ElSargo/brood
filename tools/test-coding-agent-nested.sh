@@ -82,6 +82,15 @@ wasm-tools component new \
   --output "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/inbox/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm \
+  --output "$PACKAGE/brood_inbox_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_inbox_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/picker/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -278,7 +287,7 @@ rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"
   "$CLIENT_LOG"
 second_agent_ui_focused
 
-click_at 480 360
+click_at 240 360
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -s 100 -k F2
@@ -309,7 +318,7 @@ capture() {
 capture "$OUT/agent-idle.png"
 
 PROMPT='create .brood/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
-click_at 480 360
+click_at 240 360
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -k Tab -s 100 "$PROMPT" -s 100 -k Return
@@ -353,7 +362,33 @@ rg -q "component actor worker finished" "$SERVER_LOG"
 idle_updates="$(rg -c 'backend actor message.*"status":"idle"' "$CLIENT_LOG" || true)"
 ((idle_updates >= 3))
 
-click_at 480 360
+for _ in $(seq 1 300); do
+  if rg -q \
+    'backend actor message .*sender=coding-agent-2 recipient=inbox .*"title":"Agent finished"' \
+    "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.1
+done
+rg -q \
+  'backend actor message .*sender=coding-agent-2 recipient=inbox .*"title":"Agent finished"' \
+  "$CLIENT_LOG"
+capture "$OUT/agent-finished-inbox.png"
+
+click_at 720 100
+for _ in $(seq 1 100); do
+  if rg -Fq \
+    "presentation local actor message sender=inbox recipient=$AGENT_UI body={\"kind\":\"focus\"}" \
+    "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -Fq \
+  "presentation local actor message sender=inbox recipient=$AGENT_UI body={\"kind\":\"focus\"}" \
+  "$CLIENT_LOG"
+
+click_at 240 360
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -s 100 -k F6
@@ -375,7 +410,10 @@ fi
 sleep 3
 capture "$OUT/agent-complete.png"
 
-python3 - "$OUT/agent-idle.png" "$OUT/agent-complete.png" <<'PY'
+python3 - \
+  "$OUT/agent-idle.png" \
+  "$OUT/agent-finished-inbox.png" \
+  "$OUT/agent-complete.png" <<'PY'
 import pathlib
 import subprocess
 import sys
@@ -411,8 +449,9 @@ cat > "$OUT/proof.md" <<EOF
 - agents: two independently addressed session-realm actors, enumerated and switched through the UI
 - work: a private actor worker launched Codex with workspace-write authority
 - result: .brood/agent-actor-proof.txt contains actor-ui-worker-ok
+- inbox: agent completion created a global queue item and clicking it focused the originating agent pane
 - survival: the focused UI accepted a model change after the completed turn
-- captures: agent-idle.png and agent-complete.png
+- captures: agent-idle.png, agent-finished-inbox.png, and agent-complete.png
 - status: $STATUS
 EOF
 

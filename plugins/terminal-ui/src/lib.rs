@@ -36,6 +36,7 @@ const MAX_CACHED_LAYOUTS: usize = 512;
 const RESIZE_DEBOUNCE_MS: u64 = 24;
 const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
 const CLIENT_INIT_ID: &str = "brood.client-init";
+const INBOX_ID: &str = "inbox";
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 
 static STATE: Mutex<Option<UiState>> = Mutex::new(None);
@@ -494,7 +495,7 @@ impl Guest for TerminalUi {
 }
 
 fn focus_commands_for_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
-    if sender != CLIENT_INIT_ID || body != FOCUS_MESSAGE {
+    if !matches!(sender, CLIENT_INIT_ID | INBOX_ID) || body != FOCUS_MESSAGE {
         return Vec::new();
     }
     let Ok(mut guard) = STATE.lock() else {
@@ -1671,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn only_client_init_can_focus_an_existing_editor_pane() {
+    fn trusted_client_chrome_can_focus_an_existing_terminal_pane() {
         *STATE.lock().expect("terminal UI state") = Some(UiState::new(2, 7, "neovim-ui-b2-s7"));
         STATE
             .lock()
@@ -1691,6 +1692,7 @@ mod tests {
         assert!(
             matches!(commands.get(2), Some(Command::SendSessionMessage(message)) if message.body.starts_with(b"R"))
         );
+        assert_eq!(focus_commands_for_mailbox("inbox", FOCUS_MESSAGE).len(), 3);
         assert!(focus_commands_for_mailbox("untrusted", FOCUS_MESSAGE).is_empty());
         STATE
             .lock()

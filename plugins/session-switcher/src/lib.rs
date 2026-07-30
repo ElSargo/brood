@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
 const PICKER_ACTOR_ID: &str = "picker";
+const INBOX_ACTOR_ID: &str = "inbox";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
 const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
+const INBOX_COMPONENT_FILE: &str = "brood_inbox_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const NEOVIM_CLIENT_COMPONENT_FILE: &str = "brood_neovim_client_plugin.component.wasm";
 const TERMINAL_UI_COMPONENT_FILE: &str = "brood_terminal_ui_plugin.component.wasm";
@@ -37,6 +39,7 @@ const ROW_HEIGHT: f32 = 30.0;
 const PROJECT_ROW_HEIGHT: f32 = 34.0;
 const SIDE_MARGIN: f32 = 14.0;
 const SIDEBAR_WIDTH: f64 = 320.0;
+const INBOX_WIDTH: f64 = 320.0;
 
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
@@ -165,6 +168,7 @@ struct SwitcherState {
     workspace_focus: Option<u64>,
     picker_pane: Option<u64>,
     picker_visible: bool,
+    inbox_pane: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -287,6 +291,12 @@ struct PickerLayoutMessage {
 struct PickerReplyKind {
     #[serde(rename = "type")]
     message_type: serde_json_core::heapless::String<32>,
+}
+
+#[derive(Deserialize)]
+struct InboxReadyMessage {
+    kind: serde_json_core::heapless::String<32>,
+    pane: u64,
 }
 
 #[derive(Deserialize)]
@@ -446,6 +456,7 @@ impl SwitcherState {
             workspace_focus: None,
             picker_pane: None,
             picker_visible: false,
+            inbox_pane: None,
         }
     }
 
@@ -626,6 +637,13 @@ impl Guest for SessionSwitcher {
                             backend_id: None,
                             session_id: None,
                         }),
+                        ActorCommand::StartActor(ActorStartRequest {
+                            id: INBOX_ACTOR_ID.to_string(),
+                            path: INBOX_COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
+                            backend_id: None,
+                            session_id: None,
+                        }),
                     ];
                     if let (Some(backend_id), Some(session_id)) =
                         (context.backend_id, context.session_id)
@@ -698,6 +716,12 @@ impl Guest for SessionSwitcher {
                 let Ok(mut state) = STATE.lock() else {
                     return Vec::new();
                 };
+                if id == INBOX_ACTOR_ID {
+                    state.inbox_pane = None;
+                    state.error = true;
+                    state.status = "The global inbox stopped".to_string();
+                    return Vec::new();
+                }
                 state.coding_agent_uis.retain(|actor| actor != &id);
                 state.coding_agent_targets.remove(&id);
                 let editor_lifecycle =
@@ -732,6 +756,12 @@ impl Guest for SessionSwitcher {
                 let Ok(mut state) = STATE.lock() else {
                     return Vec::new();
                 };
+                if failed.id == INBOX_ACTOR_ID {
+                    state.inbox_pane = None;
+                    state.error = true;
+                    state.status = format!("The global inbox failed: {}", failed.message);
+                    return Vec::new();
+                }
                 state.coding_agent_uis.retain(|actor| actor != &failed.id);
                 state.coding_agent_targets.remove(&failed.id);
                 let editor_failure =
@@ -765,6 +795,9 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
                 handle_picker_message(&message.body)
             }
+            Event::Mailbox(message) if message.sender == INBOX_ACTOR_ID => {
+                handle_inbox_message(&message.body)
+            }
             Event::Mailbox(message) if message.sender.starts_with(NEOVIM_UI_ID_PREFIX) => {
                 handle_editor_message(&message.sender, EditorMessage::from_bytes(&message.body))
             }
@@ -783,6 +816,20 @@ impl Guest for SessionSwitcher {
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
     }
+}
+
+fn handle_inbox_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<InboxReadyMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.kind.as_str() != "inbox-ready" || message.pane == 0 {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    state.inbox_pane = Some(message.pane);
+    publish_layout(&state, true, state.workspace_focus)
 }
 
 fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
@@ -2170,11 +2217,14 @@ fn publish_layout(
     };
     let pane = state.pane;
     let picker_pane = state.picker_pane;
+    let inbox_pane = state.inbox_pane;
     let delegated = message
         .visible_panes
         .iter()
         .copied()
-        .filter(|visible| *visible != pane && Some(*visible) != picker_pane)
+        .filter(|visible| {
+            *visible != pane && Some(*visible) != picker_pane && Some(*visible) != inbox_pane
+        })
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
                 panes.push(candidate);
@@ -2186,17 +2236,38 @@ fn publish_layout(
     let pane_visible = state.sidebar_visible && message.visible_panes.contains(&pane);
     let picker_visible = state.picker_visible
         && picker_pane.is_some_and(|picker| message.visible_panes.contains(&picker));
+    let inbox_visible = inbox_pane.is_some_and(|inbox| message.visible_panes.contains(&inbox));
     let width = f64::from(message.size.w.max(1));
-    let sidebar_fraction = if has_rest && pane_visible {
-        (SIDEBAR_WIDTH / width).clamp(0.2, 0.45)
-    } else if has_rest {
-        0.0
+    let mut sidebar_fraction = if pane_visible {
+        (SIDEBAR_WIDTH / width).clamp(0.18, 0.38)
     } else {
-        1.0
+        0.0
     };
-    let sidebar_offset = 1.0 - 2.0 * sidebar_fraction;
+    let mut inbox_fraction = if inbox_visible {
+        (INBOX_WIDTH / width).clamp(0.18, 0.38)
+    } else {
+        0.0
+    };
+    if has_rest {
+        let chrome = sidebar_fraction + inbox_fraction;
+        if chrome > 0.68 {
+            let scale = 0.68 / chrome;
+            sidebar_fraction *= scale;
+            inbox_fraction *= scale;
+        }
+    } else {
+        let chrome = sidebar_fraction + inbox_fraction;
+        if chrome > 0.0 {
+            sidebar_fraction /= chrome;
+            inbox_fraction /= chrome;
+        }
+    }
+    let rest_fraction = (1.0 - sidebar_fraction - inbox_fraction).max(0.0);
+    let sidebar_offset = -1.0 + 2.0 * rest_fraction;
     let sidebar_size = 2.0 * sidebar_fraction;
-    let rest_size = 2.0 * (1.0 - sidebar_fraction);
+    let inbox_offset = 1.0 - 2.0 * inbox_fraction;
+    let inbox_size = 2.0 * inbox_fraction;
+    let rest_size = 2.0 * rest_fraction;
 
     let mut commands = Vec::new();
     if needs_rest {
@@ -2219,6 +2290,12 @@ fn publish_layout(
         layout_items.push(format!(
             "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
             pane, pane, sidebar_offset, sidebar_size
+        ));
+    }
+    if inbox_visible && let Some(inbox) = inbox_pane {
+        layout_items.push(format!(
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":2,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
+            inbox, inbox, inbox_offset, inbox_size
         ));
     }
     if picker_visible && let Some(picker) = picker_pane {

@@ -63,6 +63,7 @@ let
         "${src}/plugins/coding-agent/Cargo.lock"
         "${src}/plugins/default-workspace/Cargo.lock"
         "${src}/plugins/diff-viewer/Cargo.lock"
+        "${src}/plugins/inbox/Cargo.lock"
         "${src}/plugins/neovim-client/Cargo.lock"
         "${src}/plugins/neovim-files/Cargo.lock"
         "${src}/plugins/picker/Cargo.lock"
@@ -274,6 +275,21 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/inbox/Cargo.toml ]]; then
+        component_core="plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm"
+        component_output="plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR inbox core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+        install -D "$component_output" \
+          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm
+      fi
+
       if [[ -f plugins/neovim-files/Cargo.toml ]]; then
         component_core="plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.wasm"
         component_output="plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.component.wasm"
@@ -469,6 +485,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm" ]]; then
           continue
         fi
         if [[ "$wasm" == "plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.wasm" ]]; then

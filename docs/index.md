@@ -45,6 +45,8 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[systems/editor-plugin]] defines the client-local Wasm Neovim editor, its
   remote backend file actor, and its bounded bidirectional actor-message
   bridge.
+- [[systems/inbox-plugin]] defines the persistent client-global notification
+  queue and click-to-source actor routing.
 
 ## Core Concepts
 
