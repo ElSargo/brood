@@ -219,7 +219,7 @@ fn validate_ssh_target(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_session_package(spec: &str) -> Result<(String, PathBuf)> {
+pub fn parse_session_package(spec: &str) -> Result<(String, PathBuf)> {
     let (package, root) = spec
         .split_once('=')
         .context("session package must use ID=ROOT_WASM_PATH")?;
@@ -238,7 +238,7 @@ fn parse_session_package(spec: &str) -> Result<(String, PathBuf)> {
     Ok((package.to_string(), root))
 }
 
-fn resolve_default_session_package(client: &Path) -> Result<(String, PathBuf)> {
+pub fn resolve_default_session_package(client: &Path) -> Result<(String, PathBuf)> {
     let packaged_config = client
         .parent()
         .and_then(Path::parent)

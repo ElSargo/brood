@@ -8,6 +8,7 @@ code-links:
   - crates/broodd/src/control.rs
   - crates/brood-remote/src/main.rs
   - crates/brood-remote/src/ssh.rs
+  - crates/brood-remote/src/container.rs
 ---
 
 # CLI Reference Pointers
@@ -31,7 +32,8 @@ Use this page as an orientation map only. Do not duplicate full parser behavior 
 
 Remote relay, probe, certificate, and one-command SSH deployment behavior is
 defined by the `brood-remote` parser. See [[../workflows/ssh-deploy]] for the
-operator workflow.
+SSH operator workflow and [[../workflows/container-backends]] for local and
+remote Podman-backed sessions.
 
 Related:
 

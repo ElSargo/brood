@@ -83,6 +83,10 @@ pub enum HostMessage {
     DeploySshBackend {
         target: String,
     },
+    DeployContainerBackend {
+        image: String,
+        connection: Option<String>,
+    },
     CreateLocalBackend,
     ToggleShortcutPassthrough,
     SetShortcutPassthrough {

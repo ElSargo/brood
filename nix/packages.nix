@@ -593,6 +593,9 @@ let
           --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \
           --set BROOD_SSH_BACKEND "${sshBackend}" \
           --set BROOD_SSH_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
+          --set BROOD_CONTAINER_BACKEND "${containerBackend}" \
+          --set BROOD_CONTAINER_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
+          --set BROOD_PODMAN_REAL "${pkgs.podman}/bin/podman" \
           --run 'export GSETTINGS_SCHEMA_DIR="''${GSETTINGS_SCHEMA_DIR:-${gsettingsSchemaDir}}"' \
           --run 'export BROOD_CONFIG="''${BROOD_CONFIG:-'"$out"'/brood.toml}"'
       done
@@ -651,6 +654,116 @@ let
           'backend = "plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"' \
           > "$out/brood.toml"
       '';
+
+  containerBackend =
+    let
+      dynamicLinker =
+        if pkgs.stdenv.hostPlatform.isx86_64 then
+          "ld-linux-x86-64.so.2"
+        else if pkgs.stdenv.hostPlatform.isAarch64 then
+          "ld-linux-aarch64.so.1"
+        else
+          throw "Brood container deployment does not support ${pkgs.stdenv.hostPlatform.system}";
+      dependencyPath = lib.makeLibraryPath (
+        profiles.nativeLibs
+        ++ [
+          pkgs.dbus
+          pkgs.expat
+          pkgs.glibc
+          pkgs.stdenv.cc.cc.lib
+        ]
+      );
+    in
+    pkgs.runCommand "brood-container-backend"
+      {
+        nativeBuildInputs = [
+          pkgs.binutils
+          pkgs.findutils
+          pkgs.gawk
+          pkgs.patchelf
+        ];
+      }
+      ''
+        mkdir -p \
+          "$out/bin" \
+          "$out/lib" \
+          "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release" \
+          "$out/share/dbus-1" \
+          "$out/share/glvnd/egl_vendor.d" \
+          "$out/share/X11"
+
+        for program in brood brood-remote brood-sessiond brood-runner-exec; do
+          cp ${broodd}/bin/"$program" "$out/bin/$program"
+          chmod u+w "$out/bin/$program"
+        done
+        cp ${pkgs.dbus}/bin/dbus-daemon "$out/bin/dbus-daemon"
+        chmod u+w "$out/bin/dbus-daemon"
+        cp ${pkgs.dbus}/share/dbus-1/session.conf "$out/share/dbus-1/session.conf"
+        cp -RL ${pkgs.xkeyboard_config}/etc/X11/xkb "$out/share/X11/xkb"
+
+        export LD_LIBRARY_PATH=${dependencyPath}
+        for executable in "$out"/bin/*; do
+          while IFS= read -r library; do
+            [[ -n "$library" && -f "$library" ]] || continue
+            cp -Lf "$library" "$out/lib/$(basename "$library")"
+          done < <(
+            ldd "$executable" \
+              | awk '/=> \// { print $3 } /^\// { print $1 }'
+          )
+        done
+        cp -Lf ${pkgs.glibc}/lib/${dynamicLinker} "$out/lib/${dynamicLinker}"
+        cp -Lf ${pkgs.wayland}/lib/libwayland*.so* "$out/lib/"
+        cp -Lf ${pkgs.libffi}/lib/libffi.so* "$out/lib/"
+        cp -R ${pkgs.libglvnd}/lib/. "$out/lib/"
+        cp -R ${pkgs.mesa}/lib/. "$out/lib/"
+        cat >"$out/share/glvnd/egl_vendor.d/50_mesa.json" <<'EOF'
+        {
+          "file_format_version": "1.0.0",
+          "ICD": { "library_path": "/brood/lib/libEGL_mesa.so.0" }
+        }
+        EOF
+        while IFS= read -r library; do
+          while IFS= read -r dependency; do
+            [[ -n "$dependency" && -f "$dependency" ]] || continue
+            cp -Lf "$dependency" "$out/lib/$(basename "$dependency")"
+          done < <(
+            ldd "$library" \
+              | awk '/=> \// { print $3 } /^\// { print $1 }'
+          )
+        done < <(find "$out/lib" -type f -name '*.so*' -print)
+        cp -Lf ${pkgs.glibc}/lib/${dynamicLinker} "$out/lib/${dynamicLinker}"
+
+        for executable in "$out"/bin/*; do
+          patchelf \
+            --set-interpreter "/brood/lib/${dynamicLinker}" \
+            --set-rpath /brood/lib \
+            "$executable"
+        done
+        find "$out/lib" -type f -name '*.so*' ! -name 'ld-linux-*' -print0 \
+          | while IFS= read -r -d "" library; do
+              if patchelf --print-rpath "$library" >/dev/null 2>&1; then
+                chmod u+w "$library"
+                patchelf --set-rpath /brood/lib "$library"
+              fi
+            done
+        install -m 0555 \
+          ${wasmModules}/plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm \
+          "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"
+        printf '%s\n' \
+          '[init]' \
+          'backend = "plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"' \
+          > "$out/brood.toml"
+      '';
+
+  podmanWithBackend = pkgs.writeShellApplication {
+    name = "podman";
+    runtimeInputs = [ brood ];
+    text = ''
+      export BROOD_PODMAN_REAL=${pkgs.podman}/bin/podman
+      export BROOD_CONTAINER_BACKEND=${containerBackend}
+      exec brood-remote podman "$@"
+    '';
+  };
 
   desktopActions = pkgs.writeShellApplication {
     name = "brood-desktop";
@@ -1130,6 +1243,8 @@ in
   "prime-cargo-target" = primeCargoTarget;
   "software-e2e-capture" = softwareE2eCapture;
   "ssh-backend" = sshBackend;
+  "container-backend" = containerBackend;
+  "podman" = podmanWithBackend;
   "runtime-files" = runtimeFiles;
   "package-manifest" = packageManifestTool;
   "wasm-modules" = wasmModules;
@@ -1162,6 +1277,8 @@ in
     shellCheck
     softwareE2eCapture
     sshBackend
+    containerBackend
+    podmanWithBackend
     wasmModules
     ;
 }

@@ -76,6 +76,8 @@ enum EditMode {
     Rename(u64, u64),
     CreateWorktree(u64, u64),
     ConnectRemote,
+    CreateLocalContainer,
+    CreateRemoteContainer,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,7 @@ struct SwitcherState {
     is_root: bool,
     can_create_local: bool,
     can_connect_remote: bool,
+    can_create_container: bool,
     pane: u64,
     backend_id: u64,
     session_id: u64,
@@ -399,6 +402,7 @@ impl SwitcherState {
             is_root: false,
             can_create_local: false,
             can_connect_remote: false,
+            can_create_container: false,
             pane: 0,
             backend_id: 0,
             session_id: 0,
@@ -928,10 +932,12 @@ fn apply_backend_sessions(
     state: &mut SwitcherState,
     can_create_local: bool,
     can_connect_remote: bool,
+    can_create_container: bool,
     backends: Vec<BackendCatalogueEntry>,
 ) {
     state.can_create_local = can_create_local;
     state.can_connect_remote = can_connect_remote;
+    state.can_create_container = can_create_container;
     state.sessions = backends
         .into_iter()
         .flat_map(|backend| {
@@ -1373,6 +1379,7 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
             BackendCatalogueMessage::Sessions {
                 can_create_local,
                 can_connect_remote,
+                can_create_container,
                 backends,
                 ..
             } => {
@@ -1381,6 +1388,7 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
                         &mut state,
                         can_create_local,
                         can_connect_remote,
+                        can_create_container,
                         backends,
                     );
                     if let Some(backend) = state.pending_directory_backend
@@ -1900,6 +1908,20 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
                 redraw_or_record_error(&mut state);
                 return Vec::new();
             }
+            "create-container-local" => {
+                state.query.clear();
+                state.mode = EditMode::CreateLocalContainer;
+                state.status = "OCI image: Enter to create and connect".to_string();
+                redraw_or_record_error(&mut state);
+                return Vec::new();
+            }
+            "create-container-remote" => {
+                state.query.clear();
+                state.mode = EditMode::CreateRemoteContainer;
+                state.status = "Podman connection::OCI image".to_string();
+                redraw_or_record_error(&mut state);
+                return Vec::new();
+            }
             _ => {}
         }
     }
@@ -2003,6 +2025,29 @@ fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> 
                 backend: None,
                 session: None,
                 action: Some("create-remote".to_string()),
+                directory: None,
+            },
+        });
+    }
+    if state.can_create_container {
+        picker_items.push(SessionPickerItem {
+            label: "Create container backend".to_string(),
+            detail: "Run a backend in a local Podman container with GPU auto-detection"
+                .to_string(),
+            value: SessionPickerValueWire {
+                backend: None,
+                session: None,
+                action: Some("create-container-local".to_string()),
+                directory: None,
+            },
+        });
+        picker_items.push(SessionPickerItem {
+            label: "Create remote container backend".to_string(),
+            detail: "Use a named remote Podman system connection".to_string(),
+            value: SessionPickerValueWire {
+                backend: None,
+                session: None,
+                action: Some("create-container-remote".to_string()),
                 directory: None,
             },
         });
@@ -2650,6 +2695,41 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
             format!("{{\"type\":\"deploy-ssh-backend\",\"target\":{address:?}}}").into_bytes(),
         )];
     }
+    if matches!(
+        state.mode,
+        EditMode::CreateLocalContainer | EditMode::CreateRemoteContainer
+    ) {
+        let query = state.query.trim();
+        let (connection, image) = if state.mode == EditMode::CreateRemoteContainer {
+            let Some((connection, image)) = query.split_once("::") else {
+                state.error = true;
+                state.status = "Use CONNECTION::IMAGE for a remote container".to_string();
+                return Vec::new();
+            };
+            (Some(connection.trim().to_string()), image.trim().to_string())
+        } else {
+            (None, query.to_string())
+        };
+        if image.is_empty() || connection.as_ref().is_some_and(String::is_empty) {
+            state.error = true;
+            state.status = "Enter an OCI image and, when remote, a connection".to_string();
+            return Vec::new();
+        }
+        state.error = false;
+        state.status = format!("Creating container backend from {image}…");
+        state.next_request();
+        let body = serde_json::json!({
+            "type": "deploy-container-backend",
+            "image": image,
+            "connection": connection,
+        });
+        let Ok(body) = serde_json::to_vec(&body) else {
+            state.error = true;
+            state.status = "Could not encode the container request".to_string();
+            return Vec::new();
+        };
+        return vec![ActorCommand::SendHostMessage(body)];
+    }
     let visible_sessions = state
         .list_items()
         .into_iter()
@@ -2877,6 +2957,8 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
             EditMode::Rename(..) => "New session name…".to_string(),
             EditMode::CreateWorktree(..) => "Branch name…".to_string(),
             EditMode::ConnectRemote => "user@host…".to_string(),
+            EditMode::CreateLocalContainer => "image:tag…".to_string(),
+            EditMode::CreateRemoteContainer => "connection::image:tag…".to_string(),
         }
     } else {
         format!("{}▏", state.query)
@@ -3245,10 +3327,10 @@ bindings::export!(SessionSwitcher with_types_in bindings);
 #[cfg(test)]
 mod tests {
     use super::{
-        ActorCommand, SwitcherState, actor_realm, authenticated_neovim_client,
+        ActorCommand, EditMode, SwitcherState, actor_realm, authenticated_neovim_client,
         ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
-        request_editor, sender_actor_is, show_diff, start_neovim_client, truncate_to_width,
-        valid_editor_actor_target,
+        open_creation_backend_picker, request_editor, sender_actor_is, show_diff,
+        start_neovim_client, submit, truncate_to_width, valid_editor_actor_target,
     };
 
     #[test]
@@ -3384,5 +3466,41 @@ mod tests {
             String::from_utf8_lossy(&message.body)
                 .contains("git --no-pager diff --color=always --no-ext-diff")
         );
+    }
+
+    #[test]
+    fn backend_picker_exposes_local_and_remote_container_creation() {
+        let mut state = SwitcherState::new();
+        state.can_create_container = true;
+        let commands = open_creation_backend_picker(&mut state);
+        let [ActorCommand::SendLocalMessage(message)] = commands.as_slice() else {
+            panic!("backend picker did not open");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&message.body).unwrap_or(serde_json::Value::Null);
+        let actions = value["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["value"]["action"].as_str())
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&"create-container-local"));
+        assert!(actions.contains(&"create-container-remote"));
+    }
+
+    #[test]
+    fn remote_container_submission_preserves_connection_and_image() {
+        let mut state = SwitcherState::new();
+        state.mode = EditMode::CreateRemoteContainer;
+        state.query = "builder::docker.io/library/alpine:latest".to_string();
+        let commands = submit(&mut state);
+        let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
+            panic!("remote container request was not sent to the host");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(value["type"], "deploy-container-backend");
+        assert_eq!(value["connection"], "builder");
+        assert_eq!(value["image"], "docker.io/library/alpine:latest");
     }
 }

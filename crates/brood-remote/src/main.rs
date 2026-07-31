@@ -35,6 +35,7 @@ use rcgen::{CertifiedKey, generate_simple_self_signed};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
+mod container;
 mod ssh;
 
 const ACTOR_LANE_CAPACITY: usize = 64;
@@ -61,6 +62,18 @@ enum Command {
     Ssh(ssh::SshArgs),
     /// Start an SSH backend for an already-running presentation client.
     AttachSsh(ssh::SshArgs),
+    /// Start a backend in a Podman container, then launch the local client.
+    Container(container::ContainerArgs),
+    /// Start a container backend for an already-running presentation client.
+    AttachContainer(container::ContainerArgs),
+    /// Run the in-container backend supervisor. This is an internal entry point.
+    #[command(hide = true)]
+    ContainerSession(container::ContainerSessionArgs),
+    /// Keep a container alive while a backend is attached. This is an internal entry point.
+    #[command(hide = true)]
+    ContainerHold,
+    /// Podman-compatible frontend which adds a Brood backend to new containers.
+    Podman(container::PodmanArgs),
     /// Relay one local session connection over authenticated QUIC.
     Relay {
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -361,6 +374,11 @@ async fn main() -> Result<()> {
         } => generate_certificate(&server_name, &certificate, &private_key),
         Command::Ssh(args) => ssh::deploy(&args),
         Command::AttachSsh(args) => ssh::attach(&args),
+        Command::Container(args) => container::deploy(&args),
+        Command::AttachContainer(args) => container::attach(&args),
+        Command::ContainerSession(args) => container::run_session(&args),
+        Command::ContainerHold => container::hold(),
+        Command::Podman(args) => container::podman(&args),
         Command::Relay {
             listen,
             certificate,

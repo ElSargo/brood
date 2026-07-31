@@ -499,7 +499,7 @@ fn main() -> Result<()> {
     let event_proxy = event_loop.create_proxy();
     let plugin_graphics = PluginGraphicsBridge::new(event_proxy.clone());
     let clipboard = ClipboardBridge::start();
-    let ssh_deployer = ssh_deployer_path();
+    let backend_deployer = backend_deployer_path();
     let mut backend_registry = BackendRegistry::default();
     let mut remote_config_template = None;
     let local_server_template = if args.no_server {
@@ -878,7 +878,8 @@ fn main() -> Result<()> {
         event_proxy: Some(event_proxy),
         remote_config_template,
         remote_connections,
-        ssh_deployer,
+        ssh_deployer: backend_deployer.clone(),
+        container_deployer: backend_deployer,
         local_server_template,
         backend_registry,
         ..Application::default()
@@ -987,6 +988,11 @@ fn main() -> Result<()> {
         .iter_mut()
         .try_for_each(SshBackendDeployment::shutdown)
         .context("stop dynamically deployed SSH backends");
+    let container_shutdown_result = application
+        .container_deployments
+        .iter_mut()
+        .try_for_each(ContainerBackendDeployment::shutdown)
+        .context("stop dynamically deployed container backends");
     let error = application.error.take();
     drop(application);
     run_result?;
@@ -994,6 +1000,7 @@ fn main() -> Result<()> {
     backend_shutdown_result?;
     remote_shutdown_result?;
     ssh_shutdown_result?;
+    container_shutdown_result?;
     if let Some(error) = error {
         return Err(error);
     }
@@ -1048,6 +1055,8 @@ enum ClientEvent {
     },
     SshBackendReady(SshBackendDeployment),
     SshBackendFailed(String),
+    ContainerBackendReady(ContainerBackendDeployment),
+    ContainerBackendFailed(String),
     RemoteTerminalInputSent {
         backend: BackendId,
         trace_sequence: u64,
@@ -1085,6 +1094,31 @@ struct SshBackendDeployment {
     backend: Option<BackendId>,
 }
 
+#[derive(Debug)]
+struct ContainerBackendDeployment {
+    description: String,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    ready: SshAttachReady,
+    backend: Option<BackendId>,
+}
+
+impl ContainerBackendDeployment {
+    fn shutdown(&mut self) -> Result<()> {
+        drop(self.stdin.take());
+        let status = self
+            .child
+            .wait()
+            .with_context(|| format!("wait for container backend {}", self.description))?;
+        anyhow::ensure!(
+            status.success(),
+            "container backend {} exited with {status}",
+            self.description
+        );
+        Ok(())
+    }
+}
+
 impl SshBackendDeployment {
     fn shutdown(&mut self) -> Result<()> {
         drop(self.stdin.take());
@@ -1101,7 +1135,7 @@ impl SshBackendDeployment {
     }
 }
 
-fn ssh_deployer_path() -> Option<PathBuf> {
+fn backend_deployer_path() -> Option<PathBuf> {
     let configured = std::env::var_os("BROOD_REMOTE_BIN")
         .map(PathBuf::from)
         .or_else(|| {
@@ -1118,6 +1152,91 @@ fn ssh_deployer_path() -> Option<PathBuf> {
             })
         })?;
     configured.is_file().then_some(configured)
+}
+
+fn start_container_backend_deployment(
+    deployer: &std::path::Path,
+    image: &str,
+    connection: Option<&str>,
+    proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
+) -> Result<()> {
+    let client = std::env::current_exe().context("resolve running brood-client executable")?;
+    let description = connection.map_or_else(
+        || image.to_string(),
+        |connection| format!("{connection}::{image}"),
+    );
+    let mut command = Command::new(deployer);
+    command
+        .arg("attach-container")
+        .arg(&image)
+        .arg("--client")
+        .arg(client);
+    if let Some(connection) = connection {
+        command.arg("--connection").arg(connection);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("start container backend deployment {description}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("container backend deployment stdin was not captured")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("container backend deployment stdout was not captured")?;
+    thread::Builder::new()
+        .name("brood-client-container-deploy".to_string())
+        .spawn(move || {
+            let mut child = child;
+            let mut stdin = Some(stdin);
+            let ready = (|| -> Result<SshAttachReady> {
+                let mut line = String::new();
+                let bytes = BufReader::new(stdout)
+                    .read_line(&mut line)
+                    .context("read container backend attachment details")?;
+                anyhow::ensure!(
+                    bytes > 0,
+                    "container deployer exited before publishing connection details"
+                );
+                serde_json::from_str(line.trim_end())
+                    .context("decode container backend attachment details")
+            })();
+            match ready {
+                Ok(ready) => {
+                    let deployment = ContainerBackendDeployment {
+                        description: description.clone(),
+                        child,
+                        stdin: stdin.take(),
+                        ready,
+                        backend: None,
+                    };
+                    if let Err(winit::event_loop::EventLoopClosed(event)) =
+                        proxy.send_event(ClientEvent::ContainerBackendReady(deployment))
+                        && let ClientEvent::ContainerBackendReady(mut deployment) = event
+                    {
+                        drop(deployment.stdin.take());
+                        drop(deployment.child.wait());
+                    }
+                }
+                Err(error) => {
+                    drop(stdin.take());
+                    let status = child.wait();
+                    let message = match status {
+                        Ok(status) => format!("{error:#}; deployer exited with {status}"),
+                        Err(wait_error) => {
+                            format!("{error:#}; could not wait for deployer: {wait_error}")
+                        }
+                    };
+                    drop(proxy.send_event(ClientEvent::ContainerBackendFailed(message)));
+                }
+            }
+        })
+        .context("spawn container backend deployment reader")?;
+    Ok(())
 }
 
 fn start_ssh_backend_deployment(
@@ -2396,6 +2515,8 @@ struct Application {
     remote_connections: Vec<remote::RemoteConnection>,
     ssh_deployer: Option<PathBuf>,
     ssh_deployments: Vec<SshBackendDeployment>,
+    container_deployer: Option<PathBuf>,
+    container_deployments: Vec<ContainerBackendDeployment>,
     local_server_template: Option<ServerLaunch>,
     next_dynamic_local: u64,
     pending_frames: BTreeMap<BackendId, ClientEvent>,
@@ -2496,6 +2617,16 @@ impl Application {
             let mut deployment = self.ssh_deployments.remove(position);
             if let Err(error) = deployment.shutdown() {
                 eprintln!("SSH deployment for backend {backend:?} stopped: {error:#}");
+            }
+        }
+        if let Some(position) = self
+            .container_deployments
+            .iter()
+            .position(|deployment| deployment.backend == Some(backend))
+        {
+            let mut deployment = self.container_deployments.remove(position);
+            if let Err(error) = deployment.shutdown() {
+                eprintln!("container deployment for backend {backend:?} stopped: {error:#}");
             }
         }
         self.backend_connected = self
@@ -2710,6 +2841,50 @@ impl Application {
         Ok(())
     }
 
+    fn connect_container_backend(
+        &mut self,
+        mut deployment: ContainerBackendDeployment,
+    ) -> Result<()> {
+        let result = (|| -> Result<BackendId> {
+            let offer = format!(
+                "{}={}",
+                deployment.ready.session_package,
+                deployment.ready.session_root.display()
+            );
+            let config = remote::RemoteConfig {
+                backend: BackendId(0),
+                connect: deployment.ready.connect,
+                server_name: deployment.ready.server_name.clone(),
+                server_certificate: deployment.ready.server_certificate.clone(),
+                client_certificate: deployment.ready.client_certificate.clone(),
+                client_private_key: deployment.ready.client_private_key.clone(),
+                artifact_offers: brood_transport::package_offers(&offer, ArtifactRealm::Session)?,
+                allowed_client_artifacts: Vec::new(),
+                artifact_cache: brood_transport::default_artifact_cache(),
+            };
+            self.connect_remote_backend_config(config)
+        })();
+        let backend = match result {
+            Ok(backend) => backend,
+            Err(error) => {
+                if let Err(shutdown_error) = deployment.shutdown() {
+                    eprintln!(
+                        "could not stop failed container deployment {}: {shutdown_error:#}",
+                        deployment.description
+                    );
+                }
+                return Err(error);
+            }
+        };
+        deployment.backend = Some(backend);
+        eprintln!(
+            "connected in-client container backend={backend:?} container={}",
+            deployment.description
+        );
+        self.container_deployments.push(deployment);
+        Ok(())
+    }
+
     fn start_ssh_backend(&self, target: String) -> Result<()> {
         let deployer = self
             .ssh_deployer
@@ -2720,6 +2895,18 @@ impl Application {
             .clone()
             .context("presentation event loop proxy is unavailable")?;
         start_ssh_backend_deployment(deployer, target, proxy)
+    }
+
+    fn start_container_backend(&self, image: String, connection: Option<String>) -> Result<()> {
+        let deployer = self
+            .container_deployer
+            .as_deref()
+            .context("the brood-remote container deployer is unavailable")?;
+        let proxy = self
+            .event_proxy
+            .clone()
+            .context("presentation event loop proxy is unavailable")?;
+        start_container_backend_deployment(deployer, &image, connection.as_deref(), proxy)
     }
 
     fn notify_backend_connected(&self, backend: BackendId) -> Result<()> {
@@ -2755,6 +2942,7 @@ impl Application {
         let message = BackendCatalogueMessage::sessions(
             self.local_server_template.is_some(),
             self.ssh_deployer.is_some(),
+            self.container_deployer.is_some(),
             self.backend_sessions
                 .iter()
                 .map(|(backend, snapshot)| BackendCatalogueEntry {
@@ -3098,6 +3286,11 @@ impl Application {
             ClientEvent::SshBackendReady(_) | ClientEvent::SshBackendFailed(_) => {
                 return Err(anyhow!(
                     "SSH backend deployment event reached scene transport path"
+                ));
+            }
+            ClientEvent::ContainerBackendReady(_) | ClientEvent::ContainerBackendFailed(_) => {
+                return Err(anyhow!(
+                    "container backend deployment event reached scene transport path"
                 ));
             }
             ClientEvent::RemoteTerminalInputSent { .. } => {
@@ -3632,6 +3825,20 @@ impl Application {
                     }
                     None
                 }
+                HostMessage::DeployContainerBackend { image, connection } => {
+                    if let Err(error) = self.start_container_backend(image, connection) {
+                        eprintln!("could not start in-client container backend: {error:#}");
+                        if let Err(notify_error) =
+                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                        {
+                            eprintln!(
+                                "could not notify session switcher about container backend \
+                                 failure: {notify_error:#}"
+                            );
+                        }
+                    }
+                    None
+                }
                 HostMessage::CreateLocalBackend => {
                     if let Err(error) = self.connect_local_backend() {
                         eprintln!("could not start dynamic local backend: {error:#}");
@@ -4147,6 +4354,28 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Err(error) = self.notify_backend_connection_failed(&message) {
                     eprintln!(
                         "could not notify session switcher about SSH backend failure: {error:#}"
+                    );
+                }
+            }
+            ClientEvent::ContainerBackendReady(deployment) => {
+                if let Err(error) = self.connect_container_backend(deployment) {
+                    eprintln!("could not attach deployed container backend: {error:#}");
+                    if let Err(notify_error) =
+                        self.notify_backend_connection_failed(&format!("{error:#}"))
+                    {
+                        eprintln!(
+                            "could not notify session switcher about container backend failure: \
+                             {notify_error:#}"
+                        );
+                    }
+                }
+            }
+            ClientEvent::ContainerBackendFailed(message) => {
+                eprintln!("in-client container backend deployment failed: {message}");
+                if let Err(error) = self.notify_backend_connection_failed(&message) {
+                    eprintln!(
+                        "could not notify session switcher about container backend failure: \
+                         {error:#}"
                     );
                 }
             }
@@ -5686,6 +5915,7 @@ fn apply_key_policy_host_message(
         | HostMessage::BackendSession { .. }
         | HostMessage::ConnectRemoteBackend { .. }
         | HostMessage::DeploySshBackend { .. }
+        | HostMessage::DeployContainerBackend { .. }
         | HostMessage::CreateLocalBackend => None,
         HostMessage::SetClipboard { text } => {
             clipboard

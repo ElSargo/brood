@@ -63,6 +63,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 
 - [[workflows/run-brood]]
 - [[workflows/ssh-deploy]]
+- [[workflows/container-backends]]
 - [[workflows/enter-session]]
 - [[workflows/test-nested]]
 - [[workflows/develop-with-nix]]

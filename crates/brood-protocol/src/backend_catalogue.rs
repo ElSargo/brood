@@ -64,6 +64,8 @@ pub enum BackendCatalogueMessage {
         version: u32,
         can_create_local: bool,
         can_connect_remote: bool,
+        #[serde(default)]
+        can_create_container: bool,
         backends: Vec<BackendCatalogueEntry>,
     },
 }
@@ -89,12 +91,14 @@ impl BackendCatalogueMessage {
     pub const fn sessions(
         can_create_local: bool,
         can_connect_remote: bool,
+        can_create_container: bool,
         backends: Vec<BackendCatalogueEntry>,
     ) -> Self {
         Self::Sessions {
             version: BACKEND_CATALOGUE_PROTOCOL_VERSION,
             can_create_local,
             can_connect_remote,
+            can_create_container,
             backends,
         }
     }
@@ -258,6 +262,21 @@ mod tests {
     }
 
     #[test]
+    fn older_catalogues_default_container_creation_to_unavailable() {
+        let json = format!(
+            "{{\"kind\":\"backend-sessions\",\"version\":{BACKEND_CATALOGUE_PROTOCOL_VERSION},\"can_create_local\":true,\"can_connect_remote\":true,\"backends\":[]}}"
+        );
+        let decoded = serde_json::from_str::<BackendCatalogueMessage>(&json);
+        assert!(matches!(
+            decoded,
+            Ok(BackendCatalogueMessage::Sessions {
+                can_create_container: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn catalogue_validation_rejects_version_and_oversized_metadata() {
         let unsupported = BackendCatalogueMessage::Connected {
             version: BACKEND_CATALOGUE_PROTOCOL_VERSION + 1,
@@ -275,6 +294,7 @@ mod tests {
         let catalogue = BackendCatalogueMessage::sessions(
             true,
             true,
+            false,
             vec![BackendCatalogueEntry {
                 backend: BackendId(1),
                 label: "Local".to_string(),
