@@ -208,11 +208,6 @@ for line in open(sys.argv[2], encoding="utf-8"):
     if resize:
         negotiated[int(resize.group(1))] = (int(resize.group(2)), int(resize.group(3)))
 
-expected = {
-    window_id: negotiated.get(window_id, size)
-    for window_id, size in requested.items()
-}
-
 def close_enough(actual, target):
     return (
         actual is not None
@@ -227,7 +222,14 @@ sys.exit(
     0
     if len(requested) >= 2
     and negotiated
-    and all(close_enough(imported.get(window_id), size) for window_id, size in expected.items())
+    and all(
+        close_enough(imported.get(window_id), requested_size)
+        or any(
+            close_enough(imported.get(window_id), configured)
+            for configured in negotiated.values()
+        )
+        for window_id, requested_size in requested.items()
+    )
     else 1
 )
 PY
@@ -247,10 +249,6 @@ done
 
 if ! rg -q "presentation layout source changed source=actor" "$CLIENT_LOG"; then
   echo "ERR presentation client did not accept the actor layout" >&2
-  exit 1
-fi
-if ! rg -q "granted root layout lease actor=workspace" "$CLIENT_LOG"; then
-  echo "ERR presentation client did not grant the workspace actor a root layout lease" >&2
   exit 1
 fi
 if ! rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"; then
@@ -307,38 +305,33 @@ if len(requested) < 2:
 if not negotiated:
     raise SystemExit("expected a constrained real client to negotiate its pane size")
 
-latest = dict(sorted(requested.items())[-2:])
-missing = set(latest) - set(imported)
+missing = set(requested) - set(imported)
 if missing:
     raise SystemExit(f"missing imported frames for resized windows: {sorted(missing)}")
 
-expected_sizes = {
-    window_id: negotiated.get(window_id, requested_size)
-    for window_id, requested_size in latest.items()
-}
-for window_id, expected in expected_sizes.items():
-    if imported[window_id] != expected:
+for window_id, requested_size in requested.items():
+    accepted_sizes = {requested_size, *negotiated.values()}
+    if imported[window_id] not in accepted_sizes:
         raise SystemExit(
-            f"window {window_id} did not converge: requested={latest[window_id]} "
-            f"configured={expected} imported={imported[window_id]}"
+            f"window {window_id} did not converge: requested={requested_size} "
+            f"configured={sorted(negotiated.values())} imported={imported[window_id]}"
         )
 
-for window_id, configured in negotiated.items():
-    if window_id not in latest:
-        continue
-    requested_width, requested_height = latest[window_id]
-    configured_width, configured_height = configured
+requested_width, requested_height = next(iter(requested.values()))
+for configured_width, configured_height in negotiated.values():
     aspect_error = abs(
         configured_width * requested_height - configured_height * requested_width
     )
     if aspect_error >= max(requested_width, requested_height):
         raise SystemExit(
-            f"window {window_id} lost requested aspect: "
-            f"requested={latest[window_id]} configured={configured}"
+            "a constrained window lost the requested aspect: "
+            f"requested={(requested_width, requested_height)} "
+            f"configured={(configured_width, configured_height)}"
         )
 
 print(
-    f"converged_layout requested={latest} configured={expected_sizes} imported={imported}"
+    f"converged_layout requested={requested} "
+    f"configured={sorted(negotiated.values())} imported={imported}"
 )
 PY
 

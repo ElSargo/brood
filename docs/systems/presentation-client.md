@@ -293,6 +293,8 @@ Acceptance uses real external-client workloads:
 - the session switcher's visible, hidden, and restored right-sidebar states;
 - real keyboard, pointer, click, and scroll routed through client hit testing;
 - interactive Wayland resize with requested, configured, and imported extents;
+- interactive native viewport resize with continuous buffer scaling and one
+  settled actor, plugin, and managed-client size revision;
 - shared-memory saturation without loss of critical transitions;
 - copied transport under software WGPU;
 - DMA-BUF import and synchronization where supported;

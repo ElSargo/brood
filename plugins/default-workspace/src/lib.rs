@@ -76,6 +76,8 @@ static mut LAYOUT_LEASE_ID: u64 = 0;
 static mut LAYOUT_LEASE_GENERATION: u64 = 0;
 static mut LAYOUT_REVISION: u64 = 0;
 static mut LAYOUT_HAS_LEASE: bool = false;
+static mut LAYOUT_VIEWPORT_WIDTH: i32 = 1280;
+static mut LAYOUT_VIEWPORT_HEIGHT: i32 = 800;
 
 type PaneList = FixedVec<u64, MAX_PANES>;
 type AppPaneList = FixedVec<AppPane, MAX_PANES>;
@@ -116,6 +118,8 @@ struct WorkspaceMessage {
     revision: Option<u64>,
     #[serde(default)]
     lease: Option<LayoutLeaseToken>,
+    #[serde(default)]
+    size: LayoutStateSize,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -128,6 +132,12 @@ struct PaneRealm {
 struct LayoutLeaseToken {
     id: u64,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+struct LayoutStateSize {
+    w: i32,
+    h: i32,
 }
 
 fn decode_json<T>(bytes: &[u8]) -> Option<T>
@@ -385,6 +395,7 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
             message.focused_pane,
             message.lease,
             message.revision,
+            message.size,
         );
         let (panes, pane_backends, focus, fullscreen, lease, revision) = layout_actor_state();
         let len = write_layout_actor_outbox(
@@ -740,6 +751,7 @@ fn store_layout_actor_state(
     focus: Option<u64>,
     lease: Option<LayoutLeaseToken>,
     revision: Option<u64>,
+    size: LayoutStateSize,
 ) {
     let pane_count = panes.len().min(64);
     unsafe {
@@ -774,6 +786,8 @@ fn store_layout_actor_state(
         } else {
             LAYOUT_HAS_LEASE = false;
         }
+        LAYOUT_VIEWPORT_WIDTH = size.w.max(1);
+        LAYOUT_VIEWPORT_HEIGHT = size.h.max(1);
     }
 }
 
@@ -890,12 +904,20 @@ fn write_set_resolved_layout_payload(
             .unwrap_or(panes[0]);
         write_pane_item_payload(payload, pane, 0.0, -1.0, -1.0, 2.0, 2.0);
     } else {
+        let (viewport_width, viewport_height) =
+            unsafe { (LAYOUT_VIEWPORT_WIDTH, LAYOUT_VIEWPORT_HEIGHT) };
         let mut index = 0;
         while index < pane_count {
             if index > 0 {
                 payload.byte(b',');
             }
-            let placement = pane_placement(index, panes, pane_backends);
+            let placement = pane_placement(
+                index,
+                panes,
+                pane_backends,
+                viewport_width,
+                viewport_height,
+            );
             write_pane_item_payload(
                 payload,
                 panes[index],

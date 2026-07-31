@@ -101,8 +101,12 @@ realm for every realm-bound managed or client-local pane, and `visible_panes`
 as the client's default session-filtered subset. The available set defines
 layout authority; `visible_panes` is a convenience policy input, not a
 validation boundary. The default workspace keeps each backend in a disjoint
-top-level column and arranges that backend's panes within its column, so panes
-from separate local or remote computers never enter the same anonymous stack.
+top-level column and arranges that backend's panes in an aspect-aware balanced
+grid within its column, so panes from separate local or remote computers never
+enter the same anonymous stack. Column width follows the amount of content in
+the backend group. Incomplete final rows expand to use their available width
+instead of leaving dead cells. This remains bounded by the actor inventory
+limit rather than assuming a fixed pane count.
 
 Other actors and the key lane may address ordinary commands such as
 `layout-action` to the layout actor. A result reaches the host only as a
@@ -172,8 +176,26 @@ pane ID shape without confusing a local pane with a managed Wayland pane.
 
 The client immediately uses a deterministic local fallback when no root layout
 actor is configured or the accepted lease tree no longer matches current
-inventory. It also falls back after an invalid root candidate. A later valid
-actor outbox message can become authoritative again.
+inventory. The fallback uses the same aspect-aware balanced-grid policy,
+without backend-specific grouping that requires actor state. It also falls back
+after an invalid root candidate. A later valid actor outbox message can become
+authoritative again.
+
+## Native Window Resize
+
+The presentation viewport is a normal resizable OS window with native
+decorations and a minimum usable extent. Interactive resize is a client-local
+visual transaction. Each native size event immediately reconfigures the WGPU
+surface and reprojects the accepted normalized layout, so the existing managed
+and plugin textures track the pointer without waiting on an actor or nested
+client.
+
+Viewport publication, plugin target recompilation, pane resize events, and
+managed Wayland size requests wait until native size events have been quiet for
+a short settlement interval. The client then publishes one coherent viewport
+revision and one final size per changed pane. New frame and actor traffic may
+continue during the drag, but cannot bypass this resize barrier and start a
+cascade of intermediate client configurations.
 
 Failure of a wrapper collapses that node and promotes its `rest` child rather
 than revoking the useful inner layout. Removed plugin-owned panes follow normal

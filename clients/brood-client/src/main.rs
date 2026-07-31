@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
+    dpi::LogicalSize,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
@@ -83,6 +84,7 @@ use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
 
 pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
 fn latency_summary(
     samples: &VecDeque<u128>,
@@ -2361,6 +2363,36 @@ struct PointerRoutingState {
     managed_target: Option<u64>,
 }
 
+struct WindowResizeTransaction {
+    started: Instant,
+    settle_at: Instant,
+    events: u32,
+    initial_size: (u32, u32),
+    latest_size: (u32, u32),
+}
+
+impl WindowResizeTransaction {
+    fn new(now: Instant, initial_size: (u32, u32), latest_size: (u32, u32)) -> Self {
+        Self {
+            started: now,
+            settle_at: now + WINDOW_RESIZE_SETTLE_DELAY,
+            events: 1,
+            initial_size,
+            latest_size,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, latest_size: (u32, u32)) {
+        self.settle_at = now + WINDOW_RESIZE_SETTLE_DELAY;
+        self.events = self.events.saturating_add(1);
+        self.latest_size = latest_size;
+    }
+
+    fn ready(&self, now: Instant) -> bool {
+        now >= self.settle_at
+    }
+}
+
 #[derive(Default)]
 struct Application {
     renderer: Option<Renderer>,
@@ -2408,6 +2440,7 @@ struct Application {
     plugin_input_traces_by_backend: BTreeMap<BackendId, VecDeque<serde_json::Value>>,
     plugin_scroll_benchmark: Option<PluginScrollBenchmark>,
     plugin_scroll_auto_last_scene: Option<(u64, Instant)>,
+    window_resize: Option<WindowResizeTransaction>,
 }
 
 impl Application {
@@ -3143,6 +3176,9 @@ impl Application {
     }
 
     fn publish_layout_state(&mut self) -> Result<()> {
+        if self.window_resize.is_some() {
+            return Ok(());
+        }
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
@@ -3770,6 +3806,46 @@ impl Application {
         }
     }
 
+    fn settle_window_resize(&mut self) -> Result<()> {
+        let Some(transaction) = self.window_resize.as_ref() else {
+            return Ok(());
+        };
+        if !transaction.ready(Instant::now()) {
+            return Ok(());
+        }
+        let transaction = self
+            .window_resize
+            .take()
+            .context("window resize transaction disappeared while settling")?;
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        let focus_change = renderer.finish_window_resize()?;
+        if let Some(change) = focus_change {
+            dispatch_focus_change(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                change,
+                self.window_focused,
+            )?;
+        }
+        if let Some(sender) = self.input_sender.as_mut() {
+            send_presentation_configuration(sender, renderer);
+        }
+        flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+        flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+        eprintln!(
+            "settled presentation window resize events={} from={}x{} to={}x{} elapsed_ms={}",
+            transaction.events,
+            transaction.initial_size.0,
+            transaction.initial_size.1,
+            transaction.latest_size.0,
+            transaction.latest_size.1,
+            transaction.started.elapsed().as_millis(),
+        );
+        Ok(())
+    }
+
     fn allocate_renderer_generation(&mut self) -> Result<u64> {
         self.next_renderer_generation = self
             .next_renderer_generation
@@ -3795,6 +3871,7 @@ impl Application {
             .renderer
             .take()
             .context("lost renderer during recovery")?;
+        self.window_resize = None;
         let replay = old
             .plugin_panes
             .values()
@@ -3855,7 +3932,12 @@ impl ApplicationHandler<ClientEvent> for Application {
             return;
         };
         let result = event_loop
-            .create_window(Window::default_attributes().with_title(title))
+            .create_window(
+                Window::default_attributes()
+                    .with_title(title)
+                    .with_resizable(true)
+                    .with_min_inner_size(LogicalSize::new(480.0, 320.0)),
+            )
             .context("create presentation window")
             .and_then(|window| {
                 let graphics = self
@@ -4351,6 +4433,10 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
+        if let Err(error) = self.settle_window_resize() {
+            self.fail(event_loop, error);
+            return;
+        }
         self.sync_default_backend_target();
         if let Err(error) = self.publish_layout_state() {
             self.fail(event_loop, error);
@@ -4403,6 +4489,18 @@ impl ApplicationHandler<ClientEvent> for Application {
             // which filled its ring. Poll until it frees a slot so input state
             // transitions cannot remain deferred indefinitely.
             event_loop.set_control_flow(ControlFlow::Poll);
+        } else if let Some(resize) = self.window_resize.as_ref() {
+            let actor_poll = Instant::now() + Duration::from_millis(50);
+            let deadline = if self
+                .wasm_runtime
+                .as_ref()
+                .is_some_and(|runtime| !runtime.is_empty())
+            {
+                resize.settle_at.min(actor_poll)
+            } else {
+                resize.settle_at
+            };
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else if self
             .wasm_runtime
             .as_ref()
@@ -4432,13 +4530,24 @@ impl ApplicationHandler<ClientEvent> for Application {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                let focus_change = match renderer.resize(size.width, size.height) {
-                    Ok(change) => change,
-                    Err(error) => {
-                        self.fail(event_loop, error);
-                        return;
-                    }
-                };
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
+                let now = Instant::now();
+                let previous_size = (renderer.config.width, renderer.config.height);
+                if self.window_resize.is_none() && previous_size == (size.width, size.height) {
+                    return;
+                }
+                if let Some(transaction) = self.window_resize.as_mut() {
+                    transaction.observe(now, (size.width, size.height));
+                } else {
+                    self.window_resize = Some(WindowResizeTransaction::new(
+                        now,
+                        previous_size,
+                        (size.width, size.height),
+                    ));
+                }
+                let focus_change = renderer.resize_window_live(size.width, size.height);
                 if let Some(change) = focus_change
                     && let Err(error) = dispatch_focus_change(
                         self.wasm_runtime.as_ref(),
@@ -4448,12 +4557,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     )
                 {
                     self.fail(event_loop, error);
-                    return;
                 }
-                if let Some(sender) = self.input_sender.as_mut() {
-                    send_presentation_configuration(sender, renderer);
-                }
-                flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
@@ -5116,6 +5220,7 @@ struct Renderer {
     layout_state_dirty: bool,
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
+    window_resize_in_progress: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6406,6 +6511,7 @@ impl Renderer {
             layout_state_dirty: true,
             sent_managed_sizes: HashMap::new(),
             sent_plugin_sizes: HashMap::new(),
+            window_resize_in_progress: false,
         })
     }
 
@@ -7206,6 +7312,9 @@ impl Renderer {
     }
 
     fn sync_plugin_graphics_extents(&mut self) -> Result<()> {
+        if self.window_resize_in_progress {
+            return Ok(());
+        }
         let scenes = self
             .plugin_panes
             .values()
@@ -7237,6 +7346,11 @@ impl Renderer {
 
     fn plugin_scene_extent(&self, pane: u64) -> (u32, u32, f32) {
         let scale = self.window.scale_factor() as f32;
+        if self.window_resize_in_progress
+            && let Some(plugin) = self.plugin_panes.get(&pane)
+        {
+            return (plugin.scene.width, plugin.scene.height, plugin.scene.scale);
+        }
         let extent = self.plugin_panes.get(&pane).map_or_else(
             || (self.config.width.max(1), self.config.height.max(1)),
             |plugin| {
@@ -7248,6 +7362,9 @@ impl Renderer {
     }
 
     fn pending_plugin_resize_events(&self) -> Vec<(u64, PluginPaneSize)> {
+        if self.window_resize_in_progress {
+            return Vec::new();
+        }
         let scale = self.window.scale_factor() as f32;
         self.plugin_panes
             .iter()
@@ -7267,14 +7384,18 @@ impl Renderer {
         self.sent_plugin_sizes.insert(pane, size);
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<Option<FocusChange>> {
-        if width == 0 || height == 0 {
-            return Ok(None);
-        }
-
+    fn resize_window_live(&mut self, width: u32, height: u32) -> Option<FocusChange> {
+        self.window_resize_in_progress = true;
         self.config.width = width;
         self.config.height = height;
         self.reconfigure();
+        let focus_change = self.project_accepted_layout(None);
+        self.window.request_redraw();
+        focus_change
+    }
+
+    fn finish_window_resize(&mut self) -> Result<Option<FocusChange>> {
+        self.window_resize_in_progress = false;
         self.layout_state_dirty = true;
         let focus_change = self.reconcile_layout();
         self.sync_plugin_graphics_extents()?;
@@ -7464,6 +7585,9 @@ impl Renderer {
     }
 
     fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32)> {
+        if self.window_resize_in_progress {
+            return Vec::new();
+        }
         let scale = self.window.scale_factor().max(f64::EPSILON);
         self.current_windows
             .iter()
@@ -7666,6 +7790,24 @@ mod tests {
     }
 
     #[test]
+    fn native_resize_events_extend_one_settlement_transaction() {
+        let started = Instant::now();
+        let mut transaction = WindowResizeTransaction::new(started, (800, 600), (810, 610));
+        for step in 1..12 {
+            transaction.observe(
+                started + Duration::from_millis(step * 16),
+                (810 + step as u32, 610 + step as u32),
+            );
+        }
+
+        assert_eq!(transaction.events, 12);
+        assert_eq!(transaction.initial_size, (800, 600));
+        assert_eq!(transaction.latest_size, (821, 621));
+        assert!(!transaction.ready(started + Duration::from_millis(295)));
+        assert!(transaction.ready(started + Duration::from_millis(296)));
+    }
+
+    #[test]
     fn terminal_trace_sequences_are_carried_by_input_and_snapshot_messages() {
         let mut input = vec![b'I'];
         input.extend_from_slice(&17_u64.to_le_bytes());
@@ -7722,61 +7864,89 @@ mod tests {
         }
     }
 
+    fn assert_placement_close(actual: PanePlacement, expected: PanePlacement) {
+        let epsilon = 0.000_1;
+        assert!((actual.offset_u - expected.offset_u).abs() < epsilon);
+        assert!((actual.offset_v - expected.offset_v).abs() < epsilon);
+        assert!((actual.size_u - expected.size_u).abs() < epsilon);
+        assert!((actual.size_v - expected.size_v).abs() < epsilon);
+    }
+
     #[test]
-    fn layout_separates_backend_groups_into_columns() {
+    fn layout_separates_backend_groups_into_weighted_columns() {
         let panes = [10, 20, 11];
         let backends = [1, 2, 1];
-        assert_eq!(
-            pane_placement(0, &panes, &backends),
+        assert_placement_close(
+            pane_placement(0, &panes, &backends, 1200, 800),
             PanePlacement {
                 offset_u: -1.0,
                 offset_v: -1.0,
-                size_u: 1.0,
+                size_u: 4.0 / 3.0,
                 size_v: 1.0,
-            }
+            },
         );
-        assert_eq!(
-            pane_placement(1, &panes, &backends),
+        assert_placement_close(
+            pane_placement(1, &panes, &backends, 1200, 800),
             PanePlacement {
-                offset_u: 0.0,
+                offset_u: 1.0 / 3.0,
                 offset_v: -1.0,
-                size_u: 1.0,
+                size_u: 2.0 / 3.0,
                 size_v: 2.0,
-            }
+            },
         );
-        assert_eq!(
-            pane_placement(2, &panes, &backends),
+        assert_placement_close(
+            pane_placement(2, &panes, &backends, 1200, 800),
             PanePlacement {
                 offset_u: -1.0,
                 offset_v: 0.0,
-                size_u: 1.0,
+                size_u: 4.0 / 3.0,
                 size_v: 1.0,
-            }
+            },
         );
     }
 
     #[test]
-    fn one_backend_keeps_the_existing_primary_and_stack_layout() {
+    fn one_backend_uses_an_aspect_aware_balanced_grid() {
         let panes = [10, 11, 12];
         let backends = [7, 7, 7];
-        assert_eq!(
-            pane_placement(0, &panes, &backends),
+        assert_placement_close(
+            pane_placement(0, &panes, &backends, 1600, 900),
             PanePlacement {
                 offset_u: -1.0,
                 offset_v: -1.0,
                 size_u: 1.0,
-                size_v: 2.0,
-            }
-        );
-        assert_eq!(
-            pane_placement(2, &panes, &backends),
-            PanePlacement {
-                offset_u: 0.0,
-                offset_v: 0.0,
-                size_u: 1.0,
                 size_v: 1.0,
-            }
+            },
         );
+        assert_placement_close(
+            pane_placement(2, &panes, &backends, 1600, 900),
+            PanePlacement {
+                offset_u: -1.0,
+                offset_v: 0.0,
+                size_u: 2.0,
+                size_v: 1.0,
+            },
+        );
+    }
+
+    #[test]
+    fn workspace_layout_keeps_sixty_four_windows_inside_the_viewport() {
+        let panes = (0..64).collect::<Vec<_>>();
+        let backends = panes.iter().map(|pane| pane / 16).collect::<Vec<_>>();
+        let placements = panes
+            .iter()
+            .enumerate()
+            .map(|(index, _)| pane_placement(index, &panes, &backends, 1920, 1080))
+            .collect::<Vec<_>>();
+
+        for placement in placements {
+            assert!(placement.offset_u >= -1.0);
+            assert!(placement.offset_v >= -1.0);
+            assert!(placement.offset_u + placement.size_u <= 1.000_1);
+            assert!(placement.offset_v + placement.size_v <= 1.000_1);
+            assert!(placement.size_u > 0.0);
+            assert!(placement.size_v > 0.0);
+        }
     }
 
     #[test]

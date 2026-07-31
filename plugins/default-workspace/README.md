@@ -47,3 +47,9 @@ does not spawn processes or toggle client-owned pane state. The repository
 acceptance proof uses this exact module with real terminal surfaces, injected
 key press/release events, and compositor screenshots. Run
 `tools/test-session-switcher-plugin-nested.sh` through the checked-in Nix shell.
+
+The workspace layout keeps backend realms in separate weighted columns and
+tiles every realm in a viewport-aspect-aware grid. It supports the full bounded
+pane inventory; a partial final row expands to the column width, and the
+existing focus-cycle and managed-fullscreen actions keep dense workspaces
+navigable.
