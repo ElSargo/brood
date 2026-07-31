@@ -15,14 +15,17 @@ use brood_plugin_sdk::{
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
     text::truncate_to_width,
 };
+use brood_protocol::backend_catalogue::{BackendCatalogueEntry, BackendCatalogueMessage};
 use serde::{Deserialize, Serialize};
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
 const PICKER_ACTOR_ID: &str = "picker";
+const KEYBINDINGS_ACTOR_ID: &str = "keybindings";
 const INBOX_ACTOR_ID: &str = "inbox";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
 const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
+const KEYBINDINGS_COMPONENT_FILE: &str = "brood_keybindings_plugin.component.wasm";
 const INBOX_COMPONENT_FILE: &str = "brood_inbox_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const NEOVIM_CLIENT_COMPONENT_FILE: &str = "brood_neovim_client_plugin.component.wasm";
@@ -73,49 +76,6 @@ enum EditMode {
     Rename(u64, u64),
     CreateWorktree(u64, u64),
     ConnectRemote,
-}
-
-#[derive(Clone, Deserialize)]
-struct BackendSessionsMessage {
-    kind: serde_json_core::heapless::String<32>,
-    #[serde(default)]
-    can_create_local: bool,
-    #[serde(default)]
-    can_connect_remote: bool,
-    backends: Vec<BackendView>,
-}
-
-#[derive(Deserialize)]
-struct BackendConnectedMessage {
-    kind: serde_json_core::heapless::String<32>,
-    backend: u64,
-}
-
-#[derive(Deserialize)]
-struct BackendConnectionFailedMessage {
-    kind: serde_json_core::heapless::String<32>,
-    message: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct BackendView {
-    backend: u64,
-    label: String,
-    sessions: Vec<BackendSession>,
-}
-
-#[derive(Clone, Deserialize)]
-struct BackendSession {
-    id: u64,
-    name: String,
-    active: bool,
-    windows: u64,
-    working_directory: Option<String>,
-    project_id: String,
-    project_name: String,
-    branch: Option<String>,
-    worktree: bool,
-    git: bool,
 }
 
 #[derive(Clone)]
@@ -177,6 +137,8 @@ struct SwitcherState {
     workspace_focus: Option<u64>,
     picker_pane: Option<u64>,
     picker_visible: bool,
+    keybindings_pane: Option<u64>,
+    keybindings_visible: bool,
     inbox_pane: Option<u64>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
@@ -467,6 +429,8 @@ impl SwitcherState {
             workspace_focus: None,
             picker_pane: None,
             picker_visible: false,
+            keybindings_pane: None,
+            keybindings_visible: false,
             inbox_pane: None,
             hovered: None,
             pressed: None,
@@ -651,6 +615,13 @@ impl Guest for SessionSwitcher {
                             session_id: None,
                         }),
                         ActorCommand::StartActor(ActorStartRequest {
+                            id: KEYBINDINGS_ACTOR_ID.to_string(),
+                            path: KEYBINDINGS_COMPONENT_FILE.to_string(),
+                            capabilities: Vec::new(),
+                            backend_id: None,
+                            session_id: None,
+                        }),
+                        ActorCommand::StartActor(ActorStartRequest {
                             id: INBOX_ACTOR_ID.to_string(),
                             path: INBOX_COMPONENT_FILE.to_string(),
                             capabilities: Vec::new(),
@@ -735,6 +706,10 @@ impl Guest for SessionSwitcher {
                     state.status = "The global inbox stopped".to_string();
                     return Vec::new();
                 }
+                if id == KEYBINDINGS_ACTOR_ID {
+                    state.keybindings_pane = None;
+                    state.keybindings_visible = false;
+                }
                 state.coding_agent_uis.retain(|actor| actor != &id);
                 state.coding_agent_targets.remove(&id);
                 let editor_lifecycle =
@@ -775,6 +750,10 @@ impl Guest for SessionSwitcher {
                     state.status = format!("The global inbox failed: {}", failed.message);
                     return Vec::new();
                 }
+                if failed.id == KEYBINDINGS_ACTOR_ID {
+                    state.keybindings_pane = None;
+                    state.keybindings_visible = false;
+                }
                 state.coding_agent_uis.retain(|actor| actor != &failed.id);
                 state.coding_agent_targets.remove(&failed.id);
                 let editor_failure =
@@ -807,6 +786,9 @@ impl Guest for SessionSwitcher {
             }
             Event::Mailbox(message) if message.sender == PICKER_ACTOR_ID => {
                 handle_picker_message(&message.body)
+            }
+            Event::Mailbox(message) if message.sender == KEYBINDINGS_ACTOR_ID => {
+                handle_keybindings_layout_message(&message.body)
             }
             Event::Mailbox(message) if message.sender == INBOX_ACTOR_ID => {
                 handle_inbox_message(&message.body)
@@ -942,21 +924,22 @@ fn apply_snapshot(state: &mut SwitcherState, backend: u64, snapshot: SessionSnap
     state.ensure_selected_visible();
 }
 
-fn apply_backend_sessions(state: &mut SwitcherState, message: BackendSessionsMessage) {
-    if message.kind.as_str() != "backend-sessions" {
-        return;
-    }
-    state.can_create_local = message.can_create_local;
-    state.can_connect_remote = message.can_connect_remote;
-    state.sessions = message
-        .backends
+fn apply_backend_sessions(
+    state: &mut SwitcherState,
+    can_create_local: bool,
+    can_connect_remote: bool,
+    backends: Vec<BackendCatalogueEntry>,
+) {
+    state.can_create_local = can_create_local;
+    state.can_connect_remote = can_connect_remote;
+    state.sessions = backends
         .into_iter()
         .flat_map(|backend| {
             backend
                 .sessions
                 .into_iter()
                 .map(move |session| ViewSession {
-                    backend: backend.backend,
+                    backend: backend.backend.0,
                     id: session.id,
                     name: session.name,
                     active: session.active,
@@ -1213,7 +1196,10 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if state.pane == 0 {
         return Vec::new();
     }
-    if message.focused_pane != Some(state.pane) && message.focused_pane != state.picker_pane {
+    if message.focused_pane != Some(state.pane)
+        && message.focused_pane != state.picker_pane
+        && message.focused_pane != state.keybindings_pane
+    {
         state.workspace_focus = message.focused_pane;
     }
     let focused_realm = message.focused_pane.and_then(|focused| {
@@ -1363,46 +1349,51 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     {
         return handle_editor_message(sender, message);
     }
-    if let Ok((message, consumed)) =
-        serde_json_core::from_slice::<BackendConnectionFailedMessage>(bytes)
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<BackendCatalogueMessage>(bytes)
         && consumed == bytes.len()
-        && message.kind.as_str() == "backend-connection-failed"
+        && message.validate().is_ok()
     {
-        if let Ok(mut state) = STATE.lock() {
-            state.mode = EditMode::Search;
-            state.pending_directory_backend = None;
-            state.error = true;
-            state.status = message.message;
-            redraw_or_record_error(&mut state);
-        }
-        return Vec::new();
-    }
-    if let Ok((message, consumed)) = serde_json_core::from_slice::<BackendConnectedMessage>(bytes)
-        && consumed == bytes.len()
-        && message.kind.as_str() == "backend-connected"
-    {
-        if let Ok(mut state) = STATE.lock() {
-            state.pending_directory_backend = Some(message.backend);
-            state.status = format!("Waiting for backend {} inventory…", message.backend);
-            redraw_or_record_error(&mut state);
-        }
-        return Vec::new();
-    }
-    if let Ok((message, consumed)) = serde_json_core::from_slice::<BackendSessionsMessage>(bytes)
-        && consumed == bytes.len()
-        && message.kind.as_str() == "backend-sessions"
-    {
-        if let Ok(mut state) = STATE.lock() {
-            apply_backend_sessions(&mut state, message);
-            if let Some(backend) = state.pending_directory_backend
-                && state
-                    .sessions
-                    .iter()
-                    .any(|session| session.backend == backend)
-            {
-                return open_directory_picker(&mut state, backend);
+        match message {
+            BackendCatalogueMessage::ConnectionFailed { message, .. } => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.mode = EditMode::Search;
+                    state.pending_directory_backend = None;
+                    state.error = true;
+                    state.status = message;
+                    redraw_or_record_error(&mut state);
+                }
             }
-            redraw_or_record_error(&mut state);
+            BackendCatalogueMessage::Connected { backend, .. } => {
+                if let Ok(mut state) = STATE.lock() {
+                    state.pending_directory_backend = Some(backend.0);
+                    state.status = format!("Waiting for backend {} inventory…", backend.0);
+                    redraw_or_record_error(&mut state);
+                }
+            }
+            BackendCatalogueMessage::Sessions {
+                can_create_local,
+                can_connect_remote,
+                backends,
+                ..
+            } => {
+                if let Ok(mut state) = STATE.lock() {
+                    apply_backend_sessions(
+                        &mut state,
+                        can_create_local,
+                        can_connect_remote,
+                        backends,
+                    );
+                    if let Some(backend) = state.pending_directory_backend
+                        && state
+                            .sessions
+                            .iter()
+                            .any(|session| session.backend == backend)
+                    {
+                        return open_directory_picker(&mut state, backend);
+                    }
+                    redraw_or_record_error(&mut state);
+                }
+            }
         }
         return Vec::new();
     }
@@ -1803,6 +1794,34 @@ fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     }
     state.picker_pane = Some(message.pane);
     state.picker_visible = message.visible;
+    let focus = if message.visible {
+        Some(message.pane)
+    } else {
+        state
+            .workspace_focus
+            .or_else(|| state.sidebar_visible.then_some(state.pane))
+    };
+    if let Some(layout) = state.layout.as_mut() {
+        layout.focused_pane = focus;
+    }
+    publish_layout(&state, false, focus)
+}
+
+fn handle_keybindings_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<PickerLayoutMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len() || message.message_type.as_str() != "keybindings-pane" {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if message.pane == 0 {
+        return Vec::new();
+    }
+    state.keybindings_pane = Some(message.pane);
+    state.keybindings_visible = message.visible;
     let focus = if message.visible {
         Some(message.pane)
     } else {
@@ -2274,13 +2293,17 @@ fn publish_layout(
     };
     let pane = state.pane;
     let picker_pane = state.picker_pane;
+    let keybindings_pane = state.keybindings_pane;
     let inbox_pane = state.inbox_pane;
     let delegated = message
         .visible_panes
         .iter()
         .copied()
         .filter(|visible| {
-            *visible != pane && Some(*visible) != picker_pane && Some(*visible) != inbox_pane
+            *visible != pane
+                && Some(*visible) != picker_pane
+                && Some(*visible) != keybindings_pane
+                && Some(*visible) != inbox_pane
         })
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
@@ -2293,6 +2316,8 @@ fn publish_layout(
     let pane_visible = state.sidebar_visible && message.visible_panes.contains(&pane);
     let picker_visible = state.picker_visible
         && picker_pane.is_some_and(|picker| message.visible_panes.contains(&picker));
+    let keybindings_visible = state.keybindings_visible
+        && keybindings_pane.is_some_and(|keybindings| message.visible_panes.contains(&keybindings));
     let inbox_visible = inbox_pane.is_some_and(|inbox| message.visible_panes.contains(&inbox));
     let width = f64::from(message.size.w.max(1));
     let mut sidebar_fraction = if pane_visible {
@@ -2367,6 +2392,20 @@ fn publish_layout(
             -picker_height,
             picker_width * 2.0,
             picker_height * 2.0
+        ));
+    }
+    if keybindings_visible && let Some(keybindings) = keybindings_pane {
+        let height = f64::from(message.size.height.max(1));
+        let overlay_width = (820.0 / width).clamp(0.52, 0.92);
+        let overlay_height = (600.0 / height).clamp(0.55, 0.90);
+        layout_items.push(format!(
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":110,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            keybindings,
+            keybindings,
+            -overlay_width,
+            -overlay_height,
+            overlay_width * 2.0,
+            overlay_height * 2.0
         ));
     }
     let layout_items = layout_items.join(",");

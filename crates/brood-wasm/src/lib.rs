@@ -5,6 +5,7 @@
 )]
 
 pub mod actor;
+mod actor_kernel;
 mod actor_link;
 pub mod api;
 mod api_link;

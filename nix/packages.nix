@@ -42,11 +42,29 @@ let
       craneLib.filterCargoSources path type || lib.hasSuffix ".wit" path || lib.hasSuffix ".witx" path;
   };
 
+  packageManifestSrc = lib.cleanSourceWith {
+    src = ../crates/brood-package-manifest;
+    filter = craneLib.filterCargoSources;
+  };
+
+  packageManifestTool = craneLib.buildPackage {
+    pname = "brood-package-manifest";
+    version = "0.1.0";
+    src = packageManifestSrc;
+    strictDeps = true;
+    cargoExtraArgs = "--locked";
+    # The repository fixture lives outside this isolated workspace. Its full
+    # test suite runs explicitly in CI and development checks.
+    doCheck = false;
+  };
+
   # The guest examples are independent Cargo workspaces. Vendor their lock
   # files explicitly so the derivation remains network-free in the Nix
   # sandbox. The conditional entries keep older source snapshots evaluable
   # before the new examples exist in the tree.
   wasmCargoVendorDir =
+    assert lib.assertMsg (builtins.pathExists "${src}/plugins/keybindings/Cargo.lock")
+      "plugins/keybindings/Cargo.lock is required by the default client init package";
     assert lib.assertMsg (builtins.pathExists "${src}/plugins/picker/Cargo.lock")
       "plugins/picker/Cargo.lock is required by the default client init package";
     assert lib.assertMsg (builtins.pathExists "${src}/plugins/diff-viewer/Cargo.lock")
@@ -64,6 +82,7 @@ let
         "${src}/plugins/default-workspace/Cargo.lock"
         "${src}/plugins/diff-viewer/Cargo.lock"
         "${src}/plugins/inbox/Cargo.lock"
+        "${src}/plugins/keybindings/Cargo.lock"
         "${src}/plugins/neovim-client/Cargo.lock"
         "${src}/plugins/neovim-files/Cargo.lock"
         "${src}/plugins/picker/Cargo.lock"
@@ -178,6 +197,7 @@ let
     cargoVendorDir = wasmCargoVendorDir;
     nativeBuildInputs = [
       craneLib.configureCargoVendoredDepsHook
+      packageManifestTool
       profiles.rustToolchain
     ]
     ++ profiles.wasmTools;
@@ -286,8 +306,6 @@ let
         wasm-tools component new "$component_core" --output "$component_output"
         wasm-tools validate "$component_output"
         wasm-tools component wit "$component_output" >/dev/null
-        install -D "$component_output" \
-          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm
       fi
 
       if [[ -f plugins/neovim-files/Cargo.toml ]]; then
@@ -316,8 +334,6 @@ let
         wasm-tools component new "$component_core" --output "$component_output"
         wasm-tools validate "$component_output"
         wasm-tools component wit "$component_output" >/dev/null
-        install -D "$component_output" \
-          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.component.wasm
       fi
 
       component_core="plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm"
@@ -331,10 +347,16 @@ let
       wasm-tools validate "$component_output"
       wasm-tools component wit "$component_output" >/dev/null
 
-      # The default client init actor supervises the picker from its own
-      # package root.
-      install -D "$component_output" \
-        plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_picker_plugin.component.wasm
+      component_core="plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm"
+      component_output="plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.component.wasm"
+      if [[ ! -s "$component_core" ]]; then
+        echo "ERR keybindings core module was not built at $component_core" >&2
+        exit 2
+      fi
+      echo "componentizing_wasm=$component_core output=$component_output"
+      wasm-tools component new "$component_core" --output "$component_output"
+      wasm-tools validate "$component_output"
+      wasm-tools component wit "$component_output" >/dev/null
 
       component_core="plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm"
       component_output="plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm"
@@ -346,11 +368,6 @@ let
       wasm-tools component new "$component_core" --output "$component_output"
       wasm-tools validate "$component_output"
       wasm-tools component wit "$component_output" >/dev/null
-
-      # The presentation init actor supervises the viewer from its package
-      # root so the child artifact must travel with the shell component.
-      install -D "$component_output" \
-        plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm
 
       if [[ -f plugins/worktree-manager/Cargo.toml ]]; then
         component_core="plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.wasm"
@@ -377,12 +394,10 @@ let
         wasm-tools validate "$component_output"
         wasm-tools component wit "$component_output" >/dev/null
 
-        # The preserved session and presentation init actors supervise coding
-        # agent children from their own package roots.
+        # The session init package remains unmanaged and still needs its child
+        # artifact co-located explicitly.
         install -D "$component_output" \
           examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm
-        install -D "$component_output" \
-          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm
       fi
 
       if [[ -f plugins/component-workspace-watch/Cargo.toml ]]; then
@@ -437,8 +452,6 @@ let
         wasm-tools component new "$component_core" --output "$component_output"
         wasm-tools validate "$component_output"
         wasm-tools component wit "$component_output" >/dev/null
-        install -D "$component_output" \
-          plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm
       fi
 
       runHook postBuild
@@ -484,6 +497,9 @@ let
         if [[ "$wasm" == "plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm" ]]; then
           continue
         fi
+        if [[ "$wasm" == "plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm" ]]; then
+          continue
+        fi
         if [[ "$wasm" == "plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm" ]]; then
           continue
         fi
@@ -504,6 +520,11 @@ let
         } | sort
       )
 
+      brood-package-manifest assemble \
+        packages/default-client.brood-package.toml \
+        "$PWD" \
+        "$out/packages/org.brood.default-client"
+
       runHook postInstall
     '';
   };
@@ -512,6 +533,20 @@ let
     mkdir -p "$out"
 
     install -D ${src}/brood.toml "$out/brood.toml"
+
+    default_client_package="packages/org.brood.default-client"
+    if [[ -d ${wasmModules}/$default_client_package ]]; then
+      cp -R ${wasmModules}/packages "$out/packages"
+      chmod -R u+w "$out/packages"
+    else
+      echo "ERR packaged WASM modules did not include $default_client_package" >&2
+      exit 2
+    fi
+    client_root="$(<"$out/$default_client_package/brood-package-root")"
+    substituteInPlace "$out/brood.toml" \
+      --replace-fail \
+      'client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm"' \
+      "client = \"$default_client_package/$client_root\""
 
     mkdir -p "$out/apps"
     cp -R ${src}/apps/. "$out/apps/"
@@ -535,8 +570,7 @@ let
     # The editor runtime belongs to the local client package only. Keep it
     # outside wasmModules so consumers of a single backend component (notably
     # the SSH bundle) do not inherit Node or the client-side Neovim runtime.
-    session_switcher_root="$out/plugins/session-switcher/target/wasm32-unknown-unknown/release"
-    chmod -R u+w "$out/plugins/session-switcher"
+    session_switcher_root="$out/$default_client_package"
     runtime_dir="$session_switcher_root/share/brood/neovim-wasm"
     mkdir -p "$runtime_dir"
     cp -R ${neovimWasm}/share/brood/neovim-wasm/. "$runtime_dir/"
@@ -1097,6 +1131,7 @@ in
   "software-e2e-capture" = softwareE2eCapture;
   "ssh-backend" = sshBackend;
   "runtime-files" = runtimeFiles;
+  "package-manifest" = packageManifestTool;
   "wasm-modules" = wasmModules;
   "wasm-examples" = wasmModules;
   inherit formatter linter;
@@ -1111,6 +1146,7 @@ in
     primeCargoTarget
     localCi
     neovimWasm
+    packageManifestTool
     devWorkflow
     devWorkflowFullWithRuntime
     devWorkflowWithRuntime

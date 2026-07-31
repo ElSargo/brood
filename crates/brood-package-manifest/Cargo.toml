@@ -1,0 +1,20 @@
+[package]
+name = "brood-package-manifest"
+version = "0.1.0"
+edition = "2024"
+description = "Typed package manifest model for Brood plugins"
+license = "MIT OR Apache-2.0"
+
+# Keep this foundation independently testable until the root workspace adopts it.
+[workspace]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.12"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"

@@ -32,6 +32,15 @@ PROJECT="$OUT/project"
 OTHER_PROJECT="$OUT/other-project"
 DATA_HOME="$OUT/data"
 DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
+OUTPUT_MODE="${BROOD_KEYBINDINGS_TEST_OUTPUT_MODE:-1280x720}"
+if [[ ! "$OUTPUT_MODE" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]]; then
+  echo "ERR BROOD_KEYBINDINGS_TEST_OUTPUT_MODE must be WIDTHxHEIGHT" >&2
+  exit 2
+fi
+if [[ "$OUTPUT_MODE" != "1280x720" && "${BROOD_KEYBINDINGS_ONLY:-0}" != "1" ]]; then
+  echo "ERR narrow output mode is supported by the keybindings-only proof" >&2
+  exit 2
+fi
 mkdir -p "$PACKAGE" "$RUNTIME_DIR" "$PROJECT" "$DATA_HOME"
 chmod 700 "$RUNTIME_DIR"
 git -C "$PROJECT" init --quiet
@@ -138,6 +147,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
   "$PACKAGE/brood_picker_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/keybindings/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm \
+  "$PACKAGE/brood_keybindings_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/worktree-manager/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -226,7 +243,7 @@ rg -q "total_windows=2" <<< "$(ctl status)"
 
 printf '%s\n' \
   'xwayland disable' \
-  'output HEADLESS-1 mode 1280x720' \
+  "output HEADLESS-1 mode $OUTPUT_MODE" \
   'seat seat0 fallback true' \
   'default_border none' \
   'default_floating_border none' \
@@ -261,6 +278,7 @@ done
 
 env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   XDG_DATA_HOME="$DATA_HOME" \
+  BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   WGPU_BACKEND=vulkan \
@@ -316,15 +334,17 @@ read -r SIDEBAR_WIDTH SIDEBAR_HEIGHT < <(
 )
 [[ -n "$SIDEBAR_WIDTH" && -n "$SIDEBAR_HEIGHT" ]]
 
-for _ in $(seq 1 100); do
-  if rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
-    && rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"; then
-    break
-  fi
-  sleep 0.05
-done
-rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
-rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+if [[ "$OUTPUT_MODE" == "1280x720" ]]; then
+  for _ in $(seq 1 100); do
+    if rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
+      && rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+  rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+fi
 
 capture() {
   local target="$1"
@@ -354,6 +374,12 @@ send_picker() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" 25
+}
+
+send_keybindings() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --ctrl-shift-only 53
 }
 
 send_diff_toggle() {
@@ -395,6 +421,133 @@ submit_text() {
 }
 
 capture "$OUT/sidebar-visible.png"
+
+KEYBINDINGS_LAYOUT_BEFORE="$(accepted_layout_count)"
+send_keybindings
+for _ in $(seq 1 100); do
+  KEYBINDINGS_LAYOUT_OPEN="$(accepted_layout_count)"
+  if rg -q "started presentation WASM actor id=keybindings" "$CLIENT_LOG" \
+    && rg -q "sent key-policy actor message actor=keybindings" "$CLIENT_LOG" \
+    && ((KEYBINDINGS_LAYOUT_OPEN > KEYBINDINGS_LAYOUT_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "started presentation WASM actor id=keybindings" "$CLIENT_LOG"
+rg -q "sent key-policy actor message actor=keybindings" "$CLIENT_LOG"
+((KEYBINDINGS_LAYOUT_OPEN > KEYBINDINGS_LAYOUT_BEFORE))
+KEYBINDINGS_PANE="$(
+  sed -n 's/.*started presentation WASM actor id=keybindings .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" \
+    | tail -1
+)"
+[[ -n "$KEYBINDINGS_PANE" ]]
+for _ in $(seq 1 100); do
+  KEYBINDINGS_RESIZE_LINE="$(
+    rg -n "sent plugin pane resize pane=${KEYBINDINGS_PANE} " "$CLIENT_LOG" \
+      | tail -1 \
+      | cut -d: -f1 \
+      || true
+  )"
+  KEYBINDINGS_REDRAW_LINE="$(
+    rg -n "accepted plugin draw packet pane=${KEYBINDINGS_PANE} " "$CLIENT_LOG" \
+      | tail -1 \
+      | cut -d: -f1 \
+      || true
+  )"
+  if [[ -n "$KEYBINDINGS_RESIZE_LINE" && -n "$KEYBINDINGS_REDRAW_LINE" ]] \
+    && ((KEYBINDINGS_REDRAW_LINE > KEYBINDINGS_RESIZE_LINE)); then
+    break
+  fi
+  sleep 0.05
+done
+((KEYBINDINGS_REDRAW_LINE > KEYBINDINGS_RESIZE_LINE))
+capture "$OUT/keybindings-visible.png"
+
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype "toggle session switcher" -s 100
+capture "$OUT/keybindings-filtered.png"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" --none 28
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" 23
+for _ in $(seq 1 100); do
+  if [[ -s "$OUT/keybindings.json" ]] \
+    && rg -q '"action": "sessions.toggle"' "$OUT/keybindings.json" \
+    && rg -q '"action": "inbox.show"' "$OUT/keybindings.json"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q '"action": "sessions.toggle"' "$OUT/keybindings.json"
+rg -q '"action": "inbox.show"' "$OUT/keybindings.json"
+python3 - "$OUT/keybindings.json" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+bindings = {
+    item["action"]: (item["key_code"], item["modifiers"])
+    for item in document["bindings"]
+}
+assert bindings["sessions.toggle"] == (31, 3), bindings
+assert bindings["inbox.show"] == (58, 3), bindings
+PY
+
+KEYBINDINGS_LAYOUT_VISIBLE="$(accepted_layout_count)"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" --none 1
+for _ in $(seq 1 100); do
+  KEYBINDINGS_LAYOUT_CLOSED="$(accepted_layout_count)"
+  ((KEYBINDINGS_LAYOUT_CLOSED > KEYBINDINGS_LAYOUT_VISIBLE)) && break
+  sleep 0.05
+done
+((KEYBINDINGS_LAYOUT_CLOSED > KEYBINDINGS_LAYOUT_VISIBLE))
+
+KEYBINDINGS_TOGGLE_LOGS="$(
+  rg -c "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG" || true
+)"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" 23
+for _ in $(seq 1 100); do
+  CURRENT_TOGGLE_LOGS="$(
+    rg -c "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG" || true
+  )"
+  ((CURRENT_TOGGLE_LOGS > KEYBINDINGS_TOGGLE_LOGS)) && break
+  sleep 0.05
+done
+((CURRENT_TOGGLE_LOGS > KEYBINDINGS_TOGGLE_LOGS))
+capture "$OUT/keybindings-remapped-toggle.png"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" 23
+
+if [[ "${BROOD_KEYBINDINGS_ONLY:-0}" == "1" ]]; then
+  cat > "$OUT/proof.md" <<EOF
+# Global keybinding remapping proof
+
+- Ctrl+Shift+/ opened the presentation-global keybindings actor as a floating pane.
+- Fuzzy text \`toggle session switcher\` narrowed the action catalogue.
+- Capturing Ctrl+Alt+I rebound \`sessions.toggle\` and swapped the conflicting
+  \`inbox.show\` action onto the old Ctrl+Alt+M chord.
+- The client persisted both overrides in $OUT/keybindings.json.
+- Pressing Ctrl+Alt+I after closing the popup invoked the remapped session
+  switcher action and visibly changed the recursive layout.
+- captures: keybindings-visible.png, keybindings-filtered.png, keybindings-remapped-toggle.png
+EOF
+  ctl quit > /dev/null 2>&1 || true
+  echo "keybindings_remap=verified"
+  echo "proof=$OUT/proof.md"
+  echo "visible=$OUT/keybindings-visible.png"
+  echo "filtered=$OUT/keybindings-filtered.png"
+  echo "remapped=$OUT/keybindings-remapped-toggle.png"
+  exit 0
+fi
 
 send_pointer hover 1244 26 700 1280 720 &
 HOVER_POINTER_PID=$!

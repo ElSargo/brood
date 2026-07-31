@@ -17,6 +17,7 @@ pub struct QualifiedPane {
 #[derive(Clone, Debug, Default)]
 pub struct BackendRegistry {
     backends: BTreeMap<BackendId, BackendState>,
+    retired: BTreeSet<BackendId>,
     view_panes: BTreeMap<QualifiedPane, u64>,
     backend_panes: BTreeMap<u64, QualifiedPane>,
     next_view_pane: u64,
@@ -41,11 +42,26 @@ impl BackendRegistry {
         }
     }
 
-    pub(crate) fn observe(&mut self, backend: BackendId, generation: Option<u64>) {
-        let state = self.backends.entry(backend).or_default();
-        if generation.is_some() {
-            state.generation = generation;
+    /// Observe state from an attached backend.
+    ///
+    /// Returns false after the backend has been retired. Backend identifiers are
+    /// never reused inside one presentation, so a late transport event cannot
+    /// silently recreate routes for a disconnected generation.
+    pub(crate) fn observe(&mut self, backend: BackendId, generation: Option<u64>) -> bool {
+        if self.retired.contains(&backend) {
+            return false;
         }
+        let state = self.backends.entry(backend).or_default();
+        if let Some(generation) = generation {
+            if state
+                .generation
+                .is_some_and(|current| current != generation)
+            {
+                state.panes.clear();
+            }
+            state.generation = Some(generation);
+        }
+        true
     }
 
     pub(crate) fn replace_panes(
@@ -53,11 +69,30 @@ impl BackendRegistry {
         backend: BackendId,
         generation: Option<u64>,
         panes: impl IntoIterator<Item = u64>,
-    ) {
-        self.observe(backend, generation);
+    ) -> bool {
+        if !self.observe(backend, generation) {
+            return false;
+        }
         if let Some(state) = self.backends.get_mut(&backend) {
             state.panes = panes.into_iter().collect();
         }
+        true
+    }
+
+    /// Retire one connection identity and invalidate all of its live routes.
+    ///
+    /// Presentation-local pane handles remain allocated so an accepted layout
+    /// can keep stable placeholders, but they no longer reverse-route input.
+    pub(crate) fn retire(&mut self, backend: BackendId) -> bool {
+        let removed = self.backends.remove(&backend).is_some();
+        if removed {
+            self.retired.insert(backend);
+        }
+        removed
+    }
+
+    pub(crate) fn is_connected(&self, backend: BackendId) -> bool {
+        self.backends.contains_key(&backend)
     }
 
     /// Return the stable presentation-local handle for one backend pane.
@@ -74,6 +109,16 @@ impl BackendRegistry {
 
     pub(crate) fn backend_pane(&self, view_pane: u64) -> Option<QualifiedPane> {
         self.backend_panes.get(&view_pane).copied()
+    }
+
+    /// Resolve a view handle only while its owning connection still has the
+    /// pane in its live inventory.
+    pub(crate) fn routable_backend_pane(&self, view_pane: u64) -> Option<QualifiedPane> {
+        let pane = self.backend_pane(view_pane)?;
+        self.backends
+            .get(&pane.backend)
+            .is_some_and(|state| state.panes.contains(&pane.pane))
+            .then_some(pane)
     }
 
     pub(crate) fn all_view_routes(&self) -> Vec<(u64, BackendId, u64)> {
@@ -180,5 +225,37 @@ mod tests {
 
         assert_eq!(registry.view_pane(qualified), view);
         assert_eq!(registry.backend_pane(view), Some(qualified));
+    }
+
+    #[test]
+    fn retired_backend_rejects_late_inventory_and_loses_routes() {
+        let backend = BackendId(10);
+        let qualified = QualifiedPane { backend, pane: 7 };
+        let mut registry = BackendRegistry::default();
+        assert!(registry.replace_panes(backend, Some(3), [qualified.pane]));
+        let view = registry.view_pane(qualified);
+
+        assert!(registry.retire(backend));
+        assert!(!registry.is_connected(backend));
+        assert!(registry.all_view_routes().is_empty());
+        assert!(!registry.observe(backend, Some(3)));
+        assert!(!registry.replace_panes(backend, Some(3), [qualified.pane]));
+        assert_eq!(registry.backend_pane(view), Some(qualified));
+        assert_eq!(registry.routable_backend_pane(view), None);
+        assert_eq!(registry.backend_count(), 0);
+    }
+
+    #[test]
+    fn replacement_generation_invalidates_old_pane_routes() {
+        let backend = BackendId(10);
+        let qualified = QualifiedPane { backend, pane: 7 };
+        let mut registry = BackendRegistry::default();
+        assert!(registry.replace_panes(backend, Some(3), [qualified.pane]));
+        registry.view_pane(qualified);
+        assert_eq!(registry.all_view_routes().len(), 1);
+
+        assert!(registry.observe(backend, Some(4)));
+        assert!(registry.all_view_routes().is_empty());
+        assert_eq!(registry.generation(backend), Some(4));
     }
 }

@@ -88,6 +88,11 @@ pub enum HostMessage {
     SetShortcutPassthrough {
         enabled: bool,
     },
+    SetKeybinding {
+        action: String,
+        key_code: i32,
+        modifiers: i32,
+    },
     SetClipboard {
         text: String,
     },

@@ -123,6 +123,15 @@ fn xdg_config_path() -> PathBuf {
     config_home.join("brood").join("brood.toml")
 }
 
+/// Return the persistent presentation-global keyboard override path.
+#[must_use]
+pub fn global_keybindings_path() -> PathBuf {
+    if let Some(path) = env::var_os("BROOD_KEYBINDINGS_PATH").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    xdg_config_path().with_file_name("keybindings.json")
+}
+
 fn repo_config_path_from_current_exe() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     let start_dir = exe.parent()?;

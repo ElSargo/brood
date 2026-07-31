@@ -1,0 +1,289 @@
+//! Versioned actor protocol for the bundled backend/session catalogue UI.
+//!
+//! These messages cross the client-host to guest-actor boundary. They are not
+//! transport commands and do not grant authority: the client remains
+//! responsible for deciding which backend operations a guest may request.
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::BackendId;
+
+/// Current version of the bundled backend catalogue actor protocol.
+pub const BACKEND_CATALOGUE_PROTOCOL_VERSION: u32 = 1;
+
+/// Stable route for the bundled catalogue actor.
+pub const BACKEND_CATALOGUE_ACTOR_ID: &str = "session-switcher";
+
+/// Sender identity used by the client host for catalogue notifications.
+pub const BACKEND_CATALOGUE_CLIENT_SENDER: &str = "client";
+
+/// Defensive limits within the already bounded actor-message envelope.
+pub const MAX_BACKEND_CATALOGUE_BACKENDS: usize = 128;
+pub const MAX_BACKEND_CATALOGUE_SESSIONS: usize = 2_048;
+pub const MAX_BACKEND_CATALOGUE_LABEL_BYTES: usize = 256;
+pub const MAX_BACKEND_CATALOGUE_NAME_BYTES: usize = 512;
+pub const MAX_BACKEND_CATALOGUE_PATH_BYTES: usize = 4_096;
+pub const MAX_BACKEND_CATALOGUE_PROJECT_ID_BYTES: usize = 512;
+pub const MAX_BACKEND_CATALOGUE_BRANCH_BYTES: usize = 1_024;
+pub const MAX_BACKEND_CONNECTION_ERROR_BYTES: usize = 1_024;
+
+/// One backend and its latest session catalogue.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackendCatalogueEntry {
+    pub backend: BackendId,
+    pub label: String,
+    pub sessions: Vec<BackendSessionEntry>,
+}
+
+/// Session metadata rendered by the bundled session switcher.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackendSessionEntry {
+    pub id: u64,
+    pub name: String,
+    pub active: bool,
+    pub windows: u64,
+    pub working_directory: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub branch: Option<String>,
+    pub worktree: bool,
+    pub git: bool,
+}
+
+/// Client-host notifications consumed by the bundled session switcher.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind")]
+pub enum BackendCatalogueMessage {
+    #[serde(rename = "backend-connected")]
+    Connected { version: u32, backend: BackendId },
+    #[serde(rename = "backend-connection-failed")]
+    ConnectionFailed { version: u32, message: String },
+    #[serde(rename = "backend-sessions")]
+    Sessions {
+        version: u32,
+        can_create_local: bool,
+        can_connect_remote: bool,
+        backends: Vec<BackendCatalogueEntry>,
+    },
+}
+
+impl BackendCatalogueMessage {
+    #[must_use]
+    pub const fn connected(backend: BackendId) -> Self {
+        Self::Connected {
+            version: BACKEND_CATALOGUE_PROTOCOL_VERSION,
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub fn connection_failed(message: impl Into<String>) -> Self {
+        Self::ConnectionFailed {
+            version: BACKEND_CATALOGUE_PROTOCOL_VERSION,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn sessions(
+        can_create_local: bool,
+        can_connect_remote: bool,
+        backends: Vec<BackendCatalogueEntry>,
+    ) -> Self {
+        Self::Sessions {
+            version: BACKEND_CATALOGUE_PROTOCOL_VERSION,
+            can_create_local,
+            can_connect_remote,
+            backends,
+        }
+    }
+
+    /// Validate the version and bounded guest-facing catalogue fields.
+    pub fn validate(&self) -> Result<(), BackendCatalogueValidationError> {
+        let version = match self {
+            Self::Connected { version, .. }
+            | Self::ConnectionFailed { version, .. }
+            | Self::Sessions { version, .. } => *version,
+        };
+        if version != BACKEND_CATALOGUE_PROTOCOL_VERSION {
+            return Err(BackendCatalogueValidationError::Version(version));
+        }
+
+        match self {
+            Self::Connected { .. } => Ok(()),
+            Self::ConnectionFailed { message, .. } => validate_text(
+                message,
+                MAX_BACKEND_CONNECTION_ERROR_BYTES,
+                BackendCatalogueTextField::ConnectionError,
+            ),
+            Self::Sessions { backends, .. } => {
+                if backends.len() > MAX_BACKEND_CATALOGUE_BACKENDS {
+                    return Err(BackendCatalogueValidationError::Backends(backends.len()));
+                }
+                let session_count = backends
+                    .iter()
+                    .try_fold(0_usize, |total, backend| {
+                        total.checked_add(backend.sessions.len())
+                    })
+                    .unwrap_or(usize::MAX);
+                if session_count > MAX_BACKEND_CATALOGUE_SESSIONS {
+                    return Err(BackendCatalogueValidationError::Sessions(session_count));
+                }
+                for backend in backends {
+                    validate_text(
+                        &backend.label,
+                        MAX_BACKEND_CATALOGUE_LABEL_BYTES,
+                        BackendCatalogueTextField::BackendLabel,
+                    )?;
+                    for session in &backend.sessions {
+                        validate_text(
+                            &session.name,
+                            MAX_BACKEND_CATALOGUE_NAME_BYTES,
+                            BackendCatalogueTextField::SessionName,
+                        )?;
+                        if let Some(path) = &session.working_directory {
+                            validate_text(
+                                path,
+                                MAX_BACKEND_CATALOGUE_PATH_BYTES,
+                                BackendCatalogueTextField::WorkingDirectory,
+                            )?;
+                        }
+                        validate_text(
+                            &session.project_id,
+                            MAX_BACKEND_CATALOGUE_PROJECT_ID_BYTES,
+                            BackendCatalogueTextField::ProjectId,
+                        )?;
+                        validate_text(
+                            &session.project_name,
+                            MAX_BACKEND_CATALOGUE_NAME_BYTES,
+                            BackendCatalogueTextField::ProjectName,
+                        )?;
+                        if let Some(branch) = &session.branch {
+                            validate_text(
+                                branch,
+                                MAX_BACKEND_CATALOGUE_BRANCH_BYTES,
+                                BackendCatalogueTextField::Branch,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+const fn validate_text(
+    value: &str,
+    maximum: usize,
+    field: BackendCatalogueTextField,
+) -> Result<(), BackendCatalogueValidationError> {
+    if value.len() > maximum {
+        return Err(BackendCatalogueValidationError::Text {
+            field,
+            bytes: value.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Text field rejected for exceeding its protocol bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendCatalogueTextField {
+    BackendLabel,
+    SessionName,
+    WorkingDirectory,
+    ProjectId,
+    ProjectName,
+    Branch,
+    ConnectionError,
+}
+
+/// Invalid bundled backend catalogue message.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum BackendCatalogueValidationError {
+    #[error("unsupported backend catalogue protocol version {0}")]
+    Version(u32),
+    #[error("backend catalogue contains {0} backends, exceeding its bound")]
+    Backends(usize),
+    #[error("backend catalogue contains {0} sessions, exceeding its bound")]
+    Sessions(usize),
+    #[error("backend catalogue {field:?} contains {bytes} bytes, exceeding its bound")]
+    Text {
+        field: BackendCatalogueTextField,
+        bytes: usize,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BACKEND_CATALOGUE_PROTOCOL_VERSION, BackendCatalogueEntry, BackendCatalogueMessage,
+        BackendCatalogueValidationError, BackendSessionEntry, MAX_BACKEND_CATALOGUE_NAME_BYTES,
+    };
+    use crate::BackendId;
+
+    fn session() -> BackendSessionEntry {
+        BackendSessionEntry {
+            id: 7,
+            name: "shell".to_string(),
+            active: true,
+            windows: 2,
+            working_directory: Some("/workspace".to_string()),
+            project_id: "project".to_string(),
+            project_name: "Project".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        }
+    }
+
+    #[test]
+    fn typed_messages_preserve_the_bundled_wire_discriminants() {
+        let connected = BackendCatalogueMessage::connected(BackendId(3));
+        let encoded = serde_json::to_string(&connected);
+        assert!(encoded.is_ok());
+        let json = encoded.unwrap_or_default();
+        assert_eq!(
+            json,
+            format!(
+                "{{\"kind\":\"backend-connected\",\"version\":{BACKEND_CATALOGUE_PROTOCOL_VERSION},\"backend\":3}}"
+            )
+        );
+        assert!(matches!(
+            serde_json::from_str::<BackendCatalogueMessage>(&json),
+            Ok(decoded) if decoded == connected
+        ));
+    }
+
+    #[test]
+    fn catalogue_validation_rejects_version_and_oversized_metadata() {
+        let unsupported = BackendCatalogueMessage::Connected {
+            version: BACKEND_CATALOGUE_PROTOCOL_VERSION + 1,
+            backend: BackendId(1),
+        };
+        assert_eq!(
+            unsupported.validate(),
+            Err(BackendCatalogueValidationError::Version(
+                BACKEND_CATALOGUE_PROTOCOL_VERSION + 1
+            ))
+        );
+
+        let mut oversized = session();
+        oversized.name = "x".repeat(MAX_BACKEND_CATALOGUE_NAME_BYTES + 1);
+        let catalogue = BackendCatalogueMessage::sessions(
+            true,
+            true,
+            vec![BackendCatalogueEntry {
+                backend: BackendId(1),
+                label: "Local".to_string(),
+                sessions: vec![oversized],
+            }],
+        );
+        assert!(matches!(
+            catalogue.validate(),
+            Err(BackendCatalogueValidationError::Text { .. })
+        ));
+    }
+}

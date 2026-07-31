@@ -49,9 +49,9 @@ use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy, zvariant};
 use crate::{
     BROOD_SESSION_ENV, BROODD_DBUS_ADDRESS_ENV, BROODD_DBUS_DESTINATION_ENV, CommandOutcome,
     CtlArgs, DEFAULT_BROOD_DBUS_NAME, EnterArgs, HideArgs, ListArgs, PlugArgs, ShowArgs,
-    ShowTarget, SwitchArgs, browser,
-    command::{SurfaceCommand, WorkspaceCommand},
-    config,
+    ShowTarget, SwitchArgs,
+    application::{SessionApplication, SessionCommand, SessionCommandResult},
+    browser, config,
     debug_dump::{self, DumpOptions},
     session_runner,
     state::{
@@ -2364,6 +2364,13 @@ fn execute_dbus_request(command: Vec<String>, json: bool, state: &mut Brood) -> 
     Ok(response)
 }
 
+fn execute_session_command(
+    state: &mut Brood,
+    command: SessionCommand,
+) -> Result<SessionCommandResult> {
+    SessionApplication::new(state).execute(command)
+}
+
 fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
     match request {
         DbusStateRequest::ControlCommand {
@@ -2413,46 +2420,50 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
             response,
         } => send_response(response, shared_memory_resource(state, resource_id)),
         DbusStateRequest::ListSurfaceSessions { response } => {
-            state.refresh_window_state();
-            let sessions = dbus_surface_sessions(state.surface_session_summaries());
-            send_response(response, Ok(sessions));
+            let result = execute_session_command(state, SessionCommand::List)
+                .and_then(SessionCommandResult::into_sessions)
+                .map(dbus_surface_sessions);
+            send_response(response, result);
         }
         DbusStateRequest::ListPresentationWindows { response } => {
-            state.refresh_window_state();
-            let windows = state
-                .presentation_window_summaries()
-                .into_iter()
-                .map(|window| (window.pane, window.session, window.app_id))
-                .collect();
-            send_response(response, Ok(windows));
+            let result = execute_session_command(state, SessionCommand::ListPresentationWindows)
+                .and_then(SessionCommandResult::into_presentation_windows)
+                .map(|windows| {
+                    windows
+                        .into_iter()
+                        .map(|window| (window.pane, window.session, window.app_id))
+                        .collect()
+                });
+            send_response(response, result);
         }
         DbusStateRequest::ActiveSession { response } => {
-            send_response(response, Ok(state.active_surface_session().raw()));
+            let result = execute_session_command(state, SessionCommand::Active)
+                .and_then(SessionCommandResult::into_active)
+                .map(SurfaceSessionId::raw);
+            send_response(response, result);
         }
         DbusStateRequest::ResolveSession { query, response } => {
-            let result = state
-                .resolve_surface_session(&query)
-                .map(SurfaceSessionId::raw)
-                .with_context(|| format!("unknown session {query:?}"));
+            let result = execute_session_command(state, SessionCommand::Resolve { query })
+                .and_then(SessionCommandResult::into_resolved)
+                .map(SurfaceSessionId::raw);
             send_response(response, result);
         }
         DbusStateRequest::ActivateSurfaceSession { id, response } => {
-            let changed = state.switch_to_surface_session(SurfaceSessionId::from_raw(id));
-            send_response(
-                response,
-                Ok(changed || state.active_surface_session().raw() == id),
-            );
+            let result = execute_session_command(
+                state,
+                SessionCommand::Activate {
+                    session: SurfaceSessionId::from_raw(id),
+                },
+            )
+            .and_then(SessionCommandResult::into_transition)
+            .map(|transition| transition.target_exists);
+            send_response(response, result);
         }
         DbusStateRequest::CreateSurfaceSession { name, response } => {
-            let result = if let Some(name) = normalize_session_name(&name) {
-                state
-                    .create_and_attach_named_surface_session(Some(name))
-                    .map(SurfaceSessionId::raw)
-            } else {
-                state
-                    .create_and_attach_surface_session()
-                    .map(SurfaceSessionId::raw)
-            };
+            let result =
+                execute_session_command(state, SessionCommand::Create { name: Some(name) })
+                    .and_then(SessionCommandResult::into_created)
+                    .map(SurfaceSessionId::raw);
             send_response(response, result);
         }
         DbusStateRequest::CreateManagedWorktreeSession {
@@ -2467,12 +2478,26 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
             );
         }
         DbusStateRequest::RenameSurfaceSession { id, name, response } => {
-            let changed = state.rename_surface_session(SurfaceSessionId::from_raw(id), &name);
-            send_response(response, Ok(changed));
+            let result = execute_session_command(
+                state,
+                SessionCommand::Rename {
+                    session: SurfaceSessionId::from_raw(id),
+                    name,
+                },
+            )
+            .and_then(SessionCommandResult::into_renamed);
+            send_response(response, result);
         }
         DbusStateRequest::CloseSurfaceSession { id, response } => {
-            let changed = state.close_surface_session(SurfaceSessionId::from_raw(id));
-            send_response(response, Ok(changed));
+            let result = execute_session_command(
+                state,
+                SessionCommand::Close {
+                    session: SurfaceSessionId::from_raw(id),
+                },
+            )
+            .and_then(SessionCommandResult::into_closed)
+            .map(|closed| closed.changed);
+            send_response(response, result);
         }
         DbusStateRequest::ListExtensions { response } => {
             let extensions = state
@@ -3516,18 +3541,22 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                 )
             }
             [subcommand] if subcommand == "next" => {
-                let changed =
-                    WorkspaceCommand::Surface(SurfaceCommand::SwitchActiveSessionNext).apply(state);
+                let transition = execute_session_command(state, SessionCommand::SwitchNext)?
+                    .into_transition()?;
                 format!(
                     "OK surface-session active={} changed={changed}\n",
-                    state.active_surface_session().raw()
+                    transition.active.raw(),
+                    changed = transition.changed,
                 )
             }
             [subcommand] if subcommand == "last-focused" => {
-                let changed = state.restore_last_interacted_surface_session();
+                let transition =
+                    execute_session_command(state, SessionCommand::RestoreLastInteracted)?
+                        .into_transition()?;
                 format!(
                     "OK surface-session active={} changed={changed}\n",
-                    state.active_surface_session().raw()
+                    transition.active.raw(),
+                    changed = transition.changed,
                 )
             }
             [subcommand, target @ ..] if subcommand == "close" => {
@@ -3535,28 +3564,26 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
             }
             [subcommand, name @ ..] if subcommand == "new" => {
                 let name = joined_name(name);
-                if let Some(name) = name {
-                    state.create_and_attach_named_surface_session(Some(name))?;
-                } else {
-                    WorkspaceCommand::Surface(SurfaceCommand::CreateAndAttachSession).apply(state);
-                }
-                format!(
-                    "OK surface-session active={} created=true\n",
-                    state.active_surface_session().raw()
-                )
+                let session = execute_session_command(state, SessionCommand::Create { name })?
+                    .into_created()?;
+                format!("OK surface-session active={} created=true\n", session.raw())
             }
             [subcommand, query] if subcommand == "switch" => {
-                let session = state
-                    .resolve_surface_session(query)
-                    .with_context(|| format!("unknown surface session {query:?}"))?;
-                let changed = state.switch_to_surface_session(session);
-                ensure!(
-                    changed || state.active_surface_session() == session,
-                    "unknown surface session {query}"
-                );
+                let session = execute_session_command(
+                    state,
+                    SessionCommand::Resolve {
+                        query: query.clone(),
+                    },
+                )?
+                .into_resolved()?;
+                let transition =
+                    execute_session_command(state, SessionCommand::Activate { session })?
+                        .into_transition()?;
+                ensure!(transition.target_exists, "unknown surface session {query}");
                 format!(
                     "OK surface-session active={} changed={changed}\n",
-                    state.active_surface_session().raw()
+                    transition.active.raw(),
+                    changed = transition.changed,
                 )
             }
             _ => bail!(
@@ -3605,19 +3632,29 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
 
 fn close_surface_session_command(args: &[String], state: &mut Brood) -> Result<String> {
     let session = match args {
-        [] => state.active_surface_session(),
-        [target] if target == "active" => state.active_surface_session(),
-        [query] => state
-            .resolve_surface_session(query)
-            .with_context(|| format!("unknown surface session {query:?}"))?,
+        [] => active_session(state)?,
+        [target] if target == "active" => active_session(state)?,
+        [query] => execute_session_command(
+            state,
+            SessionCommand::Resolve {
+                query: query.clone(),
+            },
+        )?
+        .into_resolved()?,
         _ => bail!("usage: close-session [active|<query>]"),
     };
-    let closed = session.raw();
-    let changed = state.close_surface_session(session);
+    let closed =
+        execute_session_command(state, SessionCommand::Close { session })?.into_closed()?;
     Ok(format!(
         "OK surface-session closed={closed} active={} changed={changed}\n",
-        state.active_surface_session().raw()
+        closed.active.raw(),
+        closed = closed.closed.raw(),
+        changed = closed.changed,
     ))
+}
+
+fn active_session(state: &mut Brood) -> Result<SurfaceSessionId> {
+    execute_session_command(state, SessionCommand::Active)?.into_active()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

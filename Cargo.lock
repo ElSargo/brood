@@ -488,6 +488,7 @@ dependencies = [
  "brood-dmabuf",
  "brood-graphics",
  "brood-ipc",
+ "brood-keybindings",
  "brood-layout",
  "brood-protocol",
  "brood-transport",
@@ -504,6 +505,7 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "wayland-client",
@@ -539,6 +541,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "brood-keybindings"
+version = "0.1.0"
+
+[[package]]
 name = "brood-layout"
 version = "0.1.0"
 dependencies = [
@@ -559,6 +565,7 @@ name = "brood-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

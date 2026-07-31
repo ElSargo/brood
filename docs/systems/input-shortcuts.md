@@ -149,6 +149,7 @@ network work. The session server has no key-policy provider.
 The default policy keeps the normal launch usable without desktop-global
 shortcuts or wrapper arguments:
 
+- `Ctrl+Shift+/` opens the searchable global keyboard-shortcut editor;
 - `Ctrl+Alt+M` focuses the visible session switcher, hides it when invoked
   again while focused, and restores it on the next invocation;
 - `Ctrl+Alt+I` focuses the always-visible presentation-global inbox;
@@ -173,6 +174,32 @@ request; it has no switcher-specific visibility command.
 `Ctrl+Alt+I` similarly sends an ordinary show action to the inbox actor. The
 inbox requests focus for its own presentation-global pane; it does not change
 session state or toggle the rail.
+
+## Global Remapping
+
+The presentation-global `keybindings` actor renders the effective action
+catalogue as a floating pane. Search matches action titles, categories, stable
+IDs, scopes, and current chords. Enter or a pointer click starts bounded
+pane-local capture; the next non-modifier physical key records a chord and
+Escape cancels capture.
+
+The editor lays out against its allocated pane extent rather than assuming its
+preferred desktop size. Narrow or recursively composed presentations compact
+the search field and chord column, reduce the visible row count, and keep the
+footer and panel border inside the pane.
+
+The presentation client validates updates from the authenticated editor actor,
+applies them to the immutable policy publication used by the next key event,
+and persists overrides in `keybindings.json` in Brood's global config directory.
+Assigning an occupied chord swaps the two actions instead of leaving a hidden
+conflict. The editor itself is an ordinary action, so its launcher can also be
+remapped without losing access to the catalogue.
+
+The action metadata and defaults have one source of truth in
+`crates/brood-keybindings/src/lib.rs`. The synchronous policy consumes that
+catalogue and client-published overrides; the editor consumes the same
+catalogue for labels and search. Plugin UI code does not maintain a second
+hardcoded binding table.
 
 When a terminal or Neovim pane is focused, ordinary Ctrl chords remain pane
 input so shell and Vim bindings retain their normal meaning. Ctrl+Alt product

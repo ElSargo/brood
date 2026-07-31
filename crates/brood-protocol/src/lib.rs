@@ -4,6 +4,8 @@
 //! presentation client. Local shared-memory records and remote wire frames are
 //! codecs for these types; neither carrier defines presentation behavior.
 
+pub mod backend_catalogue;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

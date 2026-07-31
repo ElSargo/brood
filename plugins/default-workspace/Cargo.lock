@@ -6,9 +6,14 @@ version = 4
 name = "brood-default-workspace-plugin"
 version = "0.1.0"
 dependencies = [
+ "brood-keybindings",
  "serde",
  "serde-json-core",
 ]
+
+[[package]]
+name = "brood-keybindings"
+version = "0.1.0"
 
 [[package]]
 name = "byteorder"

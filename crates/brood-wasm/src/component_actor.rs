@@ -28,6 +28,7 @@ mod bindings {
     });
 }
 
+use crate::actor_kernel::{ActorRuntimeKernel, allocate_generation};
 use crate::completion_io::{
     ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoConfig, CompletionIoError,
     FilesystemGrant, OperationId, start_completion_io as start_shared_completion_io,
@@ -85,7 +86,6 @@ use wasmtime::{
     component::{Component, GuestTaskId, HasSelf, Linker, Resource},
 };
 
-static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_REPLACE_TEMP: AtomicU64 = AtomicU64::new(1);
 
 /// An actor-private worker identity.
@@ -1797,11 +1797,8 @@ enum RuntimeCommand {
 /// tracked blocking I/O. [`Drop`] aborts the owned async handles as a fallback;
 /// blocking-pool work which has already started cannot be preempted.
 pub struct ComponentActor {
-    generation: u64,
+    kernel: ActorRuntimeKernel,
     completion_io: CompletionIo,
-    coordination: CoordinationHub,
-    filesystem_watches: FilesystemWatchHub,
-    runtime_io: RuntimeIoHub,
     commands: mpsc::Sender<RuntimeCommand>,
     mailbox_slots: Arc<Semaphore>,
     mailbox_capacity: usize,
@@ -1815,7 +1812,6 @@ pub struct ComponentActor {
     epoch_ticker: Option<EpochTicker>,
     shutdown_requested: Arc<AtomicBool>,
     limits: WasmResourceLimits,
-    byte_budget: GenerationByteBudget,
     observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
 }
 
@@ -1863,10 +1859,7 @@ impl ComponentActor {
         ensure!(config.epoch_yield_ticks > 0, "epoch yield must be non-zero");
         config.limits.validate()?;
 
-        let generation = NEXT_ACTOR_GENERATION
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current != 0).then(|| current.checked_add(1)).flatten()
-            })
+        let generation = allocate_generation()
             .map_err(|_exhausted| anyhow::anyhow!("actor generation allocator is exhausted"))?;
         let (coordination, notification_rx) = CoordinationHub::new(
             generation,
@@ -1888,6 +1881,13 @@ impl ComponentActor {
         let runtime_io =
             RuntimeIoHub::new(generation, config.runtime_io.clone(), coordination.clone())
                 .map_err(|error| anyhow::anyhow!("create component runtime I/O hub: {error}"))?;
+        let kernel = ActorRuntimeKernel::new(
+            generation,
+            coordination.clone(),
+            filesystem_watches.clone(),
+            runtime_io.clone(),
+            config.limits.generation_host_bytes,
+        );
 
         let engine = component_engine()?;
         let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
@@ -1904,11 +1904,9 @@ impl ComponentActor {
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
         let mailbox_capacity = config.mailbox_backlog;
-        let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
         let observer_result_bytes = Arc::new(Mutex::new(HashMap::new()));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel(config.command_capacity);
-        let actor_filesystem_watches = filesystem_watches.clone();
         let mut store = Store::new(
             &engine,
             ActorStore {
@@ -1948,7 +1946,7 @@ impl ComponentActor {
 
         let (completion_tx, completion_rx) = mpsc::channel(config.max_outstanding_io);
         let runtime_completion_io = completion_io.clone();
-        let runtime_byte_budget = byte_budget.clone();
+        let runtime_byte_budget = kernel.byte_budget().clone();
         let runtime_observer_result_bytes = Arc::clone(&observer_result_bytes);
         let limits = config.limits;
         let runtime_task = tokio::spawn(async move {
@@ -1970,11 +1968,8 @@ impl ComponentActor {
         });
 
         Ok(Self {
-            generation,
+            kernel,
             completion_io,
-            coordination,
-            filesystem_watches: actor_filesystem_watches,
-            runtime_io,
             commands: command_tx,
             mailbox_slots,
             mailbox_capacity,
@@ -1988,13 +1983,12 @@ impl ComponentActor {
             epoch_ticker: Some(epoch_ticker),
             shutdown_requested,
             limits,
-            byte_budget,
             observer_result_bytes,
         })
     }
 
     pub const fn generation(&self) -> u64 {
-        self.generation
+        self.kernel.generation()
     }
 
     /// Deliver one typed lifecycle hook and wait for explicit guest completion.
@@ -2016,15 +2010,15 @@ impl ComponentActor {
 
     /// Snapshot live notification, pollable, and worker-wait registrations.
     pub fn coordination_stats(&self) -> crate::coordination::CoordinationStats {
-        self.coordination.stats()
+        self.kernel.coordination_stats()
     }
 
     pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
-        self.filesystem_watches.stats()
+        self.kernel.filesystem_watch_stats()
     }
 
     pub fn runtime_io_stats(&self) -> crate::runtime_io::RuntimeIoStats {
-        self.runtime_io.stats()
+        self.kernel.runtime_io_stats()
     }
 
     /// Nonblocking actor-mailbox delivery.
@@ -2037,7 +2031,7 @@ impl ComponentActor {
             sender,
             body,
             self.limits,
-            &self.byte_budget,
+            self.kernel.byte_budget(),
         )
     }
 
@@ -2084,7 +2078,7 @@ impl ComponentActor {
     /// Start an actor-private worker in the same component instance.
     pub fn try_spawn_worker(&self, payload: Vec<u8>) -> Result<WorkerId> {
         self.limits.ensure_worker_payload(&payload)?;
-        let byte_permit = self.byte_budget.try_reserve(payload.len())?;
+        let byte_permit = self.kernel.byte_budget().try_reserve(payload.len())?;
         let raw = self
             .next_worker
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -2151,8 +2145,7 @@ impl ComponentActor {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.shutdown_requested.store(true, Ordering::Release);
         self.completion_io.stop();
-        self.runtime_io.teardown().await;
-        self.coordination.stop();
+        self.kernel.shutdown().await;
         let _ = self.commands.send(RuntimeCommand::Shutdown).await;
         let runtime_result = match self.runtime_task.take() {
             Some(task) => task
@@ -2223,7 +2216,7 @@ impl Drop for ComponentActor {
     fn drop(&mut self) {
         self.shutdown_requested.store(true, Ordering::Release);
         self.completion_io.stop();
-        self.coordination.stop();
+        self.kernel.stop();
         if let Some(task) = self.runtime_task.take() {
             task.abort();
         }

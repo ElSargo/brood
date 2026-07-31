@@ -1,0 +1,21 @@
+[package]
+name = "brood-keybindings-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brood-graphics = { path = "../../crates/brood-graphics" }
+brood-keybindings = { path = "../../crates/brood-keybindings" }
+brood-plugin-sdk = { path = "../../crates/brood-plugin-sdk" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[workspace]

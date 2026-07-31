@@ -59,6 +59,12 @@ transport; copied images remain a correctness fallback. Remote endpoints carry
 the same semantic protocol over independent QUIC streams and use encoded
 network-frame resources. See [[systems/presentation-transport]].
 
+The client connection registry owns stable backend identities and connection
+generations. Replacing a generation invalidates its pane input routes before a
+new inventory is accepted. Retiring a backend prevents late transport events
+from recreating authority, while presentation-local pane handles remain stable
+so an accepted layout may continue to render disconnected placeholders.
+
 The server publishes each managed surface tree as an independent window frame.
 The client returns a requested logical content size for a pane. Placement,
 clipping, z order, sidebar width, and presentation-local focus never cross the

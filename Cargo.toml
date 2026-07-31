@@ -5,6 +5,7 @@ members = [
     "crates/brood-dmabuf",
     "crates/brood-graphics",
     "crates/brood-ipc",
+    "crates/brood-keybindings",
     "crates/brood-layout",
     "crates/brood-plugin-sdk",
     "crates/brood-protocol",
@@ -39,6 +40,7 @@ rustix = { version = "1.1.4", features = ["pipe"] }
 brood-cli = { path = "crates/brood-cli" }
 brood-graphics = { path = "crates/brood-graphics" }
 brood-ipc = { path = "crates/brood-ipc" }
+brood-keybindings = { path = "crates/brood-keybindings" }
 brood-layout = { path = "crates/brood-layout" }
 brood-plugin-sdk = { path = "crates/brood-plugin-sdk" }
 brood-protocol = { path = "crates/brood-protocol" }

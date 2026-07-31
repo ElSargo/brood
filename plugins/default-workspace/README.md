@@ -34,7 +34,8 @@ nix develop --command cargo run -- test nested --force-outer --inner-headless \
   plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm
 ```
 
-The normal config selects this provider for the presentation client. Its
+The normal config selects this provider for the presentation client.
+`Ctrl+Shift+/` opens the global searchable keybinding editor. Its
 always-available workspace chords are `Ctrl+Alt+M` for the session-switcher
 pane, `Ctrl+Alt+I` to focus the global inbox, `Ctrl+Alt+P` for the session
 picker, `Ctrl+Alt+A` for the current
@@ -47,6 +48,10 @@ does not spawn processes or toggle client-owned pane state. The repository
 acceptance proof uses this exact module with real terminal surfaces, injected
 key press/release events, and compositor screenshots. Run
 `tools/test-session-switcher-plugin-nested.sh` through the checked-in Nix shell.
+
+Defaults and action metadata come from `brood-keybindings`. The client publishes
+persistent user overrides with its pane snapshot, so remaps take effect on the
+next physical key without replacing or restarting the policy module.
 
 The workspace layout keeps backend realms in separate weighted columns and
 tiles every realm in a viewport-aspect-aware grid. It supports the full bounded

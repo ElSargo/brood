@@ -1,0 +1,71 @@
+schema-version = 1
+
+[package]
+id = "org.brood.default-client"
+version = "0.1.0"
+root = "session-switcher"
+
+[[artifacts]]
+id = "session-switcher"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm"
+placement = "brood_session_switcher_plugin.component.wasm"
+capabilities = ["actor:mailbox", "presentation:layout"]
+dependencies = ["picker", "keybindings", "diff-viewer", "inbox", "neovim-client", "terminal-ui", "coding-agent"]
+
+[[artifacts]]
+id = "picker"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.component.wasm"
+placement = "brood_picker_plugin.component.wasm"
+capabilities = ["actor:mailbox", "presentation:layout"]
+
+[[artifacts]]
+id = "keybindings"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.component.wasm"
+placement = "brood_keybindings_plugin.component.wasm"
+capabilities = ["actor:mailbox", "input:key-policy"]
+
+[[artifacts]]
+id = "diff-viewer"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm"
+placement = "brood_diff_viewer_plugin.component.wasm"
+capabilities = ["actor:mailbox", "presentation:layout"]
+
+[[artifacts]]
+id = "inbox"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm"
+placement = "brood_inbox_plugin.component.wasm"
+capabilities = ["actor:mailbox"]
+
+[[artifacts]]
+id = "neovim-client"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/neovim-client/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.component.wasm"
+placement = "brood_neovim_client_plugin.component.wasm"
+capabilities = ["actor:mailbox", "presentation:pane"]
+
+[[artifacts]]
+id = "terminal-ui"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.component.wasm"
+placement = "brood_terminal_ui_plugin.component.wasm"
+capabilities = ["actor:mailbox", "presentation:pane"]
+
+[[artifacts]]
+id = "coding-agent"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm"
+placement = "brood_coding_agent_plugin.component.wasm"
+capabilities = ["actor:mailbox", "process:spawn"]

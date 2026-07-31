@@ -12,6 +12,7 @@ brood-cli.workspace = true
 brood-dmabuf = { path = "../../crates/brood-dmabuf" }
 brood-graphics.workspace = true
 brood-ipc.workspace = true
+brood-keybindings.workspace = true
 brood-layout.workspace = true
 brood-protocol.workspace = true
 brood-transport.workspace = true
@@ -32,6 +33,9 @@ winit.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

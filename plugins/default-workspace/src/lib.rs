@@ -1,5 +1,7 @@
 #![no_std]
 
+use brood_keybindings::{Action, Binding, ACTIONS};
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{ptr, slice};
 use serde::Deserialize;
@@ -14,6 +16,8 @@ const RESPONSE_BYTES: usize = 64 * 1024;
 const OUTBOX_BYTES: usize = 64 * 1024;
 const MAX_PANES: usize = 64;
 const MAX_APP_ID_BYTES: usize = 256;
+const MAX_ACTION_ID_BYTES: usize = 64;
+const MAX_BINDINGS: usize = 64;
 const MAX_MESSAGE_KIND_BYTES: usize = 64;
 const JSON_UNESCAPE_BYTES: usize = 512;
 const OUTPUT_ERROR: i32 = -1;
@@ -24,41 +28,6 @@ const KEY_RELEASED: i32 = 0;
 const KEY_PRESSED: i32 = 1;
 const INPUT_MODE_PASSTHROUGH: i32 = 0;
 const INPUT_MODE_NORMAL: i32 = 1;
-
-const MOD_CTRL: i32 = 1;
-const MOD_ALT: i32 = 2;
-const MOD_SHIFT: i32 = 4;
-
-const KEY_ESC: i32 = 1;
-const KEY_1: i32 = 10;
-const KEY_2: i32 = 11;
-const KEY_3: i32 = 12;
-const KEY_4: i32 = 13;
-const KEY_5: i32 = 14;
-const KEY_ENTER: i32 = 36;
-const KEY_A: i32 = 38;
-const KEY_E: i32 = 26;
-const KEY_I: i32 = 31;
-const KEY_O: i32 = 32;
-const KEY_B: i32 = 56;
-const KEY_M: i32 = 58;
-const KEY_Q: i32 = 24;
-const KEY_D: i32 = 40;
-const KEY_F: i32 = 41;
-const KEY_G: i32 = 42;
-const KEY_H: i32 = 43;
-const KEY_J: i32 = 44;
-const KEY_K: i32 = 45;
-const KEY_L: i32 = 46;
-const KEY_S: i32 = 39;
-const KEY_T: i32 = 28;
-const KEY_U: i32 = 30;
-const KEY_W: i32 = 25;
-const KEY_N: i32 = 57;
-const KEY_P: i32 = 33;
-const KEY_COMMA: i32 = 59;
-const KEY_DOT: i32 = 60;
-const KEY_SPACE: i32 = 65;
 
 static mut HEAP: [u8; HEAP_BYTES] = [0; HEAP_BYTES];
 static mut HEAP_CURSOR: usize = 0;
@@ -78,6 +47,7 @@ static mut LAYOUT_REVISION: u64 = 0;
 static mut LAYOUT_HAS_LEASE: bool = false;
 static mut LAYOUT_VIEWPORT_WIDTH: i32 = 1280;
 static mut LAYOUT_VIEWPORT_HEIGHT: i32 = 800;
+static mut CONSUMED_KEYS: [u64; 4] = [0; 4];
 
 type PaneList = FixedVec<u64, MAX_PANES>;
 type AppPaneList = FixedVec<AppPane, MAX_PANES>;
@@ -92,12 +62,21 @@ struct PolicyState {
     managed_panes: PaneList,
     #[serde(default)]
     app_panes: AppPaneList,
+    #[serde(default)]
+    bindings: FixedVec<BindingOverride, MAX_BINDINGS>,
 }
 
 #[derive(Deserialize)]
 struct AppPane {
     pane: u64,
     app_id: FixedString<MAX_APP_ID_BYTES>,
+}
+
+#[derive(Deserialize)]
+struct BindingOverride {
+    action: FixedString<MAX_ACTION_ID_BYTES>,
+    key_code: i32,
+    modifiers: i32,
 }
 
 #[derive(Default, Deserialize)]
@@ -212,163 +191,45 @@ pub extern "C" fn brood_policy_provider_key_workspace(
     };
     let output = response_buffer_mut();
 
-    if input.modifiers & MOD_CTRL != 0
-        && input.modifiers & MOD_SHIFT != 0
-        && input.key_code == KEY_ESC
-    {
-        return if input.key_state == KEY_RELEASED {
+    if input.key_state == KEY_RELEASED {
+        return if take_consumed_key(input.key_code) {
             write_consume(output, &[])
         } else {
-            write_consume(output, &[Message::ToggleShortcutPassthrough])
+            OUTPUT_ABSTAIN
         };
     }
+    if input.key_state != KEY_PRESSED {
+        return OUTPUT_ABSTAIN;
+    }
 
-    if input.modifiers & MOD_CTRL != 0
-        && input.modifiers & MOD_ALT == 0
+    if focused_keybinding_editor(&state) {
+        return OUTPUT_ABSTAIN;
+    }
+    if input.modifiers & brood_keybindings::MOD_CTRL != 0
+        && input.modifiers & brood_keybindings::MOD_ALT == 0
         && focused_raw_control_plugin(&state)
     {
         return OUTPUT_ABSTAIN;
     }
 
-    if input.modifiers & MOD_CTRL != 0 && input.key_code == KEY_B {
-        if input.key_state == KEY_PRESSED {
-            toggle_workspace_input_mode();
-        }
+    let normal_mode = workspace_input_mode() == INPUT_MODE_NORMAL;
+    let Some(action) = matching_action(&state, &input, normal_mode) else {
+        return OUTPUT_ABSTAIN;
+    };
+    mark_consumed_key(input.key_code);
+    if input.repeat {
+        return write_consume(output, &[]);
+    }
+    if action.id == "keybindings.open" {
+        return write_keybindings_show(output, &state.bindings);
+    }
+    if action.id == "workspace.mode" {
+        toggle_workspace_input_mode();
         return write_consume(output, &[]);
     }
 
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_A
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::CodingAgentAction("picker")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_Q
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::LayoutAction("close-active-pane")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_T
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::TerminalAction("new")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_E
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::EditorAction("open")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_I
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::InboxAction("show")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_M
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::SessionSwitcherAction("toggle")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_P
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::SessionSwitcherAction("picker")])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && input.modifiers & MOD_ALT != 0 && input.key_code == KEY_D
-    {
-        return if input.key_state == KEY_RELEASED || input.repeat {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::DiffViewerAction("toggle")])
-        };
-    }
-
-    let workspace_input_mode = workspace_input_mode();
-
-    if input.modifiers & MOD_ALT != 0
-        && input.key_code == KEY_SPACE
-        && workspace_input_mode == INPUT_MODE_NORMAL
-    {
-        return if input.key_state == KEY_RELEASED {
-            write_consume(output, &[])
-        } else {
-            write_consume(output, &[Message::SwitchActiveSessionNext])
-        };
-    }
-
-    if input.modifiers & MOD_CTRL != 0 && is_global_workspace_key(input.key_code) {
-        return if input.key_state == KEY_RELEASED {
-            write_consume(output, &[])
-        } else {
-            let mut buffer = [Message::Noop; 1];
-            write_consume(
-                output,
-                messages_for_global_key(input.key_code, &state, &mut buffer),
-            )
-        };
-    }
-
-    if input.key_state != KEY_PRESSED
-        || workspace_input_mode != INPUT_MODE_NORMAL
-        || input.modifiers & MOD_CTRL == 0
-    {
-        return OUTPUT_ABSTAIN;
-    }
-
-    let messages = match input.key_code {
-        KEY_N => &[Message::CreateAndAttachSession][..],
-        KEY_O => &[Message::SpawnApp(&["foot"])][..],
-        KEY_W => &[Message::SpawnApp(&[
-            "flatpak",
-            "run",
-            "--env=GDK_BACKEND=wayland",
-            "--env=QT_QPA_PLATFORM=wayland",
-            "org.wezfurlong.wezterm",
-        ])][..],
-        KEY_J => &[Message::LayoutAction("focus-next")][..],
-        KEY_K => &[Message::LayoutAction("focus-previous")][..],
-        KEY_Q => &[Message::LayoutAction("close-active-pane")][..],
-        KEY_F => &[Message::LayoutAction("toggle-managed-fullscreen")][..],
-        KEY_L => &[Message::LayoutAction("split-active-right")][..],
-        KEY_H => &[Message::LayoutAction("split-active-down")][..],
-        KEY_S => &[Message::LayoutAction("split-active-smart")][..],
-        KEY_U => &[Message::LayoutAction("join-active-pane")][..],
-        KEY_DOT => &[Message::LayoutAction("focus-next-split")][..],
-        KEY_COMMA => &[Message::LayoutAction("focus-previous-split")][..],
-        KEY_D => &[Message::LayoutAction("toggle-bottom-dock")][..],
-        KEY_P => &[
-            Message::LayoutAction("toggle-left-dock"),
-            Message::LayoutAction("toggle-right-dock"),
-        ][..],
-        _ => return write_consume(output, &[]),
-    };
-    write_consume(output, messages)
+    let mut buffer = [Message::Noop; 2];
+    write_consume(output, messages_for_action(action, &state, &mut buffer))
 }
 
 #[no_mangle]
@@ -437,63 +298,89 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
 #[no_mangle]
 pub extern "C" fn brood_actor_workspace_subscribe_layout_state() {}
 
-fn messages_for_global_key<'a>(
-    key_code: i32,
+fn messages_for_action<'a>(
+    action: &Action,
     state: &PolicyState,
-    buffer: &'a mut [Message<'static>; 1],
+    buffer: &'a mut [Message<'static>; 2],
 ) -> &'a [Message<'static>] {
-    match key_code {
-        KEY_J => focus_cycle_managed_pane(state, true, buffer),
-        KEY_K => focus_cycle_managed_pane(state, false, buffer),
-        KEY_O => &[Message::SpawnApp(&["foot"])],
-        KEY_H => &[Message::LayoutAction("split-active-down")],
-        KEY_L => &[Message::LayoutAction("split-active-right")],
-        KEY_S => &[Message::LayoutAction("split-active-smart")],
-        KEY_U => &[Message::LayoutAction("join-active-pane")],
-        KEY_DOT => focus_cycle_terminal(state, true, buffer)
+    match action.id {
+        "shortcuts.passthrough" => &[Message::ToggleShortcutPassthrough],
+        "agent.picker" => &[Message::CodingAgentAction("picker")],
+        "pane.close" => &[Message::LayoutAction("close-active-pane")],
+        "terminal.new" => &[Message::TerminalAction("new")],
+        "editor.open" => &[Message::EditorAction("open")],
+        "inbox.show" => &[Message::InboxAction("show")],
+        "sessions.toggle" => &[Message::SessionSwitcherAction("toggle")],
+        "sessions.picker" => &[Message::SessionSwitcherAction("picker")],
+        "diff.toggle" => &[Message::DiffViewerAction("toggle")],
+        "sessions.next" => &[Message::SwitchActiveSessionNext],
+        "focus.next" => focus_cycle_managed_pane(state, true, buffer),
+        "focus.previous" => focus_cycle_managed_pane(state, false, buffer),
+        "terminal.spawn" => &[Message::SpawnApp(&["foot"])],
+        "split.down" => &[Message::LayoutAction("split-active-down")],
+        "split.right" => &[Message::LayoutAction("split-active-right")],
+        "split.smart" => &[Message::LayoutAction("split-active-smart")],
+        "split.join" => &[Message::LayoutAction("join-active-pane")],
+        "split.next" => focus_cycle_terminal(state, true, buffer)
             .unwrap_or(&[Message::LayoutAction("focus-next-split")]),
-        KEY_COMMA => focus_cycle_terminal(state, false, buffer)
+        "split.previous" => focus_cycle_terminal(state, false, buffer)
             .unwrap_or(&[Message::LayoutAction("focus-previous-split")]),
-        KEY_G => &[Message::FocusOrSpawnApp {
+        "lazygit.open" => &[Message::FocusOrSpawnApp {
             app_id: "brood-lazygit",
             argv: &["foot", "--app-id", "brood-lazygit", "lazygit"],
         }],
-        KEY_ENTER => focus_or_spawn_app(
+        "pi.open" => focus_or_spawn_app(
             state,
             b"pi-foot",
             &["foot", "--app-id", "pi-foot", "pi"],
             buffer,
         ),
-        KEY_1 => focus_or_spawn_app(
+        "terminal.1" => focus_or_spawn_app(
             state,
             b"brood-terminal-1",
             &["foot", "--app-id", "brood-terminal-1"],
             buffer,
         ),
-        KEY_2 => focus_or_spawn_app(
+        "terminal.2" => focus_or_spawn_app(
             state,
             b"brood-terminal-2",
             &["foot", "--app-id", "brood-terminal-2"],
             buffer,
         ),
-        KEY_3 => focus_or_spawn_app(
+        "terminal.3" => focus_or_spawn_app(
             state,
             b"brood-terminal-3",
             &["foot", "--app-id", "brood-terminal-3"],
             buffer,
         ),
-        KEY_4 => focus_or_spawn_app(
+        "terminal.4" => focus_or_spawn_app(
             state,
             b"brood-terminal-4",
             &["foot", "--app-id", "brood-terminal-4"],
             buffer,
         ),
-        KEY_5 => focus_or_spawn_app(
+        "terminal.5" => focus_or_spawn_app(
             state,
             b"brood-terminal-5",
             &["foot", "--app-id", "brood-terminal-5"],
             buffer,
         ),
+        "session.new" => &[Message::CreateAndAttachSession],
+        "wezterm.spawn" => &[Message::SpawnApp(&[
+            "flatpak",
+            "run",
+            "--env=GDK_BACKEND=wayland",
+            "--env=QT_QPA_PLATFORM=wayland",
+            "org.wezfurlong.wezterm",
+        ])],
+        "pane.close-workspace" => &[Message::LayoutAction("close-active-pane")],
+        "pane.fullscreen" => &[Message::LayoutAction("toggle-managed-fullscreen")],
+        "dock.bottom" => &[Message::LayoutAction("toggle-bottom-dock")],
+        "dock.sides" => {
+            buffer[0] = Message::LayoutAction("toggle-left-dock");
+            buffer[1] = Message::LayoutAction("toggle-right-dock");
+            buffer
+        }
         _ => &[],
     }
 }
@@ -502,20 +389,20 @@ fn focus_or_spawn_app<'a>(
     state: &PolicyState,
     app_id: &'static [u8],
     argv: &'static [&'static str],
-    buffer: &'a mut [Message<'static>; 1],
+    buffer: &'a mut [Message<'static>; 2],
 ) -> &'a [Message<'static>] {
     if let Some(pane) = pane_for_app_id(state, app_id) {
         buffer[0] = Message::FocusPane(pane);
     } else {
         buffer[0] = Message::SpawnApp(argv);
     }
-    buffer
+    &buffer[..1]
 }
 
 fn focus_cycle_terminal<'a>(
     state: &PolicyState,
     next: bool,
-    buffer: &'a mut [Message<'static>; 1],
+    buffer: &'a mut [Message<'static>; 2],
 ) -> Option<&'a [Message<'static>]> {
     let mut panes = [0_u64; 5];
     let mut count = 0;
@@ -554,13 +441,13 @@ fn focus_cycle_terminal<'a>(
         (None, false) => count - 1,
     };
     buffer[0] = Message::FocusPane(panes[target]);
-    Some(buffer)
+    Some(&buffer[..1])
 }
 
 fn focus_cycle_managed_pane<'a>(
     state: &PolicyState,
     next: bool,
-    buffer: &'a mut [Message<'static>; 1],
+    buffer: &'a mut [Message<'static>; 2],
 ) -> &'a [Message<'static>] {
     let panes = if state.managed_panes.is_empty() {
         &state.panes
@@ -581,29 +468,61 @@ fn focus_cycle_managed_pane<'a>(
         (None, false) => panes.len() - 1,
     };
     buffer[0] = Message::FocusPane(panes[target]);
-    buffer
+    &buffer[..1]
 }
 
-fn is_global_workspace_key(key_code: i32) -> bool {
-    matches!(
-        key_code,
-        KEY_J
-            | KEY_K
-            | KEY_O
-            | KEY_G
-            | KEY_H
-            | KEY_L
-            | KEY_S
-            | KEY_U
-            | KEY_COMMA
-            | KEY_DOT
-            | KEY_ENTER
-            | KEY_1
-            | KEY_2
-            | KEY_3
-            | KEY_4
-            | KEY_5
-    )
+fn matching_action(
+    state: &PolicyState,
+    input: &KeyInput,
+    normal_mode: bool,
+) -> Option<&'static Action> {
+    ACTIONS.iter().find(|action| {
+        action.is_enabled(normal_mode)
+            && effective_binding(state, action) == Binding::new(input.key_code, input.modifiers)
+    })
+}
+
+fn effective_binding(state: &PolicyState, action: &Action) -> Binding {
+    state
+        .bindings
+        .iter()
+        .find(|binding| binding.action.as_str() == action.id)
+        .map_or(action.default_binding, |binding| {
+            Binding::new(binding.key_code, binding.modifiers)
+        })
+}
+
+fn mark_consumed_key(key_code: i32) {
+    let Ok(key_code) = usize::try_from(key_code) else {
+        return;
+    };
+    if key_code >= 256 {
+        return;
+    }
+    unsafe {
+        let slot = ptr::addr_of_mut!(CONSUMED_KEYS)
+            .cast::<u64>()
+            .add(key_code / 64);
+        slot.write(slot.read() | (1_u64 << (key_code % 64)));
+    }
+}
+
+fn take_consumed_key(key_code: i32) -> bool {
+    let Ok(key_code) = usize::try_from(key_code) else {
+        return false;
+    };
+    if key_code >= 256 {
+        return false;
+    }
+    unsafe {
+        let slot = ptr::addr_of_mut!(CONSUMED_KEYS)
+            .cast::<u64>()
+            .add(key_code / 64);
+        let mask = 1_u64 << (key_code % 64);
+        let consumed = slot.read() & mask != 0;
+        slot.write(slot.read() & !mask);
+        consumed
+    }
 }
 
 fn workspace_input_mode() -> i32 {
@@ -911,13 +830,8 @@ fn write_set_resolved_layout_payload(
             if index > 0 {
                 payload.byte(b',');
             }
-            let placement = pane_placement(
-                index,
-                panes,
-                pane_backends,
-                viewport_width,
-                viewport_height,
-            );
+            let placement =
+                pane_placement(index, panes, pane_backends, viewport_width, viewport_height);
             write_pane_item_payload(
                 payload,
                 panes[index],
@@ -959,6 +873,30 @@ fn write_pane_item_payload(
 
 fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
     finish_response(write_consume_payload(output, messages))
+}
+
+fn write_keybindings_show(output: &mut [u8], bindings: &[BindingOverride]) -> i32 {
+    let mut writer = Writer::new(output);
+    writer.bytes(br#"{"decision":"consume","messages":[{"actor":"keybindings","payload":["#);
+    let mut payload = PayloadWriter::new(&mut writer);
+    payload.bytes(br#"{"type":"keybindings-show","bindings":["#);
+    let mut first = true;
+    for binding in bindings {
+        if !first {
+            payload.byte(b',');
+        }
+        first = false;
+        payload.bytes(br#"{"action":""#);
+        payload.quoted_body(binding.action.as_bytes());
+        payload.bytes(br#"","key_code":"#);
+        payload.u64(binding.key_code.max(0) as u64);
+        payload.bytes(br#","modifiers":"#);
+        payload.u64(binding.modifiers.max(0) as u64);
+        payload.byte(b'}');
+    }
+    payload.bytes(br#"]}"#);
+    writer.bytes(br#"]}]}"#);
+    finish_response(writer.finish())
 }
 
 fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
@@ -1259,6 +1197,16 @@ fn focused_raw_control_plugin(state: &PolicyState) -> bool {
     })
 }
 
+fn focused_keybinding_editor(state: &PolicyState) -> bool {
+    let Some(focused) = state.focused_pane else {
+        return false;
+    };
+    state
+        .app_panes
+        .iter()
+        .any(|item| item.pane == focused && item.app_id.as_str() == "keybindings")
+}
+
 fn pane_for_app_id_in_list(app_panes: &[AppPane], app_id: &[u8]) -> Option<u64> {
     app_panes
         .iter()
@@ -1305,6 +1253,7 @@ fn pack_actor_outbox(ptr: i32, len: i32) -> i64 {
 }
 
 #[panic_handler]
+#[cfg(not(test))]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
 }

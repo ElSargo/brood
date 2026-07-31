@@ -50,6 +50,7 @@ use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
 };
 
+use crate::actor_kernel::{ActorRuntimeKernel, allocate_generation};
 use crate::completion_io::{
     ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoConfig, CompletionIoError,
     FilesystemGrant, OperationId, start_completion_io,
@@ -64,9 +65,7 @@ use crate::filesystem_watch::{
 use crate::lifecycle::{
     PluginLifecycleEvent, PluginStartReason, PluginStopReason, wait_for_lifecycle_reply,
 };
-use crate::resource_limits::{
-    GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
-};
+use crate::resource_limits::{GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits};
 use crate::runtime_io::{
     ChildStatus, PtySpawnOptions, RuntimeIoCapabilities, RuntimeIoConfig, RuntimeIoError,
     RuntimeIoHub, StreamRead, TerminalProfile, TimerStatus,
@@ -119,8 +118,6 @@ const EVENT_WORKER_CANCELLED: u32 = 9;
 const EVENT_NOTIFICATION: u32 = 10;
 const EVENT_LIFECYCLE_START: u32 = 11;
 const EVENT_LIFECYCLE_STOP: u32 = 12;
-static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
-
 const STACK_ALIGNMENT: u32 = 16;
 
 type WorkerInputRegistry = Arc<Mutex<HashMap<Preview1WorkerId, Option<mpsc::Sender<Vec<u8>>>>>>;
@@ -1589,18 +1586,14 @@ impl Drop for Preview1CompletionSupervisor {
 
 /// One actor and its scoped Preview 1 compatibility workers.
 pub struct Preview1WorkerRuntime {
+    kernel: ActorRuntimeKernel,
     commands: mpsc::Sender<Command>,
     mailbox_slots: Arc<Semaphore>,
     mailbox_capacity: usize,
     parent: Option<TokioJoinHandle<Result<(), Preview1WorkerError>>>,
-    generation: u64,
     stats: Arc<Preview1CompatStatsInner>,
-    coordination: CoordinationHub,
-    filesystem_watches: FilesystemWatchHub,
-    runtime_io: RuntimeIoHub,
     terminal_error: Arc<Mutex<Option<String>>>,
     limits: WasmResourceLimits,
-    byte_budget: GenerationByteBudget,
 }
 
 impl Preview1WorkerRuntime {
@@ -1701,10 +1694,7 @@ impl Preview1WorkerRuntime {
         let memory = SharedMemory::new(&engine, memory_type)
             .map_err(|error| Preview1WorkerError::InvalidModule(error.to_string()))?;
 
-        let generation = NEXT_ACTOR_GENERATION
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current != 0).then(|| current.checked_add(1)).flatten()
-            })
+        let generation = allocate_generation()
             .map_err(|_exhausted| Preview1WorkerError::AtCapacity("actor generations"))?;
         let (coordination, notification_rx) = CoordinationHub::new(
             generation,
@@ -1749,6 +1739,13 @@ impl Preview1WorkerRuntime {
             coordination.clone(),
         )
         .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
+        let kernel = ActorRuntimeKernel::new(
+            generation,
+            coordination.clone(),
+            filesystem_watches.clone(),
+            runtime_io.clone(),
+            config.limits.generation_host_bytes,
+        );
         let (completion_io, completion_rx, completion_task) =
             start_completion_io(generation, &completion_config)
                 .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
@@ -1758,7 +1755,6 @@ impl Preview1WorkerRuntime {
         let (commands, receiver) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
         let mailbox_capacity = config.mailbox_backlog;
-        let byte_budget = GenerationByteBudget::new(config.limits.generation_host_bytes);
         let stats = Arc::new(Preview1CompatStatsInner::default());
         let next_worker = Arc::new(AtomicU64::new(1));
         let worker_inputs = Arc::new(Mutex::new(HashMap::new()));
@@ -1840,18 +1836,14 @@ impl Preview1WorkerRuntime {
             result
         });
         Ok(Self {
+            kernel,
             commands,
             mailbox_slots,
             mailbox_capacity,
             parent: Some(parent),
-            generation,
             stats,
-            coordination,
-            filesystem_watches,
-            runtime_io,
             terminal_error,
             limits: config.limits,
-            byte_budget,
         })
     }
 
@@ -1870,7 +1862,8 @@ impl Preview1WorkerRuntime {
             return Err(Preview1WorkerError::AtCapacity("mailbox body bytes"));
         }
         let byte_permit = self
-            .byte_budget
+            .kernel
+            .byte_budget()
             .try_reserve(sender.len().saturating_add(payload.len()))
             .map_err(|_error| {
                 increment_saturating(&self.stats.mailbox_dropped);
@@ -1902,10 +1895,10 @@ impl Preview1WorkerRuntime {
 
     /// Snapshot daemon-observable lifecycle counters.
     pub fn stats(&self) -> Preview1CompatStats {
-        let coordination = self.coordination.stats();
-        let filesystem_watches = self.filesystem_watches.stats();
+        let coordination = self.kernel.coordination_stats();
+        let filesystem_watches = self.kernel.filesystem_watch_stats();
         Preview1CompatStats {
-            generation: self.generation,
+            generation: self.kernel.generation(),
             mailbox_queued: self.stats.mailbox_queued.load(Ordering::Relaxed),
             mailbox_dropped: self.stats.mailbox_dropped.load(Ordering::Relaxed),
             mailbox_capacity: self.mailbox_capacity,
@@ -1932,11 +1925,11 @@ impl Preview1WorkerRuntime {
     }
 
     pub fn filesystem_watch_stats(&self) -> crate::filesystem_watch::FilesystemWatchStats {
-        self.filesystem_watches.stats()
+        self.kernel.filesystem_watch_stats()
     }
 
     pub fn runtime_io_stats(&self) -> crate::runtime_io::RuntimeIoStats {
-        self.runtime_io.stats()
+        self.kernel.runtime_io_stats()
     }
 
     fn try_take_terminal_error(&self) -> Option<String> {
@@ -2039,9 +2032,7 @@ impl Preview1WorkerRuntime {
             return Ok(());
         }
 
-        self.filesystem_watches.stop();
-        self.runtime_io.teardown().await;
-        self.coordination.stop();
+        self.kernel.shutdown().await;
 
         let (reply, response) = oneshot::channel();
         let sent = self
@@ -2069,8 +2060,7 @@ impl Preview1WorkerRuntime {
 
 impl Drop for Preview1WorkerRuntime {
     fn drop(&mut self) {
-        self.filesystem_watches.stop();
-        self.coordination.stop();
+        self.kernel.stop();
         if let Some(parent) = self.parent.take() {
             parent.abort();
         }
@@ -2153,7 +2143,7 @@ impl Preview1CompatActor {
     }
 
     pub const fn generation(&self) -> u64 {
-        self.runtime.generation
+        self.runtime.kernel.generation()
     }
 
     pub async fn lifecycle(

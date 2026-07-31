@@ -40,10 +40,14 @@ use brood_layout::{
 use brood_protocol::{
     ArtifactManifest, ArtifactRealm, BackendActorRealm, BackendId, ClientLifecycle, ClientMessage,
     FrameTransportKind, InputEvent, PanePosition,
+    backend_catalogue::{
+        BACKEND_CATALOGUE_ACTOR_ID, BACKEND_CATALOGUE_CLIENT_SENDER, BackendCatalogueEntry,
+        BackendCatalogueMessage, BackendSessionEntry,
+    },
 };
 use clap::Parser;
 use num_traits::ToPrimitive;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
@@ -317,7 +321,8 @@ fn main() -> Result<()> {
         eprintln!("presentation WASM actor check passed");
         return Ok(());
     }
-    let mut key_policy = ClientKeyPolicy::load(key_policy_spec)?;
+    let mut key_policy =
+        ClientKeyPolicy::load(key_policy_spec, brood_cli::global_keybindings_path())?;
     if args.check_wasm_key_policy {
         let snapshot = KeyPolicySnapshot {
             focused_pane: Some(1),
@@ -416,6 +421,13 @@ fn main() -> Result<()> {
             true,
             &snapshot,
         )?;
+        let open_keybindings = key_policy.evaluate(
+            brood_keybindings::KEY_SLASH,
+            brood_wasm::ABI_KEY_PRESSED,
+            brood_wasm::ABI_MOD_CTRL | brood_wasm::ABI_MOD_SHIFT,
+            false,
+            &snapshot,
+        )?;
         let close_pane = key_policy.evaluate(
             24,
             brood_wasm::ABI_KEY_PRESSED,
@@ -447,12 +459,18 @@ fn main() -> Result<()> {
                 )
             })
             || !toggle_switcher.actor_messages.iter().any(|message| {
-                message.actor == "session-switcher"
+                message.actor == BACKEND_CATALOGUE_ACTOR_ID
                     && message.payload == br#"{"type":"sidebar-action","action":"toggle"}"#
             })
             || !open_agent_picker.actor_messages.iter().any(|message| {
                 message.actor == "brood.client-init"
                     && message.payload == br#"{"kind":"coding-agent-action","action":"picker"}"#
+            })
+            || !open_keybindings.actor_messages.iter().any(|message| {
+                message.actor == "keybindings"
+                    && message
+                        .payload
+                        .starts_with(br#"{"type":"keybindings-show","bindings":["#)
             })
             || !repeated_open_agent_picker.actor_messages.is_empty()
             || !close_pane.host_messages.iter().any(|message| {
@@ -1081,35 +1099,6 @@ impl SshBackendDeployment {
         );
         Ok(())
     }
-}
-
-#[derive(Serialize)]
-struct BackendSessionsMessage {
-    kind: &'static str,
-    can_create_local: bool,
-    can_connect_remote: bool,
-    backends: Vec<BackendSessionsView>,
-}
-
-#[derive(Serialize)]
-struct BackendSessionsView {
-    backend: u64,
-    label: String,
-    sessions: Vec<BackendSessionView>,
-}
-
-#[derive(Serialize)]
-struct BackendSessionView {
-    id: u64,
-    name: String,
-    active: bool,
-    windows: u64,
-    working_directory: Option<String>,
-    project_id: String,
-    project_name: String,
-    branch: Option<String>,
-    worktree: bool,
-    git: bool,
 }
 
 fn ssh_deployer_path() -> Option<PathBuf> {
@@ -2474,7 +2463,10 @@ impl Application {
         if let Some(lane) = self.backend_commands.as_mut() {
             let _removed = lane.remove_backend(backend)?;
         }
-        self.backend_registry.replace_panes(backend, None, []);
+        anyhow::ensure!(
+            self.backend_registry.retire(backend),
+            "disconnected backend is absent from the connection registry"
+        );
         self.backend_sessions.remove(&backend);
         self.pending_frames.remove(&backend);
         self.pending_backend_snapshots.remove(&backend);
@@ -2734,14 +2726,12 @@ impl Application {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(());
         };
+        let message = BackendCatalogueMessage::connected(backend);
+        message.validate()?;
         runtime.send_actor_message(
-            "session-switcher",
-            "client".to_string(),
-            format!(
-                "{{\"kind\":\"backend-connected\",\"backend\":{}}}",
-                backend.0
-            )
-            .into_bytes(),
+            BACKEND_CATALOGUE_ACTOR_ID,
+            BACKEND_CATALOGUE_CLIENT_SENDER.to_string(),
+            serde_json::to_vec(&message).context("encode backend connection notification")?,
         )
     }
 
@@ -2749,14 +2739,12 @@ impl Application {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(());
         };
+        let notification = BackendCatalogueMessage::connection_failed(message);
+        notification.validate()?;
         runtime.send_actor_message(
-            "session-switcher",
-            "client".to_string(),
-            serde_json::to_vec(&serde_json::json!({
-                "kind": "backend-connection-failed",
-                "message": message,
-            }))
-            .context("encode backend connection failure")?,
+            BACKEND_CATALOGUE_ACTOR_ID,
+            BACKEND_CATALOGUE_CLIENT_SENDER.to_string(),
+            serde_json::to_vec(&notification).context("encode backend connection failure")?,
         )
     }
 
@@ -2764,20 +2752,18 @@ impl Application {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(());
         };
-        let message = BackendSessionsMessage {
-            kind: "backend-sessions",
-            can_create_local: self.local_server_template.is_some(),
-            can_connect_remote: self.ssh_deployer.is_some(),
-            backends: self
-                .backend_sessions
+        let message = BackendCatalogueMessage::sessions(
+            self.local_server_template.is_some(),
+            self.ssh_deployer.is_some(),
+            self.backend_sessions
                 .iter()
-                .map(|(backend, snapshot)| BackendSessionsView {
-                    backend: backend.0,
+                .map(|(backend, snapshot)| BackendCatalogueEntry {
+                    backend: *backend,
                     label: format!("Backend {}", backend.0),
                     sessions: snapshot
                         .sessions
                         .iter()
-                        .map(|session| BackendSessionView {
+                        .map(|session| BackendSessionEntry {
                             id: session.id,
                             name: session.name.clone(),
                             active: session.active,
@@ -2792,20 +2778,23 @@ impl Application {
                         .collect(),
                 })
                 .collect(),
-        };
-        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
-            for backend in &message.backends {
+        );
+        message.validate()?;
+        if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
+            && let BackendCatalogueMessage::Sessions { backends, .. } = &message
+        {
+            for backend in backends {
                 if let Some(active) = backend.sessions.iter().find(|session| session.active) {
                     eprintln!(
                         "backend session catalogue backend={} active={} name={:?}",
-                        backend.backend, active.id, active.name
+                        backend.backend.0, active.id, active.name
                     );
                 }
             }
         }
         runtime.send_actor_message(
-            "session-switcher",
-            "client".to_string(),
+            BACKEND_CATALOGUE_ACTOR_ID,
+            BACKEND_CATALOGUE_CLIENT_SENDER.to_string(),
             serde_json::to_vec(&message).context("encode backend session catalogue")?,
         )
     }
@@ -3054,6 +3043,9 @@ impl Application {
                 height,
                 windows,
             } => {
+                if !self.backend_registry.is_connected(backend) {
+                    return Ok(());
+                }
                 let mut windows = windows;
                 for window in &mut windows {
                     window.window_id = self.backend_registry.view_pane(QualifiedPane {
@@ -3064,7 +3056,6 @@ impl Application {
                 if let Some(sender) = self.input_sender.as_mut() {
                     sender.set_pane_routes(self.backend_registry.all_view_routes());
                 }
-                self.backend_registry.observe(backend, None);
                 (backend, sequence, width, height, windows)
             }
             ClientEvent::TransportError(message) => return Err(anyhow!(message)),
@@ -3595,7 +3586,7 @@ impl Application {
                         .sender
                         .as_ref()
                         .map(|sender| sender.name.clone())
-                        .unwrap_or_else(|| "session-switcher".to_string());
+                        .unwrap_or_else(|| BACKEND_CATALOGUE_ACTOR_ID.to_string());
                     let command = actor_runtime::SessionCommandEnvelope {
                         actor_id,
                         request: SessionCommandRequest {
@@ -3652,6 +3643,55 @@ impl Application {
                                  {notify_error:#}"
                             );
                         }
+                    }
+                    None
+                }
+                HostMessage::SetKeybinding {
+                    action,
+                    key_code,
+                    modifiers,
+                } => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored keybinding update without authenticated actor identity");
+                        continue;
+                    };
+                    if sender.name != "keybindings" {
+                        eprintln!(
+                            "ignored keybinding update from unauthorized actor={}",
+                            sender.name
+                        );
+                        continue;
+                    }
+                    let result = self
+                        .key_policy
+                        .as_mut()
+                        .context("presentation key policy is unavailable")
+                        .and_then(|policy| {
+                            policy.set_binding(
+                                &action,
+                                brood_keybindings::Binding::new(key_code, modifiers),
+                            )
+                        });
+                    let (success, message) = match &result {
+                        Ok(()) => (true, "Saved".to_string()),
+                        Err(error) => (false, format!("{error:#}")),
+                    };
+                    if let Some(runtime) = self.wasm_runtime.as_ref() {
+                        let response = serde_json::to_vec(&serde_json::json!({
+                            "type": "keybinding-saved",
+                            "action": action,
+                            "key_code": key_code,
+                            "modifiers": modifiers,
+                            "success": success,
+                            "message": message,
+                        }))?;
+                        if let Err(error) = runtime.send_key_policy_message("keybindings", response)
+                        {
+                            eprintln!("could not acknowledge keybinding update: {error:#}");
+                        }
+                    }
+                    if let Err(error) = result {
+                        eprintln!("could not persist keybinding update: {error:#}");
                     }
                     None
                 }
@@ -3792,7 +3832,7 @@ impl Application {
         let Some(pane) = self.renderer.as_ref().and_then(Renderer::focused_pane_id) else {
             return;
         };
-        let Some(qualified) = self.backend_registry.backend_pane(pane) else {
+        let Some(qualified) = self.backend_registry.routable_backend_pane(pane) else {
             return;
         };
         if let Some(commands) = self.backend_commands.as_mut() {
@@ -4222,8 +4262,12 @@ impl ApplicationHandler<ClientEvent> for Application {
             } => {
                 let local_panes = windows.iter().map(|window| window.pane).collect::<Vec<_>>();
                 let first_local_pane = local_panes.first().copied();
-                self.backend_registry
-                    .replace_panes(backend, None, local_panes);
+                if !self
+                    .backend_registry
+                    .replace_panes(backend, None, local_panes)
+                {
+                    return;
+                }
                 let windows = windows
                     .into_iter()
                     .map(|mut window| {
@@ -4359,7 +4403,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                 body,
                 received_at,
             } => {
-                self.backend_registry.observe(backend, None);
+                if !self.backend_registry.observe(backend, None) {
+                    return;
+                }
                 if body.starts_with(b"BTRM")
                     && sender.starts_with("terminal-session")
                     && let Some(pane) = self.wasm_runtime.as_ref().and_then(|runtime| {
@@ -5636,6 +5682,7 @@ fn apply_key_policy_host_message(
         }
         HostMessage::ToggleShortcutPassthrough
         | HostMessage::SetShortcutPassthrough { .. }
+        | HostMessage::SetKeybinding { .. }
         | HostMessage::BackendSession { .. }
         | HostMessage::ConnectRemoteBackend { .. }
         | HostMessage::DeploySshBackend { .. }
