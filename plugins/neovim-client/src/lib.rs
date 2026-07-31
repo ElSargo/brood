@@ -1,18 +1,17 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Mutex,
 };
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent, PresentationEvent,
-    SessionActorMessage, WorkerEvent, WorkerRequest,
+use brood_plugin_sdk::{
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
+        PresentationEvent, SessionActorMessage, StartContext, WorkerEvent, WorkerRequest,
+    },
+    input::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER},
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -51,11 +50,6 @@ const MAX_RUNNER_COLUMNS: u16 = 400;
 const FONT_SIZE: f32 = 16.0;
 const REQUESTED_LINE_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
-const MOD_CTRL: u32 = 1;
-const MOD_ALT: u32 = 2;
-const MOD_SHIFT: u32 = 4;
-const MOD_SUPER: u32 = 8;
-
 static STATE: Mutex<Option<ClientState>> = Mutex::new(None);
 
 struct NeovimClient;
@@ -404,7 +398,7 @@ impl Guest for NeovimClient {
     }
 }
 
-fn start(context: exports::brood::plugin::actor::StartContext) -> Vec<Command> {
+fn start(context: StartContext) -> Vec<Command> {
     let Some(backend_id) = context.backend_id else {
         return vec![Command::LifecycleComplete(Err(
             "Neovim client requires a backend association".to_string(),
@@ -2725,7 +2719,7 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-export!(NeovimClient);
+bindings::export!(NeovimClient with_types_in bindings);
 
 #[cfg(test)]
 mod tests {

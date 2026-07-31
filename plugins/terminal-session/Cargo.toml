@@ -9,10 +9,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 brood-graphics = { path = "../../crates/brood-graphics" }
+brood-plugin-sdk = { path = "../../crates/brood-plugin-sdk" }
 serde_json = "1.0.150"
 unicode-width = "0.2"
 vte = "0.15"
-wit-bindgen = "0.57.1"
 
 [profile.release]
 panic = "abort"

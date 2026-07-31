@@ -8,7 +8,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.57.1"
+brood-plugin-sdk = { path = "../../crates/brood-plugin-sdk" }
 
 [profile.release]
 panic = "abort"

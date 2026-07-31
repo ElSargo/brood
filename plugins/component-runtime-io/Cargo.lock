@@ -18,6 +18,18 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 name = "brood-component-runtime-io-plugin"
 version = "0.1.0"
 dependencies = [
+ "brood-plugin-sdk",
+]
+
+[[package]]
+name = "brood-graphics"
+version = "0.1.0"
+
+[[package]]
+name = "brood-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "brood-graphics",
  "wit-bindgen",
 ]
 

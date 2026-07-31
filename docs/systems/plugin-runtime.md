@@ -27,6 +27,22 @@ The complete model has three execution roles:
 The detailed I/O and resource protocol is specified in
 [[plugin-io-and-resources]].
 
+## Guest SDK
+
+Component Model plugins depend on `crates/brood-plugin-sdk`. It is the
+canonical generation point for `crates/brood-wasm/wit/brood-plugin.wit`, so a
+host-contract change is compiled once and every plugin implements the same
+`Guest` types. The SDK also owns the small mechanisms whose invariants should
+not vary by plugin: explicitly addressed actor commands, stable input bits,
+bounded label preparation, draw-packet submission and resource retirement, and
+worker-only notification, timer, stream, child, and subprocess handling.
+
+The SDK remains below plugin policy. It does not choose actors, capabilities,
+mailbox formats, supervision trees, retry policy, process allowlists, terminal
+emulation, editor protocols, widget identity, or layout. The actor dispatcher
+still returns commands immediately; only `worker-run` code may use the SDK's
+waiting I/O helpers.
+
 ## Trust And Isolation
 
 Installing and enabling a plugin is equivalent to choosing to execute it as the

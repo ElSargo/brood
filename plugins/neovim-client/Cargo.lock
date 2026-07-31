@@ -32,10 +32,18 @@ name = "brood-neovim-client-plugin"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
+ "brood-plugin-sdk",
  "serde",
  "serde_json",
  "sha2",
  "unicode-width",
+]
+
+[[package]]
+name = "brood-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "brood-graphics",
  "wit-bindgen",
 ]
 

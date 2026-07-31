@@ -1,10 +1,10 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
-use brood::plugin::host;
-use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
+use brood_plugin_sdk::{
+    actor::spawn_worker,
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{Command, Event, Guest},
+    runtime::FilesystemWatch,
+};
 
 const WORKER: u64 = 1;
 const REPORT: &str = ".brood/component-workspace-watch.md";
@@ -15,10 +15,7 @@ impl Guest for ComponentWorkspaceWatch {
     fn dispatch(event: Event) -> Vec<Command> {
         match event {
             Event::Mailbox(message) if message.body == b"start" => {
-                vec![Command::SpawnWorker(WorkerRequest {
-                    worker: WORKER,
-                    payload: Vec::new(),
-                })]
+                vec![spawn_worker(WORKER, Vec::new())]
             }
             _ => Vec::new(),
         }
@@ -56,42 +53,6 @@ impl Guest for ComponentWorkspaceWatch {
     }
 }
 
-/// Guest SDK wrapper: resource ownership is RAII, while readiness reuses the
-/// normal notification pollable and worker `wait-any` path.
-struct FilesystemWatch {
-    resource: host::FilesystemWatch,
-    generation: u64,
-}
-
-impl FilesystemWatch {
-    fn recursive(path: &str) -> Result<Self, String> {
-        let resource = host::filesystem_watch_create(path, true)
-            .map_err(|error| format!("create filesystem watch: {error:?}"))?;
-        Ok(Self {
-            resource,
-            generation: 0,
-        })
-    }
-
-    async fn next(&mut self) -> Result<host::FilesystemWatchBatch, String> {
-        let notification = self
-            .resource
-            .notification()
-            .map_err(|error| format!("get watch notification: {error:?}"))?;
-        let pollable = host::notification_pollable(notification, self.generation)
-            .map_err(|error| format!("create watch pollable: {error:?}"))?;
-        let ready = host::worker_wait_any(vec![pollable], None, host::WaitMode::Fair).await;
-        let _drop_result = host::pollable_drop(pollable);
-        ready.map_err(|error| format!("wait for filesystem watch: {error:?}"))?;
-        let batch = self
-            .resource
-            .read()
-            .map_err(|error| format!("read filesystem watch: {error:?}"))?;
-        self.generation = batch.generation;
-        Ok(batch)
-    }
-}
-
 const fn event_kind(kind: host::FilesystemEventKind) -> &'static str {
     match kind {
         host::FilesystemEventKind::Created => "created",
@@ -119,4 +80,4 @@ fn display_path(path: &[u8]) -> String {
     display
 }
 
-export!(ComponentWorkspaceWatch);
+bindings::export!(ComponentWorkspaceWatch with_types_in bindings);

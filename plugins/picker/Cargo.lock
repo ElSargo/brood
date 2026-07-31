@@ -23,8 +23,16 @@ name = "brood-picker-plugin"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
+ "brood-plugin-sdk",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "brood-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "brood-graphics",
  "wit-bindgen",
 ]
 

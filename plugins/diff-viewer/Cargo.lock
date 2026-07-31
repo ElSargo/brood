@@ -19,12 +19,20 @@ name = "brood-diff-viewer-plugin"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
- "wit-bindgen",
+ "brood-plugin-sdk",
 ]
 
 [[package]]
 name = "brood-graphics"
 version = "0.1.0"
+
+[[package]]
+name = "brood-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "brood-graphics",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "equivalent"

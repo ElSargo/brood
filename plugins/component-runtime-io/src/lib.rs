@@ -1,11 +1,9 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
-use brood::plugin::host;
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, WorkerEvent, WorkerFinished, WorkerRequest,
+use brood_plugin_sdk::{
+    actor::spawn_worker,
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{Command, Event, Guest, WorkerEvent, WorkerFinished},
+    runtime::{wait_child, wait_notification, wait_timer, write_all},
 };
 
 const WORKER: u64 = 1;
@@ -16,10 +14,7 @@ struct RuntimeIoProof;
 impl Guest for RuntimeIoProof {
     fn dispatch(event: Event) -> Vec<Command> {
         match event {
-            Event::Mailbox(message) => vec![Command::SpawnWorker(WorkerRequest {
-                worker: WORKER,
-                payload: message.body,
-            })],
+            Event::Mailbox(message) => vec![spawn_worker(WORKER, message.body)],
             Event::Worker(WorkerEvent::Finished(WorkerFinished { worker, .. }))
                 if worker == WORKER =>
             {
@@ -111,24 +106,6 @@ impl Guest for RuntimeIoProof {
     }
 }
 
-async fn write_all(stream: u64, mut bytes: &[u8]) -> Result<(), String> {
-    let mut generation = 0;
-    while !bytes.is_empty() {
-        match host::stream_write(stream, bytes) {
-            Ok(written) => bytes = &bytes[written as usize..],
-            Err(host::RuntimeIoError::WouldBlock) => {
-                generation = wait_notification(
-                    host::stream_notification(stream).map_err(debug("stream notification"))?,
-                    generation,
-                )
-                .await?;
-            }
-            Err(error) => return Err(format!("stream write: {error:?}")),
-        }
-    }
-    Ok(())
-}
-
 async fn read_to_eof(stream: u64) -> Result<Vec<u8>, String> {
     let notification = host::stream_notification(stream).map_err(debug("stream notification"))?;
     let mut generation = 0;
@@ -142,27 +119,6 @@ async fn read_to_eof(stream: u64) -> Result<Vec<u8>, String> {
             }
         }
     }
-}
-
-async fn wait_child(child: u64) -> Result<(host::ChildState, Option<i32>), String> {
-    let notification = host::child_notification(child).map_err(debug("child notification"))?;
-    let mut generation = 0;
-    loop {
-        let status = host::child_status(child).map_err(debug("child status"))?;
-        if status.0 != host::ChildState::Running {
-            return Ok(status);
-        }
-        generation = wait_notification(notification, generation).await?;
-    }
-}
-
-async fn wait_timer(timer: u64) -> Result<(), String> {
-    let notification = host::timer_notification(timer).map_err(debug("timer notification"))?;
-    let mut generation = 0;
-    while host::timer_status(timer).map_err(debug("timer status"))? == host::TimerState::Pending {
-        generation = wait_notification(notification, generation).await?;
-    }
-    Ok(())
 }
 
 async fn wait_timer_pair(sooner: u64, later: u64) -> Result<&'static str, String> {
@@ -186,16 +142,6 @@ async fn wait_timer_pair(sooner: u64, later: u64) -> Result<&'static str, String
     Ok(if ready.index == 0 { "20ms" } else { "80ms" })
 }
 
-async fn wait_notification(notification: u64, generation: u64) -> Result<u64, String> {
-    let pollable =
-        host::notification_pollable(notification, generation).map_err(debug("create pollable"))?;
-    let ready = host::worker_wait_any(vec![pollable], None, host::WaitMode::Fair)
-        .await
-        .map_err(debug("wait notification"));
-    let _ = host::pollable_drop(pollable);
-    ready.map(|ready| ready.generation)
-}
-
 fn display(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .replace('\r', "\\r")
@@ -214,4 +160,4 @@ fn debug<T: core::fmt::Debug>(context: &'static str) -> impl FnOnce(T) -> String
     move |error| format!("{context}: {error:?}")
 }
 
-export!(RuntimeIoProof);
+bindings::export!(RuntimeIoProof with_types_in bindings);

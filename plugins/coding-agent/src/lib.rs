@@ -1,19 +1,19 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
 };
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
-    LocalActorMessage, PresentationActorMessage, PresentationEvent, SessionActorMessage,
-    WorkerEvent, WorkerRequest,
+use brood_plugin_sdk::{
+    actor::{send_local, send_presentation, send_session},
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
+        PresentationEvent, WorkerEvent, WorkerRequest,
+    },
+    graphics::{drop_resources, layout_ui_text, submit_packet},
+    input::BUTTON_PRIMARY as LEFT_BUTTON,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,6 @@ const INBOX_ID: &str = "inbox";
 const FIRST_AGENT: &str = "coding-agent-1";
 const WORKER_ID: u64 = 1;
 const UPDATE_NOTIFICATION_TOKEN: u64 = 0x434f_4445_5841_4745;
-const LEFT_BUTTON: u32 = 0x110;
 const MAX_LOG_LINES: usize = 96;
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 
@@ -717,21 +716,15 @@ fn subscriber_message(subscriber: &Subscriber, message: &WireMessage) -> Option<
 }
 
 fn local_message(actor: &str, message: &WireMessage) -> Option<ActorCommand> {
-    serde_json::to_vec(message).ok().map(|body| {
-        ActorCommand::SendLocalMessage(LocalActorMessage {
-            actor: actor.to_string(),
-            body,
-        })
-    })
+    serde_json::to_vec(message)
+        .ok()
+        .map(|body| send_local(actor, body))
 }
 
 fn presentation_message(actor: &str, message: &WireMessage) -> Option<ActorCommand> {
-    serde_json::to_vec(message).ok().map(|body| {
-        ActorCommand::SendPresentationMessage(PresentationActorMessage {
-            actor: actor.to_string(),
-            body,
-        })
-    })
+    serde_json::to_vec(message)
+        .ok()
+        .map(|body| send_presentation(actor, body))
 }
 
 fn session_message(
@@ -740,14 +733,9 @@ fn session_message(
     actor: &str,
     message: &WireMessage,
 ) -> Option<ActorCommand> {
-    serde_json::to_vec(message).ok().map(|body| {
-        ActorCommand::SendSessionMessage(SessionActorMessage {
-            backend_id,
-            session_id,
-            actor: actor.to_string(),
-            body,
-        })
-    })
+    serde_json::to_vec(message)
+        .ok()
+        .map(|body| send_session(backend_id, session_id, actor, body))
 }
 
 fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
@@ -1156,19 +1144,10 @@ fn redraw_ui(ui: &mut UiState) {
     draw_toolbar(ui, &mut packet);
     draw_transcript(ui, &mut packet);
     draw_prompt(ui, &mut packet);
-    let submitted = ui.draw_error.take().map_or_else(
-        || {
-            packet
-                .encode()
-                .map_err(|error| format!("encode draw packet: {error}"))
-                .and_then(|bytes| {
-                    host::graphics_submit_draw_packet(ui.pane, &bytes)
-                        .map(|_| ())
-                        .map_err(|error| format!("submit draw packet: {error:?}"))
-                })
-        },
-        Err,
-    );
+    let submitted = ui
+        .draw_error
+        .take()
+        .map_or_else(|| submit_packet(ui.pane, &packet).map(|_| ()), Err);
     match submitted {
         Ok(()) => {
             let stale = ui
@@ -1179,7 +1158,7 @@ fn redraw_ui(ui: &mut UiState) {
                 .collect::<Vec<_>>();
             for key in stale {
                 if let Some(resource) = ui.text_resources.remove(&key) {
-                    let _ = host::graphics_drop_resource(ui.pane, resource);
+                    drop_resources(ui.pane, [resource]);
                 }
             }
             ui.created_text_resources.clear();
@@ -1188,7 +1167,7 @@ fn redraw_ui(ui: &mut UiState) {
         Err(error) => {
             for key in std::mem::take(&mut ui.created_text_resources) {
                 if let Some(resource) = ui.text_resources.remove(&key) {
-                    let _ = host::graphics_drop_resource(ui.pane, resource);
+                    drop_resources(ui.pane, [resource]);
                 }
             }
             ui.error = error;
@@ -1440,26 +1419,11 @@ fn draw_text(
     let handle = if let Some(handle) = ui.text_resources.get(&key) {
         *handle
     } else {
-        let layout = match host::graphics_layout_text(
-            ui.pane,
-            text,
-            host::TextLayoutOptions {
-                font_intent: host::FontIntent::Ui,
-                font_weight: host::FontWeight::Normal,
-                font_style: host::FontStyle::Normal,
-                font_size: size,
-                max_width: width,
-                line_height: size * 1.35,
-                red: color.r,
-                green: color.g,
-                blue: color.b,
-                alpha: color.a,
-            },
-        ) {
+        let layout = match layout_ui_text(ui.pane, text, size, width, size * 1.35, color) {
             Ok(layout) => layout,
             Err(error) => {
                 ui.draw_error
-                    .get_or_insert_with(|| format!("layout text: {error:?}"));
+                    .get_or_insert_with(|| format!("layout text: {error}"));
                 return;
             }
         };
@@ -1719,4 +1683,4 @@ fn runtime_error<T: core::fmt::Debug>(context: &'static str) -> impl FnOnce(T) -
     move |error| format!("{context}: {error:?}")
 }
 
-export!(CodingAgentPlugin);
+bindings::export!(CodingAgentPlugin with_types_in bindings);

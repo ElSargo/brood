@@ -34,10 +34,11 @@ snapshots, and the root-to-`rest` lease chain.
 
 The canvas workload uses filled and stroked rounded rectangles, rectangles,
 one list clip, and native text layout handles. No component, row, button,
-editor, or list identity crosses the guest boundary. The current component
-code is deliberately direct: extracting its column, list, row, text-editor,
-theme, and resource-cache helpers into a guest SDK is the next useful SDK
-slice.
+editor, or list identity crosses the guest boundary. The plugin uses the common
+guest SDK for its ABI, actor addressing, input constants, bounded labels, text
+layout options, packet submission, and resource retirement. Its column, list,
+row, text-editor, and interaction state stay direct guest code: those are
+composition policy, not a host or SDK ABI.
 
 The workload exposed two narrower platform needs:
 

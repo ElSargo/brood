@@ -1,19 +1,19 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Mutex,
 };
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    ActorStartRequest, ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest,
-    LifecycleEvent, LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
-    SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
+use brood_plugin_sdk::{
+    bindings,
+    exports::brood::plugin::actor::{
+        ActorStartRequest, ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest,
+        LifecycleEvent, LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
+        SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
+    },
+    graphics::{drop_resources, layout_ui_text, submit_packet},
+    input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
+    text::truncate_to_width,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,8 +31,6 @@ const TERMINAL_UI_ID: &str = "terminal-ui";
 const NEOVIM_UI_ID_PREFIX: &str = "neovim-ui-b";
 const NEOVIM_FILES_ID: &str = "neovim-files";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
-const LEFT_BUTTON: u32 = 0x110;
-const RIGHT_BUTTON: u32 = 0x111;
 const HEADER_HEIGHT: f32 = 52.0;
 const FOOTER_HEIGHT: f32 = 28.0;
 const ROW_HEIGHT: f32 = 30.0;
@@ -3132,12 +3130,8 @@ fn redraw(state: &mut SwitcherState) -> Result<(), String> {
         state.width - 28.0,
     )?;
 
-    let bytes = packet.encode().map_err(|error| error.to_string())?;
-    host::graphics_submit_draw_packet(state.pane, &bytes)
-        .map_err(|error| format!("submit session switcher: {error:?}"))?;
-    for handle in state.text_resources.drain(..) {
-        let _ = host::graphics_drop_resource(state.pane, handle);
-    }
+    submit_packet(state.pane, &packet)?;
+    drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())
 }
@@ -3188,23 +3182,8 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = host::graphics_layout_text(
-        state.pane,
-        text,
-        host::TextLayoutOptions {
-            font_intent: host::FontIntent::Ui,
-            font_weight: host::FontWeight::Normal,
-            font_style: host::FontStyle::Normal,
-            font_size: size,
-            max_width: max_width.max(1.0),
-            line_height: size + 4.0,
-            red: color.r,
-            green: color.g,
-            blue: color.b,
-            alpha: color.a,
-        },
-    )
-    .map_err(|error| format!("layout session switcher text: {error:?}"))?;
+    let layout = layout_ui_text(state.pane, text, size, max_width, size + 4.0, color)
+        .map_err(|error| format!("layout session switcher text: {error}"))?;
     resources.push(layout.handle);
     packet.push(Command::Save);
     packet.push(Command::ClipRect(Rect::new(
@@ -3222,25 +3201,7 @@ fn add_text(
     Ok(())
 }
 
-fn truncate_to_width(text: &str, max_width: f32, font_size: f32) -> String {
-    if max_width < font_size {
-        return String::new();
-    }
-    let max_chars = (max_width / (font_size * 0.64)).floor().max(2.0) as usize;
-    truncate(text, max_chars)
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut characters = text.chars();
-    let prefix = characters.by_ref().take(max_chars).collect::<String>();
-    if characters.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
-}
-
-export!(SessionSwitcher with_types_in self);
+bindings::export!(SessionSwitcher with_types_in bindings);
 
 #[cfg(test)]
 mod tests {

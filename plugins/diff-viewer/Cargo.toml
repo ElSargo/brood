@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 brood-graphics = { path = "../../crates/brood-graphics" }
-wit-bindgen = "0.57.1"
+brood-plugin-sdk = { path = "../../crates/brood-plugin-sdk" }
 
 [workspace]

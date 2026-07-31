@@ -1,12 +1,11 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
-use brood::plugin::host;
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, PresentationActorMessage, WorkerEvent, WorkerFinished,
-    WorkerRequest,
+use brood_plugin_sdk::{
+    actor::{send_presentation, spawn_worker},
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        Command, Event, Guest, LifecycleEvent, WorkerEvent, WorkerFinished,
+    },
+    runtime::{sleep as wait_timer, wait_child, wait_notification},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -139,7 +138,7 @@ impl ManagerState {
         self.next_worker = self.next_worker.saturating_add(1);
         let payload = serde_json::to_vec(&input).ok()?;
         self.jobs.insert(worker, job);
-        Some(Command::SpawnWorker(WorkerRequest { worker, payload }))
+        Some(spawn_worker(worker, payload))
     }
 
     fn schedule_timer(&mut self) -> Option<Command> {
@@ -510,12 +509,7 @@ fn directory_list_response(
         "message": message,
     }))
     .ok()
-    .map(|body| {
-        Command::SendPresentationMessage(PresentationActorMessage {
-            actor: actor.to_string(),
-            body,
-        })
-    })
+    .map(|body| send_presentation(actor, body))
     .into_iter()
     .collect()
 }
@@ -688,9 +682,7 @@ async fn list_directories(roots: &[String]) -> Result<Vec<String>, String> {
         let before = directories.len();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let path = line.trim_end_matches('/');
-            if path.is_empty()
-                || !path.starts_with('/')
-                || directory_is_implementation_noise(path)
+            if path.is_empty() || !path.starts_with('/') || directory_is_implementation_noise(path)
             {
                 continue;
             }
@@ -714,7 +706,11 @@ async fn list_directories(roots: &[String]) -> Result<Vec<String>, String> {
                 .filter(|component| component.starts_with('.'))
                 .count()
         };
-        let depth = |path: &str| path.split('/').filter(|component| !component.is_empty()).count();
+        let depth = |path: &str| {
+            path.split('/')
+                .filter(|component| !component.is_empty())
+                .count()
+        };
         let preferred = |path: &str| {
             !preferred_roots
                 .iter()
@@ -830,42 +826,4 @@ async fn read_to_eof(stream: u64) -> Result<Vec<u8>, String> {
     }
 }
 
-async fn wait_child(child: u64) -> Result<(host::ChildState, Option<i32>), String> {
-    let notification = host::child_notification(child)
-        .map_err(|error| format!("child notification: {error:?}"))?;
-    let mut generation = 0;
-    loop {
-        let status =
-            host::child_status(child).map_err(|error| format!("child status: {error:?}"))?;
-        if status.0 != host::ChildState::Running {
-            return Ok(status);
-        }
-        generation = wait_notification(notification, generation).await?;
-    }
-}
-
-async fn wait_timer(duration_ms: u64) -> Result<(), String> {
-    let timer =
-        host::timer_create(duration_ms).map_err(|error| format!("create timer: {error:?}"))?;
-    let notification = host::timer_notification(timer)
-        .map_err(|error| format!("timer notification: {error:?}"))?;
-    let mut generation = 0;
-    while host::timer_status(timer).map_err(|error| format!("timer status: {error:?}"))?
-        == host::TimerState::Pending
-    {
-        generation = wait_notification(notification, generation).await?;
-    }
-    Ok(())
-}
-
-async fn wait_notification(notification: u64, generation: u64) -> Result<u64, String> {
-    let pollable = host::notification_pollable(notification, generation)
-        .map_err(|error| format!("create pollable: {error:?}"))?;
-    let ready = host::worker_wait_any(vec![pollable], None, host::WaitMode::Fair)
-        .await
-        .map_err(|error| format!("wait notification: {error:?}"));
-    let _ = host::pollable_drop(pollable);
-    ready.map(|ready| ready.generation)
-}
-
-export!(WorktreeManager);
+bindings::export!(WorktreeManager with_types_in bindings);

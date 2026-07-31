@@ -1,15 +1,17 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{collections::VecDeque, sync::Mutex};
 
-use brood::plugin::host;
 use brood_graphics::theme::ashen;
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
-    PresentationActorMessage, WorkerEvent, WorkerRequest,
+use brood_plugin_sdk::{
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
+        PresentationActorMessage, WorkerEvent, WorkerRequest,
+    },
+    runtime::{
+        sleep as wait_duration, wait_child, wait_notification, wait_timer,
+        write_all as write_worker_bytes,
+    },
 };
 use serde_json::{Map, Value};
 use unicode_width::UnicodeWidthChar;
@@ -1329,68 +1331,6 @@ fn publish_terminal_revision(notification: u64) -> Result<Vec<u8>, String> {
     Ok(responses)
 }
 
-async fn wait_timer(timer: u64) -> Result<(), String> {
-    let notification = host::timer_notification(timer)
-        .map_err(|error| format!("snapshot timer notification: {error:?}"))?;
-    let mut generation = 0;
-    while host::timer_status(timer).map_err(|error| format!("snapshot timer status: {error:?}"))?
-        == host::TimerState::Pending
-    {
-        generation = wait_notification(notification, generation).await?;
-    }
-    Ok(())
-}
-
-async fn wait_duration(duration_ms: u64) -> Result<(), String> {
-    let timer = host::timer_create(duration_ms)
-        .map_err(|error| format!("create duration timer: {error:?}"))?;
-    let result = wait_timer(timer).await;
-    let dropped = host::timer_drop(timer)
-        .await
-        .map_err(|error| format!("drop duration timer: {error:?}"));
-    result.and(dropped)
-}
-
-async fn write_worker_bytes(stream: u64, mut bytes: &[u8]) -> Result<(), String> {
-    let notification = host::stream_notification(stream)
-        .map_err(|error| format!("stream notification: {error:?}"))?;
-    let mut observed = 0;
-    while !bytes.is_empty() {
-        match host::stream_write(stream, bytes) {
-            Ok(written) if written > 0 => bytes = &bytes[written as usize..],
-            Ok(_) | Err(host::RuntimeIoError::WouldBlock) => {
-                observed = wait_notification(notification, observed).await?;
-            }
-            Err(error) => return Err(format!("write terminal response: {error:?}")),
-        }
-    }
-    Ok(())
-}
-
-async fn wait_notification(notification: u64, generation: u64) -> Result<u64, String> {
-    let pollable = host::notification_pollable(notification, generation)
-        .map_err(|error| format!("create terminal pollable: {error:?}"))?;
-    let ready = host::worker_wait_any(vec![pollable], None, host::WaitMode::Fair)
-        .await
-        .map_err(|error| format!("wait for terminal readiness: {error:?}"));
-    let _ = host::pollable_drop(pollable);
-    ready.map(|ready| ready.generation)
-}
-
-async fn wait_child(child: u64) -> Result<(host::ChildState, Option<i32>), String> {
-    let notification = host::child_notification(child)
-        .map_err(|error| format!("child notification: {error:?}"))?;
-    let mut generation = 0;
-    loop {
-        let status =
-            host::child_status(child).map_err(|error| format!("child status: {error:?}"))?;
-        if status.0 != host::ChildState::Running {
-            return Ok(status);
-        }
-        generation = wait_notification(notification, generation).await?;
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Style {
     fg: u32,
@@ -2287,7 +2227,7 @@ mod tests {
         editor_socket_path, editor_worker_finished_message, encode_snapshot,
         is_editor_session_instance, parse_editor_open, route_editor_action, trusted_input_sender,
     };
-    use crate::exports::brood::plugin::actor::Command;
+    use brood_plugin_sdk::exports::brood::plugin::actor::Command;
     use serde_json::Value;
     use vte::{Parser, Perform};
 
@@ -2708,4 +2648,4 @@ fn finish_encoded_run(bytes: &mut [u8], run: EncodedRun, cells: u16) {
         .copy_from_slice(&text_length.to_le_bytes());
 }
 
-export!(TerminalSession);
+bindings::export!(TerminalSession with_types_in bindings);

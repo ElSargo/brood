@@ -1,12 +1,10 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
-use brood::plugin::host;
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, MailboxMessage, PresentationActorMessage, WorkerEvent,
-    WorkerFailed, WorkerFinished, WorkerRequest,
+use brood_plugin_sdk::{
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        Command, Event, Guest, LifecycleEvent, MailboxMessage, PresentationActorMessage,
+        WorkerEvent, WorkerFailed, WorkerFinished, WorkerRequest,
+    },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1751,7 +1749,7 @@ fn bounded_text(text: &str, max_bytes: usize) -> String {
     text.get(..end).unwrap_or_default().to_string()
 }
 
-export!(NeovimFiles);
+bindings::export!(NeovimFiles with_types_in bindings);
 
 #[cfg(test)]
 mod tests {

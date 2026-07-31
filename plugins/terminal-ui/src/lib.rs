@@ -1,18 +1,20 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, Mutex},
 };
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
-    WorkerRequest,
+use brood_plugin_sdk::{
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
+        WorkerRequest,
+    },
+    input::{
+        BUTTON_MIDDLE as MIDDLE_BUTTON, BUTTON_PRIMARY as LEFT_BUTTON, MOD_ALT, MOD_CTRL, MOD_SHIFT,
+    },
+    runtime::sleep as wait_timer,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -25,11 +27,6 @@ const PADDING: f32 = 8.0;
 const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
 const CURSOR: u32 = ashen::CURSOR_RGB;
 const SELECTION_BG: u32 = ashen::SELECTION_RGB;
-const MOD_CTRL: u32 = 1;
-const MOD_ALT: u32 = 2;
-const MOD_SHIFT: u32 = 4;
-const LEFT_BUTTON: u32 = 0x110;
-const MIDDLE_BUTTON: u32 = 0x112;
 const SCROLL_PIXELS_PER_LINE: f32 = 5.0;
 const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
@@ -807,28 +804,6 @@ fn finish_resize_debounce() -> Vec<Command> {
     };
     state.resize_worker_pending = false;
     state.send_resize_if_changed().into_iter().collect()
-}
-
-async fn wait_timer(duration_ms: u64) -> Result<(), String> {
-    let timer =
-        host::timer_create(duration_ms).map_err(|error| format!("create timer: {error:?}"))?;
-    let notification = host::timer_notification(timer)
-        .map_err(|error| format!("timer notification: {error:?}"))?;
-    let mut generation = 0;
-    while host::timer_status(timer).map_err(|error| format!("timer status: {error:?}"))?
-        == host::TimerState::Pending
-    {
-        let pollable = host::notification_pollable(notification, generation)
-            .map_err(|error| format!("create timer pollable: {error:?}"))?;
-        let ready = host::worker_wait_any(vec![pollable], None, host::WaitMode::Fair)
-            .await
-            .map_err(|error| format!("wait for timer: {error:?}"));
-        let _ = host::pollable_drop(pollable);
-        generation = ready?.generation;
-    }
-    host::timer_drop(timer)
-        .await
-        .map_err(|error| format!("drop timer: {error:?}"))
 }
 
 fn set_clipboard_command(text: String) -> Option<Command> {
@@ -1640,7 +1615,7 @@ fn rgb_channels(value: u32) -> [f32; 3] {
     ]
 }
 
-export!(TerminalUi);
+bindings::export!(TerminalUi with_types_in bindings);
 
 #[cfg(test)]
 mod tests {

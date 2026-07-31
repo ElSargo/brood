@@ -1,20 +1,19 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{collections::VecDeque, sync::Mutex};
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
+use brood_plugin_sdk::{
+    bindings,
+    exports::brood::plugin::actor::{
+        Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
+    },
+    graphics::{drop_resources, layout_ui_text, submit_packet},
+    input::BUTTON_PRIMARY as LEFT_BUTTON,
+    text::one_line,
 };
 use serde::Deserialize;
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const INBOX_ACTOR_ID: &str = "inbox";
-const LEFT_BUTTON: u32 = 0x110;
 const HEADER_HEIGHT: f32 = 48.0;
 const ITEM_HEIGHT: f32 = 72.0;
 const MAX_ITEMS: usize = 32;
@@ -286,9 +285,7 @@ fn redraw(state: &mut InboxState) -> Result<(), String> {
     if state.pane == 0 {
         return Ok(());
     }
-    for resource in state.text_resources.drain(..) {
-        let _ = host::graphics_drop_resource(state.pane, resource);
-    }
+    let stale_resources = std::mem::take(&mut state.text_resources);
     let mut packet = Packet::new();
     let mut resources = Vec::new();
     packet.push(DrawCommand::FillRect {
@@ -432,11 +429,8 @@ fn redraw(state: &mut InboxState) -> Result<(), String> {
             state.width - 24.0,
         )?;
     }
-    let bytes = packet
-        .encode()
-        .map_err(|error| format!("encode inbox draw packet: {error}"))?;
-    host::graphics_submit_draw_packet(state.pane, &bytes)
-        .map_err(|error| format!("submit inbox draw packet: {error:?}"))?;
+    submit_packet(state.pane, &packet)?;
+    drop_resources(state.pane, stale_resources);
     state.text_resources = resources;
     state.error.clear();
     Ok(())
@@ -454,23 +448,8 @@ fn add_text(
     y: f32,
     width: f32,
 ) -> Result<(), String> {
-    let layout = host::graphics_layout_text(
-        pane,
-        text,
-        host::TextLayoutOptions {
-            font_intent: host::FontIntent::Ui,
-            font_weight: host::FontWeight::Normal,
-            font_style: host::FontStyle::Normal,
-            font_size: size,
-            max_width: width.max(1.0),
-            line_height: size * 1.3,
-            red: color.r,
-            green: color.g,
-            blue: color.b,
-            alpha: color.a,
-        },
-    )
-    .map_err(|error| format!("layout inbox text: {error:?}"))?;
+    let layout = layout_ui_text(pane, text, size, width, size * 1.3, color)
+        .map_err(|error| format!("layout inbox text: {error}"))?;
     resources.push(layout.handle);
     packet.push(DrawCommand::DrawTextLayout {
         layout: layout.handle,
@@ -488,13 +467,6 @@ fn valid_actor(actor: &str) -> bool {
         && actor
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-fn one_line(text: &str, maximum: usize) -> String {
-    text.replace(['\r', '\n'], " ")
-        .chars()
-        .take(maximum)
-        .collect()
 }
 
 fn truncate(text: &str, width: f32, size: f32) -> String {
@@ -566,4 +538,4 @@ mod tests {
     }
 }
 
-export!(InboxPlugin);
+bindings::export!(InboxPlugin with_types_in bindings);

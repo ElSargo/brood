@@ -22,9 +22,15 @@ Root-level target-shape Brood plugins live here.
 - `neovim-runtime/` contains the JSONL Node/Emscripten runner and injected Lua
   bridge. It mirrors the client's Neovim config into the Wasm filesystem.
 
-The WASM crates are currently standalone because `brood-wasm` is
-host/runtime-only. Once guest-side helpers exist, plugins can depend on a guest
-SDK instead of hand-writing ABI exports and JSON envelopes.
+Component Model plugins use `crates/brood-plugin-sdk`. The SDK owns the
+generated `brood-plugin` bindings plus common actor, input, graphics-resource,
+text-bounding, and worker-runtime mechanisms. Plugins remain standalone crates
+so their dependency closures and artifacts stay independent; the SDK does not
+own their protocols, state machines, supervision, or UI composition.
+
+Preview 1 core modules (`default-workspace` and `workspace-file-log`) retain
+their lane-specific ABI. They share a host contract with Component plugins but
+do not pretend to implement the Component Model `Guest` interface.
 
 ## Visual language
 

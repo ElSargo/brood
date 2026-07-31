@@ -6,6 +6,7 @@ members = [
     "crates/brood-graphics",
     "crates/brood-ipc",
     "crates/brood-layout",
+    "crates/brood-plugin-sdk",
     "crates/brood-protocol",
     "crates/brood-remote",
     "crates/brood-transport",
@@ -39,6 +40,7 @@ brood-cli = { path = "crates/brood-cli" }
 brood-graphics = { path = "crates/brood-graphics" }
 brood-ipc = { path = "crates/brood-ipc" }
 brood-layout = { path = "crates/brood-layout" }
+brood-plugin-sdk = { path = "crates/brood-plugin-sdk" }
 brood-protocol = { path = "crates/brood-protocol" }
 brood-transport = { path = "crates/brood-transport" }
 lyon_tessellation = "1.0.20"

@@ -1,18 +1,19 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Mutex,
 };
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
-    WorkerRequest,
+use brood_plugin_sdk::{
+    bindings,
+    brood::plugin::host,
+    exports::brood::plugin::actor::{
+        Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
+        WorkerRequest,
+    },
+    graphics::{drop_resources, layout_ui_text, submit_packet},
+    input::BUTTON_PRIMARY as LEFT_BUTTON,
+    runtime::run_process,
 };
 
 const FIRST_WORKER: u64 = 1;
@@ -23,7 +24,6 @@ const HUNK_HEADER_HEIGHT: f32 = 28.0;
 const CODE_ROW_HEIGHT: f32 = 22.0;
 const FILE_GAP_HEIGHT: f32 = 12.0;
 const GUTTER_WIDTH: f32 = 54.0;
-const LEFT_BUTTON: u32 = 0x110;
 const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
 const SCROLLBAR_INSET: f32 = 5.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 5.0;
@@ -654,9 +654,7 @@ fn redraw_with_layouts(
         state.width - 28.0,
     )?;
 
-    let bytes = packet.encode().map_err(|error| error.to_string())?;
-    host::graphics_submit_draw_packet(state.pane, &bytes)
-        .map_err(|error| format!("submit diff viewer: {error:?}"))?;
+    submit_packet(state.pane, &packet)?;
 
     let stale = text_resources
         .layouts
@@ -667,7 +665,7 @@ fn redraw_with_layouts(
         let Some(handle) = text_resources.layouts.remove(&key) else {
             continue;
         };
-        let _ = host::graphics_drop_resource(state.pane, handle);
+        drop_resources(state.pane, [handle]);
     }
     Ok(())
 }
@@ -960,23 +958,8 @@ fn add_text(
     let handle = if let Some(handle) = resources.layouts.get(&key) {
         *handle
     } else {
-        let layout = host::graphics_layout_text(
-            resources.pane,
-            text,
-            host::TextLayoutOptions {
-                font_intent: host::FontIntent::Ui,
-                font_weight: host::FontWeight::Normal,
-                font_style: host::FontStyle::Normal,
-                font_size: size,
-                max_width,
-                line_height,
-                red: color.r,
-                green: color.g,
-                blue: color.b,
-                alpha: color.a,
-            },
-        )
-        .map_err(|error| format!("layout diff text: {error:?}"))?;
+        let layout = layout_ui_text(resources.pane, text, size, max_width, line_height, color)
+            .map_err(|error| format!("layout diff text: {error}"))?;
         resources.layouts.insert(key, layout.handle);
         layout.handle
     };
@@ -1347,80 +1330,12 @@ async fn run_git(arguments: &[&str]) -> Result<ProcessOutput, String> {
         .iter()
         .map(|argument| (*argument).to_string())
         .collect::<Vec<_>>();
-    let process = host::subprocess_spawn("git", &arguments)
-        .map_err(|error| format!("spawn git: {error:?}"))?;
-    let _ = host::stream_close_write(process.stdin);
-    let result = drain_process(&process).await;
-    let _ = host::stream_drop(process.stdin).await;
-    let _ = host::stream_drop(process.stdout).await;
-    let _ = host::stream_drop(process.stderr).await;
-    let _ = host::child_drop(process.child).await;
-    result
-}
-
-async fn drain_process(process: &host::ProcessIo) -> Result<ProcessOutput, String> {
-    let stdout_notification =
-        host::stream_notification(process.stdout).map_err(runtime_error("stdout notification"))?;
-    let stderr_notification =
-        host::stream_notification(process.stderr).map_err(runtime_error("stderr notification"))?;
-    let child_notification =
-        host::child_notification(process.child).map_err(runtime_error("child notification"))?;
-    let mut stdout_generation = 0;
-    let mut stderr_generation = 0;
-    let mut child_generation = 0;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let mut stdout_eof = false;
-    let mut stderr_eof = false;
-    loop {
-        stdout_eof |= drain_stream(process.stdout, &mut stdout)?;
-        stderr_eof |= drain_stream(process.stderr, &mut stderr)?;
-        let status = host::child_status(process.child).map_err(runtime_error("git status"))?;
-        if status.0 != host::ChildState::Running && stdout_eof && stderr_eof {
-            return Ok(ProcessOutput {
-                code: status.1.unwrap_or(-1),
-                stdout,
-                stderr,
-            });
-        }
-        let stdout_pollable = host::notification_pollable(stdout_notification, stdout_generation)
-            .map_err(runtime_error("stdout pollable"))?;
-        let stderr_pollable = host::notification_pollable(stderr_notification, stderr_generation)
-            .map_err(runtime_error("stderr pollable"))?;
-        let child_pollable = host::notification_pollable(child_notification, child_generation)
-            .map_err(runtime_error("child pollable"))?;
-        let ready = host::worker_wait_any(
-            vec![stdout_pollable, stderr_pollable, child_pollable],
-            None,
-            host::WaitMode::Fair,
-        )
-        .await;
-        let _ = host::pollable_drop(stdout_pollable);
-        let _ = host::pollable_drop(stderr_pollable);
-        let _ = host::pollable_drop(child_pollable);
-        match ready {
-            Ok(ready) if ready.index == 0 => stdout_generation = ready.generation,
-            Ok(ready) if ready.index == 1 => stderr_generation = ready.generation,
-            Ok(ready) => child_generation = ready.generation,
-            Err(host::WaitError::Cancelled) => return Err("git refresh cancelled".to_string()),
-            Err(error) => return Err(format!("wait for git: {error:?}")),
-        }
-    }
-}
-
-fn drain_stream(stream: u64, output: &mut Vec<u8>) -> Result<bool, String> {
-    loop {
-        match host::stream_read(stream, 16 * 1024).map_err(runtime_error("read git stream"))? {
-            host::StreamReadResult::Data(bytes) => {
-                if output.len() < MAX_DIFF_BYTES {
-                    let remaining = MAX_DIFF_BYTES - output.len();
-                    output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-                }
-            }
-            host::StreamReadResult::WouldBlock => return Ok(false),
-            host::StreamReadResult::Eof => return Ok(true),
-        }
-    }
+    let output = run_process("git", &arguments, MAX_DIFF_BYTES, MAX_DIFF_BYTES).await?;
+    Ok(ProcessOutput {
+        code: output.code.unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 fn append_bounded(output: &mut Vec<u8>, bytes: &[u8]) {
@@ -1467,11 +1382,7 @@ fn process_failure(operation: &str, output: &ProcessOutput) -> String {
     }
 }
 
-fn runtime_error<T: core::fmt::Debug>(context: &'static str) -> impl FnOnce(T) -> String {
-    move |error| format!("{context}: {error:?}")
-}
-
-export!(DiffViewer with_types_in self);
+bindings::export!(DiffViewer with_types_in bindings);
 
 #[cfg(test)]
 mod tests {

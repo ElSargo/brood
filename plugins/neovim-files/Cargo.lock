@@ -24,12 +24,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "brood-graphics"
+version = "0.1.0"
+
+[[package]]
 name = "brood-neovim-files-plugin"
 version = "0.1.0"
 dependencies = [
+ "brood-plugin-sdk",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "brood-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "brood-graphics",
  "wit-bindgen",
 ]
 

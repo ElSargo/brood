@@ -1,20 +1,20 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
-
 use std::{collections::VecDeque, sync::Mutex};
 
-use brood::plugin::host;
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
-use exports::brood::plugin::actor::{
-    Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
+use brood_plugin_sdk::{
+    actor::send_local,
+    bindings,
+    exports::brood::plugin::actor::{
+        Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
+    },
+    graphics::{drop_resources, layout_ui_text, submit_packet},
+    input::BUTTON_PRIMARY as LEFT_BUTTON,
+    text::{truncate, truncate_to_width},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const LAYOUT_ACTOR_ID: &str = "session-switcher";
-const LEFT_BUTTON: u32 = 0x110;
 const HEADER_HEIGHT: f32 = 52.0;
 const FOOTER_HEIGHT: f32 = 28.0;
 const ROW_HEIGHT: f32 = 30.0;
@@ -803,10 +803,7 @@ fn reply(actor: &str, message: &impl Serialize) -> ActorCommand {
     let body = serde_json::to_vec(message).unwrap_or_else(|error| {
         format!(r#"{{"type":"picker-error","message":"serialize reply: {error}"}}"#).into_bytes()
     });
-    ActorCommand::SendLocalMessage(LocalActorMessage {
-        actor: actor.to_string(),
-        body,
-    })
+    send_local(actor, body)
 }
 
 fn picker_error(actor: &str, picker: Option<u64>, message: &str) -> ActorCommand {
@@ -1053,12 +1050,8 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
         width: 1.0,
     });
 
-    let bytes = packet.encode().map_err(|error| error.to_string())?;
-    host::graphics_submit_draw_packet(state.pane, &bytes)
-        .map_err(|error| format!("submit picker: {error:?}"))?;
-    for handle in state.text_resources.drain(..) {
-        let _drop_result = host::graphics_drop_resource(state.pane, handle);
-    }
+    submit_packet(state.pane, &packet)?;
+    drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())
 }
@@ -1075,23 +1068,8 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = host::graphics_layout_text(
-        state.pane,
-        text,
-        host::TextLayoutOptions {
-            font_intent: host::FontIntent::Ui,
-            font_weight: host::FontWeight::Normal,
-            font_style: host::FontStyle::Normal,
-            font_size: size,
-            max_width: max_width.max(1.0),
-            line_height: size + 4.0,
-            red: color.r,
-            green: color.g,
-            blue: color.b,
-            alpha: color.a,
-        },
-    )
-    .map_err(|error| format!("layout picker text: {error:?}"))?;
+    let layout = layout_ui_text(state.pane, text, size, max_width, size + 4.0, color)
+        .map_err(|error| format!("layout picker text: {error}"))?;
     resources.push(layout.handle);
     packet.push(Command::Save);
     packet.push(Command::ClipRect(Rect::new(
@@ -1107,24 +1085,6 @@ fn add_text(
     });
     packet.push(Command::Restore);
     Ok(())
-}
-
-fn truncate_to_width(text: &str, max_width: f32, font_size: f32) -> String {
-    if max_width < font_size {
-        return String::new();
-    }
-    let max_chars = (max_width / (font_size * 0.64)).floor().max(2.0) as usize;
-    truncate(text, max_chars)
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut characters = text.chars();
-    let prefix = characters.by_ref().take(max_chars).collect::<String>();
-    if characters.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
 }
 
 #[cfg(test)]
@@ -1218,4 +1178,4 @@ mod tests {
     }
 }
 
-export!(PickerActor with_types_in self);
+bindings::export!(PickerActor with_types_in bindings);
