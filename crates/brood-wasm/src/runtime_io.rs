@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, Command},
@@ -240,6 +240,9 @@ struct ChildInner {
     /// The minimum native object required for safe PTY resize. It remains
     /// generation-owned and is released with the child handle.
     pty_control: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    /// A separately owned signal handle lets the monitor block in `wait`
+    /// without polling, while teardown can still terminate the child.
+    pty_killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
 }
 
 /// Generation-owned timer handle.
@@ -875,8 +878,7 @@ impl RuntimeIoHub {
             .ok()
             .and_then(|child| child.as_ref().and_then(Weak::upgrade));
         if let Some(child) = linked_child {
-            child.alive.store(false, Ordering::Release);
-            child.shutdown.notify_one();
+            child.request_stop();
             loop {
                 let notified = child.exited.notified();
                 if child
@@ -915,8 +917,7 @@ impl RuntimeIoHub {
             .ok_or(RuntimeIoError::StaleHandle)?;
         let _cleanup = CleanupGuard::new(&self.inner);
         drop(admission);
-        child.alive.store(false, Ordering::Release);
-        child.shutdown.notify_one();
+        child.request_stop();
         loop {
             let notified = child.exited.notified();
             if child
@@ -1003,8 +1004,7 @@ impl RuntimeIoHub {
             |children| children.values().cloned().collect(),
         );
         for child in &children {
-            child.alive.store(false, Ordering::Release);
-            child.shutdown.notify_one();
+            child.request_stop();
         }
         for child in &children {
             loop {
@@ -1138,21 +1138,13 @@ impl RuntimeIoHub {
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
         state: Arc<ChildInner>,
     ) -> Result<ChildHandle, RuntimeIoError> {
+        if let Ok(mut killer) = state.pty_killer.lock() {
+            *killer = Some(child.clone_killer());
+        }
         let monitor = Arc::clone(&state);
         self.push_task(
             state.id,
             tokio::task::spawn_blocking(move || {
-                while monitor.alive.load(Ordering::Acquire) {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            monitor.complete(status.exit_code().try_into().ok());
-                            return;
-                        }
-                        Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                        Err(_error) => break,
-                    }
-                }
-                let _result = child.kill();
                 let status = child
                     .wait()
                     .ok()
@@ -1182,6 +1174,7 @@ impl RuntimeIoHub {
             exited: Notify::new(),
             status: Mutex::new(ChildStatus::Running),
             pty_control: Mutex::new(None),
+            pty_killer: Mutex::new(None),
         });
         self.inner
             .children
@@ -1648,6 +1641,16 @@ fn resolve_command_in_path(command: &str, path: &std::ffi::OsStr, cwd: &Path) ->
 }
 
 impl ChildInner {
+    fn request_stop(&self) {
+        self.alive.store(false, Ordering::Release);
+        if let Ok(mut killer) = self.pty_killer.lock()
+            && let Some(killer) = killer.as_mut()
+        {
+            let _result = killer.kill();
+        }
+        self.shutdown.notify_one();
+    }
+
     fn complete(&self, code: Option<i32>) {
         if let Ok(mut status) = self.status.lock() {
             *status = ChildStatus::Exited(code);

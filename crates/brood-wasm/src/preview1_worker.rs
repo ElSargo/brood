@@ -24,12 +24,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::mpsc as std_mpsc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    thread,
     time::Duration,
 };
 
@@ -59,6 +57,7 @@ use crate::coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError,
     NotificationId, PollError, PollableId, WaitMode,
 };
+use crate::epoch_clock::EpochTicker;
 use crate::filesystem_watch::{
     FilesystemWatchError, FilesystemWatchHub, FilesystemWatchId, NativeFilesystemWatcherService,
 };
@@ -1760,7 +1759,8 @@ impl Preview1WorkerRuntime {
         let worker_inputs = Arc::new(Mutex::new(HashMap::new()));
         let runtime_children = Arc::new(Mutex::new(HashMap::new()));
         let initialized: Result<_, Preview1WorkerError> = async {
-            let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
+            let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)
+                .map_err(|error| Preview1WorkerError::ParentTask(error.to_string()))?;
             // The dispatcher is completion-driven and receives no blocking WASI
             // filesystem or stdin surface. Only worker stores inherit the grant.
             let actor_wasi = build_wasi_context(&Preview1ActorCapabilities::default(), None)?;
@@ -1788,8 +1788,12 @@ impl Preview1WorkerRuntime {
             );
             actor_store.limiter(|data| &mut data.limits);
             configure_actor_yield(&mut actor_store, config.actor_yield_ticks);
-            let actor_instance = instantiate(&engine, &module, &memory, &mut actor_store).await?;
-            validate_actor_exports(&mut actor_store, actor_instance).await?;
+            let actor_instance = epoch_ticker
+                .drive(instantiate(&engine, &module, &memory, &mut actor_store))
+                .await?;
+            epoch_ticker
+                .drive(validate_actor_exports(&mut actor_store, actor_instance))
+                .await?;
             Ok((actor_store, actor_instance, epoch_ticker))
         }
         .await;
@@ -1808,26 +1812,26 @@ impl Preview1WorkerRuntime {
         let parent_runtime_io = runtime_io.clone();
         let parent_stats = Arc::clone(&stats);
         let parent = tokio::spawn(async move {
-            let result = parent_loop(
-                engine,
-                module,
-                memory,
-                actor_store,
-                actor_instance,
-                capabilities,
-                completion_rx,
-                notification_rx,
-                parent_coordination,
-                parent_runtime_io,
-                completion_supervisor,
-                next_worker,
-                worker_inputs,
-                parent_stats,
-                config,
-                receiver,
-                epoch_ticker,
-            )
-            .await;
+            let result = epoch_ticker
+                .drive(parent_loop(
+                    engine,
+                    module,
+                    memory,
+                    actor_store,
+                    actor_instance,
+                    capabilities,
+                    completion_rx,
+                    notification_rx,
+                    parent_coordination,
+                    parent_runtime_io,
+                    completion_supervisor,
+                    next_worker,
+                    worker_inputs,
+                    parent_stats,
+                    config,
+                    receiver,
+                ))
+                .await;
             if let Err(error) = &result
                 && let Ok(mut terminal_error) = parent_terminal_error.lock()
             {
@@ -2427,7 +2431,6 @@ async fn parent_loop(
     stats: Arc<Preview1CompatStatsInner>,
     config: Preview1WorkerConfig,
     mut commands: mpsc::Receiver<Command>,
-    _epoch_ticker: EpochTicker,
 ) -> Result<(), Preview1WorkerError> {
     let completion_io = completion_supervisor.io().clone();
     let mut actor_store = Some(actor_store);
@@ -3665,36 +3668,4 @@ fn prepare_actor_operations_for_shutdown(
         }
     }
     *actor_operations = retained;
-}
-
-struct EpochTicker {
-    stop: std_mpsc::Sender<()>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl EpochTicker {
-    fn start(engine: Engine, interval: Duration) -> Result<Self, Preview1WorkerError> {
-        let (stop, stopped) = std_mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("brood-wasm-epoch".to_string())
-            .spawn(move || {
-                while stopped.recv_timeout(interval) == Err(std_mpsc::RecvTimeoutError::Timeout) {
-                    engine.increment_epoch();
-                }
-            })
-            .map_err(|error| Preview1WorkerError::ParentTask(error.to_string()))?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for EpochTicker {
-    fn drop(&mut self) {
-        let _result = self.stop.send(());
-        if let Some(thread) = self.thread.take() {
-            let _result = thread.join();
-        }
-    }
 }

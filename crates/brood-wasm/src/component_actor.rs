@@ -37,6 +37,7 @@ use crate::coordination::{
     ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError, NotificationId,
     PollError, PollableId, WaitMode,
 };
+use crate::epoch_clock::EpochTicker;
 use crate::filesystem_watch::{
     FilesystemWatchBatchEvent, FilesystemWatchError, FilesystemWatchEventKind, FilesystemWatchHub,
     FilesystemWatchId, NativeFilesystemWatcherService,
@@ -65,9 +66,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc as std_mpsc,
     },
-    thread,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -1934,21 +1933,26 @@ impl ComponentActor {
             }
             Ok(wasmtime::UpdateDeadline::Yield(epoch_yield_ticks))
         });
-        let plugin =
-            match bindings::BroodPlugin::instantiate_async(&mut store, &component, &linker).await {
-                Ok(plugin) => plugin,
-                Err(error) => {
-                    completion_io.stop();
-                    let _ = io_task.await;
-                    return Err(anyhow::anyhow!("instantiate component actor: {error}"));
-                }
-            };
+        let plugin = match epoch_ticker
+            .drive(bindings::BroodPlugin::instantiate_async(
+                &mut store, &component, &linker,
+            ))
+            .await
+        {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                completion_io.stop();
+                let _ = io_task.await;
+                return Err(anyhow::anyhow!("instantiate component actor: {error}"));
+            }
+        };
 
         let (completion_tx, completion_rx) = mpsc::channel(config.max_outstanding_io);
         let runtime_completion_io = completion_io.clone();
         let runtime_byte_budget = kernel.byte_budget().clone();
         let runtime_observer_result_bytes = Arc::clone(&observer_result_bytes);
         let limits = config.limits;
+        let runtime_epoch_ticker = epoch_ticker.clone();
         let runtime_task = tokio::spawn(async move {
             let result = run_component_actor(
                 &mut store,
@@ -1961,6 +1965,7 @@ impl ComponentActor {
                 config,
                 runtime_byte_budget,
                 runtime_observer_result_bytes,
+                &runtime_epoch_ticker,
             )
             .await;
             runtime_completion_io.stop();
@@ -2238,38 +2243,6 @@ fn component_engine() -> Result<Engine> {
         .map_err(|error| anyhow::anyhow!("create concurrent Component Model engine: {error}"))
 }
 
-struct EpochTicker {
-    stop: std_mpsc::Sender<()>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl EpochTicker {
-    fn start(engine: Engine, interval: Duration) -> Result<Self> {
-        let (stop, stopped) = std_mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("brood-component-epoch".to_string())
-            .spawn(move || {
-                while stopped.recv_timeout(interval) == Err(std_mpsc::RecvTimeoutError::Timeout) {
-                    engine.increment_epoch();
-                }
-            })
-            .context("start component epoch ticker")?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-        })
-    }
-}
-
-impl Drop for EpochTicker {
-    fn drop(&mut self) {
-        let _ = self.stop.send(());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 fn open_worker_filesystem(config: &ComponentActorConfig) -> Result<Option<WorkerFilesystem>> {
     config
         .filesystem
@@ -2324,12 +2297,13 @@ async fn run_component_actor(
     config: ComponentActorConfig,
     byte_budget: GenerationByteBudget,
     observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
+    epoch_ticker: &EpochTicker,
 ) -> Result<()> {
     let guest = plugin.brood_plugin_actor();
     let stopped_observer = event_observer.clone();
     let blocking_io = store.data().blocking_io.clone();
-    let concurrent_result = store
-        .run_concurrent(async move |accessor| {
+    let concurrent_result = epoch_ticker
+        .drive(store.run_concurrent(async move |accessor| {
             run_component_event_loop(
                 accessor,
                 guest,
@@ -2343,7 +2317,7 @@ async fn run_component_actor(
                 &observer_result_bytes,
             )
             .await
-        })
+        }))
         .await;
     // Retire watch notifications and native subscriptions before the
     // generation can report termination or a replacement becomes reachable.

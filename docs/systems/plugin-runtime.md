@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-25
+last-reviewed: 2026-08-01
 ---
 
 # Plugin Runtime
@@ -178,6 +178,13 @@ input, cancellation, and mailbox traffic moving while background work waits.
 The host enforces peer fairness by yielding CPU-bound guest execution.
 Exhausting an epoch or fuel quantum does not fail or restart the actor;
 execution resumes on a later scheduler turn.
+
+The epoch clock is shared by all local actor engines and is armed while the host
+polls guest execution, with a short grace period to coalesce adjacent polls. A
+dormant actor or a worker waiting on input or I/O does not create periodic
+process wakeups. Once guest code is runnable, the configured wall-clock yield
+cadence applies immediately, so idle power behavior does not trade away
+cancellation or peer-scheduling latency.
 
 Use another actor when work needs an independent address, memory space, failure
 domain, or lifecycle.

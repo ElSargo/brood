@@ -2,7 +2,7 @@
 status: current
 type: system
 authority: implementation
-last-reviewed: 2026-07-24
+last-reviewed: 2026-08-01
 code-links:
   - crates/broodd/src/control.rs
   - crates/broodd/src/browser.rs
@@ -54,6 +54,9 @@ unique-name allocation, well-known-name acquisition/replacement/release, and
 disconnect cleanup cross fallible state-transition methods. Rejected
 transitions do not mutate owner tables. Successful ownership changes produce
 explicit `NameOwnerChange` values before they are encoded and broadcast.
+Realm listeners block until a client connects. Teardown makes a local wakeup
+connection after marking the realm stopped, so both connection acceptance and
+shutdown are immediate without periodic idle polling.
 
 Parsed method calls, method returns, errors, and signals become a
 `MessageClass` plus a destination. The router returns a typed unicast,

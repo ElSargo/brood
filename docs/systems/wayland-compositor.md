@@ -2,7 +2,7 @@
 status: canonical
 type: system
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-08-01
 code-links:
   - crates/broodd/src/compositor.rs
   - crates/broodd/src/runtime.rs
@@ -26,6 +26,10 @@ The compositor:
 - applies content-size requests and pane-local input authorized by the active
   presentation lease;
 - keeps applications and their latest state alive without a connected frontend.
+
+Surface and hosted-process cleanup is driven by their Wayland and child-exit
+events. The server does not poll managed-window lifecycle while idle; teardown
+repairs focus and inventory on the event that made them stale.
 
 It does not create a Winit window, render an offscreen presentation, compute
 pane placement, perform global viewport hit testing, or run a layout actor.

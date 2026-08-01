@@ -42,7 +42,6 @@ use smithay::{
         calloop::{
             EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, channel,
             generic::Generic,
-            timer::{TimeoutAction, Timer},
         },
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
@@ -91,7 +90,6 @@ use brood_wasm::{TestHarnessCompletion, TestHarnessOutcomeKind, TestHarnessRunti
 
 #[cfg(feature = "shm-fallback")]
 const MANDATORY_SHM_FORMATS: usize = 2;
-const WINDOW_LIFECYCLE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const SESSION_INIT_ACTOR_PREFIX: &str = "brood.session-init";
 const BACKEND_INIT_ACTOR_ID: &str = "brood.backend-init";
 pub const SESSION_OUTPUT_REFRESH_MILLIHZ: i32 = 60_000;
@@ -740,6 +738,7 @@ pub struct Brood {
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
+    window_lifecycle_refresh_pending: bool,
     fullscreen_toplevels: Vec<(WlSurface, Option<wl_output::WlOutput>)>,
     next_pane_id: u64,
     window_pane_ids: Vec<(WlSurface, u64)>,
@@ -823,7 +822,6 @@ impl Brood {
         let hosted_child_event_sender = Self::init_hosted_child_event_source(event_loop);
         let host_clipboard_bridge = Self::init_host_clipboard_bridge(event_loop);
         let plugin_host_event_sender = Self::init_plugin_host_event_source(event_loop);
-        Self::init_window_lifecycle_timer(event_loop);
         let loop_handle = event_loop.handle();
         let loop_signal = event_loop.get_signal();
 
@@ -866,6 +864,7 @@ impl Brood {
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
+            window_lifecycle_refresh_pending: false,
             fullscreen_toplevels: Vec::new(),
             next_pane_id: 1,
             window_pane_ids: Vec::new(),
@@ -1799,20 +1798,6 @@ impl Brood {
         socket_name
     }
 
-    fn init_window_lifecycle_timer(event_loop: &mut EventLoop<'static, Self>) {
-        event_loop
-            .handle()
-            .insert_source(
-                Timer::from_duration(WINDOW_LIFECYCLE_REFRESH_INTERVAL),
-                |_, (), state| {
-                    state.refresh_hosted_children();
-                    state.refresh_window_state_from_lifecycle_timer();
-                    TimeoutAction::ToDuration(WINDOW_LIFECYCLE_REFRESH_INTERVAL)
-                },
-            )
-            .expect("insert window lifecycle timer");
-    }
-
     fn init_hosted_child_event_source(
         event_loop: &mut EventLoop<'static, Self>,
     ) -> channel::Sender<HostedChildEvent> {
@@ -1832,6 +1817,7 @@ impl Brood {
                     }
                     HostedChildEvent::Exited(exit) => state.record_hosted_child_exit(exit),
                 }
+                state.refresh_window_state_from_lifecycle_event();
             })
             .expect("insert hosted child event source");
         sender
@@ -5663,7 +5649,18 @@ impl Brood {
         self.refresh_window_state_inner();
     }
 
-    pub fn refresh_window_state_from_lifecycle_timer(&mut self) {
+    pub fn schedule_window_lifecycle_refresh(&mut self) {
+        if self.window_lifecycle_refresh_pending {
+            return;
+        }
+        self.window_lifecycle_refresh_pending = true;
+        self.loop_handle.insert_idle(|state| {
+            state.window_lifecycle_refresh_pending = false;
+            state.refresh_window_state_from_lifecycle_event();
+        });
+    }
+
+    pub fn refresh_window_state_from_lifecycle_event(&mut self) {
         let outcome = self.refresh_window_state_inner();
         self.stats.window_lifecycle_refreshes += 1;
         if outcome.focus_cleared {

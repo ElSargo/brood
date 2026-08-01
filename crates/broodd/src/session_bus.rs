@@ -174,9 +174,6 @@ impl SessionBusHandle {
         let socket_path = dir.join("bus");
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("set DBus realm listener nonblocking")?;
 
         let guid = make_guid(realm);
         let address = format!("unix:path={}", socket_path.display());
@@ -250,6 +247,7 @@ impl RealmState {
 fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<RealmState>>, stop: &Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
+            Ok((_stream, _)) if stop.load(Ordering::Relaxed) => break,
             Ok((stream, _)) => {
                 let connection_state = Arc::clone(state);
                 match thread::Builder::new()
@@ -262,9 +260,6 @@ fn accept_loop(listener: &UnixListener, state: &Arc<Mutex<RealmState>>, stop: &A
                     Ok(handle) => drop(handle),
                     Err(error) => warn!(?error, "spawn in-process DBus client failed"),
                 }
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(err) => {
                 warn!(?err, "in-process DBus realm accept failed");
@@ -282,6 +277,7 @@ fn accept_loop_on_runtime(
 ) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
+            Ok((_stream, _)) if stop.load(Ordering::Relaxed) => break,
             Ok((stream, _)) => {
                 let connection_state = Arc::clone(state);
                 let task = runtime.spawn_blocking(move || {
@@ -290,9 +286,6 @@ fn accept_loop_on_runtime(
                     }
                 });
                 drop(task);
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(err) => {
                 warn!(?err, "in-process DBus realm accept failed");

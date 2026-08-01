@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-25
+last-reviewed: 2026-08-01
 ---
 
 # Plugin I/O And Resources
@@ -269,6 +269,11 @@ behavior wherever the compatibility contract exposes PTYs.
 PTY output participates in worker `select!`. The public surface does not expose
 arbitrary `ioctl`, termios state, descriptors, or unrestricted Unix signal
 numbers.
+
+The host waits for PTY child exit on the operating-system wait path rather than
+polling child status. A separately owned termination handle wakes that wait
+during explicit close or generation teardown, preserving immediate exit
+notification and bounded shutdown without an idle timer.
 
 ### Networking
 

@@ -192,6 +192,9 @@ impl CompositorHandler for Brood {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         self.unregister_surface(surface);
+        // Defer until Smithay has completed the destruction callback so the
+        // coalesced lifecycle refresh observes the final surface tree.
+        self.schedule_window_lifecycle_refresh();
     }
 
     fn commit(&mut self, surface: &WlSurface) {
