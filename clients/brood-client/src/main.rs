@@ -5,6 +5,7 @@
     reason = "bounded window, text, and graphics coordinates intentionally narrow to the f32 and integer formats used by WGPU"
 )]
 
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader},
@@ -611,6 +612,8 @@ fn main() -> Result<()> {
                 backend,
                 Box::new(BackendCommandLane::Remote(backend_commands)),
             );
+            backend_registry.observe(backend, Some(connection.generation));
+            connection.activate_disconnect_notifications()?;
             remote_connections.push(connection);
         }
         let mut fast_path_enabled = false;
@@ -1057,6 +1060,12 @@ enum ClientEvent {
     SshBackendFailed(String),
     ContainerBackendReady(ContainerBackendDeployment),
     ContainerBackendFailed(String),
+    RemoteBackendReady(Box<RemoteBackendReady>),
+    RemoteBackendFailed {
+        backend: BackendId,
+        description: String,
+        message: String,
+    },
     RemoteTerminalInputSent {
         backend: BackendId,
         trace_sequence: u64,
@@ -1101,6 +1110,39 @@ struct ContainerBackendDeployment {
     stdin: Option<ChildStdin>,
     ready: SshAttachReady,
     backend: Option<BackendId>,
+}
+
+#[derive(Debug)]
+enum RemoteAttachOrigin {
+    Direct { address: String },
+    Ssh(SshBackendDeployment),
+    Container(ContainerBackendDeployment),
+}
+
+#[derive(Debug)]
+struct RemoteBackendReady {
+    connection: remote::RemoteConnection,
+    origin: RemoteAttachOrigin,
+}
+
+impl RemoteAttachOrigin {
+    fn description(&self) -> String {
+        match self {
+            Self::Direct { address } => format!("remote backend {address}"),
+            Self::Ssh(deployment) => format!("SSH backend {}", deployment.target),
+            Self::Container(deployment) => {
+                format!("container backend {}", deployment.description)
+            }
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Direct { .. } => Ok(()),
+            Self::Ssh(deployment) => deployment.shutdown(),
+            Self::Container(deployment) => deployment.shutdown(),
+        }
+    }
 }
 
 impl ContainerBackendDeployment {
@@ -2366,6 +2408,22 @@ impl BackendCommandLane {
         }
     }
 
+    fn release_resource_to(&self, backend: BackendId, resource: u64) -> Result<()> {
+        match self {
+            Self::Local(_) => Ok(()),
+            Self::Remote(lane) => lane.try_release_resource(resource),
+            Self::Multi { lanes, .. } => match lanes
+                .get(&backend)
+                .context("resource owner backend is not connected")?
+                .as_ref()
+            {
+                Self::Local(_) => Ok(()),
+                Self::Remote(lane) => lane.try_release_resource(resource),
+                Self::Multi { .. } => anyhow::bail!("nested backend command registry is invalid"),
+            },
+        }
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         match self {
             Self::Local(lane) => lane.shutdown(),
@@ -2760,54 +2818,138 @@ impl Application {
             "dynamic remote connections are unavailable without remote transport configuration",
         )?;
         config.connect = connect;
-        self.connect_remote_backend_config(config)?;
-        eprintln!("connected dynamic remote backend address={address}");
+        self.queue_remote_backend_config(config, RemoteAttachOrigin::Direct { address })?;
         Ok(())
     }
 
-    fn connect_remote_backend_config(
+    fn queue_remote_backend_config(
         &mut self,
         mut config: remote::RemoteConfig,
+        origin: RemoteAttachOrigin,
     ) -> Result<BackendId> {
         let backend = self.backend_registry.allocate(None);
         config.backend = backend;
         let proxy = self
             .event_proxy
-            .as_ref()
+            .clone()
             .context("presentation event loop proxy is unavailable")?;
-        let mut connection = remote::RemoteConnection::start(config, proxy)?;
-        anyhow::ensure!(
-            connection.backend == backend,
-            "remote connection changed its assigned backend identity"
-        );
-        let (input, actor_messages, backend_commands) = connection.take_lanes()?;
-        self.input_sender
-            .as_mut()
-            .context("presentation input lane is unavailable")?
-            .insert_remote(backend, input)?;
-        self.actor_message_sender
-            .as_mut()
-            .context("presentation actor lane is unavailable")?
-            .insert_remote(backend, actor_messages)?;
-        self.backend_commands
-            .as_mut()
-            .context("presentation command lane is unavailable")?
-            .insert_remote(backend, backend_commands)?;
-        self.backend_registry
-            .observe(backend, Some(connection.generation));
-        self.remote_connections.push(connection);
-        self.notify_backend_connected(backend)?;
+        let description = origin.description();
+        thread::Builder::new()
+            .name("brood-client-remote-attach".to_string())
+            .spawn(move || {
+                let mut origin = origin;
+                match remote::RemoteConnection::start(config, &proxy) {
+                    Ok(connection) => {
+                        if let Err(winit::event_loop::EventLoopClosed(event)) =
+                            proxy.send_event(ClientEvent::RemoteBackendReady(Box::new(
+                                RemoteBackendReady { connection, origin },
+                            )))
+                            && let ClientEvent::RemoteBackendReady(ready) = event
+                        {
+                            let RemoteBackendReady {
+                                mut connection,
+                                mut origin,
+                            } = *ready;
+                            drop(connection.shutdown());
+                            drop(origin.shutdown());
+                        }
+                    }
+                    Err(error) => {
+                        let mut message = format!("{error:#}");
+                        if let Err(shutdown_error) = origin.shutdown() {
+                            let _write_result =
+                                write!(message, "; cleanup failed: {shutdown_error:#}");
+                        }
+                        drop(proxy.send_event(ClientEvent::RemoteBackendFailed {
+                            backend,
+                            description,
+                            message,
+                        }));
+                    }
+                }
+            })
+            .context("spawn dynamic remote backend attachment")?;
         Ok(backend)
     }
 
+    fn accept_remote_backend(
+        &mut self,
+        mut connection: remote::RemoteConnection,
+        mut origin: RemoteAttachOrigin,
+    ) -> Result<()> {
+        let backend = connection.backend;
+        let attach_result = (|| {
+            let (input, actor_messages, backend_commands) = connection.take_lanes()?;
+            self.input_sender
+                .as_mut()
+                .context("presentation input lane is unavailable")?
+                .insert_remote(backend, input)?;
+            self.actor_message_sender
+                .as_mut()
+                .context("presentation actor lane is unavailable")?
+                .insert_remote(backend, actor_messages)?;
+            self.backend_commands
+                .as_mut()
+                .context("presentation command lane is unavailable")?
+                .insert_remote(backend, backend_commands)?;
+            self.backend_registry
+                .observe(backend, Some(connection.generation));
+            connection.activate_disconnect_notifications()?;
+            self.notify_backend_connected(backend)
+        })();
+        if let Err(error) = attach_result {
+            if let Some(input) = self.input_sender.as_mut() {
+                let _removed = input.remove_backend(backend);
+            }
+            if let Some(actors) = self.actor_message_sender.as_mut() {
+                let _removed = actors.remove_backend(backend);
+            }
+            if let Some(commands) = self.backend_commands.as_mut() {
+                drop(commands.remove_backend(backend));
+            }
+            let _retired = self.backend_registry.retire(backend);
+            drop(connection.shutdown());
+            drop(origin.shutdown());
+            return Err(error);
+        }
+        match &mut origin {
+            RemoteAttachOrigin::Direct { address } => {
+                eprintln!("connected dynamic remote backend={backend:?} address={address}");
+            }
+            RemoteAttachOrigin::Ssh(deployment) => {
+                deployment.backend = Some(backend);
+                eprintln!(
+                    "connected in-client SSH backend={backend:?} target={}",
+                    deployment.target
+                );
+            }
+            RemoteAttachOrigin::Container(deployment) => {
+                deployment.backend = Some(backend);
+                eprintln!(
+                    "connected in-client container backend={backend:?} container={}",
+                    deployment.description
+                );
+            }
+        }
+        self.remote_connections.push(connection);
+        match origin {
+            RemoteAttachOrigin::Direct { .. } => {}
+            RemoteAttachOrigin::Ssh(deployment) => self.ssh_deployments.push(deployment),
+            RemoteAttachOrigin::Container(deployment) => {
+                self.container_deployments.push(deployment);
+            }
+        }
+        Ok(())
+    }
+
     fn connect_ssh_backend(&mut self, mut deployment: SshBackendDeployment) -> Result<()> {
-        let result = (|| -> Result<BackendId> {
+        let config = (|| -> Result<remote::RemoteConfig> {
             let offer = format!(
                 "{}={}",
                 deployment.ready.session_package,
                 deployment.ready.session_root.display()
             );
-            let config = remote::RemoteConfig {
+            Ok(remote::RemoteConfig {
                 backend: BackendId(0),
                 connect: deployment.ready.connect,
                 server_name: deployment.ready.server_name.clone(),
@@ -2817,11 +2959,12 @@ impl Application {
                 artifact_offers: brood_transport::package_offers(&offer, ArtifactRealm::Session)?,
                 allowed_client_artifacts: Vec::new(),
                 artifact_cache: brood_transport::default_artifact_cache(),
-            };
-            self.connect_remote_backend_config(config)
+            })
         })();
-        let backend = match result {
-            Ok(backend) => backend,
+        match config {
+            Ok(config) => self
+                .queue_remote_backend_config(config, RemoteAttachOrigin::Ssh(deployment))
+                .map(|_backend| ()),
             Err(error) => {
                 if let Err(shutdown_error) = deployment.shutdown() {
                     eprintln!(
@@ -2829,29 +2972,22 @@ impl Application {
                         deployment.target
                     );
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        deployment.backend = Some(backend);
-        eprintln!(
-            "connected in-client SSH backend={backend:?} target={}",
-            deployment.target
-        );
-        self.ssh_deployments.push(deployment);
-        Ok(())
+        }
     }
 
     fn connect_container_backend(
         &mut self,
         mut deployment: ContainerBackendDeployment,
     ) -> Result<()> {
-        let result = (|| -> Result<BackendId> {
+        let config = (|| -> Result<remote::RemoteConfig> {
             let offer = format!(
                 "{}={}",
                 deployment.ready.session_package,
                 deployment.ready.session_root.display()
             );
-            let config = remote::RemoteConfig {
+            Ok(remote::RemoteConfig {
                 backend: BackendId(0),
                 connect: deployment.ready.connect,
                 server_name: deployment.ready.server_name.clone(),
@@ -2861,11 +2997,12 @@ impl Application {
                 artifact_offers: brood_transport::package_offers(&offer, ArtifactRealm::Session)?,
                 allowed_client_artifacts: Vec::new(),
                 artifact_cache: brood_transport::default_artifact_cache(),
-            };
-            self.connect_remote_backend_config(config)
+            })
         })();
-        let backend = match result {
-            Ok(backend) => backend,
+        match config {
+            Ok(config) => self
+                .queue_remote_backend_config(config, RemoteAttachOrigin::Container(deployment))
+                .map(|_backend| ()),
             Err(error) => {
                 if let Err(shutdown_error) = deployment.shutdown() {
                     eprintln!(
@@ -2873,16 +3010,9 @@ impl Application {
                         deployment.description
                     );
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        deployment.backend = Some(backend);
-        eprintln!(
-            "connected in-client container backend={backend:?} container={}",
-            deployment.description
-        );
-        self.container_deployments.push(deployment);
-        Ok(())
+        }
     }
 
     fn start_ssh_backend(&self, target: String) -> Result<()> {
@@ -3293,6 +3423,11 @@ impl Application {
                     "container backend deployment event reached scene transport path"
                 ));
             }
+            ClientEvent::RemoteBackendReady(_) | ClientEvent::RemoteBackendFailed { .. } => {
+                return Err(anyhow!(
+                    "remote backend attachment event reached scene transport path"
+                ));
+            }
             ClientEvent::RemoteTerminalInputSent { .. } => {
                 return Err(anyhow!(
                     "remote terminal timing event reached scene transport path"
@@ -3320,7 +3455,13 @@ impl Application {
             );
             return Ok(());
         };
-        let focus_change = renderer.select_scene(backend, sequence, width, height, windows)?;
+        let (focus_change, released_resources) =
+            renderer.select_scene(backend, sequence, width, height, windows)?;
+        if let Some(commands) = self.backend_commands.as_ref() {
+            for resource in released_resources {
+                commands.release_resource_to(backend, resource)?;
+            }
+        }
         renderer.sync_plugin_graphics_extents()?;
         if self
             .pointer_grab
@@ -4334,6 +4475,33 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                     }
                     Err(error) => self.fail(event_loop, error),
+                }
+            }
+            ClientEvent::RemoteBackendReady(ready) => {
+                let RemoteBackendReady { connection, origin } = *ready;
+                if let Err(error) = self.accept_remote_backend(connection, origin) {
+                    eprintln!("could not attach remote backend: {error:#}");
+                    if let Err(notify_error) =
+                        self.notify_backend_connection_failed(&format!("{error:#}"))
+                    {
+                        eprintln!(
+                            "could not notify session switcher about remote backend failure: \
+                             {notify_error:#}"
+                        );
+                    }
+                }
+            }
+            ClientEvent::RemoteBackendFailed {
+                backend,
+                description,
+                message,
+            } => {
+                let _retired = self.backend_registry.retire(backend);
+                eprintln!("{description} attachment failed: {message}");
+                if let Err(error) = self.notify_backend_connection_failed(&message) {
+                    eprintln!(
+                        "could not notify session switcher about remote backend failure: {error:#}"
+                    );
                 }
             }
             ClientEvent::SshBackendReady(deployment) => {
@@ -6959,8 +7127,12 @@ impl Renderer {
         _width: u32,
         _height: u32,
         windows: Vec<SceneWindowUpdate>,
-    ) -> Result<Option<FocusChange>> {
+    ) -> Result<(Option<FocusChange>, Vec<u64>)> {
         let previous_focus = self.focused_pane;
+        let live_resources = windows
+            .iter()
+            .map(|window| window.resource_id)
+            .collect::<HashSet<_>>();
         let previous_managed_panes = self
             .current_windows
             .iter()
@@ -7054,9 +7226,27 @@ impl Renderer {
                     })
                 });
             self.window.request_redraw();
-            return Ok(focus_change);
+            let stale_resources = self
+                .frame_keys
+                .iter()
+                .filter(|((owner, resource), _key)| {
+                    *owner == backend && !live_resources.contains(resource)
+                })
+                .map(|((owner, resource), key)| ((*owner, *resource), *key))
+                .collect::<Vec<_>>();
+            for (qualified, key) in &stale_resources {
+                self.frame_keys.remove(qualified);
+                self.imported_frames.remove(key);
+            }
+            return Ok((
+                focus_change,
+                stale_resources
+                    .into_iter()
+                    .map(|((_owner, resource), _key)| resource)
+                    .collect(),
+            ));
         }
-        Ok(None)
+        Ok((None, Vec::new()))
     }
 
     fn resource_key(&mut self, backend: BackendId, resource: u64) -> u64 {

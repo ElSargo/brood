@@ -5,7 +5,7 @@ security-boundary: process-and-network
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-28
+last-reviewed: 2026-08-01
 code-links:
   - crates/brood-protocol/src/lib.rs
   - crates/brood-ipc/src/local_protocol.rs
@@ -112,15 +112,30 @@ before ordinary traffic begins. Transport keepalives preserve an otherwise
 idle static desktop. Stream readers remain owned by dedicated receive tasks so
 selecting between lanes cannot cancel a partial framed read.
 
+Critical input and latest-state input have separate producers, queues, sender
+tasks, network streams, receiver tasks, and local handoff state. Latest-state
+publication replaces the previous unsent value; it can never occupy a FIFO in
+front of a key or lifecycle transition. The relay's local IPC writer chooses
+critical work first whenever both classes are ready. Relay egress queues are
+bounded, and every transport task is supervised so an unexpected sender,
+receiver, or local bridge exit terminates the connection instead of silently
+removing one semantic lane.
+
 Network peers exchange semantic messages with length-delimited bounded
 encoding. The baseline frame-resource packet is a losslessly compressed full
 window image with explicit pane, resource, sequence, extent, stride, pixel
 format, and color space. It establishes correctness and portability. Future
 damage, video, or GPU-aware codecs may replace that payload after negotiation;
 they must preserve scene/resource lifecycle and must not introduce a second
-presentation model. The relay retains at most one complete not-yet-sent scene,
-so a slow link converges on current pixels instead of accumulating an
-ever-older visual queue. It may finish a scene already being written, but
+presentation model. Each lane reuses its bounded wire buffers between messages,
+and frame codec work runs outside the network I/O scheduler. The relay retains
+at most one complete not-yet-sent scene, so a slow link converges on current
+pixels instead of accumulating an ever-older visual queue. The frame forwarder
+drains each available IPC burst before encoding and compresses only its newest
+complete scene. Its bounded
+network-to-backend handoff applies transport backpressure and backs off when the
+local shared-memory lane is full instead of growing an unbounded queue or
+spinning a runtime worker. It may finish a scene already being written, but
 superseded queued scenes do not consume unbounded memory or tail latency.
 
 A relay may adapt a local session-server connection into the network carrier.
@@ -153,6 +168,16 @@ acknowledgement before closing the connection. Completion revokes all
 connection-owned resources. Producers retain the latest window content
 independently so a replacement client can build a fresh snapshot without
 preserving old transport handles.
+
+Scene/frame joins have explicit packet and byte budgets. Late frames older than
+the last published sequence are discarded, and the newest complete scene
+supersedes older incomplete work. Once a selected scene stops referring to a
+network frame resource, the client releases it and both renderer and relay drop
+their generation-scoped mappings. The server sends a disconnect acknowledgement
+only after the disconnect record has been published and notified on the local
+IPC lane. Setup, graceful shutdown, cancellation, and worker joins all have
+finite deadlines; dynamic remote attachment performs connection setup outside
+the presentation event loop.
 
 ## Selection And Diagnostics
 

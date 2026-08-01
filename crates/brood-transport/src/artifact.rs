@@ -180,7 +180,98 @@ pub enum ArtifactExchangeEvent {
 #[derive(Default)]
 pub struct ArtifactExchangeUpdate {
     pub outbound: Vec<ArtifactMessage>,
+    pub transfers: Vec<ArtifactTransfer>,
     pub events: Vec<ArtifactExchangeEvent>,
+}
+
+/// One verified local file that should be streamed to the peer in bounded chunks.
+pub struct ArtifactTransfer {
+    digest: ArtifactDigest,
+    path: PathBuf,
+    bytes: u64,
+}
+
+impl ArtifactTransfer {
+    /// Open the file and produce one owned wire message at a time.
+    pub fn messages(self) -> Result<ArtifactTransferMessages> {
+        let file = fs::File::open(&self.path)
+            .with_context(|| format!("open offered artifact {}", self.path.display()))?;
+        Ok(ArtifactTransferMessages {
+            file,
+            digest: self.digest,
+            expected_bytes: self.bytes,
+            offset: 0,
+            hasher: Sha256::new(),
+            finished: false,
+        })
+    }
+}
+
+/// A bounded, lazy artifact-message iterator.
+pub struct ArtifactTransferMessages {
+    file: fs::File,
+    digest: ArtifactDigest,
+    expected_bytes: u64,
+    offset: u64,
+    hasher: Sha256,
+    finished: bool,
+}
+
+impl Iterator for ArtifactTransferMessages {
+    type Item = Result<ArtifactMessage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if self.offset == self.expected_bytes {
+            self.finished = true;
+            let mut extra = [0_u8; 1];
+            let actual_digest: ArtifactDigest = self.hasher.clone().finalize().into();
+            return Some(match self.file.read(&mut extra) {
+                Ok(0) if actual_digest == self.digest => Ok(ArtifactMessage::Complete {
+                    digest: self.digest,
+                }),
+                Ok(0) => Ok(ArtifactMessage::Rejected {
+                    digest: self.digest,
+                    reason: "offered artifact changed while it was streamed".to_string(),
+                }),
+                Ok(_) => Ok(ArtifactMessage::Rejected {
+                    digest: self.digest,
+                    reason: "offered artifact grew while it was streamed".to_string(),
+                }),
+                Err(error) => Err(error).context("check offered artifact end"),
+            });
+        }
+        let remaining = self.expected_bytes.saturating_sub(self.offset);
+        let length = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(MAX_ARTIFACT_CHUNK_BYTES);
+        let mut bytes = vec![0; length];
+        let read = match self.file.read(&mut bytes) {
+            Ok(0) => {
+                self.finished = true;
+                return Some(Ok(ArtifactMessage::Rejected {
+                    digest: self.digest,
+                    reason: "offered artifact was truncated while streaming".to_string(),
+                }));
+            }
+            Ok(read) => read,
+            Err(error) => {
+                self.finished = true;
+                return Some(Err(error).context("read offered artifact chunk"));
+            }
+        };
+        bytes.truncate(read);
+        let offset = self.offset;
+        self.offset = self.offset.saturating_add(read as u64);
+        self.hasher.update(&bytes);
+        Some(Ok(ArtifactMessage::Chunk {
+            digest: self.digest,
+            offset,
+            bytes,
+        }))
+    }
 }
 
 /// Per-connection artifact transfer state.
@@ -437,6 +528,7 @@ impl ArtifactExchange {
                 outbound: vec![ArtifactMessage::Accepted {
                     digest: manifest.digest,
                 }],
+                transfers: Vec::new(),
                 events: Vec::new(),
             });
         }
@@ -447,6 +539,7 @@ impl ArtifactExchange {
             self.ready.insert(manifest.digest);
             return Ok(ArtifactExchangeUpdate {
                 outbound: Vec::new(),
+                transfers: Vec::new(),
                 events: vec![ArtifactExchangeEvent::Installed(InstalledArtifact {
                     manifest,
                     path,
@@ -482,6 +575,7 @@ impl ArtifactExchange {
         );
         Ok(ArtifactExchangeUpdate {
             outbound: vec![ArtifactMessage::Request { digest }],
+            transfers: Vec::new(),
             events: Vec::new(),
         })
     }
@@ -493,42 +587,30 @@ impl ArtifactExchange {
                 "requested artifact is not offered".to_string(),
             ));
         };
-        if !self.served.insert(digest) {
+        if self.served.contains(&digest) {
             return Ok(rejection(
                 digest,
                 "artifact was already served on this connection".to_string(),
             ));
         }
-        let bytes = fs::read(&offer.path)
-            .with_context(|| format!("read offered artifact {}", offer.path.display()))?;
-        if u64::try_from(bytes.len()).ok() != Some(offer.manifest.bytes)
-            || digest_bytes(&bytes) != offer.manifest.digest
+        if fs::metadata(&offer.path)
+            .with_context(|| format!("inspect offered artifact {}", offer.path.display()))?
+            .len()
+            != offer.manifest.bytes
         {
             return Ok(rejection(
                 digest,
                 "offered artifact changed after its manifest was created".to_string(),
             ));
         }
-        let mut outbound = Vec::with_capacity(
-            bytes
-                .len()
-                .div_ceil(MAX_ARTIFACT_CHUNK_BYTES)
-                .saturating_add(1),
-        );
-        for (index, chunk) in bytes.chunks(MAX_ARTIFACT_CHUNK_BYTES).enumerate() {
-            let offset = index
-                .checked_mul(MAX_ARTIFACT_CHUNK_BYTES)
-                .and_then(|offset| u64::try_from(offset).ok())
-                .context("artifact chunk offset overflow")?;
-            outbound.push(ArtifactMessage::Chunk {
-                digest,
-                offset,
-                bytes: chunk.to_vec(),
-            });
-        }
-        outbound.push(ArtifactMessage::Complete { digest });
+        self.served.insert(digest);
         Ok(ArtifactExchangeUpdate {
-            outbound,
+            outbound: Vec::new(),
+            transfers: vec![ArtifactTransfer {
+                digest,
+                path: offer.path.clone(),
+                bytes: offer.manifest.bytes,
+            }],
             events: Vec::new(),
         })
     }
@@ -579,6 +661,7 @@ impl ArtifactExchange {
         self.ready.insert(digest);
         Ok(ArtifactExchangeUpdate {
             outbound: Vec::new(),
+            transfers: Vec::new(),
             events: vec![ArtifactExchangeEvent::Installed(InstalledArtifact {
                 manifest: incoming.manifest,
                 path,
@@ -595,13 +678,22 @@ impl ArtifactExchange {
             .collect();
         ArtifactExchangeUpdate {
             outbound: Vec::new(),
+            transfers: Vec::new(),
             events,
         }
     }
 
-    fn handle_rejected(&self, digest: ArtifactDigest, reason: String) -> ArtifactExchangeUpdate {
+    fn handle_rejected(
+        &mut self,
+        digest: ArtifactDigest,
+        reason: String,
+    ) -> ArtifactExchangeUpdate {
+        if let Some(incoming) = self.incoming.remove(&digest) {
+            self.incoming_bytes = self.incoming_bytes.saturating_sub(incoming.manifest.bytes);
+        }
         ArtifactExchangeUpdate {
             outbound: Vec::new(),
+            transfers: Vec::new(),
             events: vec![ArtifactExchangeEvent::PeerRejected {
                 manifest: self.offers.get(&digest).map(|offer| offer.manifest.clone()),
                 digest,
@@ -743,6 +835,7 @@ fn digest_bytes(bytes: &[u8]) -> ArtifactDigest {
 fn rejection(digest: ArtifactDigest, reason: String) -> ArtifactExchangeUpdate {
     ArtifactExchangeUpdate {
         outbound: vec![ArtifactMessage::Rejected { digest, reason }],
+        transfers: Vec::new(),
         events: Vec::new(),
     }
 }
@@ -821,6 +914,14 @@ mod tests {
                     .handle(message)
                     .unwrap_or_else(|error| unreachable!("{error}"));
                 to_receiver.extend(update.outbound);
+                for transfer in update.transfers {
+                    to_receiver.extend(
+                        transfer
+                            .messages()
+                            .unwrap_or_else(|error| unreachable!("{error}"))
+                            .map(|message| message.unwrap_or_else(|error| unreachable!("{error}"))),
+                    );
+                }
             }
         }
         let installed = installed.unwrap_or_else(|| unreachable!("artifact was not installed"));
@@ -879,6 +980,70 @@ mod tests {
                 .as_slice(),
             [ArtifactMessage::Rejected { .. }]
         ));
+        drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn streaming_detects_mutation_and_releases_receive_budget() {
+        let root = test_root("stream-mutation");
+        fs::create_dir_all(&root).unwrap_or_else(|error| unreachable!("{error}"));
+        let source_path = root.join("source.wasm");
+        fs::write(&source_path, vec![0x41; 96 * 1024])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let offer =
+            ArtifactOffer::from_path("workspace", ArtifactRealm::Client, &source_path, Vec::new())
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        let manifest = offer.manifest.clone();
+        let mut sender = ArtifactExchange::new(
+            ArtifactRealm::Session,
+            Vec::<String>::new(),
+            root.join("sender-cache"),
+            vec![offer],
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let mut receiver = ArtifactExchange::new(
+            ArtifactRealm::Client,
+            ["workspace".to_string()],
+            root.join("receiver-cache"),
+            Vec::new(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let request = receiver
+            .handle(ArtifactMessage::Offer(manifest))
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .outbound
+            .pop()
+            .unwrap_or_else(|| unreachable!("receiver did not request the artifact"));
+        let transfer = sender
+            .handle(request)
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .transfers
+            .pop()
+            .unwrap_or_else(|| unreachable!("sender did not start a transfer"));
+        fs::write(&source_path, vec![0x42; 96 * 1024])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let messages = transfer
+            .messages()
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(matches!(
+            messages.last(),
+            Some(ArtifactMessage::Rejected { .. })
+        ));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, ArtifactMessage::Complete { .. }))
+        );
+        for message in messages {
+            receiver
+                .handle(message)
+                .unwrap_or_else(|error| unreachable!("{error}"));
+        }
+        assert!(receiver.incoming.is_empty());
+        assert_eq!(receiver.incoming_bytes, 0);
         drop(fs::remove_dir_all(root));
     }
 

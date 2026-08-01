@@ -9,7 +9,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -36,7 +36,14 @@ use brood_wasm::{
 
 const INPUT_CAPACITY: usize = 512;
 const RELIABLE_CAPACITY: usize = 128;
+const MAX_DEFERRED_CRITICAL_INPUTS: usize = 512;
+const MAX_PENDING_BACKEND_REQUESTS: usize = 128;
 const MAX_PENDING_SCENES: usize = 4;
+const MAX_PENDING_FRAME_PACKETS: usize = 256;
+const MAX_PENDING_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct RemoteConfig {
@@ -59,16 +66,32 @@ pub struct RemoteConnection {
     actor_messages: Option<RemoteActorMessageLane>,
     backend_commands: Option<RemoteBackendCommandLane>,
     shutdown_sender: tokio_mpsc::Sender<ClientMessage>,
+    cancel_sender: tokio::sync::watch::Sender<bool>,
+    event_gate_sender: mpsc::SyncSender<bool>,
     worker: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl std::fmt::Debug for RemoteConnection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteConnection")
+            .field("backend", &self.backend)
+            .field("profile", &self.profile)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteConnection {
     pub fn start(config: RemoteConfig, proxy: &EventLoopProxy<ClientEvent>) -> Result<Self> {
         let configured_backend = config.backend;
-        let (input_sender, input_receiver) = tokio_mpsc::channel(INPUT_CAPACITY);
+        let (critical_input_sender, critical_input_receiver) = tokio_mpsc::channel(INPUT_CAPACITY);
+        let (latest_input_sender, latest_input_receiver) = tokio::sync::watch::channel(None);
         let (actor_sender, actor_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
         let (reliable_sender, reliable_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (event_gate_sender, event_gate_receiver) = mpsc::sync_channel(1);
         let worker_proxy = proxy.clone();
         let established = Arc::new(AtomicBool::new(false));
         let worker_established = Arc::clone(&established);
@@ -84,14 +107,17 @@ impl RemoteConnection {
                 let result = runtime.block_on(run_connection(
                     config,
                     worker_proxy.clone(),
-                    input_receiver,
+                    critical_input_receiver,
+                    latest_input_receiver,
                     actor_receiver,
                     reliable_receiver,
+                    cancel_receiver,
                     ready_sender,
                     worker_established,
                 ));
                 if let Err(error) = &result
                     && established.load(Ordering::Acquire)
+                    && event_gate_receiver.recv_timeout(CONNECTION_SETUP_TIMEOUT) == Ok(true)
                 {
                     let _send_result = worker_proxy.send_event(ClientEvent::BackendDisconnected {
                         backend: configured_backend,
@@ -101,17 +127,37 @@ impl RemoteConnection {
                 result
             })
             .context("spawn remote presentation transport")?;
-        let ready = ready_receiver
-            .recv()
-            .context("remote presentation worker stopped before handshake")??;
+        let ready = match ready_receiver.recv_timeout(CONNECTION_SETUP_TIMEOUT) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => {
+                let _send_result = cancel_sender.send(true);
+                drop(worker);
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _send_result = cancel_sender.send(true);
+                drop(worker);
+                bail!("remote presentation handshake timed out");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _send_result = cancel_sender.send(true);
+                drop(worker);
+                bail!("remote presentation worker stopped before handshake");
+            }
+        };
         Ok(Self {
             backend: ready.backend,
             profile: ready.profile,
             generation: ready.generation,
-            input: Some(RemoteInputLane::new(input_sender.clone())),
+            input: Some(RemoteInputLane::new(
+                critical_input_sender.clone(),
+                latest_input_sender,
+            )),
             actor_messages: Some(RemoteActorMessageLane::new(actor_sender)),
             backend_commands: Some(RemoteBackendCommandLane::new(reliable_sender)),
-            shutdown_sender: input_sender,
+            shutdown_sender: critical_input_sender,
+            cancel_sender,
+            event_gate_sender,
             worker: Some(worker),
         })
     }
@@ -137,27 +183,52 @@ impl RemoteConnection {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        if let Err(error) = self
+        let _gate_result = self.event_gate_sender.try_send(false);
+        match self
             .shutdown_sender
-            .blocking_send(ClientMessage::Lifecycle(ClientLifecycle::Disconnect))
+            .try_send(ClientMessage::Lifecycle(ClientLifecycle::Disconnect))
         {
-            eprintln!("remote presentation disconnect channel already closed: {error}");
+            Ok(()) | Err(tokio_mpsc::error::TrySendError::Closed(_)) => {}
+            Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                let _send_result = self.cancel_sender.send(true);
+            }
         }
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_panic| anyhow!("remote presentation worker panicked"))??;
-        }
-        Ok(())
+        self.join_worker(CONNECTION_SHUTDOWN_TIMEOUT)
     }
 
     pub fn reap(&mut self) -> Result<()> {
-        if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_panic| anyhow!("remote presentation worker panicked"))??;
+        let _gate_result = self.event_gate_sender.try_send(false);
+        self.join_worker(CONNECTION_CANCEL_TIMEOUT)
+    }
+
+    pub fn activate_disconnect_notifications(&self) -> Result<()> {
+        self.event_gate_sender
+            .try_send(true)
+            .context("remote presentation worker stopped before attachment")
+    }
+
+    fn join_worker(&mut self, graceful_timeout: Duration) -> Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        let graceful_deadline = Instant::now() + graceful_timeout;
+        while !worker.is_finished() && Instant::now() < graceful_deadline {
+            thread::sleep(Duration::from_millis(5));
         }
-        Ok(())
+        if !worker.is_finished() {
+            let _send_result = self.cancel_sender.send(true);
+            let cancel_deadline = Instant::now() + CONNECTION_CANCEL_TIMEOUT;
+            while !worker.is_finished() && Instant::now() < cancel_deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        ensure!(
+            worker.is_finished(),
+            "remote presentation worker did not stop before its deadline"
+        );
+        worker
+            .join()
+            .map_err(|_panic| anyhow!("remote presentation worker panicked"))?
     }
 }
 
@@ -167,16 +238,29 @@ struct RemoteReady {
     generation: u64,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the connection worker owns one receiver for each independent semantic lane"
+)]
 async fn run_connection(
     config: RemoteConfig,
     proxy: EventLoopProxy<ClientEvent>,
-    input_receiver: tokio_mpsc::Receiver<ClientMessage>,
+    critical_input_receiver: tokio_mpsc::Receiver<ClientMessage>,
+    latest_input_receiver: tokio::sync::watch::Receiver<Option<ClientMessage>>,
     actor_receiver: tokio_mpsc::Receiver<ActorCommand>,
     reliable_receiver: tokio_mpsc::Receiver<ReliableCommand>,
+    mut cancel_receiver: tokio::sync::watch::Receiver<bool>,
     ready_sender: mpsc::SyncSender<Result<RemoteReady>>,
     established: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = connect_and_split(&config).await;
+    let result = tokio::select! {
+        result = tokio::time::timeout(CONNECTION_SETUP_TIMEOUT, connect_and_split(&config)) => {
+            result.context("remote presentation handshake timed out")?
+        }
+        () = wait_for_cancellation(&mut cancel_receiver) => {
+            bail!("remote presentation connection was cancelled during setup");
+        }
+    };
     let (endpoint, mut network) = match result {
         Ok(connection) => connection,
         Err(error) => {
@@ -208,11 +292,14 @@ async fn run_connection(
     established.store(true, Ordering::Release);
 
     let disconnect_acknowledged = Arc::new(tokio::sync::Notify::new());
-    let mut input_task = tokio::spawn(send_input_messages(
+    let mut critical_input_task = tokio::spawn(send_critical_input_messages(
         critical_send,
-        latest_send,
-        input_receiver,
+        critical_input_receiver,
         Arc::clone(&disconnect_acknowledged),
+    ));
+    let mut latest_input_task = tokio::spawn(send_latest_input_messages(
+        latest_send,
+        latest_input_receiver,
     ));
     let mut critical_task = tokio::spawn(receive_critical_messages(
         critical_receive,
@@ -269,7 +356,11 @@ async fn run_connection(
 
     let result = tokio::select! {
         biased;
-        result = &mut input_task => join_transport_task("input", result),
+        () = wait_for_cancellation(&mut cancel_receiver) => {
+            Err(anyhow!("remote presentation connection was cancelled"))
+        }
+        result = &mut critical_input_task => join_transport_task("critical input", result),
+        result = &mut latest_input_task => join_transport_task("latest-state input", result),
         result = &mut critical_task => join_transport_task("critical", result),
         result = &mut actor_send_task => join_transport_task("actor send", result),
         result = &mut actor_receive_task => join_transport_task("actor receive", result),
@@ -278,7 +369,8 @@ async fn run_connection(
         result = &mut frame_task => join_transport_task("frame", result),
         result = &mut artifact_task => join_transport_task("artifact", result),
     };
-    input_task.abort();
+    critical_input_task.abort();
+    latest_input_task.abort();
     critical_task.abort();
     actor_send_task.abort();
     actor_receive_task.abort();
@@ -300,6 +392,14 @@ async fn run_connection(
     drop(network);
     drop(endpoint);
     result
+}
+
+async fn wait_for_cancellation(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow_and_update() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn connect_and_split(
@@ -346,21 +446,19 @@ fn join_transport_task(
         .with_context(|| format!("{name} presentation task stopped"))
 }
 
-async fn send_input_messages(
+async fn send_critical_input_messages(
     mut critical: NetworkSendLane,
-    mut latest: NetworkSendLane,
     mut receiver: tokio_mpsc::Receiver<ClientMessage>,
     disconnect_acknowledged: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     while let Some(message) = receiver.recv().await {
         let disconnect = message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
         match &message {
-            ClientMessage::Input(input) if input.lane() == Lane::LatestState => {
-                latest.send_client_message(&message).await?;
-            }
-            ClientMessage::Input(_) | ClientMessage::Lifecycle(_) => {
+            ClientMessage::Input(input) if input.lane() == Lane::Critical => {
                 critical.send_client_message(&message).await?;
             }
+            ClientMessage::Lifecycle(_) => critical.send_client_message(&message).await?,
+            ClientMessage::Input(_) => bail!("latest-state input reached the critical sender"),
             ClientMessage::Actor(_)
             | ClientMessage::BackendRequest(_)
             | ClientMessage::Artifact(_)
@@ -373,6 +471,24 @@ async fn send_input_messages(
             disconnect_acknowledged.notified().await;
             return Ok(());
         }
+    }
+    Ok(())
+}
+
+async fn send_latest_input_messages(
+    mut latest: NetworkSendLane,
+    mut receiver: tokio::sync::watch::Receiver<Option<ClientMessage>>,
+) -> Result<()> {
+    while receiver.changed().await.is_ok() {
+        let message = receiver.borrow_and_update().clone();
+        let Some(message) = message else {
+            continue;
+        };
+        ensure!(
+            matches!(&message, ClientMessage::Input(input) if input.lane() == Lane::LatestState),
+            "non-latest input reached the latest-state sender"
+        );
+        latest.send_client_message(&message).await?;
     }
     Ok(())
 }
@@ -415,6 +531,7 @@ enum ReliableCommand {
         request: BackendRequest,
         context: PendingBackend,
     },
+    ReleaseResource(u64),
 }
 
 enum PendingBackend {
@@ -467,7 +584,9 @@ async fn send_actor_messages(
                         usize::try_from(session % 4).unwrap_or_default()
                     }
                 };
-                senders[lane]
+                senders
+                    .get(lane)
+                    .context("interactive actor lane index is invalid")?
                     .try_send(command)
                     .map_err(|_error| anyhow!("interactive actor sender is full or stopped"))?;
             }
@@ -558,7 +677,7 @@ async fn exchange_reliable_messages(
     let mut pending = HashMap::<u64, PendingBackend>::new();
     let result = loop {
         tokio::select! {
-            command = outbound.recv() => {
+            command = outbound.recv(), if pending.len() < MAX_PENDING_BACKEND_REQUESTS => {
                 let Some(command) = command else {
                     break Ok(());
                 };
@@ -575,6 +694,10 @@ async fn exchange_reliable_messages(
                             pending.remove(&request.id);
                             return Err(error);
                         }
+                    }
+                    ReliableCommand::ReleaseResource(resource) => {
+                        send.send_client_message(&ClientMessage::ReleaseResource { resource })
+                            .await?;
                     }
                 }
             }
@@ -722,14 +845,22 @@ async fn exchange_artifacts(
     proxy: EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let mut outbound = VecDeque::from(exchange.initial_messages());
+    let mut transfers = VecDeque::<brood_transport::ArtifactTransfer>::new();
     loop {
         while let Some(message) = outbound.pop_front() {
             send.send_client_message(&ClientMessage::Artifact(message))
                 .await?;
         }
+        while let Some(transfer) = transfers.pop_front() {
+            for message in transfer.messages()? {
+                send.send_client_message(&ClientMessage::Artifact(message?))
+                    .await?;
+            }
+        }
         let message = receive_server_artifact(&mut receive).await?;
         let update = exchange.handle(message)?;
         outbound.extend(update.outbound);
+        transfers.extend(update.transfers);
         for event in update.events {
             match event {
                 ArtifactExchangeEvent::Installed(artifact) => {
@@ -791,12 +922,17 @@ async fn receive_scenes(
     let frame_task = tokio::spawn(receive_frame_messages(frames, sender));
     let mut pending_scenes = BTreeMap::<u64, FrameScene>::new();
     let mut pending_frames = HashMap::<(u64, u64), NetworkFramePacket>::new();
+    let mut last_published = None;
     let result = loop {
         let Some(event) = events.recv().await else {
             break Err(anyhow!("remote scene receive tasks stopped"));
         };
         match event? {
             RemoteSceneEvent::Scene(scene) => {
+                ensure!(
+                    scene.backend == backend,
+                    "remote scene backend identity does not match its connection"
+                );
                 pending_scenes.insert(scene.sequence, scene);
                 while pending_scenes.len() > MAX_PENDING_SCENES {
                     let Some(sequence) = pending_scenes.keys().next().copied() else {
@@ -807,10 +943,20 @@ async fn receive_scenes(
                 }
             }
             RemoteSceneEvent::Frame(frame) => {
-                pending_frames.insert((frame.sequence, frame.resource), frame);
+                if last_published.is_none_or(|sequence| frame.sequence > sequence) {
+                    pending_frames.insert((frame.sequence, frame.resource), frame);
+                }
             }
         }
-        publish_ready_scenes(&mut pending_scenes, &mut pending_frames, &proxy, backend)?;
+        prune_pending_frames(&mut pending_scenes, &mut pending_frames);
+        publish_ready_scenes(
+            &mut pending_scenes,
+            &mut pending_frames,
+            &proxy,
+            backend,
+            &mut last_published,
+        )
+        .await?;
     };
     scene_task.abort();
     frame_task.abort();
@@ -857,23 +1003,25 @@ async fn receive_frame_messages(
     }
 }
 
-fn publish_ready_scenes(
+async fn publish_ready_scenes(
     scenes: &mut BTreeMap<u64, FrameScene>,
     frames: &mut HashMap<(u64, u64), NetworkFramePacket>,
     proxy: &EventLoopProxy<ClientEvent>,
     backend: BackendId,
+    last_published: &mut Option<u64>,
 ) -> Result<()> {
     loop {
-        let Some((&sequence, scene)) = scenes.first_key_value() else {
+        let Some(sequence) = scenes.iter().rev().find_map(|(sequence, scene)| {
+            scene
+                .windows
+                .iter()
+                .all(|window| frames.contains_key(&(*sequence, window.resource.id())))
+                .then_some(*sequence)
+        }) else {
             return Ok(());
         };
-        if !scene
-            .windows
-            .iter()
-            .all(|window| frames.contains_key(&(sequence, window.resource.id())))
-        {
-            return Ok(());
-        }
+        scenes.retain(|pending_sequence, _| *pending_sequence >= sequence);
+        frames.retain(|(frame_sequence, _), _| *frame_sequence >= sequence);
         let scene = scenes
             .remove(&sequence)
             .context("ready remote scene disappeared")?;
@@ -881,8 +1029,8 @@ fn publish_ready_scenes(
             scene.backend == backend,
             "remote scene backend identity does not match its connection"
         );
-        let mut windows = Vec::with_capacity(scene.windows.len());
-        for window in scene.windows {
+        let mut packets = Vec::with_capacity(scene.windows.len());
+        for window in &scene.windows {
             let resource = window.resource.id();
             let packet = frames
                 .remove(&(sequence, resource))
@@ -893,35 +1041,86 @@ fn publish_ready_scenes(
                     && packet.pane == window.pane,
                 "remote frame identity does not match its scene"
             );
-            let pixels = packet.pixels()?;
-            windows.push(SceneWindowUpdate {
-                backend,
-                window_id: window.pane,
-                resource_id: resource,
-                rect: window.source,
-                active: window.active,
-                resource: Some(FrameResource::Network(NetworkFrame {
-                    width: packet.width,
-                    height: packet.height,
-                    stride: packet.stride,
-                    pixel_format: packet.pixel_format,
-                    color_space: packet.color_space,
-                    compressed_bytes: packet.compressed_pixels.len(),
-                    pixels,
-                })),
-            });
+            packets.push(packet);
         }
+        let windows = tokio::task::spawn_blocking(move || decode_scene_windows(scene, packets))
+            .await
+            .context("join remote frame decoder")??;
         proxy
             .send_event(ClientEvent::SceneFrame {
                 backend,
                 sequence,
-                width: scene.extent[0],
-                height: scene.extent[1],
-                windows,
+                width: windows.extent[0],
+                height: windows.extent[1],
+                windows: windows.windows,
             })
             .map_err(|_error| anyhow!("presentation event loop stopped"))?;
         frames.retain(|(frame_sequence, _), _| *frame_sequence > sequence);
+        *last_published = Some(sequence);
     }
+}
+
+fn prune_pending_frames(
+    scenes: &mut BTreeMap<u64, FrameScene>,
+    frames: &mut HashMap<(u64, u64), NetworkFramePacket>,
+) {
+    while frames.len() > MAX_PENDING_FRAME_PACKETS
+        || frames.values().fold(0_usize, |total, frame| {
+            total.saturating_add(frame.compressed_pixels.len())
+        }) > MAX_PENDING_FRAME_BYTES
+    {
+        let Some(sequence) = frames.keys().map(|(sequence, _)| *sequence).min() else {
+            break;
+        };
+        frames.retain(|(frame_sequence, _), _| *frame_sequence != sequence);
+        scenes.remove(&sequence);
+    }
+}
+
+struct DecodedSceneWindows {
+    extent: [u32; 2],
+    windows: Vec<SceneWindowUpdate>,
+}
+
+fn decode_scene_windows(
+    scene: FrameScene,
+    packets: Vec<NetworkFramePacket>,
+) -> Result<DecodedSceneWindows> {
+    ensure!(
+        scene.windows.len() == packets.len(),
+        "remote scene packet count changed before decode"
+    );
+    let mut windows = Vec::with_capacity(scene.windows.len());
+    for (window, packet) in scene.windows.into_iter().zip(packets) {
+        let resource = window.resource.id();
+        ensure!(
+            packet.sequence == scene.sequence
+                && packet.resource == resource
+                && packet.pane == window.pane,
+            "remote frame identity does not match its scene"
+        );
+        let pixels = packet.pixels()?;
+        windows.push(SceneWindowUpdate {
+            backend: scene.backend,
+            window_id: window.pane,
+            resource_id: resource,
+            rect: window.source,
+            active: window.active,
+            resource: Some(FrameResource::Network(NetworkFrame {
+                width: packet.width,
+                height: packet.height,
+                stride: packet.stride,
+                pixel_format: packet.pixel_format,
+                color_space: packet.color_space,
+                compressed_bytes: packet.compressed_pixels.len(),
+                pixels,
+            })),
+        });
+    }
+    Ok(DecodedSceneWindows {
+        extent: scene.extent,
+        windows,
+    })
 }
 
 #[derive(Debug)]
@@ -936,20 +1135,23 @@ pub struct NetworkFrame {
 }
 
 pub struct RemoteInputLane {
-    sender: tokio_mpsc::Sender<ClientMessage>,
+    critical: tokio_mpsc::Sender<ClientMessage>,
+    latest: tokio::sync::watch::Sender<Option<ClientMessage>>,
     deferred: VecDeque<ClientMessage>,
     deferred_high_water: usize,
-    coalesced_motion: u64,
     pane_routes: BTreeMap<u64, u64>,
 }
 
 impl RemoteInputLane {
-    const fn new(sender: tokio_mpsc::Sender<ClientMessage>) -> Self {
+    const fn new(
+        critical: tokio_mpsc::Sender<ClientMessage>,
+        latest: tokio::sync::watch::Sender<Option<ClientMessage>>,
+    ) -> Self {
         Self {
-            sender,
+            critical,
+            latest,
             deferred: VecDeque::new(),
             deferred_high_water: 0,
-            coalesced_motion: 0,
             pane_routes: BTreeMap::new(),
         }
     }
@@ -963,17 +1165,16 @@ impl RemoteInputLane {
     }
 
     pub fn send(&mut self, message: ClientMessage) -> bool {
+        if is_pointer_motion(&message) {
+            return self.latest.send(Some(message)).is_ok();
+        }
         self.flush_deferred();
         if self.has_deferred() {
-            self.defer(message);
-            return true;
+            return self.defer(message);
         }
-        match self.sender.try_send(message) {
+        match self.critical.try_send(message) {
             Ok(()) => true,
-            Err(tokio_mpsc::error::TrySendError::Full(message)) => {
-                self.defer(message);
-                true
-            }
+            Err(tokio_mpsc::error::TrySendError::Full(message)) => self.defer(message),
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
@@ -981,7 +1182,7 @@ impl RemoteInputLane {
     pub fn flush_deferred(&mut self) {
         let had_deferred = !self.deferred.is_empty();
         while let Some(message) = self.deferred.pop_front() {
-            match self.sender.try_send(message) {
+            match self.critical.try_send(message) {
                 Ok(()) => {}
                 Err(tokio_mpsc::error::TrySendError::Full(message)) => {
                     self.deferred.push_front(message);
@@ -995,11 +1196,10 @@ impl RemoteInputLane {
         }
         if had_deferred && self.deferred.is_empty() {
             eprintln!(
-                "drained deferred network input high_water={} coalesced_motion={}",
-                self.deferred_high_water, self.coalesced_motion
+                "drained deferred critical network input high_water={}",
+                self.deferred_high_water
             );
             self.deferred_high_water = 0;
-            self.coalesced_motion = 0;
         }
     }
 
@@ -1007,20 +1207,17 @@ impl RemoteInputLane {
         !self.deferred.is_empty()
     }
 
-    fn defer(&mut self, message: ClientMessage) {
-        if is_pointer_motion(&message)
-            && let Some(previous) = self.deferred.back_mut()
-            && is_pointer_motion(previous)
-        {
-            *previous = message;
-            self.coalesced_motion = self.coalesced_motion.saturating_add(1);
-            return;
+    fn defer(&mut self, message: ClientMessage) -> bool {
+        if self.deferred.len() >= MAX_DEFERRED_CRITICAL_INPUTS {
+            eprintln!("critical network input backlog is full");
+            return false;
         }
         if self.deferred.is_empty() {
-            eprintln!("network input lane backpressured; deferring input messages");
+            eprintln!("critical network input lane backpressured; deferring input messages");
         }
         self.deferred.push_back(message);
         self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
+        true
     }
 }
 
@@ -1140,6 +1337,12 @@ impl RemoteBackendCommandLane {
         )
     }
 
+    pub fn try_release_resource(&self, resource: u64) -> Result<()> {
+        self.sender
+            .try_send(ReliableCommand::ReleaseResource(resource))
+            .context("remote resource-release queue is full or closed")
+    }
+
     fn try_send_command(&self, operation: BackendOperation, context: PendingBackend) -> Result<()> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         self.sender
@@ -1148,5 +1351,35 @@ impl RemoteBackendCommandLane {
                 context,
             })
             .context("remote backend command queue is full or closed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brood_protocol::{ClientMessage, InputEvent, PanePosition};
+
+    use super::RemoteInputLane;
+
+    fn pointer(x: f64) -> ClientMessage {
+        ClientMessage::Input(InputEvent::PointerMotion {
+            position: PanePosition { pane: 7, x, y: 2.0 },
+        })
+    }
+
+    #[test]
+    fn pointer_motion_supersedes_without_blocking_critical_input() {
+        let (critical_sender, mut critical_receiver) = tokio::sync::mpsc::channel(1);
+        let (latest_sender, latest_receiver) = tokio::sync::watch::channel(None);
+        let mut lane = RemoteInputLane::new(critical_sender, latest_sender);
+
+        assert!(lane.send(pointer(1.0)));
+        assert!(lane.send(pointer(3.0)));
+        assert!(lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
+
+        assert_eq!(latest_receiver.borrow().as_ref(), Some(&pointer(3.0)));
+        assert_eq!(
+            critical_receiver.try_recv().ok(),
+            Some(ClientMessage::Input(InputEvent::KeyboardReset))
+        );
     }
 }

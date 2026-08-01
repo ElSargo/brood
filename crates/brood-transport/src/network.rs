@@ -1,9 +1,15 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use brood_protocol::{
     BackendActorRealm, CarrierKind, ClientMessage, EndpointCapabilities, FrameColorSpace,
-    FramePixelFormat, Lane, ServerMessage, TransportProfile, negotiate_profile,
+    FramePixelFormat, Lane, MAX_ACTOR_ID_BYTES, MAX_ACTOR_MESSAGE_BYTES, MAX_NETWORK_FRAME_BYTES,
+    ServerMessage, TransportProfile, negotiate_profile,
 };
 use quinn::{
     AckFrequencyConfig, Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt,
@@ -97,7 +103,10 @@ const LANES: [Lane; 10] = [
 // may still emit a large compressed frame resource. Keep the carrier ceiling
 // above the largest valid artifact/package exchange while retaining a hard
 // bound against untrusted length prefixes.
-const MAX_WIRE_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
+const FRAME_ENVELOPE_BYTES: usize = 64 * 1024;
+const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
+const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024 * 1024 + FRAME_ENVELOPE_BYTES;
+const MAX_FRAME_DAMAGE_RECTS: usize = 1_024;
 
 /// First authenticated application message sent by the remote client.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -121,6 +130,12 @@ pub struct NetworkLane {
     lane: Lane,
     send: SendStream,
     receive: RecvStream,
+    send_buffer: Vec<u8>,
+    receive_buffer: Vec<u8>,
+    send_limit: usize,
+    receive_limit: usize,
+    send_frame_limit: u64,
+    receive_frame_limit: u64,
 }
 
 /// Sending half of one semantic QUIC lane.
@@ -128,6 +143,9 @@ pub struct NetworkSendLane {
     _connection: Connection,
     lane: Lane,
     send: SendStream,
+    buffer: Vec<u8>,
+    limit: usize,
+    frame_limit: u64,
 }
 
 /// Receiving half of one semantic QUIC lane.
@@ -135,6 +153,9 @@ pub struct NetworkReceiveLane {
     _connection: Connection,
     lane: Lane,
     receive: RecvStream,
+    buffer: Vec<u8>,
+    limit: usize,
+    frame_limit: u64,
 }
 
 impl NetworkLane {
@@ -146,11 +167,17 @@ impl NetworkLane {
                 _connection: self.connection.clone(),
                 lane: self.lane,
                 send: self.send,
+                buffer: self.send_buffer,
+                limit: self.send_limit,
+                frame_limit: self.send_frame_limit,
             },
             NetworkReceiveLane {
                 _connection: self.connection,
                 lane: self.lane,
                 receive: self.receive,
+                buffer: self.receive_buffer,
+                limit: self.receive_limit,
+                frame_limit: self.receive_frame_limit,
             },
         )
     }
@@ -167,6 +194,7 @@ impl NetworkLane {
             client_message_lane(message) == self.lane,
             "client message belongs on a different semantic lane"
         );
+        validate_client_message(message)?;
         self.send_value(message).await
     }
 
@@ -177,6 +205,7 @@ impl NetworkLane {
             client_message_lane(&message) == self.lane,
             "client message arrived on the wrong semantic lane"
         );
+        validate_client_message(&message)?;
         Ok(message)
     }
 
@@ -186,6 +215,7 @@ impl NetworkLane {
             server_message_lane(message) == self.lane,
             "server message belongs on a different semantic lane"
         );
+        validate_server_message(message)?;
         self.send_value(message).await
     }
 
@@ -196,6 +226,7 @@ impl NetworkLane {
             server_message_lane(&message) == self.lane,
             "server message arrived on the wrong semantic lane"
         );
+        validate_server_message(&message)?;
         Ok(message)
     }
 
@@ -205,6 +236,7 @@ impl NetworkLane {
             self.lane == Lane::FrameResource,
             "network frame belongs on the frame-resource lane"
         );
+        frame.validate(self.send_frame_limit)?;
         self.send_value(frame).await
     }
 
@@ -214,21 +246,28 @@ impl NetworkLane {
             self.lane == Lane::FrameResource,
             "network frame belongs on the frame-resource lane"
         );
-        self.receive_value().await
+        let frame: NetworkFramePacket = self.receive_value().await?;
+        frame.validate(self.receive_frame_limit)?;
+        Ok(frame)
     }
 
     async fn send_value<T: Serialize + Sync>(&mut self, value: &T) -> Result<()> {
-        let bytes = postcard::to_stdvec(value).context("encode presentation network message")?;
-        ensure!(
-            bytes.len() <= MAX_WIRE_MESSAGE_BYTES,
-            "presentation network message exceeds the carrier limit"
-        );
-        write_frame(&mut self.send, &bytes).await
+        send_value(
+            &mut self.send,
+            &mut self.send_buffer,
+            self.send_limit,
+            value,
+        )
+        .await
     }
 
     async fn receive_value<T: DeserializeOwned>(&mut self) -> Result<T> {
-        let bytes = read_frame(&mut self.receive).await?;
-        postcard::from_bytes(&bytes).context("decode presentation network message")
+        receive_value(
+            &mut self.receive,
+            &mut self.receive_buffer,
+            self.receive_limit,
+        )
+        .await
     }
 }
 
@@ -239,7 +278,8 @@ impl NetworkSendLane {
             client_message_lane(message) == self.lane,
             "client message belongs on a different semantic lane"
         );
-        send_value(&mut self.send, message).await
+        validate_client_message(message)?;
+        send_value(&mut self.send, &mut self.buffer, self.limit, message).await
     }
 
     /// Send a server message after validating its semantic lane.
@@ -248,7 +288,8 @@ impl NetworkSendLane {
             server_message_lane(message) == self.lane,
             "server message belongs on a different semantic lane"
         );
-        send_value(&mut self.send, message).await
+        validate_server_message(message)?;
+        send_value(&mut self.send, &mut self.buffer, self.limit, message).await
     }
 
     /// Send a compressed frame on the frame-resource lane.
@@ -257,7 +298,8 @@ impl NetworkSendLane {
             self.lane == Lane::FrameResource,
             "network frame belongs on the frame-resource lane"
         );
-        send_value(&mut self.send, frame).await
+        frame.validate(self.frame_limit)?;
+        send_value(&mut self.send, &mut self.buffer, self.limit, frame).await
     }
 
     /// Finish this lane and wait until the peer acknowledges every buffered byte.
@@ -277,21 +319,23 @@ impl NetworkSendLane {
 impl NetworkReceiveLane {
     /// Receive and validate a client message.
     pub async fn receive_client_message(&mut self) -> Result<ClientMessage> {
-        let message = receive_value(&mut self.receive).await?;
+        let message = receive_value(&mut self.receive, &mut self.buffer, self.limit).await?;
         ensure!(
             client_message_lane(&message) == self.lane,
             "client message arrived on the wrong semantic lane"
         );
+        validate_client_message(&message)?;
         Ok(message)
     }
 
     /// Receive and validate a server message.
     pub async fn receive_server_message(&mut self) -> Result<ServerMessage> {
-        let message = receive_value(&mut self.receive).await?;
+        let message = receive_value(&mut self.receive, &mut self.buffer, self.limit).await?;
         ensure!(
             server_message_lane(&message) == self.lane,
             "server message arrived on the wrong semantic lane"
         );
+        validate_server_message(&message)?;
         Ok(message)
     }
 
@@ -301,7 +345,10 @@ impl NetworkReceiveLane {
             self.lane == Lane::FrameResource,
             "network frame belongs on the frame-resource lane"
         );
-        receive_value(&mut self.receive).await
+        let frame: NetworkFramePacket =
+            receive_value(&mut self.receive, &mut self.buffer, self.limit).await?;
+        frame.validate(self.frame_limit)?;
+        Ok(frame)
     }
 
     /// Read the peer's lane finish marker after its final framed message.
@@ -319,18 +366,30 @@ impl NetworkReceiveLane {
     }
 }
 
-async fn send_value<T: Serialize + Sync>(send: &mut SendStream, value: &T) -> Result<()> {
-    let bytes = postcard::to_stdvec(value).context("encode presentation network message")?;
+async fn send_value<T: Serialize + Sync>(
+    send: &mut SendStream,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+    value: &T,
+) -> Result<()> {
+    buffer.clear();
+    let reusable = std::mem::take(buffer);
+    *buffer =
+        postcard::to_extend(value, reusable).context("encode presentation network message")?;
     ensure!(
-        bytes.len() <= MAX_WIRE_MESSAGE_BYTES,
-        "presentation network message exceeds the carrier limit"
+        buffer.len() <= limit,
+        "presentation network message exceeds its negotiated lane limit"
     );
-    write_frame(send, &bytes).await
+    write_frame(send, buffer).await
 }
 
-async fn receive_value<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<T> {
-    let bytes = read_frame(receive).await?;
-    postcard::from_bytes(&bytes).context("decode presentation network message")
+async fn receive_value<T: DeserializeOwned>(
+    receive: &mut RecvStream,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> Result<T> {
+    read_frame(receive, buffer, limit).await?;
+    postcard::from_bytes(buffer).context("decode presentation network message")
 }
 
 /// One mutually authenticated QUIC presentation carrier.
@@ -338,12 +397,13 @@ async fn receive_value<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<
 /// Each semantic traffic class owns a distinct ordered QUIC stream, preventing
 /// frame congestion from causing head-of-line blocking for critical input.
 pub struct NetworkConnection {
-    _connection: Connection,
+    connection: Connection,
     lanes: HashMap<Lane, NetworkLane>,
     pub backend: brood_protocol::BackendId,
     pub profile: TransportProfile,
     pub connection_generation: u64,
     pub peer_capabilities: EndpointCapabilities,
+    local_capabilities: EndpointCapabilities,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -360,7 +420,7 @@ pub struct NetworkDiagnostics {
 impl NetworkConnection {
     #[must_use]
     pub fn diagnostics(&self) -> NetworkDiagnostics {
-        let stats = self._connection.stats();
+        let stats = self.connection.stats();
         NetworkDiagnostics {
             rtt_us: stats.path.rtt.as_micros(),
             congestion_window: stats.path.cwnd,
@@ -381,6 +441,7 @@ impl NetworkConnection {
 
     /// Send one client message on its required logical lane.
     pub async fn send_client_message(&mut self, message: &ClientMessage) -> Result<()> {
+        validate_client_message(message)?;
         self.send(client_message_lane(message), message).await
     }
 
@@ -391,11 +452,13 @@ impl NetworkConnection {
             client_message_lane(&message) == lane,
             "client message arrived on the wrong semantic lane"
         );
+        validate_client_message(&message)?;
         Ok(message)
     }
 
     /// Send one server message on its required logical lane.
     pub async fn send_server_message(&mut self, message: &ServerMessage) -> Result<()> {
+        validate_server_message(message)?;
         self.send(server_message_lane(message), message).await
     }
 
@@ -406,17 +469,21 @@ impl NetworkConnection {
             server_message_lane(&message) == lane,
             "server message arrived on the wrong semantic lane"
         );
+        validate_server_message(&message)?;
         Ok(message)
     }
 
     /// Send one compressed managed-window frame packet.
     pub async fn send_frame(&mut self, frame: &NetworkFramePacket) -> Result<()> {
+        frame.validate(self.peer_capabilities.max_frame_bytes)?;
         self.send(Lane::FrameResource, frame).await
     }
 
     /// Receive one compressed managed-window frame packet.
     pub async fn receive_frame(&mut self) -> Result<NetworkFramePacket> {
-        self.receive(Lane::FrameResource).await
+        let frame: NetworkFramePacket = self.receive(Lane::FrameResource).await?;
+        frame.validate(self.local_capabilities.max_frame_bytes)?;
+        Ok(frame)
     }
 
     async fn send<T: Serialize + Sync>(&mut self, lane: Lane, value: &T) -> Result<()> {
@@ -444,6 +511,7 @@ pub async fn connect_network(
     backend: brood_protocol::BackendId,
     capabilities: EndpointCapabilities,
 ) -> Result<NetworkConnection> {
+    validate_capabilities(&capabilities)?;
     ensure!(
         capabilities.carriers.contains(&CarrierKind::Network),
         "client capabilities do not offer the network carrier"
@@ -466,22 +534,26 @@ pub async fn connect_network(
     )
     .await?;
     let hello: ServerHello = read_serialized(&mut handshake_receive).await?;
+    validate_capabilities(&hello.capabilities)?;
+    let expected_profile = negotiate_profile(&capabilities, &hello.capabilities)
+        .context("validate server-selected remote presentation profile")?;
     ensure!(
-        hello.profile == TransportProfile::REMOTE,
-        "server selected a non-network profile for a remote connection"
+        hello.profile == expected_profile && hello.profile == TransportProfile::REMOTE,
+        "server selected an invalid remote presentation profile"
     );
     ensure!(
         hello.backend == backend,
         "server did not retain the client-assigned backend identity"
     );
-    let lanes = open_lanes(&connection).await?;
+    let lanes = open_lanes(&connection, &hello.capabilities, &capabilities).await?;
     Ok(NetworkConnection {
-        _connection: connection,
+        connection,
         lanes,
         backend: hello.backend,
         profile: hello.profile,
         connection_generation: hello.connection_generation,
         peer_capabilities: hello.capabilities,
+        local_capabilities: capabilities,
     })
 }
 
@@ -491,6 +563,7 @@ pub async fn accept_network_connection(
     capabilities: EndpointCapabilities,
     connection_generation: u64,
 ) -> Result<NetworkConnection> {
+    validate_capabilities(&capabilities)?;
     ensure!(
         capabilities.carriers.contains(&CarrierKind::Network),
         "server capabilities do not offer the network carrier"
@@ -503,6 +576,7 @@ pub async fn accept_network_connection(
         .await
         .context("accept presentation handshake stream")?;
     let hello: ClientHello = read_serialized(&mut handshake_receive).await?;
+    validate_capabilities(&hello.capabilities)?;
     let profile = negotiate_profile(&hello.capabilities, &capabilities)
         .context("negotiate remote presentation profile")?;
     write_serialized(
@@ -515,18 +589,23 @@ pub async fn accept_network_connection(
         },
     )
     .await?;
-    let lanes = accept_lanes(&connection).await?;
+    let lanes = accept_lanes(&connection, &hello.capabilities, &capabilities).await?;
     Ok(NetworkConnection {
-        _connection: connection,
+        connection,
         lanes,
         backend: hello.backend,
         profile,
         connection_generation,
         peer_capabilities: hello.capabilities,
+        local_capabilities: capabilities,
     })
 }
 
-async fn open_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLane>> {
+async fn open_lanes(
+    connection: &Connection,
+    send_capabilities: &EndpointCapabilities,
+    receive_capabilities: &EndpointCapabilities,
+) -> Result<HashMap<Lane, NetworkLane>> {
     let mut lanes = HashMap::with_capacity(LANES.len());
     for lane in LANES {
         let (mut send, receive) = connection
@@ -545,13 +624,23 @@ async fn open_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLane
                 lane,
                 send,
                 receive,
+                send_buffer: Vec::new(),
+                receive_buffer: Vec::new(),
+                send_limit: lane_message_limit(send_capabilities, lane)?,
+                receive_limit: lane_message_limit(receive_capabilities, lane)?,
+                send_frame_limit: send_capabilities.max_frame_bytes,
+                receive_frame_limit: receive_capabilities.max_frame_bytes,
             },
         );
     }
     Ok(lanes)
 }
 
-async fn accept_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLane>> {
+async fn accept_lanes(
+    connection: &Connection,
+    send_capabilities: &EndpointCapabilities,
+    receive_capabilities: &EndpointCapabilities,
+) -> Result<HashMap<Lane, NetworkLane>> {
     let mut lanes = HashMap::with_capacity(LANES.len());
     while lanes.len() < LANES.len() {
         let (send, mut receive) = connection
@@ -575,6 +664,12 @@ async fn accept_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLa
                         lane,
                         send,
                         receive,
+                        send_buffer: Vec::new(),
+                        receive_buffer: Vec::new(),
+                        send_limit: lane_message_limit(send_capabilities, lane)?,
+                        receive_limit: lane_message_limit(receive_capabilities, lane)?,
+                        send_frame_limit: send_capabilities.max_frame_bytes,
+                        receive_frame_limit: receive_capabilities.max_frame_bytes,
                     },
                 )
                 .is_none(),
@@ -586,11 +681,16 @@ async fn accept_lanes(connection: &Connection) -> Result<HashMap<Lane, NetworkLa
 
 async fn write_serialized<T: Serialize + Sync>(stream: &mut SendStream, value: &T) -> Result<()> {
     let bytes = postcard::to_stdvec(value).context("encode presentation handshake")?;
+    ensure!(
+        bytes.len() <= MAX_HANDSHAKE_BYTES,
+        "presentation handshake exceeds its size limit"
+    );
     write_frame(stream, &bytes).await
 }
 
 async fn read_serialized<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
-    let bytes = read_frame(stream).await?;
+    let mut bytes = Vec::new();
+    read_frame(stream, &mut bytes, MAX_HANDSHAKE_BYTES).await?;
     postcard::from_bytes(&bytes).context("decode presentation handshake")
 }
 
@@ -606,7 +706,7 @@ async fn write_frame(stream: &mut SendStream, bytes: &[u8]) -> Result<()> {
         .context("write presentation message body")
 }
 
-async fn read_frame(stream: &mut RecvStream) -> Result<Vec<u8>> {
+async fn read_frame(stream: &mut RecvStream, buffer: &mut Vec<u8>, limit: usize) -> Result<()> {
     let mut length = [0_u8; 4];
     stream
         .read_exact(&mut length)
@@ -615,16 +715,217 @@ async fn read_frame(stream: &mut RecvStream) -> Result<Vec<u8>> {
     let length = usize::try_from(u32::from_be_bytes(length))
         .context("presentation message length is invalid")?;
     ensure!(
-        length <= MAX_WIRE_MESSAGE_BYTES,
-        "presentation message length {length} exceeds the carrier limit of \
-         {MAX_WIRE_MESSAGE_BYTES} bytes"
+        length <= limit && length <= MAX_WIRE_MESSAGE_BYTES,
+        "presentation message length {length} exceeds the negotiated lane limit of {limit} bytes"
     );
-    let mut bytes = vec![0; length];
+    buffer.clear();
+    buffer.resize(length, 0);
     stream
-        .read_exact(&mut bytes)
+        .read_exact(buffer)
         .await
         .context("read presentation message body")?;
-    Ok(bytes)
+    Ok(())
+}
+
+fn validate_capabilities(capabilities: &EndpointCapabilities) -> Result<()> {
+    ensure!(
+        !capabilities.carriers.is_empty() && capabilities.carriers.len() <= 4,
+        "endpoint carrier capability list is invalid"
+    );
+    ensure!(
+        !capabilities.frame_transports.is_empty() && capabilities.frame_transports.len() <= 4,
+        "endpoint frame capability list is invalid"
+    );
+    ensure!(
+        capabilities.max_reliable_message_bytes != 0
+            && capabilities.max_reliable_message_bytes <= MAX_ACTOR_MESSAGE_BYTES,
+        "endpoint reliable-message limit is unsupported"
+    );
+    ensure!(
+        capabilities.max_frame_bytes != 0
+            && capabilities.max_frame_bytes <= MAX_NETWORK_FRAME_BYTES,
+        "endpoint frame limit is unsupported"
+    );
+    Ok(())
+}
+
+fn lane_message_limit(capabilities: &EndpointCapabilities, lane: Lane) -> Result<usize> {
+    if lane == Lane::FrameResource {
+        return usize::try_from(capabilities.max_frame_bytes)
+            .context("endpoint frame limit exceeds address space")?
+            .checked_add(FRAME_ENVELOPE_BYTES)
+            .context("endpoint frame envelope limit overflow");
+    }
+    usize::try_from(capabilities.max_reliable_message_bytes)
+        .context("endpoint message limit exceeds address space")
+}
+
+fn validate_actor_message(message: &brood_protocol::ActorMessage) -> Result<()> {
+    ensure!(
+        !message.sender.is_empty()
+            && message.sender.len() <= MAX_ACTOR_ID_BYTES
+            && !message.recipient.is_empty()
+            && message.recipient.len() <= MAX_ACTOR_ID_BYTES,
+        "network actor identity is invalid"
+    );
+    ensure!(
+        message.body.len() <= MAX_ACTOR_MESSAGE_BYTES as usize,
+        "network actor body exceeds the negotiated limit"
+    );
+    Ok(())
+}
+
+fn validate_client_message(message: &ClientMessage) -> Result<()> {
+    match message {
+        ClientMessage::Input(input) => validate_input(input),
+        ClientMessage::Actor(message) => validate_actor_message(message),
+        ClientMessage::BackendRequest(request) => validate_backend_request(request),
+        ClientMessage::Artifact(message) => message
+            .validate()
+            .context("validate network artifact message"),
+        ClientMessage::Lifecycle(_) | ClientMessage::ReleaseResource { .. } => Ok(()),
+    }
+}
+
+fn validate_server_message(message: &ServerMessage) -> Result<()> {
+    match message {
+        ServerMessage::Catalog(catalog) => validate_catalog(catalog),
+        ServerMessage::Scene(scene) => validate_scene(scene),
+        ServerMessage::Actor(message) => validate_actor_message(message),
+        ServerMessage::Artifact(message) => message
+            .validate()
+            .context("validate network artifact message"),
+        ServerMessage::BackendResponse(response) => {
+            if let Err(reason) = &response.result {
+                ensure!(reason.len() <= MAX_ACTOR_MESSAGE_BYTES as usize);
+            }
+            Ok(())
+        }
+        ServerMessage::FocusPresentation
+        | ServerMessage::ClosePresentation
+        | ServerMessage::DisconnectAcknowledged => Ok(()),
+    }
+}
+
+fn validate_input(input: &brood_protocol::InputEvent) -> Result<()> {
+    let finite_position =
+        |position: &brood_protocol::PanePosition| position.x.is_finite() && position.y.is_finite();
+    match input {
+        brood_protocol::InputEvent::PointerMotion { position }
+        | brood_protocol::InputEvent::PointerButton { position, .. }
+        | brood_protocol::InputEvent::PointerWheel { position, .. } => {
+            ensure!(
+                finite_position(position),
+                "network pointer position is not finite"
+            );
+        }
+        brood_protocol::InputEvent::PointerAxis {
+            position,
+            horizontal,
+            vertical,
+        } => {
+            ensure!(
+                finite_position(position) && horizontal.is_finite() && vertical.is_finite(),
+                "network pointer axis is not finite"
+            );
+        }
+        brood_protocol::InputEvent::KeyboardKey { .. }
+        | brood_protocol::InputEvent::KeyboardReset
+        | brood_protocol::InputEvent::PresentationSize { .. }
+        | brood_protocol::InputEvent::PresentationFocus { .. }
+        | brood_protocol::InputEvent::WindowFocus { .. }
+        | brood_protocol::InputEvent::WindowResize { .. }
+        | brood_protocol::InputEvent::PointerLeave => {}
+    }
+    Ok(())
+}
+
+fn validate_backend_request(request: &brood_protocol::BackendRequest) -> Result<()> {
+    match &request.operation {
+        brood_protocol::BackendOperation::Control { argv } => {
+            ensure!(
+                !argv.is_empty()
+                    && argv.len() <= 256
+                    && argv.iter().all(|argument| argument.len() <= 4_096),
+                "network backend command is invalid"
+            );
+        }
+        brood_protocol::BackendOperation::Session {
+            name, directory, ..
+        } => {
+            ensure!(
+                name.as_ref().is_none_or(|name| name.len() <= 512)
+                    && directory
+                        .as_ref()
+                        .is_none_or(|directory| directory.len() <= 4_096),
+                "network session operation metadata is oversized"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog(catalog: &brood_protocol::CatalogSnapshot) -> Result<()> {
+    ensure!(catalog.sessions.len() <= 2_048 && catalog.windows.len() <= 16_384);
+    let mut sessions = HashSet::with_capacity(catalog.sessions.len());
+    for session in &catalog.sessions {
+        ensure!(
+            sessions.insert(session.id),
+            "network catalog repeats a session ID"
+        );
+        ensure!(
+            session.name.len() <= 512
+                && session
+                    .working_directory
+                    .as_ref()
+                    .is_none_or(|path| path.len() <= 4_096)
+                && session.project_id.len() <= 512
+                && session.project_name.len() <= 512
+                && session.project_directory.len() <= 4_096
+                && session
+                    .branch
+                    .as_ref()
+                    .is_none_or(|branch| branch.len() <= 1_024),
+            "network catalog session metadata is oversized"
+        );
+    }
+    let mut panes = HashSet::with_capacity(catalog.windows.len());
+    for window in &catalog.windows {
+        ensure!(
+            panes.insert(window.pane),
+            "network catalog repeats a pane ID"
+        );
+        ensure!(window.app_id.len() <= 512, "network app ID is oversized");
+    }
+    Ok(())
+}
+
+fn validate_scene(scene: &brood_protocol::FrameScene) -> Result<()> {
+    ensure!(
+        scene.windows.len() <= 16_384,
+        "network scene has too many windows"
+    );
+    let mut panes = HashSet::with_capacity(scene.windows.len());
+    let mut resources = HashSet::with_capacity(scene.windows.len());
+    for window in &scene.windows {
+        ensure!(panes.insert(window.pane), "network scene repeats a pane ID");
+        ensure!(
+            matches!(
+                window.resource,
+                brood_protocol::FrameResourceRef::Network { .. }
+            ),
+            "network scene refers to a non-network frame resource"
+        );
+        ensure!(
+            resources.insert(window.resource.id()),
+            "network scene repeats a frame resource"
+        );
+        ensure!(
+            window.source[2] >= 0 && window.source[3] >= 0,
+            "network scene has a negative source extent"
+        );
+    }
+    Ok(())
 }
 
 const fn lane_code(lane: Lane) -> u8 {
@@ -648,8 +949,8 @@ const fn lane_priority(lane: Lane) -> i32 {
         Lane::InteractiveSession0
         | Lane::InteractiveSession1
         | Lane::InteractiveSession2
-        | Lane::InteractiveSession3 => 15,
-        Lane::InteractiveDaemon => 15,
+        | Lane::InteractiveSession3
+        | Lane::InteractiveDaemon => 15,
         Lane::Reliable => 10,
         Lane::LatestState => 5,
         Lane::Bulk => -10,
@@ -751,6 +1052,12 @@ impl NetworkFramePacket {
             pixels.len() == expected,
             "network frame pixel length mismatch"
         );
+        ensure!(
+            u64::try_from(expected)
+                .ok()
+                .is_some_and(|bytes| bytes <= MAX_NETWORK_FRAME_BYTES),
+            "network frame exceeds the supported decompressed size"
+        );
         let compressed_pixels =
             zstd::bulk::compress(pixels, 1).context("compress network frame")?;
         Ok(Self {
@@ -769,16 +1076,13 @@ impl NetworkFramePacket {
 
     /// Decompress and validate this packet's packed pixels.
     pub fn pixels(&self) -> Result<Vec<u8>> {
+        self.validate(MAX_NETWORK_FRAME_BYTES)?;
         let expected = usize::try_from(
             u64::from(self.stride)
                 .checked_mul(u64::from(self.height))
                 .context("network frame length overflow")?,
         )
         .context("network frame length exceeds address space")?;
-        ensure!(
-            expected <= MAX_WIRE_MESSAGE_BYTES,
-            "decompressed network frame exceeds the carrier limit"
-        );
         let pixels = zstd::bulk::decompress(&self.compressed_pixels, expected)
             .context("decompress network frame")?;
         ensure!(
@@ -786,6 +1090,52 @@ impl NetworkFramePacket {
             "decompressed network frame is truncated"
         );
         Ok(pixels)
+    }
+
+    fn validate(&self, max_frame_bytes: u64) -> Result<()> {
+        ensure!(
+            self.width != 0 && self.height != 0,
+            "network frame has an empty extent"
+        );
+        ensure!(
+            self.stride
+                == self
+                    .width
+                    .checked_mul(4)
+                    .context("network frame stride overflow")?,
+            "network frame stride does not match its pixel format"
+        );
+        let expected = u64::from(self.stride)
+            .checked_mul(u64::from(self.height))
+            .context("network frame length overflow")?;
+        ensure!(
+            expected <= max_frame_bytes,
+            "decompressed network frame exceeds the negotiated limit"
+        );
+        let compressed_limit = usize::try_from(max_frame_bytes)
+            .context("network frame limit exceeds address space")?
+            .checked_add(FRAME_ENVELOPE_BYTES)
+            .context("network compressed-frame limit overflow")?;
+        ensure!(
+            self.compressed_pixels.len() <= compressed_limit,
+            "compressed network frame exceeds the negotiated limit"
+        );
+        ensure!(
+            self.damage.len() <= MAX_FRAME_DAMAGE_RECTS,
+            "network frame has too many damage rectangles"
+        );
+        for [x, y, width, height] in &self.damage {
+            ensure!(
+                *width != 0
+                    && *height != 0
+                    && x.checked_add(*width)
+                        .is_some_and(|right| right <= self.width)
+                    && y.checked_add(*height)
+                        .is_some_and(|bottom| bottom <= self.height),
+                "network frame damage rectangle is outside the image"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -801,14 +1151,16 @@ mod tests {
         ARTIFACT_ABI_VERSION, ActorMessage, ArtifactKind, ArtifactManifest, ArtifactMessage,
         ArtifactRealm, BackendActorRealm, BackendOperation, BackendRequest, BackendResponse,
         BackendResponseValue, ClientMessage, EndpointCapabilities, FrameColorSpace,
-        FramePixelFormat, InputEvent, Lane, MAX_ARTIFACT_CHUNK_BYTES, PanePosition, ServerMessage,
+        FramePixelFormat, InputEvent, Lane, MAX_ACTOR_MESSAGE_BYTES, MAX_ARTIFACT_CHUNK_BYTES,
+        PanePosition, ServerMessage,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
 
     use super::{
         NetworkFramePacket, accept_network_connection, client_endpoint, client_message_lane,
-        connect_network, lane_priority, server_endpoint,
+        connect_network, lane_priority, server_endpoint, validate_capabilities,
+        validate_client_message,
     };
 
     #[test]
@@ -858,6 +1210,41 @@ mod tests {
             client_message_lane(&message(BackendActorRealm::Session(7))),
             Lane::InteractiveSession3
         );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_oversized_actor_messages() {
+        let message = ClientMessage::Actor(ActorMessage {
+            realm: BackendActorRealm::Daemon,
+            sender: "sender".to_string(),
+            recipient: "recipient".to_string(),
+            body: vec![0; MAX_ACTOR_MESSAGE_BYTES as usize + 1],
+        });
+        assert!(validate_client_message(&message).is_err());
+    }
+
+    #[test]
+    fn frame_validation_rejects_metadata_that_cannot_match_pixels() {
+        let packet = NetworkFramePacket {
+            resource: 1,
+            sequence: 2,
+            pane: 3,
+            width: 4,
+            height: 4,
+            stride: 15,
+            pixel_format: FramePixelFormat::Rgba8,
+            color_space: FrameColorSpace::Srgb,
+            damage: vec![[0, 0, 4, 4]],
+            compressed_pixels: vec![0],
+        };
+        assert!(packet.pixels().is_err());
+    }
+
+    #[test]
+    fn endpoint_capabilities_cannot_advertise_unbounded_frames() {
+        let mut capabilities = EndpointCapabilities::remote();
+        capabilities.max_frame_bytes = u64::MAX;
+        assert!(validate_capabilities(&capabilities).is_err());
     }
 
     fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {

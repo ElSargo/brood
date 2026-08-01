@@ -7,12 +7,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_cli::control::{
-    ControlTarget, activate_surface_session, close_surface_session,
+    ControlTarget, SharedMemoryFrame, activate_surface_session, close_surface_session,
     complete_realm_artifact_request, create_surface_session, handshake,
     install_session_init_artifact, open_presentation_fast_path, rename_surface_session,
     request_dbus_command, resolve_control_target, shared_memory_resource,
@@ -26,9 +26,10 @@ use brood_protocol::{
     SessionOperation, WindowFrame,
 };
 use brood_transport::{
-    ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, NetworkFramePacket, NetworkReceiveLane,
-    NetworkSendLane, accept_network_connection, client_endpoint, connect_network,
-    default_artifact_cache, digest_file, digest_hex, package_offers, server_endpoint,
+    ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, ArtifactTransfer, NetworkFramePacket,
+    NetworkReceiveLane, NetworkSendLane, accept_network_connection, client_endpoint,
+    connect_network, default_artifact_cache, digest_file, digest_hex, package_offers,
+    server_endpoint,
 };
 use clap::{Parser, Subcommand};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -39,6 +40,15 @@ mod container;
 mod ssh;
 
 const ACTOR_LANE_CAPACITY: usize = 64;
+const CRITICAL_EGRESS_CAPACITY: usize = 32;
+const ACTOR_EGRESS_CAPACITY: usize = 128;
+const RELIABLE_EGRESS_CAPACITY: usize = 32;
+const LOCAL_INPUT_CAPACITY: usize = 512;
+const LOCAL_ACTOR_CAPACITY: usize = 128;
+const IPC_RETRY_YIELDS: u32 = 4;
+const IPC_RETRY_INITIAL_DELAY: Duration = Duration::from_micros(50);
+const IPC_RETRY_MAX_DELAY: Duration = Duration::from_millis(1);
+const NETWORK_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
 #[command(about = "Brood remote presentation transport")]
@@ -133,9 +143,9 @@ enum Command {
 
 #[derive(Clone)]
 struct Outbound {
-    critical: mpsc::UnboundedSender<CriticalOutbound>,
-    actors: mpsc::UnboundedSender<ServerMessage>,
-    reliable: mpsc::UnboundedSender<ServerMessage>,
+    critical: mpsc::Sender<CriticalOutbound>,
+    actors: mpsc::Sender<ServerMessage>,
+    reliable: mpsc::Sender<ServerMessage>,
     scenes: tokio::sync::watch::Sender<Option<Arc<NetworkScene>>>,
 }
 
@@ -143,6 +153,8 @@ struct NetworkScene {
     frames: Vec<NetworkFramePacket>,
     scene: FrameScene,
 }
+
+type SharedFrameResources = Arc<Mutex<HashMap<u64, Arc<SharedMemoryFrame>>>>;
 
 #[derive(Clone, Default)]
 struct TerminalRelayLatency(Arc<Mutex<TerminalRelayLatencyState>>);
@@ -302,6 +314,10 @@ fn terminal_snapshot_trace_key(message: &ActorMessage) -> Option<(u64, u64)> {
     Some((session, u64::from_le_bytes(encoded)))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "diagnostic latency statistics are approximate floating-point summaries"
+)]
 fn latency_summary(samples: &VecDeque<u128>) -> serde_json::Value {
     let mut sorted = samples.iter().copied().collect::<Vec<_>>();
     sorted.sort_unstable();
@@ -341,6 +357,11 @@ fn latency_summary(samples: &VecDeque<u128>) -> serde_json::Value {
 enum CriticalOutbound {
     Message(ServerMessage),
     DisconnectAcknowledgement(oneshot::Sender<()>),
+}
+
+struct LocalCriticalInput {
+    message: ClientMessage,
+    published: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Deserialize)]
@@ -520,15 +541,19 @@ async fn relay(
         .accept()
         .await
         .context("remote relay listener closed")?;
-    let mut network = accept_network_connection(
-        incoming,
-        EndpointCapabilities::remote(),
-        fast_path.generation,
+    let mut network = tokio::time::timeout(
+        NETWORK_SETUP_TIMEOUT,
+        accept_network_connection(
+            incoming,
+            EndpointCapabilities::remote(),
+            fast_path.generation,
+        ),
     )
-    .await?;
-    let (critical_tx, critical_rx) = mpsc::unbounded_channel();
-    let (actor_tx, actor_rx) = mpsc::unbounded_channel();
-    let (reliable_tx, reliable_rx) = mpsc::unbounded_channel();
+    .await
+    .context("remote presentation handshake timed out")??;
+    let (critical_tx, critical_rx) = mpsc::channel(CRITICAL_EGRESS_CAPACITY);
+    let (actor_tx, actor_rx) = mpsc::channel(ACTOR_EGRESS_CAPACITY);
+    let (reliable_tx, reliable_rx) = mpsc::channel(RELIABLE_EGRESS_CAPACITY);
     let (scene_tx, scene_rx) = tokio::sync::watch::channel(None);
     let outbound = Outbound {
         critical: critical_tx.clone(),
@@ -545,6 +570,7 @@ async fn relay(
         network.backend,
         outbound.clone(),
     )?;
+    let frame_resources = Arc::new(Mutex::new(HashMap::new()));
     spawn_frame_forwarder(
         target.clone(),
         &fast_path.frame_fd,
@@ -552,6 +578,7 @@ async fn relay(
         fast_path.generation,
         network.backend,
         outbound.clone(),
+        Arc::clone(&frame_resources),
     )?;
     spawn_actor_forwarder(
         &fast_path.presentation_message_fd,
@@ -569,21 +596,33 @@ async fn relay(
     )?;
     let actor_notifications =
         brood_ipc::EventNotifier::from_owned_fd(fast_path.actor_message_notify_fd);
-    let (local_input_tx, local_input_rx) = mpsc::unbounded_channel();
-    let (local_actor_tx, local_actor_rx) = mpsc::unbounded_channel();
-    tokio::spawn(write_local_input(
-        input,
-        input_notifications,
-        fast_path.generation,
-        local_input_rx,
-    ));
-    tokio::spawn(write_local_actor_messages(
-        actor_messages,
-        actor_notifications,
-        fast_path.generation,
-        local_actor_rx,
-        terminal_latency.clone(),
-    ));
+    let (local_critical_input_tx, local_critical_input_rx) = mpsc::channel(LOCAL_INPUT_CAPACITY);
+    let (local_latest_input_tx, local_latest_input_rx) = tokio::sync::watch::channel(None);
+    let (local_actor_tx, local_actor_rx) = mpsc::channel(LOCAL_ACTOR_CAPACITY);
+    let mut transport_tasks = tokio::task::JoinSet::new();
+    transport_tasks.spawn(async move {
+        write_local_input(
+            input,
+            input_notifications,
+            fast_path.generation,
+            local_critical_input_rx,
+            local_latest_input_rx,
+        )
+        .await
+        .context("local input writer stopped")
+    });
+    let actor_writer_latency = terminal_latency.clone();
+    transport_tasks.spawn(async move {
+        write_local_actor_messages(
+            actor_messages,
+            actor_notifications,
+            fast_path.generation,
+            local_actor_rx,
+            actor_writer_latency,
+        )
+        .await
+        .context("local actor writer stopped")
+    });
 
     let (critical_send, mut critical_receive) = network.take_lane(Lane::Critical)?.split();
     let (session0_send, session0_receive) = network.take_lane(Lane::InteractiveSession0)?.split();
@@ -596,63 +635,104 @@ async fn relay(
     let (bulk_send, bulk_receive) = network.take_lane(Lane::Bulk)?.split();
     let (frame_send, _frame_receive) = network.take_lane(Lane::FrameResource)?.split();
 
-    tokio::spawn(send_critical_messages(critical_send, critical_rx));
-    tokio::spawn(send_server_messages(
-        [session0_send, session1_send, session2_send, session3_send],
-        daemon_send,
-        actor_rx,
-        terminal_latency.clone(),
-    ));
-    tokio::spawn(send_reliable_messages(reliable_send, reliable_rx));
-    tokio::spawn(send_network_scenes(frame_send, latest_send, scene_rx));
+    transport_tasks.spawn(async move {
+        send_critical_messages(critical_send, critical_rx)
+            .await
+            .context("critical network sender stopped")
+    });
+    let actor_sender_latency = terminal_latency.clone();
+    transport_tasks.spawn(async move {
+        send_server_messages(
+            [session0_send, session1_send, session2_send, session3_send],
+            daemon_send,
+            actor_rx,
+            actor_sender_latency,
+        )
+        .await
+        .context("actor network sender stopped")
+    });
+    transport_tasks.spawn(async move {
+        send_reliable_messages(reliable_send, reliable_rx)
+            .await
+            .context("reliable network sender stopped")
+    });
+    transport_tasks.spawn(async move {
+        send_network_scenes(frame_send, latest_send, scene_rx)
+            .await
+            .context("scene network sender stopped")
+    });
 
     let (disconnect_tx, mut disconnect_rx) = oneshot::channel();
-    let critical_input_tx = local_input_tx.clone();
+    let critical_input_tx = local_critical_input_tx;
     let disconnect_critical_tx = critical_tx;
-    tokio::spawn(async move {
-        loop {
-            let message = critical_receive.receive_client_message().await?;
-            let disconnect = message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
-            critical_input_tx
-                .send(message)
-                .map_err(|_error| anyhow!("local input writer stopped"))?;
-            if disconnect {
-                critical_receive.wait_for_finish().await?;
-                let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
-                disconnect_critical_tx
-                    .send(CriticalOutbound::DisconnectAcknowledgement(acknowledged_tx))
-                    .map_err(|_error| anyhow!("critical network sender stopped"))?;
-                acknowledged_rx
+    transport_tasks.spawn(async move {
+        let result: Result<()> = async {
+            loop {
+                let message = critical_receive.receive_client_message().await?;
+                let disconnect = message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
+                let (published, publication) = if disconnect {
+                    let (published, publication) = oneshot::channel();
+                    (Some(published), Some(publication))
+                } else {
+                    (None, None)
+                };
+                critical_input_tx
+                    .send(LocalCriticalInput { message, published })
                     .await
-                    .context("critical network sender dropped the disconnect acknowledgement")?;
-                let _send_result = disconnect_tx.send(());
-                return Ok::<(), anyhow::Error>(());
+                    .map_err(|_error| anyhow!("local input writer stopped"))?;
+                if disconnect {
+                    publication
+                        .context("disconnect publication acknowledgement is missing")?
+                        .await
+                        .context("local input writer dropped disconnect publication")?;
+                    critical_receive.wait_for_finish().await?;
+                    let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
+                    disconnect_critical_tx
+                        .send(CriticalOutbound::DisconnectAcknowledgement(acknowledged_tx))
+                        .await
+                        .map_err(|_error| anyhow!("critical network sender stopped"))?;
+                    acknowledged_rx.await.context(
+                        "critical network sender dropped the disconnect acknowledgement",
+                    )?;
+                    let _send_result = disconnect_tx.send(());
+                    return Ok(());
+                }
             }
         }
+        .await;
+        result.context("critical network receiver stopped")
     });
-    tokio::spawn(receive_latest_input(latest_receive, local_input_tx));
+    transport_tasks.spawn(async move {
+        receive_latest_input(latest_receive, local_latest_input_tx)
+            .await
+            .context("latest-state network receiver stopped")
+    });
     for receive in [
         session0_receive,
         session1_receive,
         session2_receive,
         session3_receive,
     ] {
-        tokio::spawn(receive_actor_input(
-            receive,
-            local_actor_tx.clone(),
-            terminal_latency.clone(),
-        ));
+        let actor_input_tx = local_actor_tx.clone();
+        let actor_input_latency = terminal_latency.clone();
+        transport_tasks.spawn(async move {
+            receive_actor_input(receive, actor_input_tx, actor_input_latency)
+                .await
+                .context("session actor network receiver stopped")
+        });
     }
-    tokio::spawn(receive_actor_input(
-        daemon_receive,
-        local_actor_tx,
-        terminal_latency.clone(),
-    ));
-    tokio::spawn(receive_reliable_input(
-        reliable_receive,
-        target.clone(),
-        outbound,
-    ));
+    let daemon_input_latency = terminal_latency.clone();
+    transport_tasks.spawn(async move {
+        receive_actor_input(daemon_receive, local_actor_tx, daemon_input_latency)
+            .await
+            .context("daemon actor network receiver stopped")
+    });
+    let reliable_target = target.clone();
+    transport_tasks.spawn(async move {
+        receive_reliable_input(reliable_receive, reliable_target, outbound, frame_resources)
+            .await
+            .context("reliable network receiver stopped")
+    });
     let mut artifact_task = tokio::spawn(exchange_session_artifacts(
         bulk_send,
         bulk_receive,
@@ -663,8 +743,17 @@ async fn relay(
     ));
 
     let result = tokio::select! {
+        biased;
         disconnect = &mut disconnect_rx => {
             disconnect.context("remote client disconnected without a lifecycle message")
+        }
+        task = transport_tasks.join_next() => {
+            match task {
+                Some(Ok(Ok(()))) => Err(anyhow!("remote transport task stopped unexpectedly")),
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => Err(anyhow!(error).context("remote transport task panicked")),
+                None => Err(anyhow!("remote transport task set is empty")),
+            }
         }
         artifact = &mut artifact_task => {
             let artifact = match artifact {
@@ -691,6 +780,7 @@ async fn relay(
             }
         }
     };
+    transport_tasks.abort_all();
     artifact_task.abort();
     eprintln!(
         "remote terminal relay diagnostics {}",
@@ -719,6 +809,7 @@ async fn exchange_session_artifacts(
     package_cache: PathBuf,
 ) -> Result<()> {
     let mut outbound = VecDeque::from(exchange.initial_messages());
+    let mut transfers = VecDeque::<ArtifactTransfer>::new();
     let mut waiting_by_digest = HashMap::<ArtifactDigest, Vec<u64>>::new();
     let mut active_package_roots = HashMap::<String, PathBuf>::new();
     let mut unresolved = VecDeque::<(u64, String, std::time::Instant)>::new();
@@ -729,6 +820,12 @@ async fn exchange_session_artifacts(
             send.send_server_message(&ServerMessage::Artifact(message))
                 .await?;
         }
+        while let Some(transfer) = transfers.pop_front() {
+            for message in transfer.messages()? {
+                send.send_server_message(&ServerMessage::Artifact(message?))
+                    .await?;
+            }
+        }
 
         tokio::select! {
             message = receive_client_artifact(&mut receive) => {
@@ -737,6 +834,7 @@ async fn exchange_session_artifacts(
                     update,
                     &mut exchange,
                     &mut outbound,
+                    &mut transfers,
                     &target,
                     &package_cache,
                     &mut waiting_by_digest,
@@ -796,6 +894,7 @@ async fn exchange_session_artifacts(
                         update,
                         &mut exchange,
                         &mut outbound,
+                        &mut transfers,
                         &target,
                         &package_cache,
                         &mut waiting_by_digest,
@@ -807,16 +906,22 @@ async fn exchange_session_artifacts(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "artifact installation updates several independent connection-scoped registries"
+)]
 async fn apply_session_artifact_update(
     update: brood_transport::ArtifactExchangeUpdate,
     exchange: &mut ArtifactExchange,
     outbound: &mut VecDeque<ArtifactMessage>,
+    transfers: &mut VecDeque<ArtifactTransfer>,
     target: &ControlTarget,
     package_cache: &Path,
     waiting_by_digest: &mut HashMap<ArtifactDigest, Vec<u64>>,
     active_package_roots: &mut HashMap<String, PathBuf>,
 ) -> Result<()> {
     outbound.extend(update.outbound);
+    transfers.extend(update.transfers);
     for event in update.events {
         match event {
             ArtifactExchangeEvent::Installed(artifact) => {
@@ -1063,19 +1168,19 @@ async fn receive_client_artifact(lane: &mut NetworkReceiveLane) -> Result<Artifa
 
 async fn receive_latest_input(
     mut lane: brood_transport::NetworkReceiveLane,
-    sender: mpsc::UnboundedSender<ClientMessage>,
+    sender: tokio::sync::watch::Sender<Option<ClientMessage>>,
 ) -> Result<()> {
     loop {
         let message = lane.receive_client_message().await?;
         sender
-            .send(message)
+            .send(Some(message))
             .map_err(|_error| anyhow!("local input writer stopped"))?;
     }
 }
 
 async fn receive_actor_input(
     mut lane: brood_transport::NetworkReceiveLane,
-    sender: mpsc::UnboundedSender<ActorMessage>,
+    sender: mpsc::Sender<ActorMessage>,
     terminal_latency: TerminalRelayLatency,
 ) -> Result<()> {
     loop {
@@ -1090,6 +1195,7 @@ async fn receive_actor_input(
         }
         sender
             .send(message)
+            .await
             .map_err(|_error| anyhow!("local actor writer stopped"))?;
     }
 }
@@ -1098,6 +1204,7 @@ async fn receive_reliable_input(
     mut lane: brood_transport::NetworkReceiveLane,
     target: ControlTarget,
     outbound: Outbound,
+    frame_resources: SharedFrameResources,
 ) -> Result<()> {
     loop {
         match lane.receive_client_message().await? {
@@ -1111,9 +1218,15 @@ async fn receive_reliable_input(
                 outbound
                     .reliable
                     .send(ServerMessage::BackendResponse(response))
+                    .await
                     .map_err(|_error| anyhow!("remote reliable sender stopped"))?;
             }
-            ClientMessage::ReleaseResource { .. } => {}
+            ClientMessage::ReleaseResource { resource } => {
+                frame_resources
+                    .lock()
+                    .map_err(|_poisoned| anyhow!("shared frame resource registry is poisoned"))?
+                    .remove(&resource);
+            }
             ClientMessage::Actor(_)
             | ClientMessage::Input(_)
             | ClientMessage::Lifecycle(_)
@@ -1205,7 +1318,7 @@ fn execute_session_operation(
 async fn send_server_messages(
     session_lanes: [NetworkSendLane; 4],
     daemon_lane: NetworkSendLane,
-    mut receiver: mpsc::UnboundedReceiver<ServerMessage>,
+    mut receiver: mpsc::Receiver<ServerMessage>,
     terminal_latency: TerminalRelayLatency,
 ) -> Result<()> {
     let mut senders = Vec::with_capacity(5);
@@ -1247,7 +1360,9 @@ async fn send_server_messages(
                     },
                     _ => 0,
                 };
-                senders[lane]
+                senders
+                    .get(lane)
+                    .context("remote actor lane index is invalid")?
                     .try_send(message)
                     .map_err(|_error| anyhow!("remote actor sender is full or stopped"))?;
             }
@@ -1283,7 +1398,7 @@ async fn send_server_actor_lane(
 
 async fn send_reliable_messages(
     mut lane: NetworkSendLane,
-    mut receiver: mpsc::UnboundedReceiver<ServerMessage>,
+    mut receiver: mpsc::Receiver<ServerMessage>,
 ) -> Result<()> {
     while let Some(message) = receiver.recv().await {
         lane.send_server_message(&message).await?;
@@ -1293,7 +1408,7 @@ async fn send_reliable_messages(
 
 async fn send_critical_messages(
     mut lane: NetworkSendLane,
-    mut receiver: mpsc::UnboundedReceiver<CriticalOutbound>,
+    mut receiver: mpsc::Receiver<CriticalOutbound>,
 ) -> Result<()> {
     while let Some(command) = receiver.recv().await {
         match command {
@@ -1305,7 +1420,7 @@ async fn send_critical_messages(
                     .await?;
                 lane.finish().await?;
                 let _send_result = completion.send(());
-                return Ok(());
+                return std::future::pending::<Result<()>>().await;
             }
         }
     }
@@ -1338,31 +1453,53 @@ async fn write_local_input(
     mut producer: brood_ipc::CriticalProducer,
     notifications: brood_ipc::EventNotifier,
     generation: u64,
-    mut receiver: mpsc::UnboundedReceiver<ClientMessage>,
+    mut critical: mpsc::Receiver<LocalCriticalInput>,
+    mut latest: tokio::sync::watch::Receiver<Option<ClientMessage>>,
 ) -> Result<()> {
     let mut sequence = 0_u64;
-    while let Some(message) = receiver.recv().await {
+    let mut critical_open = true;
+    loop {
+        let (message, published) = tokio::select! {
+            biased;
+            input = critical.recv(), if critical_open => {
+                let Some(input) = input else {
+                    critical_open = false;
+                    continue;
+                };
+                (input.message, input.published)
+            }
+            changed = latest.changed() => {
+                changed.context("latest-state input forwarder stopped")?;
+                let Some(message) = latest.borrow_and_update().clone() else {
+                    continue;
+                };
+                (message, None)
+            }
+        };
         sequence = sequence.wrapping_add(1);
         let mut record = brood_ipc::encode_client_record(message, generation, sequence)?;
+        let mut retry = IpcRetry::default();
         loop {
             match producer.try_send(record) {
                 Ok(()) => break,
                 Err(returned) => {
                     record = returned;
-                    tokio::task::yield_now().await;
+                    retry.wait().await;
                 }
             }
         }
         notifications.notify()?;
+        if let Some(published) = published {
+            let _send_result = published.send(());
+        }
     }
-    Ok(())
 }
 
 async fn write_local_actor_messages(
     mut producer: brood_ipc::ActorMessageProducer,
     notifications: brood_ipc::EventNotifier,
     generation: u64,
-    mut receiver: mpsc::UnboundedReceiver<ActorMessage>,
+    mut receiver: mpsc::Receiver<ActorMessage>,
     terminal_latency: TerminalRelayLatency,
 ) -> Result<()> {
     let mut sequence = 0_u64;
@@ -1376,12 +1513,13 @@ async fn write_local_actor_messages(
             &message.recipient,
             &message.body,
         )?;
+        let mut retry = IpcRetry::default();
         loop {
             match producer.try_send(record) {
                 Ok(()) => break,
                 Err(returned) => {
                     record = returned;
-                    tokio::task::yield_now().await;
+                    retry.wait().await;
                 }
             }
         }
@@ -1389,6 +1527,28 @@ async fn write_local_actor_messages(
         terminal_latency.record_input_ipc_sent(&message);
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct IpcRetry {
+    waits: u32,
+}
+
+impl IpcRetry {
+    async fn wait(&mut self) {
+        if self.waits < IPC_RETRY_YIELDS {
+            self.waits += 1;
+            tokio::task::yield_now().await;
+            return;
+        }
+        let exponent = self.waits.saturating_sub(IPC_RETRY_YIELDS).min(5);
+        let multiplier = 1_u32 << exponent;
+        let delay = IPC_RETRY_INITIAL_DELAY
+            .saturating_mul(multiplier)
+            .min(IPC_RETRY_MAX_DELAY);
+        self.waits = self.waits.saturating_add(1);
+        tokio::time::sleep(delay).await;
+    }
 }
 
 fn spawn_catalog_forwarder(
@@ -1456,7 +1616,7 @@ fn spawn_catalog_forwarder(
                             };
                             if outbound
                                 .reliable
-                                .send(ServerMessage::Catalog(CatalogSnapshot {
+                                .blocking_send(ServerMessage::Catalog(CatalogSnapshot {
                                     backend,
                                     revision,
                                     active_session: catalog.active_session,
@@ -1484,6 +1644,7 @@ fn spawn_frame_forwarder(
     generation: u64,
     backend: brood_protocol::BackendId,
     outbound: Outbound,
+    resources: SharedFrameResources,
 ) -> Result<()> {
     let mut consumer = brood_ipc::CriticalConsumer::map(fd.as_fd(), generation)?;
     let notifications = brood_ipc::EventNotifier::from_owned_fd(notify_fd);
@@ -1491,8 +1652,8 @@ fn spawn_frame_forwarder(
         .name("brood-remote-frames".to_string())
         .spawn(move || {
             let mut pending: Option<PendingScene> = None;
-            let mut resources = HashMap::new();
             while notifications.wait().is_ok() {
+                let mut newest_complete = None;
                 while let Some(record) = consumer.try_recv() {
                     match record.opcode {
                         brood_ipc::FRAME_SCENE_BEGIN => {
@@ -1512,6 +1673,9 @@ fn spawn_frame_forwarder(
                                 continue;
                             };
                             let resource = record.arguments[1];
+                            let Ok(mut resources) = resources.lock() else {
+                                return;
+                            };
                             if let std::collections::hash_map::Entry::Vacant(entry) =
                                 resources.entry(resource)
                             {
@@ -1520,7 +1684,7 @@ fn spawn_frame_forwarder(
                                 else {
                                     return;
                                 };
-                                entry.insert(frame);
+                                entry.insert(Arc::new(frame));
                             }
                             let (x, y) = unpack_i32_pair(record.arguments[2]);
                             let (width, height) = unpack_i32_pair(record.arguments[3]);
@@ -1538,55 +1702,9 @@ fn spawn_frame_forwarder(
                             if scene.sequence != record.sequence
                                 || scene.windows.len() != scene.expected_windows
                             {
-                                return;
+                                continue;
                             }
-                            let mut windows = Vec::with_capacity(scene.windows.len());
-                            let mut frames = Vec::with_capacity(scene.windows.len());
-                            for window in scene.windows {
-                                let Some(frame) = resources.get(&window.resource) else {
-                                    return;
-                                };
-                                let metadata = frame.image.metadata();
-                                let Ok(pixels) = frame.image.pixels(scene.sequence) else {
-                                    return;
-                                };
-                                let Ok(packet) = NetworkFramePacket::from_pixels(
-                                    window.resource,
-                                    scene.sequence,
-                                    window.pane,
-                                    metadata.width,
-                                    metadata.height,
-                                    metadata.pixel_format,
-                                    metadata.color_space,
-                                    pixels,
-                                ) else {
-                                    return;
-                                };
-                                frames.push(packet);
-                                windows.push(WindowFrame {
-                                    pane: window.pane,
-                                    resource: FrameResourceRef::Network {
-                                        resource: window.resource,
-                                    },
-                                    source: window.source,
-                                    active: window.active,
-                                });
-                            }
-                            if outbound
-                                .scenes
-                                .send(Some(Arc::new(NetworkScene {
-                                    frames,
-                                    scene: FrameScene {
-                                        backend,
-                                        sequence: scene.sequence,
-                                        extent: scene.extent,
-                                        windows,
-                                    },
-                                })))
-                                .is_err()
-                            {
-                                return;
-                            }
+                            newest_complete = Some(scene);
                         }
                         opcode @ (brood_ipc::FRAME_FOCUS_PRESENTATION
                         | brood_ipc::FRAME_CLOSE_PRESENTATION) => {
@@ -1597,7 +1715,7 @@ fn spawn_frame_forwarder(
                             };
                             if outbound
                                 .critical
-                                .send(CriticalOutbound::Message(message))
+                                .blocking_send(CriticalOutbound::Message(message))
                                 .is_err()
                             {
                                 return;
@@ -1606,10 +1724,65 @@ fn spawn_frame_forwarder(
                         _ => {}
                     }
                 }
+                let Some(scene) = newest_complete else {
+                    continue;
+                };
+                let Ok(scene) = encode_network_scene(backend, scene, &resources) else {
+                    continue;
+                };
+                if outbound.scenes.send(Some(Arc::new(scene))).is_err() {
+                    return;
+                }
             }
         })
         .context("spawn remote frame forwarder")?;
     Ok(())
+}
+
+fn encode_network_scene(
+    backend: brood_protocol::BackendId,
+    scene: PendingScene,
+    resources: &SharedFrameResources,
+) -> Result<NetworkScene> {
+    let mut windows = Vec::with_capacity(scene.windows.len());
+    let mut frames = Vec::with_capacity(scene.windows.len());
+    for window in scene.windows {
+        let frame = resources
+            .lock()
+            .map_err(|_poisoned| anyhow!("shared frame resource registry is poisoned"))?
+            .get(&window.resource)
+            .cloned()
+            .with_context(|| format!("frame resource {} is unavailable", window.resource))?;
+        let metadata = frame.image.metadata();
+        let pixels = frame.image.pixels(scene.sequence)?;
+        frames.push(NetworkFramePacket::from_pixels(
+            window.resource,
+            scene.sequence,
+            window.pane,
+            metadata.width,
+            metadata.height,
+            metadata.pixel_format,
+            metadata.color_space,
+            pixels,
+        )?);
+        windows.push(WindowFrame {
+            pane: window.pane,
+            resource: FrameResourceRef::Network {
+                resource: window.resource,
+            },
+            source: window.source,
+            active: window.active,
+        });
+    }
+    Ok(NetworkScene {
+        frames,
+        scene: FrameScene {
+            backend,
+            sequence: scene.sequence,
+            extent: scene.extent,
+            windows,
+        },
+    })
 }
 
 fn spawn_actor_forwarder(
@@ -1644,7 +1817,11 @@ fn spawn_actor_forwarder(
                     {
                         terminal_latency.record_snapshot(&message);
                     }
-                    if outbound.actors.send(ServerMessage::Actor(message)).is_err() {
+                    if outbound
+                        .actors
+                        .blocking_send(ServerMessage::Actor(message))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1894,12 +2071,19 @@ async fn probe_artifacts(
     expected_received: usize,
 ) -> Result<(usize, usize)> {
     let mut outbound = VecDeque::from(exchange.initial_messages());
+    let mut transfers = VecDeque::<ArtifactTransfer>::new();
     let mut accepted = HashSet::new();
     let mut installed = HashSet::new();
     while accepted.len() < expected_sent || installed.len() < expected_received {
         while let Some(message) = outbound.pop_front() {
             send.send_client_message(&ClientMessage::Artifact(message))
                 .await?;
+        }
+        while let Some(transfer) = transfers.pop_front() {
+            for message in transfer.messages()? {
+                send.send_client_message(&ClientMessage::Artifact(message?))
+                    .await?;
+            }
         }
         let message = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -1947,10 +2131,17 @@ async fn probe_artifacts(
             }
         }
         outbound.extend(update.outbound);
+        transfers.extend(update.transfers);
     }
     while let Some(message) = outbound.pop_front() {
         send.send_client_message(&ClientMessage::Artifact(message))
             .await?;
+    }
+    while let Some(transfer) = transfers.pop_front() {
+        for message in transfer.messages()? {
+            send.send_client_message(&ClientMessage::Artifact(message?))
+                .await?;
+        }
     }
     Ok((accepted.len(), installed.len()))
 }

@@ -5,7 +5,7 @@ security-boundary: process-and-network
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-28
+last-reviewed: 2026-08-01
 code-links:
   - crates/brood-protocol/src/lib.rs
   - crates/brood-transport/src/artifact.rs
@@ -46,6 +46,12 @@ Chunks are ordered, bounded, and completed explicitly. The receiver checks
 length and digest before publishing the cache entry or passing it to a runtime.
 The receiver sends `Accepted` only after the destination runtime installs the
 artifact; a load or policy failure produces `Rejected`.
+
+The sender reads and hashes an offered file incrementally and retains at most
+one owned chunk for the active transfer. It does not construct a file-sized
+buffer or a queue containing every chunk. A file that changes, grows, or is
+truncated during transfer is rejected before `Complete`; rejection releases the
+receiver's in-flight byte reservation.
 
 The same state machine runs at both endpoints. Direction-specific commands are
 operator policy around that state machine, not distinct client-push and

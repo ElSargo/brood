@@ -15,6 +15,12 @@ pub const PRESENTATION_PROTOCOL_VERSION: u32 = 21;
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
 
+/// Maximum endpoint actor identity carried across a presentation connection.
+pub const MAX_ACTOR_ID_BYTES: usize = 256;
+
+/// Maximum decompressed frame accepted by the baseline network profile.
+pub const MAX_NETWORK_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Stable identity of one independently controlled session backend.
 ///
 /// Pane and session numbers are only unique within a backend. Presentation
@@ -183,7 +189,7 @@ impl EndpointCapabilities {
             carriers: vec![CarrierKind::Network],
             frame_transports: vec![FrameTransportKind::Network],
             max_reliable_message_bytes: MAX_ACTOR_MESSAGE_BYTES,
-            max_frame_bytes: 64 * 1024 * 1024,
+            max_frame_bytes: MAX_NETWORK_FRAME_BYTES,
         }
     }
 }
