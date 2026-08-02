@@ -2440,17 +2440,10 @@ fn publish_layout(
         ));
     }
     if keybindings_visible && let Some(keybindings) = keybindings_pane {
-        let height = f64::from(message.size.height.max(1));
-        let overlay_width = (820.0 / width).clamp(0.52, 0.92);
-        let overlay_height = (600.0 / height).clamp(0.55, 0.90);
         layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":110,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":110,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":2,\"v\":2}}}},\"input\":\"pane\"}}",
             keybindings,
-            keybindings,
-            -overlay_width,
-            -overlay_height,
-            overlay_width * 2.0,
-            overlay_height * 2.0
+            keybindings
         ));
     }
     let layout_items = layout_items.join(",");

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect, Transform, theme::ashen};
 use brood_keybindings::{ACTIONS, Action, Binding, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER};
 use brood_plugin_sdk::{
     actor::send_local,
@@ -21,6 +21,9 @@ const ROW_HEIGHT: f32 = 42.0;
 const SIDE_MARGIN: f32 = 16.0;
 const MAX_BINDING_WIDTH: f32 = 190.0;
 const RADIUS: f32 = 9.0;
+const WINDOW_WIDTH: f32 = 820.0;
+const WINDOW_HEIGHT: f32 = 600.0;
+const WINDOW_MARGIN: f32 = 16.0;
 
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
@@ -31,6 +34,9 @@ const FG: Color = ashen::TEXT;
 const MUTED: Color = ashen::MUTED;
 const ACCENT: Color = ashen::ACCENT;
 const ERROR: Color = ashen::ERROR;
+const SCRIM: Color = Color::rgba(0.0, 0.0, 0.0, 0.48);
+const SHADOW_WIDE: Color = Color::rgba(0.0, 0.0, 0.0, 0.18);
+const SHADOW_NEAR: Color = Color::rgba(0.0, 0.0, 0.0, 0.30);
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -58,6 +64,38 @@ struct BindingOverride {
     modifiers: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FloatingWindow {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl FloatingWindow {
+    fn in_viewport(width: f32, height: f32) -> Self {
+        let width = width.max(1.0);
+        let height = height.max(1.0);
+        let window_width = WINDOW_WIDTH.min((width - WINDOW_MARGIN * 2.0).max(1.0));
+        let window_height = WINDOW_HEIGHT.min((height - WINDOW_MARGIN * 2.0).max(1.0));
+        Self {
+            x: (width - window_width) * 0.5,
+            y: (height - window_height) * 0.5,
+            width: window_width,
+            height: window_height,
+        }
+    }
+
+    fn contains(self, x: f32, y: f32) -> bool {
+        x.is_finite()
+            && y.is_finite()
+            && x >= self.x
+            && x < self.x + self.width
+            && y >= self.y
+            && y < self.y + self.height
+    }
+}
+
 #[derive(Serialize)]
 struct LayoutVisibility {
     #[serde(rename = "type")]
@@ -80,6 +118,7 @@ struct KeybindingsState {
     error: bool,
     hovered: Option<usize>,
     pressed: Option<usize>,
+    backdrop_pressed: bool,
     escape_pending: bool,
     text_resources: Vec<u64>,
 }
@@ -88,8 +127,8 @@ impl KeybindingsState {
     fn new() -> Self {
         Self {
             pane: 0,
-            width: 820.0,
-            height: 600.0,
+            width: WINDOW_WIDTH + WINDOW_MARGIN * 2.0,
+            height: WINDOW_HEIGHT + WINDOW_MARGIN * 2.0,
             visible: false,
             query: String::new(),
             selected: Some(0),
@@ -100,13 +139,14 @@ impl KeybindingsState {
             error: false,
             hovered: None,
             pressed: None,
+            backdrop_pressed: false,
             escape_pending: false,
             text_resources: Vec::new(),
         }
     }
 
     fn visible_rows(&self) -> usize {
-        ((self.height - HEADER_HEIGHT - FOOTER_HEIGHT) / ROW_HEIGHT)
+        ((self.window().height - HEADER_HEIGHT - FOOTER_HEIGHT) / ROW_HEIGHT)
             .floor()
             .max(1.0) as usize
     }
@@ -114,7 +154,14 @@ impl KeybindingsState {
     fn resize(&mut self, width: f32, height: f32) {
         self.width = width.max(1.0);
         self.height = height.max(1.0);
+        self.hovered = None;
+        self.pressed = None;
+        self.backdrop_pressed = false;
         self.ensure_selected_visible();
+    }
+
+    fn window(&self) -> FloatingWindow {
+        FloatingWindow::in_viewport(self.width, self.height)
     }
 
     fn filtered(&self) -> Vec<usize> {
@@ -230,6 +277,7 @@ fn handle_message(state: &mut KeybindingsState, bytes: &[u8]) -> Vec<ActorComman
             state.error = false;
             state.hovered = None;
             state.pressed = None;
+            state.backdrop_pressed = false;
             state.escape_pending = false;
             state.ensure_selection();
             redraw_or_record_error(state);
@@ -309,7 +357,7 @@ fn handle_presentation(
             Vec::new()
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
-            let target = target_at(state, moved.y);
+            let target = target_at(state, moved.x, moved.y);
             if state.hovered != target {
                 state.hovered = target;
                 redraw_or_record_error(state);
@@ -319,20 +367,28 @@ fn handle_presentation(
         PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
             state.hovered = None;
             state.pressed = None;
+            state.backdrop_pressed = false;
             redraw_or_record_error(state);
             Vec::new()
         }
         PresentationEvent::PointerButton(button)
             if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
-            let target = target_at(state, button.y);
+            let window = state.window();
+            let target = target_at(state, button.x, button.y);
             if button.pressed {
+                state.backdrop_pressed = !window.contains(button.x, button.y);
                 state.pressed = target;
                 state.hovered = target;
                 if let Some(target) = target {
                     state.selected = Some(target);
                 }
             } else {
+                if state.backdrop_pressed && !window.contains(button.x, button.y) {
+                    state.backdrop_pressed = false;
+                    return hide(state);
+                }
+                state.backdrop_pressed = false;
                 let pressed = state.pressed.take();
                 state.hovered = target;
                 if pressed.is_some() && pressed == target {
@@ -345,6 +401,9 @@ fn handle_presentation(
             Vec::new()
         }
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
+            if !state.window().contains(scroll.x, scroll.y) {
+                return Vec::new();
+            }
             let filtered = state.filtered();
             let max_scroll = filtered.len().saturating_sub(state.visible_rows());
             if scroll.vertical < 0.0 {
@@ -445,11 +504,18 @@ fn move_selection(state: &mut KeybindingsState, delta: isize) {
     state.ensure_selected_visible();
 }
 
-fn target_at(state: &KeybindingsState, y: f32) -> Option<usize> {
-    if !y.is_finite() || y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
+fn target_at(state: &KeybindingsState, x: f32, y: f32) -> Option<usize> {
+    let window = state.window();
+    if !window.contains(x, y) {
         return None;
     }
-    let row = ((y - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(0.0) as usize;
+    let local_y = y - window.y;
+    if local_y < HEADER_HEIGHT || local_y >= window.height - FOOTER_HEIGHT {
+        return None;
+    }
+    let row = ((local_y - HEADER_HEIGHT) / ROW_HEIGHT)
+        .floor()
+        .max(0.0) as usize;
     state.filtered().get(state.scroll + row).copied()
 }
 
@@ -478,6 +544,7 @@ fn hide(state: &mut KeybindingsState) -> Vec<ActorCommand> {
     state.capture = None;
     state.hovered = None;
     state.pressed = None;
+    state.backdrop_pressed = false;
     state.escape_pending = false;
     state.status.clear();
     redraw_or_record_error(state);
@@ -595,22 +662,55 @@ fn redraw_or_record_error(state: &mut KeybindingsState) {
 }
 
 fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
-    let header = header_geometry(state.width);
-    let row_layout = row_geometry(state.width);
+    let window = state.window();
+    let width = window.width;
+    let height = window.height;
+    let header = header_geometry(width);
+    let row_layout = row_geometry(width);
     let mut packet = Packet::new();
     let mut resources = Vec::new();
-    packet.push(Command::FillRoundedRect {
+    packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
+        color: SCRIM,
+    });
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(
+            window.x - 12.0,
+            window.y - 6.0,
+            window.width + 24.0,
+            window.height + 28.0,
+        ),
+        radius: RADIUS + 12.0,
+        color: SHADOW_WIDE,
+    });
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(
+            window.x - 5.0,
+            window.y - 2.0,
+            window.width + 10.0,
+            window.height + 13.0,
+        ),
+        radius: RADIUS + 5.0,
+        color: SHADOW_NEAR,
+    });
+    packet.push(Command::Save);
+    packet.push(Command::SetTransform(Transform {
+        tx: window.x,
+        ty: window.y,
+        ..Transform::IDENTITY
+    }));
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(0.0, 0.0, width, height),
         radius: RADIUS,
         color: BG,
     });
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
+        rect: Rect::new(0.0, 0.0, width, HEADER_HEIGHT),
         radius: RADIUS,
         color: PANEL,
     });
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, RADIUS, state.width, HEADER_HEIGHT - RADIUS),
+        rect: Rect::new(0.0, RADIUS, width, HEADER_HEIGHT - RADIUS),
         color: PANEL,
     });
     add_text(
@@ -681,8 +781,8 @@ fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
     packet.push(Command::ClipRect(Rect::new(
         0.0,
         HEADER_HEIGHT,
-        state.width,
-        state.height - HEADER_HEIGHT - FOOTER_HEIGHT,
+        width,
+        height - HEADER_HEIGHT - FOOTER_HEIGHT,
     )));
     for (row, index) in filtered
         .iter()
@@ -700,7 +800,7 @@ fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
         let pressed = state.pressed == Some(index);
         if selected || hovered || pressed {
             packet.push(Command::FillRect {
-                rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
+                rect: Rect::new(0.0, y, width, ROW_HEIGHT),
                 color: if pressed {
                     ashen::INTERACTIVE_PRESSED
                 } else if hovered {
@@ -717,7 +817,7 @@ fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
             });
         }
         packet.push(Command::FillRect {
-            rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
+            rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, width, 1.0),
             color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.32),
         });
         add_text(
@@ -793,18 +893,18 @@ fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
             MUTED,
             SIDE_MARGIN,
             HEADER_HEIGHT + 14.0,
-            state.width - SIDE_MARGIN * 2.0,
+            width - SIDE_MARGIN * 2.0,
         )?;
     }
 
-    let footer_y = state.height - FOOTER_HEIGHT;
+    let footer_y = height - FOOTER_HEIGHT;
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(0.0, footer_y, state.width, FOOTER_HEIGHT),
+        rect: Rect::new(0.0, footer_y, width, FOOTER_HEIGHT),
         radius: RADIUS,
         color: PANEL,
     });
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, footer_y, state.width, RADIUS),
+        rect: Rect::new(0.0, footer_y, width, RADIUS),
         color: PANEL,
     });
     let footer = if state.status.is_empty() {
@@ -819,19 +919,20 @@ fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
         state,
         &mut packet,
         &mut resources,
-        &truncate_to_width(&footer, state.width - SIDE_MARGIN * 2.0, 10.0),
+        &truncate_to_width(&footer, width - SIDE_MARGIN * 2.0, 10.0),
         10.0,
         if state.error { ERROR } else { MUTED },
         SIDE_MARGIN,
         footer_y + 9.0,
-        state.width - SIDE_MARGIN * 2.0,
+        width - SIDE_MARGIN * 2.0,
     )?;
     packet.push(Command::StrokeRoundedRect {
-        rect: Rect::new(0.5, 0.5, state.width - 1.0, state.height - 1.0),
+        rect: Rect::new(0.5, 0.5, width - 1.0, height - 1.0),
         radius: RADIUS,
         color: BORDER,
         width: 1.0,
     });
+    packet.push(Command::Restore);
 
     submit_packet(state.pane, &packet)?;
     drop_resources(state.pane, state.text_resources.drain(..));
@@ -937,21 +1038,31 @@ mod tests {
     }
 
     #[test]
-    fn narrow_pane_geometry_uses_the_real_extent_without_cutoff() {
+    fn floating_window_is_centered_and_uses_the_real_narrow_extent() {
         let mut state = KeybindingsState::new();
         state.resize(330.0, 300.0);
         assert_eq!((state.width, state.height), (330.0, 300.0));
         assert_eq!(state.visible_rows(), 4);
 
-        let header = header_geometry(state.width);
+        let window = state.window();
+        assert_eq!(window, FloatingWindow::in_viewport(330.0, 300.0));
+        assert_eq!((window.x, window.y), (16.0, 16.0));
+        assert_eq!((window.width, window.height), (298.0, 268.0));
+        assert!(window.contains(16.0, 16.0));
+        assert!(!window.contains(0.0, 0.0));
+
+        let header = header_geometry(window.width);
         assert!(header.title_width > 0.0);
         assert!(header.search_width > 0.0);
-        assert!(header.search_x + header.search_width <= state.width - SIDE_MARGIN);
+        assert!(header.search_x + header.search_width <= window.width - SIDE_MARGIN);
 
-        let row = row_geometry(state.width);
+        let row = row_geometry(window.width);
         assert!(row.title_width > 0.0);
         assert!(row.chip_width > 0.0);
-        assert!(row.chip_x + row.chip_width <= state.width - SIDE_MARGIN);
+        assert!(row.chip_x + row.chip_width <= window.width - SIDE_MARGIN);
+
+        assert_eq!(target_at(&state, window.x + 1.0, window.y + HEADER_HEIGHT), Some(0));
+        assert_eq!(target_at(&state, 0.0, 0.0), None);
     }
 }
 

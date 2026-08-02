@@ -498,9 +498,15 @@ assert bindings["inbox.show"] == (58, 3), bindings
 PY
 
 KEYBINDINGS_LAYOUT_VISIBLE="$(accepted_layout_count)"
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  "$OUT/virtual-keyboard-key" --none 1
+if [[ "$OUTPUT_MODE" == "1280x720" ]]; then
+  KEYBINDINGS_CLOSE_PROOF="Clicking the dimmed backdrop closed the window."
+  click_at 32 360
+else
+  KEYBINDINGS_CLOSE_PROOF="Escape closed the window in the narrow presentation."
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 1
+fi
 for _ in $(seq 1 100); do
   KEYBINDINGS_LAYOUT_CLOSED="$(accepted_layout_count)"
   ((KEYBINDINGS_LAYOUT_CLOSED > KEYBINDINGS_LAYOUT_VISIBLE)) && break
@@ -531,7 +537,8 @@ if [[ "${BROOD_KEYBINDINGS_ONLY:-0}" == "1" ]]; then
   cat > "$OUT/proof.md" <<EOF
 # Global keybinding remapping proof
 
-- Ctrl+Shift+/ opened the presentation-global keybindings actor as a floating pane.
+- Ctrl+Shift+/ opened the presentation-global keybindings actor as a modal floating window.
+- $KEYBINDINGS_CLOSE_PROOF
 - Fuzzy text \`toggle session switcher\` narrowed the action catalogue.
 - Capturing Ctrl+Alt+I rebound \`sessions.toggle\` and swapped the conflicting
   \`inbox.show\` action onto the old Ctrl+Alt+M chord.

@@ -178,15 +178,17 @@ session state or toggle the rail.
 ## Global Remapping
 
 The presentation-global `keybindings` actor renders the effective action
-catalogue as a floating pane. Search matches action titles, categories, stable
-IDs, scopes, and current chords. Enter or a pointer click starts bounded
-pane-local capture; the next non-modifier physical key records a chord and
-Escape cancels capture.
+catalogue in a centered modal floating window over the current workspace. Its
+full-viewport layer dims and contains the workspace without changing the
+underlying layout; clicking the backdrop or pressing Escape closes it. Search
+matches action titles, categories, stable IDs, scopes, and current chords.
+Enter or a pointer click starts bounded pane-local capture; the next
+non-modifier physical key records a chord and Escape cancels capture.
 
-The editor lays out against its allocated pane extent rather than assuming its
-preferred desktop size. Narrow or recursively composed presentations compact
-the search field and chord column, reduce the visible row count, and keep the
-footer and panel border inside the pane.
+The editor derives the floating window from its allocated viewport rather than
+assuming a desktop size. Narrow or recursively composed presentations preserve
+a viewport margin, compact the search field and chord column, reduce the visible
+row count, and keep the footer and window border inside the viewport.
 
 The presentation client validates updates from the authenticated editor actor,
 applies them to the immutable policy publication used by the next key event,
