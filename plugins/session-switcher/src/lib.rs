@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
 const PICKER_ACTOR_ID: &str = "picker";
+const BACKEND_PICKER_REQUEST: &str = "backend-discovery";
 const KEYBINDINGS_ACTOR_ID: &str = "keybindings";
 const INBOX_ACTOR_ID: &str = "inbox";
 const STATUS_BAR_ACTOR_ID: &str = "status-bar";
@@ -123,6 +124,7 @@ struct SwitcherState {
     width: f32,
     height: f32,
     sessions: Vec<ViewSession>,
+    backends: Vec<(u64, String)>,
     collapsed_projects: BTreeSet<String>,
     selected: Option<(u64, u64)>,
     query: String,
@@ -131,6 +133,8 @@ struct SwitcherState {
     request: u64,
     pending: Option<u64>,
     pending_directory_backend: Option<u64>,
+    awaiting_backend_catalogue: bool,
+    backend_picker: Option<u64>,
     status: String,
     error: bool,
     next_coding_agent_ui: u64,
@@ -288,7 +292,24 @@ struct InboxReadyMessage {
 struct PickerSelection {
     #[serde(rename = "type")]
     _message_type: serde_json_core::heapless::String<32>,
+    picker: u64,
     result: SessionPickerResult,
+}
+
+#[derive(Deserialize)]
+struct PickerCreatedMessage {
+    #[serde(rename = "type")]
+    _message_type: serde_json_core::heapless::String<32>,
+    #[serde(default)]
+    request: Option<String>,
+    picker: u64,
+}
+
+#[derive(Deserialize)]
+struct PickerCancelledMessage {
+    #[serde(rename = "type")]
+    _message_type: serde_json_core::heapless::String<32>,
+    picker: u64,
 }
 
 #[derive(Deserialize)]
@@ -360,9 +381,23 @@ struct WorktreeSessionCompletion {
 struct SessionPickerRequest {
     #[serde(rename = "type")]
     message_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<&'static str>,
     title: &'static str,
     placeholder: &'static str,
     items: Vec<SessionPickerItem>,
+    loading: bool,
+    loading_label: &'static str,
+}
+
+#[derive(Serialize)]
+struct SessionPickerUpdate {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    picker: u64,
+    items: Vec<SessionPickerItem>,
+    loading: bool,
+    loading_label: &'static str,
 }
 
 #[derive(Serialize)]
@@ -382,6 +417,12 @@ struct SessionPickerValueWire {
     action: Option<String>,
     #[serde(default)]
     directory: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StatusBarNotice<'a> {
+    kind: &'static str,
+    message: &'a str,
 }
 
 #[derive(Serialize)]
@@ -419,6 +460,7 @@ impl SwitcherState {
             width: 320.0,
             height: 720.0,
             sessions: Vec::new(),
+            backends: Vec::new(),
             collapsed_projects: BTreeSet::new(),
             selected: None,
             query: String::new(),
@@ -427,6 +469,8 @@ impl SwitcherState {
             request: 0,
             pending: None,
             pending_directory_backend: None,
+            awaiting_backend_catalogue: false,
+            backend_picker: None,
             status: String::new(),
             error: false,
             next_coding_agent_ui: 2,
@@ -758,7 +802,7 @@ impl Guest for SessionSwitcher {
                     state.inbox_visible = false;
                     state.error = true;
                     state.status = format!("The global inbox failed: {}", failed.message);
-                    return Vec::new();
+                    return status_bar_notice(&state.status).into_iter().collect();
                 }
                 if failed.id == STATUS_BAR_ACTOR_ID {
                     state.status_bar_pane = None;
@@ -791,7 +835,12 @@ impl Guest for SessionSwitcher {
                     });
                 state.error = true;
                 state.status = format!("Plugin pane failed: {}", failed.message);
-                editor_failure.into_iter().chain(stop).collect()
+                let notice = status_bar_notice(&state.status);
+                editor_failure
+                    .into_iter()
+                    .chain(stop)
+                    .chain(notice)
+                    .collect()
             }
             Event::Presentation(event) => handle_presentation(event),
             Event::Session(event) => handle_session_event(event),
@@ -833,6 +882,20 @@ impl Guest for SessionSwitcher {
     }
 }
 
+fn status_bar_notice(message: &str) -> Option<ActorCommand> {
+    serde_json::to_vec(&StatusBarNotice {
+        kind: "status-bar-error",
+        message,
+    })
+    .ok()
+    .map(|body| {
+        ActorCommand::SendLocalMessage(LocalActorMessage {
+            actor: STATUS_BAR_ACTOR_ID.to_string(),
+            body,
+        })
+    })
+}
+
 fn handle_inbox_message(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok((message, consumed)) = serde_json_core::from_slice::<InboxReadyMessage>(bytes) else {
         return Vec::new();
@@ -860,10 +923,7 @@ fn handle_status_bar_message(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok((message, consumed)) = serde_json_core::from_slice::<InboxReadyMessage>(bytes) else {
         return Vec::new();
     };
-    if consumed != bytes.len()
-        || message.kind.as_str() != "status-bar-ready"
-        || message.pane == 0
-    {
+    if consumed != bytes.len() || message.kind.as_str() != "status-bar-ready" || message.pane == 0 {
         return Vec::new();
     }
     let Ok(mut state) = STATE.lock() else {
@@ -980,6 +1040,11 @@ fn apply_backend_sessions(
     state.can_create_local = can_create_local;
     state.can_connect_remote = can_connect_remote;
     state.can_create_container = can_create_container;
+    state.backends = backends
+        .iter()
+        .map(|backend| (backend.backend.0, backend.label.clone()))
+        .collect();
+    state.backends.sort_by_key(|(backend, _)| *backend);
     state.sessions = backends
         .into_iter()
         .flat_map(|backend| {
@@ -1369,7 +1434,9 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         return Vec::new();
     }
     let requested_focus = match message.action.as_str() {
-        "new" => return open_creation_backend_picker(&mut state),
+        "new" => {
+            return request_creation_backend_picker(&mut state);
+        }
         "picker" => return open_session_picker(&mut state),
         "show" => {
             state.sidebar_visible = true;
@@ -1407,8 +1474,7 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     {
         return handle_editor_message(sender, message);
     }
-    if let Ok((message, consumed)) = serde_json_core::from_slice::<BackendCatalogueMessage>(bytes)
-        && consumed == bytes.len()
+    if let Ok(message) = serde_json::from_slice::<BackendCatalogueMessage>(bytes)
         && message.validate().is_ok()
     {
         match message {
@@ -1443,11 +1509,19 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
                         can_create_container,
                         backends,
                     );
+                    if state.awaiting_backend_catalogue {
+                        state.awaiting_backend_catalogue = false;
+                        state.status = "Backends discovered".to_string();
+                        state.error = false;
+                        if let Some(update) = update_creation_backend_picker(&state) {
+                            return vec![update];
+                        }
+                    }
                     if let Some(backend) = state.pending_directory_backend
                         && state
-                            .sessions
+                            .backends
                             .iter()
-                            .any(|session| session.backend == backend)
+                            .any(|(candidate, _)| *candidate == backend)
                     {
                         return open_directory_picker(&mut state, backend);
                     }
@@ -1812,11 +1886,36 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
     match kind.message_type.as_str() {
         "picker-pane" => handle_picker_layout_message(bytes),
         "picker-created" => {
-            if let Ok(mut state) = STATE.lock() {
-                state.status = "Session picker opened".to_string();
+            let Ok((message, consumed)) =
+                serde_json_core::from_slice::<PickerCreatedMessage>(bytes)
+            else {
+                return Vec::new();
+            };
+            if consumed != bytes.len() {
+                return Vec::new();
+            }
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            if message.request.as_deref() == Some(BACKEND_PICKER_REQUEST) {
+                state.backend_picker = Some(message.picker);
+                state.status = if state.awaiting_backend_catalogue {
+                    "Discovering backends…".to_string()
+                } else {
+                    "Backends discovered".to_string()
+                };
                 state.error = false;
                 redraw_or_record_error(&mut state);
+                if !state.awaiting_backend_catalogue
+                    && let Some(update) = update_creation_backend_picker(&state)
+                {
+                    return vec![update];
+                }
+                return Vec::new();
             }
+            state.status = "Session picker opened".to_string();
+            state.error = false;
+            redraw_or_record_error(&mut state);
             Vec::new()
         }
         "picker-selected" => handle_picker_selection(bytes),
@@ -1832,7 +1931,18 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
             }
             Vec::new()
         }
-        "picker-cancelled" => Vec::new(),
+        "picker-cancelled" => {
+            if let Ok((message, consumed)) =
+                serde_json_core::from_slice::<PickerCancelledMessage>(bytes)
+                && consumed == bytes.len()
+                && let Ok(mut state) = STATE.lock()
+                && state.backend_picker == Some(message.picker)
+            {
+                state.backend_picker = None;
+                state.awaiting_backend_catalogue = false;
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -1903,6 +2013,10 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
+    if state.backend_picker == Some(message.picker) {
+        state.backend_picker = None;
+        state.awaiting_backend_catalogue = false;
+    }
     if let Some(session) = message.result.value.session {
         let backend = message.result.value.backend.unwrap_or_default();
         let request = state.next_request();
@@ -2017,9 +2131,12 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
         .collect::<Vec<_>>();
     let request = SessionPickerRequest {
         message_type: "picker-create",
+        request: None,
         title: "Switch session",
         placeholder: "Type to fuzzy-match sessions…",
         items,
+        loading: false,
+        loading_label: "",
     };
     let Ok(body) = serde_json::to_vec(&request) else {
         state.error = true;
@@ -2033,22 +2150,19 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     })]
 }
 
-fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
-    let mut items = state
-        .sessions
-        .iter()
-        .map(|session| session.backend)
-        .collect::<Vec<_>>();
-    items.sort_unstable();
-    items.dedup();
+fn creation_backend_items(state: &SwitcherState) -> Vec<SessionPickerItem> {
     let mut picker_items = Vec::new();
-    for backend in items {
-        let label = format!("Backend {backend}");
+    for (backend, backend_label) in &state.backends {
+        let label = if backend_label.is_empty() {
+            format!("Backend {backend}")
+        } else {
+            backend_label.clone()
+        };
         picker_items.push(SessionPickerItem {
             label,
             detail: "Create a session on this backend".to_string(),
             value: SessionPickerValueWire {
-                backend: Some(backend),
+                backend: Some(*backend),
                 session: None,
                 action: Some("choose-directory".to_string()),
                 directory: None,
@@ -2057,8 +2171,8 @@ fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> 
     }
     if state.can_create_local {
         picker_items.push(SessionPickerItem {
-            label: "Create local backend".to_string(),
-            detail: "Start another local session server".to_string(),
+            label: "Local".to_string(),
+            detail: "Start a local backend, then create a session".to_string(),
             value: SessionPickerValueWire {
                 backend: None,
                 session: None,
@@ -2082,8 +2196,7 @@ fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> 
     if state.can_create_container {
         picker_items.push(SessionPickerItem {
             label: "Create container backend".to_string(),
-            detail: "Run a backend in a local Podman container with GPU auto-detection"
-                .to_string(),
+            detail: "Run a backend in a local Podman container with GPU auto-detection".to_string(),
             value: SessionPickerValueWire {
                 backend: None,
                 session: None,
@@ -2102,22 +2215,73 @@ fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> 
             },
         });
     }
+    picker_items
+}
+
+fn creation_backend_picker_command(
+    state: &mut SwitcherState,
+    loading: bool,
+) -> Option<ActorCommand> {
     let request = SessionPickerRequest {
         message_type: "picker-create",
+        request: loading.then_some(BACKEND_PICKER_REQUEST),
         title: "Choose backend",
         placeholder: "Fuzzy-match a backend or create a connection…",
-        items: picker_items,
+        items: creation_backend_items(state),
+        loading,
+        loading_label: if loading {
+            "Discovering backends…"
+        } else {
+            ""
+        },
     };
     let Ok(body) = serde_json::to_vec(&request) else {
         state.error = true;
         state.status = "Could not encode the backend picker".to_string();
         redraw_or_record_error(state);
-        return Vec::new();
+        return None;
     };
-    vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+    Some(ActorCommand::SendLocalMessage(LocalActorMessage {
         actor: PICKER_ACTOR_ID.to_string(),
         body,
-    })]
+    }))
+}
+
+#[cfg(test)]
+fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    creation_backend_picker_command(state, false)
+        .into_iter()
+        .collect()
+}
+
+fn update_creation_backend_picker(state: &SwitcherState) -> Option<ActorCommand> {
+    let picker = state.backend_picker?;
+    let body = serde_json::to_vec(&SessionPickerUpdate {
+        message_type: "picker-update",
+        picker,
+        items: creation_backend_items(state),
+        loading: false,
+        loading_label: "",
+    })
+    .ok()?;
+    Some(ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body,
+    }))
+}
+
+fn request_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    state.awaiting_backend_catalogue = true;
+    state.backend_picker = None;
+    state.status = "Discovering backends…".to_string();
+    redraw_or_record_error(state);
+    let mut commands = creation_backend_picker_command(state, true)
+        .into_iter()
+        .collect::<Vec<_>>();
+    commands.push(ActorCommand::SendHostMessage(
+        br#"{"type":"request-backend-catalogue"}"#.to_vec(),
+    ));
+    commands
 }
 
 fn open_directory_picker(state: &mut SwitcherState, backend: u64) -> Vec<ActorCommand> {
@@ -2179,9 +2343,12 @@ fn show_directory_picker(
         .collect();
     let request = SessionPickerRequest {
         message_type: "picker-create",
+        request: None,
         title: "Choose directory",
         placeholder: "Fuzzy-match a directory…",
         items,
+        loading: false,
+        loading_label: "",
     };
     let Ok(body) = serde_json::to_vec(&request) else {
         state.error = true;
@@ -2610,7 +2777,7 @@ fn activate_switcher_target(
     target: SwitcherTarget,
 ) -> Vec<ActorCommand> {
     match target {
-        SwitcherTarget::NewSession => open_creation_backend_picker(state),
+        SwitcherTarget::NewSession => request_creation_backend_picker(state),
         SwitcherTarget::ProjectToggle(backend, project) => {
             let project_key = format!("{backend}:{project}");
             if !state.collapsed_projects.remove(&project_key) {
@@ -2791,7 +2958,10 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
                 state.status = "Use CONNECTION::IMAGE for a remote container".to_string();
                 return Vec::new();
             };
-            (Some(connection.trim().to_string()), image.trim().to_string())
+            (
+                Some(connection.trim().to_string()),
+                image.trim().to_string(),
+            )
         } else {
             (None, query.to_string())
         };
@@ -3411,16 +3581,16 @@ bindings::export!(SessionSwitcher with_types_in bindings);
 
 #[cfg(test)]
 mod tests {
-    use brood_plugin_sdk::exports::brood::plugin::actor::{
-        PresentationScope, PresentationSession,
-    };
+    use brood_plugin_sdk::exports::brood::plugin::actor::{PresentationScope, PresentationSession};
+    use brood_protocol::backend_catalogue::BackendCatalogueEntry;
 
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutStateSize, SwitcherState,
-        actor_realm, authenticated_neovim_client, ensure_default_terminal_ui, header_geometry,
-        neovim_client_realm, neovim_ui_id, open_creation_backend_picker, publish_layout,
+        actor_realm, apply_backend_sessions, authenticated_neovim_client,
+        ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
+        open_creation_backend_picker, publish_layout, request_creation_backend_picker,
         request_editor, sender_actor_is, shell_requested_focus, show_diff, start_neovim_client,
-        submit, truncate_to_width, valid_editor_actor_target,
+        submit, truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
     };
 
     #[test]
@@ -3453,9 +3623,7 @@ mod tests {
             panic!("empty startup layout should publish one complete root fragment");
         };
         let value: serde_json::Value = serde_json::from_slice(body).expect("valid layout JSON");
-        let items = value["layout"]["items"]
-            .as_array()
-            .expect("layout items");
+        let items = value["layout"]["items"].as_array().expect("layout items");
         assert_eq!(items.len(), 2);
         assert!(items.iter().any(|item| item["id"] == 1));
         let status = items
@@ -3501,16 +3669,17 @@ mod tests {
 
         state.status_bar_pane = Some(5);
         let commands = publish_layout(&state, true, Some(6));
-        let [ActorCommand::SendHostMessage(delegate), ActorCommand::SendHostMessage(layout)] =
-            commands.as_slice()
+        let [
+            ActorCommand::SendHostMessage(delegate),
+            ActorCommand::SendHostMessage(layout),
+        ] = commands.as_slice()
         else {
             panic!("complete shell catalogue should delegate and publish exactly once");
         };
         let delegate: serde_json::Value =
             serde_json::from_slice(delegate).expect("valid delegation JSON");
         assert_eq!(delegate["panes"], serde_json::json!([6]));
-        let layout: serde_json::Value =
-            serde_json::from_slice(layout).expect("valid layout JSON");
+        let layout: serde_json::Value = serde_json::from_slice(layout).expect("valid layout JSON");
         assert!(
             layout["layout"]["items"]
                 .as_array()
@@ -3712,7 +3881,17 @@ mod tests {
     #[test]
     fn backend_picker_exposes_local_and_remote_container_creation() {
         let mut state = SwitcherState::new();
-        state.can_create_container = true;
+        apply_backend_sessions(
+            &mut state,
+            true,
+            false,
+            true,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(7),
+                label: "Local".to_string(),
+                sessions: Vec::new(),
+            }],
+        );
         let commands = open_creation_backend_picker(&mut state);
         let [ActorCommand::SendLocalMessage(message)] = commands.as_slice() else {
             panic!("backend picker did not open");
@@ -3727,6 +3906,77 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(actions.contains(&"create-container-local"));
         assert!(actions.contains(&"create-container-remote"));
+        assert!(actions.contains(&"choose-directory"));
+        assert_eq!(value["items"][0]["label"], "Local");
+        assert_eq!(value["items"][0]["value"]["backend"], 7);
+        assert!(actions.contains(&"create-local"));
+        assert!(value["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["label"] == "Local" && item["value"]["action"] == "create-local")
+        }));
+    }
+
+    #[test]
+    fn new_session_opens_a_loading_picker_before_requesting_backends() {
+        let mut state = SwitcherState::new();
+        let commands = request_creation_backend_picker(&mut state);
+        let [
+            ActorCommand::SendLocalMessage(open),
+            ActorCommand::SendHostMessage(discover),
+        ] = commands.as_slice()
+        else {
+            panic!("new session did not open the picker before backend discovery");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&open.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(open.actor, "picker");
+        assert_eq!(value["type"], "picker-create");
+        assert_eq!(value["request"], "backend-discovery");
+        assert_eq!(value["loading"], true);
+        assert_eq!(value["loading_label"], "Discovering backends…");
+        assert_eq!(discover, br#"{"type":"request-backend-catalogue"}"#);
+    }
+
+    #[test]
+    fn completed_empty_discovery_offers_local_backend_creation() {
+        let mut state = SwitcherState::new();
+        state.backend_picker = Some(17);
+        apply_backend_sessions(&mut state, true, false, false, Vec::new());
+        let ActorCommand::SendLocalMessage(update) =
+            update_creation_backend_picker(&state).expect("picker update")
+        else {
+            panic!("backend discovery did not update the picker");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&update.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(value["type"], "picker-update");
+        assert_eq!(value["picker"], 17);
+        assert_eq!(value["loading"], false);
+        assert!(value["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["label"] == "Local" && item["value"]["action"] == "create-local")
+        }));
+    }
+
+    #[test]
+    fn backend_catalogue_wire_message_decodes_in_the_guest() {
+        let message = brood_protocol::backend_catalogue::BackendCatalogueMessage::sessions(
+            true,
+            true,
+            true,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(1),
+                label: "Backend 1".to_string(),
+                sessions: Vec::new(),
+            }],
+        );
+        let bytes = serde_json::to_vec(&message).expect("catalogue JSON");
+        let decoded = serde_json::from_slice::<
+            brood_protocol::backend_catalogue::BackendCatalogueMessage,
+        >(&bytes);
+        assert_eq!(decoded.expect("decode catalogue JSON"), message);
     }
 
     #[test]

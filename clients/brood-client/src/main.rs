@@ -879,14 +879,18 @@ fn main() -> Result<()> {
             Vec::new(),
         )
     };
+    let mut wasm_runtime = PresentationWasmRuntime::start(
+        &wasm_actor_specs,
+        init_actor.as_deref(),
+        bound_session_id,
+        Some(&plugin_graphics),
+        Some(event_proxy.clone()),
+    )?;
+    for backend in backend_registry.connected_backend_ids() {
+        wasm_runtime.connect_backend(backend);
+    }
     let mut application = Application {
-        wasm_runtime: Some(PresentationWasmRuntime::start(
-            &wasm_actor_specs,
-            init_actor.as_deref(),
-            bound_session_id,
-            Some(&plugin_graphics),
-            Some(event_proxy.clone()),
-        )?),
+        wasm_runtime: Some(wasm_runtime),
         key_policy: Some(key_policy),
         plugin_graphics: Some(plugin_graphics),
         clipboard,
@@ -905,6 +909,7 @@ fn main() -> Result<()> {
         backend_registry,
         ..Application::default()
     };
+    application.publish_backend_sessions()?;
 
     let run_result = event_loop
         .run_app(&mut application)
@@ -2843,6 +2848,9 @@ impl Application {
             )?;
         self.backend_registry
             .observe(backend, Some(fast_path.generation));
+        if let Some(runtime) = self.wasm_runtime.as_mut() {
+            runtime.connect_backend(backend);
+        }
         self.notify_backend_connected(backend)?;
         eprintln!("started dynamic local backend={backend:?} session={session_id:?}");
         Ok(())
@@ -2935,6 +2943,9 @@ impl Application {
             self.backend_registry
                 .observe(backend, Some(connection.generation));
             connection.activate_disconnect_notifications()?;
+            if let Some(runtime) = self.wasm_runtime.as_mut() {
+                runtime.connect_backend(backend);
+            }
             self.notify_backend_connected(backend)
         })();
         if let Err(error) = attach_result {
@@ -2948,6 +2959,9 @@ impl Application {
                 drop(commands.remove_backend(backend));
             }
             let _retired = self.backend_registry.retire(backend);
+            if let Some(runtime) = self.wasm_runtime.as_mut() {
+                drop(runtime.disconnect_backend(backend));
+            }
             drop(connection.shutdown());
             drop(origin.shutdown());
             return Err(error);
@@ -3113,14 +3127,16 @@ impl Application {
             self.local_server_template.is_some(),
             self.ssh_deployer.is_some(),
             self.container_deployer.is_some(),
-            self.backend_sessions
-                .iter()
-                .map(|(backend, snapshot)| BackendCatalogueEntry {
-                    backend: *backend,
+            self.backend_registry
+                .connected_backend_ids()
+                .map(|backend| BackendCatalogueEntry {
+                    backend,
                     label: format!("Backend {}", backend.0),
-                    sessions: snapshot
-                        .sessions
-                        .iter()
+                    sessions: self
+                        .backend_sessions
+                        .get(&backend)
+                        .into_iter()
+                        .flat_map(|snapshot| &snapshot.sessions)
                         .map(|session| BackendSessionEntry {
                             id: session.id,
                             name: session.name.clone(),
@@ -4035,6 +4051,12 @@ impl Application {
                                  failure: {notify_error:#}"
                             );
                         }
+                    }
+                    None
+                }
+                HostMessage::RequestBackendCatalogue => {
+                    if let Err(error) = self.publish_backend_sessions() {
+                        eprintln!("could not publish requested backend catalogue: {error:#}");
                     }
                     None
                 }
@@ -6204,6 +6226,7 @@ fn apply_key_policy_host_message(
         | HostMessage::ConnectRemoteBackend { .. }
         | HostMessage::DeploySshBackend { .. }
         | HostMessage::DeployContainerBackend { .. }
+        | HostMessage::RequestBackendCatalogue
         | HostMessage::CreateLocalBackend => None,
         HostMessage::SetClipboard { text } => {
             clipboard

@@ -43,6 +43,10 @@ A caller creates work by sending:
 }
 ```
 
+Callers that discover items asynchronously set `loading` and may provide a
+short `loading_label`. The picker is visible and accepts a query immediately;
+it renders a progress spinner until the owner publishes the discovered items.
+
 `request` is optional caller-owned JSON used only for correlating the reply.
 Items are either strings or objects with a string `label`. Object items may
 contain an optional string `detail` and any other caller-owned JSON.
@@ -68,6 +72,20 @@ results without replacing existing entries:
   "items": [
     {"label": "src/main.rs", "value": {"path": "src/main.rs"}}
   ]
+}
+```
+
+When a discovery result is a fresh snapshot rather than an append-only stream,
+the owner replaces the items and completes the loading state in one update:
+
+```json
+{
+  "type": "picker-update",
+  "picker": 7,
+  "items": [
+    {"label": "Local", "value": {"backend": 1}}
+  ],
+  "loading": false
 }
 ```
 

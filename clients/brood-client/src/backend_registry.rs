@@ -144,6 +144,12 @@ impl BackendRegistry {
         self.backends.len()
     }
 
+    pub(crate) fn connected_backend_ids(&self) -> impl Iterator<Item = BackendId> + '_ {
+        self.backends
+            .iter()
+            .filter_map(|(backend, state)| state.generation.is_some().then_some(*backend))
+    }
+
     #[cfg(test)]
     fn generation(&self, backend: BackendId) -> Option<u64> {
         self.backends
@@ -183,8 +189,8 @@ mod tests {
         let a = BackendId(10);
         let b = BackendId(20);
         let mut registry = BackendRegistry::default();
-        registry.replace_panes(a, None, [1, 2]);
-        registry.replace_panes(b, None, [3]);
+        registry.replace_panes(a, Some(1), [1, 2]);
+        registry.replace_panes(b, Some(1), [3]);
         registry.view_pane(QualifiedPane {
             backend: a,
             pane: 1,
@@ -212,6 +218,10 @@ mod tests {
             pane: 3
         }));
         assert_eq!(registry.all_view_routes().len(), 2);
+        assert_eq!(
+            registry.connected_backend_ids().collect::<Vec<_>>(),
+            vec![a, b]
+        );
     }
 
     #[test]
@@ -257,5 +267,17 @@ mod tests {
         assert!(registry.observe(backend, Some(4)));
         assert!(registry.all_view_routes().is_empty());
         assert_eq!(registry.generation(backend), Some(4));
+    }
+
+    #[test]
+    fn allocated_backend_is_not_connected_until_transport_generation_arrives() {
+        let mut registry = BackendRegistry::default();
+        let backend = registry.allocate(None);
+        assert!(registry.connected_backend_ids().next().is_none());
+        assert!(registry.observe(backend, Some(7)));
+        assert_eq!(
+            registry.connected_backend_ids().collect::<Vec<_>>(),
+            [backend]
+        );
     }
 }

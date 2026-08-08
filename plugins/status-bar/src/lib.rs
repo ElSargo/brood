@@ -9,6 +9,7 @@ use brood_plugin_sdk::{
     },
     graphics::{drop_resources, layout_ui_text, submit_packet},
 };
+use serde::Deserialize;
 
 const STATUS_BAR_ACTOR_ID: &str = "status-bar";
 const SHELL_ACTOR_ID: &str = "session-switcher";
@@ -30,6 +31,7 @@ struct StatusBarState {
     backends: BTreeMap<u64, StatusBackend>,
     text_resources: Vec<u64>,
     error: String,
+    notice: String,
 }
 
 impl StatusBarState {
@@ -41,6 +43,7 @@ impl StatusBarState {
             backends: BTreeMap::new(),
             text_resources: Vec::new(),
             error: String::new(),
+            notice: String::new(),
         }
     }
 }
@@ -110,6 +113,20 @@ impl Guest for StatusBar {
                 redraw_or_record_error(&mut state);
                 Vec::new()
             }
+            Event::Mailbox(message) if message.sender == SHELL_ACTOR_ID => {
+                let Ok(notice) = serde_json::from_slice::<StatusBarNotice>(&message.body) else {
+                    return Vec::new();
+                };
+                if notice.kind != "status-bar-error" || notice.message.is_empty() {
+                    return Vec::new();
+                }
+                let Ok(mut state) = STATE.lock() else {
+                    return Vec::new();
+                };
+                state.notice = notice.message;
+                redraw_or_record_error(&mut state);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -173,6 +190,9 @@ fn redraw(state: &mut StatusBarState) -> Result<(), String> {
 }
 
 fn status_bar_text(state: &StatusBarState, width: f32) -> String {
+    if !state.notice.is_empty() {
+        return state.notice.clone();
+    }
     let session_count = state
         .backends
         .values()
@@ -203,6 +223,12 @@ fn status_bar_text(state: &StatusBarState, width: f32) -> String {
     }
 }
 
+#[derive(Deserialize)]
+struct StatusBarNotice {
+    kind: String,
+    message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +252,12 @@ mod tests {
 
         state.backends.get_mut(&1).expect("backend").session_count = 1;
         assert!(status_bar_text(&state, 1440.0).contains("main · 1 session"));
+
+        state.notice = "terminal-ui failed to create its pane".to_string();
+        assert_eq!(
+            status_bar_text(&state, 360.0),
+            "terminal-ui failed to create its pane"
+        );
     }
 }
 

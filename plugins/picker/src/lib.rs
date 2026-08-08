@@ -5,10 +5,12 @@ use brood_plugin_sdk::{
     actor::send_local,
     bindings,
     exports::brood::plugin::actor::{
-        Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
+        Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
+        WorkerRequest,
     },
     graphics::{drop_resources, layout_ui_text, submit_packet},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
+    runtime::sleep,
     text::{truncate, truncate_to_width},
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,7 @@ const ROW_HEIGHT: f32 = 30.0;
 const SIDE_MARGIN: f32 = 14.0;
 const CONTAINER_RADIUS: f32 = 8.0;
 const QUERY_X: f32 = 150.0;
+const SPINNER_INTERVAL_MS: u64 = 90;
 
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
@@ -47,12 +50,26 @@ enum PickerMessage {
         placeholder: String,
         #[serde(default)]
         items: Vec<Value>,
+        #[serde(default)]
+        loading: bool,
+        #[serde(default)]
+        loading_label: String,
     },
     #[serde(rename = "picker-add")]
     Add {
         picker: u64,
         #[serde(default)]
         items: Vec<Value>,
+    },
+    #[serde(rename = "picker-update")]
+    Update {
+        picker: u64,
+        #[serde(default)]
+        items: Vec<Value>,
+        #[serde(default)]
+        loading: bool,
+        #[serde(default)]
+        loading_label: String,
     },
     #[serde(rename = "picker-cancel")]
     Cancel { picker: u64 },
@@ -112,6 +129,8 @@ struct PickerRequest {
     query: String,
     selected: Option<usize>,
     scroll: usize,
+    loading: bool,
+    loading_label: String,
 }
 
 impl PickerRequest {
@@ -121,6 +140,8 @@ impl PickerRequest {
         title: String,
         placeholder: String,
         items: Vec<Value>,
+        loading: bool,
+        loading_label: String,
     ) -> Result<Self, String> {
         let entries = parse_entries(0, items)?;
         let selected = entries.first().map(|entry| entry.index);
@@ -133,12 +154,28 @@ impl PickerRequest {
             query: String::new(),
             selected,
             scroll: 0,
+            loading,
+            loading_label,
         })
     }
 
     fn add(&mut self, items: Vec<Value>) -> Result<(), String> {
         let start = self.items.len();
         self.items.extend(parse_entries(start, items)?);
+        self.ensure_selection();
+        Ok(())
+    }
+
+    fn update(
+        &mut self,
+        items: Vec<Value>,
+        loading: bool,
+        loading_label: String,
+    ) -> Result<(), String> {
+        self.items = parse_entries(0, items)?;
+        self.loading = loading;
+        self.loading_label = loading_label;
+        self.scroll = 0;
         self.ensure_selection();
         Ok(())
     }
@@ -209,6 +246,9 @@ struct PickerState {
     error: bool,
     hovered: Option<usize>,
     pressed: Option<usize>,
+    spinner_phase: usize,
+    spinner_worker: Option<u64>,
+    next_spinner_worker: u64,
 }
 
 impl PickerState {
@@ -225,6 +265,9 @@ impl PickerState {
             error: false,
             hovered: None,
             pressed: None,
+            spinner_phase: 0,
+            spinner_worker: None,
+            next_spinner_worker: 1,
         }
     }
 
@@ -256,7 +299,23 @@ impl PickerState {
         self.error = false;
         self.hovered = None;
         self.pressed = None;
+        self.spinner_phase = 0;
         self.active.is_some()
+    }
+
+    fn start_spinner(&mut self) -> Option<ActorCommand> {
+        if self.spinner_worker.is_some()
+            || !self.active.as_ref().is_some_and(|picker| picker.loading)
+        {
+            return None;
+        }
+        let worker = self.next_spinner_worker;
+        self.next_spinner_worker = self.next_spinner_worker.checked_add(1)?;
+        self.spinner_worker = Some(worker);
+        Some(ActorCommand::SpawnWorker(WorkerRequest {
+            worker,
+            payload: Vec::new(),
+        }))
     }
 }
 
@@ -275,11 +334,13 @@ impl Guest for PickerActor {
             }
             Event::Mailbox(message) => handle_message(&message.sender, &message.body),
             Event::Presentation(event) => handle_presentation(event),
+            Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
         }
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        sleep(SPINNER_INTERVAL_MS).await?;
         Ok(Vec::new())
     }
 }
@@ -304,8 +365,24 @@ fn handle_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
             title,
             placeholder,
             items,
-        } => create_picker(sender, request, title, placeholder, items),
+            loading,
+            loading_label,
+        } => create_picker(
+            sender,
+            request,
+            title,
+            placeholder,
+            items,
+            loading,
+            loading_label,
+        ),
         PickerMessage::Add { picker, items } => add_items(sender, picker, items),
+        PickerMessage::Update {
+            picker,
+            items,
+            loading,
+            loading_label,
+        } => update_picker(sender, picker, items, loading, loading_label),
         PickerMessage::Cancel { picker } => cancel_picker(sender, picker),
         PickerMessage::Close if sender == "pane-close" => {
             let Ok(mut state) = STATE.lock() else {
@@ -323,6 +400,8 @@ fn create_picker(
     title: String,
     placeholder: String,
     items: Vec<Value>,
+    loading: bool,
+    loading_label: String,
 ) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
@@ -340,7 +419,15 @@ fn create_picker(
             )];
         }
     };
-    let picker = match PickerRequest::new(id, sender.to_string(), title, placeholder, items) {
+    let picker = match PickerRequest::new(
+        id,
+        sender.to_string(),
+        title,
+        placeholder,
+        items,
+        loading,
+        loading_label,
+    ) {
         Ok(picker) => picker,
         Err(message) => {
             return vec![reply(
@@ -376,6 +463,9 @@ fn create_picker(
     if !queued && state.pane != 0 {
         commands.push(layout_visibility(state.pane, true));
     }
+    if !queued && let Some(spinner) = state.start_spinner() {
+        commands.push(spinner);
+    }
     commands
 }
 
@@ -404,6 +494,64 @@ fn add_items(sender: &str, picker: u64, items: Vec<Value>) -> Vec<ActorCommand> 
     }
     if active {
         redraw_or_record_error(&mut state);
+    }
+    Vec::new()
+}
+
+fn update_picker(
+    sender: &str,
+    picker: u64,
+    items: Vec<Value>,
+    loading: bool,
+    loading_label: String,
+) -> Vec<ActorCommand> {
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let active = state
+        .active
+        .as_ref()
+        .is_some_and(|active| active.id == picker);
+    let result = match state.find_mut(picker) {
+        Some(request) if request.owner == sender => request.update(items, loading, loading_label),
+        Some(_) => Err("only the actor that created a picker may update it".to_string()),
+        None => Err("picker is unavailable".to_string()),
+    };
+    if let Err(message) = result {
+        return vec![reply(
+            sender,
+            &ErrorReply {
+                message_type: "picker-error",
+                picker: Some(picker),
+                message,
+            },
+        )];
+    }
+    if active {
+        state.spinner_phase = 0;
+        redraw_or_record_error(&mut state);
+    }
+    state.start_spinner().into_iter().collect()
+}
+
+fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
+    let (worker, advance) = match event {
+        WorkerEvent::Started(_) => return Vec::new(),
+        WorkerEvent::Finished(finished) => (finished.worker, true),
+        WorkerEvent::Failed(failed) => (failed.worker, false),
+        WorkerEvent::Cancelled(worker) => (worker, false),
+    };
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if state.spinner_worker != Some(worker) {
+        return Vec::new();
+    }
+    state.spinner_worker = None;
+    if advance && state.active.as_ref().is_some_and(|picker| picker.loading) {
+        state.spinner_phase = state.spinner_phase.wrapping_add(1) % 8;
+        redraw_or_record_error(&mut state);
+        return state.start_spinner().into_iter().collect();
     }
     Vec::new()
 }
@@ -676,6 +824,7 @@ fn finish_active(state: &mut PickerState, selected: bool) -> Vec<ActorCommand> {
     }
     if state.promote() {
         redraw_or_record_error(state);
+        commands.extend(state.start_spinner());
     } else if state.pane != 0 {
         commands.push(layout_visibility(state.pane, false));
     }
@@ -991,7 +1140,30 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
         }
         packet.push(Command::Restore);
 
-        if filtered.is_empty() {
+        if active.loading {
+            let loading_row = filtered
+                .len()
+                .saturating_sub(active.scroll)
+                .min(visible_rows - 1);
+            let loading_y = HEADER_HEIGHT + loading_row as f32 * ROW_HEIGHT;
+            draw_spinner(&mut packet, state.spinner_phase, loading_y + 15.0);
+            let loading_label = if active.loading_label.trim().is_empty() {
+                "Loading…"
+            } else {
+                active.loading_label.as_str()
+            };
+            add_text(
+                state,
+                &mut packet,
+                &mut resources,
+                loading_label,
+                13.0,
+                MUTED,
+                SIDE_MARGIN + 24.0,
+                loading_y + 9.0,
+                state.width - SIDE_MARGIN * 2.0 - 24.0,
+            )?;
+        } else if filtered.is_empty() {
             add_text(
                 state,
                 &mut packet,
@@ -1005,7 +1177,13 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
             )?;
         }
 
-        let footer = if !state.status.is_empty() {
+        let footer = if active.loading {
+            if active.loading_label.trim().is_empty() {
+                "Loading…".to_string()
+            } else {
+                active.loading_label.clone()
+            }
+        } else if !state.status.is_empty() {
             state.status.clone()
         } else if let Some(hovered) = state.hovered {
             let label = active
@@ -1056,6 +1234,29 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
     Ok(())
 }
 
+fn draw_spinner(packet: &mut Packet, phase: usize, center_y: f32) {
+    let center_x = SIDE_MARGIN + 7.0;
+    let points = [
+        (0.0, -7.0),
+        (5.0, -5.0),
+        (7.0, 0.0),
+        (5.0, 5.0),
+        (0.0, 7.0),
+        (-5.0, 5.0),
+        (-7.0, 0.0),
+        (-5.0, -5.0),
+    ];
+    for (index, (x, y)) in points.into_iter().enumerate() {
+        let distance = (index + 8 - phase % 8) % 8;
+        let alpha = 1.0 - distance as f32 * 0.1;
+        packet.push(Command::FillRoundedRect {
+            rect: Rect::new(center_x + x - 1.5, center_y + y - 1.5, 3.0, 3.0),
+            radius: 1.5,
+            color: Color::rgba(YELLOW.r, YELLOW.g, YELLOW.b, alpha.max(0.3)),
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_text(
     state: &PickerState,
@@ -1099,6 +1300,8 @@ mod tests {
             String::new(),
             String::new(),
             labels.iter().map(|label| json!(label)).collect(),
+            false,
+            String::new(),
         )
         .expect("valid picker request")
     }
@@ -1159,6 +1362,8 @@ mod tests {
                 "Choose".to_string(),
                 String::new(),
                 vec![json!("alpha"), json!({"label":"beta","value":{"id":42}})],
+                false,
+                String::new(),
             )
             .expect("valid picker request"),
         );
@@ -1175,6 +1380,31 @@ mod tests {
         assert_eq!(body["picker"], 9);
         assert_eq!(body["index"], 1);
         assert_eq!(body["result"]["value"]["id"], 42);
+    }
+
+    #[test]
+    fn update_replaces_loading_results_without_resetting_the_query() {
+        let mut picker = PickerRequest::new(
+            4,
+            "caller".to_string(),
+            "Backends".to_string(),
+            String::new(),
+            Vec::new(),
+            true,
+            "Discovering backends…".to_string(),
+        )
+        .expect("valid loading picker");
+        picker.query = "loc".to_string();
+        picker
+            .update(
+                vec![json!({"label":"Local","value":{"backend":1}})],
+                false,
+                String::new(),
+            )
+            .expect("replace picker results");
+        assert!(!picker.loading);
+        assert_eq!(picker.query, "loc");
+        assert_eq!(picker.selected, Some(0));
     }
 }
 

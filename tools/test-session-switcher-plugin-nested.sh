@@ -390,6 +390,46 @@ PY
     "$OUT/empty-startup-status-bar.png"
   STATUS_COLOURS="$(magick "$OUT/empty-startup-status-bar.png" -format '%k' info:)"
   ((STATUS_COLOURS >= 8))
+
+  EMPTY_BACKEND_PICKER_LAYOUT_BEFORE="$(
+    rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true
+  )"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-click" 1244 26 1280 720
+  for _ in $(seq 1 200); do
+    EMPTY_BACKEND_PICKER_LAYOUT_OPEN="$(
+      rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true
+    )"
+    if ((EMPTY_BACKEND_PICKER_LAYOUT_OPEN > EMPTY_BACKEND_PICKER_LAYOUT_BEFORE)) \
+      && rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery".*"loading":true' "$CLIENT_LOG" \
+      && rg -q 'sender=session-switcher recipient=picker body=.*"type":"picker-update".*"loading":false' "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  ((EMPTY_BACKEND_PICKER_LAYOUT_OPEN > EMPTY_BACKEND_PICKER_LAYOUT_BEFORE))
+  capture "$OUT/empty-startup-backend-picker.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --plain 28
+  for _ in $(seq 1 400); do
+    if rg -q 'presentation actor message realm=Daemon sender=session-switcher recipient=init body=.*"kind":"list-directories"' "$CLIENT_LOG" \
+      && rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":true.*"type":"directory-list"' "$CLIENT_LOG" \
+      && rg -q 'sender=session-switcher recipient=picker body=.*"title":"Choose directory"' "$CLIENT_LOG"; then
+      break
+    fi
+    kill -0 "$CLIENT_PID" 2>/dev/null || {
+      echo "ERR presentation exited while selecting its empty backend" >&2
+      exit 1
+    }
+    sleep 0.05
+  done
+  ! rg -q 'addressed unknown backend' "$CLIENT_LOG"
+  rg -q 'presentation actor message realm=Daemon sender=session-switcher recipient=init body=.*"kind":"list-directories"' "$CLIENT_LOG"
+  rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":true.*"type":"directory-list"' "$CLIENT_LOG"
+  capture "$OUT/empty-startup-directory-picker.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --plain 1
+
   send_keybindings
   for _ in $(seq 1 200); do
     if rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG" \
@@ -427,10 +467,11 @@ PY
 
 - session catalogue: zero sessions and no active session
 - backend actors: no terminal-session actor
+- backend picker: New discovered backend 1 with no sessions, routed a real daemon directory request, and opened the directory picker without an unknown-backend failure
 - presentation actors: session-switcher and status-bar visible; inbox started but excluded from the two-pane composition
 - status bar: composed at 1280x34 with visible text/detail below a 320x686 session picker and empty content viewport
 - synthetic input: Ctrl+Shift+/ opened the keybindings actor
-- captures: empty-startup.png, empty-startup-status-bar.png, and empty-startup-keybindings.png
+- captures: empty-startup.png, empty-startup-status-bar.png, empty-startup-backend-picker.png, empty-startup-directory-picker.png, and empty-startup-keybindings.png
 EOF
   echo "empty_startup_plugins=verified"
   echo "proof=$OUT/proof.md"
@@ -758,6 +799,30 @@ EOF
   echo "artifacts=$OUT"
   exit 0
 fi
+
+BACKEND_PICKER_LAYOUT_BEFORE="$(accepted_layout_count)"
+click_at 1244 26
+for _ in $(seq 1 100); do
+  BACKEND_PICKER_LAYOUT_OPEN="$(accepted_layout_count)"
+  if ((BACKEND_PICKER_LAYOUT_OPEN > BACKEND_PICKER_LAYOUT_BEFORE)) \
+    && rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery".*"loading":true' "$CLIENT_LOG" \
+    && rg -q 'sender=session-switcher recipient=picker body=.*"type":"picker-update".*"loading":false' "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((BACKEND_PICKER_LAYOUT_OPEN > BACKEND_PICKER_LAYOUT_BEFORE))
+rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery".*"loading":true' "$CLIENT_LOG"
+rg -q 'sender=session-switcher recipient=picker body=.*"type":"picker-update".*"loading":false' "$CLIENT_LOG"
+capture "$OUT/backend-picker-visible.png"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" --plain 1
+for _ in $(seq 1 100); do
+  BACKEND_PICKER_LAYOUT_CLOSED="$(accepted_layout_count)"
+  ((BACKEND_PICKER_LAYOUT_CLOSED > BACKEND_PICKER_LAYOUT_OPEN)) && break
+  sleep 0.05
+done
+((BACKEND_PICKER_LAYOUT_CLOSED > BACKEND_PICKER_LAYOUT_OPEN))
 
 accepted_before="$(accepted_layout_count)"
 send_picker
@@ -1486,6 +1551,7 @@ cat > "$OUT/proof.md" <<EOF
 - occupation: closing that session persisted an unoccupied worktree record
 - switch: selecting Beta published a new layout revision and showed its already-mapped window
 - picker: Ctrl+Alt+P opened the reusable actor as a 720px floating pane with visibly rounded bottom corners; Bt fuzzy-matched Beta and Enter returned the original session result
+- backend picker: clicking New opened a loading picker before catalogue discovery and updated the same picker with the discovered backend options
 - transition: the previous actor layout remained visible until its replacement was accepted
 - plugin sizing: pane-local resize and GPU canvas converged to 320x${SIDEBAR_HEIGHT}
 - visible: managed pane resized to ${SIDEBAR_WIDTH}x${SIDEBAR_HEIGHT} beside the 320px right sidebar
@@ -1498,7 +1564,7 @@ cat > "$OUT/proof.md" <<EOF
 - diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
 - diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
 - interaction feedback: the New control visibly changed between idle, hover, and held-press captures; releasing away from the control cancelled activation
-- captures: sidebar-visible.png, sidebar-new-hover.png, sidebar-new-pressed.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, worktree-plugin-before-switch.png, worktree-plugin-after-switch.png, projects.png
+- captures: sidebar-visible.png, sidebar-new-hover.png, sidebar-new-pressed.png, backend-picker-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, worktree-plugin-before-switch.png, worktree-plugin-after-switch.png, projects.png
 - status: $STATUS
 EOF
 
@@ -1507,6 +1573,7 @@ echo "session_switcher_recursive=verified"
 echo "proof=$OUT/proof.md"
 echo "visible=$OUT/sidebar-visible.png"
 echo "picker=$OUT/picker-visible.png"
+echo "backend_picker=$OUT/backend-picker-visible.png"
 echo "beta=$OUT/session-beta.png"
 echo "hidden=$OUT/sidebar-hidden.png"
 echo "restored=$OUT/sidebar-restored.png"

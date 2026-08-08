@@ -83,11 +83,20 @@ The migration order is:
 
 The sidebar's `New` action is backend-aware. It opens the fuzzy picker with
 the currently attached backends plus the backend-creation actions supported by
-the current client installation. The remote action accepts an OpenSSH target,
-deploys and starts the remote backend asynchronously, and attaches its
-authenticated transport to the running presentation. Selecting an attached
-backend asks its daemon actor to enumerate a bounded directory catalogue rooted
-at the backend user's home, filesystem root, and known session directories.
+the current client installation. Opening the picker never waits for backend
+discovery: the picker appears immediately with a progress indicator, preserves
+input while the client refreshes its backend catalogue, and replaces its items
+when discovery completes. If the refreshed catalogue is empty, the supported
+backend-creation actions remain available in that same picker. The remote
+action accepts an OpenSSH target, deploys and starts the remote backend
+asynchronously, and attaches its authenticated transport to the running
+presentation. Selecting an attached backend asks its daemon actor to enumerate
+a bounded directory catalogue rooted at the backend user's home, filesystem
+root, and known session directories.
+
+Backend addressability follows the live transport connection, independently
+of session inventory. A connected backend with zero sessions can therefore
+receive the daemon directory request needed to create its first session.
 The returned paths populate the same fuzzy picker; selecting one sends the
 create operation to that backend, where the backend owns session creation and
 returns the new session identity.

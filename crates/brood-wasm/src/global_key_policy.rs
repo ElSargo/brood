@@ -87,6 +87,7 @@ pub enum HostMessage {
         image: String,
         connection: Option<String>,
     },
+    RequestBackendCatalogue,
     CreateLocalBackend,
     ToggleShortcutPassthrough,
     SetShortcutPassthrough {

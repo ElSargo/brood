@@ -48,6 +48,7 @@ pub struct PresentationWasmRuntime {
     pending_pane_removals: VecDeque<u64>,
     bound_backend_id: Option<BackendId>,
     bound_session_id: Option<u64>,
+    connected_backends: BTreeSet<BackendId>,
     next_actor_pane: u64,
     workspace_root: PathBuf,
     session_workspaces: BTreeMap<(BackendId, u64), PathBuf>,
@@ -136,6 +137,9 @@ impl PresentationWasmRuntime {
             pending_pane_removals: VecDeque::new(),
             bound_backend_id: bound_session.map(|(backend, _session)| backend),
             bound_session_id: bound_session.map(|(_backend, session)| session),
+            connected_backends: bound_session
+                .map(|(backend, _session)| BTreeSet::from([backend]))
+                .unwrap_or_default(),
             next_actor_pane: u64::MAX,
             workspace_root,
             session_workspaces: BTreeMap::new(),
@@ -574,10 +578,7 @@ impl PresentationWasmRuntime {
                         "presentation actor {actor_id:?} addressed another backend's daemon"
                     );
                     ensure!(
-                        self.session_workspaces
-                            .keys()
-                            .any(|(known_backend, _session)| *known_backend == backend)
-                            || self.bound_backend_id == Some(backend),
+                        self.connected_backends.contains(&backend),
                         "presentation actor {actor_id:?} addressed unknown backend {}",
                         backend.0,
                     );
@@ -624,10 +625,7 @@ impl PresentationWasmRuntime {
                 ComponentActorEvent::SessionCommandRequested(request) => {
                     let backend = BackendId(request.backend_id);
                     ensure!(
-                        self.session_workspaces
-                            .keys()
-                            .any(|(known_backend, _session)| *known_backend == backend)
-                            || self.bound_backend_id == Some(backend),
+                        self.connected_backends.contains(&backend),
                         "presentation actor {actor_id:?} requested unknown backend {}",
                         backend.0,
                     );
@@ -1146,6 +1144,7 @@ impl PresentationWasmRuntime {
 
     pub fn bind_session_snapshot(&mut self, snapshot: &SessionSnapshot) {
         let backend = BackendId(snapshot.backend_id);
+        self.connected_backends.insert(backend);
         self.session_snapshots.insert(backend, snapshot.clone());
         self.session_workspaces
             .retain(|(known_backend, _session), _path| *known_backend != backend);
@@ -1160,6 +1159,7 @@ impl PresentationWasmRuntime {
     }
 
     pub fn disconnect_backend(&mut self, backend: BackendId) -> Result<()> {
+        self.connected_backends.remove(&backend);
         let revision = self
             .session_snapshots
             .get(&backend)
@@ -1181,6 +1181,10 @@ impl PresentationWasmRuntime {
             self.bound_session_id = None;
         }
         Ok(())
+    }
+
+    pub fn connect_backend(&mut self, backend: BackendId) {
+        self.connected_backends.insert(backend);
     }
 
     pub fn discard_backend_requests(&mut self, backend: BackendId) {

@@ -4,6 +4,10 @@
 pane is omitted from layout until a request becomes active, then the client init
 composition places it as a centered floating overlay and focuses it.
 
+Requests may open in a loading state. The picker remains interactive while an
+animated spinner is visible, and the owner completes discovery with a
+`picker-update` snapshot.
+
 Callers address the well-known local actor ID `picker` through ordinary actor
 mailboxes. A create request receives a `picker-created` reply with a monotonic
 `picker` ID. The ID remains valid while the request is active or queued, so the
