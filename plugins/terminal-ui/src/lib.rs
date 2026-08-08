@@ -42,6 +42,7 @@ struct TerminalUi;
 
 struct UiState {
     pane: u64,
+    focus_on_create: bool,
     backend_id: u64,
     session_id: u64,
     session_actor: String,
@@ -87,6 +88,7 @@ impl UiState {
         let session_actor = terminal_session_actor(instance_id);
         Self {
             pane: 0,
+            focus_on_create: terminal_focuses_on_create(instance_id),
             backend_id,
             session_id,
             session_actor,
@@ -253,6 +255,11 @@ fn terminal_session_actor(instance_id: &str) -> String {
         || "terminal-session".to_string(),
         |suffix| format!("terminal-session-{suffix}"),
     )
+}
+
+fn terminal_focuses_on_create(instance_id: &str) -> bool {
+    instance_id.starts_with("terminal-ui")
+        && terminal_session_actor(instance_id) != "terminal-session"
 }
 
 struct Snapshot {
@@ -549,15 +556,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 state.line_height = metrics.line_height.max(1.0);
                 let _ = host::graphics_drop_resource(state.pane, metrics.handle);
             }
-            vec![
-                Command::SendHostMessage(
-                    format!(r#"{{"type":"focus-pane","pane":{}}}"#, state.pane).into_bytes(),
-                ),
-                state.session_message(vec![b'A']),
-                state
-                    .send_resize_if_changed()
-                    .expect("new terminal pane must have an initial grid size"),
-            ]
+            terminal_ready_commands(state)
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(1.0);
@@ -793,6 +792,22 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         }
         _ => Vec::new(),
     }
+}
+
+fn terminal_ready_commands(state: &mut UiState) -> Vec<Command> {
+    let mut commands = Vec::with_capacity(3);
+    if state.focus_on_create {
+        commands.push(Command::SendHostMessage(
+            format!(r#"{{"type":"focus-pane","pane":{}}}"#, state.pane).into_bytes(),
+        ));
+    }
+    commands.push(state.session_message(vec![b'A']));
+    commands.push(
+        state
+            .send_resize_if_changed()
+            .expect("new terminal pane must have an initial grid size"),
+    );
+    commands
 }
 
 fn finish_resize_debounce() -> Vec<Command> {
@@ -1621,7 +1636,8 @@ bindings::export!(TerminalUi with_types_in bindings);
 mod tests {
     use super::{
         Command, FOCUS_MESSAGE, STATE, UiState, focus_commands_for_mailbox, paste_bytes,
-        terminal_session_actor, terminal_text_clusters,
+        terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,
+        terminal_text_clusters,
     };
 
     #[test]
@@ -1638,6 +1654,33 @@ mod tests {
             terminal_session_actor("terminal-ui-b2-s7-4"),
             "terminal-session-4"
         );
+    }
+
+    #[test]
+    fn default_terminal_creation_does_not_steal_focus_but_dynamic_creation_does() {
+        assert!(!terminal_focuses_on_create("terminal-ui-b2-s7"));
+        let mut default = UiState::new(2, 7, "terminal-ui-b2-s7");
+        default.pane = 41;
+        let default_commands = terminal_ready_commands(&mut default);
+        assert!(
+            !default_commands
+                .iter()
+                .any(|command| matches!(command, Command::SendHostMessage(_)))
+        );
+        assert!(matches!(
+            default_commands.first(),
+            Some(Command::SendSessionMessage(message)) if message.body == b"A"
+        ));
+
+        assert!(terminal_focuses_on_create("terminal-ui-b2-s7-4"));
+        let mut dynamic = UiState::new(2, 7, "terminal-ui-b2-s7-4");
+        dynamic.pane = 42;
+        let dynamic_commands = terminal_ready_commands(&mut dynamic);
+        assert!(matches!(
+            dynamic_commands.first(),
+            Some(Command::SendHostMessage(body))
+                if body == br#"{"type":"focus-pane","pane":42}"#
+        ));
     }
 
     #[test]

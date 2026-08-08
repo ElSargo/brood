@@ -5,7 +5,7 @@ wit_bindgen::generate!({
 
 use exports::brood::plugin::actor::{
     ActorStartRequest, AppStartRequest, ChildEvent, Command, Event, Guest, LifecycleEvent,
-    LocalActorMessage, PresentationActorMessage, SessionActorMessage,
+    LocalActorMessage, PresentationActorMessage, PresentationScope, SessionActorMessage,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -191,8 +191,7 @@ fn start_agent(id: &str) -> Command {
             "filesystem:workspace-write".to_string(),
             "subprocess:codex".to_string(),
         ],
-        backend_id: None,
-        session_id: None,
+        presentation_scope: PresentationScope::Global,
     })
 }
 
@@ -201,8 +200,7 @@ fn start_terminal(id: &str) -> Command {
         id: id.to_string(),
         path: TERMINAL_SESSION_COMPONENT_FILE.to_string(),
         capabilities: vec!["pty".to_string(), "subprocess:sh".to_string()],
-        backend_id: None,
-        session_id: None,
+        presentation_scope: PresentationScope::Global,
     })
 }
 
@@ -211,8 +209,7 @@ fn start_editor_files() -> Command {
         id: NEOVIM_FILES.to_string(),
         path: NEOVIM_FILES_COMPONENT_FILE.to_string(),
         capabilities: vec!["filesystem:workspace-write".to_string()],
-        backend_id: None,
-        session_id: None,
+        presentation_scope: PresentationScope::Global,
     })
 }
 

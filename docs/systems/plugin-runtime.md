@@ -135,12 +135,12 @@ placement. A client init actor creates client-local actors; a session init actor
 creates actors and apps in its own surface session; a daemon init actor creates
 backend actors whose lifecycle is independent of every session.
 
-A presentation root identifies each child as either presentation-global or
-associated with one surface session when it starts that child. The host retains
-this association for pane filtering, workspace authority, cross-realm message
-validation, and explicit session teardown. Actor names are labels, not an
-ownership convention, and changing the active session never changes an
-existing child's association.
+A presentation root supplies one explicit `presentation-scope` when it starts
+each child: `global` or one backend-qualified surface session. The host retains
+this immutable scope for pane filtering, workspace authority, cross-realm
+message validation, and explicit session teardown. Actor names are labels, not
+an ownership convention, and changing the active session never changes an
+existing child's scope.
 
 The default daemon root is the worktree manager. It serializes managed
 worktree acquisition, records occupation, and decides which idle worktrees are

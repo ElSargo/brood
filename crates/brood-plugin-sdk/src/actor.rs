@@ -1,9 +1,46 @@
 //! Constructors for ordinary actor commands.
 
 use crate::exports::brood::plugin::actor::{
-    Command, DaemonActorMessage, LocalActorMessage, PresentationActorMessage, SessionActorMessage,
-    WorkerRequest,
+    ActorStartRequest, Command, DaemonActorMessage, LocalActorMessage, PresentationActorMessage,
+    PresentationScope, PresentationSession, SessionActorMessage, WorkerRequest,
 };
+
+/// Start a presentation-global child actor, or an ordinary same-realm child
+/// when used by a backend init actor.
+#[must_use]
+pub fn start_global_actor(
+    id: impl Into<String>,
+    path: impl Into<String>,
+    capabilities: Vec<String>,
+) -> Command {
+    Command::StartActor(ActorStartRequest {
+        id: id.into(),
+        path: path.into(),
+        capabilities,
+        presentation_scope: PresentationScope::Global,
+    })
+}
+
+/// Start a presentation child whose pane remains scoped to one backend
+/// session across active-session changes.
+#[must_use]
+pub fn start_session_actor(
+    id: impl Into<String>,
+    path: impl Into<String>,
+    capabilities: Vec<String>,
+    backend_id: u64,
+    session_id: u64,
+) -> Command {
+    Command::StartActor(ActorStartRequest {
+        id: id.into(),
+        path: path.into(),
+        capabilities,
+        presentation_scope: PresentationScope::Session(PresentationSession {
+            backend_id,
+            session_id,
+        }),
+    })
+}
 
 /// Enqueue work without blocking the actor dispatcher.
 #[must_use]
@@ -82,6 +119,36 @@ mod tests {
         if let Some(message) = message {
             assert_eq!((message.backend_id, message.session_id), (7, 11));
             assert_eq!(message.actor, "terminal-session");
+        }
+    }
+
+    #[test]
+    fn actor_start_scope_distinguishes_global_and_session_panes() {
+        let global = match start_global_actor("inbox", "inbox.wasm", Vec::new()) {
+            Command::StartActor(request) => Some(request),
+            _ => None,
+        };
+        assert!(global.is_some());
+        if let Some(global) = global {
+            assert!(matches!(
+                global.presentation_scope,
+                PresentationScope::Global
+            ));
+        }
+
+        let scoped = match start_session_actor("terminal", "terminal.wasm", Vec::new(), 3, 9) {
+            Command::StartActor(request) => Some(request),
+            _ => None,
+        };
+        assert!(scoped.is_some());
+        if let Some(scoped) = scoped {
+            assert!(matches!(
+                scoped.presentation_scope,
+                PresentationScope::Session(PresentationSession {
+                    backend_id: 3,
+                    session_id: 9,
+                })
+            ));
         }
     }
 }

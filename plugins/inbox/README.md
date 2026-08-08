@@ -10,7 +10,7 @@ removes it from the queue and sends that actor a `focus` message. Pane IDs stay
 inside the target presentation actor, so notification routing does not depend
 on backend-local pane numbers.
 
-The default client layout reserves an always-visible rail for the inbox. The
-queue is presentation-local and intentionally disappears when that client
-disconnects; agent and terminal ownership remains in the backend session.
-`Ctrl+Alt+I` focuses the rail without hiding or recreating it.
+The default client starts the inbox rail hidden and reveals it on
+`Ctrl+Alt+I`. The queue remains live while hidden and intentionally disappears
+when that client disconnects; agent and terminal ownership remains in the
+backend session.

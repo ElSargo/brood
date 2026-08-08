@@ -65,7 +65,7 @@ fn validates_the_default_client_migration_fixture() {
     );
     assert_eq!(
         manifest.installation_order().expect("install order").len(),
-        8
+        9
     );
 }
 

@@ -106,9 +106,10 @@ presentation client
 Presentation actors run in the client for local and remote deployments. Their
 mailbox traffic, layout updates, UI state, animations, and drawing remain local.
 Only explicitly addressed operations and daemon- or session-realm actor
-messages cross the connection. A presentation child records its optional
-backend-and-session association at creation; the client does not derive
-ownership from the active session, focused backend, or actor ID.
+messages cross the connection. A presentation child declares one immutable
+presentation scope when its init actor creates it: either `global` or an
+explicit backend-qualified session. The client does not derive ownership from
+the active session, focused backend, or actor ID.
 
 The default visible set contains presentation-global actors plus actors and
 managed windows associated with the one selected backend/session pair.
@@ -155,6 +156,15 @@ Local clients receive atomic catalog snapshots through a dedicated
 server-to-client shared-memory lane with eventfd wakeups. DBus remains the
 descriptor bootstrap and asynchronous command path, not the catalog transport.
 
+Client-realm Component actors wake the native presentation loop when an
+observer event is admitted, and the loop drains those events before sleeping
+again. A dormant Component actor therefore does not arm a periodic client
+timer. Preview 1 compatibility actors may use a bounded recovery poll until
+they provide the same notification boundary. When a bounded presentation lane
+is full, the client retries on a short deadline instead of busy-spinning the
+platform event loop; critical input ordering remains intact while a slow or
+descheduled consumer cannot pin a CPU.
+
 Frame work is demand driven. Each subscription has bounded in-flight ownership
 and explicit acquire, release, cancellation, and disconnect behavior.
 Intermediate frames may be superseded, but reliable inventory and resource
@@ -182,11 +192,12 @@ accepted, then swaps layouts atomically and releases panes the replacement no
 longer references. Native fallback is startup and failure recovery, not an
 intermediate session-switch state.
 
-Presentation-global panes may appear in any session view. A session-associated
-plugin pane remains owned by its recorded session across activation and
-catalogue changes and is hidden when that session is outside the accepted
-layout. Explicit session closure stops its associated presentation actors;
-merely having no managed windows does not.
+Presentation-global panes may appear in any session view. A session-scoped
+plugin pane remains owned by its declared session across activation and
+catalogue changes and is omitted from the default visible set when another
+session is selected. The complete pane inventory and scope remain available to
+custom multi-session layout policy. Explicit session closure stops its scoped
+presentation actors; merely having no managed windows does not.
 
 The default session switcher claims the root, places its pane on the right, and
 delegates `rest` to the workspace actor. Hiding and showing are ordinary

@@ -83,10 +83,12 @@ generation, lease, revision, and pane ownership before composing the complete
 tree. It then canonicalizes transforms and z order, clips children, selects
 focus, builds hit-test regions, and derives managed-pane size requests.
 
-The default client init actor starts the session switcher, reusable picker, and
-initial terminal UI as independently addressed children. The switcher claims
-the root, places its pane on the right, and delegates `rest` to the workspace
-actor, where scoped plugin panes and session windows are composed. The
+The default client init actor starts the session switcher, reusable picker,
+global utility actors, and shortcut status bar as independently addressed
+children. It starts session-scoped panes only after a session exists. The
+switcher claims the root, places its pane on the right, reserves the bottom
+status strip, and delegates `rest` to the workspace actor, where scoped plugin
+panes and session windows are composed. The
 picker's pane joins that root fragment as a floating overlay only while one of
 its FIFO-queued mailbox requests is active. The key policy sends ordinary
 sidebar, picker, and pane-lifecycle actions to the init actor; the relevant

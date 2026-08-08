@@ -152,7 +152,7 @@ shortcuts or wrapper arguments:
 - `Ctrl+Shift+/` opens the searchable global keyboard-shortcut editor;
 - `Ctrl+Alt+M` focuses the visible session switcher, hides it when invoked
   again while focused, and restores it on the next invocation;
-- `Ctrl+Alt+I` focuses the always-visible presentation-global inbox;
+- `Ctrl+Alt+I` reveals and focuses the presentation-global inbox;
 - `Ctrl+Alt+A` fuzzy-picks a running agent in the active session and opens a
   session-scoped coding-agent UI for it;
 - `Ctrl+Alt+T` asks the client- and session-init actors to create a fresh paired
@@ -172,8 +172,14 @@ its root layout fragment. The client validates the resulting layout and focus
 request; it has no switcher-specific visibility command.
 
 `Ctrl+Alt+I` similarly sends an ordinary show action to the inbox actor. The
-inbox requests focus for its own presentation-global pane; it does not change
-session state or toggle the rail.
+root shell reveals and focuses that presentation-global pane without changing
+session state.
+
+The root shell reserves a compact status bar across the bottom of every normal
+layout. It always advertises `Ctrl+Shift+/` as the route to the complete
+shortcut catalogue and, when width permits, keeps the session switcher, inbox,
+and terminal chords visible. The leading status text identifies the active
+session and total session count; the compact empty state says `No session`.
 
 ## Global Remapping
 

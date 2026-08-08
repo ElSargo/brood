@@ -14,9 +14,11 @@ sessions, and never becomes session-owned application state.
 ## Ownership And Placement
 
 The client init actor owns one `inbox` child without a backend or session
-association. The root layout reserves a persistent rail for its pane and
-delegates ordinary backend and plugin panes through the remaining layout slot.
-Changing the active session does not replace, clear, or rebind the inbox.
+association. Its pane starts hidden so a fresh presentation remains an empty
+workspace beside the session picker. The root layout reveals a rail when the
+user asks for the inbox and delegates ordinary backend and plugin panes through
+the remaining layout slot. Changing the active session does not replace,
+clear, or rebind the inbox.
 
 The queue is bounded presentation state. Reconnecting a client creates a fresh
 queue; backend agents, terminals, processes, and their histories retain their
@@ -39,8 +41,9 @@ rows whose source actor has closed are harmless and can still be dismissed.
 The newest item appears first, and pointer scrolling exposes older queued
 items without changing application focus.
 
-`Ctrl+Alt+I` sends the inbox a client-local `show` action and focuses its pane.
-The rail remains visible before and after the shortcut.
+`Ctrl+Alt+I` sends the inbox a client-local `show` action. The inbox asks the
+root shell to reveal and focus its pane; queued notifications remain available
+while the rail is hidden.
 
 ## Producers
 

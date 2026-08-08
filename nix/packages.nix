@@ -87,6 +87,7 @@ let
         "${src}/plugins/neovim-files/Cargo.lock"
         "${src}/plugins/picker/Cargo.lock"
         "${src}/plugins/session-switcher/Cargo.lock"
+        "${src}/plugins/status-bar/Cargo.lock"
         "${src}/plugins/worktree-manager/Cargo.lock"
         "${src}/plugins/terminal-session/Cargo.lock"
         "${src}/plugins/terminal-ui/Cargo.lock"
@@ -308,6 +309,19 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/status-bar/Cargo.toml ]]; then
+        component_core="plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm"
+        component_output="plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR status bar core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       if [[ -f plugins/neovim-files/Cargo.toml ]]; then
         component_core="plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.wasm"
         component_output="plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.component.wasm"
@@ -504,6 +518,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm" ]]; then
           continue
         fi
         if [[ "$wasm" == "plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.wasm" ]]; then

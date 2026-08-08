@@ -91,11 +91,24 @@ use plugin_graphics::PluginGraphicsBridge;
 
 pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
+const DEFAULT_WINDOW_WIDTH: f64 = 1440.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 900.0;
 const MAX_AGENT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_IMAGE_DECODE_DIMENSION: u32 = 16_384;
 const MAX_AGENT_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const AGENT_IMAGE_PREVIEW_WIDTH: u32 = 192;
 const AGENT_IMAGE_PREVIEW_HEIGHT: u32 = 80;
+
+const fn bound_session_for_active(
+    backend: BackendId,
+    active_session: u64,
+) -> Option<(BackendId, u64)> {
+    if active_session == 0 {
+        None
+    } else {
+        Some((backend, active_session))
+    }
+}
 
 struct AgentImagePreview {
     width: u32,
@@ -641,11 +654,7 @@ fn main() -> Result<()> {
             let fast_path =
                 open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
             let backend = backend_registry.allocate(Some(fast_path.generation));
-            let session_id = if fast_path.active_session != 0 {
-                fast_path.active_session
-            } else {
-                create_surface_session(&target, String::new())?
-            };
+            let bound_session = bound_session_for_active(backend, fast_path.active_session);
             let dmabuf_import_enabled =
                 fast_path.profile.frames == brood_protocol::FrameTransportKind::Dmabuf;
             let input =
@@ -723,7 +732,7 @@ fn main() -> Result<()> {
                 )?)),
             );
             fast_path_enabled = dmabuf_import_enabled;
-            bound_session_id = Some((backend, session_id));
+            bound_session_id = bound_session;
         }
         let default_backend = bound_session_id
             .map(|(backend, _session)| backend)
@@ -765,17 +774,14 @@ fn main() -> Result<()> {
             "selected presentation transport carrier={:?} frames={:?}",
             fast_path.profile.carrier, fast_path.profile.frames
         );
-        let session_id = if fast_path.active_session != 0 {
+        if fast_path.active_session != 0 {
             eprintln!(
                 "attached presentation to active session id={}",
                 fast_path.active_session
             );
-            fast_path.active_session
         } else {
-            let created = create_surface_session(&target, String::new())?;
-            eprintln!("created presentation session id={created}");
-            created
-        };
+            eprintln!("attached presentation to an empty session catalogue");
+        }
 
         let dmabuf_import_enabled =
             fast_path.profile.frames == brood_protocol::FrameTransportKind::Dmabuf;
@@ -869,7 +875,7 @@ fn main() -> Result<()> {
             backend_commands,
             dmabuf_import_enabled,
             true,
-            Some((backend, session_id)),
+            bound_session_for_active(backend, fast_path.active_session),
             Vec::new(),
         )
     };
@@ -2550,6 +2556,21 @@ struct WindowResizeTransaction {
     latest_size: (u32, u32),
 }
 
+fn drop_frontend_wayland_state<DropBridge, Frontend, Clipboard>(
+    wayland_drop: &mut Option<DropBridge>,
+    renderer: &mut Option<Frontend>,
+    clipboard: &mut Option<Clipboard>,
+) {
+    // The drop bridge adopts proxies from Winit's connection, so it must go
+    // before the Winit window. Both must go while the active event loop still
+    // owns that connection. The clipboard uses its own Wayland connection,
+    // but stopping it here keeps every frontend protocol client within the
+    // same explicit shutdown boundary.
+    drop(wayland_drop.take());
+    drop(renderer.take());
+    drop(clipboard.take());
+}
+
 impl WindowResizeTransaction {
     fn new(now: Instant, initial_size: (u32, u32), latest_size: (u32, u32)) -> Self {
         Self {
@@ -2626,6 +2647,14 @@ struct Application {
 }
 
 impl Application {
+    fn drop_frontend_wayland_state(&mut self) {
+        drop_frontend_wayland_state(
+            &mut self.wayland_drop,
+            &mut self.renderer,
+            &mut self.clipboard,
+        );
+    }
+
     fn disconnect_remote_backend(
         &mut self,
         backend: BackendId,
@@ -2726,11 +2755,8 @@ impl Application {
         let _handshake = connect_or_spawn(&target, &launch)?;
         let fast_path = open_presentation_fast_path(&target, &[FrameTransportKind::SharedMemory])?;
         let backend = self.backend_registry.allocate(Some(fast_path.generation));
-        let session_id = if fast_path.active_session != 0 {
-            fast_path.active_session
-        } else {
-            create_surface_session(&target, String::new())?
-        };
+        let session_id = bound_session_for_active(backend, fast_path.active_session)
+            .map(|(_backend, session)| session);
         let input =
             brood_ipc::CriticalProducer::map(fast_path.input_fd.as_fd(), fast_path.generation)?;
         let frames =
@@ -2818,7 +2844,7 @@ impl Application {
         self.backend_registry
             .observe(backend, Some(fast_path.generation));
         self.notify_backend_connected(backend)?;
-        eprintln!("started dynamic local backend={backend:?} session={session_id}");
+        eprintln!("started dynamic local backend={backend:?} session={session_id:?}");
         Ok(())
     }
 
@@ -3625,8 +3651,23 @@ impl Application {
                 .checked_add(1)
                 .context("layout state revision limit exceeded")?;
             let panes = renderer.pane_inventory();
+            let previously_owned = self
+                .layout_leases
+                .lease_tokens()
+                .into_iter()
+                .flat_map(|token| self.layout_leases.owned_panes(token).unwrap_or_default())
+                .collect::<HashSet<_>>();
+            let new_global_panes = newly_declared_global_plugin_panes(
+                &previously_owned,
+                &panes,
+                &renderer.plugin_pane_realms,
+            );
             self.layout_leases
                 .update_inventory(self.layout_revision, &panes)?;
+            if !new_global_panes.is_empty() {
+                self.layout_leases
+                    .assign_panes(self.layout_leases.root_token(), &new_global_panes)?;
+            }
             if let Some(runtime) = self.wasm_runtime.as_ref() {
                 for token in self.layout_leases.lease_tokens() {
                     let Some(holder) = self.layout_holders.get(&token.id) else {
@@ -4341,6 +4382,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 Window::default_attributes()
                     .with_title(title)
                     .with_resizable(true)
+                    .with_inner_size(LogicalSize::new(
+                        DEFAULT_WINDOW_WIDTH,
+                        DEFAULT_WINDOW_HEIGHT,
+                    ))
                     .with_min_inner_size(LogicalSize::new(480.0, 320.0)),
             )
             .context("create presentation window")
@@ -4951,7 +4996,9 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.wasm_runtime.as_ref(),
             &mut self.pointer_routing.pending_plugin_motion,
         );
-        if std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO").as_deref() == Ok("1")
+        let auto_scroll_benchmark =
+            std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO").as_deref() == Ok("1");
+        if auto_scroll_benchmark
             && self
                 .plugin_scroll_benchmark
                 .as_ref()
@@ -4972,34 +5019,54 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             PLUGIN_SCROLL_BENCH_ACTIVE.store(false, Ordering::Relaxed);
         }
+        let scroll_benchmark_deadline = if auto_scroll_benchmark {
+            self.plugin_scroll_benchmark
+                .as_ref()
+                .filter(|benchmark| benchmark.input_events == 0)
+                .and_then(|benchmark| benchmark.last_scene)
+                .map(|last| last + Duration::from_millis(80))
+        } else {
+            None
+        };
         if input_backpressured || actor_message_backpressured {
             // The shared-memory consumer already has a wakeup for the records
-            // which filled its ring. Poll until it frees a slot so input state
-            // transitions cannot remain deferred indefinitely.
-            event_loop.set_control_flow(ControlFlow::Poll);
+            // which filled its ring. Retry promptly without busy-spinning a
+            // CPU while the consumer is descheduled or slow to free a slot.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(1),
+            ));
         } else if let Some(resize) = self.window_resize.as_ref() {
             let actor_poll = Instant::now() + Duration::from_millis(50);
-            let deadline = if self
+            let mut deadline = if self
                 .wasm_runtime
                 .as_ref()
-                .is_some_and(|runtime| !runtime.is_empty())
+                .is_some_and(PresentationWasmRuntime::requires_periodic_event_poll)
             {
                 resize.settle_at.min(actor_poll)
             } else {
                 resize.settle_at
             };
+            if let Some(scroll_benchmark_deadline) = scroll_benchmark_deadline {
+                deadline = deadline.min(scroll_benchmark_deadline);
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else if self
             .wasm_runtime
             .as_ref()
-            .is_some_and(|runtime| !runtime.is_empty())
+            .is_some_and(PresentationWasmRuntime::requires_periodic_event_poll)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(50),
             ));
+        } else if let Some(deadline) = scroll_benchmark_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.drop_frontend_wayland_state();
     }
 
     fn window_event(
@@ -7486,7 +7553,11 @@ impl Renderer {
     }
 
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
-        let Some(target) = self.focus_target_for_pane(pane) else {
+        let Some(target) = focus_request_target(
+            &self.accepted_layout,
+            pane,
+            self.focus_target_for_pane(pane),
+        ) else {
             self.pending_focus_pane = Some(pane);
             return None;
         };
@@ -7763,7 +7834,7 @@ impl Renderer {
                 .any(|item| item.window_id == *window)
         });
         self.sent_plugin_sizes
-            .retain(|pane, _| self.plugin_panes.contains_key(pane));
+            .retain(|pane, _| self.plugin_pane_realms.contains_key(pane));
         focus_change_between(previous_focus, self.focused_pane)
     }
 
@@ -7833,11 +7904,7 @@ impl Renderer {
     }
 
     fn pane_inventory(&self) -> Vec<u64> {
-        self.plugin_panes
-            .keys()
-            .copied()
-            .chain(self.available_windows.iter().map(|window| window.pane))
-            .collect()
+        pane_inventory_from_catalogs(&self.plugin_pane_realms, &self.available_windows)
     }
 
     fn default_visible_pane_inventory(&self) -> Vec<u64> {
@@ -7857,16 +7924,11 @@ impl Renderer {
     }
 
     fn visible_plugin_panes(&self) -> Vec<u64> {
-        self.plugin_panes
-            .keys()
-            .copied()
-            .filter(|pane| {
-                self.plugin_pane_realms.get(pane).is_none_or(|realm| {
-                    realm
-                        .is_none_or(|(backend, session)| self.selected_session_is(backend, session))
-                })
-            })
-            .collect()
+        visible_plugin_panes_for_realm(
+            &self.plugin_pane_realms,
+            self.active_backend,
+            self.active_session,
+        )
     }
 
     fn set_plugin_pane_realms(&mut self, sessions: &[(u64, Option<(BackendId, u64)>)]) {
@@ -8038,10 +8100,13 @@ impl Renderer {
             return Vec::new();
         }
         let scale = self.window.scale_factor() as f32;
-        self.plugin_panes
-            .iter()
-            .filter_map(|(pane, plugin)| {
-                let (width, height) = positive_rect_extent(plugin.rect)?;
+        let extent = self.layout_extent();
+        self.plugin_pane_realms
+            .keys()
+            .filter_map(|pane| {
+                let item = self.accepted_layout.pane_item(*pane)?;
+                let rect = item.pixel_rect(extent);
+                let (width, height) = positive_rect_extent([rect.x, rect.y, rect.w, rect.h])?;
                 let size = PluginPaneSize {
                     width: width as f32 / scale,
                     height: height as f32 / scale,
@@ -8281,6 +8346,55 @@ impl Renderer {
     }
 }
 
+fn plugin_pane_is_visible(
+    realm: Option<(BackendId, u64)>,
+    active_backend: Option<BackendId>,
+    active_session: u64,
+) -> bool {
+    realm.is_none_or(|(backend, session)| {
+        active_backend == Some(backend) && active_session == session
+    })
+}
+
+fn visible_plugin_panes_for_realm(
+    pane_realms: &BTreeMap<u64, Option<(BackendId, u64)>>,
+    active_backend: Option<BackendId>,
+    active_session: u64,
+) -> Vec<u64> {
+    pane_realms
+        .iter()
+        .filter_map(|(pane, realm)| {
+            plugin_pane_is_visible(*realm, active_backend, active_session).then_some(*pane)
+        })
+        .collect()
+}
+
+fn pane_inventory_from_catalogs(
+    plugin_pane_realms: &BTreeMap<u64, Option<(BackendId, u64)>>,
+    available_windows: &[AvailableWindow],
+) -> Vec<u64> {
+    plugin_pane_realms
+        .keys()
+        .copied()
+        .chain(available_windows.iter().map(|window| window.pane))
+        .collect()
+}
+
+fn newly_declared_global_plugin_panes(
+    previously_owned: &HashSet<u64>,
+    inventory: &[u64],
+    plugin_pane_realms: &BTreeMap<u64, Option<(BackendId, u64)>>,
+) -> Vec<u64> {
+    inventory
+        .iter()
+        .copied()
+        .filter(|pane| {
+            !previously_owned.contains(pane)
+                && plugin_pane_realms.get(pane).is_some_and(Option::is_none)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn default_visible_panes(
     plugin_panes: impl IntoIterator<Item = u64>,
@@ -8336,6 +8450,14 @@ fn scene_focus_target(
             .map(FocusedPane::Managed)
             .or_else(|| plugin_panes.first().copied().map(FocusedPane::Plugin)),
     }
+}
+
+fn focus_request_target(
+    accepted_layout: &ResolvedLayout,
+    pane: u64,
+    target: Option<FocusedPane>,
+) -> Option<FocusedPane> {
+    accepted_layout.pane_item(pane).and(target)
 }
 
 fn focus_change_between(
@@ -8451,6 +8573,51 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 mod tests {
     use super::*;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    #[test]
+    fn frontend_wayland_state_drops_before_the_event_loop_connection() {
+        #[derive(Debug)]
+        struct DropMarker {
+            name: &'static str,
+            order: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        }
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.order.borrow_mut().push(self.name);
+            }
+        }
+
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let marker = |name| {
+            Some(DropMarker {
+                name,
+                order: std::rc::Rc::clone(&order),
+            })
+        };
+        let mut wayland_drop = marker("drop-bridge");
+        let mut renderer = marker("renderer-window");
+        let mut clipboard = marker("clipboard");
+
+        drop_frontend_wayland_state(&mut wayland_drop, &mut renderer, &mut clipboard);
+
+        assert!(wayland_drop.is_none());
+        assert!(renderer.is_none());
+        assert!(clipboard.is_none());
+        assert_eq!(
+            order.borrow().as_slice(),
+            ["drop-bridge", "renderer-window", "clipboard"]
+        );
+    }
+
+    #[test]
+    fn an_empty_catalogue_does_not_implicitly_create_or_bind_a_session() {
+        let backend = BackendId(7);
+        assert_eq!(bound_session_for_active(backend, 0), None);
+        assert_eq!(bound_session_for_active(backend, 11), Some((backend, 11)));
+        assert!(DEFAULT_WINDOW_WIDTH >= 1280.0);
+        assert!(DEFAULT_WINDOW_HEIGHT >= 800.0);
+    }
 
     #[test]
     fn latency_percentiles_use_nearest_rank_for_small_remote_samples() {
@@ -8677,6 +8844,90 @@ mod tests {
                 .is_ok(),
             "session selection must not constrain which available windows an actor can map"
         );
+    }
+
+    #[test]
+    fn plugin_panes_keep_their_declared_session_scope() {
+        assert!(plugin_pane_is_visible(None, Some(BackendId(1)), 7));
+        assert!(plugin_pane_is_visible(
+            Some((BackendId(1), 7)),
+            Some(BackendId(1)),
+            7,
+        ));
+        assert!(!plugin_pane_is_visible(
+            Some((BackendId(1), 7)),
+            Some(BackendId(1)),
+            8,
+        ));
+        assert!(!plugin_pane_is_visible(
+            Some((BackendId(1), 7)),
+            Some(BackendId(2)),
+            7,
+        ));
+        assert!(!plugin_pane_is_visible(Some((BackendId(1), 7)), None, 0,));
+    }
+
+    #[test]
+    fn declared_plugin_panes_are_visible_before_their_first_graphics_packet() {
+        let panes = BTreeMap::from([
+            (11, None),
+            (12, Some((BackendId(1), 7))),
+            (13, Some((BackendId(1), 8))),
+        ]);
+
+        assert_eq!(
+            visible_plugin_panes_for_realm(&panes, Some(BackendId(1)), 7),
+            [11, 12]
+        );
+        let inventory = pane_inventory_from_catalogs(&panes, &[]);
+        assert_eq!(inventory, [11, 12, 13]);
+        assert!(
+            native_flat_layout(&[11], LayoutSize { w: 1280, h: 800 })
+                .validate_for_panes(&inventory)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn focus_of_a_declared_but_not_yet_composed_pane_stays_deferred() {
+        let old_layout = native_flat_layout(&[11], LayoutSize { w: 1280, h: 800 });
+        assert_eq!(
+            focus_request_target(&old_layout, 12, Some(FocusedPane::Plugin(12))),
+            None,
+            "declaring a pane must not let it steal focus before layout composition"
+        );
+
+        let replacement = native_flat_layout(&[11, 12], LayoutSize { w: 1280, h: 800 });
+        assert_eq!(
+            focus_request_target(&replacement, 12, Some(FocusedPane::Plugin(12))),
+            Some(FocusedPane::Plugin(12)),
+            "the pending focus target becomes usable with the accepted replacement"
+        );
+    }
+
+    #[test]
+    fn late_global_shell_panes_remain_owned_by_the_root_layout_lease() -> Result<()> {
+        let mut leases = LayoutLeaseTree::default();
+        leases.update_inventory(1, &[1, 2])?;
+        let root = leases.root_token();
+        let rest = leases.grant_rest(root, &[2])?;
+        let previously_owned = leases
+            .lease_tokens()
+            .into_iter()
+            .flat_map(|token| leases.owned_panes(token).unwrap_or_default())
+            .collect::<HashSet<_>>();
+        let pane_realms = BTreeMap::from([(1, None), (3, None), (4, Some((BackendId(1), 7)))]);
+        let inventory = [1, 2, 3, 4];
+        let new_global =
+            newly_declared_global_plugin_panes(&previously_owned, &inventory, &pane_realms);
+
+        leases.update_inventory(2, &inventory)?;
+        leases.assign_panes(root, &new_global)?;
+
+        assert_eq!(new_global, [3]);
+        assert_eq!(leases.owned_panes(root), Some(vec![1, 3]));
+        assert_eq!(leases.owned_panes(rest), Some(vec![2, 4]));
+        Ok(())
     }
 
     #[test]

@@ -5,10 +5,11 @@ use std::{
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_plugin_sdk::{
+    actor::{start_global_actor, start_session_actor},
     bindings,
     exports::brood::plugin::actor::{
-        ActorStartRequest, ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest,
-        LifecycleEvent, LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
+        ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest, LifecycleEvent,
+        LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
         SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
     },
     graphics::{drop_resources, layout_ui_text, submit_packet},
@@ -23,14 +24,18 @@ const CHILD_ACTOR_ID: &str = "session-switcher";
 const PICKER_ACTOR_ID: &str = "picker";
 const KEYBINDINGS_ACTOR_ID: &str = "keybindings";
 const INBOX_ACTOR_ID: &str = "inbox";
+const STATUS_BAR_ACTOR_ID: &str = "status-bar";
 const COMPONENT_FILE: &str = "brood_session_switcher_plugin.component.wasm";
 const PICKER_COMPONENT_FILE: &str = "brood_picker_plugin.component.wasm";
 const KEYBINDINGS_COMPONENT_FILE: &str = "brood_keybindings_plugin.component.wasm";
 const INBOX_COMPONENT_FILE: &str = "brood_inbox_plugin.component.wasm";
+const STATUS_BAR_COMPONENT_FILE: &str = "brood_status_bar_plugin.component.wasm";
 const CODING_AGENT_COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
+const DIFF_VIEWER_COMPONENT_FILE: &str = "brood_diff_viewer_plugin.component.wasm";
 const NEOVIM_CLIENT_COMPONENT_FILE: &str = "brood_neovim_client_plugin.component.wasm";
 const TERMINAL_UI_COMPONENT_FILE: &str = "brood_terminal_ui_plugin.component.wasm";
 const TERMINAL_UI_ID: &str = "terminal-ui";
+const DIFF_VIEWER_ID_PREFIX: &str = "diff-viewer-s";
 const NEOVIM_UI_ID_PREFIX: &str = "neovim-ui-b";
 const NEOVIM_FILES_ID: &str = "neovim-files";
 const CODING_AGENT_UI_ID: &str = "coding-agent-ui";
@@ -41,6 +46,7 @@ const PROJECT_ROW_HEIGHT: f32 = 34.0;
 const SIDE_MARGIN: f32 = 14.0;
 const SIDEBAR_WIDTH: f64 = 320.0;
 const INBOX_WIDTH: f64 = 320.0;
+const STATUS_BAR_HEIGHT: f64 = 34.0;
 
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
@@ -132,6 +138,7 @@ struct SwitcherState {
     coding_agent_targets: BTreeMap<String, String>,
     agents: Vec<WireAgent>,
     agent_picker_pending: bool,
+    diff_viewers: BTreeSet<String>,
     terminal_uis: BTreeMap<String, (u64, u64)>,
     neovim_uis_starting: BTreeMap<(u64, u64), String>,
     neovim_uis: BTreeMap<(u64, u64), String>,
@@ -143,6 +150,8 @@ struct SwitcherState {
     keybindings_pane: Option<u64>,
     keybindings_visible: bool,
     inbox_pane: Option<u64>,
+    inbox_visible: bool,
+    status_bar_pane: Option<u64>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
 }
@@ -425,6 +434,7 @@ impl SwitcherState {
             coding_agent_targets: BTreeMap::new(),
             agents: Vec::new(),
             agent_picker_pending: false,
+            diff_viewers: BTreeSet::new(),
             terminal_uis: BTreeMap::new(),
             neovim_uis_starting: BTreeMap::new(),
             neovim_uis: BTreeMap::new(),
@@ -436,6 +446,8 @@ impl SwitcherState {
             keybindings_pane: None,
             keybindings_visible: false,
             inbox_pane: None,
+            inbox_visible: false,
+            status_bar_pane: None,
             hovered: None,
             pressed: None,
         }
@@ -604,45 +616,30 @@ impl Guest for SessionSwitcher {
                         }
                     }
                     let mut commands = vec![
-                        ActorCommand::StartActor(ActorStartRequest {
-                            id: CHILD_ACTOR_ID.to_string(),
-                            path: COMPONENT_FILE.to_string(),
-                            capabilities: Vec::new(),
-                            backend_id: None,
-                            session_id: None,
-                        }),
-                        ActorCommand::StartActor(ActorStartRequest {
-                            id: PICKER_ACTOR_ID.to_string(),
-                            path: PICKER_COMPONENT_FILE.to_string(),
-                            capabilities: Vec::new(),
-                            backend_id: None,
-                            session_id: None,
-                        }),
-                        ActorCommand::StartActor(ActorStartRequest {
-                            id: KEYBINDINGS_ACTOR_ID.to_string(),
-                            path: KEYBINDINGS_COMPONENT_FILE.to_string(),
-                            capabilities: Vec::new(),
-                            backend_id: None,
-                            session_id: None,
-                        }),
-                        ActorCommand::StartActor(ActorStartRequest {
-                            id: INBOX_ACTOR_ID.to_string(),
-                            path: INBOX_COMPONENT_FILE.to_string(),
-                            capabilities: Vec::new(),
-                            backend_id: None,
-                            session_id: None,
-                        }),
+                        start_global_actor(CHILD_ACTOR_ID, COMPONENT_FILE, Vec::new()),
+                        start_global_actor(PICKER_ACTOR_ID, PICKER_COMPONENT_FILE, Vec::new()),
+                        start_global_actor(
+                            KEYBINDINGS_ACTOR_ID,
+                            KEYBINDINGS_COMPONENT_FILE,
+                            Vec::new(),
+                        ),
+                        start_global_actor(INBOX_ACTOR_ID, INBOX_COMPONENT_FILE, Vec::new()),
+                        start_global_actor(
+                            STATUS_BAR_ACTOR_ID,
+                            STATUS_BAR_COMPONENT_FILE,
+                            Vec::new(),
+                        ),
                     ];
                     if let (Some(backend_id), Some(session_id)) =
                         (context.backend_id, context.session_id)
                     {
-                        commands.push(ActorCommand::StartActor(ActorStartRequest {
-                            id: TERMINAL_UI_ID.to_string(),
-                            path: TERMINAL_UI_COMPONENT_FILE.to_string(),
-                            capabilities: Vec::new(),
-                            backend_id: Some(backend_id),
-                            session_id: Some(session_id),
-                        }));
+                        commands.push(start_session_actor(
+                            TERMINAL_UI_ID,
+                            TERMINAL_UI_COMPONENT_FILE,
+                            Vec::new(),
+                            backend_id,
+                            session_id,
+                        ));
                         commands.push(subscribe_agent_registry(backend_id, session_id));
                         commands.push(query_editor_status(backend_id, session_id));
                     }
@@ -706,8 +703,15 @@ impl Guest for SessionSwitcher {
                 };
                 if id == INBOX_ACTOR_ID {
                     state.inbox_pane = None;
+                    state.inbox_visible = false;
                     state.error = true;
                     state.status = "The global inbox stopped".to_string();
+                    return Vec::new();
+                }
+                if id == STATUS_BAR_ACTOR_ID {
+                    state.status_bar_pane = None;
+                    state.error = true;
+                    state.status = "The status bar stopped".to_string();
                     return Vec::new();
                 }
                 if id == KEYBINDINGS_ACTOR_ID {
@@ -716,6 +720,7 @@ impl Guest for SessionSwitcher {
                 }
                 state.coding_agent_uis.retain(|actor| actor != &id);
                 state.coding_agent_targets.remove(&id);
+                state.diff_viewers.remove(&id);
                 let editor_lifecycle =
                     remove_neovim_ui(&mut state, &id).map(|(backend_id, session_id)| {
                         editor_client_lifecycle(
@@ -750,8 +755,15 @@ impl Guest for SessionSwitcher {
                 };
                 if failed.id == INBOX_ACTOR_ID {
                     state.inbox_pane = None;
+                    state.inbox_visible = false;
                     state.error = true;
                     state.status = format!("The global inbox failed: {}", failed.message);
+                    return Vec::new();
+                }
+                if failed.id == STATUS_BAR_ACTOR_ID {
+                    state.status_bar_pane = None;
+                    state.error = true;
+                    state.status = format!("The status bar failed: {}", failed.message);
                     return Vec::new();
                 }
                 if failed.id == KEYBINDINGS_ACTOR_ID {
@@ -760,6 +772,7 @@ impl Guest for SessionSwitcher {
                 }
                 state.coding_agent_uis.retain(|actor| actor != &failed.id);
                 state.coding_agent_targets.remove(&failed.id);
+                state.diff_viewers.remove(&failed.id);
                 let editor_failure =
                     remove_neovim_ui_any(&mut state, &failed.id).map(|(backend_id, session_id)| {
                         editor_client_lifecycle(
@@ -797,6 +810,9 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == INBOX_ACTOR_ID => {
                 handle_inbox_message(&message.body)
             }
+            Event::Mailbox(message) if message.sender == STATUS_BAR_ACTOR_ID => {
+                handle_status_bar_message(&message.body)
+            }
             Event::Mailbox(message) if message.sender.starts_with(NEOVIM_UI_ID_PREFIX) => {
                 handle_editor_message(&message.sender, EditorMessage::from_bytes(&message.body))
             }
@@ -821,13 +837,39 @@ fn handle_inbox_message(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok((message, consumed)) = serde_json_core::from_slice::<InboxReadyMessage>(bytes) else {
         return Vec::new();
     };
-    if consumed != bytes.len() || message.kind.as_str() != "inbox-ready" || message.pane == 0 {
+    if consumed != bytes.len() || message.pane == 0 {
         return Vec::new();
     }
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    state.inbox_pane = Some(message.pane);
+    match message.kind.as_str() {
+        "inbox-ready" => {
+            state.inbox_pane = Some(message.pane);
+            publish_layout(&state, true, state.workspace_focus)
+        }
+        "inbox-show" if state.inbox_pane == Some(message.pane) => {
+            state.inbox_visible = true;
+            publish_layout(&state, false, Some(message.pane))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn handle_status_bar_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<InboxReadyMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len()
+        || message.kind.as_str() != "status-bar-ready"
+        || message.pane == 0
+    {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    state.status_bar_pane = Some(message.pane);
     publish_layout(&state, true, state.workspace_focus)
 }
 
@@ -1225,19 +1267,29 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
             state.agents.clear();
         }
     }
+    let requested_focus = shell_requested_focus(&state, message.focused_pane);
     state.layout = Some(LayoutContext {
         revision: message.revision,
         lease: message.lease,
         visible_panes: message.visible_panes,
-        focused_pane: message.focused_pane,
+        focused_pane: requested_focus,
         size: message.size,
         rest: message.rest,
     });
-    let mut commands = publish_layout(&state, true, message.focused_pane);
+    let mut commands = publish_layout(&state, true, requested_focus);
     if realm_changed {
         commands.push(subscribe_agent_registry(state.backend_id, state.session_id));
     }
     commands
+}
+
+fn shell_requested_focus(state: &SwitcherState, fallback: Option<u64>) -> Option<u64> {
+    state
+        .keybindings_visible
+        .then_some(state.keybindings_pane)
+        .flatten()
+        .or_else(|| state.picker_visible.then_some(state.picker_pane).flatten())
+        .or(fallback)
 }
 
 fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -1453,13 +1505,13 @@ fn handle_terminal_lifecycle(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     state
         .terminal_uis
         .insert(id.clone(), (backend_id, session_id));
-    vec![ActorCommand::StartActor(ActorStartRequest {
+    vec![start_session_actor(
         id,
-        path: TERMINAL_UI_COMPONENT_FILE.to_string(),
-        capabilities: Vec::new(),
-        backend_id: Some(backend_id),
-        session_id: Some(session_id),
-    })]
+        TERMINAL_UI_COMPONENT_FILE,
+        Vec::new(),
+        backend_id,
+        session_id,
+    )]
 }
 
 fn backend_from_sender(sender: &str) -> Option<u64> {
@@ -1648,16 +1700,16 @@ fn valid_editor_actor_target(target: &str) -> bool {
 }
 
 fn start_neovim_client(id: String, backend_id: u64, session_id: u64) -> ActorCommand {
-    ActorCommand::StartActor(ActorStartRequest {
+    start_session_actor(
         id,
-        path: NEOVIM_CLIENT_COMPONENT_FILE.to_string(),
-        capabilities: vec![
+        NEOVIM_CLIENT_COMPONENT_FILE,
+        vec![
             "runtime:package-cwd".to_string(),
             "subprocess:node".to_string(),
         ],
-        backend_id: Some(backend_id),
-        session_id: Some(session_id),
-    })
+        backend_id,
+        session_id,
+    )
 }
 
 impl EditorMessage {
@@ -1670,19 +1722,17 @@ fn sender_actor_is(sender: &str, expected: &str) -> bool {
     sender.rsplit(':').next() == Some(expected)
 }
 
-fn show_diff(_state: &mut SwitcherState, backend_id: u64, session_id: u64) -> Vec<ActorCommand> {
-    let Ok(body) = serde_json::to_vec(&serde_json::json!({
-        "kind": "create-terminal",
-        "command": "git --no-pager diff --color=always --no-ext-diff",
-    })) else {
-        return Vec::new();
-    };
-    vec![ActorCommand::SendSessionMessage(SessionActorMessage {
-        backend_id,
-        session_id,
-        actor: "init".to_string(),
-        body,
-    })]
+fn show_diff(state: &mut SwitcherState, backend_id: u64, session_id: u64) -> Vec<ActorCommand> {
+    let id = format!("{DIFF_VIEWER_ID_PREFIX}b{backend_id}-s{session_id}");
+    if state.diff_viewers.contains(&id) {
+        vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+            actor: id,
+            body: br#"{"kind":"focus"}"#.to_vec(),
+        })]
+    } else {
+        state.diff_viewers.insert(id.clone());
+        vec![start_diff_viewer(&id, backend_id, session_id)]
+    }
 }
 
 fn start_editor_agent_work(
@@ -2174,13 +2224,26 @@ fn open_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
 }
 
 fn start_coding_agent_ui(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
-    ActorCommand::StartActor(ActorStartRequest {
-        id: id.to_string(),
-        path: CODING_AGENT_COMPONENT_FILE.to_string(),
-        capabilities: Vec::new(),
-        backend_id: Some(backend_id),
-        session_id: Some(session_id),
-    })
+    start_session_actor(
+        id,
+        CODING_AGENT_COMPONENT_FILE,
+        Vec::new(),
+        backend_id,
+        session_id,
+    )
+}
+
+fn start_diff_viewer(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
+    start_session_actor(
+        id,
+        DIFF_VIEWER_COMPONENT_FILE,
+        vec![
+            "filesystem:workspace-read".to_string(),
+            "subprocess:git".to_string(),
+        ],
+        backend_id,
+        session_id,
+    )
 }
 
 fn bind_coding_agent_ui(
@@ -2230,13 +2293,13 @@ fn ensure_default_terminal_ui(
     state
         .terminal_uis
         .insert(id.clone(), (backend_id, session_id));
-    Some(ActorCommand::StartActor(ActorStartRequest {
+    Some(start_session_actor(
         id,
-        path: TERMINAL_UI_COMPONENT_FILE.to_string(),
-        capabilities: Vec::new(),
-        backend_id: Some(backend_id),
-        session_id: Some(session_id),
-    }))
+        TERMINAL_UI_COMPONENT_FILE,
+        Vec::new(),
+        backend_id,
+        session_id,
+    ))
 }
 
 fn actor_realm(actor: &str) -> Option<(u64, u64)> {
@@ -2336,10 +2399,25 @@ fn publish_layout(
     let Some(message) = state.layout.as_ref() else {
         return Vec::new();
     };
+    // The global shell actors are started together, but their pane-created
+    // messages race the first root layout-state publication.  Publishing
+    // before every shell pane is known can delegate a late pane to the
+    // workspace lease.  The root fragment then cannot legally compose that
+    // pane when its ready message arrives.  Hold the initial composition until
+    // the complete shell catalogue is available so chrome ownership is stable
+    // from the first delegation onward.
+    if state.picker_pane.is_none()
+        || state.keybindings_pane.is_none()
+        || state.inbox_pane.is_none()
+        || state.status_bar_pane.is_none()
+    {
+        return Vec::new();
+    }
     let pane = state.pane;
     let picker_pane = state.picker_pane;
     let keybindings_pane = state.keybindings_pane;
     let inbox_pane = state.inbox_pane;
+    let status_bar_pane = state.status_bar_pane;
     let delegated = message
         .visible_panes
         .iter()
@@ -2349,6 +2427,7 @@ fn publish_layout(
                 && Some(*visible) != picker_pane
                 && Some(*visible) != keybindings_pane
                 && Some(*visible) != inbox_pane
+                && Some(*visible) != status_bar_pane
         })
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
@@ -2363,8 +2442,12 @@ fn publish_layout(
         && picker_pane.is_some_and(|picker| message.visible_panes.contains(&picker));
     let keybindings_visible = state.keybindings_visible
         && keybindings_pane.is_some_and(|keybindings| message.visible_panes.contains(&keybindings));
-    let inbox_visible = inbox_pane.is_some_and(|inbox| message.visible_panes.contains(&inbox));
+    let inbox_visible = state.inbox_visible && inbox_pane.is_some();
+    // Shell chrome is introduced by this root fragment, so it cannot depend
+    // on already being present in the previously accepted visible set.
+    let status_bar_visible = status_bar_pane.is_some();
     let width = f64::from(message.size.w.max(1));
+    let height = f64::from(message.size.height.max(1));
     let mut sidebar_fraction = if pane_visible {
         (SIDEBAR_WIDTH / width).clamp(0.18, 0.38)
     } else {
@@ -2382,12 +2465,6 @@ fn publish_layout(
             sidebar_fraction *= scale;
             inbox_fraction *= scale;
         }
-    } else {
-        let chrome = sidebar_fraction + inbox_fraction;
-        if chrome > 0.0 {
-            sidebar_fraction /= chrome;
-            inbox_fraction /= chrome;
-        }
     }
     let rest_fraction = (1.0 - sidebar_fraction - inbox_fraction).max(0.0);
     let sidebar_offset = -1.0 + 2.0 * rest_fraction;
@@ -2395,6 +2472,14 @@ fn publish_layout(
     let inbox_offset = 1.0 - 2.0 * inbox_fraction;
     let inbox_size = 2.0 * inbox_fraction;
     let rest_size = 2.0 * rest_fraction;
+    let status_fraction = if status_bar_visible {
+        (STATUS_BAR_HEIGHT / height).clamp(0.03, 0.14)
+    } else {
+        0.0
+    };
+    let content_size = 2.0 * (1.0 - status_fraction);
+    let status_offset = 1.0 - 2.0 * status_fraction;
+    let status_size = 2.0 * status_fraction;
 
     let mut commands = Vec::new();
     if needs_rest {
@@ -2415,18 +2500,23 @@ fn publish_layout(
     let mut layout_items = Vec::new();
     if pane_visible {
         layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
-            pane, pane, sidebar_offset, sidebar_size
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            pane, pane, sidebar_offset, sidebar_size, content_size
         ));
     }
     if inbox_visible && let Some(inbox) = inbox_pane {
         layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":2,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}},\"input\":\"pane\"}}",
-            inbox, inbox, inbox_offset, inbox_size
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":2,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            inbox, inbox, inbox_offset, inbox_size, content_size
+        ));
+    }
+    if status_bar_visible && let Some(status) = status_bar_pane {
+        layout_items.push(format!(
+            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":90,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":{}}},\"size\":{{\"u\":2,\"v\":{}}}}},\"input\":\"pane\"}}",
+            status, status, status_offset, status_size
         ));
     }
     if picker_visible && let Some(picker) = picker_pane {
-        let height = f64::from(message.size.height.max(1));
         let picker_width = (720.0 / width).clamp(0.45, 0.88);
         let picker_height = (480.0 / height).clamp(0.40, 0.82);
         layout_items.push(format!(
@@ -2448,10 +2538,12 @@ fn publish_layout(
     }
     let layout_items = layout_items.join(",");
     let rest = if has_rest {
-        format!(
-            ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{},\"v\":2}}}}}}",
-            rest_size
-        )
+        let mut rest = format!(
+            ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{rest_size},\"v\":"
+        );
+        rest.push_str(&content_size.to_string());
+        rest.push_str("}}}");
+        rest
     } else {
         String::new()
     };
@@ -3319,12 +3411,137 @@ bindings::export!(SessionSwitcher with_types_in bindings);
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ActorCommand, EditMode, SwitcherState, actor_realm, authenticated_neovim_client,
-        ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
-        open_creation_backend_picker, request_editor, sender_actor_is, show_diff,
-        start_neovim_client, submit, truncate_to_width, valid_editor_actor_target,
+    use brood_plugin_sdk::exports::brood::plugin::actor::{
+        PresentationScope, PresentationSession,
     };
+
+    use super::{
+        ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutStateSize, SwitcherState,
+        actor_realm, authenticated_neovim_client, ensure_default_terminal_ui, header_geometry,
+        neovim_client_realm, neovim_ui_id, open_creation_backend_picker, publish_layout,
+        request_editor, sender_actor_is, shell_requested_focus, show_diff, start_neovim_client,
+        submit, truncate_to_width, valid_editor_actor_target,
+    };
+
+    #[test]
+    fn empty_startup_layout_shows_switcher_and_status_but_hides_inbox() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.status_bar_pane = Some(2);
+        state.inbox_pane = Some(3);
+        state.picker_pane = Some(4);
+        state.keybindings_pane = Some(5);
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            visible_panes,
+            focused_pane: Some(1),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+
+        let commands = publish_layout(&state, true, Some(1));
+        let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
+            panic!("empty startup layout should publish one complete root fragment");
+        };
+        let value: serde_json::Value = serde_json::from_slice(body).expect("valid layout JSON");
+        let items = value["layout"]["items"]
+            .as_array()
+            .expect("layout items");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item["id"] == 1));
+        let status = items
+            .iter()
+            .find(|item| item["id"] == 2)
+            .expect("status bar item");
+        assert_eq!(status["input"], "pane");
+        let switcher = items
+            .iter()
+            .find(|item| item["id"] == 1)
+            .expect("switcher item");
+        assert_eq!(switcher["transform"]["offset"]["u"], 0.5);
+        assert_eq!(switcher["transform"]["size"]["u"], 0.5);
+        assert!(!items.iter().any(|item| item["id"] == 3));
+        assert!(value.get("rest").is_none());
+    }
+
+    #[test]
+    fn initial_root_layout_waits_for_the_complete_shell_catalogue() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            visible_panes,
+            focused_pane: Some(6),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        assert!(publish_layout(&state, true, Some(6)).is_empty());
+
+        state.status_bar_pane = Some(5);
+        let commands = publish_layout(&state, true, Some(6));
+        let [ActorCommand::SendHostMessage(delegate), ActorCommand::SendHostMessage(layout)] =
+            commands.as_slice()
+        else {
+            panic!("complete shell catalogue should delegate and publish exactly once");
+        };
+        let delegate: serde_json::Value =
+            serde_json::from_slice(delegate).expect("valid delegation JSON");
+        assert_eq!(delegate["panes"], serde_json::json!([6]));
+        let layout: serde_json::Value =
+            serde_json::from_slice(layout).expect("valid layout JSON");
+        assert!(
+            layout["layout"]["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["id"] == 5))
+        );
+    }
+
+    #[test]
+    fn visible_shell_overlay_keeps_focus_across_layout_state_revisions() {
+        let mut state = SwitcherState::new();
+        state.inbox_pane = Some(3);
+        state.inbox_visible = true;
+        assert_eq!(
+            shell_requested_focus(&state, Some(9)),
+            Some(9),
+            "the non-modal inbox must allow its target content to retain focus"
+        );
+
+        state.picker_pane = Some(4);
+        state.picker_visible = true;
+        assert_eq!(shell_requested_focus(&state, Some(9)), Some(4));
+
+        state.keybindings_pane = Some(5);
+        state.keybindings_visible = true;
+        assert_eq!(shell_requested_focus(&state, Some(9)), Some(5));
+
+        state.keybindings_visible = false;
+        state.picker_visible = false;
+        state.inbox_visible = false;
+        assert_eq!(shell_requested_focus(&state, Some(9)), Some(9));
+    }
 
     #[test]
     fn narrow_header_geometry_never_overlaps_the_action_button() {
@@ -3351,12 +3568,26 @@ mod tests {
             panic!("first backend did not start a terminal frontend");
         };
         assert_eq!(first.id, "terminal-ui");
+        assert!(matches!(
+            first.presentation_scope,
+            PresentationScope::Session(PresentationSession {
+                backend_id: 1,
+                session_id: 7,
+            })
+        ));
 
         let Some(ActorCommand::StartActor(second)) = ensure_default_terminal_ui(&mut state, 2, 7)
         else {
             panic!("second backend did not start a terminal frontend");
         };
         assert_eq!(second.id, "terminal-ui-b2-s7");
+        assert!(matches!(
+            second.presentation_scope,
+            PresentationScope::Session(PresentationSession {
+                backend_id: 2,
+                session_id: 7,
+            })
+        ));
         assert!(ensure_default_terminal_ui(&mut state, 2, 7).is_none());
     }
 
@@ -3412,8 +3643,13 @@ mod tests {
             started.capabilities,
             ["runtime:package-cwd", "subprocess:node"]
         );
-        assert_eq!(started.backend_id, Some(4));
-        assert_eq!(started.session_id, Some(27));
+        assert!(matches!(
+            started.presentation_scope,
+            PresentationScope::Session(PresentationSession {
+                backend_id: 4,
+                session_id: 27,
+            })
+        ));
     }
 
     #[test]
@@ -3446,19 +3682,31 @@ mod tests {
     }
 
     #[test]
-    fn editor_diff_request_runs_git_in_the_remote_session() {
+    fn editor_diff_request_reuses_one_preferred_session_viewer() {
         let mut state = SwitcherState::new();
-        let commands = show_diff(&mut state, 3, 9);
-        let [ActorCommand::SendSessionMessage(message)] = commands.as_slice() else {
-            panic!("diff request did not use the session mailbox");
+        let first = show_diff(&mut state, 3, 9);
+        let [ActorCommand::StartActor(started)] = first.as_slice() else {
+            panic!("first diff request did not start a viewer");
         };
-        assert_eq!(message.backend_id, 3);
-        assert_eq!(message.session_id, 9);
-        assert_eq!(message.actor, "init");
-        assert!(
-            String::from_utf8_lossy(&message.body)
-                .contains("git --no-pager diff --color=always --no-ext-diff")
+        assert_eq!(started.id, "diff-viewer-sb3-s9");
+        assert!(matches!(
+            started.presentation_scope,
+            PresentationScope::Session(PresentationSession {
+                backend_id: 3,
+                session_id: 9,
+            })
+        ));
+        assert_eq!(
+            started.capabilities,
+            ["filesystem:workspace-read", "subprocess:git"]
         );
+
+        let second = show_diff(&mut state, 3, 9);
+        let [ActorCommand::SendLocalMessage(focus)] = second.as_slice() else {
+            panic!("second diff request did not focus the viewer");
+        };
+        assert_eq!(focus.actor, "diff-viewer-sb3-s9");
+        assert_eq!(focus.body, br#"{"kind":"focus"}"#);
     }
 
     #[test]

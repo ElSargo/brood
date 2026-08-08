@@ -41,13 +41,20 @@ hit testing, or presentation-local key policy.
 The presentation client:
 
 - discovers or starts a session server and completes the presentation handshake;
-- creates its Winit/WGPU viewport;
+- creates a generously sized Winit/WGPU viewport suitable for the default
+  multi-pane workspace;
 - starts the client init actor, presentation plugins, and selected key policy;
 - combines local plugin panes with backend-managed pane inventory;
 - grants and recursively composes layout leases;
 - imports subscribed window frames and renders the accepted layout;
 - performs hit testing, local focus, and physical input routing;
 - sends only pane-local input and requested content sizes to the server.
+
+A fresh normal launch does not create a surface session as a side effect of
+connecting the presentation. The initial catalogue is empty, the session
+switcher is visible, and no terminal or other session-scoped pane exists until
+the user creates or selects a session. Presentation-global chrome, including
+the shortcut status bar, remains available in this empty state.
 
 Closing the client revokes its presentation authority. Starting another client
 creates a new presentation and layout-lease generation without restarting the

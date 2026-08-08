@@ -52,7 +52,8 @@ pub use completion_io::{
 };
 pub use component_actor::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
-    ComponentActorMailboxStats, ComponentAppEvent, ComponentChildEvent, WorkerId,
+    ComponentActorMailboxStats, ComponentAppEvent, ComponentChildEvent, PresentationScope,
+    WorkerId,
 };
 pub use coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, CoordinationStats,

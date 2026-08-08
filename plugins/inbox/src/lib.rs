@@ -13,6 +13,7 @@ use brood_plugin_sdk::{
 use serde::Deserialize;
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
+const SHELL_ACTOR_ID: &str = "session-switcher";
 const INBOX_ACTOR_ID: &str = "inbox";
 const HEADER_HEIGHT: f32 = 48.0;
 const ITEM_HEIGHT: f32 = 72.0;
@@ -119,7 +120,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
         let Ok(state) = STATE.lock() else {
             return Vec::new();
         };
-        return focus_pane_command(state.pane);
+        return show_pane_commands(state.pane);
     }
     let Some(item) = parse_item(sender, body) else {
         return Vec::new();
@@ -135,15 +136,14 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
     Vec::new()
 }
 
-fn focus_pane_command(pane: u64) -> Vec<Command> {
-    (pane != 0)
-        .then(|| {
-            Command::SendHostMessage(
-                format!(r#"{{"type":"focus-pane","pane":{pane}}}"#).into_bytes(),
-            )
-        })
-        .into_iter()
-        .collect()
+fn show_pane_commands(pane: u64) -> Vec<Command> {
+    if pane == 0 {
+        return Vec::new();
+    }
+    vec![Command::SendLocalMessage(LocalActorMessage {
+        actor: SHELL_ACTOR_ID.to_string(),
+        body: format!(r#"{{"kind":"inbox-show","pane":{pane}}}"#).into_bytes(),
+    })]
 }
 
 fn parse_item(sender: &str, body: &[u8]) -> Option<InboxItem> {
@@ -182,7 +182,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.height = created.height.max(160.0);
             redraw_or_record_error(&mut state);
             vec![Command::SendLocalMessage(LocalActorMessage {
-                actor: INIT_ACTOR_ID.to_string(),
+                actor: SHELL_ACTOR_ID.to_string(),
                 body: format!(r#"{{"kind":"inbox-ready","pane":{}}}"#, state.pane).into_bytes(),
             })]
         }
@@ -527,13 +527,14 @@ mod tests {
     }
 
     #[test]
-    fn show_action_focuses_the_global_inbox_pane() {
-        assert!(focus_pane_command(0).is_empty());
-        let commands = focus_pane_command(42);
+    fn show_action_asks_the_root_shell_to_reveal_the_global_inbox_pane() {
+        assert!(show_pane_commands(0).is_empty());
+        let commands = show_pane_commands(42);
         assert!(matches!(
             commands.as_slice(),
-            [Command::SendHostMessage(body)]
-                if body == br#"{"type":"focus-pane","pane":42}"#
+            [Command::SendLocalMessage(LocalActorMessage { actor, body })]
+                if actor == SHELL_ACTOR_ID
+                    && body == br#"{"kind":"inbox-show","pane":42}"#
         ));
     }
 }

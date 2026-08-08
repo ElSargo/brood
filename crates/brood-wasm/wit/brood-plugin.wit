@@ -435,6 +435,18 @@ interface actor {
     }
     variant lifecycle-event { start(start-context), stop(stop-context) }
 
+    record presentation-session {
+        backend-id: u64,
+        session-id: u64,
+    }
+
+    /// Stable visibility and authority scope for a presentation child and its
+    /// default pane. Session-realm hosts ignore this presentation-only value.
+    variant presentation-scope {
+        global,
+        session(presentation-session),
+    }
+
     record actor-start-request {
         id: string,
         /// Path relative to the init actor's capability root.
@@ -442,12 +454,7 @@ interface actor {
         /// Authority requested for the child actor. The realm host validates
         /// these declarations before constructing the child generation.
         capabilities: list<string>,
-        /// Immutable session association for a presentation child and its
-        /// default pane. `none` denotes presentation-global state. Session
-        /// realm hosts already supply their enclosing session and ignore this
-        /// presentation-only association.
-        backend-id: option<u64>,
-        session-id: option<u64>,
+        presentation-scope: presentation-scope,
     }
     record actor-started { id: string, generation: u64 }
     record actor-failed { id: string, message: string }

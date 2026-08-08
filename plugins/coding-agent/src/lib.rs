@@ -5,12 +5,12 @@ use std::{
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_plugin_sdk::{
-    actor::{send_local, send_presentation, send_session},
+    actor::{send_local, send_presentation, send_session, start_global_actor, start_session_actor},
     bindings,
     brood::plugin::host,
     exports::brood::plugin::actor::{
-        ActorStartRequest, ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent,
-        PresentationEvent, WorkerEvent, WorkerRequest,
+        ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
+        WorkerEvent, WorkerRequest,
     },
     graphics::{drop_resources, layout_ui_text, submit_packet},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
@@ -380,26 +380,24 @@ fn set_root_state(client: bool, backend_id: u64, session_id: u64) {
 }
 
 fn start_ui_command(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
-    ActorCommand::StartActor(ActorStartRequest {
-        id: id.to_string(),
-        path: COMPONENT_FILE.to_string(),
-        capabilities: Vec::new(),
-        backend_id: Some(backend_id),
-        session_id: Some(session_id),
-    })
+    start_session_actor(
+        id,
+        COMPONENT_FILE,
+        Vec::new(),
+        backend_id,
+        session_id,
+    )
 }
 
 fn start_agent_command(id: &str) -> ActorCommand {
-    ActorCommand::StartActor(ActorStartRequest {
-        id: id.to_string(),
-        path: COMPONENT_FILE.to_string(),
-        capabilities: vec![
+    start_global_actor(
+        id,
+        COMPONENT_FILE,
+        vec![
             "filesystem:workspace-write".to_string(),
             "subprocess:codex".to_string(),
         ],
-        backend_id: None,
-        session_id: None,
-    })
+    )
 }
 
 fn handle_child(event: ChildEvent) -> Vec<ActorCommand> {

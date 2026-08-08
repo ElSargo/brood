@@ -3,19 +3,22 @@
 This is the default presentation-local Brood shell plugin. The same
 Component Model artifact runs first as the blessed client init actor and starts
 the child actor which owns the native session-switcher pane, the reusable
-`picker` actor, and the initial terminal UI. The init actor also starts and
+`picker` actor, global inbox, keybinding editor, and compact status bar. A fresh
+presentation creates no surface session or terminal UI; creating or selecting
+a session starts session-scoped workloads. The init actor also starts and
 supervises diff, terminal, and coding-agent UI children, so adding those
 workloads does not replace the default shell. The switcher child receives
 typed session snapshots from `brood-client`, renders them through canvas
 packets, and requests typed session operations without DBus, subprocesses, or
 a native toolkit inside the plugin.
 
-The init actor marks each child as presentation-global or supplies its owning
-surface-session ID in the start request. Changing the active session changes
-which scoped children are visible; it does not infer ownership from the actor
-name or rebind an existing terminal, diff viewer, or coding-agent UI to another
-session. A session and its scoped children remain alive with no managed Wayland
-windows and stop only when the session is explicitly closed.
+The init actor gives every child an explicit presentation scope in its start
+request. The switcher, picker, keybinding editor, and inbox use `global`;
+terminal, editor, and coding-agent panes use a backend-qualified `session`
+scope. Changing the active session changes which scoped children are visible;
+it does not infer ownership from the actor name or rebind an existing pane to
+another session. A session and its scoped children remain alive with no managed
+Wayland windows and stop only when the session is explicitly closed.
 
 The child claims the root layout lease, keeps its own pane in a right sidebar,
 and asks the host to delegate every other pane through its `rest` slot to the

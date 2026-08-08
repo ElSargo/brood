@@ -152,8 +152,7 @@ pub enum ComponentActorEvent {
         id: String,
         path: String,
         capabilities: Vec<String>,
-        backend_id: Option<u64>,
-        session_id: Option<u64>,
+        presentation_scope: PresentationScope,
     },
     ActorStopRequested {
         id: String,
@@ -188,6 +187,26 @@ pub enum ComponentActorEvent {
     Stopped,
 }
 
+/// Immutable presentation placement requested for a realm-init child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationScope {
+    Global,
+    Session { backend_id: u64, session_id: u64 },
+}
+
+impl PresentationScope {
+    #[must_use]
+    pub const fn session(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Global => None,
+            Self::Session {
+                backend_id,
+                session_id,
+            } => Some((backend_id, session_id)),
+        }
+    }
+}
+
 /// Cumulative delivery counters and the configured capacity for an actor's
 /// global mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +232,32 @@ impl ComponentActorEventWaker {
 impl std::fmt::Debug for ComponentActorEventWaker {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ComponentActorEventWaker")
+    }
+}
+
+#[derive(Clone)]
+struct ComponentActorEventObserver {
+    sender: mpsc::Sender<ComponentActorEvent>,
+    waker: Option<ComponentActorEventWaker>,
+}
+
+impl ComponentActorEventObserver {
+    const fn new(
+        sender: mpsc::Sender<ComponentActorEvent>,
+        waker: Option<ComponentActorEventWaker>,
+    ) -> Self {
+        Self { sender, waker }
+    }
+
+    fn try_send(
+        &self,
+        event: ComponentActorEvent,
+    ) -> std::result::Result<(), mpsc::error::TrySendError<ComponentActorEvent>> {
+        self.sender.try_send(event)?;
+        if let Some(waker) = self.waker.as_ref() {
+            waker.wake();
+        }
+        Ok(())
     }
 }
 
@@ -476,7 +521,7 @@ struct ActorStore {
     worker_filesystem: Option<WorkerFilesystem>,
     worker_cancellations: WorkerCancellationRegistry,
     blocking_io: BlockingIoTracker,
-    event_observer: mpsc::Sender<ComponentActorEvent>,
+    event_observer: ComponentActorEventObserver,
     shutdown_requested: Arc<AtomicBool>,
     limits: GenerationStoreLimits,
 }
@@ -1628,7 +1673,7 @@ async fn worker_read_file(
     path: PathBuf,
     offset: u64,
     max_bytes: usize,
-    pending_observer: Option<mpsc::Sender<ComponentActorEvent>>,
+    pending_observer: Option<ComponentActorEventObserver>,
     blocking_io: BlockingIoTracker,
     cancellation: Option<Arc<WorkerCancellationToken>>,
 ) -> Result<Vec<u8>> {
@@ -1962,6 +2007,7 @@ impl ComponentActor {
         let observer_result_bytes = Arc::new(Mutex::new(HashMap::new()));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel(config.command_capacity);
+        let event_observer = ComponentActorEventObserver::new(event_tx, config.event_waker.clone());
         let mut store = Store::new(
             &engine,
             ActorStore {
@@ -1974,7 +2020,7 @@ impl ComponentActor {
                 worker_filesystem,
                 worker_cancellations: WorkerCancellationRegistry::default(),
                 blocking_io: BlockingIoTracker::default(),
-                event_observer: event_tx.clone(),
+                event_observer: event_observer.clone(),
                 shutdown_requested: Arc::clone(&shutdown_requested),
                 limits: config.limits.store_limits(),
             },
@@ -2017,7 +2063,7 @@ impl ComponentActor {
                 io_completion_rx,
                 notification_rx,
                 completion_tx,
-                event_tx,
+                event_observer,
                 config,
                 runtime_byte_budget,
                 runtime_observer_result_bytes,
@@ -2349,7 +2395,7 @@ async fn run_component_actor(
     mut io_completions: mpsc::Receiver<ActorCompletion>,
     mut notifications: mpsc::Receiver<NotificationId>,
     completion_observer: mpsc::Sender<ActorCompletion>,
-    event_observer: mpsc::Sender<ComponentActorEvent>,
+    event_observer: ComponentActorEventObserver,
     config: ComponentActorConfig,
     byte_budget: GenerationByteBudget,
     observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
@@ -2408,7 +2454,7 @@ async fn run_component_event_loop(
     io_completions: &mut mpsc::Receiver<ActorCompletion>,
     notifications: &mut mpsc::Receiver<NotificationId>,
     completion_observer: &mpsc::Sender<ActorCompletion>,
-    event_observer: &mpsc::Sender<ComponentActorEvent>,
+    event_observer: &ComponentActorEventObserver,
     config: &ComponentActorConfig,
     byte_budget: &GenerationByteBudget,
     observer_result_bytes: &Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
@@ -2624,8 +2670,13 @@ async fn run_component_event_loop(
                                                     id: request.id,
                                                     path: request.path,
                                                     capabilities: request.capabilities,
-                                                    backend_id: request.backend_id,
-                                                    session_id: request.session_id,
+                                                    presentation_scope: match request.presentation_scope {
+                                                        abi::PresentationScope::Global => PresentationScope::Global,
+                                                        abi::PresentationScope::Session(session) => PresentationScope::Session {
+                                                            backend_id: session.backend_id,
+                                                            session_id: session.session_id,
+                                                        },
+                                                    },
                                                 })
                                                 .context("realm init actor request queue is full")?;
                                         }
@@ -2712,9 +2763,6 @@ async fn run_component_event_loop(
                                                     body: request.body,
                                                 })
                                                 .context("presentation actor message request queue is full")?;
-                                            if let Some(waker) = config.event_waker.as_ref() {
-                                                waker.wake();
-                                            }
                                         }
                                         abi::Command::SessionCommand(request) => {
                                             ensure!(
@@ -3174,7 +3222,7 @@ fn pop_component_dispatch(
     presentation_queue: &mut VecDeque<PresentationEvent>,
     mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit, GenerationBytePermit)>,
     accessor: &wasmtime::component::Accessor<ActorStore>,
-    event_observer: &mpsc::Sender<ComponentActorEvent>,
+    event_observer: &ComponentActorEventObserver,
 ) -> Result<
     Option<(
         GuestEvent,
@@ -3315,7 +3363,7 @@ fn enqueue_retained_dispatch(
 }
 
 fn observe_retained_worker_event(
-    observer: &mpsc::Sender<ComponentActorEvent>,
+    observer: &ComponentActorEventObserver,
     retained: &Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
     worker: WorkerId,
     event: ComponentActorEvent,
@@ -3353,7 +3401,7 @@ fn start_worker<'a>(
     calls: &mut futures::stream::FuturesUnordered<GuestCallFuture<'a>>,
     system_queue: &mut VecDeque<QueuedGuestEvent>,
     active_workers: &mut HashSet<WorkerId>,
-    event_observer: &mpsc::Sender<ComponentActorEvent>,
+    event_observer: &ComponentActorEventObserver,
     config: &ComponentActorConfig,
     byte_permit: GenerationBytePermit,
 ) -> Result<bool> {
@@ -3482,6 +3530,38 @@ fn completion_to_guest(completion: &ActorCompletion) -> GuestEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_event_observer_wakes_only_after_queueing_work() {
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_wakes = Arc::clone(&wakes);
+        let (sender, mut receiver) = mpsc::channel(1);
+        let observer = ComponentActorEventObserver::new(
+            sender,
+            Some(ComponentActorEventWaker::new(move || {
+                observed_wakes.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+
+        assert!(
+            observer
+                .try_send(ComponentActorEvent::DispatcherReturned)
+                .is_ok()
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            receiver.try_recv().ok(),
+            Some(ComponentActorEvent::DispatcherReturned)
+        );
+
+        drop(receiver);
+        assert!(
+            observer
+                .try_send(ComponentActorEvent::DispatcherReturned)
+                .is_err()
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
 
     #[cfg(unix)]
     #[test]

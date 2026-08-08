@@ -8,13 +8,14 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use brood_protocol::{BackendActorRealm, BackendId};
 use brood_wasm::{
-    ActorId, ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentChildEvent,
-    FilesystemGrant, HostedWasmActor, LegacyWasmActorGeneration, LegacyWasmRuntimeEvent, Mailbox,
-    NativeFilesystemWatcherService, PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext,
-    PluginStartReason, PresentationEvent, Preview1ActorCapabilities, Preview1CompatActor,
-    Preview1FilesystemGrant, Preview1WorkerConfig, Registry, RuntimeIoCapabilities,
-    RuntimeIoConfig, SessionCommandRequest, SessionEvent, SessionSnapshot, WasmActor,
-    WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
+    ActorId, ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
+    ComponentChildEvent, FilesystemGrant, HostedWasmActor, LegacyWasmActorGeneration,
+    LegacyWasmRuntimeEvent, Mailbox, NativeFilesystemWatcherService, PluginLifecycleEntry,
+    PluginLifecycleEvent, PluginStartContext, PluginStartReason, PresentationEvent,
+    PresentationScope, Preview1ActorCapabilities, Preview1CompatActor, Preview1FilesystemGrant,
+    Preview1WorkerConfig, Registry, RuntimeIoCapabilities, RuntimeIoConfig, SessionCommandRequest,
+    SessionEvent, SessionSnapshot, WasmActor, WasmActorDeclaration, WasmActorEventKind,
+    WasmPluginArtifact,
 };
 use tokio::sync::Mutex;
 use winit::event_loop::EventLoopProxy;
@@ -211,6 +212,7 @@ impl PresentationWasmRuntime {
             true,
             &[],
             &self.workspace_root,
+            self.event_proxy.clone(),
         ))?;
         self.executor.block_on(actor.lifecycle(
             PluginLifecycleEvent::Start(PluginStartContext {
@@ -380,6 +382,7 @@ impl PresentationWasmRuntime {
             false,
             capabilities,
             &workspace_root,
+            self.event_proxy.clone(),
         ))?;
         if let Some(presentation) = presentation {
             presentation.bind_generation(actor.generation());
@@ -451,17 +454,9 @@ impl PresentationWasmRuntime {
                     id,
                     path,
                     capabilities,
-                    backend_id,
-                    session_id,
+                    presentation_scope,
                 } if actor_id == CLIENT_INIT_ACTOR_ID => {
-                    self.handle_init_start(
-                        id,
-                        &path,
-                        &capabilities,
-                        backend_id.map(BackendId),
-                        session_id,
-                        graphics,
-                    );
+                    self.handle_init_start(id, &path, &capabilities, presentation_scope, graphics);
                 }
                 ComponentActorEvent::ActorStopRequested { id }
                     if actor_id == CLIENT_INIT_ACTOR_ID =>
@@ -698,12 +693,11 @@ impl PresentationWasmRuntime {
         id: String,
         guest_path: &str,
         capabilities: &[String],
-        backend: Option<BackendId>,
-        session: Option<u64>,
+        presentation_scope: PresentationScope,
         graphics: Option<&PluginGraphicsBridge>,
     ) {
         let result =
-            self.start_init_child(&id, guest_path, capabilities, backend, session, graphics);
+            self.start_init_child(&id, guest_path, capabilities, presentation_scope, graphics);
         match result {
             Ok(generation) => {
                 self.send_init_child_event(ComponentChildEvent::Started { id, generation });
@@ -720,8 +714,7 @@ impl PresentationWasmRuntime {
         id: &str,
         guest_path: &str,
         capabilities: &[String],
-        backend: Option<BackendId>,
-        session: Option<u64>,
+        presentation_scope: PresentationScope,
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<u64> {
         ensure!(
@@ -776,11 +769,10 @@ impl PresentationWasmRuntime {
             "init child actors must use the hosted Component or Preview 1 runtime"
         );
         let pane = self.allocate_actor_pane()?;
-        ensure!(
-            backend.is_some() == session.is_some(),
-            "presentation child backend and session association must be specified together"
-        );
-        if let Some(realm) = backend.zip(session) {
+        let realm = presentation_scope
+            .session()
+            .map(|(backend, session)| (BackendId(backend), session));
+        if let Some(realm) = realm {
             ensure!(
                 self.session_workspaces.contains_key(&realm)
                     || self.bound_backend_id == Some(realm.0)
@@ -790,6 +782,7 @@ impl PresentationWasmRuntime {
                 realm.1,
             );
         }
+        let (backend, session) = realm.unzip();
         self.load_actor(spec, pane, backend, session, graphics, capabilities)?;
         let generation = self
             .actors
@@ -805,7 +798,7 @@ impl PresentationWasmRuntime {
             session_id: session,
             workspace_root: self
                 .session_workspaces
-                .get(&backend.zip(session).unwrap_or((BackendId(0), 0)))
+                .get(&realm.unwrap_or((BackendId(0), 0)))
                 .unwrap_or(&self.workspace_root)
                 .to_string_lossy()
                 .into_owned(),
@@ -999,8 +992,13 @@ impl PresentationWasmRuntime {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.actors.is_empty() && self.legacy_actors.is_empty()
+    /// Preview 1 compatibility actors do not yet expose an event callback.
+    /// Component and legacy actors wake Winit when their observer queues gain
+    /// work, so they must not keep a periodic client timer armed while idle.
+    pub fn requires_periodic_event_poll(&self) -> bool {
+        self.actors
+            .values()
+            .any(|actor| matches!(actor.actor, HostedWasmActor::Preview1(_)))
     }
 
     pub fn pane_ids(&self) -> impl Iterator<Item = u64> + '_ {
@@ -1366,6 +1364,7 @@ async fn load_hosted_actor(
     actor_management: bool,
     capabilities: &[String],
     workspace_root: &Path,
+    event_proxy: Option<EventLoopProxy<ClientEvent>>,
 ) -> Result<HostedWasmActor> {
     let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
     let (filesystem, runtime_io) = presentation_actor_grants(root, workspace_root, capabilities)?;
@@ -1384,6 +1383,11 @@ async fn load_hosted_actor(
                     session_messaging: true,
                     daemon_messaging: true,
                     session_control: true,
+                    event_waker: event_proxy.map(|proxy| {
+                        ComponentActorEventWaker::new(move || {
+                            drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+                        })
+                    }),
                     ..ComponentActorConfig::default()
                 },
             )

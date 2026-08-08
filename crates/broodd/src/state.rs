@@ -1594,8 +1594,7 @@ impl Brood {
                     id,
                     path,
                     capabilities,
-                    backend_id: _,
-                    session_id: _,
+                    presentation_scope: _,
                 } => {
                     if let Some(session) = self.realm_init_root_session(&actor_name) {
                         init_requests.push(InitRequest::StartActor(
