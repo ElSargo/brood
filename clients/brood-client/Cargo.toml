@@ -17,8 +17,10 @@ brood-layout.workspace = true
 brood-protocol.workspace = true
 brood-transport.workspace = true
 brood-wasm = { path = "../../crates/brood-wasm" }
+brood-wayland-drop.workspace = true
 calloop.workspace = true
 calloop-wayland-source.workspace = true
+image.workspace = true
 quinn.workspace = true
 rustix.workspace = true
 lyon_tessellation.workspace = true

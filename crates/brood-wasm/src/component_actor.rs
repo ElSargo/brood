@@ -364,6 +364,12 @@ fn worker_write_file(
     u64::try_from(bytes.len()).context("convert write length")
 }
 
+fn worker_remove_file(root: &Dir, writable: bool, path: PathBuf) -> Result<()> {
+    ensure!(writable, "filesystem capability is read-only");
+    root.remove_file(&path)
+        .with_context(|| format!("remove {path:?} from worker filesystem"))
+}
+
 fn read_worker_regular_file(
     root: &Dir,
     path: PathBuf,
@@ -1545,6 +1551,56 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             }
             match result {
                 Ok(Ok(bytes_written)) => Ok(Ok(bytes_written)),
+                Ok(Err(_)) | Err(_) => Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                )),
+            }
+        }
+    }
+
+    fn worker_remove_file(
+        accessor: &wasmtime::component::Accessor<ActorStore, Self>,
+        path: String,
+    ) -> impl Future<
+        Output = wasmtime::Result<
+            std::result::Result<(), bindings::brood::plugin::host::SubmitError>,
+        >,
+    > + Send {
+        let current = current_component_worker(accessor);
+        let (filesystem, blocking_io) = accessor.with(|mut access| {
+            let store = access.get();
+            (store.worker_filesystem.clone(), store.blocking_io.clone())
+        });
+        async move {
+            let (_worker, cancellation) = current?;
+            if cancellation.is_requested() {
+                return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
+            }
+            let Some(filesystem) = filesystem else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            };
+            if !filesystem.writable {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
+            let Ok(path) = validate_capability_path(Path::new(&path)) else {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::InvalidArgument,
+                ));
+            };
+            let result = blocking_io
+                .spawn(move || {
+                    worker_remove_file(filesystem.root.as_ref(), filesystem.writable, path)
+                })
+                .await;
+            if cancellation.is_requested() {
+                return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
+            }
+            match result {
+                Ok(Ok(())) => Ok(Ok(())),
                 Ok(Err(_)) | Err(_) => Ok(Err(
                     bindings::brood::plugin::host::SubmitError::NotPermitted,
                 )),
@@ -2962,6 +3018,23 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
         PresentationEvent::Paste { pane, text } => {
             abi::PresentationEvent::Paste(abi::PasteEvent { pane, text })
         }
+        PresentationEvent::Image {
+            pane,
+            name,
+            mime_type,
+            bytes,
+            preview_width,
+            preview_height,
+            preview_rgba8,
+        } => abi::PresentationEvent::Image(abi::ImageEvent {
+            pane,
+            name,
+            mime_type,
+            bytes,
+            preview_width,
+            preview_height,
+            preview_rgba8,
+        }),
     };
     abi::Event::Presentation(event)
 }
@@ -3196,7 +3269,8 @@ fn enqueue_presentation_dispatch(
         | PresentationEvent::PointerScroll { .. }
         | PresentationEvent::Key { .. }
         | PresentationEvent::Text { .. }
-        | PresentationEvent::Paste { .. } => {}
+        | PresentationEvent::Paste { .. }
+        | PresentationEvent::Image { .. } => {}
     }
 
     if queue.len() >= capacity {

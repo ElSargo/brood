@@ -37,6 +37,13 @@ const TEXT_MIME_TYPES: &[&str] = &[
     "STRING",
     "TEXT",
 ];
+const IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardContent {
+    Text(String),
+    Image { mime_type: String, bytes: Vec<u8> },
+}
 
 #[derive(Clone, Debug)]
 pub struct ClipboardBridge {
@@ -46,21 +53,20 @@ pub struct ClipboardBridge {
 #[derive(Debug)]
 struct ClipboardBridgeInner {
     command_sender: channel::Sender<ClipboardCommand>,
-    latest_text: Arc<Mutex<Option<String>>>,
+    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
 }
 
 impl ClipboardBridge {
     pub fn start() -> Option<Self> {
-        if env::var_os("WAYLAND_DISPLAY").is_none() {
-            return None;
-        }
-        let latest_text = Arc::new(Mutex::new(None));
-        let thread_latest_text = Arc::clone(&latest_text);
+        env::var_os("WAYLAND_DISPLAY")?;
+        let latest_content = Arc::new(Mutex::new(None));
+        let thread_latest_content = Arc::clone(&latest_content);
         let (command_sender, command_receiver) = channel::channel();
         let spawn = thread::Builder::new()
             .name("brood-client-clipboard".to_string())
             .spawn(move || {
-                if let Err(error) = run_clipboard_data_control(thread_latest_text, command_receiver)
+                if let Err(error) =
+                    run_clipboard_data_control(thread_latest_content, command_receiver)
                 {
                     eprintln!("presentation clipboard bridge stopped: {error:#}");
                 }
@@ -69,7 +75,7 @@ impl ClipboardBridge {
             Ok(_handle) => Some(Self {
                 inner: Arc::new(ClipboardBridgeInner {
                     command_sender,
-                    latest_text,
+                    latest_content,
                 }),
             }),
             Err(error) => {
@@ -80,8 +86,8 @@ impl ClipboardBridge {
     }
 
     pub fn set_text(&self, text: String) {
-        if let Ok(mut latest) = self.inner.latest_text.lock() {
-            *latest = Some(text.clone());
+        if let Ok(mut latest) = self.inner.latest_content.lock() {
+            *latest = Some(ClipboardContent::Text(text.clone()));
         }
         if self
             .inner
@@ -93,8 +99,8 @@ impl ClipboardBridge {
         }
     }
 
-    pub fn text(&self) -> Option<String> {
-        self.inner.latest_text.lock().ok()?.clone()
+    pub fn content(&self) -> Option<ClipboardContent> {
+        self.inner.latest_content.lock().ok()?.clone()
     }
 }
 
@@ -154,7 +160,7 @@ struct ClipboardState {
     protocol: ClipboardProtocol,
     offers: HashMap<wayland_client::backend::ObjectId, OfferData>,
     active_source: Option<ActiveSource>,
-    latest_text: Arc<Mutex<Option<String>>>,
+    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
     loop_signal: LoopSignal,
 }
 
@@ -203,16 +209,17 @@ impl ClipboardState {
             return;
         };
         let mime_types = self.offer_mime_types(&offer.id());
-        let Some(mime_type) = choose_text_mime_type(&mime_types) else {
+        let Some((mime_type, kind)) = choose_content_mime_type(&mime_types) else {
             return;
         };
+        self.clear_latest();
         let Ok((read_fd, write_fd)) = rustix::pipe::pipe() else {
             return;
         };
-        offer.receive(mime_type, write_fd.as_fd());
+        offer.receive(mime_type.clone(), write_fd.as_fd());
         drop(write_fd);
         if self.connection.flush().is_ok() {
-            spawn_offer_reader(Arc::clone(&self.latest_text), read_fd);
+            spawn_offer_reader(Arc::clone(&self.latest_content), read_fd, mime_type, kind);
         }
     }
 
@@ -222,16 +229,17 @@ impl ClipboardState {
             return;
         };
         let mime_types = self.offer_mime_types(&offer.id());
-        let Some(mime_type) = choose_text_mime_type(&mime_types) else {
+        let Some((mime_type, kind)) = choose_content_mime_type(&mime_types) else {
             return;
         };
+        self.clear_latest();
         let Ok((read_fd, write_fd)) = rustix::pipe::pipe() else {
             return;
         };
-        offer.receive(mime_type, write_fd.as_fd());
+        offer.receive(mime_type.clone(), write_fd.as_fd());
         drop(write_fd);
         if self.connection.flush().is_ok() {
-            spawn_offer_reader(Arc::clone(&self.latest_text), read_fd);
+            spawn_offer_reader(Arc::clone(&self.latest_content), read_fd, mime_type, kind);
         }
     }
 
@@ -243,7 +251,7 @@ impl ClipboardState {
     }
 
     fn clear_latest(&self) {
-        if let Ok(mut latest) = self.latest_text.lock() {
+        if let Ok(mut latest) = self.latest_content.lock() {
             *latest = None;
         }
     }
@@ -260,7 +268,7 @@ impl ClipboardState {
 }
 
 fn run_clipboard_data_control(
-    latest_text: Arc<Mutex<Option<String>>>,
+    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
     command_receiver: channel::Channel<ClipboardCommand>,
 ) -> Result<()> {
     let connection = Connection::connect_to_env().context("connect to Wayland compositor")?;
@@ -292,7 +300,7 @@ fn run_clipboard_data_control(
         protocol,
         offers: HashMap::new(),
         active_source: None,
-        latest_text,
+        latest_content,
         loop_signal,
     };
     event_loop
@@ -329,19 +337,52 @@ fn choose_text_mime_type(mime_types: &[String]) -> Option<String> {
         .map(|mime_type| (*mime_type).to_string())
 }
 
-fn spawn_offer_reader(latest_text: Arc<Mutex<Option<String>>>, fd: OwnedFd) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardContentKind {
+    Text,
+    Image,
+}
+
+fn choose_content_mime_type(mime_types: &[String]) -> Option<(String, ClipboardContentKind)> {
+    IMAGE_MIME_TYPES
+        .iter()
+        .find(|preferred| {
+            mime_types
+                .iter()
+                .any(|mime_type| mime_type.eq_ignore_ascii_case(preferred))
+        })
+        .map(|mime_type| ((*mime_type).to_string(), ClipboardContentKind::Image))
+        .or_else(|| {
+            choose_text_mime_type(mime_types)
+                .map(|mime_type| (mime_type, ClipboardContentKind::Text))
+        })
+}
+
+fn spawn_offer_reader(
+    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
+    fd: OwnedFd,
+    mime_type: String,
+    kind: ClipboardContentKind,
+) {
     let spawn = thread::Builder::new()
         .name("brood-client-clipboard-read".to_string())
         .spawn(move || match read_fd_limited(fd) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => {
-                    if let Ok(mut latest) = latest_text.lock() {
-                        *latest = Some(text);
-                    }
+            Ok(bytes) => {
+                let content = match kind {
+                    ClipboardContentKind::Text => match String::from_utf8(bytes) {
+                        Ok(text) => ClipboardContent::Text(text),
+                        Err(error) => {
+                            eprintln!("clipboard text is not UTF-8: {error}");
+                            return;
+                        }
+                    },
+                    ClipboardContentKind::Image => ClipboardContent::Image { mime_type, bytes },
+                };
+                if let Ok(mut latest) = latest_content.lock() {
+                    *latest = Some(content);
                 }
-                Err(error) => eprintln!("clipboard text is not UTF-8: {error}"),
-            },
-            Err(error) => eprintln!("failed to read clipboard text: {error}"),
+            }
+            Err(error) => eprintln!("failed to read clipboard content: {error}"),
         });
     if let Err(error) = spawn {
         eprintln!("failed to start clipboard reader: {error}");
@@ -356,7 +397,7 @@ fn read_fd_limited(fd: OwnedFd) -> io::Result<Vec<u8>> {
     if bytes.len() > MAX_CLIPBOARD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "clipboard text exceeds the presentation limit",
+            "clipboard content exceeds the presentation limit",
         ));
     }
     Ok(bytes)

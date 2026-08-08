@@ -18,6 +18,10 @@ The UI supports:
 - `Ctrl+Alt+A` globally to fuzzy-pick a running agent in the current session
   and open a UI focused on it;
 - `Enter` to submit the prompt;
+- `Ctrl+V` to attach an image from the presentation clipboard (ordinary text
+  is pasted into the prompt);
+- desktop drag and drop to attach PNG, JPEG, WebP, or GIF files;
+- `Backspace` on an empty prompt to remove the last staged image;
 - `Tab` to switch agent;
 - `F2` to create another independent agent actor;
 - `F6` to cycle model selection;
@@ -27,6 +31,14 @@ The UI supports:
 Every UI's top bar follows the complete session registry, including agents
 created from other UI panes. Closing a UI pane does not stop its session-side
 agents.
+
+Attachments are read by the presentation client and transferred as bounded,
+ordered actor messages. The backend never dereferences a client pathname, so
+the same interaction works when the selected session is remote. The agent
+validates at most four images, 8 MiB each and 12 MiB in aggregate, then gives
+the provider temporary workspace files that are removed after the turn. Staged
+images are shown as aspect-preserving thumbnails in a strip directly above the
+prompt editor until the turn is submitted or the attachment is removed.
 
 This is deliberately an actor-system workload rather than a new privileged
 agent subsystem. Editors, diff tools, LSP bridges, automation actors, and other

@@ -2,7 +2,7 @@
 status: experiment
 type: experiment
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-08-03
 ---
 
 # Coding Agent Actors
@@ -20,7 +20,11 @@ replacing the UI does not stop the agents. An agent failure does not stop its
 peers or the session root.
 
 Each UI is a compact canvas application with agent tabs, status and
-configuration, a transcript, and a prompt editor. `Ctrl+Alt+A` fuzzy-picks
+configuration, a transcript, and a prompt editor. Images pasted from the
+presentation clipboard or dropped from the presentation desktop appear as
+aspect-preserving thumbnails in a strip above the prompt editor and are sent
+with the next turn. Backspace removes the last attachment when the text prompt
+is empty. `Ctrl+Alt+A` fuzzy-picks
 from the active session's agent registry and creates an independently
 addressed UI actor focused on that agent. Each UI remains bound to its owning
 session and shows the complete session registry in its tab bar. Opening or
@@ -75,6 +79,7 @@ root -> UI:       registry
 UI -> agent:      subscribe
 agent -> UI:      agent-state
 UI -> agent:      configure / prompt / cancel
+UI -> agent:      image-start / image-chunk / image-finish
 agent -> UI:      agent-state / agent-log
 UI -> root:       create-agent
 root -> UI:       registry
@@ -83,6 +88,13 @@ root -> UI:       registry
 These are application messages over the ordinary bounded actor transport.
 Presentation-to-session and session-to-presentation routing authenticate the
 origin at the connection boundary. Message bodies do not grant authority.
+
+Image bytes originate on the presentation machine, never as a path assumed to
+exist on the backend. The UI validates the clipboard or dropped-file format,
+shows the staged attachment, and streams bounded ordered chunks before the
+prompt. The session actor validates the declared length, format, count, order,
+and aggregate turn size before making a completed image available to its
+worker. This same transfer is used for local and remote sessions.
 
 Subscriptions are leases on a presentation connection, not ownership of the
 agent. The target protocol needs explicit unsubscribe and connection-loss
@@ -103,6 +115,14 @@ or a Codex process adapter should all project the same events into the agent
 actor. Provider credentials and outbound network access belong to declared
 capabilities and session configuration; they are not embedded in the UI or
 mailbox protocol.
+
+The Codex adapter starts the capability-allowed executable directly, with a Bash
+login-shell fallback for remote hosts that provide Codex from their normal
+interactive environment. It materializes validated images as uniquely named
+temporary files inside its workspace grant, attaches those files to the initial
+model turn, and removes them after the process exits or is cancelled. The
+temporary file is a provider boundary detail rather than part of the public
+mailbox protocol or durable workspace state.
 
 Tools should become actors when they need independent identity, lifecycle,
 state, subscriptions, or reuse by several agents. A one-turn subprocess or
@@ -149,6 +169,11 @@ and completed screenshots must differ, and structured logs must correlate the
 actor route, worker result, draw packet sequence, and workspace effect.
 The workload then sends another configuration command through the same UI and
 fails if the actor closed its mailbox or stopped producing scheduler progress.
+The image lane additionally pastes a real image through the nested compositor,
+verifies the visible attachment state, asks the real model about image content,
+and checks that no temporary attachment file remains. The same proof must be
+run with the session actor hosted on a remote backend so success cannot depend
+on a presentation-local pathname.
 
 Further proofs should run turns concurrently, switch the selected UI agent
 during output, cancel one without affecting another, replace the UI actor,

@@ -1531,7 +1531,8 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
         | PresentationEvent::PointerScroll { pane, .. }
         | PresentationEvent::Key { pane, .. }
         | PresentationEvent::Text { pane, .. }
-        | PresentationEvent::Paste { pane, .. } => *pane,
+        | PresentationEvent::Paste { pane, .. }
+        | PresentationEvent::Image { pane, .. } => *pane,
     }
 }
 

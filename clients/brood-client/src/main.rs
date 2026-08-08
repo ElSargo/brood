@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Cursor},
     mem::size_of,
     net::ToSocketAddrs,
     os::fd::AsFd,
@@ -80,7 +80,8 @@ use brood_wasm::{
     SessionCommandRequest, SessionEvent, SessionOperation, SessionSnapshot, SessionSummary,
     WasmActorEventKind, WasmPluginArtifact,
 };
-use clipboard::ClipboardBridge;
+use brood_wayland_drop::{DropBridge as WaylandDropBridge, DropEvent as WaylandDropEvent};
+use clipboard::{ClipboardBridge, ClipboardContent};
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
 use layout::{
     LayoutSource, convert_actor_layout_fragment, convert_actor_layout_lease, native_flat_layout,
@@ -90,6 +91,17 @@ use plugin_graphics::PluginGraphicsBridge;
 
 pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
+const MAX_AGENT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AGENT_IMAGE_DECODE_DIMENSION: u32 = 16_384;
+const MAX_AGENT_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+const AGENT_IMAGE_PREVIEW_WIDTH: u32 = 192;
+const AGENT_IMAGE_PREVIEW_HEIGHT: u32 = 80;
+
+struct AgentImagePreview {
+    width: u32,
+    height: u32,
+    rgba8: Vec<u8>,
+}
 
 fn latency_summary(
     samples: &VecDeque<u128>,
@@ -1072,6 +1084,7 @@ enum ClientEvent {
         queued_at: Instant,
         sent_at: Instant,
     },
+    WaylandDroppedFile(WaylandDropEvent),
     ActorHostMessagesReady,
     BackendActorMessage {
         backend: BackendId,
@@ -2589,6 +2602,7 @@ struct Application {
     key_policy: Option<ClientKeyPolicy>,
     plugin_graphics: Option<PluginGraphicsBridge>,
     clipboard: Option<ClipboardBridge>,
+    wayland_drop: Option<WaylandDropBridge>,
     backend_commands: Option<BackendCommandLane>,
     event_proxy: Option<winit::event_loop::EventLoopProxy<ClientEvent>>,
     next_renderer_generation: u64,
@@ -3432,6 +3446,9 @@ impl Application {
                 return Err(anyhow!(
                     "remote terminal timing event reached scene transport path"
                 ));
+            }
+            ClientEvent::WaylandDroppedFile(_) => {
+                return Err(anyhow!("Wayland file drop reached scene transport path"));
             }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
@@ -4337,12 +4354,24 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.fast_path_enabled,
                     graphics,
                     generation,
-                    proxy,
+                    proxy.clone(),
                 )
             });
 
         match result {
             Ok(renderer) => {
+                match WaylandDropBridge::new(renderer.window.as_ref(), move |drop_event| {
+                    drop(proxy.send_event(ClientEvent::WaylandDroppedFile(drop_event)));
+                }) {
+                    Ok(bridge) => self.wayland_drop = bridge,
+                    Err(error) => {
+                        self.fail(
+                            event_loop,
+                            error.context("initialize presentation file drop"),
+                        );
+                        return;
+                    }
+                }
                 renderer.window.request_redraw();
                 self.renderer = Some(renderer);
                 if let (Some(runtime), Some(renderer)) =
@@ -4414,6 +4443,16 @@ impl ApplicationHandler<ClientEvent> for Application {
             return;
         }
         match event {
+            ClientEvent::WaylandDroppedFile(drop) => {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    deliver_dropped_image(
+                        renderer,
+                        self.wasm_runtime.as_ref(),
+                        Some((f64::from(drop.position.0), f64::from(drop.position.1))),
+                        &drop.path,
+                    );
+                }
+            }
             ClientEvent::RemoteArtifactInstalled {
                 manifest,
                 path,
@@ -4876,6 +4915,12 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
+        if let Some(wayland_drop) = self.wayland_drop.as_mut()
+            && let Err(error) = wayland_drop.dispatch_pending()
+        {
+            self.fail(event_loop, error);
+            return;
+        }
         if let Err(error) = self.settle_window_resize() {
             self.fail(event_loop, error);
             return;
@@ -5023,6 +5068,14 @@ impl ApplicationHandler<ClientEvent> for Application {
                 send_managed_pointer_leave(
                     self.input_sender.as_mut(),
                     &mut self.pointer_routing.managed_target,
+                );
+            }
+            WindowEvent::DroppedFile(path) => {
+                deliver_dropped_image(
+                    renderer,
+                    self.wasm_runtime.as_ref(),
+                    self.cursor_position,
+                    &path,
                 );
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -6096,11 +6149,43 @@ fn apply_key_policy_host_message(
                 renderer.focused_plugin_pane() == Some(pane),
                 "clipboard paste target is not the focused plugin pane"
             );
-            if let Some(text) = clipboard.and_then(ClipboardBridge::text) {
-                send_presentation_event(
-                    runtime.as_deref(),
-                    PresentationEvent::Paste { pane, text },
-                )?;
+            if let Some(content) = clipboard.and_then(ClipboardBridge::content) {
+                match content {
+                    ClipboardContent::Text(text) => send_presentation_event(
+                        runtime.as_deref(),
+                        PresentationEvent::Paste { pane, text },
+                    )?,
+                    ClipboardContent::Image { mime_type, bytes } => {
+                        anyhow::ensure!(
+                            bytes.len() <= MAX_AGENT_IMAGE_BYTES,
+                            "clipboard image exceeds the {MAX_AGENT_IMAGE_BYTES} byte attachment limit"
+                        );
+                        let detected = image_mime_type(&bytes)
+                            .context("clipboard image has an unsupported or invalid format")?;
+                        anyhow::ensure!(
+                            detected == mime_type,
+                            "clipboard image MIME type {mime_type:?} does not match {detected:?} bytes"
+                        );
+                        let preview = decode_agent_image_preview(&bytes)
+                            .context("create clipboard image preview")?;
+                        let byte_count = bytes.len();
+                        eprintln!(
+                            "delivering clipboard image pane={pane} mime={mime_type} bytes={byte_count}"
+                        );
+                        send_presentation_event(
+                            runtime.as_deref(),
+                            PresentationEvent::Image {
+                                pane,
+                                name: format!("clipboard.{}", image_extension(detected)),
+                                mime_type,
+                                bytes,
+                                preview_width: preview.width,
+                                preview_height: preview.height,
+                                preview_rgba8: preview.rgba8,
+                            },
+                        )?;
+                    }
+                }
             }
             None
         }
@@ -6122,6 +6207,126 @@ fn apply_key_policy_host_message(
         )?;
     }
     Ok(())
+}
+
+fn deliver_dropped_image(
+    renderer: &Renderer,
+    runtime: Option<&PresentationWasmRuntime>,
+    position: Option<(f64, f64)>,
+    path: &std::path::Path,
+) {
+    let pane = position
+        .and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y))
+        .and_then(|target| match target {
+            PanePointerTarget::Plugin { pane, .. } => Some(pane),
+            PanePointerTarget::Managed { .. } => None,
+        })
+        .or_else(|| renderer.focused_plugin_pane());
+    let Some(pane) = pane else {
+        eprintln!(
+            "ignored dropped file outside a plugin pane path={}",
+            path.display()
+        );
+        return;
+    };
+    match read_image_attachment(path) {
+        Ok((name, mime_type, bytes, preview)) => {
+            let byte_count = bytes.len();
+            if let Err(error) = send_presentation_event(
+                runtime,
+                PresentationEvent::Image {
+                    pane,
+                    name: name.clone(),
+                    mime_type: mime_type.clone(),
+                    bytes,
+                    preview_width: preview.width,
+                    preview_height: preview.height,
+                    preview_rgba8: preview.rgba8,
+                },
+            ) {
+                eprintln!("dropped image event was rejected: {error:#}");
+            } else {
+                eprintln!(
+                    "delivered dropped image pane={pane} name={name:?} mime={mime_type} bytes={byte_count}"
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("ignored dropped file {}: {error:#}", path.display());
+        }
+    }
+}
+
+fn read_image_attachment(
+    path: &std::path::Path,
+) -> Result<(String, String, Vec<u8>, AgentImagePreview)> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("inspect dropped image {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "drop target is not a regular file");
+    anyhow::ensure!(
+        metadata.len() <= MAX_AGENT_IMAGE_BYTES as u64,
+        "image exceeds the {MAX_AGENT_IMAGE_BYTES} byte attachment limit"
+    );
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read dropped image {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_AGENT_IMAGE_BYTES,
+        "image grew beyond the {MAX_AGENT_IMAGE_BYTES} byte attachment limit while being read"
+    );
+    let mime_type = image_mime_type(&bytes)
+        .context("only PNG, JPEG, WebP, and GIF images can be attached")?
+        .to_string();
+    let preview = decode_agent_image_preview(&bytes).context("create dropped image preview")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("dropped-image")
+        .to_string();
+    Ok((name, mime_type, bytes, preview))
+}
+
+fn decode_agent_image_preview(bytes: &[u8]) -> Result<AgentImagePreview> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detect image format for preview")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_AGENT_IMAGE_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_AGENT_IMAGE_DECODE_DIMENSION);
+    limits.max_alloc = Some(MAX_AGENT_IMAGE_DECODE_BYTES);
+    reader.limits(limits);
+    let decoded = reader.decode().context("decode image for preview")?;
+    let preview = decoded
+        .thumbnail(AGENT_IMAGE_PREVIEW_WIDTH, AGENT_IMAGE_PREVIEW_HEIGHT)
+        .into_rgba8();
+    Ok(AgentImagePreview {
+        width: preview.width(),
+        height: preview.height(),
+        rgba8: preview.into_raw(),
+    })
+}
+
+fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    }
 }
 
 fn queue_spawn_command(
@@ -8617,5 +8822,26 @@ mod tests {
             application.backend_registry.all_view_routes(),
             vec![(local_view, local, 1)]
         );
+    }
+
+    #[test]
+    fn image_mime_detection_uses_bytes_instead_of_file_names() {
+        assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime_type(b"\xff\xd8\xffrest"), Some("image/jpeg"));
+        assert_eq!(image_mime_type(b"GIF89arest"), Some("image/gif"));
+        assert_eq!(image_mime_type(b"RIFF1234WEBPrest"), Some("image/webp"));
+        assert_eq!(image_mime_type(b"not an image"), None);
+    }
+
+    #[test]
+    fn image_preview_preserves_aspect_ratio_and_pixels() {
+        let source = image::RgbaImage::from_pixel(192, 128, image::Rgba([255, 0, 0, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let preview = decode_agent_image_preview(encoded.get_ref()).unwrap();
+        assert_eq!((preview.width, preview.height), (120, 80));
+        assert_eq!(preview.rgba8.get(0..4), Some([255, 0, 0, 255].as_slice()));
     }
 }

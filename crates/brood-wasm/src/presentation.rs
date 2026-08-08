@@ -166,6 +166,15 @@ pub enum PresentationEvent {
         pane: u64,
         text: String,
     },
+    Image {
+        pane: u64,
+        name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+        preview_width: u32,
+        preview_height: u32,
+        preview_rgba8: Vec<u8>,
+    },
 }
 
 /// One backend surface session as observed by a presentation-local actor.

@@ -154,6 +154,31 @@ int main(int argc, char **argv) {
             .tv_nsec = (long)(hold_milliseconds % 1000) * 1000000,
         };
         nanosleep(&hold, NULL);
+        const uint32_t trigger_x =
+            release_x < x && x >= 40 ? x - 40 : x + 40;
+        zwlr_virtual_pointer_v1_motion_absolute(
+            pointer,
+            monotonic_msec(),
+            trigger_x,
+            y,
+            width,
+            height
+        );
+        zwlr_virtual_pointer_v1_frame(pointer);
+        if (wl_display_roundtrip(display) < 0) {
+            fprintf(stderr, "virtual pointer drag trigger failed\n");
+            zwlr_virtual_pointer_v1_destroy(pointer);
+            zwlr_virtual_pointer_manager_v1_destroy(manager);
+            wl_seat_destroy(seat);
+            wl_registry_destroy(registry);
+            wl_display_disconnect(display);
+            return 1;
+        }
+        const struct timespec drag_start_settle = {
+            .tv_sec = 0,
+            .tv_nsec = 250000000,
+        };
+        nanosleep(&drag_start_settle, NULL);
         zwlr_virtual_pointer_v1_motion_absolute(
             pointer,
             monotonic_msec(),
@@ -172,6 +197,11 @@ int main(int argc, char **argv) {
             wl_display_disconnect(display);
             return 1;
         }
+        const struct timespec drag_settle = {
+            .tv_sec = 0,
+            .tv_nsec = 250000000,
+        };
+        nanosleep(&drag_settle, NULL);
     }
     zwlr_virtual_pointer_v1_button(pointer, monotonic_msec(), 0x110, 0);
     zwlr_virtual_pointer_v1_frame(pointer);
@@ -183,6 +213,14 @@ int main(int argc, char **argv) {
         wl_registry_destroy(registry);
         wl_display_disconnect(display);
         return 1;
+    }
+    if (hold_milliseconds != 0) {
+        const struct timespec transfer_settle = {
+            .tv_sec = 2,
+            .tv_nsec = 0,
+        };
+        nanosleep(&transfer_settle, NULL);
+        (void)wl_display_roundtrip(display);
     }
 
     zwlr_virtual_pointer_v1_destroy(pointer);

@@ -282,6 +282,12 @@ interface host {
         bytes: list<u8>,
     ) -> result<u64, submit-error>;
 
+    /// Worker-only removal of a capability-relative regular file or symlink.
+    /// The host never follows the final path component and rejects directory
+    /// removal. The host rejects this import outside a registered worker guest
+    /// task or without a writable filesystem grant.
+    worker-remove-file: async func(path: string) -> result<_, submit-error>;
+
     /// Cooperatively yield a CPU-running stackless worker. Native async host
     /// calls release the component Store so the owning actor can dispatch.
     /// A true result asks the cooperative worker to return without doing more
@@ -521,6 +527,15 @@ interface actor {
     }
     record text-event { pane: u64, text: string }
     record paste-event { pane: u64, text: string }
+    record image-event {
+        pane: u64,
+        name: string,
+        mime-type: string,
+        bytes: list<u8>,
+        preview-width: u32,
+        preview-height: u32,
+        preview-rgba8: list<u8>,
+    }
 
     record session-summary {
         id: u64,
@@ -585,6 +600,7 @@ interface actor {
         key(key-event),
         text(text-event),
         paste(paste-event),
+        image(image-event),
     }
 
     variant event {

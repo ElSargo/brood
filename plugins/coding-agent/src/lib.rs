@@ -25,6 +25,14 @@ const FIRST_AGENT: &str = "coding-agent-1";
 const WORKER_ID: u64 = 1;
 const UPDATE_NOTIFICATION_TOKEN: u64 = 0x434f_4445_5841_4745;
 const MAX_LOG_LINES: usize = 96;
+const MAX_IMAGES: usize = 4;
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+const IMAGE_CHUNK_BYTES: usize = 20 * 1024;
+const PROMPT_HEIGHT: f32 = 60.0;
+const IMAGE_TRAY_HEIGHT: f32 = 112.0;
+const IMAGE_TRAY_GAP: f32 = 8.0;
+const MOD_CTRL: u32 = 1;
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 
 const BG: Color = ashen::BACKGROUND;
@@ -58,6 +66,13 @@ struct WireMessage {
     detail: String,
     target_actor: String,
     agents: Vec<WireAgent>,
+    image_id: u64,
+    image_ids: Vec<u64>,
+    image_name: String,
+    mime_type: String,
+    total_bytes: u64,
+    offset: u64,
+    data: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -75,6 +90,27 @@ struct TurnRequest {
     prompt: String,
     model: String,
     reasoning: String,
+}
+
+#[derive(Clone, Debug)]
+struct ImageAttachment {
+    id: u64,
+    name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+}
+
+struct ImagePreview {
+    handle: u64,
+    width: u32,
+    height: u32,
+}
+
+struct IncomingImage {
+    name: String,
+    mime_type: String,
+    total_bytes: usize,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -119,6 +155,9 @@ struct AgentState {
     published_generation: u64,
     observed_generation: u64,
     queued: VecDeque<(u64, WireMessage)>,
+    incoming_images: BTreeMap<u64, IncomingImage>,
+    draft_images: BTreeMap<u64, ImageAttachment>,
+    active_images: Vec<ImageAttachment>,
 }
 
 impl AgentState {
@@ -135,6 +174,9 @@ impl AgentState {
             published_generation: 0,
             observed_generation: 0,
             queued: VecDeque::new(),
+            incoming_images: BTreeMap::new(),
+            draft_images: BTreeMap::new(),
+            active_images: Vec::new(),
         }
     }
 }
@@ -177,6 +219,12 @@ struct UiState {
     selected: usize,
     preferred_agent: Option<String>,
     prompt: String,
+    images: Vec<ImageAttachment>,
+    image_previews: BTreeMap<u64, ImagePreview>,
+    retired_image_previews: Vec<u64>,
+    next_image: u64,
+    suppressed_text: Option<String>,
+    paste_key_pressed: bool,
     text_resources: BTreeMap<TextLayoutKey, u64>,
     frame_text_resources: BTreeSet<TextLayoutKey>,
     created_text_resources: Vec<TextLayoutKey>,
@@ -185,6 +233,10 @@ struct UiState {
     error: String,
     hovered: Option<UiTarget>,
     pressed: Option<UiTarget>,
+    notification: u64,
+    published_generation: u64,
+    observed_generation: u64,
+    outbox: VecDeque<(String, WireMessage)>,
 }
 
 impl UiState {
@@ -200,6 +252,12 @@ impl UiState {
             selected: 0,
             preferred_agent: None,
             prompt: String::new(),
+            images: Vec::new(),
+            image_previews: BTreeMap::new(),
+            retired_image_previews: Vec::new(),
+            next_image: 1,
+            suppressed_text: None,
+            paste_key_pressed: false,
             text_resources: BTreeMap::new(),
             frame_text_resources: BTreeSet::new(),
             created_text_resources: Vec::new(),
@@ -208,6 +266,10 @@ impl UiState {
             error: String::new(),
             hovered: None,
             pressed: None,
+            notification: 0,
+            published_generation: 0,
+            observed_generation: 0,
+            outbox: VecDeque::new(),
         }
     }
 
@@ -235,7 +297,7 @@ impl Guest for CodingAgentPlugin {
             Event::Presentation(event) => handle_presentation(event),
             Event::Mailbox(message) => handle_mailbox(&message.sender, &message.body),
             Event::Notification(event) => {
-                handle_agent_notification(event.notification, event.generation, event.token)
+                handle_notification(event.notification, event.generation, event.token)
             }
             Event::Worker(event) => handle_worker_event(event),
             _ => Vec::new(),
@@ -245,7 +307,22 @@ impl Guest for CodingAgentPlugin {
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         let request: TurnRequest =
             serde_json::from_slice(&payload).map_err(|error| format!("decode turn: {error}"))?;
-        run_codex_turn(&request).await
+        let images = active_worker_images(&request.agent);
+        run_codex_turn(&request, &images).await
+    }
+}
+
+fn active_worker_images(agent: &str) -> Vec<ImageAttachment> {
+    let Ok(state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let RoleState::Agent(state) = &*state else {
+        return Vec::new();
+    };
+    if state.id == agent {
+        state.active_images.clone()
+    } else {
+        Vec::new()
     }
 }
 
@@ -508,12 +585,52 @@ fn handle_agent_message(
                 },
             )
         }
+        "image-start" if agent.active_worker.is_none() => {
+            let result = begin_agent_image(agent, &message);
+            image_transfer_result(agent, result)
+        }
+        "image-chunk" if agent.active_worker.is_none() => {
+            let result = append_agent_image(agent, &message);
+            image_transfer_result(agent, result)
+        }
+        "image-finish" if agent.active_worker.is_none() => {
+            let result = finish_agent_image(agent, message.image_id);
+            image_transfer_result(agent, result)
+        }
         "prompt" if agent.active_worker.is_none() => {
+            if let Some(image_id) = message
+                .image_ids
+                .iter()
+                .find(|image_id| !agent.draft_images.contains_key(image_id))
+            {
+                return agent_commands(
+                    agent,
+                    &WireMessage {
+                        kind: "agent-state".to_string(),
+                        agent: agent.id.clone(),
+                        status: agent.status.clone(),
+                        log_kind: "error".to_string(),
+                        text: format!(
+                            "Image transfer {image_id} was incomplete; the turn was not started"
+                        ),
+                        ..WireMessage::default()
+                    },
+                );
+            }
+            let mut images = Vec::new();
+            for image_id in &message.image_ids {
+                let image = agent
+                    .draft_images
+                    .remove(image_id)
+                    .expect("image IDs were checked before removal");
+                images.push(image);
+            }
             agent.id = message.agent;
             agent.model = message.model;
             agent.reasoning = message.reasoning;
             agent.status = "running".to_string();
             agent.active_worker = Some(WORKER_ID);
+            agent.active_images = images;
             agent.active_target = sender
                 .strip_prefix("presentation:")
                 .filter(|actor| *actor != CLIENT_INIT_ID)
@@ -533,7 +650,20 @@ fn handle_agent_message(
                     reasoning: agent.reasoning.clone(),
                     status: agent.status.clone(),
                     log_kind: "user".to_string(),
-                    text: request.prompt.clone(),
+                    text: if agent.active_images.is_empty() {
+                        request.prompt.clone()
+                    } else {
+                        format!(
+                            "{} · {} image{}",
+                            request.prompt,
+                            agent.active_images.len(),
+                            if agent.active_images.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                    },
                     ..WireMessage::default()
                 },
             );
@@ -582,30 +712,164 @@ fn handle_agent_message(
     }
 }
 
-fn handle_agent_notification(notification: u64, _generation: u64, token: u64) -> Vec<ActorCommand> {
+fn begin_agent_image(agent: &mut AgentState, message: &WireMessage) -> Result<(), String> {
+    let total_bytes = usize::try_from(message.total_bytes)
+        .map_err(|_| "Image size does not fit this backend".to_string())?;
+    if total_bytes == 0 || total_bytes > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "Image must contain at most {} MiB",
+            MAX_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    if !matches!(
+        message.mime_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) {
+        return Err("Unsupported image MIME type".to_string());
+    }
+    if agent.incoming_images.contains_key(&message.image_id)
+        || agent.draft_images.contains_key(&message.image_id)
+    {
+        return Err("Duplicate image transfer identifier".to_string());
+    }
+    if agent.incoming_images.len() + agent.draft_images.len() >= MAX_IMAGES {
+        return Err(format!("At most {MAX_IMAGES} images can be staged"));
+    }
+    let aggregate = agent
+        .incoming_images
+        .values()
+        .map(|image| image.total_bytes)
+        .chain(agent.draft_images.values().map(|image| image.bytes.len()))
+        .sum::<usize>()
+        .saturating_add(total_bytes);
+    if aggregate > MAX_TOTAL_IMAGE_BYTES {
+        return Err(format!(
+            "Staged images exceed the {} MiB turn limit",
+            MAX_TOTAL_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    agent.incoming_images.insert(
+        message.image_id,
+        IncomingImage {
+            name: one_line(&message.image_name, 80),
+            mime_type: message.mime_type.clone(),
+            total_bytes,
+            bytes: Vec::with_capacity(total_bytes),
+        },
+    );
+    Ok(())
+}
+
+fn append_agent_image(agent: &mut AgentState, message: &WireMessage) -> Result<(), String> {
+    let image = agent
+        .incoming_images
+        .get_mut(&message.image_id)
+        .ok_or_else(|| "Image chunk arrived before its transfer start".to_string())?;
+    if message.offset != image.bytes.len() as u64 {
+        return Err("Image chunks arrived out of order".to_string());
+    }
+    let bytes =
+        hex_decode(&message.data).map_err(|_| "Image chunk is not valid hex".to_string())?;
+    if bytes.len() > IMAGE_CHUNK_BYTES
+        || image.bytes.len().saturating_add(bytes.len()) > image.total_bytes
+    {
+        return Err("Image chunk exceeds its declared transfer bound".to_string());
+    }
+    image.bytes.extend(bytes);
+    Ok(())
+}
+
+fn finish_agent_image(agent: &mut AgentState, image_id: u64) -> Result<(), String> {
+    let image = agent
+        .incoming_images
+        .remove(&image_id)
+        .ok_or_else(|| "Image finish arrived before its transfer start".to_string())?;
+    if image.bytes.len() != image.total_bytes {
+        return Err("Image transfer finished before all bytes arrived".to_string());
+    }
+    validate_image(&image.mime_type, &image.bytes)?;
+    agent.draft_images.insert(
+        image_id,
+        ImageAttachment {
+            id: image_id,
+            name: image.name,
+            mime_type: image.mime_type,
+            bytes: image.bytes,
+        },
+    );
+    Ok(())
+}
+
+fn image_transfer_result(agent: &AgentState, result: Result<(), String>) -> Vec<ActorCommand> {
+    result.map_or_else(
+        |text| {
+            agent_commands(
+                agent,
+                &WireMessage {
+                    kind: "agent-state".to_string(),
+                    agent: agent.id.clone(),
+                    status: agent.status.clone(),
+                    log_kind: "error".to_string(),
+                    text,
+                    ..WireMessage::default()
+                },
+            )
+        },
+        |()| Vec::new(),
+    )
+}
+
+fn handle_notification(notification: u64, generation: u64, token: u64) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    let RoleState::Agent(agent) = &mut *state else {
-        return Vec::new();
-    };
-    if notification != agent.notification || token != UPDATE_NOTIFICATION_TOKEN {
-        return Vec::new();
+    match &mut *state {
+        RoleState::Agent(agent)
+            if notification == agent.notification && token == UPDATE_NOTIFICATION_TOKEN =>
+        {
+            let mut commands = Vec::new();
+            for _ in 0..16 {
+                let Some((generation, message)) = agent.queued.pop_front() else {
+                    break;
+                };
+                agent.observed_generation = generation;
+                commands.extend(agent_commands(agent, &message));
+            }
+            let _ = host::notification_watch_actor(
+                agent.notification,
+                agent.observed_generation,
+                UPDATE_NOTIFICATION_TOKEN,
+            );
+            commands
+        }
+        RoleState::Ui(ui)
+            if notification == ui.notification && token == UPDATE_NOTIFICATION_TOKEN =>
+        {
+            ui.observed_generation = generation;
+            let mut commands = Vec::new();
+            for _ in 0..32 {
+                let Some((agent, message)) = ui.outbox.pop_front() else {
+                    break;
+                };
+                if let Some(command) =
+                    session_message(ui.backend_id, ui.session_id, &agent, &message)
+                {
+                    commands.push(command);
+                }
+            }
+            if !ui.outbox.is_empty() {
+                ui.published_generation = ui.published_generation.saturating_add(1);
+                let _ = host::notification_signal(ui.notification, ui.published_generation);
+            }
+            let _ = host::notification_watch_actor(
+                ui.notification,
+                ui.observed_generation,
+                UPDATE_NOTIFICATION_TOKEN,
+            );
+            commands
+        }
+        _ => Vec::new(),
     }
-    let mut commands = Vec::new();
-    for _ in 0..16 {
-        let Some((generation, message)) = agent.queued.pop_front() else {
-            break;
-        };
-        agent.observed_generation = generation;
-        commands.extend(agent_commands(agent, &message));
-    }
-    let _ = host::notification_watch_actor(
-        agent.notification,
-        agent.observed_generation,
-        UPDATE_NOTIFICATION_TOKEN,
-    );
-    commands
 }
 
 fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
@@ -618,6 +882,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
     match event {
         WorkerEvent::Finished(finished) if finished.worker == WORKER_ID => {
             agent.active_worker = None;
+            agent.active_images.clear();
             agent.status = "idle".to_string();
             let mut commands = agent_commands(
                 agent,
@@ -634,6 +899,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
         }
         WorkerEvent::Failed(failed) if failed.worker == WORKER_ID => {
             agent.active_worker = None;
+            agent.active_images.clear();
             agent.status = "failed".to_string();
             let mut commands = agent_commands(
                 agent,
@@ -652,6 +918,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
         }
         WorkerEvent::Cancelled(worker) if worker == WORKER_ID => {
             agent.active_worker = None;
+            agent.active_images.clear();
             agent.status = "idle".to_string();
             agent.active_target = None;
             agent_commands(
@@ -785,11 +1052,18 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     | "Escape"
             );
             (
-                handle_ui_key(ui, &key.logical_key, key.pressed),
+                handle_ui_key(ui, &key.logical_key, key.pressed, key.modifiers),
                 should_redraw,
             )
         }
         PresentationEvent::Text(text) if text.pane == ui.pane => {
+            if ui
+                .suppressed_text
+                .take()
+                .is_some_and(|key| key.eq_ignore_ascii_case(&text.text))
+            {
+                return Vec::new();
+            }
             let mut commands = Vec::new();
             for character in text.text.chars() {
                 if matches!(character, '\r' | '\n') {
@@ -799,6 +1073,28 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 }
             }
             (commands, true)
+        }
+        PresentationEvent::Paste(paste) if paste.pane == ui.pane => {
+            ui.prompt.extend(
+                paste.text.chars().filter(|character| {
+                    !matches!(character, '\r' | '\n') && !character.is_control()
+                }),
+            );
+            (Vec::new(), true)
+        }
+        PresentationEvent::Image(image) if image.pane == ui.pane => {
+            if let Err(error) = attach_ui_image(
+                ui,
+                image.name,
+                image.mime_type,
+                image.bytes,
+                image.preview_width,
+                image.preview_height,
+                image.preview_rgba8,
+            ) {
+                ui.error = error;
+            }
+            (Vec::new(), true)
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == ui.pane => {
             let hovered = ui_target_at(ui, moved.x, moved.y);
@@ -955,15 +1251,34 @@ fn subscribe_agent(backend_id: u64, session_id: u64, agent: &str) -> Option<Acto
     )
 }
 
-fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool) -> Vec<ActorCommand> {
+fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool, modifiers: u32) -> Vec<ActorCommand> {
+    let paste_shortcut = modifiers & MOD_CTRL != 0 && key.eq_ignore_ascii_case("v");
+    if paste_shortcut {
+        if pressed {
+            ui.paste_key_pressed = true;
+            ui.suppressed_text = Some(key.to_string());
+            return vec![request_clipboard_paste_command(ui.pane)];
+        }
+        if ui.paste_key_pressed {
+            ui.paste_key_pressed = false;
+            return Vec::new();
+        }
+        return vec![request_clipboard_paste_command(ui.pane)];
+    }
     if pressed {
         if key == "Backspace" {
-            ui.prompt.pop();
+            if ui.prompt.is_empty() {
+                if let Some(image) = ui.images.pop() {
+                    retire_image_preview(ui, image.id);
+                }
+            } else {
+                ui.prompt.pop();
+            }
         }
         return Vec::new();
     }
     match key {
-        "Enter" | "Return" | "NumpadEnter" => submit_prompt(ui).into_iter().collect(),
+        "Enter" | "Return" | "NumpadEnter" => submit_prompt(ui),
         "Tab" => {
             if !ui.agents.is_empty() {
                 ui.selected = (ui.selected + 1) % ui.agents.len();
@@ -976,6 +1291,12 @@ fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool) -> Vec<ActorCommand
         "Escape" => cancel_selected(ui).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn request_clipboard_paste_command(pane: u64) -> ActorCommand {
+    ActorCommand::SendHostMessage(
+        format!(r#"{{"type":"request-clipboard-paste","pane":{pane}}}"#).into_bytes(),
+    )
 }
 
 fn ui_target_at(ui: &UiState, x: f32, y: f32) -> Option<UiTarget> {
@@ -1008,7 +1329,7 @@ fn activate_ui_target(ui: &mut UiState, target: UiTarget) -> Vec<ActorCommand> {
         }
         UiTarget::Model => configure_selected(ui, true).into_iter().collect(),
         UiTarget::Reasoning => configure_selected(ui, false).into_iter().collect(),
-        UiTarget::Send => submit_prompt(ui).into_iter().collect(),
+        UiTarget::Send => submit_prompt(ui),
         UiTarget::AgentTab(_) => Vec::new(),
     }
 }
@@ -1043,30 +1364,239 @@ fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
-fn can_submit(ui: &UiState) -> bool {
-    ui.session_id != 0 && ui.selected_agent().is_some() && !ui.prompt.trim().is_empty()
+fn attach_ui_image(
+    ui: &mut UiState,
+    name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    preview_width: u32,
+    preview_height: u32,
+    preview_rgba8: Vec<u8>,
+) -> Result<(), String> {
+    if ui.images.len() >= MAX_IMAGES {
+        return Err(format!(
+            "At most {MAX_IMAGES} images can be attached to one turn"
+        ));
+    }
+    validate_image(&mime_type, &bytes)?;
+    let total = ui
+        .images
+        .iter()
+        .map(|image| image.bytes.len())
+        .sum::<usize>()
+        .saturating_add(bytes.len());
+    if total > MAX_TOTAL_IMAGE_BYTES {
+        return Err(format!(
+            "Attached images exceed the {} MiB turn limit",
+            MAX_TOTAL_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    let expected_preview_bytes = usize::try_from(preview_width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(preview_height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "Image preview dimensions are invalid".to_string())?;
+    if preview_width == 0 || preview_height == 0 || expected_preview_bytes != preview_rgba8.len() {
+        return Err("Image preview pixels are invalid".to_string());
+    }
+    let preview_handle =
+        host::graphics_create_image_rgba8(ui.pane, preview_width, preview_height, &preview_rgba8)
+            .map_err(|error| format!("Create image preview: {error:?}"))?;
+    let id = ui.pane.rotate_left(32) ^ ui.next_image.max(1);
+    ui.next_image = ui.next_image.saturating_add(1);
+    ui.images.push(ImageAttachment {
+        id,
+        name: one_line(if name.is_empty() { "image" } else { &name }, 80),
+        mime_type,
+        bytes,
+    });
+    ui.image_previews.insert(
+        id,
+        ImagePreview {
+            handle: preview_handle,
+            width: preview_width,
+            height: preview_height,
+        },
+    );
+    ui.error.clear();
+    Ok(())
 }
 
-fn submit_prompt(ui: &mut UiState) -> Option<ActorCommand> {
-    let agent = ui.selected_agent()?.to_string();
-    if ui.prompt.trim().is_empty() || ui.session_id == 0 {
-        return None;
+fn retire_image_preview(ui: &mut UiState, image_id: u64) {
+    if let Some(preview) = ui.image_previews.remove(&image_id) {
+        ui.retired_image_previews.push(preview.handle);
     }
-    let view = ui.views.get(&agent)?;
-    let prompt = std::mem::take(&mut ui.prompt);
-    session_message(
-        ui.backend_id,
-        ui.session_id,
-        &agent,
-        &WireMessage {
-            kind: "prompt".to_string(),
-            agent: agent.clone(),
-            prompt,
-            model: view.model.clone(),
-            reasoning: view.reasoning.clone(),
+}
+
+fn validate_image(mime_type: &str, bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("Image is empty".to_string());
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "Image exceeds the {} MiB attachment limit",
+            MAX_IMAGE_BYTES / 1024 / 1024
+        ));
+    }
+    let detected = image_mime_type(bytes)
+        .ok_or_else(|| "Only PNG, JPEG, WebP, and GIF images can be attached".to_string())?;
+    if detected != mime_type {
+        return Err(format!(
+            "Image MIME type {mime_type:?} does not match {detected:?} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Result<Vec<u8>, String> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err("Image chunk has an odd hexadecimal length".to_string());
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(String::new()),
+    }
+}
+
+fn can_submit(ui: &UiState) -> bool {
+    ui.session_id != 0
+        && ui.selected_agent().is_some()
+        && (!ui.prompt.trim().is_empty() || !ui.images.is_empty())
+}
+
+fn submit_prompt(ui: &mut UiState) -> Vec<ActorCommand> {
+    let Some(agent) = ui.selected_agent().map(str::to_string) else {
+        return Vec::new();
+    };
+    if (!can_submit(ui)) || ui.session_id == 0 {
+        return Vec::new();
+    }
+    let Some(view) = ui.views.get(&agent) else {
+        return Vec::new();
+    };
+    let model = view.model.clone();
+    let reasoning = view.reasoning.clone();
+    let prompt = if ui.prompt.trim().is_empty() {
+        "Describe the attached image(s).".to_string()
+    } else {
+        std::mem::take(&mut ui.prompt)
+    };
+    let images = std::mem::take(&mut ui.images);
+    let image_ids = images.iter().map(|image| image.id).collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for image in &images {
+        messages.extend(image_transfer_messages(image));
+    }
+    for image in &images {
+        retire_image_preview(ui, image.id);
+    }
+    messages.push(WireMessage {
+        kind: "prompt".to_string(),
+        agent: agent.clone(),
+        prompt,
+        model,
+        reasoning,
+        image_ids,
+        ..WireMessage::default()
+    });
+    queue_ui_messages(ui, &agent, messages)
+}
+
+fn image_transfer_messages(image: &ImageAttachment) -> Vec<WireMessage> {
+    let mut messages = vec![WireMessage {
+        kind: "image-start".to_string(),
+        image_id: image.id,
+        image_name: image.name.clone(),
+        mime_type: image.mime_type.clone(),
+        total_bytes: image.bytes.len() as u64,
+        ..WireMessage::default()
+    }];
+    for (index, chunk) in image.bytes.chunks(IMAGE_CHUNK_BYTES).enumerate() {
+        messages.push(WireMessage {
+            kind: "image-chunk".to_string(),
+            image_id: image.id,
+            offset: (index * IMAGE_CHUNK_BYTES) as u64,
+            data: hex_encode(chunk),
             ..WireMessage::default()
-        },
-    )
+        });
+    }
+    messages.push(WireMessage {
+        kind: "image-finish".to_string(),
+        image_id: image.id,
+        ..WireMessage::default()
+    });
+    messages
+}
+
+fn queue_ui_messages(
+    ui: &mut UiState,
+    agent: &str,
+    messages: Vec<WireMessage>,
+) -> Vec<ActorCommand> {
+    if ui.notification == 0 {
+        let Ok(notification) = host::notification_create() else {
+            ui.error = "Could not create the image transfer notification".to_string();
+            return Vec::new();
+        };
+        ui.notification = notification;
+        let _ = host::notification_watch_actor(
+            notification,
+            ui.observed_generation,
+            UPDATE_NOTIFICATION_TOKEN,
+        );
+    }
+    ui.outbox.extend(
+        messages
+            .into_iter()
+            .map(|message| (agent.to_string(), message)),
+    );
+    ui.published_generation = ui.published_generation.saturating_add(1);
+    if host::notification_signal(ui.notification, ui.published_generation).is_err() {
+        ui.error = "Could not start the image transfer".to_string();
+    }
+    Vec::new()
 }
 
 fn create_agent(ui: &UiState) -> Option<ActorCommand> {
@@ -1150,6 +1680,7 @@ fn redraw_ui(ui: &mut UiState) {
         .map_or_else(|| submit_packet(ui.pane, &packet).map(|_| ()), Err);
     match submitted {
         Ok(()) => {
+            drop_resources(ui.pane, ui.retired_image_previews.drain(..));
             let stale = ui
                 .text_resources
                 .keys()
@@ -1309,7 +1840,12 @@ fn draw_transcript(ui: &mut UiState, packet: &mut Packet) {
         .and_then(|agent| ui.views.get(agent))
         .map(|view| view.logs.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    let available = ((ui.height - 190.0) / 24.0).max(1.0) as usize;
+    let composer_extra = if ui.images.is_empty() {
+        0.0
+    } else {
+        IMAGE_TRAY_HEIGHT + IMAGE_TRAY_GAP
+    };
+    let available = ((ui.height - 190.0 - composer_extra) / 24.0).max(1.0) as usize;
     let start = lines.len().saturating_sub(available);
     let mut y = 108.0;
     for line in lines.iter().skip(start) {
@@ -1347,9 +1883,12 @@ fn draw_transcript(ui: &mut UiState, packet: &mut Packet) {
 }
 
 fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
-    let y = ui.height - 78.0;
+    let y = ui.height - PROMPT_HEIGHT - 18.0;
+    if !ui.images.is_empty() {
+        draw_image_tray(ui, packet, y - IMAGE_TRAY_GAP - IMAGE_TRAY_HEIGHT);
+    }
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(12.0, y, ui.width - 24.0, 60.0),
+        rect: Rect::new(12.0, y, ui.width - 24.0, PROMPT_HEIGHT),
         radius: 8.0,
         color: PANEL,
     });
@@ -1385,11 +1924,90 @@ fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
         packet,
         if send_enabled { "Send" } else { "Enter" },
         ui.width - 88.0,
-        y + if send_pressed { 20.0 } else { 19.0 },
+        send_rect.y + if send_pressed { 11.0 } else { 10.0 },
         14.0,
         56.0,
         if send_enabled { PANEL } else { MUTED },
     );
+    if !ui.error.is_empty() {
+        let error_y = if ui.images.is_empty() {
+            y - 22.0
+        } else {
+            y - IMAGE_TRAY_GAP - IMAGE_TRAY_HEIGHT - 22.0
+        };
+        draw_text(
+            ui,
+            packet,
+            &one_line(&ui.error, 120),
+            18.0,
+            error_y.max(92.0),
+            12.0,
+            (ui.width - 36.0).max(100.0),
+            RED,
+        );
+    }
+}
+
+fn draw_image_tray(ui: &mut UiState, packet: &mut Packet, y: f32) {
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(12.0, y, ui.width - 24.0, IMAGE_TRAY_HEIGHT),
+        radius: 8.0,
+        color: PANEL,
+    });
+    let images = ui
+        .images
+        .iter()
+        .map(|image| (image.id, image.name.clone()))
+        .collect::<Vec<_>>();
+    let count = images.len() as f32;
+    let content_width = (ui.width - 48.0).max(1.0);
+    let total_gaps = (count - 1.0).max(0.0) * 8.0;
+    let card_width = ((content_width - total_gaps) / count).clamp(72.0, 150.0);
+    for (index, (image_id, name)) in images.into_iter().enumerate() {
+        let x = 18.0 + index as f32 * (card_width + 8.0);
+        let card = Rect::new(x, y + 6.0, card_width, IMAGE_TRAY_HEIGHT - 12.0);
+        packet.push(Command::FillRoundedRect {
+            rect: card,
+            radius: 6.0,
+            color: PANEL_LIGHT,
+        });
+        packet.push(Command::StrokeRoundedRect {
+            rect: card,
+            radius: 6.0,
+            color: HOVER,
+            width: 1.0,
+        });
+        if let Some((handle, width, height)) = ui
+            .image_previews
+            .get(&image_id)
+            .map(|preview| (preview.handle, preview.width, preview.height))
+        {
+            let image_width = (card.width - 12.0).max(1.0);
+            let image_height = 76.0_f32.min(card.height - 28.0).max(1.0);
+            let scale = (image_width / width as f32).min(image_height / height as f32);
+            let destination_width = width as f32 * scale;
+            let destination_height = height as f32 * scale;
+            packet.push(Command::DrawImage {
+                image: handle,
+                destination: Rect::new(
+                    card.x + (card.width - destination_width) * 0.5,
+                    card.y + (image_height - destination_height) * 0.5,
+                    destination_width,
+                    destination_height,
+                ),
+            });
+        }
+        draw_text(
+            ui,
+            packet,
+            &one_line(&name, 24),
+            card.x + 6.0,
+            card.y + card.height - 18.0,
+            11.0,
+            (card.width - 12.0).max(1.0),
+            MUTED,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1451,7 +2069,10 @@ fn one_line(text: &str, maximum: usize) -> String {
     output
 }
 
-async fn run_codex_turn(request: &TurnRequest) -> Result<Vec<u8>, String> {
+async fn run_codex_turn(
+    request: &TurnRequest,
+    images: &[ImageAttachment],
+) -> Result<Vec<u8>, String> {
     publish_worker_log(
         &request.agent,
         "status",
@@ -1476,16 +2097,101 @@ async fn run_codex_turn(request: &TurnRequest) -> Result<Vec<u8>, String> {
         arguments.push("--model".to_string());
         arguments.push(request.model.clone());
     }
+    let mut temporary_images = Vec::new();
+    for image in images {
+        let path = temporary_image_path(&request.agent, image);
+        match host::worker_replace_file(path.clone(), image.bytes.clone()).await {
+            Ok(written) if written == image.bytes.len() as u64 => {
+                arguments.push("--image".to_string());
+                arguments.push(path.clone());
+                temporary_images.push(path);
+            }
+            Ok(written) => {
+                cleanup_temporary_images(&request.agent, &temporary_images).await;
+                return Err(format!(
+                    "write attached image {}: expected {} bytes, wrote {written}",
+                    image.name,
+                    image.bytes.len()
+                ));
+            }
+            Err(error) => {
+                cleanup_temporary_images(&request.agent, &temporary_images).await;
+                return Err(format!("write attached image {}: {error:?}", image.name));
+            }
+        }
+    }
+    // `--image` accepts one or more values, so terminate option parsing before
+    // the positional prompt or clap will consume it as another image path.
+    arguments.push("--".to_string());
     arguments.push(request.prompt.clone());
-    let process = host::subprocess_spawn("codex", &arguments)
-        .map_err(|error| format!("spawn codex: {error:?}"))?;
+    let process = match host::subprocess_spawn("codex", &arguments) {
+        Ok(process) => process,
+        Err(direct_error) => {
+            let mut shell_arguments = vec![
+                "-lic".to_string(),
+                "exec codex \"$@\"".to_string(),
+                "brood-codex".to_string(),
+            ];
+            shell_arguments.extend(arguments);
+            match host::subprocess_spawn("bash", &shell_arguments) {
+                Ok(process) => process,
+                Err(shell_error) => {
+                    cleanup_temporary_images(&request.agent, &temporary_images).await;
+                    return Err(format!(
+                        "spawn Codex directly ({direct_error:?}) or through a login shell ({shell_error:?})"
+                    ));
+                }
+            }
+        }
+    };
     let _ = host::stream_close_write(process.stdin);
     let result = drain_codex_process(&request.agent, &process).await;
     let _ = host::stream_drop(process.stdin).await;
     let _ = host::stream_drop(process.stdout).await;
     let _ = host::stream_drop(process.stderr).await;
     let _ = host::child_drop(process.child).await;
+    cleanup_temporary_images(&request.agent, &temporary_images).await;
     result
+}
+
+fn temporary_image_path(agent: &str, image: &ImageAttachment) -> String {
+    let safe_agent = agent
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    format!(
+        ".brood-agent-image-{safe_agent}-{}.{}",
+        image.id,
+        image_extension(&image.mime_type)
+    )
+}
+
+fn image_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    }
+}
+
+async fn cleanup_temporary_images(agent: &str, paths: &[String]) {
+    for path in paths {
+        if let Err(error) = host::worker_remove_file(path.clone()).await {
+            publish_worker_log(
+                agent,
+                "error",
+                &format!("Could not remove temporary image {path}: {error:?}"),
+            );
+        }
+    }
 }
 
 async fn drain_codex_process(agent: &str, process: &host::ProcessIo) -> Result<Vec<u8>, String> {
@@ -1681,6 +2387,90 @@ fn publish_worker_log(agent: &str, kind: &str, text: &str) {
 
 fn runtime_error<T: core::fmt::Debug>(context: &'static str) -> impl FnOnce(T) -> String {
     move |error| format!("{context}: {error:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_bytes(size: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(size.max(bytes.len()), 0x5a);
+        bytes
+    }
+
+    #[test]
+    fn image_chunks_stay_below_the_remote_actor_message_limit() {
+        let image = ImageAttachment {
+            id: 7,
+            name: "proof.png".to_string(),
+            mime_type: "image/png".to_string(),
+            bytes: png_bytes(IMAGE_CHUNK_BYTES * 2 + 19),
+        };
+        let messages = image_transfer_messages(&image);
+        assert_eq!(messages.len(), 5);
+        for message in messages {
+            assert!(serde_json::to_vec(&message).unwrap().len() < 64 * 1024);
+        }
+    }
+
+    #[test]
+    fn agent_reassembles_ordered_image_chunks() {
+        let bytes = png_bytes(IMAGE_CHUNK_BYTES + 11);
+        let mut agent = AgentState::new();
+        begin_agent_image(
+            &mut agent,
+            &WireMessage {
+                image_id: 9,
+                image_name: "remote.png".to_string(),
+                mime_type: "image/png".to_string(),
+                total_bytes: bytes.len() as u64,
+                ..WireMessage::default()
+            },
+        )
+        .unwrap();
+        for (index, chunk) in bytes.chunks(IMAGE_CHUNK_BYTES).enumerate() {
+            append_agent_image(
+                &mut agent,
+                &WireMessage {
+                    image_id: 9,
+                    offset: (index * IMAGE_CHUNK_BYTES) as u64,
+                    data: hex_encode(chunk),
+                    ..WireMessage::default()
+                },
+            )
+            .unwrap();
+        }
+        finish_agent_image(&mut agent, 9).unwrap();
+        assert_eq!(agent.draft_images.get(&9).unwrap().bytes, bytes);
+    }
+
+    #[test]
+    fn agent_rejects_out_of_order_image_chunks() {
+        let mut agent = AgentState::new();
+        begin_agent_image(
+            &mut agent,
+            &WireMessage {
+                image_id: 2,
+                image_name: "bad.png".to_string(),
+                mime_type: "image/png".to_string(),
+                total_bytes: 20,
+                ..WireMessage::default()
+            },
+        )
+        .unwrap();
+        let error = append_agent_image(
+            &mut agent,
+            &WireMessage {
+                image_id: 2,
+                offset: 4,
+                data: "89504e47".to_string(),
+                ..WireMessage::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("out of order"));
+    }
 }
 
 bindings::export!(CodingAgentPlugin with_types_in bindings);

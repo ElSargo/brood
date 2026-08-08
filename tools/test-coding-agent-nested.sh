@@ -3,12 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
+REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc grim magick pkg-config sway wasm-tools wayland-scanner wtype; do
+for tool in cargo cc grim magick pkg-config python3 sway swaymsg wasm-tools wayland-scanner wl-copy wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the coding-agent proof" >&2
     exit 2
@@ -32,10 +34,11 @@ git -C "$WORKSPACE" init -q
 CLIENT_PID=""
 SERVER_PID=""
 COMPOSITOR_PID=""
+DRAG_PID=""
 cleanup() {
   local result=$?
   set +e
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
+  for pid in "$DRAG_PID" "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
       kill "$pid" > /dev/null 2>&1
       wait "$pid" > /dev/null 2>&1
@@ -54,6 +57,9 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build -p broodd -p brood-client --bins
+if [[ -n "$SSH_TARGET" ]]; then
+  cargo build --release -p brood-remote --bin brood-remote --locked
+fi
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -124,6 +130,15 @@ cc \
   "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c" \
   -o "$OUT/virtual-pointer-click" \
   "${WAYLAND_BUILD_FLAGS[@]}"
+read -r -a GTK_BUILD_FLAGS <<< "$(pkg-config --cflags --libs gtk4)"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/image-drag-source.c \
+  -o "$OUT/image-drag-source" \
+  "${GTK_BUILD_FLAGS[@]}"
 target/debug/brood-client \
   --no-server \
   --wasm-key-policy workspace \
@@ -141,6 +156,7 @@ path = "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/br
 EOF
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+if [[ -z "$SSH_TARGET" ]]; then
 (
   cd "$WORKSPACE"
   env -u brood_session \
@@ -169,6 +185,7 @@ for _ in $(seq 1 150); do
   sleep 0.1
 done
 ctl status > /dev/null
+fi
 
 cat > "$SWAY_CONFIG" <<'EOF'
 xwayland disable
@@ -176,6 +193,8 @@ output HEADLESS-1 mode 1280x720
 seat seat0 fallback true
 default_border none
 default_floating_border none
+for_window [app_id="org.brood.ImageDragSource"] floating enable, resize set 240 120, move position 980 300
+for_window [title="Brood image drag source"] floating enable, resize set 240 120, move position 980 300
 EOF
 
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -204,25 +223,52 @@ click_at() {
     "$OUT/virtual-pointer-click" "$1" "$2" 1280 720
 }
 
-env -u brood_session \
-  XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  WGPU_BACKEND=vulkan \
-  BROOD_DMABUF_HAPPY_PATH=1 \
-  BROOD_TRACE_PLUGIN_INPUT=1 \
-  BROOD_TRACE_PLUGIN_TEXT=1 \
-  RUST_LOG="$RUST_LOG" \
-  target/debug/brood-client \
-  --config "$CONFIG" \
-  --dbus-destination "$DBUS_DESTINATION" \
-  --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
-  > "$CLIENT_LOG" 2>&1 &
+if [[ -n "$SSH_TARGET" ]]; then
+  env -u brood_session \
+    XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    WGPU_BACKEND=vulkan \
+    BROOD_DMABUF_HAPPY_PATH=1 \
+    BROOD_TRACE_PLUGIN_INPUT=1 \
+    BROOD_TRACE_PLUGIN_TEXT=1 \
+    RUST_LOG="$RUST_LOG" \
+    target/release/brood-remote ssh \
+    --session-package "coding-agent-image-test=$PACKAGE/brood_wasm_init_actor_example.component.wasm" \
+    --client "$ROOT/target/debug/brood-client" \
+    "$SSH_TARGET" \
+    -- --config "$CONFIG" \
+    > "$CLIENT_LOG" 2>&1 &
+else
+  env -u brood_session \
+    XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    WGPU_BACKEND=vulkan \
+    BROOD_DMABUF_HAPPY_PATH=1 \
+    BROOD_TRACE_PLUGIN_INPUT=1 \
+    BROOD_TRACE_PLUGIN_TEXT=1 \
+    RUST_LOG="$RUST_LOG" \
+    target/debug/brood-client \
+    --config "$CONFIG" \
+    --dbus-destination "$DBUS_DESTINATION" \
+    --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+    > "$CLIENT_LOG" 2>&1 &
+fi
 CLIENT_PID=$!
 
-for _ in $(seq 1 300); do
+backend_ready() {
+  if [[ -n "$SSH_TARGET" ]]; then
+    rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG"
+  else
+    rg -q "delivered presentation-to-session actor message" "$SERVER_LOG" \
+      && rg -q "coding-agent-1" "$SERVER_LOG"
+  fi
+}
+
+STARTUP_ATTEMPTS=300
+[[ -z "$SSH_TARGET" ]] || STARTUP_ATTEMPTS=3600
+for _ in $(seq 1 "$STARTUP_ATTEMPTS"); do
   if rg -q "accepted plugin draw packet" "$CLIENT_LOG" \
-    && rg -q "delivered presentation-to-session actor message" "$SERVER_LOG" \
-    && rg -q "coding-agent-1" "$SERVER_LOG"; then
+    && backend_ready; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -232,8 +278,12 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 rg -q "accepted plugin draw packet" "$CLIENT_LOG"
-rg -q "delivered presentation-to-session actor message" "$SERVER_LOG"
-rg -q "coding-agent-1" "$SERVER_LOG"
+if [[ -n "$SSH_TARGET" ]]; then
+  rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG"
+else
+  rg -q "delivered presentation-to-session actor message" "$SERVER_LOG"
+  rg -q "coding-agent-1" "$SERVER_LOG"
+fi
 
 # wtype uses a compact generated keymap. Prime 29 distinct symbols so its
 # virtual A lands on the normal evdev/XKB keycode 38 used by the key policy.
@@ -255,9 +305,9 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype -s 100 -k Return
 
-AGENT_UI="coding-agent-ui-b1-s1-2"
+AGENT_UI=""
 
-second_agent_ui_focused() {
+agent_ui_focused() {
   rg -q "presentation key policy requested pane focus.*focused=Some.*changed=true" \
     "$CLIENT_LOG" \
     || {
@@ -268,11 +318,18 @@ second_agent_ui_focused() {
 }
 
 for _ in $(seq 1 300); do
-  if rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
+  AGENT_UI="$(
+    { rg -o 'started presentation WASM actor id=coding-agent-ui-b[0-9]+-s[0-9]+-[0-9]+' \
+      "$CLIENT_LOG" || true; } \
+      | tail -1 \
+      | sed 's/.*id=//'
+  )"
+  if [[ -n "$AGENT_UI" ]] \
+    && rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
     && rg -q "started presentation WASM actor id=$AGENT_UI" "$CLIENT_LOG" \
     && rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
       "$CLIENT_LOG" \
-    && second_agent_ui_focused; then
+    && agent_ui_focused; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -281,32 +338,14 @@ for _ in $(seq 1 300); do
   }
   sleep 0.1
 done
+[[ -n "$AGENT_UI" ]]
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
 rg -q "started presentation WASM actor id=$AGENT_UI" "$CLIENT_LOG"
 rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"registry-subscribe\"" \
   "$CLIENT_LOG"
-second_agent_ui_focused
+agent_ui_focused
 
-click_at 240 360
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "x" -k BackSpace -s 100 -k F2
-
-for _ in $(seq 1 300); do
-  if rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG" \
-    && rg -q 'backend actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"; then
-    break
-  fi
-  kill -0 "$CLIENT_PID" 2> /dev/null || {
-    echo "ERR presentation client exited while creating the second agent" >&2
-    exit 1
-  }
-  sleep 0.1
-done
-rg -q "started component plugin actor actor=brood.session.1.coding-agent-2" "$SERVER_LOG"
-rg -q 'backend actor message.*"agent":"coding-agent-2"' "$CLIENT_LOG"
-rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"create-agent\"" \
-  "$CLIENT_LOG"
+AGENT_ID="coding-agent-1"
 
 capture() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -317,32 +356,184 @@ capture() {
 
 capture "$OUT/agent-idle.png"
 
-PROMPT='create .brood/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
-click_at 240 360
+IMAGE_EXPECTED="red green"
+magick -size 192x128 xc:red "$OUT/pasted-image.png"
+magick -size 192x128 xc:lime "$OUT/dropped-image.png"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "x" -k BackSpace -k Tab -s 100 "$PROMPT" -s 100 -k Return
+  wl-copy --type image/png < "$OUT/pasted-image.png"
+sleep 0.3
+click_at 240 670
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype -M ctrl "v" -m ctrl
 
 for _ in $(seq 1 300); do
-  if rg -q 'presentation actor message .*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"; then
+  if rg -q "delivering clipboard image .*mime=image/png" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
-rg -q 'presentation actor message .*recipient=coding-agent-2.*"kind":"prompt"' "$CLIENT_LOG"
+rg -q "delivering clipboard image .*mime=image/png" "$CLIENT_LOG"
+capture "$OUT/agent-image-attached.png"
 
-for _ in $(seq 1 900); do
-  if [[ -f "$WORKSPACE/.brood/agent-actor-proof.txt" ]] \
-    && rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt"; then
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/image-drag-source" "$OUT/dropped-image.png" \
+  > "$OUT/image-drag-source.log" 2>&1 &
+DRAG_PID=$!
+SWAY_SOCKET=""
+DRAG_START=""
+for _ in $(seq 1 100); do
+  kill -0 "$DRAG_PID"
+  SWAY_SOCKET="$(
+    find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'sway-ipc.*.sock' | head -1
+  )"
+  if [[ -n "$SWAY_SOCKET" ]]; then
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+      WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+      SWAYSOCK="$SWAY_SOCKET" \
+      swaymsg -t get_tree -r > "$OUT/sway-tree.json"
+    DRAG_START="$(python3 - "$OUT/sway-tree.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as tree_file:
+    roots = [json.load(tree_file)]
+
+while roots:
+    node = roots.pop()
+    if node.get("name") == "Brood image drag source":
+        rect = node["rect"]
+        print(rect["x"] + rect["width"] // 2, rect["y"] + rect["height"] // 2)
+        break
+    roots.extend(node.get("nodes", []))
+    roots.extend(node.get("floating_nodes", []))
+PY
+)"
+  fi
+  [[ -n "$DRAG_START" ]] && break
+  sleep 0.1
+done
+[[ -n "$DRAG_START" ]]
+read -r DRAG_X DRAG_Y <<< "$DRAG_START"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-pointer-click" "$DRAG_X" "$DRAG_Y" 1280 720 400 240 360 \
+  || echo "WARN compositor closed the disposable virtual pointer after the drag" >&2
+for _ in $(seq 1 300); do
+  if rg -q "delivered dropped image .*mime=image/png" "$CLIENT_LOG"; then
     break
   fi
-  kill -0 "$CLIENT_PID" 2> /dev/null || {
-    echo "ERR presentation client exited during the agent turn" >&2
-    exit 1
-  }
-  sleep 0.2
+  sleep 0.1
 done
-rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt"
+rg -q "delivered dropped image .*mime=image/png" "$CLIENT_LOG"
+kill "$DRAG_PID" > /dev/null 2>&1 || true
+wait "$DRAG_PID" > /dev/null 2>&1 || true
+DRAG_PID=""
+capture "$OUT/agent-images-attached.png"
+
+assert_preview_color() {
+  local image_path="$1"
+  local color="$2"
+  local pixels
+  pixels="$(
+    magick "$image_path" -format %c histogram:info:- \
+      | awk -v color="$color" '$0 ~ color { gsub(":", "", $1); total += $1 } END { print total + 0 }'
+  )"
+  if ((pixels < 500)); then
+    echo "ERR attachment preview color $color has only $pixels visible pixels" >&2
+    exit 1
+  fi
+}
+assert_preview_color "$OUT/agent-images-attached.png" '#FF0000'
+assert_preview_color "$OUT/agent-images-attached.png" '#00FF00'
+
+if [[ -n "$SSH_TARGET" ]]; then
+  PROMPT="Inspect both attached images. If their solid colors are red and green, reply with exactly this marker and nothing else: $REMOTE_IMAGE_MARKER"
+else
+  PROMPT='Inspect both attached images. Create .brood/image-proof.txt containing exactly: red green. Also create .brood/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
+fi
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wl-copy --type text/plain <<< "$PROMPT"
+sleep 0.3
+click_at 240 670
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  wtype -M ctrl "v" -m ctrl -s 100 -k Return
+
+for _ in $(seq 1 300); do
+  if rg -q "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.1
+done
+rg -q "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG"
+
+if [[ -n "$SSH_TARGET" ]]; then
+  for _ in $(seq 1 180); do
+    if rg -Fq "\"text\":\"$REMOTE_IMAGE_MARKER\"" "$CLIENT_LOG"; then
+      break
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || {
+      echo "ERR remote presentation client exited during the agent turn" >&2
+      exit 1
+    }
+    sleep 1
+  done
+  rg -Fq "\"text\":\"$REMOTE_IMAGE_MARKER\"" "$CLIENT_LOG"
+
+  for _ in $(seq 1 300); do
+    if rg -q 'backend actor message .*"status":"idle"' "$CLIENT_LOG" \
+      && rg -q '"text":"Turn complete"' "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.2
+  done
+  rg -q '"text":"Turn complete"' "$CLIENT_LOG"
+  if ssh -T -o BatchMode=yes "$SSH_TARGET" \
+    'find "$HOME" -maxdepth 1 -name '\''.brood-agent-image-*'\'' -print -quit' \
+    | rg -q .; then
+    echo "ERR remote coding-agent temporary image was not removed" >&2
+    exit 1
+  fi
+  capture "$OUT/agent-complete.png"
+  kill "$CLIENT_PID" > /dev/null 2>&1 || true
+  wait "$CLIENT_PID" > /dev/null 2>&1 || true
+  CLIENT_PID=""
+  cat > "$OUT/proof.md" <<EOF
+# Remote coding agent image proof
+
+- target: $SSH_TARGET
+- input: real Wayland clipboard paste and desktop drag/drop
+- transfer: bounded actor messages crossed the SSH backend connection
+- model: Luna-hosted Codex emitted the verified marker $REMOTE_IMAGE_MARKER
+- cleanup: temporary image files were removed on Luna
+- captures: agent-images-attached.png and agent-complete.png
+EOF
+  echo "coding_agent_remote_images=verified target=$SSH_TARGET"
+  echo "proof=$OUT/proof.md"
+  echo "attachments=$OUT/agent-images-attached.png"
+  echo "complete=$OUT/agent-complete.png"
+  exit 0
+else
+  for _ in $(seq 1 900); do
+    if [[ -f "$WORKSPACE/.brood/agent-actor-proof.txt" ]] \
+      && rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt" \
+      && [[ -f "$WORKSPACE/.brood/image-proof.txt" ]] \
+      && rg -qx "$IMAGE_EXPECTED" "$WORKSPACE/.brood/image-proof.txt"; then
+      break
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || {
+      echo "ERR presentation client exited during the agent turn" >&2
+      exit 1
+    }
+    sleep 0.2
+  done
+  rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt"
+  rg -qx "$IMAGE_EXPECTED" "$WORKSPACE/.brood/image-proof.txt"
+fi
 
 for _ in $(seq 1 600); do
   idle_updates="$(
@@ -361,17 +552,21 @@ done
 rg -q "component actor worker finished" "$SERVER_LOG"
 idle_updates="$(rg -c 'backend actor message.*"status":"idle"' "$CLIENT_LOG" || true)"
 ((idle_updates >= 3))
+if find "$WORKSPACE" -maxdepth 1 -name '.brood-agent-image-*' -print -quit | rg -q .; then
+  echo "ERR coding-agent temporary image was not removed" >&2
+  exit 1
+fi
 
 for _ in $(seq 1 300); do
   if rg -q \
-    'backend actor message .*sender=coding-agent-2 recipient=inbox .*"title":"Agent finished"' \
+    "backend actor message .*sender=$AGENT_ID recipient=inbox .*\"title\":\"Agent finished\"" \
     "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
 rg -q \
-  'backend actor message .*sender=coding-agent-2 recipient=inbox .*"title":"Agent finished"' \
+  "backend actor message .*sender=$AGENT_ID recipient=inbox .*\"title\":\"Agent finished\"" \
   "$CLIENT_LOG"
 capture "$OUT/agent-finished-inbox.png"
 
@@ -393,13 +588,13 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "x" -k BackSpace -s 100 -k F6
 for _ in $(seq 1 300); do
-  if rg -q "presentation actor message .*sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
+  if rg -q "presentation actor message .*sender=$AGENT_UI recipient=$AGENT_ID.*\"kind\":\"configure\"" \
     "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
-rg -q "presentation actor message .*sender=$AGENT_UI recipient=coding-agent-2.*\"kind\":\"configure\"" \
+rg -q "presentation actor message .*sender=$AGENT_UI recipient=$AGENT_ID.*\"kind\":\"configure\"" \
   "$CLIENT_LOG"
 if rg -q "presentation init child actor failed|component actor mailbox rejected message: channel closed" \
   "$CLIENT_LOG"; then
@@ -412,6 +607,8 @@ capture "$OUT/agent-complete.png"
 
 python3 - \
   "$OUT/agent-idle.png" \
+  "$OUT/agent-image-attached.png" \
+  "$OUT/agent-images-attached.png" \
   "$OUT/agent-finished-inbox.png" \
   "$OUT/agent-complete.png" <<'PY'
 import pathlib
@@ -425,7 +622,7 @@ for value in sys.argv[1:]:
         raise SystemExit(f"invalid graphical proof: {path}")
 
 metric = subprocess.run(
-    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[2], "null:"],
+    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[4], "null:"],
     text=True,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -446,12 +643,13 @@ cat > "$OUT/proof.md" <<EOF
 
 - input: real text and Enter events through a headless Sway presentation
 - UI: Ctrl+Alt+A opened the session agent picker and Enter launched a session-scoped client-realm canvas actor for its selected agent
-- agents: two independently addressed session-realm actors, enumerated and switched through the UI
+- agent: one independently addressed session-realm actor selected through the UI
 - work: a private actor worker launched Codex with workspace-write authority
 - result: .brood/agent-actor-proof.txt contains actor-ui-worker-ok
+- image: real compositor clipboard and desktop drag/drop PNGs were attached, transferred to the session actor, interpreted by Codex as $IMAGE_EXPECTED, and removed after the turn
 - inbox: agent completion created a global queue item and clicking it focused the originating agent pane
 - survival: the focused UI accepted a model change after the completed turn
-- captures: agent-idle.png, agent-finished-inbox.png, and agent-complete.png
+- captures: agent-idle.png, agent-image-attached.png, agent-images-attached.png, agent-finished-inbox.png, and agent-complete.png
 - status: $STATUS
 EOF
 

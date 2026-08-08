@@ -170,6 +170,48 @@ REMOTE_HOME="$(
 }
 
 cargo build --release -p brood-client -p brood-remote -p broodd --bins --locked
+
+build_component() {
+  local manifest="$1"
+  local core="$2"
+  local component="$3"
+  cargo build \
+    --release \
+    --target wasm32-unknown-unknown \
+    --manifest-path "$manifest" \
+    --locked
+  [[ ! -e "$component" ]] || chmod u+w "$component"
+  wasm-tools component new "$core" --output "$component"
+  wasm-tools validate "$component"
+}
+
+build_component \
+  examples/wasm-init-actor/Cargo.toml \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.wasm \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.component.wasm
+build_component \
+  plugins/picker/Cargo.toml \
+  plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
+  plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.component.wasm
+build_component \
+  plugins/keybindings/Cargo.toml \
+  plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm \
+  plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.component.wasm
+build_component \
+  plugins/diff-viewer/Cargo.toml \
+  plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm \
+  plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.component.wasm
+build_component \
+  plugins/neovim-client/Cargo.toml \
+  plugins/neovim-client/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.wasm \
+  plugins/neovim-client/target/wasm32-unknown-unknown/release/brood_neovim_client_plugin.component.wasm
+build_component \
+  plugins/coding-agent/Cargo.toml \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm
+install -D \
+  plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm
 cargo build \
   --release \
   --target wasm32-unknown-unknown \

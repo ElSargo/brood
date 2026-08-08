@@ -815,6 +815,10 @@ async fn exchange_session_artifacts(
     let mut unresolved = VecDeque::<(u64, String, std::time::Instant)>::new();
     let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `read_exact` is not cancellation safe: dropping it after it has consumed
+    // only part of a frame loses those bytes. Keep one receive future alive
+    // across package-request poll ticks, which matters on higher-latency links.
+    let mut incoming = Box::pin(receive_client_artifact(&mut receive));
     loop {
         while let Some(message) = outbound.pop_front() {
             send.send_server_message(&ServerMessage::Artifact(message))
@@ -828,8 +832,10 @@ async fn exchange_session_artifacts(
         }
 
         tokio::select! {
-            message = receive_client_artifact(&mut receive) => {
-                let update = exchange.handle(message?)?;
+            message = &mut incoming => {
+                let message = message?;
+                drop(incoming);
+                let update = exchange.handle(message)?;
                 apply_session_artifact_update(
                     update,
                     &mut exchange,
@@ -840,6 +846,7 @@ async fn exchange_session_artifacts(
                     &mut waiting_by_digest,
                     &mut active_package_roots,
                 ).await?;
+                incoming = Box::pin(receive_client_artifact(&mut receive));
             }
             _ = poll.tick() => {
                 let poll_target = target.clone();
