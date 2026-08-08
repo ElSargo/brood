@@ -50,3 +50,17 @@ externally visible behavior through a real presentation client. Presentation
 proofs use frontend-owned layout state, real input, and client capture. Server
 diagnostics may accompany a proof, but are not acceptance evidence for final
 layout, hit testing, or pixels.
+
+## Complete Plugin Matrix
+
+`test-bundled-plugins.sh` audits `bundled-plugin-e2e.tsv` against every bundled
+plugin crate and runs the referenced focused lanes. The matrix records the
+synthetic input and the screen, disk, process, protocol, or structured-runtime
+state that decides acceptance. Run it through `nix develop`; use `--all` for
+the complete suite or `--lane NAME` while iterating.
+
+`test-runtime-plugins-nested.sh` is reached through the built-in nested test
+supervisor. It is intentionally disk-authoritative: Component runtime I/O,
+Component filesystem watch, and Preview 1 filesystem/runtime behavior leave
+human-readable workspace artifacts and bounded resource snapshots rather than
+inventing a graphical proxy for server-side plugins.

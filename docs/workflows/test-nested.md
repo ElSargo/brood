@@ -14,6 +14,18 @@ nix develop --command ./tools/test-client-layout-actor.sh
 nix develop --command ./tools/test-session-switcher-plugin-nested.sh
 ```
 
+Audit or run the complete bundled-plugin matrix with:
+
+```sh
+nix develop --command ./tools/test-bundled-plugins.sh --audit
+nix develop --command ./tools/test-bundled-plugins.sh --all --out-dir /tmp/brood-plugin-e2e
+```
+
+Use `--list` to inspect the external assertion owned by each plugin and
+`--lane NAME` to run one focused workload. The parser in
+`tools/test-bundled-plugins.sh` defines the exact accepted options. Every lane
+retains its own log and evidence directory below the suite output.
+
 These workflows launch a real external presentation client under an isolated
 graphical compositor. They drive input through that frontend and retain
 frontend-owned logs and captures.

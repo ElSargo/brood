@@ -1,0 +1,19 @@
+# plugin	lane	synthetic input	external assertions
+coding-agent	coding-agent	open agent picker; paste text and two images; submit; Backspace; cancel	composed PNG transitions; preview colours; inbox-to-source focus route; temporary-image removal; actor logs
+component-runtime-io	runtime-io	actor message containing a live loopback peer address	Markdown transcript for pipes, PTY input, socket response, and timer order; independent peer log
+component-workspace-watch	workspace-watch	create, modify, remove, and create two non-UTF-8 file names	Markdown watch history with reversible paths; actor generation and watcher resource counts
+default-workspace	session-shell	global shortcuts, text, pointer presses, drags, and releases	composed PNG transitions; key-policy routes; persisted shortcut overrides; session catalogue
+diff-viewer	session-shell	global shortcut; pointer scroll, drag, release, and close	composed PNG transitions; changed scroll position; actor lifecycle logs
+inbox	terminal	command completion; click notification; Ctrl+Alt+I	composed PNG; notification-to-source focus route; global shortcut focus route
+keybindings	keybindings-narrow	open, fuzzy-filter, capture a replacement chord, resolve conflict, invoke replacement	persisted JSON; composed 360x320 PNG transitions; key-policy route
+neovim-client	editor	modal text, Backspace, save, commands, and inbound open message	composed PNG transitions; runner routes; process placement; host config marker
+neovim-files	editor	open, chunked read, edit, save, conflict-safe replace, and inbound open	written fixture bytes; >64-chunk transfer counts; actor routes; no backend Neovim process
+picker	session-shell	open, fuzzy text, arrows, Enter, Escape, and backdrop click	composed overlay PNG; original selected value; actor removal; retained recursive layout
+session-switcher	session-shell	shortcuts, fuzzy session selection, rename, close, pointer hover/press/release	composed PNG transitions; session catalogue; focus and recursive-layout routes
+session-switcher	startup-empty	fresh client; Ctrl+Shift+/	zero-session catalogue; no terminal actors; hidden inbox; 34px status-bar and session-picker composition; composed PNG transition
+status-bar	startup-empty	fresh empty-session catalogue; Ctrl+Shift+/	34px composed canvas; persistent hotkey guidance; hidden inbox; keybindings overlay PNG transition
+terminal-session	terminal	shell text; exact modified keys; resize; scroll; mouse report; paste; child exit	PTY byte capture; process state; written paste marker; resource and mailbox metrics
+terminal-ui	terminal	keys, text, pointer selection, wheel scroll, clipboard copy/paste, reconnect	composed PNG transitions; clipboard bytes; packet/text/layout metrics; pane identity
+workspace-file-log	runtime-io	actor message containing a live loopback peer address	Preview 1 Markdown transcript; independent peer log; bounded runtime resource counts
+workspace-file-log	workspace-watch	create, modify, remove, watch churn, and two non-UTF-8 file names	primary and mirror logs; exact path-byte escapes; file index; watcher counts after churn
+worktree-manager	worktree	request the same managed branch twice, then release its session	one clean Git worktree; stable session ID; metadata file with released session

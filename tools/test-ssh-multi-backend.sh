@@ -254,6 +254,17 @@ wasm-tools component new \
 cargo build \
   --release \
   --target wasm32-unknown-unknown \
+  --manifest-path plugins/status-bar/Cargo.toml \
+  --locked
+[[ ! -e plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.component.wasm ]] \
+  || chmod u+w plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.component.wasm
+wasm-tools component new \
+  plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm \
+  --output \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.component.wasm
+cargo build \
+  --release \
+  --target wasm32-unknown-unknown \
   --manifest-path plugins/inbox/Cargo.toml \
   --locked
 [[ ! -e plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_inbox_plugin.component.wasm ]] \
@@ -339,6 +350,7 @@ env \
   -u BROOD_PANE_ID \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
   WGPU_BACKEND=vulkan \
   BROOD_TRACE_PLUGIN_INPUT=1 \
   BROOD_REMOTE_BIN="$ROOT/target/release/brood-remote" \

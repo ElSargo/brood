@@ -137,6 +137,15 @@ WORKTREE_METADATA="$WORKTREE_PARENT/$WORKTREE_NAME.brood-worktree.json"
 [[ -z "$(git -C "$WORKTREE_DIRECTORY" status --short)" ]]
 
 ctl surface-session new primary > /dev/null
+python3 - "$WORKTREE_METADATA" "$SESSION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+metadata = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert metadata["session"] == int(sys.argv[2])
+PY
+ctl close-session "$SESSION_ID" > /dev/null
 for _ in $(seq 1 100); do
   if python3 - "$WORKTREE_METADATA" <<'PY'
 import json
@@ -171,7 +180,8 @@ cat > "$OUT/proof.md" <<EOF
 - retry acquisition: reused session $REUSED_SESSION_ID
 - metadata: $WORKTREE_METADATA
 - checkout status: clean
-- released occupation: session null
+- persistence: creating another session retained the durable worktree session
+- released occupation: closing the managed session wrote session null
 EOF
 
 echo "worktree_manager=verified"

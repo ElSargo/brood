@@ -18,10 +18,17 @@ done
 if [[ -n "${BROOD_TERMINAL_PACKAGE:-}" ]]; then
   PACKAGE="$BROOD_TERMINAL_PACKAGE"
 else
-  PACKAGE="$ROOT/result-terminal"
-  nix build path:.#brood -o "$PACKAGE"
+  PACKAGE="$(nix build .#brood --no-link --print-out-paths)"
 fi
 PACKAGE="$(readlink -f "$PACKAGE")"
+
+# Keep non-visual bundled plugin acceptance behind the built-in `brood test`
+# supervisor as well. These actors expose their result through workspace files,
+# so a presentation client would add no evidence to this focused lane.
+if [[ "${BROOD_RUNTIME_PLUGIN_ONLY:-0}" == 1 ]]; then
+  exec env BROOD_RUNTIME_PLUGIN_PACKAGE="$PACKAGE" \
+    bash "$ROOT/tools/test-runtime-plugins-nested.sh"
+fi
 
 OUT="${BROOD_TERMINAL_OUT:-$(mktemp -d /tmp/brood-terminal.XXXXXX)}"
 RUNTIME_DIR="$(mktemp -d /tmp/brood-terminal-runtime.XXXXXX)"
@@ -42,13 +49,14 @@ else
 fi
 TMUX_SOCKET="$OUT/helix-tmux.sock"
 SHELL_ENV_FILE="$OUT/terminal-shell-env.sh"
+TERMINAL_PROOF_FILE="$OUT/terminal-proof.txt"
 mkdir -p "$OUT"
 chmod 700 "$RUNTIME_DIR"
 
 if [[ "$WESTON_DIRECT" == 1 ]]; then
-  seq 1 2000 | sed 's/^/terminal plugin scroll line /' > /tmp/brood-terminal-proof.txt
-  printf 'exec tmux -S %q new-session hx /tmp/brood-terminal-proof.txt\n' \
-    "$TMUX_SOCKET" > "$SHELL_ENV_FILE"
+  seq 1 2000 | sed 's/^/terminal plugin scroll line /' > "$TERMINAL_PROOF_FILE"
+  printf 'exec tmux -S %q new-session hx %q\n' \
+    "$TMUX_SOCKET" "$TERMINAL_PROOF_FILE" > "$SHELL_ENV_FILE"
 fi
 
 CLIENT_PID=""
@@ -231,6 +239,7 @@ start_client() {
   env -u brood_session \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
     WGPU_BACKEND=vulkan \
     BROOD_DMABUF_HAPPY_PATH=1 \
     BROOD_TRACE_PLUGIN_INPUT=1 \
@@ -281,12 +290,42 @@ metric_value() {
 }
 
 type_line() {
-  wayland_env wtype -s 2 "$1" -k Return
+  local input="$1"
+  local ascii_chunk="" character code index
+  # Keep all ASCII on one standard-keymap virtual keyboard so shell text never
+  # needs compact-keymap Ctrl chords that can accidentally match product
+  # shortcuts. The visual proof includes two non-ASCII characters, which are
+  # sent individually through wtype between the stable ASCII chunks.
+  for ((index = 0; index < ${#input}; index++)); do
+    character="${input:index:1}"
+    printf -v code '%d' "'$character"
+    if ((code < 128)); then
+      ascii_chunk+="$character"
+      continue
+    fi
+    if [[ -n "$ascii_chunk" ]]; then
+      wayland_env "$OUT/virtual-keyboard-key" --text "$ascii_chunk"
+      ascii_chunk=""
+    fi
+    wayland_env wtype "$character"
+  done
+  wayland_env "$OUT/virtual-keyboard-key" --text "${ascii_chunk}"$'\r'
+}
+
+ctrl_alt_i() {
+  wayland_env "$OUT/virtual-keyboard-key" 23
 }
 
 focus_terminal() {
   local log="$1"
-  local baseline next quiet_previous quiet_samples
+  local baseline next quiet_previous quiet_samples terminal_pane
+  terminal_pane="$(
+    sed -n \
+      's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' \
+      "$log" \
+      | head -1
+  )"
+  [[ -n "$terminal_pane" ]]
   for attempt in $(seq 1 5); do
     quiet_previous="$(metric_value "$log" pty_bytes)"
     quiet_samples=0
@@ -302,6 +341,10 @@ focus_terminal() {
       fi
     done
     baseline="$(metric_value "$log" pty_bytes)"
+    # The terminal is the composed workspace surface on the left. Use real
+    # pointer input to focus that visible pane; Ctrl+J cycles the declared pane
+    # catalogue and may legitimately defer on a currently hidden plugin pane.
+    wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
     type_line "echo __TERMINAL_FOCUS_${attempt}__"
     for _ in $(seq 1 60); do
       next="$(metric_value "$log" pty_bytes)"
@@ -310,7 +353,6 @@ focus_terminal() {
       fi
       sleep 0.05
     done
-    wayland_env "$OUT/virtual-keyboard-key" --ctrl-only 36
   done
   echo "ERR could not focus the terminal plugin pane" >&2
   exit 1
@@ -361,89 +403,6 @@ done
 ((SHELL_BYTES > SHELL_BASELINE + 40 && SHELL_QUIET >= 8))
 capture "$OUT/terminal-shell-ansi-unicode.png"
 
-INBOX_FOCUS_BASELINE="$(
-  rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
-    "$CLIENT1_LOG" || true
-)"
-TERMINAL_PANE="$(
-  sed -n \
-    's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' \
-    "$CLIENT1_LOG" \
-    | head -1
-)"
-[[ -n "$TERMINAL_PANE" ]]
-wayland_env "$OUT/virtual-pointer-input" click 720 100 1280 720
-for _ in $(seq 1 100); do
-  INBOX_FOCUS_COUNT="$(
-    rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
-      "$CLIENT1_LOG" || true
-  )"
-  if ((INBOX_FOCUS_COUNT > INBOX_FOCUS_BASELINE)) \
-    && rg -a -q "presentation key policy requested pane focus pane=$TERMINAL_PANE .* changed=true deferred=false" \
-      "$CLIENT1_LOG"; then
-    break
-  fi
-  sleep 0.05
-done
-((INBOX_FOCUS_COUNT > INBOX_FOCUS_BASELINE))
-rg -a -q "presentation key policy requested pane focus pane=$TERMINAL_PANE .* changed=true deferred=false" \
-  "$CLIENT1_LOG"
-capture "$OUT/inbox-click-focused-terminal.png"
-
-INBOX_PANE="$(
-  sed -n \
-    's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' \
-    "$CLIENT1_LOG" \
-    | head -1
-)"
-[[ -n "$INBOX_PANE" ]]
-INBOX_SHORTCUT_BASELINE="$(
-  rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
-)"
-wayland_env "$OUT/virtual-keyboard-key" 23
-for _ in $(seq 1 100); do
-  INBOX_SHORTCUT_COUNT="$(
-    rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
-  )"
-  if ((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE)) \
-    && rg -a -q "presentation key policy requested pane focus pane=$INBOX_PANE focused=Some\\($TERMINAL_PANE\\) .* changed=true deferred=false" \
-      "$CLIENT1_LOG"; then
-    break
-  fi
-  sleep 0.05
-done
-((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE))
-rg -a -q "presentation key policy requested pane focus pane=$INBOX_PANE focused=Some\\($TERMINAL_PANE\\) .* changed=true deferred=false" \
-  "$CLIENT1_LOG"
-capture "$OUT/inbox-ctrl-alt-i-focused.png"
-
-TERMINAL_POINTER_FOCUS_BASELINE="$(
-  rg -a -c "focused local plugin pane=$TERMINAL_PANE" "$CLIENT1_LOG" || true
-)"
-wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
-for _ in $(seq 1 100); do
-  TERMINAL_POINTER_FOCUS_COUNT="$(
-    rg -a -c "focused local plugin pane=$TERMINAL_PANE" "$CLIENT1_LOG" || true
-  )"
-  ((TERMINAL_POINTER_FOCUS_COUNT > TERMINAL_POINTER_FOCUS_BASELINE)) && break
-  sleep 0.05
-done
-((TERMINAL_POINTER_FOCUS_COUNT > TERMINAL_POINTER_FOCUS_BASELINE))
-
-if [[ "${BROOD_TERMINAL_INBOX_ONLY:-0}" == 1 ]]; then
-  cat > "$OUT/proof.md" <<EOF
-# Nested inbox shortcut proof
-
-- notification action: clicking a real command-completion card focused terminal-ui
-- shortcut input: real Ctrl+Alt+I through the nested Wayland keyboard
-- shortcut result: focus changed from terminal-ui to the presentation-global inbox pane
-- screenshot: inbox-ctrl-alt-i-focused.png
-EOF
-  echo "nested inbox shortcut proof passed"
-  echo "proof=$OUT/proof.md"
-  exit 0
-fi
-
 KEY_FILE="$OUT/key-sequences.bin"
 type_line "IFS= read -r key; printf %s \"\$key\" > '$KEY_FILE'; echo __KEY_SEQUENCE_OK__"
 wayland_env "$OUT/virtual-keyboard-key" --none 63
@@ -473,6 +432,110 @@ for _ in $(seq 1 200); do
 done
 APPLICATION_KEY_HEX="$(od -An -tx1 "$APPLICATION_KEY_FILE" | tr -d ' \n')"
 [[ "$APPLICATION_KEY_HEX" == "1b4f41" ]]
+
+INBOX_FOCUS_BASELINE="$(
+  rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
+    "$CLIENT1_LOG" || true
+)"
+TERMINAL_PANE="$(
+  sed -n \
+    's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT1_LOG" \
+    | head -1
+)"
+[[ -n "$TERMINAL_PANE" ]]
+INBOX_PANE="$(
+  sed -n \
+    's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT1_LOG" \
+    | head -1
+)"
+[[ -n "$INBOX_PANE" ]]
+INBOX_REVEAL_BASELINE="$(
+  rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
+)"
+ctrl_alt_i
+for _ in $(seq 1 100); do
+  INBOX_REVEAL_COUNT="$(
+    rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
+  )"
+  if ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE)) \
+    && rg -a -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT1_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE))
+rg -a -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT1_LOG"
+INBOX_CLICK_X=$((1280 - 320 / 2))
+wayland_env "$OUT/virtual-pointer-input" click "$INBOX_CLICK_X" 100 1280 720
+for _ in $(seq 1 100); do
+  INBOX_FOCUS_COUNT="$(
+    rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
+      "$CLIENT1_LOG" || true
+  )"
+  if ((INBOX_FOCUS_COUNT > INBOX_FOCUS_BASELINE)) \
+    && rg -a -q "presentation key policy requested pane focus pane=$TERMINAL_PANE .* changed=true deferred=false" \
+      "$CLIENT1_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((INBOX_FOCUS_COUNT > INBOX_FOCUS_BASELINE))
+rg -a -q "presentation key policy requested pane focus pane=$TERMINAL_PANE .* changed=true deferred=false" \
+  "$CLIENT1_LOG"
+capture "$OUT/inbox-click-focused-terminal.png"
+
+INBOX_SHORTCUT_BASELINE="$(
+  rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
+)"
+INBOX_PANE_FOCUS_BASELINE="$(
+  rg -a -c "focused local plugin pane=$INBOX_PANE" "$CLIENT1_LOG" || true
+)"
+ctrl_alt_i
+for _ in $(seq 1 100); do
+  INBOX_SHORTCUT_COUNT="$(
+    rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
+  )"
+  INBOX_PANE_FOCUS_COUNT="$(
+    rg -a -c "focused local plugin pane=$INBOX_PANE" "$CLIENT1_LOG" || true
+  )"
+  if ((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE)) \
+    && ((INBOX_PANE_FOCUS_COUNT > INBOX_PANE_FOCUS_BASELINE)); then
+    break
+  fi
+  sleep 0.05
+done
+((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE))
+((INBOX_PANE_FOCUS_COUNT > INBOX_PANE_FOCUS_BASELINE))
+capture "$OUT/inbox-ctrl-alt-i-focused.png"
+
+TERMINAL_POINTER_FOCUS_BASELINE="$(
+  rg -a -c "focused local plugin pane=$TERMINAL_PANE" "$CLIENT1_LOG" || true
+)"
+wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
+for _ in $(seq 1 100); do
+  TERMINAL_POINTER_FOCUS_COUNT="$(
+    rg -a -c "focused local plugin pane=$TERMINAL_PANE" "$CLIENT1_LOG" || true
+  )"
+  ((TERMINAL_POINTER_FOCUS_COUNT > TERMINAL_POINTER_FOCUS_BASELINE)) && break
+  sleep 0.05
+done
+((TERMINAL_POINTER_FOCUS_COUNT > TERMINAL_POINTER_FOCUS_BASELINE))
+
+if [[ "${BROOD_TERMINAL_INBOX_ONLY:-0}" == 1 ]]; then
+  cat > "$OUT/proof.md" <<EOF
+# Nested inbox shortcut proof
+
+- notification action: clicking a real command-completion card focused terminal-ui
+- shortcut input: real Ctrl+Alt+I through the nested Wayland keyboard
+- shortcut result: focus changed from terminal-ui to the presentation-global inbox pane
+- screenshot: inbox-ctrl-alt-i-focused.png
+EOF
+  echo "nested inbox shortcut proof passed"
+  echo "proof=$OUT/proof.md"
+  exit 0
+fi
 
 close_frontend
 STATUS_DISCONNECTED="$(ctl status-json)"
@@ -585,7 +648,8 @@ fi
 
 HELIX_BASELINE="$(metric_value "$SCROLL_LOG" pty_bytes)"
 if [[ "$WESTON_DIRECT" != 1 ]]; then
-  type_line '{ printf "terminal plugin TUI proof λ中\n"; seq 1 2000 | sed "s/^/terminal plugin scroll line /"; } > /tmp/brood-terminal-proof.txt; hx /tmp/brood-terminal-proof.txt'
+  TERMINAL_PROOF_SHELL_PATH="$(printf %q "$TERMINAL_PROOF_FILE")"
+  type_line "{ printf \"terminal plugin TUI proof λ中\\n\"; seq 1 2000 | sed \"s/^/terminal plugin scroll line /\"; } > $TERMINAL_PROOF_SHELL_PATH; hx $TERMINAL_PROOF_SHELL_PATH"
 fi
 for _ in $(seq 1 300); do
   HELIX_BYTES="$(metric_value "$SCROLL_LOG" pty_bytes)"

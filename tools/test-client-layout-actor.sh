@@ -28,6 +28,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   plugins/session-switcher/brood_session_switcher_plugin.component.wasm
 cargo build \
+  --manifest-path plugins/status-bar/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm \
+  plugins/session-switcher/brood_status_bar_plugin.component.wasm
+cargo build \
   --manifest-path plugins/inbox/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -43,6 +51,14 @@ cargo build \
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
   plugins/session-switcher/brood_picker_plugin.component.wasm
+cargo build \
+  --manifest-path plugins/keybindings/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm \
+  plugins/session-switcher/brood_keybindings_plugin.component.wasm
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -148,6 +164,7 @@ ctl status > /dev/null 2>&1 || {
 
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WESTON_SOCKET" \
+  BROOD_KEYBINDINGS_PATH="$TEST_TMP/keybindings.json" \
   WGPU_BACKEND=vulkan \
   BROOD_DMABUF_HAPPY_PATH=1 \
   RUST_LOG="$RUST_LOG" \

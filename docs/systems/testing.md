@@ -42,6 +42,10 @@ server's pane-size protocol.
 `tools/test-session-switcher-plugin-nested.sh` is the full wrapper proof. It
 must demonstrate:
 
+- a fresh catalogue remains empty, with no terminal actor or pane;
+- the switcher and 34-pixel status bar are the only composed startup panes,
+  while the inbox actor is live but hidden;
+- real `Ctrl+Shift+/` input opens the shortcut catalogue from that empty state;
 - the switcher claims the root lease;
 - its `rest` slot is delegated to the workspace actor;
 - the visible switcher occupies a right sidebar;
@@ -59,6 +63,12 @@ Screenshots should cover visible, picker-overlay, hidden, and restored states.
 Logs should record lease generations, revisions, accepted recursive
 composition, picker focus and sizing, and managed-pane size convergence.
 
+`tools/test-bundled-plugins.sh` audits the bundled plugin inventory against
+`tools/bundled-plugin-e2e.tsv` and routes each plugin to a Nix-backed real
+workload lane. A row is complete only when synthetic input reaches the plugin
+and an external boundary records the result: composed pixels, persisted bytes,
+process or actor state, or an independently observed protocol exchange.
+
 ## Lifecycle Proof
 
 A frontend replacement proof closes or kills only `brood-client`, confirms
@@ -66,6 +76,25 @@ that the session server and hosted applications remain alive, then starts a
 replacement client. The replacement receives the existing pane identities and
 frames, obtains new presentation and layout-lease generations, and reconstructs
 the sidebar/workspace composition.
+
+## Bundled Plugin Acceptance
+
+`tools/test-bundled-plugins.sh` is the complete first-party plugin acceptance
+index. Its checked-in matrix must name every crate below `plugins/`; inventory
+drift is a test failure rather than an undocumented coverage gap. Each matrix
+row identifies a real synthetic-input lane and the external evidence that lane
+must retain.
+
+The empty-startup lane connects a real presentation client before any surface
+session exists. It requires a composed session picker and status bar, keeps the
+global inbox out of the visible layout until requested, and opens the hotkey
+list with a physical frontend chord. The general session-shell lane then uses
+populated sessions for switching, picker, diff, worktree, and pointer behavior.
+
+Non-visual runtime plugins use workspace files as their product boundary. The
+runtime lane sends actor messages, creates native file events, exercises PTY,
+pipe, timer, and loopback readiness, hot-replaces a Component watch generation,
+and retains guest-written transcripts plus structured host resource state.
 
 ## Acceptance And CI
 

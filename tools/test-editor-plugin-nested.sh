@@ -133,12 +133,12 @@ fi
 [[ -x "$PACKAGE/bin/brood-sessiond" ]]
 [[ -s "$PACKAGE/brood.toml" ]]
 
-CLIENT_RELEASE="$PACKAGE/plugins/session-switcher/target/wasm32-unknown-unknown/release"
-FILES_RELEASE="$PACKAGE/examples/wasm-init-actor/target/wasm32-unknown-unknown/release"
-CLIENT_COMPONENT="$CLIENT_RELEASE/brood_neovim_client_plugin.component.wasm"
+CLIENT_PACKAGE="$PACKAGE/packages/org.brood.default-client"
+FILES_RELEASE="$PACKAGE/plugins/neovim-files/target/wasm32-unknown-unknown/release"
+CLIENT_COMPONENT="$CLIENT_PACKAGE/brood_neovim_client_plugin.component.wasm"
 FILES_COMPONENT="$FILES_RELEASE/brood_neovim_files_plugin.component.wasm"
 CLIENT_RELEASE_REAL="$(dirname "$(readlink -f "$CLIENT_COMPONENT")")"
-WASM_RUNTIME="$CLIENT_RELEASE/share/brood/neovim-wasm"
+WASM_RUNTIME="$CLIENT_PACKAGE/share/brood/neovim-wasm"
 [[ -s "$CLIENT_COMPONENT" ]]
 [[ -s "$FILES_COMPONENT" ]]
 for artifact in runner.mjs brood.lua nvim.js nvim.wasm nvim.data; do
@@ -682,10 +682,11 @@ done
 (("$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")" > SAVES_BEFORE))
 capture "$OUT/editor-large-stream.png"
 
-# Exercise the typed outbound routes through actual Neovim commands. Terminal
-# and diff actions both create backend terminal actors; the first leaves a
-# filesystem marker and the second renders the real git diff. Ctrl+Alt+E
-# focuses the existing local editor between panes.
+# Exercise the typed outbound routes through actual Neovim commands. The
+# terminal action creates a backend terminal actor and leaves a filesystem
+# marker. The diff action starts the preferred-session diff-viewer and renders
+# the real workspace diff. Ctrl+Alt+E focuses the existing local editor between
+# panes.
 DYNAMIC_TERMINALS_BEFORE="$(
   actor_list | rg -c '\.terminal-session-[0-9]+ ' || true
 )"
@@ -724,40 +725,42 @@ sleep 0.4
 capture "$OUT/editor-terminal-action.png"
 
 focus_editor
-DYNAMIC_TERMINALS_BEFORE="$DYNAMIC_TERMINALS_AFTER"
 nvim_command BroodDiff
-DIFF_TERMINAL_UI=""
-DIFF_TERMINAL_PANE=""
+DIFF_ACTOR="diff-viewer-sb1-s1"
+DIFF_PANE=""
+INITIAL_DIFF_SEQUENCE=""
+POPULATED_DIFF_SEQUENCE=""
 for _ in {1..800}; do
-  DYNAMIC_TERMINALS_AFTER="$(
-    actor_list | rg -c '\.terminal-session-[0-9]+ ' || true
-  )"
-  DIFF_TERMINAL_UI="$(
-    sed -n \
-      's/.*started presentation WASM actor id=\(terminal-ui-b[^ ]*-s[^ ]*-[0-9][0-9]*\).*/\1/p' \
-      "$CLIENT_LOG" \
-      | tail -1
-  )"
-  if [[ -n "$DIFF_TERMINAL_UI" ]]; then
-    DIFF_TERMINAL_PANE="$(actor_pane "$DIFF_TERMINAL_UI" "$CLIENT_LOG")"
+  if [[ -z "$DIFF_PANE" ]] \
+    && rg -a -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG"; then
+    DIFF_PANE="$(actor_pane "$DIFF_ACTOR" "$CLIENT_LOG")"
   fi
-  if ((DYNAMIC_TERMINALS_AFTER > DYNAMIC_TERMINALS_BEFORE)) \
-    && [[ "$DIFF_TERMINAL_UI" != "$TERMINAL_ACTION_UI" \
-      && "$DIFF_TERMINAL_PANE" =~ ^[0-9]+$ ]] \
-    && terminal_snapshot_rendered \
-      "$DIFF_TERMINAL_UI" "$DIFF_TERMINAL_PANE" "$CLIENT_LOG"; then
+  if [[ "$DIFF_PANE" =~ ^[0-9]+$ && -z "$INITIAL_DIFF_SEQUENCE" ]]; then
+    INITIAL_DIFF_SEQUENCE="$(
+      sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+        | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
+        | head -1
+    )"
+  fi
+  if [[ -n "$INITIAL_DIFF_SEQUENCE" ]] \
+    && rg -a -q "presentation actor worker finished actor=$DIFF_ACTOR" "$CLIENT_LOG"; then
+    POPULATED_DIFF_SEQUENCE="$(
+      sed -n "/presentation actor worker finished actor=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+        | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
+        | tail -1
+    )"
+  fi
+  if [[ -n "$POPULATED_DIFF_SEQUENCE" ]] \
+    && ((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE)); then
     break
   fi
   sleep 0.05
 done
-((DYNAMIC_TERMINALS_AFTER > DYNAMIC_TERMINALS_BEFORE))
-[[ "$DIFF_TERMINAL_UI" != "$TERMINAL_ACTION_UI" ]]
-[[ "$DIFF_TERMINAL_PANE" =~ ^[0-9]+$ ]]
-terminal_snapshot_rendered \
-  "$DIFF_TERMINAL_UI" "$DIFF_TERMINAL_PANE" "$CLIENT_LOG"
-rg -F -q \
-  '"command":"git --no-pager diff --color=always --no-ext-diff"' \
-  "$CLIENT_LOG"
+rg -a -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG"
+[[ "$DIFF_PANE" =~ ^[0-9]+$ ]]
+rg -a -q "presentation actor worker finished actor=$DIFF_ACTOR" "$CLIENT_LOG"
+[[ -n "$INITIAL_DIFF_SEQUENCE" && -n "$POPULATED_DIFF_SEQUENCE" ]]
+((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE))
 sleep 0.8
 capture "$OUT/editor-diff-action.png"
 
@@ -935,7 +938,7 @@ jq -n \
       },
       outbound_routes: {
         terminal_command_marker: true,
-        diff_terminal: true,
+        preferred_session_diff_viewer: true,
         agent_prompt: true
       }
     },
@@ -957,7 +960,7 @@ jq -n \
     "- remote editing: workspace-relative open/read and revision-checked save messages crossed between $EDITOR_UI and $EDITOR_FILES_ACTOR; tracked.txt and inbound.txt contain the resulting bytes" \
     '- inbound messaging: an addressed open-editor selected inbound.txt at line 2, column 3; the real key append produced sec__BROOD_INBOUND__ond inbound line' \
     "- streaming: large.txt crossed more than 64 client-to-runner chunks and its Z-prefixed save returned through the backend file actor" \
-    '- outbound messaging: :BroodTerminal executed a backend command, :BroodDiff opened a backend git-diff terminal, and :BroodAgent routed a bounded prompt into a coding-agent pane' \
+    '- outbound messaging: :BroodTerminal executed a backend command, :BroodDiff opened the preferred-session diff-viewer and populated its canvas, and :BroodAgent routed a bounded prompt into a coding-agent pane' \
     '- graphical proof: editor-created.png, editor-opened.png, editor-edited.png, editor-inbound-open.png, editor-large-stream.png, editor-terminal-action.png, editor-diff-action.png, editor-agent-action.png' \
     '- structured evidence: proof.json, screenshot-metrics.json, editor-routes.log, editor-process-placement.txt, actors-editor-created.txt, actors-after-inbound.txt, actors-final.txt' \
     '- scope: this built-in nested proof validates the client/backend actor boundary in one private offscreen process topology; cross-host transport remains covered by the separate SSH test path' \

@@ -33,6 +33,7 @@ OTHER_PROJECT="$OUT/other-project"
 DATA_HOME="$OUT/data"
 DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
 OUTPUT_MODE="${BROOD_KEYBINDINGS_TEST_OUTPUT_MODE:-1280x720}"
+EMPTY_STARTUP_ONLY="${BROOD_EMPTY_STARTUP_ONLY:-0}"
 if [[ ! "$OUTPUT_MODE" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]]; then
   echo "ERR BROOD_KEYBINDINGS_TEST_OUTPUT_MODE must be WIDTHxHEIGHT" >&2
   exit 2
@@ -131,6 +132,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/status-bar/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm \
+  "$PACKAGE/brood_status_bar_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/inbox/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -191,6 +200,10 @@ printf '[init]\nbackend = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider =
   > "$CONFIG"
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+SERVER_EXTRA_ARGS=()
+if [[ "$EMPTY_STARTUP_ONLY" == 1 ]]; then
+  SERVER_EXTRA_ARGS+=(--no-initial-surface-session)
+fi
 (
   cd "$PROJECT"
   env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
@@ -201,7 +214,8 @@ RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,
     --no-default-modules \
     --config "$CONFIG" \
     --dbus-destination "$DBUS_DESTINATION" \
-    --dbus-address "$DBUS_SESSION_BUS_ADDRESS"
+    --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+    "${SERVER_EXTRA_ARGS[@]}"
 ) > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -226,20 +240,22 @@ ctl status > /dev/null 2>&1 || {
   exit 1
 }
 
-ctl surface-session new Beta > /dev/null
-ctl close-session 1 > /dev/null
-ctl spawn weston-simple-egl > /dev/null
-for _ in $(seq 1 100); do
-  rg -q "total_windows=1" <<< "$(ctl status)" && break
-  sleep 0.05
-done
-ctl surface-session new Gamma > /dev/null
-ctl spawn weston-simple-shm > /dev/null
-for _ in $(seq 1 100); do
-  rg -q "total_windows=2" <<< "$(ctl status)" && break
-  sleep 0.05
-done
-rg -q "total_windows=2" <<< "$(ctl status)"
+if [[ "$EMPTY_STARTUP_ONLY" != 1 ]]; then
+  ctl surface-session new Beta > /dev/null
+  ctl close-session 1 > /dev/null
+  ctl spawn weston-simple-egl > /dev/null
+  for _ in $(seq 1 100); do
+    rg -q "total_windows=1" <<< "$(ctl status)" && break
+    sleep 0.05
+  done
+  ctl surface-session new Gamma > /dev/null
+  ctl spawn weston-simple-shm > /dev/null
+  for _ in $(seq 1 100); do
+    rg -q "total_windows=2" <<< "$(ctl status)" && break
+    sleep 0.05
+  done
+  rg -q "total_windows=2" <<< "$(ctl status)"
+fi
 
 printf '%s\n' \
   'xwayland disable' \
@@ -311,6 +327,116 @@ rg -q "accepted plugin draw packet" "$CLIENT_LOG"
 rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
+capture() {
+  local target="$1"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    grim "$target"
+  [[ -s "$target" ]]
+}
+
+send_keybindings() {
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --ctrl-shift-only 53
+}
+
+if [[ "$EMPTY_STARTUP_ONLY" == 1 ]]; then
+  for _ in $(seq 1 200); do
+    if rg -q 'started presentation WASM actor id=session-switcher ' "$CLIENT_LOG" \
+      && rg -q 'started presentation WASM actor id=status-bar ' "$CLIENT_LOG" \
+      && rg -q 'started presentation WASM actor id=inbox ' "$CLIENT_LOG" \
+      && rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  SESSION_CATALOG="$(ctl surface-session list-json)"
+  python3 - "$SESSION_CATALOG" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+assert catalog["sessions"] == [], catalog
+assert catalog["active"] == 0, catalog
+PY
+  ACTORS_EMPTY="$(ctl actors list)"
+  ! rg -q 'terminal-ui|terminal-session' <<< "$ACTORS_EMPTY"
+  printf '%s\n' "$SESSION_CATALOG" > "$OUT/empty-startup-sessions.json"
+  printf '%s\n' "$ACTORS_EMPTY" > "$OUT/empty-startup-actors.txt"
+
+  SWITCHER_PANE="$(
+    sed -n 's/.*started presentation WASM actor id=session-switcher .* pane=\([0-9][0-9]*\) .*/\1/p' \
+      "$CLIENT_LOG" | tail -1
+  )"
+  STATUS_PANE="$(
+    sed -n 's/.*started presentation WASM actor id=status-bar .* pane=\([0-9][0-9]*\) .*/\1/p' \
+      "$CLIENT_LOG" | tail -1
+  )"
+  INBOX_PANE="$(
+    sed -n 's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' \
+      "$CLIENT_LOG" | tail -1
+  )"
+  [[ -n "$SWITCHER_PANE" && -n "$STATUS_PANE" && -n "$INBOX_PANE" ]]
+  rg -q "sent plugin pane resize pane=$STATUS_PANE logical_size=1280x34 " "$CLIENT_LOG"
+  rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=1280x34 " "$CLIENT_LOG"
+  rg -q "sent plugin pane resize pane=$SWITCHER_PANE logical_size=320x686 " "$CLIENT_LOG"
+  rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"
+  ! rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=(320|480|640)x686 " "$CLIENT_LOG"
+
+  capture "$OUT/empty-startup.png"
+  magick identify -format '%wx%h' "$OUT/empty-startup.png" | rg -qx '1280x720'
+  magick "$OUT/empty-startup.png" -crop 1280x34+0+686 +repage \
+    "$OUT/empty-startup-status-bar.png"
+  STATUS_COLOURS="$(magick "$OUT/empty-startup-status-bar.png" -format '%k' info:)"
+  ((STATUS_COLOURS >= 8))
+  send_keybindings
+  for _ in $(seq 1 200); do
+    if rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG" \
+      && rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG"
+  rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG"
+  capture "$OUT/empty-startup-keybindings.png"
+  python3 - \
+    "$OUT/empty-startup.png" \
+    "$OUT/empty-startup-keybindings.png" <<'PY'
+import re
+import subprocess
+import sys
+
+result = subprocess.run(
+    ["magick", "compare", "-metric", "RMSE", sys.argv[1], sys.argv[2], "null:"],
+    check=False,
+    capture_output=True,
+    text=True,
+)
+match = re.search(r"\(([^)]+)\)", result.stderr)
+if match is None:
+    raise SystemExit(f"missing RMSE metric: {result.stderr}")
+normalized = float(match.group(1))
+if normalized <= 0.01:
+    raise SystemExit(f"keybindings did not visibly alter empty startup: RMSE={normalized}")
+print(f"empty_startup_keybindings_rmse={normalized:.6f}")
+PY
+  cat > "$OUT/proof.md" <<EOF
+# Empty startup proof
+
+- session catalogue: zero sessions and no active session
+- backend actors: no terminal-session actor
+- presentation actors: session-switcher and status-bar visible; inbox started but excluded from the two-pane composition
+- status bar: composed at 1280x34 with visible text/detail below a 320x686 session picker and empty content viewport
+- synthetic input: Ctrl+Shift+/ opened the keybindings actor
+- captures: empty-startup.png, empty-startup-status-bar.png, and empty-startup-keybindings.png
+EOF
+  echo "empty_startup_plugins=verified"
+  echo "proof=$OUT/proof.md"
+  exit 0
+fi
+
 for _ in $(seq 1 200); do
   if rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG" \
     && rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG" \
@@ -333,6 +459,22 @@ read -r SIDEBAR_WIDTH SIDEBAR_HEIGHT < <(
     | tail -1
 )
 [[ -n "$SIDEBAR_WIDTH" && -n "$SIDEBAR_HEIGHT" ]]
+
+STATUS_PANE="$(
+  sed -n 's/.*started presentation WASM actor id=status-bar .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" | tail -1
+)"
+OUTPUT_WIDTH="${OUTPUT_MODE%x*}"
+[[ -n "$STATUS_PANE" ]]
+for _ in $(seq 1 100); do
+  if rg -q "sent plugin pane resize pane=$STATUS_PANE logical_size=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG" \
+    && rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "sent plugin pane resize pane=$STATUS_PANE logical_size=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG"
+rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG"
 
 if [[ "$OUTPUT_MODE" == "1280x720" ]]; then
   for _ in $(seq 1 100); do
@@ -361,7 +503,7 @@ accepted_layout_count() {
 send_toggle() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-    "$OUT/virtual-keyboard-key" 50
+    "$OUT/virtual-keyboard-key" 23
 }
 
 send_open_terminal() {

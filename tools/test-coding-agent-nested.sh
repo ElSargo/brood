@@ -88,6 +88,15 @@ wasm-tools component new \
   --output "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/status-bar/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm \
+  --output "$PACKAGE/brood_status_bar_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_status_bar_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/inbox/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -106,11 +115,28 @@ wasm-tools component new \
   --output "$PACKAGE/brood_picker_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/brood_picker_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/keybindings/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm \
+  --output "$PACKAGE/brood_keybindings_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_keybindings_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
-read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client)"
+read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/virtual-keyboard-key.c \
+  -o "$OUT/virtual-keyboard-key" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
 VIRTUAL_POINTER_XML="$(
   pkg-config --variable=pkgdatadir wlr-protocols
 )/unstable/wlr-virtual-pointer-unstable-v1.xml"
@@ -227,6 +253,7 @@ if [[ -n "$SSH_TARGET" ]]; then
   env -u brood_session \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
     WGPU_BACKEND=vulkan \
     BROOD_DMABUF_HAPPY_PATH=1 \
     BROOD_TRACE_PLUGIN_INPUT=1 \
@@ -242,6 +269,7 @@ else
   env -u brood_session \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
     WGPU_BACKEND=vulkan \
     BROOD_DMABUF_HAPPY_PATH=1 \
     BROOD_TRACE_PLUGIN_INPUT=1 \
@@ -285,25 +313,49 @@ else
   rg -q "coding-agent-1" "$SERVER_LOG"
 fi
 
-# wtype uses a compact generated keymap. Prime 29 distinct symbols so its
-# virtual A lands on the normal evdev/XKB keycode 38 used by the key policy.
-KEYMAP_PRIMER="bcdefghijklmnopqrstuvwxyz0123"
+# Open the agent picker with the physical KeyA binding. Keep the keymap and
+# scan code independent of wtype's compact generated keymap, and wait for the
+# picker to be accepted at its modal geometry before selecting its first result.
+PICKER_PANE="$(
+  sed -n \
+    's/.*started presentation WASM actor id=picker .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" \
+    | tail -1
+)"
+[[ "$PICKER_PANE" =~ ^[0-9]+$ ]]
+PICKER_VISIBLE_BEFORE="$(
+  rg -c 'sender=picker recipient=session-switcher body=.*"visible":true' "$CLIENT_LOG" || true
+)"
+PICKER_RESIZE_BEFORE="$(
+  rg -c "sent plugin pane resize pane=$PICKER_PANE logical_size=720x480" "$CLIENT_LOG" || true
+)"
+PICKER_LAYOUT_BEFORE="$(rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true)"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "$KEYMAP_PRIMER" -s 100 -M ctrl -M alt -k a -m alt -m ctrl
+  "$OUT/virtual-keyboard-key" 30
 
 for _ in $(seq 1 300); do
-  if rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
-    && rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
+  PICKER_VISIBLE_AFTER="$(
+    rg -c 'sender=picker recipient=session-switcher body=.*"visible":true' "$CLIENT_LOG" || true
+  )"
+  PICKER_RESIZE_AFTER="$(
+    rg -c "sent plugin pane resize pane=$PICKER_PANE logical_size=720x480" "$CLIENT_LOG" || true
+  )"
+  PICKER_LAYOUT_AFTER="$(rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true)"
+  if ((PICKER_VISIBLE_AFTER > PICKER_VISIBLE_BEFORE)) \
+    && ((PICKER_RESIZE_AFTER > PICKER_RESIZE_BEFORE)) \
+    && ((PICKER_LAYOUT_AFTER > PICKER_LAYOUT_BEFORE)); then
     break
   fi
   sleep 0.1
 done
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
-rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
+((PICKER_VISIBLE_AFTER > PICKER_VISIBLE_BEFORE))
+((PICKER_RESIZE_AFTER > PICKER_RESIZE_BEFORE))
+((PICKER_LAYOUT_AFTER > PICKER_LAYOUT_BEFORE))
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype -s 100 -k Return
+  "$OUT/virtual-keyboard-key" --none 28
 
 AGENT_UI=""
 
@@ -452,16 +504,13 @@ assert_preview_color "$OUT/agent-images-attached.png" '#00FF00'
 if [[ -n "$SSH_TARGET" ]]; then
   PROMPT="Inspect both attached images. If their solid colors are red and green, reply with exactly this marker and nothing else: $REMOTE_IMAGE_MARKER"
 else
-  PROMPT='Inspect both attached images. Create .brood/image-proof.txt containing exactly: red green. Also create .brood/agent-actor-proof.txt containing exactly: actor-ui-worker-ok'
+  PROMPT='Create .brood/image-proof.txt with red green and .brood/agent-actor-proof.txt with actor-ui-worker-ok'
 fi
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wl-copy --type text/plain <<< "$PROMPT"
-sleep 0.3
 click_at 240 670
+sleep 0.2
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype -M ctrl "v" -m ctrl -s 100 -k Return
+  wtype "$PROMPT" -s 50 -k Return
 
 for _ in $(seq 1 300); do
   if rg -q "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG"; then
@@ -568,9 +617,36 @@ done
 rg -q \
   "backend actor message .*sender=$AGENT_ID recipient=inbox .*\"title\":\"Agent finished\"" \
   "$CLIENT_LOG"
+
+INBOX_PANE="$(
+  sed -n \
+    's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" \
+    | head -1
+)"
+[[ -n "$INBOX_PANE" ]]
+INBOX_SHORTCUT_BASELINE="$(
+  rg -c 'sent key-policy actor message actor=inbox' "$CLIENT_LOG" || true
+)"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" 23
+for _ in $(seq 1 100); do
+  INBOX_SHORTCUT_COUNT="$(
+    rg -c 'sent key-policy actor message actor=inbox' "$CLIENT_LOG" || true
+  )"
+  if ((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE)) \
+    && rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE))
+rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT_LOG"
 capture "$OUT/agent-finished-inbox.png"
 
-click_at 720 100
+INBOX_CLICK_X=$((1280 - 320 / 2))
+click_at "$INBOX_CLICK_X" 100
 for _ in $(seq 1 100); do
   if rg -Fq \
     "presentation local actor message sender=inbox recipient=$AGENT_UI body={\"kind\":\"focus\"}" \
