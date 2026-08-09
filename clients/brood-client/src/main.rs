@@ -5371,6 +5371,8 @@ impl ApplicationHandler<ClientEvent> for Application {
                 is_synthetic,
                 ..
             } => {
+                let text_input =
+                    plugin_text_input(&event.logical_key, event.text.as_deref(), self.modifiers);
                 let logical_key = plugin_logical_key(&event.logical_key);
                 if std::env::var_os("BROOD_TERMINAL_SCROLL_BENCH").is_some()
                     && matches!(logical_key.as_str(), "F11" | "F12")
@@ -5533,8 +5535,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                         benchmark.record_input(Instant::now());
                     }
                     if event.state == ElementState::Pressed
-                        && let Some(text) = event.text.as_ref()
-                        && !text.is_empty()
+                        && let Some(text) = text_input.as_deref()
                     {
                         if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some()
                             && !PLUGIN_SCROLL_BENCH_ACTIVE.load(Ordering::Relaxed)
@@ -5771,6 +5772,24 @@ fn plugin_logical_key(key: &Key) -> String {
         }
         Key::Unidentified(_) => String::new(),
     }
+}
+
+fn plugin_text_input(
+    logical_key: &Key,
+    event_text: Option<&str>,
+    modifiers: ModifiersState,
+) -> Option<String> {
+    if let Some(text) = event_text.filter(|text| !text.is_empty()) {
+        return Some(text.to_string());
+    }
+    if modifiers.control_key() || modifiers.alt_key() || modifiers.super_key() {
+        return None;
+    }
+    let Key::Character(character) = logical_key else {
+        return None;
+    };
+    (!character.is_empty() && !character.chars().any(char::is_control))
+        .then(|| character.to_string())
 }
 
 struct Renderer {
@@ -8596,6 +8615,33 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 mod tests {
     use super::*;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    #[test]
+    fn native_logical_characters_fill_missing_text_events() {
+        let key = Key::Character("i".into());
+
+        assert_eq!(
+            plugin_text_input(&key, None, ModifiersState::empty()).as_deref(),
+            Some("i")
+        );
+        assert_eq!(
+            plugin_text_input(&key, Some("insert"), ModifiersState::empty()).as_deref(),
+            Some("insert"),
+            "an explicit text event remains authoritative and is not duplicated"
+        );
+    }
+
+    #[test]
+    fn native_text_fallback_does_not_turn_shortcuts_into_text() {
+        let key = Key::Character("s".into());
+
+        assert_eq!(plugin_text_input(&key, None, ModifiersState::CONTROL), None);
+        assert_eq!(plugin_text_input(&key, None, ModifiersState::ALT), None);
+        assert_eq!(
+            plugin_text_input(&Key::Named(NamedKey::Enter), None, ModifiersState::empty()),
+            None
+        );
+    }
 
     #[test]
     fn frontend_wayland_state_drops_before_the_event_loop_connection() {

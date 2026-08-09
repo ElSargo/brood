@@ -54,6 +54,11 @@ user's normal filetype detection and `FileType` hooks to run. A remote write
 emits `BufWritePre` before the replacement is captured and `BufWritePost` only
 after backend success.
 
+The client-local Emscripten runtime suppresses Neovim's native fs-event-backed
+autoread plugin before user configuration loads. Remote changes belong to the
+backend file actor, while save revisions prevent silently replacing content
+that changed on the backend.
+
 - Supported client requests: `hello`, `open`, `read`, `open-abort`,
   `save-begin`, `save-chunk`, `save-commit`, and `save-abort`.
 - Backend replies: `hello`, `open`, `read`, `save-ready`,

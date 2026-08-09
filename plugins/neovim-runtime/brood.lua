@@ -965,6 +965,11 @@ function M.install()
     return
   end
   installed = true
+  -- Neovim's default autoread plugin installs uv_fs_event watchers for normal
+  -- file buffers. The Emscripten runtime has no native fs-event handle, and
+  -- remote workspace changes arrive through the Brood file actor instead.
+  -- This runs from --cmd, before runtime plugins and the user's init.lua.
+  vim.g.loaded_autoread = 1
   vim.brood = vim.brood or {}
   vim.brood.send = function(message)
     if type(message) ~= "table" then

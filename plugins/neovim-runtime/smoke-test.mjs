@@ -318,6 +318,22 @@ async function main() {
       );
     }
 
+    send({
+      type: "text",
+      text: ":lua local ok,err=pcall(vim.cmd.edit,'/home/brood/.local/share/nvim/smoke-plugin.lua'); vim.brood.send({type='action',action='native-file-open',ok=ok,error=ok and '' or tostring(err)})",
+    });
+    send({ type: "key", key: "<CR>" });
+    const nativeFileOpen = await waitFor(
+      (message) =>
+        message.type === "action" && message.action === "native-file-open",
+      "native file open without an fs-event watcher",
+    );
+    if (nativeFileOpen.ok !== true || nativeFileOpen.error !== "") {
+      throw new Error(
+        `native file open reached the unsupported autoread watcher: ${JSON.stringify(nativeFileOpen)}`,
+      );
+    }
+
     for (let index = 0; index < 1100; index += 1) {
       send({ type: "resize", columns: 72, rows: 18 });
     }
