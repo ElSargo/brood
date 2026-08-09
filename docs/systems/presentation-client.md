@@ -5,7 +5,7 @@ security-boundary: mixed
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-07-25
+last-reviewed: 2026-08-09
 ---
 
 # Presentation Client Architecture
@@ -38,9 +38,11 @@ The presentation client owns:
 
 - its native or web viewport and platform input state;
 - presentation-local actors, workers, publications, and persistence;
-- the synchronous key-policy lease;
+- synchronous key- and pointer-policy leases;
 - local plugin panes, canvas resources, and native text services;
 - the recursive layout-lease tree, visibility, focus, chrome, and animation;
+- resize epochs, projected geometry, bounded staged content, and atomic
+  promotion;
 - final WGPU composition, hit testing, accessibility projection, and capture;
 - managed-window subscriptions and frame import.
 
@@ -77,6 +79,9 @@ viewport hit-test result crosses the server boundary.
   separate bounded flow-control rules.
 - WGPU resources, platform handles, and plugin graphics objects never cross the
   presentation protocol.
+- Rendered dividers, interaction hit testing, and pane content always use one
+  presented layout revision.
+- A waited pane's partially staged content never replaces visible content.
 
 ## Topology
 

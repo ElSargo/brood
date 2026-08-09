@@ -23,6 +23,7 @@ declare -A LANE_COMMANDS=(
   [editor]='BROOD_EDITOR_PACKAGE="$SUITE_PACKAGE" cargo run --quiet -- test editor --out-dir "$LANE_OUT"'
   [keybindings-narrow]='BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" BROOD_KEYBINDINGS_ONLY=1 BROOD_KEYBINDINGS_TEST_OUTPUT_MODE=360x320 bash tools/test-session-switcher-plugin-nested.sh'
   [runtime-io]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" BROOD_RUNTIME_PLUGIN_ONLY=1 BROOD_RUNTIME_PLUGIN_OUT="$LANE_OUT" cargo run --quiet -- test nested'
+  [resize]='cargo run --quiet -- test resize --out-dir "$LANE_OUT"'
   [session-shell]='BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
   [startup-empty]='BROOD_EMPTY_STARTUP_ONLY=1 BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
   [terminal]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" cargo run --quiet -- test nested --out-dir "$LANE_OUT"'

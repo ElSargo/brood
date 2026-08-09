@@ -5,7 +5,7 @@ security-boundary: process-and-network
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-08-01
+last-reviewed: 2026-08-09
 code-links:
   - crates/brood-protocol/src/lib.rs
   - crates/brood-ipc/src/local_protocol.rs
@@ -64,6 +64,12 @@ decode. Carrier scheduling gives critical first priority, then interactive
 actor streams, then reliable inventory, ahead of latest-state, bulk, and
 frame-resource streams. Separate streams without explicit scheduler priority
 are not sufficient under congestion.
+
+Managed pane resize records carry the presentation client's resize epoch in
+addition to the requested content size. The server associates that epoch with
+the applicable Wayland configure serial and returns it only with the first
+suitable committed frame. An untagged or older frame can still refresh ordinary
+visible content, but it cannot satisfy a newer synchronized-paint wait set.
 
 Connection establishment compares immutable endpoint capabilities and selects
 one profile for the connection generation. Failure to agree on protocol

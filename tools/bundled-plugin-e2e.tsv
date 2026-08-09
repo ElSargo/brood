@@ -9,6 +9,7 @@ keybindings	keybindings-narrow	open, fuzzy-filter, capture a replacement chord, 
 neovim-client	editor	modal text, Backspace, save, commands, and inbound open message	composed PNG transitions; runner routes; process placement; host config marker
 neovim-files	editor	open, chunked read, edit, save, conflict-safe replace, and inbound open	written fixture bytes; >64-chunk transfer counts; actor routes; no backend Neovim process
 picker	session-shell	open, fuzzy text, arrows, Enter, Escape, and backdrop click	composed overlay PNG; original selected value; actor removal; retained recursive layout
+resize-proof	resize	synchronized divider motion with fast, delayed, and stall-once actors	frame-by-frame epoch and extent fiducials; projected barrier; atomic promotion; degraded recovery
 session-switcher	session-shell	shortcuts, fuzzy session selection, rename, close, pointer hover/press/release	composed PNG transitions; session catalogue; focus and recursive-layout routes
 session-switcher	startup-empty	fresh client; Ctrl+Shift+/	zero-session catalogue; no terminal actors; hidden inbox; 34px status-bar and session-picker composition; composed PNG transition
 status-bar	startup-empty	fresh empty-session catalogue; Ctrl+Shift+/	34px composed canvas; persistent hotkey guidance; hidden inbox; keybindings overlay PNG transition

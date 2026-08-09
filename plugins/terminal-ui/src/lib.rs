@@ -81,6 +81,7 @@ struct UiState {
     resize_worker_pending: bool,
     last_sent_grid_size: Option<(u16, u16)>,
     next_input_sequence: u64,
+    pending_resize_epoch: Option<u64>,
 }
 
 impl UiState {
@@ -127,6 +128,7 @@ impl UiState {
             resize_worker_pending: false,
             last_sent_grid_size: None,
             next_input_sequence: 0,
+            pending_resize_epoch: None,
         }
     }
 
@@ -561,7 +563,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(1.0);
             state.height = resized.height.max(1.0);
-            state.schedule_resize().into_iter().collect()
+            state.pending_resize_epoch = resized.resize_epoch;
+            let commands = state.schedule_resize().into_iter().collect();
+            let redraw_epoch = resized.resize_epoch.filter(|_| state.latest.is_some());
+            drop(guard);
+            if redraw_epoch.is_some() {
+                let _ignored = render_latest_snapshot(redraw_epoch);
+            }
+            commands
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
             state.suppressed_text = ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0
@@ -664,7 +673,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 });
                 drop(guard);
                 if changed {
-                    let _ignored = render_latest_snapshot();
+                    let _ignored = render_latest_snapshot(None);
                 }
                 return Vec::new();
             }
@@ -712,7 +721,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     clipboard = selection_text(state.latest.as_deref(), *selection);
                 }
                 drop(guard);
-                let _ignored = render_latest_snapshot();
+                let _ignored = render_latest_snapshot(None);
                 return clipboard
                     .and_then(set_clipboard_command)
                     .into_iter()
@@ -1180,9 +1189,10 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         .full_snapshots_received
         .saturating_add(u64::from(header.full));
     state.requested_viewport = header.viewport_offset;
+    let resize_epoch = state.pending_resize_epoch;
     drop(guard);
 
-    let Ok(metrics) = render_latest_snapshot() else {
+    let Ok(metrics) = render_latest_snapshot(resize_epoch) else {
         return Vec::new();
     };
     let Ok(mut guard) = STATE.lock() else {
@@ -1194,7 +1204,7 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
     state.metrics_command_if_due(metrics).into_iter().collect()
 }
 
-fn render_latest_snapshot() -> Result<Vec<u8>, String> {
+fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> {
     let (pane, width, height, cell_width, line_height, snapshot, selection, mut cache) = {
         let mut guard = STATE
             .lock()
@@ -1365,8 +1375,24 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
     let bytes = packet
         .encode()
         .map_err(|error| format!("encode terminal draw packet: {error}"))?;
-    host::graphics_submit_draw_packet(pane, &bytes)
-        .map_err(|error| format!("submit terminal draw packet: {error:?}"))?;
+    let submit_result = resize_epoch.map_or_else(
+        || {
+            host::graphics_submit_draw_packet(pane, &bytes)
+                .map_err(|error| format!("submit terminal draw packet: {error:?}"))
+        },
+        |resize_epoch| {
+            host::graphics_submit_tagged_draw_packet(pane, resize_epoch, &bytes)
+                .map_err(|error| format!("submit tagged terminal draw packet: {error:?}"))
+        },
+    );
+    if let Err(error) = submit_result {
+        if let Ok(mut guard) = STATE.lock()
+            && let Some(state) = guard.as_mut()
+        {
+            state.cache = cache;
+        }
+        return Err(error);
+    }
     let drop_count = cache.len().saturating_sub(MAX_CACHED_LAYOUTS);
     let mut obsolete = cache
         .iter()
@@ -1376,10 +1402,15 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
     obsolete.sort_by_key(|(revision, _)| *revision);
     let mut dropped = 0_u64;
     for (_, key) in obsolete.into_iter().take(drop_count) {
-        if let Some(cached) = cache.remove(&key) {
-            host::graphics_drop_resource(pane, cached.handle)
-                .map_err(|error| format!("drop obsolete terminal layout: {error:?}"))?;
-            dropped = dropped.saturating_add(1);
+        let Some(cached) = cache.get(&key) else {
+            continue;
+        };
+        match host::graphics_drop_resource(pane, cached.handle) {
+            Ok(()) | Err(host::GraphicsError::InvalidResource) => {
+                cache.remove(&key);
+                dropped = dropped.saturating_add(1);
+            }
+            Err(_) => {}
         }
     }
 
@@ -1408,6 +1439,9 @@ fn render_latest_snapshot() -> Result<Vec<u8>, String> {
         state.packets = state.packets.saturating_add(1);
         state.max_packet_bytes = state.max_packet_bytes.max(bytes.len());
         state.max_commands = state.max_commands.max(command_count);
+        if resize_epoch.is_some() && state.pending_resize_epoch == resize_epoch {
+            state.pending_resize_epoch = None;
+        }
         (
             state.layouts_created,
             state.layouts_reused,

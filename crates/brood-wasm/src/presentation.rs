@@ -83,6 +83,25 @@ pub trait PresentationHost: fmt::Debug + Send + Sync + 'static {
         packet: Vec<u8>,
     ) -> Result<u64, PresentationError>;
 
+    fn submit_tagged_draw_packet(
+        &self,
+        _actor_generation: u64,
+        _pane: u64,
+        _resize_epoch: u64,
+        _packet: Vec<u8>,
+    ) -> Result<u64, PresentationError> {
+        Err(PresentationError::Unavailable)
+    }
+
+    fn reuse_pane_content(
+        &self,
+        _actor_generation: u64,
+        _pane: u64,
+        _resize_epoch: u64,
+    ) -> Result<(), PresentationError> {
+        Err(PresentationError::Unavailable)
+    }
+
     fn create_image_rgba8(
         &self,
         actor_generation: u64,
@@ -121,6 +140,7 @@ pub enum PresentationEvent {
         width: f32,
         height: f32,
         scale: f32,
+        resize_epoch: Option<u64>,
     },
     PaneFocused {
         pane: u64,

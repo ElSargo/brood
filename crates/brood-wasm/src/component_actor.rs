@@ -691,6 +691,44 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             .map_err(map_component_presentation_error))
     }
 
+    fn graphics_submit_tagged_draw_packet(
+        &mut self,
+        pane: u64,
+        resize_epoch: u64,
+        packet: Vec<u8>,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::GraphicsError>>
+    {
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.submit_tagged_draw_packet(
+                    self.actor_generation,
+                    pane,
+                    resize_epoch,
+                    packet,
+                )
+            })
+            .map_err(map_component_presentation_error))
+    }
+
+    fn graphics_reuse_pane_content(
+        &mut self,
+        pane: u64,
+        resize_epoch: u64,
+    ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::GraphicsError>>
+    {
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.reuse_pane_content(self.actor_generation, pane, resize_epoch)
+            })
+            .map_err(map_component_presentation_error))
+    }
+
     fn graphics_create_image_rgba8(
         &mut self,
         pane: u64,
@@ -2142,6 +2180,12 @@ impl ComponentActor {
         )
     }
 
+    /// Whether the actor runtime has stopped receiving mailbox commands.
+    #[must_use]
+    pub fn mailbox_is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     /// Deliver one typed pane lifecycle or input event without blocking.
     pub fn try_send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
         self.commands
@@ -3000,11 +3044,13 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
             width,
             height,
             scale,
+            resize_epoch,
         } => abi::PresentationEvent::PaneResized(abi::PaneResized {
             pane,
             width,
             height,
             scale,
+            resize_epoch,
         }),
         PresentationEvent::PaneFocused { pane, focused } => {
             abi::PresentationEvent::PaneFocused(abi::PaneFocused { pane, focused })
@@ -3763,6 +3809,7 @@ mod tests {
             width: 640.0,
             height: 480.0,
             scale: 1.0,
+            resize_epoch: Some(41),
         }]);
 
         assert!(
@@ -3774,6 +3821,7 @@ mod tests {
                     width: 1280.0,
                     height: 720.0,
                     scale: 1.25,
+                    resize_epoch: Some(42),
                 },
             )
             .is_ok()
@@ -3785,6 +3833,7 @@ mod tests {
                 width: 1280.0,
                 height: 720.0,
                 scale: 1.25,
+                resize_epoch: Some(42),
             }]
         );
     }

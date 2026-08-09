@@ -2,14 +2,17 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-08-09
 ---
 
 # Client-Local Layout Actor
 
 Each presentation client owns a host-validated tree of layout leases. Every
 lease is held by an ordinary mailbox-driven presentation actor. Layout does not
-have a synchronous provider lane or a session-server implementation.
+have a synchronous layout provider or a session-server implementation. A lease
+holder may expose a synchronous pointer policy, but that policy can only route
+the current event and enqueue bounded actor messages; it cannot submit layout
+or start a paint transaction.
 
 ```text
 root viewport lease
@@ -40,7 +43,11 @@ The presentation client owns:
   state changes;
 - final layout validation and canonicalization;
 - recursive transform, clipping, and paint-order composition;
-- pane bounds, clipping, z order, hit testing, and focus routing;
+- pane bounds, interaction zones, divider chrome, clipping, z order, hit
+  testing, and focus routing;
+- pointer-policy invocation, interaction IDs, event sequencing, and capture;
+- resize-epoch validation, staged pane content, deadlines, and atomic
+  promotion;
 - deterministic client-local fallback while no valid actor result is available;
 - managed-window size requests derived from accepted pane bounds.
 
@@ -95,6 +102,8 @@ is the recorded lease holder.
 The host sends `layout-state` after lease grant, pane inventory, viewport size,
 application identity, or focus changes. Delivery is queued and bounded like any
 other actor message; the client remains responsive while an actor processes it.
+The snapshot identifies inventory and presented-layout revisions separately and
+publishes the eligible `waitable_panes` in the lease subtree.
 Each snapshot includes the selected session, the lease's available managed
 windows with their session and application identities, the backend/session
 realm for every realm-bound managed or client-local pane, and `visible_panes`
@@ -109,9 +118,11 @@ instead of leaving dead cells. This remains bounded by the actor inventory
 limit rather than assuming a fixed pane count.
 
 Other actors and the key lane may address ordinary commands such as
-`layout-action` to the layout actor. A result reaches the host only as a
-`set-resolved-layout` message in the actor's ordinary host outbox. The host
-rejects direct layout submission from the synchronous key lane.
+`layout-action` to the layout actor. An immediate candidate reaches the host as
+`set-resolved-layout`; an update that needs a paint barrier uses one
+synchronized-layout command containing its target fragment and explicit wait
+set. Both leave the actor's ordinary host outbox. The host rejects direct layout
+submission from every synchronous policy lane.
 
 There is no synchronous request/return pairing requirement. Revisions make
 state snapshots observable, while normal actor mailbox ordering determines
@@ -120,9 +131,10 @@ host rejects stale lease generations and results computed from an obsolete
 inventory revision.
 
 A layout result contains the lease token, input revision, locally normalized
-items, an optional `rest` child transform and local paint position, and an
-optional focus request. The actor never supplies its insertion point in the
-global tree; the lease determines where the host inserts the fragment.
+items, interaction zones, divider chrome, an optional `rest` child transform
+and local paint position, and an optional focus request. The actor never
+supplies its insertion point in the global tree; the lease determines where the
+host inserts the fragment.
 
 The default session-switcher composition is a concrete instance of this model.
 The blessed init child claims the root, places its pane in a right sidebar, and
@@ -165,6 +177,30 @@ The portable `brood-layout` crate owns validation, normalized projection,
 recursive lease-fragment composition, and hit testing. It does not depend on
 Smithay, Winit, WGPU, transport code, or the WASM runtime.
 
+## Pointer-Driven Synchronized Resize
+
+Interaction zones are lease-local input geometry, separate from rendered pane
+items. The client composes and clips them with the same transforms used for the
+presented layout. It selects the top applicable zone, invokes that lease
+holder's bounded pointer policy once, and keeps captured motion and the final
+release on one interaction ID. Hover cursor selection and native divider state
+remain client-local and do not invoke WASM.
+
+The pointer policy may consume or pass the event and enqueue an ordinary actor
+message. The layout actor owns the durable split ratio. If that message changes
+geometry, the actor submits one synchronized layout command containing its
+lease token, inventory and base-layout revisions, target fragment, presentation
+mode, and explicit pane wait set.
+
+After validation, the client allocates a resize epoch, projects the last visible
+content into the target geometry, and notifies all affected panes together.
+Only a draw or reuse response tagged with that epoch can satisfy a waited pane.
+Visible content and staged content remain separate until the complete wait set
+is ready; geometry, pane content, and divider chrome are then promoted in one
+presented frame. A newer request in the same interaction supersedes the staged
+request, and every accepted request has a client-owned deadline and degraded
+fallback.
+
 ## Pane Identity
 
 The client presents managed panes and client-local WASM panes in one flat
@@ -190,12 +226,13 @@ surface and reprojects the accepted normalized layout, so the existing managed
 and plugin textures track the pointer without waiting on an actor or nested
 client.
 
-Viewport publication, plugin target recompilation, pane resize events, and
-managed Wayland size requests wait until native size events have been quiet for
-a short settlement interval. The client then publishes one coherent viewport
-revision and one final size per changed pane. New frame and actor traffic may
-continue during the drag, but cannot bypass this resize barrier and start a
-cascade of intermediate client configurations.
+After native size events have been quiet for a short settlement interval, the
+client publishes one coherent viewport revision to the root actor. The actor
+may submit a final synchronized layout through the same resize-epoch and
+wait-set path used by divider interaction. Plugin target recompilation and
+managed Wayland size requests are tagged with that accepted epoch. New frame
+and actor traffic may continue during the drag, but cannot bypass this barrier
+and start a cascade of incompatible intermediate configurations.
 
 Failure of a wrapper collapses that node and promotes its `rest` child rather
 than revoking the useful inner layout. Removed plugin-owned panes follow normal

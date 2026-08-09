@@ -58,6 +58,8 @@ pub struct ActorPresentationHost {
 pub struct GraphicsSnapshot {
     pub pane: u64,
     pub sequence: u64,
+    /// Present only when this packet is staged for a synchronized resize.
+    pub resize_epoch: Option<u64>,
     pub packet: Packet,
     pub images: BTreeMap<u64, ImageResource>,
     pub text_layouts: BTreeMap<u64, TextLayoutResource>,
@@ -88,6 +90,7 @@ pub struct ImageResource {
 struct PaneScene {
     generation: u64,
     sequence: u64,
+    resize_epoch: Option<u64>,
     terminal_input_sequence: Option<u64>,
     packet: Packet,
 }
@@ -159,6 +162,9 @@ struct GraphicsState {
     next_sequence: u64,
     next_resource: u64,
     panes: BTreeMap<u64, PaneScene>,
+    staged_panes: BTreeMap<(u64, u64), PaneScene>,
+    deferred_panes: BTreeMap<u64, PaneScene>,
+    active_resize_epochs: BTreeMap<u64, u64>,
     pending_terminal_input_sequences: BTreeMap<u64, VecDeque<u64>>,
     images: BTreeMap<u64, ImageResource>,
     text_layouts: BTreeMap<u64, TextLayoutEntry>,
@@ -175,6 +181,115 @@ struct ReferencedResources {
     text_layouts: BTreeMap<u64, TextLayoutResource>,
     glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
     ready: bool,
+}
+
+fn resize_epoch_is_active(state: &GraphicsState, pane: u64, resize_epoch: u64) -> bool {
+    resize_epoch != 0 && state.active_resize_epochs.get(&pane) == Some(&resize_epoch)
+}
+
+fn pane_content_is_reusable(
+    state: &GraphicsState,
+    pane: u64,
+    actor_generation: u64,
+    resize_epoch: u64,
+) -> bool {
+    resize_epoch_is_active(state, pane, resize_epoch)
+        && state
+            .panes
+            .get(&pane)
+            .is_some_and(|scene| scene.generation == actor_generation)
+}
+
+fn take_ready_deferred_scene(state: &mut GraphicsState, pane: u64) -> Option<PaneScene> {
+    let ready = state.deferred_panes.get(&pane).is_some_and(|scene| {
+        referenced_resources(state, pane, scene.generation, &scene.packet)
+            .is_ok_and(|resources| resources.ready)
+    });
+    ready.then(|| state.deferred_panes.remove(&pane)).flatten()
+}
+
+fn promote_ready_deferred_scene(state: &mut GraphicsState, pane: u64) {
+    if state.active_resize_epochs.contains_key(&pane) {
+        return;
+    }
+    let Some(pending) = take_ready_deferred_scene(state, pane) else {
+        return;
+    };
+    if state
+        .panes
+        .get(&pane)
+        .is_none_or(|visible| pending.sequence > visible.sequence)
+    {
+        state.panes.insert(pane, pending);
+    }
+}
+
+fn abort_resize_epoch_state(
+    state: &mut GraphicsState,
+    resize_epoch: u64,
+) -> Vec<(u64, u64, Option<u64>)> {
+    let panes = state
+        .active_resize_epochs
+        .iter()
+        .filter_map(|(pane, epoch)| (*epoch == resize_epoch).then_some(*pane))
+        .collect::<Vec<_>>();
+    let mut deferred = Vec::new();
+    for pane in panes {
+        state.active_resize_epochs.remove(&pane);
+        state.staged_panes.remove(&(pane, resize_epoch));
+        if let Some(scene) = take_ready_deferred_scene(state, pane) {
+            deferred.push((pane, scene.sequence, scene.terminal_input_sequence));
+            state.panes.insert(pane, scene);
+        }
+    }
+    state
+        .staged_panes
+        .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
+    deferred
+}
+
+fn complete_resize_epoch_state(
+    state: &mut GraphicsState,
+    resize_epoch: u64,
+    promote_tagged: bool,
+) -> Vec<(u64, u64, Option<u64>)> {
+    let panes = state
+        .active_resize_epochs
+        .iter()
+        .filter_map(|(pane, epoch)| (*epoch == resize_epoch).then_some(*pane))
+        .collect::<Vec<_>>();
+    let mut deferred = Vec::new();
+    for pane in panes {
+        state.active_resize_epochs.remove(&pane);
+        let tagged = state.staged_panes.remove(&(pane, resize_epoch));
+        let ordinary = take_ready_deferred_scene(state, pane);
+        match (tagged, ordinary) {
+            (Some(mut tagged), Some(ordinary)) if promote_tagged => {
+                let terminal_input_sequence = ordinary.terminal_input_sequence;
+                if ordinary.sequence > tagged.sequence {
+                    deferred.push((pane, ordinary.sequence, terminal_input_sequence));
+                    state.panes.insert(pane, ordinary);
+                } else {
+                    tagged.resize_epoch = None;
+                    deferred.push((pane, tagged.sequence, terminal_input_sequence));
+                    state.panes.insert(pane, tagged);
+                }
+            }
+            (_tagged, Some(ordinary)) => {
+                deferred.push((pane, ordinary.sequence, ordinary.terminal_input_sequence));
+                state.panes.insert(pane, ordinary);
+            }
+            (Some(mut tagged), None) if promote_tagged => {
+                tagged.resize_epoch = None;
+                state.panes.insert(pane, tagged);
+            }
+            (_, None) => {}
+        }
+    }
+    state
+        .staged_panes
+        .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
+    deferred
 }
 
 impl PluginGraphicsBridge {
@@ -213,14 +328,54 @@ impl PluginGraphicsBridge {
             .entry(pane)
             .or_default()
             .push_back(input_sequence);
+        drop(state);
+        Ok(())
+    }
+
+    /// Admit tagged presentation work only for panes in the current resize.
+    pub fn activate_resize_epoch(&self, resize_epoch: u64, panes: &[u64]) -> Result<()> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        state.active_resize_epochs.clear();
+        state
+            .active_resize_epochs
+            .extend(panes.iter().copied().map(|pane| (pane, resize_epoch)));
+        drop(state);
+        Ok(())
+    }
+
+    /// Validate a reuse response sent through the ordinary actor mailbox.
+    ///
+    /// Component imports use the same predicate before publishing their
+    /// ready event, so neither path can satisfy a barrier without matching
+    /// visible content for the currently admitted pane epoch.
+    pub fn validate_reuse_pane_content(
+        &self,
+        pane: u64,
+        actor_generation: u64,
+        resize_epoch: u64,
+    ) -> Result<(), PresentationError> {
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if !resize_epoch_is_active(&state, pane, resize_epoch) {
+            return Err(PresentationError::InvalidArgument);
+        }
+        if !pane_content_is_reusable(&state, pane, actor_generation, resize_epoch) {
+            return Err(PresentationError::InvalidResource);
+        }
         Ok(())
     }
 
     pub fn snapshot(&self, pane: u64) -> Result<Option<GraphicsSnapshot>> {
-        let state = self
+        let mut state = self
             .shared
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        promote_ready_deferred_scene(&mut state, pane);
         let Some(scene) = state.panes.get(&pane) else {
             return Ok(None);
         };
@@ -232,6 +387,7 @@ impl PluginGraphicsBridge {
         let snapshot = GraphicsSnapshot {
             pane,
             sequence: scene.sequence,
+            resize_epoch: None,
             packet: scene.packet.clone(),
             images: resources.images,
             text_layouts: resources.text_layouts,
@@ -239,6 +395,102 @@ impl PluginGraphicsBridge {
         };
         drop(state);
         Ok(Some(snapshot))
+    }
+
+    /// Return the content explicitly tagged for one resize epoch without
+    /// replacing the pane's currently visible scene.
+    pub fn staged_snapshot(
+        &self,
+        pane: u64,
+        resize_epoch: u64,
+    ) -> Result<Option<GraphicsSnapshot>> {
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let Some(scene) = state.staged_panes.get(&(pane, resize_epoch)) else {
+            return Ok(None);
+        };
+        let resources = referenced_resources(&state, pane, scene.generation, &scene.packet)
+            .map_err(|_error| anyhow!("staged packet lost a referenced resource"))?;
+        if !resources.ready {
+            return Ok(None);
+        }
+        let snapshot = GraphicsSnapshot {
+            pane,
+            sequence: scene.sequence,
+            resize_epoch: Some(resize_epoch),
+            packet: scene.packet.clone(),
+            images: resources.images,
+            text_layouts: resources.text_layouts,
+            glyphs: resources.glyphs,
+        };
+        drop(state);
+        Ok(Some(snapshot))
+    }
+
+    pub fn discard_staged_epoch(&self, resize_epoch: u64) -> Result<usize> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let before = state.staged_panes.len();
+        state
+            .staged_panes
+            .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
+        state
+            .active_resize_epochs
+            .retain(|_pane, epoch| *epoch != resize_epoch);
+        Ok(before.saturating_sub(state.staged_panes.len()))
+    }
+
+    /// Panes admitted to an epoch, including panes whose tagged GPU scene may
+    /// already have been installed for a not-yet-presented frame.
+    pub fn active_resize_panes(&self, resize_epoch: u64) -> Result<Vec<u64>> {
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        Ok(state
+            .active_resize_epochs
+            .iter()
+            .filter_map(|(pane, epoch)| (*epoch == resize_epoch).then_some(*pane))
+            .collect())
+    }
+
+    /// Abort one admitted epoch without making its tagged scenes visible.
+    ///
+    /// Ordinary scenes submitted while the barrier was active are newer than
+    /// the still-visible content. They become the bridge-visible scenes when
+    /// the transaction is cancelled, and the renderer recompiles them before
+    /// its next presentation.
+    pub fn abort_resize_epoch(&self, resize_epoch: u64) -> Result<Vec<(u64, u64, Option<u64>)>> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let deferred = abort_resize_epoch_state(&mut state, resize_epoch);
+        drop(state);
+        Ok(deferred)
+    }
+
+    /// Close one epoch after its atomic frame has reached `queue.present`.
+    /// The newest ordinary draw submitted while each pane was waiting becomes
+    /// the bridge's visible scene only at this post-present boundary. Tagged
+    /// scenes become bridge-visible only when the renderer actually promoted
+    /// them; degraded old-content presentation passes `false`.
+    pub fn complete_resize_epoch(
+        &self,
+        resize_epoch: u64,
+        promote_tagged: bool,
+    ) -> Result<Vec<(u64, u64, Option<u64>)>> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let deferred = complete_resize_epoch_state(&mut state, resize_epoch, promote_tagged);
+        drop(state);
+        Ok(deferred)
     }
 
     pub fn diagnostics(&self) -> Result<GraphicsDiagnostics> {
@@ -300,7 +552,7 @@ fn finish_glyph_raster(
     request: &GlyphRasterRequest,
     result: Result<TextLayoutResource, PresentationError>,
 ) {
-    let notification = {
+    let notifications = {
         let Ok(mut state) = shared.lock() else {
             return;
         };
@@ -323,35 +575,48 @@ fn finish_glyph_raster(
                 return;
             }
         }
-        let Some(scene) = state.panes.get(&request.pane) else {
-            return;
-        };
-        if scene.generation != request.generation
-            || !packet_references_text_layout(&scene.packet, request.handle)
-        {
-            return;
-        }
-        match referenced_resources(&state, request.pane, request.generation, &scene.packet) {
-            Ok(resources) if resources.ready => {
-                Some((scene.sequence, scene.terminal_input_sequence))
-            }
-            Ok(_) | Err(_) => None,
-        }
+        state
+            .panes
+            .get(&request.pane)
+            .into_iter()
+            .chain(state.deferred_panes.get(&request.pane))
+            .chain(
+                state
+                    .staged_panes
+                    .range((request.pane, 0)..=(request.pane, u64::MAX))
+                    .map(|(_key, scene)| scene),
+            )
+            .filter(|scene| {
+                scene.generation == request.generation
+                    && packet_references_text_layout(&scene.packet, request.handle)
+            })
+            .filter_map(|scene| {
+                referenced_resources(&state, request.pane, request.generation, &scene.packet)
+                    .is_ok_and(|resources| resources.ready)
+                    .then_some((
+                        scene.sequence,
+                        scene.resize_epoch,
+                        scene.terminal_input_sequence,
+                    ))
+            })
+            .collect::<Vec<_>>()
     };
-    if let Some((sequence, terminal_input_sequence)) = notification
-        && proxy
+    for (sequence, resize_epoch, terminal_input_sequence) in notifications {
+        if proxy
             .send_event(ClientEvent::PluginGraphicsChanged {
                 pane: request.pane,
                 sequence,
+                resize_epoch,
                 terminal_input_sequence,
                 ready_at: Instant::now(),
             })
             .is_err()
-    {
-        eprintln!(
-            "failed to publish ready plugin text scene pane={} sequence={sequence}",
-            request.pane
-        );
+        {
+            eprintln!(
+                "failed to publish ready plugin text scene pane={} sequence={sequence} resize_epoch={resize_epoch:?}",
+                request.pane
+            );
+        }
     }
 }
 
@@ -373,6 +638,11 @@ impl ActorPresentationHost {
                 .text_layouts
                 .retain(|_, resource| resource.pane != self.pane);
             state.pending_terminal_input_sequences.remove(&self.pane);
+            state
+                .staged_panes
+                .retain(|(pane, _epoch), _scene| *pane != self.pane);
+            state.deferred_panes.remove(&self.pane);
+            state.active_resize_epochs.remove(&self.pane);
             state.text_layouts_dropped = state.text_layouts_dropped.saturating_add(
                 u64::try_from(previous_text_layouts.saturating_sub(state.text_layouts.len()))
                     .unwrap_or(u64::MAX),
@@ -400,6 +670,11 @@ impl Drop for ActorPresentationHost {
                 .text_layouts
                 .retain(|_, resource| resource.pane != self.pane);
             state.pending_terminal_input_sequences.remove(&self.pane);
+            state
+                .staged_panes
+                .retain(|(pane, _epoch), _scene| *pane != self.pane);
+            state.deferred_panes.remove(&self.pane);
+            state.active_resize_epochs.remove(&self.pane);
             let removed = previous_text_layouts.saturating_sub(state.text_layouts.len());
             state.text_layouts_dropped = state
                 .text_layouts_dropped
@@ -409,16 +684,20 @@ impl Drop for ActorPresentationHost {
     }
 }
 
-impl PresentationHost for ActorPresentationHost {
-    fn submit_draw_packet(
+impl ActorPresentationHost {
+    fn submit_draw_packet_inner(
         &self,
         actor_generation: u64,
         pane: u64,
-        packet: Vec<u8>,
+        resize_epoch: Option<u64>,
+        packet: &[u8],
     ) -> Result<u64, PresentationError> {
         self.authorize(actor_generation, pane)?;
+        if resize_epoch == Some(0) {
+            return Err(PresentationError::InvalidArgument);
+        }
         let packet_bytes = packet.len();
-        let packet = Packet::decode(&packet).map_err(|error| match error {
+        let packet = Packet::decode(packet).map_err(|error| match error {
             PacketError::Limit(_) => PresentationError::LimitReached,
             PacketError::Invalid(_) => PresentationError::InvalidPacket,
         })?;
@@ -431,11 +710,17 @@ impl PresentationHost for ActorPresentationHost {
             if actor_generation != self.generation.load(Ordering::Acquire) {
                 return Err(PresentationError::InvalidPane);
             }
+            if let Some(resize_epoch) = resize_epoch
+                && !resize_epoch_is_active(&state, pane, resize_epoch)
+            {
+                return Err(PresentationError::InvalidArgument);
+            }
             referenced_resources(&state, pane, actor_generation, &packet)?
         };
         let candidate = GraphicsSnapshot {
             pane,
             sequence: 0,
+            resize_epoch,
             packet,
             images: resources.images,
             text_layouts: resources.text_layouts,
@@ -443,7 +728,7 @@ impl PresentationHost for ActorPresentationHost {
         };
         crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
         let packet = candidate.packet;
-        let (sequence, terminal_input_sequence, previous, ready) = {
+        let (sequence, terminal_input_sequence, previous, ready, deferred_ordinary) = {
             let mut state = self
                 .bridge
                 .shared
@@ -451,6 +736,11 @@ impl PresentationHost for ActorPresentationHost {
                 .map_err(|_poisoned| PresentationError::HostFailure)?;
             if actor_generation != self.generation.load(Ordering::Acquire) {
                 return Err(PresentationError::InvalidPane);
+            }
+            if let Some(resize_epoch) = resize_epoch
+                && !resize_epoch_is_active(&state, pane, resize_epoch)
+            {
+                return Err(PresentationError::InvalidArgument);
             }
             let resources = referenced_resources(&state, pane, actor_generation, &packet)?;
             state.accepted_packets = state.accepted_packets.saturating_add(1);
@@ -461,21 +751,39 @@ impl PresentationHost for ActorPresentationHost {
                 .checked_add(1)
                 .ok_or(PresentationError::LimitReached)?;
             let sequence = state.next_sequence;
-            let terminal_input_sequence = state
-                .pending_terminal_input_sequences
-                .get_mut(&pane)
-                .and_then(VecDeque::pop_front);
-            let previous = state.panes.insert(
-                pane,
-                PaneScene {
-                    generation: actor_generation,
-                    sequence,
-                    terminal_input_sequence,
-                    packet,
-                },
-            );
+            let terminal_input_sequence = resize_epoch
+                .is_none()
+                .then(|| {
+                    state
+                        .pending_terminal_input_sequences
+                        .get_mut(&pane)
+                        .and_then(VecDeque::pop_front)
+                })
+                .flatten();
+            let scene = PaneScene {
+                generation: actor_generation,
+                sequence,
+                resize_epoch,
+                terminal_input_sequence,
+                packet,
+            };
+            let deferred_ordinary = resize_epoch.is_none()
+                && (state.active_resize_epochs.contains_key(&pane) || !resources.ready);
+            let previous = if let Some(resize_epoch) = resize_epoch {
+                state.staged_panes.insert((pane, resize_epoch), scene)
+            } else if deferred_ordinary {
+                state.deferred_panes.insert(pane, scene)
+            } else {
+                state.panes.insert(pane, scene)
+            };
             drop(state);
-            (sequence, terminal_input_sequence, previous, resources.ready)
+            (
+                sequence,
+                terminal_input_sequence,
+                previous,
+                resources.ready,
+                deferred_ordinary,
+            )
         };
         if ready
             && self
@@ -484,6 +792,7 @@ impl PresentationHost for ActorPresentationHost {
                 .send_event(ClientEvent::PluginGraphicsChanged {
                     pane,
                     sequence,
+                    resize_epoch,
                     terminal_input_sequence,
                     ready_at: Instant::now(),
                 })
@@ -492,16 +801,68 @@ impl PresentationHost for ActorPresentationHost {
             if let Ok(mut state) = self.bridge.shared.lock() {
                 match previous {
                     Some(previous) => {
-                        state.panes.insert(pane, previous);
+                        if let Some(resize_epoch) = resize_epoch {
+                            state.staged_panes.insert((pane, resize_epoch), previous);
+                        } else if deferred_ordinary {
+                            state.deferred_panes.insert(pane, previous);
+                        } else {
+                            state.panes.insert(pane, previous);
+                        }
                     }
                     None => {
-                        state.panes.remove(&pane);
+                        if let Some(resize_epoch) = resize_epoch {
+                            state.staged_panes.remove(&(pane, resize_epoch));
+                        } else if deferred_ordinary {
+                            state.deferred_panes.remove(&pane);
+                        } else {
+                            state.panes.remove(&pane);
+                        }
                     }
                 }
             }
             return Err(PresentationError::HostFailure);
         }
         Ok(sequence)
+    }
+}
+
+impl PresentationHost for ActorPresentationHost {
+    fn submit_draw_packet(
+        &self,
+        actor_generation: u64,
+        pane: u64,
+        packet: Vec<u8>,
+    ) -> Result<u64, PresentationError> {
+        self.submit_draw_packet_inner(actor_generation, pane, None, &packet)
+    }
+
+    fn submit_tagged_draw_packet(
+        &self,
+        actor_generation: u64,
+        pane: u64,
+        resize_epoch: u64,
+        packet: Vec<u8>,
+    ) -> Result<u64, PresentationError> {
+        self.submit_draw_packet_inner(actor_generation, pane, Some(resize_epoch), &packet)
+    }
+
+    fn reuse_pane_content(
+        &self,
+        actor_generation: u64,
+        pane: u64,
+        resize_epoch: u64,
+    ) -> Result<(), PresentationError> {
+        self.authorize(actor_generation, pane)?;
+        self.bridge
+            .validate_reuse_pane_content(pane, actor_generation, resize_epoch)?;
+        self.bridge
+            .proxy
+            .send_event(ClientEvent::PluginContentReused {
+                pane,
+                resize_epoch,
+                ready_at: Instant::now(),
+            })
+            .map_err(|_closed| PresentationError::HostFailure)
     }
 
     fn create_image_rgba8(
@@ -645,13 +1006,19 @@ impl PresentationHost for ActorPresentationHost {
         if actor_generation != self.generation.load(Ordering::Acquire) {
             return Err(PresentationError::InvalidPane);
         }
-        if state.panes.values().any(|scene| {
-            scene.packet.commands.iter().any(|command| match command {
-                Command::DrawImage { image, .. } => *image == resource,
-                Command::DrawTextLayout { layout, .. } => *layout == resource,
-                _ => false,
+        if state
+            .panes
+            .values()
+            .chain(state.deferred_panes.values())
+            .chain(state.staged_panes.values())
+            .any(|scene| {
+                scene.packet.commands.iter().any(|command| match command {
+                    Command::DrawImage { image, .. } => *image == resource,
+                    Command::DrawTextLayout { layout, .. } => *layout == resource,
+                    _ => false,
+                })
             })
-        }) {
+        {
             return Err(PresentationError::ResourceInUse);
         }
         let owned_image = state.images.get(&resource).is_some_and(|candidate| {
@@ -1107,5 +1474,297 @@ mod tests {
             referenced_resources(&state, 7, 11, &text_packet(&[1])),
             Err(PresentationError::HostFailure)
         ));
+    }
+
+    #[test]
+    fn tagged_work_is_admitted_only_for_the_current_pane_epoch() {
+        let mut state = GraphicsState::default();
+        state.active_resize_epochs.insert(7, 41);
+
+        assert!(resize_epoch_is_active(&state, 7, 41));
+        assert!(!resize_epoch_is_active(&state, 7, 40));
+        assert!(!resize_epoch_is_active(&state, 8, 41));
+        assert!(!resize_epoch_is_active(&state, 7, 0));
+
+        assert!(!pane_content_is_reusable(&state, 7, 2, 41));
+        state.panes.insert(
+            7,
+            PaneScene {
+                generation: 2,
+                sequence: 1,
+                resize_epoch: None,
+                terminal_input_sequence: None,
+                packet: Packet::default(),
+            },
+        );
+        assert!(pane_content_is_reusable(&state, 7, 2, 41));
+        assert!(!pane_content_is_reusable(&state, 7, 3, 41));
+        assert!(!pane_content_is_reusable(&state, 7, 2, 42));
+    }
+
+    #[test]
+    fn abort_discards_tagged_content_and_releases_newest_ordinary_scene() {
+        let scene = |sequence, resize_epoch, terminal_input_sequence| PaneScene {
+            generation: 2,
+            sequence,
+            resize_epoch,
+            terminal_input_sequence,
+            packet: Packet::default(),
+        };
+        let mut state = GraphicsState::default();
+        state.panes.insert(7, scene(1, None, None));
+        state.panes.insert(8, scene(4, None, None));
+        state.staged_panes.insert((7, 41), scene(2, Some(41), None));
+        state.staged_panes.insert((8, 41), scene(5, Some(41), None));
+        state.deferred_panes.insert(7, scene(3, None, Some(19)));
+        state.active_resize_epochs.insert(7, 41);
+        state.active_resize_epochs.insert(8, 41);
+
+        let deferred = abort_resize_epoch_state(&mut state, 41);
+
+        assert_eq!(deferred, vec![(7, 3, Some(19))]);
+        assert_eq!(state.panes.get(&7).map(|scene| scene.sequence), Some(3));
+        assert_eq!(state.panes.get(&8).map(|scene| scene.sequence), Some(4));
+        assert!(state.staged_panes.is_empty());
+        assert!(state.deferred_panes.is_empty());
+        assert!(state.active_resize_epochs.is_empty());
+        state.active_resize_epochs.insert(7, 42);
+        assert!(pane_content_is_reusable(&state, 7, 2, 42));
+    }
+
+    #[test]
+    fn supersession_releases_deferred_panes_dropped_from_the_next_wait_set() {
+        let scene = |sequence, resize_epoch, terminal_input_sequence| PaneScene {
+            generation: 2,
+            sequence,
+            resize_epoch,
+            terminal_input_sequence,
+            packet: Packet::default(),
+        };
+        let mut state = GraphicsState::default();
+        state.panes.insert(7, scene(1, None, None));
+        state.panes.insert(8, scene(4, None, None));
+        state.staged_panes.insert((7, 41), scene(2, Some(41), None));
+        state.staged_panes.insert((8, 41), scene(5, Some(41), None));
+        state.deferred_panes.insert(8, scene(6, None, Some(20)));
+        state.active_resize_epochs.insert(7, 41);
+        state.active_resize_epochs.insert(8, 41);
+
+        assert_eq!(
+            abort_resize_epoch_state(&mut state, 41),
+            vec![(8, 6, Some(20))]
+        );
+        assert_eq!(state.panes.get(&8).map(|scene| scene.sequence), Some(6));
+
+        // The superseding epoch waits only for A. B remains ordinary and
+        // visible instead of being hidden until an unrelated later resize.
+        state.active_resize_epochs.insert(7, 42);
+        assert!(!resize_epoch_is_active(&state, 8, 42));
+        assert_eq!(state.panes.get(&8).map(|scene| scene.sequence), Some(6));
+
+        state.active_resize_epochs.clear();
+        state.active_resize_epochs.insert(8, 43);
+        assert!(pane_content_is_reusable(&state, 8, 2, 43));
+    }
+
+    #[test]
+    fn promoted_before_present_abort_retains_only_the_old_bridge_scene() {
+        let scene = |sequence, resize_epoch| PaneScene {
+            generation: 2,
+            sequence,
+            resize_epoch,
+            terminal_input_sequence: None,
+            packet: Packet::default(),
+        };
+        let mut state = GraphicsState::default();
+        state.panes.insert(7, scene(1, None));
+        state.staged_panes.insert((7, 41), scene(2, Some(41)));
+        state.active_resize_epochs.insert(7, 41);
+
+        // The renderer may have installed sequence 2 into its GPU map before
+        // a skipped presentation, but the bridge still identifies sequence 1
+        // as the only scene with visible evidence.
+        assert!(abort_resize_epoch_state(&mut state, 41).is_empty());
+        assert_eq!(state.panes.get(&7).map(|scene| scene.sequence), Some(1));
+        assert!(state.staged_panes.is_empty());
+        assert!(state.active_resize_epochs.is_empty());
+    }
+
+    #[test]
+    fn abort_keeps_old_scene_visible_until_deferred_resources_are_ready() -> Result<()> {
+        let mut state = GraphicsState::default();
+        state.panes.insert(
+            7,
+            PaneScene {
+                generation: 11,
+                sequence: 1,
+                resize_epoch: None,
+                terminal_input_sequence: None,
+                packet: Packet::default(),
+            },
+        );
+        state.text_layouts.insert(1, pending_text_entry());
+        state.deferred_panes.insert(
+            7,
+            PaneScene {
+                generation: 11,
+                sequence: 3,
+                resize_epoch: None,
+                terminal_input_sequence: Some(20),
+                packet: text_packet(&[1]),
+            },
+        );
+        state.active_resize_epochs.insert(7, 41);
+
+        anyhow::ensure!(abort_resize_epoch_state(&mut state, 41).is_empty());
+        anyhow::ensure!(state.panes.get(&7).map(|scene| scene.sequence) == Some(1));
+        anyhow::ensure!(state.deferred_panes.get(&7).map(|scene| scene.sequence) == Some(3));
+        promote_ready_deferred_scene(&mut state, 7);
+        anyhow::ensure!(state.panes.get(&7).map(|scene| scene.sequence) == Some(1));
+
+        state
+            .text_layouts
+            .get_mut(&1)
+            .ok_or_else(|| anyhow!("pending layout disappeared"))?
+            .state = TextLayoutState::Ready(ready_text_layout());
+        promote_ready_deferred_scene(&mut state, 7);
+        anyhow::ensure!(state.panes.get(&7).map(|scene| scene.sequence) == Some(3));
+        anyhow::ensure!(state.deferred_panes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn completion_keeps_tagged_scene_until_newer_deferred_resources_are_ready() -> Result<()> {
+        let mut state = GraphicsState::default();
+        state.panes.insert(
+            7,
+            PaneScene {
+                generation: 11,
+                sequence: 1,
+                resize_epoch: None,
+                terminal_input_sequence: None,
+                packet: Packet::default(),
+            },
+        );
+        state.staged_panes.insert(
+            (7, 41),
+            PaneScene {
+                generation: 11,
+                sequence: 2,
+                resize_epoch: Some(41),
+                terminal_input_sequence: None,
+                packet: Packet::default(),
+            },
+        );
+        state.text_layouts.insert(1, pending_text_entry());
+        state.deferred_panes.insert(
+            7,
+            PaneScene {
+                generation: 11,
+                sequence: 3,
+                resize_epoch: None,
+                terminal_input_sequence: Some(20),
+                packet: text_packet(&[1]),
+            },
+        );
+        state.active_resize_epochs.insert(7, 41);
+
+        anyhow::ensure!(complete_resize_epoch_state(&mut state, 41, true).is_empty());
+        anyhow::ensure!(state.panes.get(&7).map(|scene| scene.sequence) == Some(2));
+        anyhow::ensure!(state.deferred_panes.get(&7).map(|scene| scene.sequence) == Some(3));
+
+        state
+            .text_layouts
+            .get_mut(&1)
+            .ok_or_else(|| anyhow!("pending layout disappeared"))?
+            .state = TextLayoutState::Ready(ready_text_layout());
+        promote_ready_deferred_scene(&mut state, 7);
+        anyhow::ensure!(state.panes.get(&7).map(|scene| scene.sequence) == Some(3));
+        anyhow::ensure!(state.deferred_panes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_completion_never_exposes_unpresented_tagged_content() {
+        let scene = |sequence, resize_epoch, terminal_input_sequence| PaneScene {
+            generation: 2,
+            sequence,
+            resize_epoch,
+            terminal_input_sequence,
+            packet: Packet::default(),
+        };
+
+        let mut degraded = GraphicsState::default();
+        degraded.panes.insert(7, scene(1, None, None));
+        degraded
+            .staged_panes
+            .insert((7, 41), scene(2, Some(41), None));
+        degraded.active_resize_epochs.insert(7, 41);
+        assert!(complete_resize_epoch_state(&mut degraded, 41, false).is_empty());
+        assert_eq!(degraded.panes.get(&7).map(|scene| scene.sequence), Some(1));
+        degraded.active_resize_epochs.insert(7, 42);
+        assert!(pane_content_is_reusable(&degraded, 7, 2, 42));
+
+        let mut promoted = GraphicsState::default();
+        promoted.panes.insert(7, scene(1, None, None));
+        promoted
+            .staged_panes
+            .insert((7, 41), scene(2, Some(41), None));
+        promoted.active_resize_epochs.insert(7, 41);
+        assert!(complete_resize_epoch_state(&mut promoted, 41, true).is_empty());
+        assert_eq!(promoted.panes.get(&7).map(|scene| scene.sequence), Some(2));
+        assert_eq!(
+            promoted.panes.get(&7).and_then(|scene| scene.resize_epoch),
+            None
+        );
+
+        let mut newer_tagged = GraphicsState::default();
+        newer_tagged.panes.insert(7, scene(1, None, None));
+        newer_tagged
+            .deferred_panes
+            .insert(7, scene(2, None, Some(18)));
+        newer_tagged
+            .staged_panes
+            .insert((7, 41), scene(3, Some(41), None));
+        newer_tagged.active_resize_epochs.insert(7, 41);
+        assert_eq!(
+            complete_resize_epoch_state(&mut newer_tagged, 41, true),
+            vec![(7, 3, Some(18))]
+        );
+        assert_eq!(
+            newer_tagged.panes.get(&7).map(|scene| scene.sequence),
+            Some(3)
+        );
+
+        let mut newer_ordinary = GraphicsState::default();
+        newer_ordinary.panes.insert(7, scene(1, None, None));
+        newer_ordinary
+            .staged_panes
+            .insert((7, 41), scene(2, Some(41), None));
+        newer_ordinary
+            .deferred_panes
+            .insert(7, scene(3, None, Some(19)));
+        newer_ordinary.active_resize_epochs.insert(7, 41);
+        assert_eq!(
+            complete_resize_epoch_state(&mut newer_ordinary, 41, true),
+            vec![(7, 3, Some(19))]
+        );
+        assert_eq!(
+            newer_ordinary.panes.get(&7).map(|scene| scene.sequence),
+            Some(3)
+        );
+
+        let mut deferred = GraphicsState::default();
+        deferred.panes.insert(7, scene(1, None, None));
+        deferred
+            .staged_panes
+            .insert((7, 41), scene(2, Some(41), None));
+        deferred.deferred_panes.insert(7, scene(3, None, Some(19)));
+        deferred.active_resize_epochs.insert(7, 41);
+        assert_eq!(
+            complete_resize_epoch_state(&mut deferred, 41, false),
+            vec![(7, 3, Some(19))]
+        );
+        assert_eq!(deferred.panes.get(&7).map(|scene| scene.sequence), Some(3));
     }
 }

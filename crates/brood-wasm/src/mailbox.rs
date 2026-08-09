@@ -198,6 +198,14 @@ impl MailboxRegistry {
         self.mailboxes.contains_key(&actor_id)
     }
 
+    /// Report whether a registered generation no longer has a mailbox reader.
+    #[must_use]
+    pub fn actor_mailbox_is_closed(&self, actor_id: ActorId) -> Option<bool> {
+        self.mailboxes
+            .get(&actor_id)
+            .map(|mailbox| mailbox.sender.is_closed())
+    }
+
     pub fn try_post_named_message(&self, recipient: &str, payload: Vec<u8>) -> Result<()> {
         let actor_id = self
             .actor_id_for_name(recipient)
@@ -334,5 +342,26 @@ impl Mailbox {
                 bail!("actor {} mailbox is closed", self.actor_id.raw())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_distinguishes_a_closed_current_generation_from_backpressure() -> Result<()> {
+        let mut registry = MailboxRegistry::new();
+        let (registration, mailbox) = registry.prepare_actor("layout", 1)?;
+        let actor_id = mailbox.actor_id();
+        registry.activate_prepared(vec![registration], &[])?;
+
+        ensure!(registry.actor_mailbox_is_closed(actor_id) == Some(false));
+        registry.try_post_message(actor_id, vec![1])?;
+        ensure!(registry.actor_mailbox_is_closed(actor_id) == Some(false));
+
+        drop(mailbox);
+        ensure!(registry.actor_mailbox_is_closed(actor_id) == Some(true));
+        Ok(())
     }
 }

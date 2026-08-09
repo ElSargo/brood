@@ -86,6 +86,7 @@ let
         "${src}/plugins/neovim-client/Cargo.lock"
         "${src}/plugins/neovim-files/Cargo.lock"
         "${src}/plugins/picker/Cargo.lock"
+        "${src}/plugins/resize-proof/Cargo.lock"
         "${src}/plugins/session-switcher/Cargo.lock"
         "${src}/plugins/status-bar/Cargo.lock"
         "${src}/plugins/worktree-manager/Cargo.lock"
@@ -468,6 +469,19 @@ let
         wasm-tools component wit "$component_output" >/dev/null
       fi
 
+      if [[ -f plugins/resize-proof/Cargo.toml ]]; then
+        component_core="plugins/resize-proof/target/wasm32-unknown-unknown/release/brood_resize_proof_plugin.wasm"
+        component_output="plugins/resize-proof/target/wasm32-unknown-unknown/release/brood_resize_proof_plugin.component.wasm"
+        if [[ ! -s "$component_core" ]]; then
+          echo "ERR resize proof core module was not built at $component_core" >&2
+          exit 2
+        fi
+        echo "componentizing_wasm=$component_core output=$component_output"
+        wasm-tools component new "$component_core" --output "$component_output"
+        wasm-tools validate "$component_output"
+        wasm-tools component wit "$component_output" >/dev/null
+      fi
+
       runHook postBuild
     '';
 
@@ -527,6 +541,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/resize-proof/target/wasm32-unknown-unknown/release/brood_resize_proof_plugin.wasm" ]]; then
           continue
         fi
         install -D "$wasm" "$out/$wasm"

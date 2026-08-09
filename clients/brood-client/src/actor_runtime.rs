@@ -150,9 +150,33 @@ impl PresentationWasmRuntime {
         }
         for spec in specs {
             let pane = runtime.allocate_actor_pane()?;
+            let id = spec.id.clone();
             runtime.load_actor(spec, pane, None, None, graphics, &[])?;
+            runtime.start_direct_component_actor(&id)?;
         }
         Ok(runtime)
+    }
+
+    fn start_direct_component_actor(&self, id: &str) -> Result<()> {
+        let Some(hosted) = self.actors.get(id) else {
+            anyhow::ensure!(
+                self.legacy_actors.contains_key(id),
+                "direct presentation actor {id:?} is unavailable"
+            );
+            return Ok(());
+        };
+        if !matches!(&hosted.actor, HostedWasmActor::Component(_)) {
+            return Ok(());
+        }
+        let context =
+            direct_actor_start_context(id, hosted.actor.generation(), &self.workspace_root);
+        self.executor
+            .block_on(
+                hosted
+                    .actor
+                    .lifecycle(PluginLifecycleEvent::Start(context), Duration::from_secs(2)),
+            )
+            .with_context(|| format!("start direct presentation actor {id:?}"))
     }
 
     fn allocate_actor_pane(&mut self) -> Result<u64> {
@@ -1134,6 +1158,34 @@ impl PresentationWasmRuntime {
         })
     }
 
+    /// Whether the authenticated actor generation can no longer receive a
+    /// terminal mailbox message. A full live mailbox deliberately returns
+    /// false so callers continue retrying it.
+    pub fn actor_mailbox_is_closed(&self, actor: &ActorIdentity) -> bool {
+        if self.actor_identity(&actor.name).as_ref() != Some(actor) {
+            return true;
+        }
+        if let Some(hosted) = self.actors.get(&actor.name) {
+            return hosted.actor.mailbox_is_closed();
+        }
+        let Some(legacy) = self.legacy_actors.get(&actor.name) else {
+            return true;
+        };
+        let Some(actor_id) = legacy.generation.actor_ids().get(&actor.name).copied() else {
+            return true;
+        };
+        self.executor.block_on({
+            let registry = Arc::clone(&self.legacy_registry);
+            let actor_name = actor.name.clone();
+            async move {
+                registry
+                    .lock()
+                    .await
+                    .actor_mailbox_is_closed(&actor_name, actor_id)
+            }
+        })
+    }
+
     pub fn actor_identities(&self) -> Vec<ActorIdentity> {
         self.actors
             .keys()
@@ -1337,6 +1389,25 @@ impl PresentationWasmRuntime {
             });
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn direct_actor_start_context(
+    instance_id: &str,
+    generation: u64,
+    workspace_root: &Path,
+) -> PluginStartContext {
+    PluginStartContext {
+        instance_id: instance_id.to_string(),
+        generation,
+        reason: PluginStartReason::Initial,
+        backend_id: None,
+        session_id: None,
+        workspace_root: workspace_root.to_string_lossy().into_owned(),
+        data: vec![PluginLifecycleEntry {
+            key: "realm".to_string(),
+            value: "client".to_string(),
+        }],
     }
 }
 
@@ -1547,6 +1618,22 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_component_start_context_preserves_each_instance_identity() {
+        let root = Path::new("/workspace");
+        let fast = direct_actor_start_context("resize-proof-fast", 7, root);
+        let slow = direct_actor_start_context("resize-proof-slow", 8, root);
+        assert_eq!(fast.instance_id, "resize-proof-fast");
+        assert_eq!(slow.instance_id, "resize-proof-slow");
+        assert_ne!(fast.instance_id, slow.instance_id);
+        assert_eq!(fast.generation, 7);
+        assert_eq!(slow.generation, 8);
+        assert_eq!(fast.backend_id, None);
+        assert_eq!(slow.session_id, None);
+        assert_eq!(fast.workspace_root, "/workspace");
+        assert_eq!(fast.data, slow.data);
+    }
 
     #[test]
     fn presentation_child_git_capability_keeps_package_filesystem_read_only() -> Result<()> {

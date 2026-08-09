@@ -1,6 +1,9 @@
 #![no_std]
 
-use brood_keybindings::{Action, Binding, ACTIONS};
+#[cfg(test)]
+extern crate std;
+
+use brood_keybindings::{ACTIONS, Action, Binding};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{ptr, slice};
@@ -19,6 +22,7 @@ const MAX_APP_ID_BYTES: usize = 256;
 const MAX_ACTION_ID_BYTES: usize = 64;
 const MAX_BINDINGS: usize = 64;
 const MAX_MESSAGE_KIND_BYTES: usize = 64;
+const MAX_POINTER_PHASE_BYTES: usize = 32;
 const JSON_UNESCAPE_BYTES: usize = 512;
 const OUTPUT_ERROR: i32 = -1;
 const OUTPUT_ABSTAIN: i32 = 0;
@@ -28,6 +32,16 @@ const KEY_RELEASED: i32 = 0;
 const KEY_PRESSED: i32 = 1;
 const INPUT_MODE_PASSTHROUGH: i32 = 0;
 const INPUT_MODE_NORMAL: i32 = 1;
+const PRIMARY_BUTTON: u32 = 0x110;
+// Stable lease-local chrome IDs near the middle of the u64 space in an ASCII
+// "BROOD" namespace. Managed pane IDs grow up from the low end while plugin
+// pane IDs grow down from `u64::MAX`, so chrome must use neither allocator end.
+const DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_4401;
+const DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_4402;
+const DIVIDER_EVENT_MASK: u8 = 0b1111;
+const MIN_PRIMARY_SPLIT_RATIO: f32 = 0.15;
+const MAX_PRIMARY_SPLIT_RATIO: f32 = 0.85;
+const MAX_PENDING_RESIZE_PROPOSALS: usize = 256;
 
 static mut HEAP: [u8; HEAP_BYTES] = [0; HEAP_BYTES];
 static mut HEAP_CURSOR: usize = 0;
@@ -44,13 +58,38 @@ static mut LAYOUT_FULLSCREEN: bool = false;
 static mut LAYOUT_LEASE_ID: u64 = 0;
 static mut LAYOUT_LEASE_GENERATION: u64 = 0;
 static mut LAYOUT_REVISION: u64 = 0;
+static mut LAYOUT_BASE_PRESENTED_REVISION: u64 = 0;
 static mut LAYOUT_HAS_LEASE: bool = false;
 static mut LAYOUT_VIEWPORT_WIDTH: i32 = 1280;
 static mut LAYOUT_VIEWPORT_HEIGHT: i32 = 800;
+static mut LAYOUT_WAITABLE_PANES: [u64; 64] = [0; 64];
+static mut LAYOUT_WAITABLE_PANE_COUNT: usize = 0;
+// Pointer motion updates the requested ratio immediately so later samples in
+// the same drag stay continuous. Ordinary layout publications use the durable
+// ratio until the host confirms that a synchronized request was presented.
+static mut PRIMARY_SPLIT_RATIO: f32 = 0.5;
+static mut DURABLE_PRIMARY_SPLIT_RATIO: f32 = 0.5;
+static mut PENDING_RESIZE_REQUEST_IDS: [u64; MAX_PENDING_RESIZE_PROPOSALS] =
+    [0; MAX_PENDING_RESIZE_PROPOSALS];
+static mut PENDING_RESIZE_RATIOS: [f32; MAX_PENDING_RESIZE_PROPOSALS] =
+    [0.0; MAX_PENDING_RESIZE_PROPOSALS];
+static mut ACTIVE_POINTER_INTERACTION: u64 = 0;
+static mut HAS_ACTIVE_POINTER_INTERACTION: bool = false;
+static mut LAST_POINTER_EVENT_SEQUENCE: u64 = 0;
+static mut POINTER_SPLIT_OFFSET: f32 = 0.0;
+static mut NEXT_LAYOUT_REQUEST_ID: u64 = 1;
 static mut CONSUMED_KEYS: [u64; 4] = [0; 4];
 
 type PaneList = FixedVec<u64, MAX_PANES>;
 type AppPaneList = FixedVec<AppPane, MAX_PANES>;
+type LayoutActorState = (
+    &'static [u64],
+    &'static [u64],
+    Option<u64>,
+    bool,
+    Option<LayoutLeaseToken>,
+    Option<u64>,
+);
 
 #[derive(Default, Deserialize)]
 struct PolicyState {
@@ -86,6 +125,8 @@ struct WorkspaceMessage {
     #[serde(default)]
     action: Option<FixedString<MAX_MESSAGE_KIND_BYTES>>,
     #[serde(default)]
+    request_id: Option<u64>,
+    #[serde(default)]
     visible_panes: PaneList,
     #[serde(default)]
     pane_realms: FixedVec<PaneRealm, MAX_PANES>,
@@ -96,9 +137,33 @@ struct WorkspaceMessage {
     #[serde(default)]
     revision: Option<u64>,
     #[serde(default)]
+    inventory_revision: Option<u64>,
+    #[serde(default)]
+    base_layout_revision: Option<u64>,
+    #[serde(default)]
+    presented_layout_revision: Option<u64>,
+    #[serde(default)]
+    layout_revision: Option<u64>,
+    #[serde(default)]
     lease: Option<LayoutLeaseToken>,
     #[serde(default)]
     size: LayoutStateSize,
+    #[serde(default, alias = "waitable_plugin_panes")]
+    waitable_panes: PaneList,
+    #[serde(default)]
+    interaction: Option<u64>,
+    #[serde(default)]
+    event_sequence: Option<u64>,
+    #[serde(default)]
+    zone: Option<u64>,
+    #[serde(default)]
+    phase: Option<FixedString<MAX_POINTER_PHASE_BYTES>>,
+    #[serde(default)]
+    position: Option<LayoutPoint>,
+    #[serde(default)]
+    button: Option<u32>,
+    #[serde(default, rename = "modifiers")]
+    _modifiers: u32,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -107,7 +172,7 @@ struct PaneRealm {
     backend: u64,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 struct LayoutLeaseToken {
     id: u64,
     generation: u64,
@@ -117,6 +182,29 @@ struct LayoutLeaseToken {
 struct LayoutStateSize {
     w: i32,
     h: i32,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+struct LayoutPoint {
+    u: f64,
+    v: f64,
+}
+
+#[derive(Clone, Copy)]
+struct LayoutTransform {
+    offset_u: f32,
+    offset_v: f32,
+    size_u: f32,
+    size_v: f32,
+}
+
+#[derive(Deserialize)]
+struct PointerPolicyQuery {
+    zone: u64,
+    phase: FixedString<MAX_POINTER_PHASE_BYTES>,
+    #[serde(default)]
+    button: Option<u32>,
+    captured: bool,
 }
 
 fn decode_json<T>(bytes: &[u8]) -> Option<T>
@@ -233,6 +321,38 @@ pub extern "C" fn brood_policy_provider_key_workspace(
 }
 
 #[no_mangle]
+pub extern "C" fn brood_policy_provider_pointer_workspace(
+    query_ptr: i32,
+    query_len: i32,
+    _state_ptr: i32,
+    _state_len: i32,
+) -> i32 {
+    let Some(query) = guest_slice(query_ptr, query_len) else {
+        return OUTPUT_ERROR;
+    };
+    let Some(query) = decode_json::<PointerPolicyQuery>(query) else {
+        return OUTPUT_ERROR;
+    };
+    let Some(capture) = pointer_capture_decision(&query) else {
+        return OUTPUT_ABSTAIN;
+    };
+    finish_response(write_pointer_policy_result(response_buffer_mut(), capture))
+}
+
+fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<&'static str> {
+    if query.zone != DIVIDER_ZONE_ID {
+        return None;
+    }
+    Some(match query.phase.as_str() {
+        "button-press" if !query.captured && query.button == Some(PRIMARY_BUTTON) => "acquire",
+        "motion" if query.captured => "unchanged",
+        "button-release" if query.captured && query.button == Some(PRIMARY_BUTTON) => "release",
+        "cancel" if query.captured => "release",
+        _ => return None,
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn brood_actor_workspace_epoch_run(
     _epoch: i64,
     inbox_ptr: i32,
@@ -255,7 +375,12 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
             &message.pane_realms,
             message.focused_pane,
             message.lease,
-            message.revision,
+            message.inventory_revision.or(message.revision),
+            message
+                .base_layout_revision
+                .or(message.presented_layout_revision)
+                .or(message.layout_revision),
+            &message.waitable_panes,
             message.size,
         );
         let (panes, pane_backends, focus, fullscreen, lease, revision) = layout_actor_state();
@@ -273,6 +398,22 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
             return -2;
         }
         return pack_actor_outbox(output.as_ptr() as i32, len);
+    }
+
+    if message.message_type == "layout-pointer" {
+        let len = handle_layout_pointer(output, &message);
+        if len < 0 {
+            return -2;
+        }
+        return if len == 0 {
+            0
+        } else {
+            pack_actor_outbox(output.as_ptr() as i32, len)
+        };
+    }
+
+    if handle_synchronized_layout_notification(&message) {
+        return 0;
     }
 
     if message.message_type != "layout-action" {
@@ -560,6 +701,10 @@ enum Message<'a> {
     EditorAction(&'a str),
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the state publication and initial layout share one bounded outbox"
+)]
 fn write_layout_actor_outbox(
     output: &mut [u8],
     app_panes: &[AppPane],
@@ -664,12 +809,18 @@ fn write_layout_actor_update_outbox(
     writer.finish()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the host layout-state fields are copied into durable fixed storage together"
+)]
 fn store_layout_actor_state(
     panes: &[u64],
     pane_realms: &[PaneRealm],
     focus: Option<u64>,
     lease: Option<LayoutLeaseToken>,
     revision: Option<u64>,
+    base_layout_revision: Option<u64>,
+    waitable_panes: &[u64],
     size: LayoutStateSize,
 ) {
     let pane_count = panes.len().min(64);
@@ -701,23 +852,30 @@ fn store_layout_actor_state(
             LAYOUT_LEASE_ID = lease.id;
             LAYOUT_LEASE_GENERATION = lease.generation;
             LAYOUT_REVISION = revision;
+            LAYOUT_BASE_PRESENTED_REVISION = base_layout_revision.unwrap_or(revision);
             LAYOUT_HAS_LEASE = true;
         } else {
             LAYOUT_HAS_LEASE = false;
         }
         LAYOUT_VIEWPORT_WIDTH = size.w.max(1);
         LAYOUT_VIEWPORT_HEIGHT = size.h.max(1);
+        let waitable_target = ptr::addr_of_mut!(LAYOUT_WAITABLE_PANES).cast::<u64>();
+        let mut waitable_count = 0;
+        for pane in waitable_panes {
+            if waitable_count >= MAX_PANES
+                || !panes[..pane_count].contains(pane)
+                || slice::from_raw_parts(waitable_target, waitable_count).contains(pane)
+            {
+                continue;
+            }
+            waitable_target.add(waitable_count).write(*pane);
+            waitable_count += 1;
+        }
+        LAYOUT_WAITABLE_PANE_COUNT = waitable_count;
     }
 }
 
-fn layout_actor_state() -> (
-    &'static [u64],
-    &'static [u64],
-    Option<u64>,
-    bool,
-    Option<LayoutLeaseToken>,
-    Option<u64>,
-) {
+fn layout_actor_state() -> LayoutActorState {
     unsafe {
         let pane_count = LAYOUT_PANE_COUNT.min(64);
         let panes = slice::from_raw_parts(ptr::addr_of!(LAYOUT_PANES).cast::<u64>(), pane_count);
@@ -740,6 +898,361 @@ fn layout_actor_state() -> (
             revision,
         )
     }
+}
+
+fn layout_waitable_panes() -> &'static [u64] {
+    unsafe {
+        slice::from_raw_parts(
+            ptr::addr_of!(LAYOUT_WAITABLE_PANES).cast::<u64>(),
+            LAYOUT_WAITABLE_PANE_COUNT.min(MAX_PANES),
+        )
+    }
+}
+
+fn primary_split_is_available(panes: &[u64]) -> bool {
+    panes.len() == 2
+        && panes
+            .iter()
+            .all(|pane| layout_waitable_panes().contains(pane))
+}
+
+fn primary_split_ratio() -> f32 {
+    unsafe { PRIMARY_SPLIT_RATIO.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO) }
+}
+
+fn durable_primary_split_ratio() -> f32 {
+    unsafe { DURABLE_PRIMARY_SPLIT_RATIO.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO) }
+}
+
+fn remember_resize_proposal(request_id: u64, ratio: f32) {
+    if request_id == 0 {
+        return;
+    }
+    unsafe {
+        let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        let ratios = ptr::addr_of_mut!(PENDING_RESIZE_RATIOS).cast::<f32>();
+        let mut empty = None;
+        let mut oldest = (0, u64::MAX);
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            let candidate = ids.add(index).read();
+            if candidate == request_id {
+                ratios.add(index).write(ratio);
+                return;
+            }
+            if candidate == 0 && empty.is_none() {
+                empty = Some(index);
+            } else if candidate != 0 && candidate < oldest.1 {
+                oldest = (index, candidate);
+            }
+        }
+        let slot = empty.unwrap_or(oldest.0);
+        ids.add(slot).write(request_id);
+        ratios.add(slot).write(ratio);
+    }
+}
+
+fn resize_proposal_ratio(request_id: u64) -> Option<f32> {
+    unsafe {
+        let ids = ptr::addr_of!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        let ratios = ptr::addr_of!(PENDING_RESIZE_RATIOS).cast::<f32>();
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            if ids.add(index).read() == request_id {
+                return Some(
+                    ratios
+                        .add(index)
+                        .read()
+                        .clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO),
+                );
+            }
+        }
+    }
+    None
+}
+
+fn remove_resize_proposal(request_id: u64) {
+    unsafe {
+        let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            if ids.add(index).read() == request_id {
+                ids.add(index).write(0);
+                return;
+            }
+        }
+    }
+}
+
+fn remove_resize_proposals_through(request_id: u64) {
+    unsafe {
+        let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            let candidate = ids.add(index).read();
+            if candidate != 0 && candidate <= request_id {
+                ids.add(index).write(0);
+            }
+        }
+    }
+}
+
+fn latest_resize_proposal_ratio() -> Option<f32> {
+    unsafe {
+        let ids = ptr::addr_of!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        let ratios = ptr::addr_of!(PENDING_RESIZE_RATIOS).cast::<f32>();
+        let mut latest = None;
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            let request_id = ids.add(index).read();
+            if request_id != 0 && latest.is_none_or(|(latest_id, _)| request_id > latest_id) {
+                latest = Some((request_id, ratios.add(index).read()));
+            }
+        }
+        latest.map(|(_, ratio)| ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO))
+    }
+}
+
+fn restore_requested_split_ratio() {
+    let ratio = latest_resize_proposal_ratio().unwrap_or_else(durable_primary_split_ratio);
+    unsafe {
+        PRIMARY_SPLIT_RATIO = ratio;
+    }
+}
+
+fn commit_resize_proposal(request_id: u64) {
+    if let Some(ratio) = resize_proposal_ratio(request_id) {
+        unsafe {
+            DURABLE_PRIMARY_SPLIT_RATIO = ratio;
+        }
+    }
+    remove_resize_proposals_through(request_id);
+    restore_requested_split_ratio();
+}
+
+fn reject_resize_proposal(request_id: u64) {
+    remove_resize_proposal(request_id);
+    restore_requested_split_ratio();
+}
+
+fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
+    match message.message_type.as_str() {
+        "accepted" => true,
+        "completed" | "degraded" => {
+            if let Some(request_id) = message.request_id {
+                commit_resize_proposal(request_id);
+            }
+            true
+        }
+        "rejected" | "superseded" => {
+            if let Some(request_id) = message.request_id {
+                reject_resize_proposal(request_id);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn reset_resize_proposal_state(ratio: f32) {
+    let ratio = ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO);
+    unsafe {
+        PRIMARY_SPLIT_RATIO = ratio;
+        DURABLE_PRIMARY_SPLIT_RATIO = ratio;
+        let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        let ratios = ptr::addr_of_mut!(PENDING_RESIZE_RATIOS).cast::<f32>();
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            ids.add(index).write(0);
+            ratios.add(index).write(0.0);
+        }
+    }
+}
+
+fn primary_divider_transforms(ratio: f32) -> (LayoutTransform, LayoutTransform) {
+    let width = unsafe { LAYOUT_VIEWPORT_WIDTH.max(1) } as f32;
+    let center = ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO) * 2.0 - 1.0;
+    let zone_width = (16.0 / width).clamp(0.005, 0.05);
+    let divider_width = (2.0 / width).clamp(0.001, 0.02);
+    (
+        LayoutTransform {
+            offset_u: center - zone_width * 0.5,
+            offset_v: -1.0,
+            size_u: zone_width,
+            size_v: 2.0,
+        },
+        LayoutTransform {
+            offset_u: center - divider_width * 0.5,
+            offset_v: -1.0,
+            size_u: divider_width,
+            size_v: 2.0,
+        },
+    )
+}
+
+fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
+    if message.zone != Some(DIVIDER_ZONE_ID) {
+        return 0;
+    }
+    let Some(interaction) = message.interaction.filter(|interaction| *interaction != 0) else {
+        return 0;
+    };
+    let Some(event_sequence) = message.event_sequence.filter(|sequence| *sequence != 0) else {
+        return 0;
+    };
+    let Some(phase) = message.phase.as_deref() else {
+        return 0;
+    };
+    let Some(position) = message
+        .position
+        .filter(|position| position.u.is_finite() && position.v.is_finite())
+    else {
+        return 0;
+    };
+    let (panes, pane_backends, focus, fullscreen, lease, _) = layout_actor_state();
+    let Some(lease) = lease.filter(|lease| Some(*lease) == message.lease) else {
+        return 0;
+    };
+    if fullscreen || !primary_split_is_available(panes) {
+        return 0;
+    }
+
+    unsafe {
+        if let Some(inventory_revision) = message.inventory_revision {
+            LAYOUT_REVISION = inventory_revision;
+        }
+        if let Some(base_layout_revision) = message
+            .base_layout_revision
+            .or(message.presented_layout_revision)
+            .or(message.layout_revision)
+        {
+            LAYOUT_BASE_PRESENTED_REVISION = base_layout_revision;
+        }
+    }
+
+    if phase == "button-press" && message.button == Some(PRIMARY_BUTTON) {
+        unsafe {
+            ACTIVE_POINTER_INTERACTION = interaction;
+            HAS_ACTIVE_POINTER_INTERACTION = true;
+            LAST_POINTER_EVENT_SEQUENCE = event_sequence;
+            POINTER_SPLIT_OFFSET = primary_split_ratio() * 2.0 - 1.0 - position.u as f32;
+        }
+        return 0;
+    }
+
+    let active = unsafe {
+        HAS_ACTIVE_POINTER_INTERACTION
+            && ACTIVE_POINTER_INTERACTION == interaction
+            && event_sequence > LAST_POINTER_EVENT_SEQUENCE
+    };
+    if !active {
+        return 0;
+    }
+    if phase == "cancel" {
+        clear_pointer_interaction();
+        return 0;
+    }
+    if phase != "motion" && !(phase == "button-release" && message.button == Some(PRIMARY_BUTTON)) {
+        return 0;
+    }
+
+    unsafe {
+        let center = position.u as f32 + POINTER_SPLIT_OFFSET;
+        PRIMARY_SPLIT_RATIO =
+            ((center + 1.0) * 0.5).clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO);
+        LAST_POINTER_EVENT_SEQUENCE = event_sequence;
+    }
+    let request_id = next_layout_request_id();
+    let len = write_synchronized_layout_outbox(
+        output,
+        panes,
+        pane_backends,
+        focus,
+        lease,
+        interaction,
+        event_sequence,
+        request_id,
+    );
+    if len > 0 {
+        remember_resize_proposal(request_id, primary_split_ratio());
+    } else {
+        restore_requested_split_ratio();
+    }
+    if phase == "button-release" {
+        clear_pointer_interaction();
+    }
+    len
+}
+
+fn next_layout_request_id() -> u64 {
+    unsafe {
+        let request_id = NEXT_LAYOUT_REQUEST_ID.max(1);
+        NEXT_LAYOUT_REQUEST_ID = request_id.saturating_add(1).max(1);
+        request_id
+    }
+}
+
+fn clear_pointer_interaction() {
+    unsafe {
+        HAS_ACTIVE_POINTER_INTERACTION = false;
+        ACTIVE_POINTER_INTERACTION = 0;
+        LAST_POINTER_EVENT_SEQUENCE = 0;
+        POINTER_SPLIT_OFFSET = 0.0;
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the synchronized request identity and complete layout snapshot are emitted together"
+)]
+fn write_synchronized_layout_outbox(
+    output: &mut [u8],
+    panes: &[u64],
+    pane_backends: &[u64],
+    focus: Option<u64>,
+    lease: LayoutLeaseToken,
+    interaction: u64,
+    event_sequence: u64,
+    request_id: u64,
+) -> i32 {
+    let (inventory_revision, base_layout_revision) =
+        unsafe { (LAYOUT_REVISION, LAYOUT_BASE_PRESENTED_REVISION) };
+    let mut writer = Writer::new(output);
+    writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    let mut payload = PayloadWriter::new(&mut writer);
+    payload.bytes(br#"{"type":"submit-synchronized-layout","request_id":"#);
+    payload.u64(request_id);
+    payload.bytes(br#", "interaction":"#);
+    payload.u64(interaction);
+    payload.bytes(br#", "event_sequence":"#);
+    payload.u64(event_sequence);
+    payload.bytes(br#", "lease":{"id":"#);
+    payload.u64(lease.id);
+    payload.bytes(br#", "generation":"#);
+    payload.u64(lease.generation);
+    payload.bytes(br#"},"inventory_revision":"#);
+    payload.u64(inventory_revision);
+    payload.bytes(br#", "base_layout_revision":"#);
+    payload.u64(base_layout_revision);
+    payload.bytes(br#", "fragment":{"layout":"#);
+    write_resolved_layout_payload(
+        &mut payload,
+        panes,
+        pane_backends,
+        focus,
+        false,
+        primary_split_ratio(),
+    );
+    payload.bytes(br#"},"wait_for_panes":["#);
+    let mut first = true;
+    for pane in panes {
+        if !layout_waitable_panes().contains(pane) {
+            continue;
+        }
+        if !first {
+            payload.byte(b',');
+        }
+        first = false;
+        payload.u64(*pane);
+    }
+    payload.bytes(br#"],"presentation":"scale-then-atomic"}"#);
+    writer.bytes(br#"]}]}"#);
+    writer.finish()
 }
 
 fn apply_layout_actor_action(action: &str) {
@@ -815,13 +1328,52 @@ fn write_set_resolved_layout_payload(
         payload.bytes(br#"},"revision":"#);
         payload.u64(revision);
     }
-    payload.bytes(br#","layout":{"items":["#);
+    payload.bytes(br#","layout":"#);
+    write_resolved_layout_payload(
+        payload,
+        panes,
+        pane_backends,
+        focus,
+        fullscreen,
+        durable_primary_split_ratio(),
+    );
+    payload.bytes(br#", "focus":"#);
+    if let Some(focus) = focus {
+        payload.u64(focus);
+    } else {
+        payload.bytes(b"null");
+    }
+    payload.byte(b'}');
+}
+
+fn write_resolved_layout_payload(
+    payload: &mut PayloadWriter<'_, '_>,
+    panes: &[u64],
+    pane_backends: &[u64],
+    focus: Option<u64>,
+    fullscreen: bool,
+    split_ratio: f32,
+) {
+    payload.bytes(br#"{"items":["#);
     let pane_count = panes.len();
     if fullscreen && pane_count > 0 {
         let pane = focus
             .filter(|focus| panes.contains(focus))
             .unwrap_or(panes[0]);
         write_pane_item_payload(payload, pane, 0.0, -1.0, -1.0, 2.0, 2.0);
+    } else if primary_split_is_available(panes) {
+        let ratio = split_ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO);
+        write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, ratio * 2.0, 2.0);
+        payload.byte(b',');
+        write_pane_item_payload(
+            payload,
+            panes[1],
+            1.0,
+            ratio * 2.0 - 1.0,
+            -1.0,
+            (1.0 - ratio) * 2.0,
+            2.0,
+        );
     } else {
         let (viewport_width, viewport_height) =
             unsafe { (LAYOUT_VIEWPORT_WIDTH, LAYOUT_VIEWPORT_HEIGHT) };
@@ -844,11 +1396,14 @@ fn write_set_resolved_layout_payload(
             index += 1;
         }
     }
-    payload.bytes(br#"]},"focus":"#);
-    if let Some(focus) = focus {
-        payload.u64(focus);
-    } else {
-        payload.bytes(b"null");
+    payload.byte(b']');
+    if !fullscreen && primary_split_is_available(panes) {
+        let (zone_transform, divider_transform) = primary_divider_transforms(split_ratio);
+        payload.bytes(br#", "zones":["#);
+        write_interaction_zone_payload(payload, zone_transform);
+        payload.bytes(br#"],"dividers":["#);
+        write_divider_payload(payload, divider_transform);
+        payload.byte(b']');
     }
     payload.byte(b'}');
 }
@@ -871,8 +1426,72 @@ fn write_pane_item_payload(
     }
 }
 
+fn write_interaction_zone_payload(payload: &mut PayloadWriter<'_, '_>, transform: LayoutTransform) {
+    let mut item = [0_u8; 512];
+    let mut writer = Writer::new(&mut item);
+    writer.bytes(br#"{"id":"#);
+    writer.u64(DIVIDER_ZONE_ID);
+    writer.bytes(br#", "transform":{"offset":{"u":"#);
+    writer.f32(transform.offset_u);
+    writer.bytes(br#", "v":"#);
+    writer.f32(transform.offset_v);
+    writer.bytes(br#"},"size":{"u":"#);
+    writer.f32(transform.size_u);
+    writer.bytes(br#", "v":"#);
+    writer.f32(transform.size_v);
+    writer.bytes(br#"}},"z":1000,"event_mask":"#);
+    writer.u64(u64::from(DIVIDER_EVENT_MASK));
+    writer.bytes(br#", "cursor":"col-resize","input":"drag"}"#);
+    let len = writer.finish();
+    if len > 0 {
+        payload.bytes(&item[..len as usize]);
+    }
+}
+
+fn write_divider_payload(payload: &mut PayloadWriter<'_, '_>, transform: LayoutTransform) {
+    let mut item = [0_u8; 512];
+    let mut writer = Writer::new(&mut item);
+    writer.bytes(br#"{"id":"#);
+    writer.u64(DIVIDER_ITEM_ID);
+    writer.bytes(br#", "zone":"#);
+    writer.u64(DIVIDER_ZONE_ID);
+    writer.bytes(br#", "z":1001,"transform":{"offset":{"u":"#);
+    writer.f32(transform.offset_u);
+    writer.bytes(br#", "v":"#);
+    writer.f32(transform.offset_v);
+    writer.bytes(br#"},"size":{"u":"#);
+    writer.f32(transform.size_u);
+    writer.bytes(br#", "v":"#);
+    writer.f32(transform.size_v);
+    writer.bytes(br#"}},"axis":"vertical","role":"split"}"#);
+    let len = writer.finish();
+    if len > 0 {
+        payload.bytes(&item[..len as usize]);
+    }
+}
+
 fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
     finish_response(write_consume_payload(output, messages))
+}
+
+fn write_pointer_policy_result(output: &mut [u8], capture: &str) -> i32 {
+    const PROVIDER_PAYLOAD: &[u8] = br#"{"kind":"divider"}"#;
+
+    let mut writer = Writer::new(output);
+    writer.bytes(br#"{"delivery":"consume","capture":"#);
+    writer.byte(b'"');
+    writer.bytes(capture.as_bytes());
+    writer.bytes(br#"","messages":[{"actor":"workspace","payload":["#);
+    let mut index = 0;
+    while index < PROVIDER_PAYLOAD.len() {
+        if index > 0 {
+            writer.byte(b',');
+        }
+        writer.u64(u64::from(PROVIDER_PAYLOAD[index]));
+        index += 1;
+    }
+    writer.bytes(br#"]}]}"#);
+    writer.finish()
 }
 
 fn write_keybindings_show(output: &mut [u8], bindings: &[BindingOverride]) -> i32 {
@@ -1250,6 +1869,232 @@ fn pack_actor_outbox(ptr: i32, len: i32) -> i64 {
         return -2;
     }
     ((ptr as i64) << 32) | (len as u32 as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{format, string::ToString, vec::Vec};
+
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn host_payload(output: &[u8], len: i32) -> Value {
+        assert!(len > 0);
+        let envelope: Value = serde_json::from_slice(&output[..len as usize]).unwrap();
+        let encoded = envelope["messages"][0]["payload"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|byte| byte.as_u64().unwrap() as u8)
+            .collect::<Vec<_>>();
+        serde_json::from_slice(&encoded).unwrap()
+    }
+
+    fn pointer_message(
+        phase: &str,
+        position: f64,
+        sequence: u64,
+        button: Option<u32>,
+    ) -> WorkspaceMessage {
+        let button = button.map_or_else(|| "null".into(), |button| button.to_string());
+        let json = format!(
+            "{{\"type\":\"layout-pointer\",\"interaction\":99,\"event_sequence\":{sequence},\"lease\":{{\"id\":5,\"generation\":2}},\"zone\":{DIVIDER_ZONE_ID},\"phase\":\"{phase}\",\"position\":{{\"u\":{position},\"v\":0.0}},\"button\":{button},\"modifiers\":0,\"inventory_revision\":7,\"base_layout_revision\":3}}"
+        );
+        decode_json(json.as_bytes()).unwrap()
+    }
+
+    fn synchronized_notification(kind: &str, request_id: u64) -> WorkspaceMessage {
+        decode_json(format!(r#"{{"type":"{kind}","request_id":{request_id}}}"#).as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn divider_policy_and_actor_preserve_one_synchronized_drag() {
+        let layout_state: WorkspaceMessage = decode_json(
+            br#"{"type":"layout-state","revision":7,"inventory_revision":7,"layout_revision":3,"presented_layout_revision":3,"lease":{"id":5,"generation":2},"waitable_panes":[11,22],"visible_panes":[11,22],"size":{"w":1280,"h":720}}"#,
+        )
+        .unwrap();
+        assert_eq!(layout_state.inventory_revision, Some(7));
+        assert_eq!(layout_state.presented_layout_revision, Some(3));
+        assert_eq!(layout_state.layout_revision, Some(3));
+        assert_eq!(layout_state.waitable_panes.as_slice(), &[11, 22]);
+
+        let press: PointerPolicyQuery = decode_json(
+            format!(
+                "{{\"zone\":{DIVIDER_ZONE_ID},\"phase\":\"button-press\",\"button\":{PRIMARY_BUTTON},\"captured\":false}}"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(pointer_capture_decision(&press), Some("acquire"));
+        let motion: PointerPolicyQuery = decode_json(
+            format!(
+                "{{\"zone\":{DIVIDER_ZONE_ID},\"phase\":\"motion\",\"button\":null,\"captured\":true}}"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(pointer_capture_decision(&motion), Some("unchanged"));
+        let mut policy_output = [0_u8; 512];
+        let policy_len = write_pointer_policy_result(&mut policy_output, "unchanged");
+        let policy: Value = serde_json::from_slice(&policy_output[..policy_len as usize]).unwrap();
+        assert_eq!(policy["delivery"], "consume");
+        assert_eq!(policy["capture"], "unchanged");
+        assert_eq!(policy["messages"][0]["actor"], "workspace");
+        let other_zone: PointerPolicyQuery =
+            decode_json(br#"{"zone":7,"phase":"motion","button":null,"captured":true}"#).unwrap();
+        assert_eq!(pointer_capture_decision(&other_zone), None);
+
+        clear_pointer_interaction();
+        reset_resize_proposal_state(0.5);
+        unsafe {
+            NEXT_LAYOUT_REQUEST_ID = 1;
+        }
+        let panes = [11, 22];
+        let realms = [
+            PaneRealm {
+                pane: 11,
+                backend: 1,
+            },
+            PaneRealm {
+                pane: 22,
+                backend: 1,
+            },
+        ];
+        store_layout_actor_state(
+            &panes,
+            &realms,
+            Some(11),
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+            Some(3),
+            &panes,
+            LayoutStateSize { w: 1280, h: 720 },
+        );
+
+        let mut output = [0_u8; OUTBOX_BYTES];
+        assert_eq!(
+            handle_layout_pointer(
+                &mut output,
+                &pointer_message("button-press", 0.0, 1, Some(PRIMARY_BUTTON)),
+            ),
+            0
+        );
+        let motion_len =
+            handle_layout_pointer(&mut output, &pointer_message("motion", 0.4, 2, None));
+        let motion = host_payload(&output, motion_len);
+        assert_eq!(motion["type"], "submit-synchronized-layout");
+        assert_eq!(motion["request_id"], 1);
+        assert_eq!(motion["interaction"], 99);
+        assert_eq!(motion["event_sequence"], 2);
+        assert_eq!(motion["inventory_revision"], 7);
+        assert_eq!(motion["base_layout_revision"], 3);
+        assert_eq!(motion["wait_for_panes"], json!([11, 22]));
+        assert_eq!(motion["presentation"], "scale-then-atomic");
+        assert_eq!(
+            motion["fragment"]["layout"]["zones"][0]["id"],
+            DIVIDER_ZONE_ID
+        );
+        assert_eq!(
+            motion["fragment"]["layout"]["dividers"][0]["zone"],
+            DIVIDER_ZONE_ID
+        );
+        let zone_width = motion["fragment"]["layout"]["zones"][0]["transform"]["size"]["u"]
+            .as_f64()
+            .unwrap();
+        let zone_physical_width = zone_width * 1280.0 * 0.5;
+        assert!((7.5..=9.0).contains(&zone_physical_width));
+        let motion_primary_width =
+            motion["fragment"]["layout"]["items"][0]["transform"]["size"]["u"]
+                .as_f64()
+                .unwrap();
+        assert!((motion_primary_width - 1.4).abs() < 0.01);
+
+        let release_len = handle_layout_pointer(
+            &mut output,
+            &pointer_message("button-release", 0.5, 3, Some(PRIMARY_BUTTON)),
+        );
+        let release = host_payload(&output, release_len);
+        assert_eq!(release["request_id"], 2);
+        assert_eq!(release["event_sequence"], 3);
+        assert_eq!(
+            release["fragment"]["layout"]["items"][0]["transform"]["size"]["u"],
+            1.5
+        );
+        assert!(!unsafe { HAS_ACTIVE_POINTER_INTERACTION });
+
+        // Ordinary actor updates cannot publish the proposed geometry before
+        // the host confirms that the synchronized request was presented.
+        let len = write_layout_actor_update_outbox(
+            &mut output,
+            &panes,
+            &[1, 1],
+            Some(11),
+            false,
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+        );
+        let before_completion = host_payload(&output, len);
+        assert_eq!(
+            before_completion["layout"]["items"][0]["transform"]["size"]["u"],
+            1.0
+        );
+
+        assert!(handle_synchronized_layout_notification(
+            &synchronized_notification("superseded", 1)
+        ));
+        assert!(handle_synchronized_layout_notification(
+            &synchronized_notification("completed", 2)
+        ));
+        let len = write_layout_actor_update_outbox(
+            &mut output,
+            &panes,
+            &[1, 1],
+            Some(11),
+            false,
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+        );
+        let durable = host_payload(&output, len);
+        assert_eq!(durable["layout"]["items"][0]["transform"]["size"]["u"], 1.5);
+        assert_eq!(durable["layout"]["zones"][0]["event_mask"], 15);
+
+        unsafe {
+            PRIMARY_SPLIT_RATIO = 0.8;
+        }
+        remember_resize_proposal(3, 0.8);
+        assert!(handle_synchronized_layout_notification(
+            &synchronized_notification("rejected", 3)
+        ));
+        assert!((primary_split_ratio() - 0.75).abs() < f32::EPSILON);
+        assert!((durable_primary_split_ratio() - 0.75).abs() < f32::EPSILON);
+
+        // A completion for an older request advances durable state without
+        // snapping an already-proposed newer pointer sample backwards.
+        reset_resize_proposal_state(0.5);
+        remember_resize_proposal(10, 0.6);
+        remember_resize_proposal(11, 0.7);
+        unsafe {
+            PRIMARY_SPLIT_RATIO = 0.7;
+        }
+        assert!(handle_synchronized_layout_notification(
+            &synchronized_notification("completed", 10)
+        ));
+        assert!((durable_primary_split_ratio() - 0.6).abs() < f32::EPSILON);
+        assert!((primary_split_ratio() - 0.7).abs() < f32::EPSILON);
+        assert!(handle_synchronized_layout_notification(
+            &synchronized_notification("rejected", 11)
+        ));
+        assert!((primary_split_ratio() - 0.6).abs() < f32::EPSILON);
+    }
 }
 
 #[panic_handler]

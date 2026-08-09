@@ -8,7 +8,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::sleep,
     text::{truncate, truncate_to_width},
@@ -622,7 +622,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.hovered = None;
             state.pressed = None;
             ensure_active_selection_visible(&mut state);
-            redraw_or_record_error(&mut state);
+            redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
             Vec::new()
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
@@ -978,16 +978,20 @@ fn layout_visibility(pane: u64, visible: bool) -> ActorCommand {
 }
 
 fn redraw_or_record_error(state: &mut PickerState) {
+    redraw_for_resize_or_record_error(state, None);
+}
+
+fn redraw_for_resize_or_record_error(state: &mut PickerState, resize_epoch: Option<u64>) {
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state) {
+    if let Err(error) = redraw(state, resize_epoch) {
         state.status = error;
         state.error = true;
     }
 }
 
-fn redraw(state: &mut PickerState) -> Result<(), String> {
+fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), String> {
     let mut packet = Packet::new();
     let mut resources = Vec::new();
     packet.push(Command::FillRoundedRect {
@@ -1228,7 +1232,10 @@ fn redraw(state: &mut PickerState) -> Result<(), String> {
         width: 1.0,
     });
 
-    submit_packet(state.pane, &packet)?;
+    resize_epoch.map_or_else(
+        || submit_packet(state.pane, &packet),
+        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
+    )?;
     drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())

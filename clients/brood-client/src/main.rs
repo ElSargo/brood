@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Cursor},
     mem::size_of,
     net::ToSocketAddrs,
@@ -35,8 +35,9 @@ use brood_cli::{
 };
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use brood_layout::{
+    ComposedDivider, ComposedInteractionZone, ComposedLayout, ComposedZoneId, CursorRole,
     LayoutAction, LayoutItemKind, LayoutLeaseId, LayoutLeaseTree, LayoutRect, LayoutSize,
-    LocalPoint, ResolvedLayout,
+    LocalPoint, PointerEventMask, ResolvedLayout, ZoneHitResult,
 };
 use brood_protocol::{
     ArtifactManifest, ArtifactRealm, BackendActorRealm, BackendId, ClientLifecycle, ClientMessage,
@@ -57,7 +58,7 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
     platform::scancode::PhysicalKeyExtScancode,
-    window::{UserAttentionType, Window, WindowId},
+    window::{CursorIcon, UserAttentionType, Window, WindowId},
 };
 
 mod actor_runtime;
@@ -67,13 +68,14 @@ mod key_policy;
 mod layout;
 mod plugin_gpu;
 mod plugin_graphics;
+mod pointer_policy;
 mod remote;
 
 #[cfg(test)]
 #[path = "../../../plugins/default-workspace/src/backend_layout.rs"]
 mod default_workspace_backend_layout;
 
-use actor_runtime::{ActorIdentity, PresentationWasmRuntime};
+use actor_runtime::{ActorIdentity, HostActorMessage, PresentationWasmRuntime};
 use backend_registry::{BackendRegistry, QualifiedPane};
 use brood_wasm::{
     GlobalKeyDecision, HostMessage, PresentationEvent, SessionCommandCompletion,
@@ -84,13 +86,18 @@ use brood_wayland_drop::{DropBridge as WaylandDropBridge, DropEvent as WaylandDr
 use clipboard::{ClipboardBridge, ClipboardContent};
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
 use layout::{
-    LayoutSource, convert_actor_layout_fragment, convert_actor_layout_lease, native_flat_layout,
+    LayoutSource, convert_actor_layout_fragment, convert_actor_layout_lease, native_flat_dividers,
+    native_flat_interaction_zones, native_flat_layout,
 };
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
+use pointer_policy::ClientPointerPolicy;
 
 pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
+const SYNCHRONIZED_RESIZE_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS: usize = 64;
+const MAX_DEFERRED_ACTOR_HOST_MESSAGES: usize = 128;
 const DEFAULT_WINDOW_WIDTH: f64 = 1440.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 900.0;
 const MAX_AGENT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -519,6 +526,7 @@ fn main() -> Result<()> {
         eprintln!("presentation WASM key policy check passed");
         return Ok(());
     }
+    let pointer_policy = ClientPointerPolicy::load(key_policy_spec)?;
     let event_loop = EventLoop::<ClientEvent>::with_user_event()
         .build()
         .context("create event loop")?;
@@ -892,6 +900,7 @@ fn main() -> Result<()> {
     let mut application = Application {
         wasm_runtime: Some(wasm_runtime),
         key_policy: Some(key_policy),
+        pointer_policy: Some(pointer_policy),
         plugin_graphics: Some(plugin_graphics),
         clipboard,
         input_sender,
@@ -1058,7 +1067,13 @@ enum ClientEvent {
     PluginGraphicsChanged {
         pane: u64,
         sequence: u64,
+        resize_epoch: Option<u64>,
         terminal_input_sequence: Option<u64>,
+        ready_at: Instant,
+    },
+    PluginContentReused {
+        pane: u64,
+        resize_epoch: u64,
         ready_at: Instant,
     },
     RendererFailed {
@@ -2561,6 +2576,187 @@ struct WindowResizeTransaction {
     latest_size: (u32, u32),
 }
 
+#[derive(Debug)]
+struct PolicyPointerCapture {
+    interaction: brood_wasm::InteractionId,
+    zone: ComposedZoneId,
+    buttons: BTreeSet<u32>,
+    event_sequence: u64,
+    local_position: LocalPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PointerPolicyRoute {
+    Consumed,
+    Forward {
+        position: Option<(f64, f64)>,
+        modifiers: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EffectivePointerPolicyEvent {
+    local_position: LocalPoint,
+    modifiers: u32,
+    route: PointerPolicyRoute,
+}
+
+struct ActiveSynchronizedResize {
+    request_id: u64,
+    interaction: Option<brood_wasm::InteractionId>,
+    event_sequence: u64,
+    chain_base_layout_revision: u64,
+    epoch: brood_wasm::ResizeEpoch,
+    requester: ActorIdentity,
+    target_tree: LayoutLeaseTree,
+    focus: Option<u64>,
+    wait_panes: BTreeSet<u64>,
+    ready_panes: BTreeSet<u64>,
+    affected_panes: BTreeSet<u64>,
+    started: Instant,
+    deadline: Instant,
+    presentation: SynchronizedResizePresentation,
+}
+
+type DeferredPluginScene = (u64, u64, Option<u64>);
+
+#[derive(Clone)]
+enum SynchronizedResizePresentation {
+    Waiting,
+    Ready {
+        degraded: bool,
+        missing_panes: Vec<u64>,
+    },
+    Promoted {
+        degraded: bool,
+        missing_panes: Vec<u64>,
+    },
+}
+
+struct SynchronizedResizeLineage {
+    interaction: brood_wasm::InteractionId,
+    requester: ActorIdentity,
+    lease: LayoutLeaseId,
+    lease_generation: u64,
+    inventory_revision: u64,
+    origin_layout_revision: u64,
+    last_event_sequence: u64,
+}
+
+struct PendingSynchronizedLayoutNotification {
+    actor: ActorIdentity,
+    request_id: u64,
+    notification: brood_wasm::SynchronizedLayoutNotification,
+    attempts: u32,
+}
+
+impl SynchronizedResizeLineage {
+    fn matches(
+        &self,
+        interaction: Option<brood_wasm::InteractionId>,
+        requester: &ActorIdentity,
+        lease: brood_layout::LayoutLeaseToken,
+        inventory_revision: u64,
+    ) -> bool {
+        interaction == Some(self.interaction)
+            && requester == &self.requester
+            && lease.id == self.lease
+            && lease.generation == self.lease_generation
+            && inventory_revision == self.inventory_revision
+    }
+}
+
+fn synchronized_base_is_applicable(
+    requested: u64,
+    current: u64,
+    interaction_chain_base: Option<u64>,
+) -> bool {
+    interaction_chain_base.map_or(requested == current, |chain_base| {
+        (chain_base..=current).contains(&requested)
+    })
+}
+
+fn synchronized_resize_inventory_matches(
+    active: &ActiveSynchronizedResize,
+    current_inventory: &[u64],
+) -> bool {
+    active
+        .target_tree
+        .waitable_panes(active.target_tree.root_token())
+        .is_some_and(|target_inventory| target_inventory == current_inventory)
+}
+
+fn synchronized_event_sequence_advances(requested: u64, previous: Option<u64>) -> bool {
+    previous.is_none_or(|previous| requested > previous)
+}
+
+fn deferred_actor_sender_is_current(
+    sender: Option<&ActorIdentity>,
+    current: Option<&ActorIdentity>,
+    mailbox_closed: bool,
+) -> bool {
+    sender.is_none_or(|sender| !mailbox_closed && current == Some(sender))
+}
+
+const fn next_presented_layout_revision(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
+const fn zone_has_actor_policy_authority(zone: ComposedZoneId) -> bool {
+    zone.lease_generation != 0
+}
+
+const fn ordinary_layout_message_conflicts_with_synchronized_resize(message: &HostMessage) -> bool {
+    matches!(message, HostMessage::SetResolvedLayout { .. })
+}
+
+const fn synchronized_layout_notification_request_id(
+    notification: &brood_wasm::SynchronizedLayoutNotification,
+) -> u64 {
+    match notification {
+        brood_wasm::SynchronizedLayoutNotification::Accepted(notification) => {
+            notification.request_id
+        }
+        brood_wasm::SynchronizedLayoutNotification::Completed(notification) => {
+            notification.request_id
+        }
+        brood_wasm::SynchronizedLayoutNotification::Rejected(notification) => {
+            notification.request_id
+        }
+        brood_wasm::SynchronizedLayoutNotification::Superseded(notification) => {
+            notification.request_id
+        }
+        brood_wasm::SynchronizedLayoutNotification::Degraded(notification) => {
+            notification.request_id
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResizePresentationTrace {
+    interaction: u64,
+    event_sequence: u64,
+    epoch: u64,
+    phase: &'static str,
+    wait_ready: usize,
+    wait_total: usize,
+    degraded: bool,
+}
+
+impl Default for ResizePresentationTrace {
+    fn default() -> Self {
+        Self {
+            interaction: 0,
+            event_sequence: 0,
+            epoch: 0,
+            phase: "settled",
+            wait_ready: 0,
+            wait_total: 0,
+            degraded: false,
+        }
+    }
+}
+
 fn drop_frontend_wayland_state<DropBridge, Frontend, Clipboard>(
     wayland_drop: &mut Option<DropBridge>,
     renderer: &mut Option<Frontend>,
@@ -2624,8 +2820,12 @@ struct Application {
     cursor_position: Option<(f64, f64)>,
     pointer_routing: PointerRoutingState,
     pointer_grab: Option<PointerGrab>,
+    policy_pointer_capture: Option<PolicyPointerCapture>,
+    next_pointer_interaction: u64,
+    pointer_event_sequence: u64,
     wasm_runtime: Option<PresentationWasmRuntime>,
     key_policy: Option<ClientKeyPolicy>,
+    pointer_policy: Option<ClientPointerPolicy>,
     plugin_graphics: Option<PluginGraphicsBridge>,
     clipboard: Option<ClipboardBridge>,
     wayland_drop: Option<WaylandDropBridge>,
@@ -2634,6 +2834,14 @@ struct Application {
     next_renderer_generation: u64,
     renderer_recoveries: u8,
     layout_revision: u64,
+    presented_layout_revision: u64,
+    pending_presented_layout_revision: Option<u64>,
+    next_resize_epoch: u64,
+    active_synchronized_resize: Option<ActiveSynchronizedResize>,
+    synchronized_resize_lineage: Option<SynchronizedResizeLineage>,
+    pending_synchronized_layout_notifications: VecDeque<PendingSynchronizedLayoutNotification>,
+    deferred_actor_host_messages: VecDeque<HostActorMessage>,
+    resize_presentation_trace: ResizePresentationTrace,
     layout_leases: LayoutLeaseTree,
     root_layout_actor: Option<ActorIdentity>,
     layout_holders: BTreeMap<LayoutLeaseId, ActorIdentity>,
@@ -3451,7 +3659,7 @@ impl Application {
                     "presentation close event reached scene transport path"
                 ));
             }
-            ClientEvent::PluginGraphicsChanged { .. } => {
+            ClientEvent::PluginGraphicsChanged { .. } | ClientEvent::PluginContentReused { .. } => {
                 return Err(anyhow!(
                     "plugin graphics event reached scene transport path"
                 ));
@@ -3563,13 +3771,92 @@ impl Application {
         if self.window_resize.is_some() {
             return Ok(());
         }
-        let Some(renderer) = self.renderer.as_mut() else {
+        let synchronized_inventory_changed = self
+            .active_synchronized_resize
+            .as_ref()
+            .zip(self.renderer.as_ref())
+            .is_some_and(|(active, renderer)| {
+                !synchronized_resize_inventory_matches(active, &renderer.pane_inventory())
+            });
+        if synchronized_inventory_changed
+            && let Some(change) = self.abort_synchronized_resize_for_inventory_change()?
+        {
+            dispatch_focus_change(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                change,
+                self.window_focused,
+            )?;
+        }
+        if synchronized_inventory_changed
+            && !self.pending_synchronized_layout_notifications.is_empty()
+        {
+            // Preserve actor mailbox order: the rejection belongs to the old
+            // inventory and must precede the replacement layout publication.
             return Ok(());
-        };
+        }
+        if self.active_synchronized_resize.is_some()
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.layout_state_dirty)
+            && let Some(change) = self.finish_synchronized_resize(true)?
+        {
+            dispatch_focus_change(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                change,
+                self.window_focused,
+            )?;
+            return Ok(());
+        }
+        if self.active_synchronized_resize.is_some()
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.layout_state_dirty)
+        {
+            return Ok(());
+        }
         let live_actors = self
             .wasm_runtime
             .as_ref()
             .map_or_else(Vec::new, PresentationWasmRuntime::actor_identities);
+        let failed_authority = self.layout_leases.lease_tokens().into_iter().any(|lease| {
+            self.layout_holders
+                .get(&lease.id)
+                .is_some_and(|holder| !live_actors.contains(holder))
+        });
+        let candidates = self
+            .wasm_runtime
+            .as_ref()
+            .map_or_else(Vec::new, PresentationWasmRuntime::layout_actor_identities);
+        let selected = self
+            .root_layout_actor
+            .as_ref()
+            .filter(|holder| {
+                self.wasm_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.actor_identity(&holder.name))
+                    .as_ref()
+                    == Some(holder)
+            })
+            .cloned()
+            .or_else(|| candidates.first().cloned());
+        if (failed_authority || selected != self.root_layout_actor)
+            && let Some(change) =
+                self.abort_layout_authority_state("layout authority changed before publication")?
+        {
+            dispatch_focus_change(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                change,
+                self.window_focused,
+            )?;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
         loop {
             let failed = self.layout_leases.lease_tokens().into_iter().find(|lease| {
                 self.layout_holders
@@ -3613,10 +3900,6 @@ impl Application {
             renderer.layout_state_dirty = true;
             break;
         }
-        let candidates = self
-            .wasm_runtime
-            .as_ref()
-            .map_or_else(Vec::new, PresentationWasmRuntime::layout_actor_identities);
         let selected = self
             .root_layout_actor
             .as_ref()
@@ -3662,6 +3945,15 @@ impl Application {
         }
 
         if renderer.layout_state_dirty {
+            if renderer.layout_source == LayoutSource::NativeFallback
+                && renderer.accepted_layout_differs_from_presented()
+                && self.pending_presented_layout_revision.is_none()
+            {
+                self.pending_presented_layout_revision = Some(
+                    next_presented_layout_revision(self.presented_layout_revision)
+                        .context("presented fallback layout revision limit exceeded")?,
+                );
+            }
             self.layout_revision = self
                 .layout_revision
                 .checked_add(1)
@@ -3680,6 +3972,7 @@ impl Application {
             );
             self.layout_leases
                 .update_inventory(self.layout_revision, &panes)?;
+            self.synchronized_resize_lineage = None;
             if !new_global_panes.is_empty() {
                 self.layout_leases
                     .assign_panes(self.layout_leases.root_token(), &new_global_panes)?;
@@ -3719,14 +4012,20 @@ impl Application {
                 .layout_leases
                 .owned_panes(lease)
                 .context("layout lease is unavailable during state publication")?;
+            let waitable_panes = self
+                .layout_leases
+                .waitable_panes(lease)
+                .context("layout lease wait set is unavailable during state publication")?;
             let focused_pane = renderer
                 .focused_pane_id()
                 .filter(|pane| self.layout_leases.subtree_contains(lease, *pane));
             let viewport = viewport.pixel_rect(renderer.layout_extent());
             let message = renderer.layout_state_message(
                 self.layout_revision,
+                self.presented_layout_revision,
                 lease,
                 &owned_panes,
+                &waitable_panes,
                 focused_pane,
                 LayoutSize {
                     w: viewport.w,
@@ -3769,12 +4068,1029 @@ impl Application {
         Ok(())
     }
 
-    fn apply_actor_host_messages(&mut self) -> Result<()> {
-        let messages = self
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "notifications are constructed for one mailbox delivery and ownership makes that boundary explicit"
+    )]
+    fn send_synchronized_layout_notification(
+        &self,
+        actor: &ActorIdentity,
+        notification: brood_wasm::SynchronizedLayoutNotification,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(&notification)
+            .context("encode synchronized-layout actor notification")?;
+        let runtime = self
             .wasm_runtime
+            .as_ref()
+            .context("layout actor runtime is unavailable")?;
+        anyhow::ensure!(
+            runtime.actor_identity(&actor.name).as_ref() == Some(actor),
+            "layout actor {:?} generation {} is no longer current",
+            actor.name,
+            actor.generation,
+        );
+        runtime.send_actor_message(&actor.name, "layout-host".to_string(), payload)
+    }
+
+    fn queue_synchronized_layout_terminal_notification(
+        &mut self,
+        actor: &ActorIdentity,
+        notification: brood_wasm::SynchronizedLayoutNotification,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !matches!(
+                notification,
+                brood_wasm::SynchronizedLayoutNotification::Accepted(_)
+            ),
+            "Accepted is not a terminal synchronized-layout notification"
+        );
+        let request_id = synchronized_layout_notification_request_id(&notification);
+        if self
+            .pending_synchronized_layout_notifications
+            .iter()
+            .any(|pending| pending.actor == *actor && pending.request_id == request_id)
+        {
+            eprintln!(
+                "coalesced duplicate synchronized layout terminal actor={} actor_generation={} request={request_id}",
+                actor.name, actor.generation
+            );
+            return Ok(());
+        }
+        if self.pending_synchronized_layout_notifications.len()
+            >= MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS
+        {
+            // Actor ingress stops as soon as one terminal backpressures, so
+            // reaching this branch would require a caller to bypass that
+            // boundary. Treat that as an internal invariant violation rather
+            // than falsely reporting success after dropping a terminal.
+            anyhow::bail!(
+                "synchronized layout terminal backlog exceeded its bounded capacity actor={} actor_generation={} request={request_id}",
+                actor.name,
+                actor.generation
+            );
+        }
+        self.pending_synchronized_layout_notifications.push_back(
+            PendingSynchronizedLayoutNotification {
+                actor: actor.clone(),
+                request_id,
+                notification,
+                attempts: 0,
+            },
+        );
+        self.flush_synchronized_layout_terminal_notifications();
+        Ok(())
+    }
+
+    fn flush_synchronized_layout_terminal_notifications(&mut self) {
+        loop {
+            let Some(pending) = self.pending_synchronized_layout_notifications.front() else {
+                return;
+            };
+            let actor = pending.actor.clone();
+            let request_id = pending.request_id;
+            let notification = pending.notification.clone();
+            let actor_generation_ended = self.wasm_runtime.as_ref().is_some_and(|runtime| {
+                runtime.actor_identity(&actor.name).as_ref() != Some(&actor)
+            });
+            let actor_mailbox_closed = self
+                .wasm_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.actor_mailbox_is_closed(&actor));
+            if actor_generation_ended || actor_mailbox_closed {
+                eprintln!(
+                    "discarded synchronized layout terminal after actor teardown actor={} actor_generation={} request={request_id} mailbox_closed={actor_mailbox_closed}",
+                    actor.name, actor.generation,
+                );
+                self.pending_synchronized_layout_notifications.pop_front();
+                continue;
+            }
+            match self.send_synchronized_layout_notification(&actor, notification) {
+                Ok(()) => {
+                    let attempts = self
+                        .pending_synchronized_layout_notifications
+                        .front()
+                        .map_or(0, |pending| pending.attempts);
+                    self.pending_synchronized_layout_notifications.pop_front();
+                    if attempts > 0 {
+                        eprintln!(
+                            "delivered deferred synchronized layout terminal actor={} actor_generation={} request={request_id} attempts={}",
+                            actor.name,
+                            actor.generation,
+                            attempts.saturating_add(1),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let attempts = self
+                        .pending_synchronized_layout_notifications
+                        .front_mut()
+                        .map_or(0, |pending| {
+                            pending.attempts = pending.attempts.saturating_add(1);
+                            pending.attempts
+                        });
+                    if attempts == 1 || attempts.is_power_of_two() {
+                        eprintln!(
+                            "deferred synchronized layout terminal actor={} actor_generation={} request={request_id} attempts={attempts}: {error:#}",
+                            actor.name, actor.generation
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn clear_synchronized_layout_terminal_notifications(&mut self, reason: &str) {
+        let cleared = self.pending_synchronized_layout_notifications.len();
+        self.pending_synchronized_layout_notifications.clear();
+        if cleared > 0 {
+            eprintln!(
+                "cleared synchronized layout terminal notifications count={cleared} reason={reason}"
+            );
+        }
+    }
+
+    fn schedule_presented_layout_revision(&mut self) -> Result<u64> {
+        if let Some(revision) = self.pending_presented_layout_revision {
+            return Ok(revision);
+        }
+        let revision = next_presented_layout_revision(self.presented_layout_revision)
+            .context("presented layout revision limit exceeded")?;
+        self.pending_presented_layout_revision = Some(revision);
+        Ok(revision)
+    }
+
+    fn complete_presented_layout_revision(&mut self) {
+        let Some(revision) = self.pending_presented_layout_revision.take() else {
+            return;
+        };
+        self.presented_layout_revision = revision;
+        self.synchronized_resize_lineage = None;
+        self.layout_publications.clear();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.settle_promoted_layout();
+        }
+        eprintln!("presented committed layout revision={revision}");
+    }
+
+    fn cancel_active_layout_capture(&mut self, reason: &str) {
+        let base_layout_revision = self.current_target_layout_revision();
+        let Some(renderer) = self.renderer.as_mut() else {
+            self.policy_pointer_capture = None;
+            return;
+        };
+        cancel_policy_pointer_capture(
+            renderer,
+            self.wasm_runtime.as_ref(),
+            &self.layout_holders,
+            self.layout_revision,
+            base_layout_revision,
+            &mut self.policy_pointer_capture,
+            &mut self.pointer_event_sequence,
+            modifier_bits(self.modifiers),
+            reason,
+        );
+    }
+
+    fn mark_deferred_plugin_scenes_ready(&mut self, deferred: &[DeferredPluginScene]) {
+        let ready_at = Instant::now();
+        for (pane, _sequence, terminal_input_sequence) in deferred {
+            for input in &mut self.pending_plugin_inputs {
+                if input.pane == *pane
+                    && input.snapshot_dispatched.is_some()
+                    && input.trace_sequence.is_some()
+                    && input.trace_sequence <= *terminal_input_sequence
+                {
+                    input.graphics_ready = Some(ready_at);
+                    input.ready = true;
+                }
+            }
+        }
+    }
+
+    fn abort_layout_authority_state(&mut self, reason: &str) -> Result<Option<FocusChange>> {
+        self.clear_synchronized_layout_terminal_notifications(reason);
+        self.cancel_active_layout_capture(reason);
+        let mut focus_change = None;
+        if let Some(active) = self.active_synchronized_resize.take() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                let (change, deferred) = renderer.abort_staged_layout(active.epoch.id)?;
+                focus_change = change;
+                self.mark_deferred_plugin_scenes_ready(&deferred);
+            } else if let Some(graphics) = self.plugin_graphics.as_ref() {
+                graphics.abort_resize_epoch(active.epoch.id)?;
+            }
+            let notification = brood_wasm::SynchronizedLayoutNotification::Rejected(
+                brood_wasm::SynchronizedLayoutRejected {
+                    request_id: active.request_id,
+                    reason: brood_wasm::SynchronizedLayoutRejectionReason::StaleLease,
+                    message: reason.to_string(),
+                },
+            );
+            self.queue_synchronized_layout_terminal_notification(&active.requester, notification)?;
+            eprintln!(
+                "aborted synchronized layout actor={} request={} epoch={} reason={reason}",
+                active.requester.name, active.request_id, active.epoch.id
+            );
+            self.resize_presentation_trace = ResizePresentationTrace::default();
+        }
+        if self.pending_presented_layout_revision.is_some()
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.layout_source == LayoutSource::Actor)
+        {
+            self.pending_presented_layout_revision = None;
+            if let Some(renderer) = self.renderer.as_mut() {
+                focus_change = renderer.reset_accepted_to_presented().or(focus_change);
+            }
+        }
+        self.synchronized_resize_lineage = None;
+        Ok(focus_change)
+    }
+
+    fn abort_synchronized_resize_for_inventory_change(&mut self) -> Result<Option<FocusChange>> {
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            return Ok(None);
+        };
+        let expected_inventory = active
+            .target_tree
+            .waitable_panes(active.target_tree.root_token())
+            .unwrap_or_default();
+        let current_inventory = self
+            .renderer
+            .as_ref()
+            .map_or_else(Vec::new, Renderer::pane_inventory);
+        let reason = format!(
+            "pane inventory changed during synchronized resize (expected {expected_inventory:?}, current {current_inventory:?})"
+        );
+        self.cancel_active_layout_capture(&reason);
+        let active = self
+            .active_synchronized_resize
+            .take()
+            .context("active synchronized resize disappeared during inventory abort")?;
+        let mut focus_change = None;
+        let mut deferred = Vec::new();
+        if let Some(renderer) = self.renderer.as_mut() {
+            let (change, released) = renderer.abort_staged_layout(active.epoch.id)?;
+            focus_change = change;
+            deferred = released;
+        } else if let Some(graphics) = self.plugin_graphics.as_ref() {
+            deferred = graphics.abort_resize_epoch(active.epoch.id)?;
+        }
+        self.mark_deferred_plugin_scenes_ready(&deferred);
+        self.synchronized_resize_lineage = None;
+        self.resize_presentation_trace = ResizePresentationTrace::default();
+        self.reject_synchronized_layout(
+            &active.requester,
+            active.request_id,
+            brood_wasm::SynchronizedLayoutRejectionReason::StaleInventoryRevision,
+            &reason,
+        )?;
+        eprintln!(
+            "aborted synchronized layout actor={} request={} epoch={} reason={reason}",
+            active.requester.name, active.request_id, active.epoch.id
+        );
+        Ok(focus_change)
+    }
+
+    fn rollback_unannounced_synchronized_resize(
+        &mut self,
+        reason: &str,
+    ) -> Result<Option<FocusChange>> {
+        let Some(active) = self.active_synchronized_resize.take() else {
+            return Ok(None);
+        };
+        let cancel_matching_capture = active.interaction.is_some_and(|interaction| {
+            self.policy_pointer_capture
+                .as_ref()
+                .is_some_and(|capture| capture.interaction == interaction)
+        });
+        let mut focus_change = None;
+        let mut deferred = Vec::new();
+        if let Some(renderer) = self.renderer.as_mut() {
+            match renderer.abort_staged_layout(active.epoch.id) {
+                Ok((change, released)) => {
+                    focus_change = change;
+                    deferred = released;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "could not fully roll back undelivered synchronized resize epoch={}: {error:#}",
+                        active.epoch.id
+                    );
+                    focus_change = renderer.reset_accepted_to_presented();
+                    match renderer.plugin_graphics.abort_resize_epoch(active.epoch.id) {
+                        Ok(released) => {
+                            for (pane, sequence, _terminal_input_sequence) in &released {
+                                if let Err(refresh_error) =
+                                    renderer.refresh_plugin_graphics(*pane, *sequence)
+                                {
+                                    eprintln!(
+                                        "could not refresh deferred plugin scene pane={pane} sequence={sequence} after undelivered epoch={}: {refresh_error:#}",
+                                        active.epoch.id
+                                    );
+                                }
+                            }
+                            deferred = released;
+                        }
+                        Err(abort_error) => {
+                            eprintln!(
+                                "could not abort undelivered graphics epoch={}: {abort_error:#}",
+                                active.epoch.id
+                            );
+                        }
+                    }
+                }
+            }
+        } else if let Some(graphics) = self.plugin_graphics.as_ref()
+            && let Err(error) = graphics.abort_resize_epoch(active.epoch.id)
+        {
+            eprintln!(
+                "could not abort undelivered graphics epoch={}: {error:#}",
+                active.epoch.id
+            );
+        }
+        self.mark_deferred_plugin_scenes_ready(&deferred);
+        if cancel_matching_capture {
+            self.cancel_active_layout_capture(reason);
+        }
+        self.synchronized_resize_lineage = None;
+        self.resize_presentation_trace = ResizePresentationTrace::default();
+        self.reject_synchronized_layout(
+            &active.requester,
+            active.request_id,
+            brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+            reason,
+        )?;
+        eprintln!(
+            "rolled back unannounced synchronized layout actor={} request={} epoch={} reason={reason}",
+            active.requester.name, active.request_id, active.epoch.id
+        );
+        Ok(focus_change)
+    }
+
+    fn reject_synchronized_layout(
+        &mut self,
+        actor: &ActorIdentity,
+        request_id: u64,
+        reason: brood_wasm::SynchronizedLayoutRejectionReason,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let message = message.into();
+        eprintln!(
+            "rejected synchronized layout actor={} request={} reason={reason:?}: {message}",
+            actor.name, request_id
+        );
+        self.queue_synchronized_layout_terminal_notification(
+            actor,
+            brood_wasm::SynchronizedLayoutNotification::Rejected(
+                brood_wasm::SynchronizedLayoutRejected {
+                    request_id,
+                    reason,
+                    message,
+                },
+            ),
+        )
+    }
+
+    fn current_target_layout_revision(&self) -> u64 {
+        self.active_synchronized_resize
+            .as_ref()
+            .map_or(self.presented_layout_revision, |active| {
+                active.epoch.target_layout_revision
+            })
+    }
+
+    fn submit_synchronized_layout(
+        &mut self,
+        sender: &ActorIdentity,
+        request: brood_wasm::SubmitSynchronizedLayout,
+    ) -> Result<Option<FocusChange>> {
+        let request_id = request.request_id;
+        if !self.pending_synchronized_layout_notifications.is_empty() {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                "a previous synchronized layout terminal is waiting for delivery",
+            )?;
+            return Ok(None);
+        }
+        if self.pending_presented_layout_revision.is_some() {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                "an ordinary layout commit is waiting for presentation",
+            )?;
+            return Ok(None);
+        }
+        if request.presentation != brood_wasm::PresentationMode::ScaleThenAtomic {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                "the initial synchronized-resize lane supports ScaleThenAtomic presentation",
+            )?;
+            return Ok(None);
+        }
+        let submitted_lease = convert_actor_layout_lease(request.lease);
+        if self.layout_holders.get(&submitted_lease.id) != Some(sender) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::StaleLease,
+                format!("actor does not hold layout lease {}", submitted_lease.id.0),
+            )?;
+            return Ok(None);
+        }
+        let current_lease = self
+            .layout_leases
+            .lease_tokens()
+            .into_iter()
+            .find(|token| token.id == submitted_lease.id);
+        if current_lease != Some(submitted_lease) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::StaleLease,
+                "layout lease generation is no longer current",
+            )?;
+            return Ok(None);
+        }
+        let inventory_revision = self.layout_leases.inventory_revision();
+        if request.inventory_revision != inventory_revision {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::StaleInventoryRevision,
+                format!(
+                    "inventory revision {} is not current after {}",
+                    request.inventory_revision, inventory_revision
+                ),
+            )?;
+            return Ok(None);
+        }
+        if self
+            .synchronized_resize_lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.inventory_revision != inventory_revision)
+        {
+            self.synchronized_resize_lineage = None;
+        }
+        let event_sequence = request.event_sequence.unwrap_or(0);
+        let (interaction_chain_base, previous_event_sequence) = if let Some(active) =
+            self.active_synchronized_resize.as_ref()
+        {
+            let same_requester = &active.requester == sender;
+            let same_lease = active.epoch.lease == submitted_lease.id.0
+                && active.epoch.lease_generation == submitted_lease.generation;
+            if active.interaction != request.interaction || !same_requester || !same_lease {
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                    "another pointer interaction owns the active workspace transaction",
+                )?;
+                return Ok(None);
+            }
+            (
+                Some(active.chain_base_layout_revision),
+                Some(active.event_sequence),
+            )
+        } else if let Some(lineage) = self.synchronized_resize_lineage.as_ref().filter(|lineage| {
+            lineage.matches(
+                request.interaction,
+                sender,
+                submitted_lease,
+                inventory_revision,
+            )
+        }) {
+            (
+                Some(lineage.origin_layout_revision),
+                Some(lineage.last_event_sequence),
+            )
+        } else {
+            (None, None)
+        };
+        if !synchronized_event_sequence_advances(event_sequence, previous_event_sequence) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::StaleEventSequence,
+                "pointer event sequence did not advance",
+            )?;
+            return Ok(None);
+        }
+        let current_base = self.current_target_layout_revision();
+        if !synchronized_base_is_applicable(
+            request.base_layout_revision,
+            current_base,
+            interaction_chain_base,
+        ) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::StaleBaseLayoutRevision,
+                format!(
+                    "base layout revision {} is not applicable to interaction chain {interaction_chain_base:?} after {current_base}",
+                    request.base_layout_revision
+                ),
+            )?;
+            return Ok(None);
+        }
+
+        let unique_wait = request
+            .wait_for_panes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if unique_wait.len() != request.wait_for_panes.len() {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::DuplicateWaitPane,
+                "wait set contains a duplicate pane",
+            )?;
+            return Ok(None);
+        }
+        let base_tree = self.active_synchronized_resize.as_ref().map_or_else(
+            || self.layout_leases.clone(),
+            |active| active.target_tree.clone(),
+        );
+        let waitable = base_tree
+            .waitable_panes(submitted_lease)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if let Some(pane) = unique_wait.iter().find(|pane| !waitable.contains(pane)) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::WaitPaneOutsideSubtree,
+                format!("pane {pane} is outside the requesting lease subtree"),
+            )?;
+            return Ok(None);
+        }
+
+        let mut target_tree = base_tree;
+        if let Err(error) = target_tree.submit(
+            submitted_lease,
+            request.inventory_revision,
+            convert_actor_layout_fragment(request.fragment.layout, request.fragment.rest),
+            None,
+        ) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                error.to_string(),
+            )?;
+            return Ok(None);
+        }
+        let composed = match target_tree.compose() {
+            Ok(composed) => composed,
+            Err(error) => {
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                    error.to_string(),
+                )?;
+                return Ok(None);
+            }
+        };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(pane) = unique_wait.iter().find(|pane| {
+            !renderer.plugin_pane_realms.contains_key(pane)
+                || composed.layout.pane_item(**pane).is_none()
+        }) {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::IneligibleWaitPane,
+                format!("pane {pane} cannot provide an epoch-tagged plugin scene"),
+            )?;
+            return Ok(None);
+        }
+        let affected_panes = changed_layout_panes(
+            &renderer.presented_layout,
+            &composed.layout,
+            renderer.layout_extent(),
+        );
+        let epoch_id = self.next_resize_epoch.max(1);
+        self.next_resize_epoch = epoch_id.saturating_add(1);
+        let Some(target_layout_revision) = next_presented_layout_revision(current_base) else {
+            self.reject_synchronized_layout(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                "presented layout revision limit is exhausted",
+            )?;
+            return Ok(None);
+        };
+        let epoch = brood_wasm::ResizeEpoch {
+            id: epoch_id,
+            lease: submitted_lease.id.0,
+            lease_generation: submitted_lease.generation,
+            base_layout_revision: current_base,
+            target_layout_revision,
+        };
+
+        if let Some(previous) = self.active_synchronized_resize.take() {
+            let mut aborted_focus_change = None;
+            let mut deferred = Vec::new();
+            if let Some(renderer) = self.renderer.as_mut() {
+                let (change, released) = renderer.abort_staged_layout(previous.epoch.id)?;
+                aborted_focus_change = change;
+                deferred = released;
+            }
+            self.mark_deferred_plugin_scenes_ready(&deferred);
+            let notification = brood_wasm::SynchronizedLayoutNotification::Superseded(
+                brood_wasm::SynchronizedLayoutSuperseded {
+                    request_id: previous.request_id,
+                    resize_epoch: previous.epoch,
+                    superseding_request_id: request_id,
+                    superseding_resize_epoch: epoch,
+                },
+            );
+            self.queue_synchronized_layout_terminal_notification(
+                &previous.requester,
+                notification,
+            )?;
+            if !self.pending_synchronized_layout_notifications.is_empty() {
+                let reason = "the superseded transaction terminal is waiting for mailbox delivery";
+                self.cancel_active_layout_capture(reason);
+                self.resize_presentation_trace = ResizePresentationTrace::default();
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                    reason,
+                )?;
+                return Ok(aborted_focus_change);
+            }
+        }
+
+        let now = Instant::now();
+        let focus = composed.focus;
+        let affected = affected_panes.iter().copied().collect::<Vec<_>>();
+        let wait = unique_wait.iter().copied().collect::<Vec<_>>();
+        let notification = brood_wasm::SynchronizedLayoutNotification::Accepted(
+            brood_wasm::SynchronizedLayoutAccepted {
+                request_id,
+                resize_epoch: epoch,
+                affected_panes: affected,
+                wait_for_panes: wait,
+            },
+        );
+        self.synchronized_resize_lineage = None;
+        self.active_synchronized_resize = Some(ActiveSynchronizedResize {
+            request_id,
+            interaction: request.interaction,
+            event_sequence,
+            chain_base_layout_revision: interaction_chain_base
+                .unwrap_or(request.base_layout_revision),
+            epoch,
+            requester: sender.clone(),
+            target_tree,
+            focus,
+            wait_panes: unique_wait,
+            ready_panes: BTreeSet::new(),
+            affected_panes,
+            started: now,
+            deadline: now + SYNCHRONIZED_RESIZE_TIMEOUT,
+            presentation: SynchronizedResizePresentation::Waiting,
+        });
+        self.resize_presentation_trace = ResizePresentationTrace {
+            interaction: request.interaction.map_or(0, |interaction| interaction.0),
+            event_sequence,
+            epoch: epoch.id,
+            phase: "projected",
+            wait_ready: 0,
+            wait_total: self
+                .active_synchronized_resize
+                .as_ref()
+                .map_or(0, |active| active.wait_panes.len()),
+            degraded: false,
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            let _focus_change = renderer.project_staged_layout(epoch.id, composed);
+        }
+        if let Err(error) = self.send_synchronized_layout_notification(sender, notification) {
+            let reason =
+                format!("host could not deliver synchronized layout acceptance: {error:#}");
+            let focus_change = self.rollback_unannounced_synchronized_resize(&reason)?;
+            return Ok(focus_change);
+        }
+        self.notify_synchronized_plugin_panes();
+        eprintln!(
+            "accepted synchronized layout actor={} request={} interaction={} event_sequence={} epoch={} base_revision={} target_revision={} wait={} affected={} mode={:?}",
+            sender.name,
+            request_id,
+            request.interaction.map_or(0, |interaction| interaction.0),
+            event_sequence,
+            epoch.id,
+            epoch.base_layout_revision,
+            epoch.target_layout_revision,
+            self.active_synchronized_resize
+                .as_ref()
+                .map_or(0, |active| active.wait_panes.len()),
+            self.active_synchronized_resize
+                .as_ref()
+                .map_or(0, |active| active.affected_panes.len()),
+            request.presentation,
+        );
+        if self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| active.wait_panes.is_empty())
+        {
+            return self.finish_synchronized_resize(false);
+        }
+        Ok(None)
+    }
+
+    fn notify_synchronized_plugin_panes(&mut self) {
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            return;
+        };
+        let epoch = active.epoch.id;
+        let affected_panes = active.affected_panes.clone();
+        let wait_panes = active.wait_panes.clone();
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let plugin_panes = renderer
+            .plugin_pane_realms
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let (tagged, ordinary) =
+            synchronized_plugin_notification_sets(&affected_panes, &wait_panes, &plugin_panes);
+        if let Some(graphics) = self.plugin_graphics.as_ref() {
+            if let Err(error) = graphics.activate_resize_epoch(epoch, &tagged) {
+                eprintln!(
+                    "could not admit synchronized graphics epoch={epoch}; waiting for degraded recovery: {error:#}"
+                );
+            }
+        } else {
+            eprintln!(
+                "plugin graphics bridge disappeared for synchronized epoch={epoch}; waiting for degraded recovery"
+            );
+        }
+        send_plugin_pane_resize_events_best_effort(
+            self.wasm_runtime.as_ref(),
+            renderer,
+            &tagged,
+            Some(epoch),
+            "synchronized barrier",
+        );
+        send_plugin_pane_resize_events_best_effort(
+            self.wasm_runtime.as_ref(),
+            renderer,
+            &ordinary,
+            None,
+            "synchronized non-wait pane",
+        );
+    }
+
+    fn note_synchronized_pane_ready(
+        &mut self,
+        pane: u64,
+        resize_epoch: u64,
+    ) -> Result<Option<FocusChange>> {
+        let Some(active) = self.active_synchronized_resize.as_mut() else {
+            return Ok(None);
+        };
+        if active.epoch.id != resize_epoch || !active.wait_panes.contains(&pane) {
+            return Ok(None);
+        }
+        if !matches!(active.presentation, SynchronizedResizePresentation::Waiting) {
+            return Ok(None);
+        }
+        active.ready_panes.insert(pane);
+        self.resize_presentation_trace.wait_ready = active.ready_panes.len();
+        if active.ready_panes == active.wait_panes {
+            return self.finish_synchronized_resize(false);
+        }
+        Ok(None)
+    }
+
+    fn finish_synchronized_resize(&mut self, degraded: bool) -> Result<Option<FocusChange>> {
+        let Some(active) = self.active_synchronized_resize.as_mut() else {
+            return Ok(None);
+        };
+        if !matches!(active.presentation, SynchronizedResizePresentation::Waiting) {
+            return Ok(None);
+        }
+        let missing = active
+            .wait_panes
+            .difference(&active.ready_panes)
+            .copied()
+            .collect::<Vec<_>>();
+        active.presentation = SynchronizedResizePresentation::Ready {
+            degraded,
+            missing_panes: missing.clone(),
+        };
+        self.resize_presentation_trace.phase = if degraded { "degraded-ready" } else { "ready" };
+        self.resize_presentation_trace.degraded = degraded;
+        self.renderer
+            .as_ref()
+            .context("renderer disappeared while scheduling synchronized presentation")?
+            .window
+            .request_redraw();
+        eprintln!(
+            "synchronized layout ready actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} ready={}/{} missing={missing:?} degraded={degraded} duration_us={}",
+            active.requester.name,
+            active.request_id,
+            active.interaction.map_or(0, |interaction| interaction.0),
+            active.event_sequence,
+            active.epoch.id,
+            active.epoch.target_layout_revision,
+            active.ready_panes.len(),
+            active.wait_panes.len(),
+            active.started.elapsed().as_micros(),
+        );
+        Ok(None)
+    }
+
+    fn complete_presented_synchronized_resize(&mut self) -> Result<Option<FocusChange>> {
+        let promoted = self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| {
+                matches!(
+                    active.presentation,
+                    SynchronizedResizePresentation::Promoted { .. }
+                )
+            });
+        if !promoted {
+            return Ok(None);
+        }
+        let active = self
+            .active_synchronized_resize
+            .take()
+            .context("promoted synchronized resize disappeared after presentation")?;
+        let (degraded, missing_panes) = match active.presentation {
+            SynchronizedResizePresentation::Promoted {
+                degraded,
+                missing_panes,
+            } => (degraded, missing_panes),
+            SynchronizedResizePresentation::Waiting
+            | SynchronizedResizePresentation::Ready { .. } => {
+                return Err(anyhow!(
+                    "synchronized resize lost its promoted state after presentation"
+                ));
+            }
+        };
+        let recovery_panes = synchronized_resize_recovery_panes(&active.wait_panes, degraded);
+        let completed_lineage = active
+            .interaction
+            .map(|interaction| SynchronizedResizeLineage {
+                interaction,
+                requester: active.requester.clone(),
+                lease: LayoutLeaseId(active.epoch.lease),
+                lease_generation: active.epoch.lease_generation,
+                inventory_revision: active.target_tree.inventory_revision(),
+                origin_layout_revision: active.chain_base_layout_revision,
+                last_event_sequence: active.event_sequence,
+            });
+        let renderer = self
+            .renderer
             .as_mut()
-            .map_or(Ok(Vec::new()), PresentationWasmRuntime::drain_host_messages)?;
-        for actor_message in messages {
+            .context("renderer disappeared after synchronized presentation")?;
+        renderer.settle_promoted_layout();
+        let deferred = renderer
+            .plugin_graphics
+            .complete_resize_epoch(active.epoch.id, !degraded)?;
+        let mut focus_change = None;
+        for (pane, sequence, terminal_input_sequence) in deferred {
+            if let Some(change) = renderer.refresh_plugin_graphics(pane, sequence)? {
+                focus_change = Some(change);
+            }
+            let ready_at = Instant::now();
+            for input in &mut self.pending_plugin_inputs {
+                if input.pane == pane
+                    && input.snapshot_dispatched.is_some()
+                    && input.trace_sequence.is_some()
+                    && input.trace_sequence <= terminal_input_sequence
+                {
+                    input.graphics_ready = Some(ready_at);
+                    input.ready = true;
+                }
+            }
+        }
+        self.layout_leases = active.target_tree;
+        self.presented_layout_revision = active.epoch.target_layout_revision;
+        self.synchronized_resize_lineage = completed_lineage;
+        self.layout_publications.clear();
+        if degraded {
+            send_plugin_pane_resize_events_best_effort(
+                self.wasm_runtime.as_ref(),
+                renderer,
+                &recovery_panes,
+                None,
+                "post-degraded recovery",
+            );
+        }
+        self.resize_presentation_trace = ResizePresentationTrace {
+            interaction: active.interaction.map_or(0, |interaction| interaction.0),
+            event_sequence: active.event_sequence,
+            epoch: active.epoch.id,
+            phase: if degraded { "degraded" } else { "promoted" },
+            wait_ready: active.ready_panes.len(),
+            wait_total: active.wait_panes.len(),
+            degraded,
+        };
+        let notification = if degraded {
+            brood_wasm::SynchronizedLayoutNotification::Degraded(
+                brood_wasm::SynchronizedLayoutDegraded {
+                    request_id: active.request_id,
+                    resize_epoch: active.epoch,
+                    missing_panes: missing_panes.clone(),
+                },
+            )
+        } else {
+            brood_wasm::SynchronizedLayoutNotification::Completed(
+                brood_wasm::SynchronizedLayoutCompleted {
+                    request_id: active.request_id,
+                    resize_epoch: active.epoch,
+                },
+            )
+        };
+        self.queue_synchronized_layout_terminal_notification(&active.requester, notification)?;
+        eprintln!(
+            "{} synchronized layout actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} ready={}/{} missing={missing_panes:?} duration_us={}",
+            if degraded { "degraded" } else { "completed" },
+            active.requester.name,
+            active.request_id,
+            active.interaction.map_or(0, |interaction| interaction.0),
+            active.event_sequence,
+            active.epoch.id,
+            active.epoch.target_layout_revision,
+            active.ready_panes.len(),
+            active.wait_panes.len(),
+            active.started.elapsed().as_micros(),
+        );
+        Ok(focus_change)
+    }
+
+    fn settle_synchronized_resize(&mut self) -> Result<Option<FocusChange>> {
+        if self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| {
+                matches!(active.presentation, SynchronizedResizePresentation::Waiting)
+                    && Instant::now() >= active.deadline
+            })
+        {
+            return self.finish_synchronized_resize(true);
+        }
+        Ok(None)
+    }
+
+    fn apply_actor_host_messages(&mut self) -> Result<()> {
+        self.flush_synchronized_layout_terminal_notifications();
+        if !self.pending_synchronized_layout_notifications.is_empty() {
+            return Ok(());
+        }
+        let mut messages = if self.deferred_actor_host_messages.is_empty() {
+            self.wasm_runtime
+                .as_mut()
+                .map_or(Ok(Vec::new()), PresentationWasmRuntime::drain_host_messages)?
+                .into()
+        } else {
+            std::mem::take(&mut self.deferred_actor_host_messages)
+        };
+        debug_assert!(messages.len() <= MAX_DEFERRED_ACTOR_HOST_MESSAGES);
+        while self.pending_synchronized_layout_notifications.is_empty() {
+            let Some(actor_message) = messages.pop_front() else {
+                break;
+            };
+            if let Some(sender) = actor_message.sender.as_ref() {
+                let current = self
+                    .wasm_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.actor_identity(&sender.name));
+                let mailbox_closed = self
+                    .wasm_runtime
+                    .as_ref()
+                    .is_none_or(|runtime| runtime.actor_mailbox_is_closed(sender));
+                if !deferred_actor_sender_is_current(Some(sender), current.as_ref(), mailbox_closed)
+                {
+                    eprintln!(
+                        "discarded deferred host message from stale actor generation actor={} actor_generation={} current_generation={:?} mailbox_closed={mailbox_closed}",
+                        sender.name,
+                        sender.generation,
+                        current.as_ref().map(|identity| identity.generation),
+                    );
+                    continue;
+                }
+            }
             let message: HostMessage = match serde_json::from_slice(&actor_message.payload) {
                 Ok(message) => message,
                 Err(error) => {
@@ -3782,6 +5098,14 @@ impl Application {
                     continue;
                 }
             };
+            if ordinary_layout_message_conflicts_with_synchronized_resize(&message)
+                && self.active_synchronized_resize.is_some()
+            {
+                eprintln!(
+                    "rejected ordinary SetResolvedLayout while a synchronized resize is active: Busy"
+                );
+                continue;
+            }
             let focus_change = match message {
                 HostMessage::ClaimRootLayout => {
                     let Some(sender) = actor_message.sender.as_ref() else {
@@ -3799,7 +5123,11 @@ impl Application {
                         );
                         continue;
                     }
+                    let mut authority_focus_change = None;
                     if self.root_layout_actor.as_ref() != Some(sender) {
+                        authority_focus_change = self.abort_layout_authority_state(
+                            "root layout holder was explicitly replaced",
+                        )?;
                         self.layout_leases = LayoutLeaseTree::default();
                         self.layout_holders.clear();
                         self.layout_publications.clear();
@@ -3814,7 +5142,7 @@ impl Application {
                             sender.name, sender.generation, root.generation
                         );
                     }
-                    None
+                    authority_focus_change
                 }
                 HostMessage::DelegateLayoutRest {
                     lease,
@@ -3948,28 +5276,79 @@ impl Application {
                     let Some(renderer) = self.renderer.as_mut() else {
                         continue;
                     };
-                    let (focus_change, accepted) = match result {
-                        Ok(Some(composed)) => {
-                            renderer.commit_actor_layout(composed.layout, composed.focus)
-                        }
+                    let (focus_change, accepted, layout_changed) = match result {
+                        Ok(Some(composed)) => renderer.commit_actor_layout(composed),
                         Ok(None) => {
                             eprintln!(
                                 "accepted layout fragment lease={} revision={revision}; waiting for child",
                                 submitted_lease.id.0
                             );
-                            (None, false)
+                            (None, false, false)
                         }
                         Err(error) => renderer.reject_actor_layout(&error),
                     };
-                    if accepted {
+                    if accepted && layout_changed {
+                        let accepted_items = renderer.accepted_layout.items.len();
+                        let accepted_panes = renderer.accepted_layout.pane_count();
+                        let pending_revision = self.schedule_presented_layout_revision()?;
                         eprintln!(
-                            "accepted leased actor layout items={} panes={} revision={}",
-                            renderer.accepted_layout.items.len(),
-                            renderer.accepted_layout.pane_count(),
-                            self.layout_leases.inventory_revision()
+                            "accepted leased actor layout items={} panes={} revision={} pending_presented_layout_revision={pending_revision}",
+                            accepted_items,
+                            accepted_panes,
+                            self.layout_leases.inventory_revision(),
+                        );
+                    } else if accepted {
+                        self.pending_presented_layout_revision = None;
+                        eprintln!(
+                            "accepted unchanged leased actor layout revision={revision} presented_layout_revision={}",
+                            self.presented_layout_revision,
                         );
                     }
                     focus_change
+                }
+                HostMessage::SubmitSynchronizedLayout(request) => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored synchronized layout request without actor identity");
+                        continue;
+                    };
+                    self.submit_synchronized_layout(sender, request)?
+                }
+                HostMessage::ReusePaneContent(reuse) => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored pane reuse response without actor identity");
+                        continue;
+                    };
+                    let owns_pane = self
+                        .wasm_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.pane_for_actor(sender))
+                        == Some(reuse.pane);
+                    if !owns_pane {
+                        eprintln!(
+                            "ignored pane reuse response actor={} pane={} because the actor does not own that pane",
+                            sender.name, reuse.pane
+                        );
+                        continue;
+                    }
+                    let Some(plugin_graphics) = self.plugin_graphics.as_ref() else {
+                        eprintln!(
+                            "ignored pane reuse response actor={} pane={} because plugin graphics is unavailable",
+                            sender.name, reuse.pane
+                        );
+                        continue;
+                    };
+                    if let Err(error) = plugin_graphics.validate_reuse_pane_content(
+                        reuse.pane,
+                        sender.generation,
+                        reuse.resize_epoch,
+                    ) {
+                        eprintln!(
+                            "ignored pane reuse response actor={} pane={} resize_epoch={} because it is not reusable: {error:?}",
+                            sender.name, reuse.pane, reuse.resize_epoch
+                        );
+                        continue;
+                    }
+                    self.note_synchronized_pane_ready(reuse.pane, reuse.resize_epoch)?
                 }
                 HostMessage::BackendSession {
                     backend,
@@ -4157,10 +5536,25 @@ impl Application {
             flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
             renderer.window.request_redraw();
         }
+        if !messages.is_empty() {
+            debug_assert!(
+                self.deferred_actor_host_messages.len() + messages.len()
+                    <= MAX_DEFERRED_ACTOR_HOST_MESSAGES
+            );
+            self.deferred_actor_host_messages.append(&mut messages);
+        }
         Ok(())
     }
 
     fn drain_wasm_events(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        // Do not admit more actor output while a synchronized terminal is
+        // backpressured. In particular, draining `HostMessageRequested`
+        // events here would fill the runtime's own bounded host-message queue
+        // while `apply_actor_host_messages` is intentionally paused.
+        self.flush_synchronized_layout_terminal_notifications();
+        if !self.pending_synchronized_layout_notifications.is_empty() {
+            return true;
+        }
         let result = (|| {
             let Some(runtime) = self.wasm_runtime.as_mut() else {
                 return Ok(());
@@ -4248,6 +5642,33 @@ impl Application {
             event_loop.exit();
             return false;
         }
+        let synchronized_inventory_changed = self
+            .active_synchronized_resize
+            .as_ref()
+            .zip(self.renderer.as_ref())
+            .is_some_and(|(active, renderer)| {
+                !synchronized_resize_inventory_matches(active, &renderer.pane_inventory())
+            });
+        if synchronized_inventory_changed {
+            let focus_change = match self.abort_synchronized_resize_for_inventory_change() {
+                Ok(change) => change,
+                Err(error) => {
+                    self.fail(event_loop, error);
+                    return false;
+                }
+            };
+            if let Some(change) = focus_change
+                && let Err(error) = dispatch_focus_change(
+                    self.wasm_runtime.as_ref(),
+                    self.input_sender.as_mut(),
+                    change,
+                    self.window_focused,
+                )
+            {
+                self.fail(event_loop, error);
+                return false;
+            }
+        }
         true
     }
 
@@ -4302,6 +5723,15 @@ impl Application {
         }
         flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
         flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+        if transaction.initial_size != transaction.latest_size
+            && self.active_synchronized_resize.is_none()
+        {
+            let pending_revision = self.schedule_presented_layout_revision()?;
+            eprintln!(
+                "scheduled settled window geometry revision={pending_revision} size={}x{}",
+                transaction.latest_size.0, transaction.latest_size.1
+            );
+        }
         eprintln!(
             "settled presentation window resize events={} from={}x{} to={}x{} elapsed_ms={}",
             transaction.events,
@@ -4340,13 +5770,28 @@ impl Application {
             .take()
             .context("lost renderer during recovery")?;
         self.window_resize = None;
-        let replay = old
-            .plugin_panes
-            .values()
-            .map(|plugin| (plugin.scene.pane, plugin.scene.sequence))
-            .collect::<Vec<_>>();
+        // Recompile from bridge-visible snapshots. A failed render may already
+        // have installed epoch-tagged GPU scenes, but those must not become the
+        // replacement renderer's visible baseline before a successful present.
+        let replay = old.plugin_panes.keys().copied().collect::<Vec<_>>();
         let available_windows = old.available_windows.clone();
         let active_session = old.active_session;
+        let active_backend = old.active_backend;
+        let active_sessions = old.active_sessions.clone();
+        let plugin_pane_realms = old.plugin_pane_realms.clone();
+        let focused_pane = old.focused_pane_id();
+        let pending_focus_pane = old.pending_focus_pane;
+        let layout_source = old.layout_source;
+        let layout_state_dirty = old.layout_state_dirty;
+        let accepted_layout = old.accepted_layout.clone();
+        let accepted_zones = old.accepted_zones.clone();
+        let accepted_dividers = old.accepted_dividers.clone();
+        let presented_layout = old.presented_layout.clone();
+        let presented_zones = old.presented_zones.clone();
+        let presented_dividers = old.presented_dividers.clone();
+        let settled_layout = old.settled_layout.clone();
+        let settled_zones = old.settled_zones.clone();
+        let settled_dividers = old.settled_dividers.clone();
         let window = Arc::clone(&old.window);
         drop(old);
         let generation = self.allocate_renderer_generation()?;
@@ -4364,9 +5809,76 @@ impl Application {
         let mut replacement =
             Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
         replacement.available_windows = available_windows;
-        let _focus_change = replacement.apply_default_session_layout(active_session);
-        for (pane, sequence) in replay {
-            replacement.refresh_plugin_graphics(pane, sequence)?;
+        replacement.active_session = active_session;
+        replacement.active_backend = active_backend;
+        replacement.active_sessions = active_sessions;
+        replacement.plugin_pane_realms = plugin_pane_realms;
+        replacement.pending_focus_pane = pending_focus_pane;
+        replacement.layout_source = layout_source;
+        let recovering_synchronized_resize = self.active_synchronized_resize.is_some();
+        replacement.accepted_layout = if recovering_synchronized_resize {
+            presented_layout.clone()
+        } else {
+            accepted_layout
+        };
+        replacement.accepted_zones = if recovering_synchronized_resize {
+            presented_zones.clone()
+        } else {
+            accepted_zones
+        };
+        replacement.accepted_dividers = if recovering_synchronized_resize {
+            presented_dividers.clone()
+        } else {
+            accepted_dividers
+        };
+        replacement.presented_layout = presented_layout;
+        replacement.presented_zones = presented_zones;
+        replacement.presented_dividers = presented_dividers;
+        replacement.settled_layout = settled_layout;
+        replacement.settled_zones = settled_zones;
+        replacement.settled_dividers = settled_dividers;
+        let _focus_change = replacement.project_accepted_layout(focused_pane);
+        for pane in replay {
+            replacement.refresh_plugin_graphics(pane, 0)?;
+        }
+        if let Some(active) = self.active_synchronized_resize.as_mut() {
+            let composed = active
+                .target_tree
+                .compose()
+                .context("recompose synchronized layout during renderer recovery")?;
+            let _focus_change = replacement.project_staged_layout(active.epoch.id, composed);
+            for pane in &active.ready_panes {
+                replacement.refresh_staged_plugin_graphics(*pane, active.epoch.id, 0)?;
+            }
+            if let SynchronizedResizePresentation::Promoted {
+                degraded,
+                missing_panes,
+            } = active.presentation.clone()
+            {
+                active.presentation = SynchronizedResizePresentation::Ready {
+                    degraded,
+                    missing_panes,
+                };
+            }
+            eprintln!(
+                "reconstructed synchronized resize request={} epoch={} ready={}/{} after renderer recovery",
+                active.request_id,
+                active.epoch.id,
+                active.ready_panes.len(),
+                active.wait_panes.len(),
+            );
+        }
+        // Snapshot replay discovers every pane again. Preserve the old dirty
+        // bit only after replay so recovery itself cannot force an active
+        // synchronized transaction down the inventory-change/degraded path.
+        replacement.layout_state_dirty = layout_state_dirty;
+        if let Some(capture) = self.policy_pointer_capture.as_ref() {
+            let cursor = replacement
+                .presented_zones
+                .iter()
+                .find(|zone| zone.id == capture.zone)
+                .map_or(CursorRole::Default, |zone| zone.cursor);
+            replacement.set_zone_pointer_state(None, Some(capture.zone), cursor);
         }
         replacement.window.request_redraw();
         self.renderer = Some(replacement);
@@ -4672,43 +6184,61 @@ impl ApplicationHandler<ClientEvent> for Application {
             ClientEvent::PluginGraphicsChanged {
                 pane,
                 sequence,
+                resize_epoch,
                 terminal_input_sequence,
                 ready_at,
             } => {
                 let mut failure = None;
+                let defer_ordinary_refresh = should_defer_ordinary_plugin_refresh(
+                    resize_epoch,
+                    pane,
+                    self.active_synchronized_resize
+                        .as_ref()
+                        .map(|active| &active.wait_panes),
+                );
                 if let Some(renderer) = self.renderer.as_mut() {
-                    match renderer.refresh_plugin_graphics(pane, sequence) {
+                    let refresh = if defer_ordinary_refresh {
+                        Ok(None)
+                    } else if let Some(epoch) = resize_epoch {
+                        renderer.refresh_staged_plugin_graphics(pane, epoch, sequence)
+                    } else {
+                        renderer.refresh_plugin_graphics(pane, sequence)
+                    };
+                    match refresh {
                         Ok(change) => {
-                            for input in &mut self.pending_plugin_inputs {
-                                if input.pane == pane
-                                    && input.snapshot_dispatched.is_some()
-                                    && input.trace_sequence.is_some()
-                                    && input.trace_sequence <= terminal_input_sequence
-                                {
-                                    input.graphics_ready = Some(ready_at);
-                                    input.ready = true;
+                            if !defer_ordinary_refresh {
+                                for input in &mut self.pending_plugin_inputs {
+                                    if input.pane == pane
+                                        && input.snapshot_dispatched.is_some()
+                                        && input.trace_sequence.is_some()
+                                        && input.trace_sequence <= terminal_input_sequence
+                                    {
+                                        input.graphics_ready = Some(ready_at);
+                                        input.ready = true;
+                                    }
                                 }
-                            }
-                            if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut()
-                                && benchmark.pane == pane
-                            {
-                                benchmark.record_scene(Instant::now());
-                            } else if std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO").as_deref()
-                                == Ok("1")
-                            {
-                                let now = Instant::now();
-                                if let Some((previous_pane, previous)) =
-                                    self.plugin_scroll_auto_last_scene
-                                    && previous_pane == pane
-                                    && now.duration_since(previous) <= Duration::from_millis(10)
+                                if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut()
+                                    && benchmark.pane == pane
                                 {
-                                    let mut benchmark = PluginScrollBenchmark::new(pane);
-                                    benchmark.record_scene(previous);
-                                    benchmark.record_scene(now);
-                                    self.plugin_scroll_benchmark = Some(benchmark);
-                                    PLUGIN_SCROLL_BENCH_ACTIVE.store(true, Ordering::Relaxed);
+                                    benchmark.record_scene(Instant::now());
+                                } else if std::env::var("BROOD_TERMINAL_SCROLL_BENCH_AUTO")
+                                    .as_deref()
+                                    == Ok("1")
+                                {
+                                    let now = Instant::now();
+                                    if let Some((previous_pane, previous)) =
+                                        self.plugin_scroll_auto_last_scene
+                                        && previous_pane == pane
+                                        && now.duration_since(previous) <= Duration::from_millis(10)
+                                    {
+                                        let mut benchmark = PluginScrollBenchmark::new(pane);
+                                        benchmark.record_scene(previous);
+                                        benchmark.record_scene(now);
+                                        self.plugin_scroll_benchmark = Some(benchmark);
+                                        PLUGIN_SCROLL_BENCH_ACTIVE.store(true, Ordering::Relaxed);
+                                    }
+                                    self.plugin_scroll_auto_last_scene = Some((pane, now));
                                 }
-                                self.plugin_scroll_auto_last_scene = Some((pane, now));
                             }
                             if let Some(change) = change
                                 && let Err(error) = dispatch_focus_change(
@@ -4733,8 +6263,56 @@ impl ApplicationHandler<ClientEvent> for Application {
                         failure = Some(error);
                     }
                 }
+                if failure.is_none()
+                    && let Some(epoch) = resize_epoch
+                {
+                    match self.note_synchronized_pane_ready(pane, epoch) {
+                        Ok(Some(change)) => {
+                            if let Err(error) = dispatch_focus_change(
+                                self.wasm_runtime.as_ref(),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            ) {
+                                failure = Some(error);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => failure = Some(error),
+                    }
+                }
                 if let Some(error) = failure {
                     self.fail(event_loop, error);
+                }
+            }
+            ClientEvent::PluginContentReused {
+                pane,
+                resize_epoch,
+                ready_at,
+            } => {
+                eprintln!(
+                    "accepted plugin content reuse pane={pane} resize_epoch={resize_epoch} ready_us={}",
+                    ready_at.elapsed().as_micros()
+                );
+                if let Err(error) = self
+                    .note_synchronized_pane_ready(pane, resize_epoch)
+                    .and_then(|change| {
+                        if let Some(change) = change {
+                            dispatch_focus_change(
+                                self.wasm_runtime.as_ref(),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            )?;
+                        }
+                        Ok(())
+                    })
+                {
+                    self.fail(event_loop, error);
+                    return;
+                }
+                if let Some(renderer) = self.renderer.as_ref() {
+                    renderer.window.request_redraw();
                 }
             }
             ClientEvent::RendererFailed {
@@ -4982,6 +6560,14 @@ impl ApplicationHandler<ClientEvent> for Application {
         if !self.drain_wasm_events(event_loop) {
             return;
         }
+        self.flush_synchronized_layout_terminal_notifications();
+        if self.pending_synchronized_layout_notifications.is_empty()
+            && !self.deferred_actor_host_messages.is_empty()
+            && let Err(error) = self.apply_actor_host_messages()
+        {
+            self.fail(event_loop, error);
+            return;
+        }
         if let Some(wayland_drop) = self.wayland_drop.as_mut()
             && let Err(error) = wayland_drop.dispatch_pending()
         {
@@ -4991,6 +6577,24 @@ impl ApplicationHandler<ClientEvent> for Application {
         if let Err(error) = self.settle_window_resize() {
             self.fail(event_loop, error);
             return;
+        }
+        match self.settle_synchronized_resize() {
+            Ok(Some(change)) => {
+                if let Err(error) = dispatch_focus_change(
+                    self.wasm_runtime.as_ref(),
+                    self.input_sender.as_mut(),
+                    change,
+                    self.window_focused,
+                ) {
+                    self.fail(event_loop, error);
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
         }
         self.sync_default_backend_target();
         if let Err(error) = self.publish_layout_state() {
@@ -5012,6 +6616,8 @@ impl ApplicationHandler<ClientEvent> for Application {
             lane.flush_deferred();
             lane.has_deferred()
         });
+        let synchronized_notification_backpressured =
+            !self.pending_synchronized_layout_notifications.is_empty();
         // A full actor lane keeps the latest position for the next Winit turn.
         // Motion is state, so intermediate samples are disposable.
         let _motion_result = flush_presentation_pointer_motion(
@@ -5050,7 +6656,14 @@ impl ApplicationHandler<ClientEvent> for Application {
         } else {
             None
         };
-        if input_backpressured || actor_message_backpressured {
+        let synchronized_resize_deadline = self
+            .active_synchronized_resize
+            .as_ref()
+            .map(|active| active.deadline);
+        if input_backpressured
+            || actor_message_backpressured
+            || synchronized_notification_backpressured
+        {
             // The shared-memory consumer already has a wakeup for the records
             // which filled its ring. Retry promptly without busy-spinning a
             // CPU while the consumer is descheduled or slow to free a slot.
@@ -5071,7 +6684,14 @@ impl ApplicationHandler<ClientEvent> for Application {
             if let Some(scroll_benchmark_deadline) = scroll_benchmark_deadline {
                 deadline = deadline.min(scroll_benchmark_deadline);
             }
+            if let Some(synchronized_resize_deadline) = synchronized_resize_deadline {
+                deadline = deadline.min(synchronized_resize_deadline);
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else if let Some(deadline) = synchronized_resize_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                scroll_benchmark_deadline.map_or(deadline, |other| deadline.min(other)),
+            ));
         } else if self
             .wasm_runtime
             .as_ref()
@@ -5138,9 +6758,61 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
+                let zone_route = match route_layout_zone_pointer(
+                    renderer,
+                    &mut self.pointer_policy,
+                    self.wasm_runtime.as_ref(),
+                    &self.layout_holders,
+                    self.layout_revision,
+                    self.active_synchronized_resize
+                        .as_ref()
+                        .map_or(self.presented_layout_revision, |active| {
+                            active.epoch.target_layout_revision
+                        }),
+                    &mut self.policy_pointer_capture,
+                    &mut self.next_pointer_interaction,
+                    &mut self.pointer_event_sequence,
+                    self.cursor_position,
+                    brood_wasm::PointerPhase::Motion,
+                    PointerEventMask::MOTION,
+                    None,
+                    modifier_bits(self.modifiers),
+                ) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        eprintln!("pointer-policy motion failed: {error:#}");
+                        PointerPolicyRoute::Consumed
+                    }
+                };
+                if self.active_synchronized_resize.is_none() {
+                    self.resize_presentation_trace = ResizePresentationTrace {
+                        interaction: self
+                            .policy_pointer_capture
+                            .as_ref()
+                            .map_or(0, |capture| capture.interaction.0),
+                        event_sequence: self.pointer_event_sequence,
+                        ..ResizePresentationTrace::default()
+                    };
+                }
+                let PointerPolicyRoute::Forward {
+                    position,
+                    modifiers: _,
+                } = zone_route
+                else {
+                    self.pointer_routing.pending_plugin_motion = None;
+                    send_plugin_pointer_leave(
+                        self.wasm_runtime.as_ref(),
+                        &mut self.pointer_routing.plugin_target,
+                    );
+                    send_managed_pointer_leave(
+                        self.input_sender.as_mut(),
+                        &mut self.pointer_routing.managed_target,
+                    );
+                    return;
+                };
                 route_pointer_motion(
                     renderer,
-                    self.cursor_position,
+                    position,
                     &mut self.pointer_grab,
                     self.wasm_runtime.as_ref(),
                     self.input_sender.as_mut(),
@@ -5149,6 +6821,27 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_position = None;
+                renderer.set_zone_pointer_state(
+                    None,
+                    self.policy_pointer_capture
+                        .as_ref()
+                        .map(|capture| capture.zone),
+                    if self.policy_pointer_capture.is_some() {
+                        renderer
+                            .presented_zones
+                            .iter()
+                            .find(|zone| {
+                                Some(zone.id)
+                                    == self
+                                        .policy_pointer_capture
+                                        .as_ref()
+                                        .map(|capture| capture.zone)
+                            })
+                            .map_or(CursorRole::Default, |zone| zone.cursor)
+                    } else {
+                        CursorRole::Default
+                    },
+                );
                 self.pointer_routing.pending_plugin_motion = None;
                 send_plugin_pointer_leave(
                     self.wasm_runtime.as_ref(),
@@ -5172,6 +6865,58 @@ impl ApplicationHandler<ClientEvent> for Application {
                     return;
                 };
                 let pressed = state == ElementState::Pressed;
+                let zone_route = match route_layout_zone_pointer(
+                    renderer,
+                    &mut self.pointer_policy,
+                    self.wasm_runtime.as_ref(),
+                    &self.layout_holders,
+                    self.layout_revision,
+                    self.active_synchronized_resize
+                        .as_ref()
+                        .map_or(self.presented_layout_revision, |active| {
+                            active.epoch.target_layout_revision
+                        }),
+                    &mut self.policy_pointer_capture,
+                    &mut self.next_pointer_interaction,
+                    &mut self.pointer_event_sequence,
+                    self.cursor_position,
+                    if pressed {
+                        brood_wasm::PointerPhase::ButtonPress
+                    } else {
+                        brood_wasm::PointerPhase::ButtonRelease
+                    },
+                    if pressed {
+                        PointerEventMask::BUTTON_PRESS
+                    } else {
+                        PointerEventMask::RELEASE
+                    },
+                    Some(button_code),
+                    modifier_bits(self.modifiers),
+                ) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        eprintln!("pointer-policy button failed: {error:#}");
+                        PointerPolicyRoute::Consumed
+                    }
+                };
+                if self.active_synchronized_resize.is_none() {
+                    self.resize_presentation_trace = ResizePresentationTrace {
+                        interaction: self
+                            .policy_pointer_capture
+                            .as_ref()
+                            .map_or(0, |capture| capture.interaction.0),
+                        event_sequence: self.pointer_event_sequence,
+                        ..ResizePresentationTrace::default()
+                    };
+                }
+                let PointerPolicyRoute::Forward {
+                    position,
+                    modifiers,
+                } = zone_route
+                else {
+                    self.pointer_routing.pending_plugin_motion = None;
+                    return;
+                };
                 if !pressed
                     && self
                         .pointer_grab
@@ -5180,11 +6925,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     return;
                 }
-                let Some(target) = pointer_target_for_cursor(
-                    renderer,
-                    self.cursor_position,
-                    self.pointer_grab.as_ref(),
-                ) else {
+                let Some(target) =
+                    pointer_target_for_cursor(renderer, position, self.pointer_grab.as_ref())
+                else {
                     return;
                 };
                 eprintln!(
@@ -5220,7 +6963,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     PointerButtonState {
                         button: button_code,
                         pressed,
-                        modifiers: modifier_bits(self.modifiers),
+                        modifiers,
                     },
                 );
 
@@ -5346,6 +7089,32 @@ impl ApplicationHandler<ClientEvent> for Application {
                         &mut self.pointer_grab,
                         modifier_bits(self.modifiers),
                     );
+                    if self.policy_pointer_capture.is_some()
+                        && let Err(error) = route_layout_zone_pointer(
+                            renderer,
+                            &mut self.pointer_policy,
+                            self.wasm_runtime.as_ref(),
+                            &self.layout_holders,
+                            self.layout_revision,
+                            self.active_synchronized_resize
+                                .as_ref()
+                                .map_or(self.presented_layout_revision, |active| {
+                                    active.epoch.target_layout_revision
+                                }),
+                            &mut self.policy_pointer_capture,
+                            &mut self.next_pointer_interaction,
+                            &mut self.pointer_event_sequence,
+                            self.cursor_position,
+                            brood_wasm::PointerPhase::Cancel,
+                            PointerEventMask::CANCEL,
+                            None,
+                            modifier_bits(self.modifiers),
+                        )
+                    {
+                        eprintln!("pointer-policy cancel failed: {error:#}");
+                        self.policy_pointer_capture = None;
+                        renderer.set_zone_pointer_state(None, None, CursorRole::Default);
+                    }
                     self.cursor_position = None;
                     self.pointer_routing.pending_plugin_motion = None;
                     send_plugin_pointer_leave(
@@ -5569,6 +7338,28 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
                     benchmark.record_redraw();
                 }
+                match promote_ready_synchronized_resize(
+                    self.active_synchronized_resize.as_mut(),
+                    renderer,
+                    &mut self.resize_presentation_trace,
+                ) {
+                    Ok(Some(change)) => {
+                        if let Err(error) = dispatch_focus_change(
+                            self.wasm_runtime.as_ref(),
+                            self.input_sender.as_mut(),
+                            change,
+                            self.window_focused,
+                        ) {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                }
                 match renderer.render() {
                     RenderOutcome::Presented {
                         sequence,
@@ -5576,6 +7367,22 @@ impl ApplicationHandler<ClientEvent> for Application {
                         timings,
                     } => {
                         self.renderer_recoveries = 0;
+                        renderer.note_frame_presented();
+                        if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+                            let trace = self.resize_presentation_trace;
+                            eprintln!(
+                                "resize-present interaction={} event_sequence={} epoch={} divider_x={} phase={} wait_ready={}/{} staged_count={} degraded={}",
+                                trace.interaction,
+                                trace.event_sequence,
+                                trace.epoch,
+                                renderer.primary_divider_x(),
+                                trace.phase,
+                                trace.wait_ready,
+                                trace.wait_total,
+                                renderer.staged_layout_count(),
+                                trace.degraded,
+                            );
+                        }
                         if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
                             benchmark.record_present(Instant::now(), timings);
                         }
@@ -5709,6 +7516,25 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 }
                             }
                         }
+                        self.complete_presented_layout_revision();
+                        match self.complete_presented_synchronized_resize() {
+                            Ok(Some(change)) => {
+                                if let Err(error) = dispatch_focus_change(
+                                    self.wasm_runtime.as_ref(),
+                                    self.input_sender.as_mut(),
+                                    change,
+                                    self.window_focused,
+                                ) {
+                                    self.fail(event_loop, error);
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.fail(event_loop, error);
+                                return;
+                            }
+                        }
                     }
                     RenderOutcome::Skipped => {
                         if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
@@ -5803,6 +7629,9 @@ struct Renderer {
     frame_sampler: wgpu::Sampler,
     frame_pipeline: wgpu::RenderPipeline,
     placeholder_pipeline: wgpu::RenderPipeline,
+    divider_pipeline: wgpu::RenderPipeline,
+    divider_hover_pipeline: wgpu::RenderPipeline,
+    divider_active_pipeline: wgpu::RenderPipeline,
     plugin_canvas: GpuCanvasRenderer,
     imported_frames: HashMap<u64, ImportedFrame>,
     frame_keys: BTreeMap<(BackendId, u64), u64>,
@@ -5816,10 +7645,25 @@ struct Renderer {
     current_sequences: BTreeMap<BackendId, u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_panes: BTreeMap<u64, PluginPaneTexture>,
+    staged_plugin_panes: BTreeMap<(u64, u64), GpuCanvasScene>,
     plugin_pane_realms: BTreeMap<u64, Option<(BackendId, u64)>>,
     focused_pane: Option<FocusedPane>,
     pending_focus_pane: Option<u64>,
     accepted_layout: ResolvedLayout,
+    accepted_zones: Vec<ComposedInteractionZone>,
+    accepted_dividers: Vec<ComposedDivider>,
+    /// Geometry and input state from the last frame handed to the compositor.
+    presented_layout: ResolvedLayout,
+    presented_zones: Vec<ComposedInteractionZone>,
+    presented_dividers: Vec<ComposedDivider>,
+    /// Last atomically completed layout. `accepted_layout` may temporarily be
+    /// a `ScaleThenAtomic` projection while a resize epoch is preparing.
+    settled_layout: ResolvedLayout,
+    settled_zones: Vec<ComposedInteractionZone>,
+    settled_dividers: Vec<ComposedDivider>,
+    staged_layouts: BTreeMap<u64, ComposedLayout>,
+    hovered_zone: Option<ComposedZoneId>,
+    captured_zone: Option<ComposedZoneId>,
     layout_source: LayoutSource,
     layout_state_dirty: bool,
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
@@ -5837,6 +7681,12 @@ enum FocusedPane {
 enum PanePointerTarget {
     Plugin { pane: u64, x: f32, y: f32 },
     Managed { pane: u64, x: f64, y: f64 },
+}
+
+#[derive(Clone, Copy)]
+enum LayoutPaintTarget {
+    Pane(u64),
+    Divider(ComposedDivider),
 }
 
 impl PanePointerTarget {
@@ -5917,7 +7767,11 @@ struct LayoutStateMessage {
     #[serde(rename = "type")]
     message_type: &'static str,
     revision: u64,
+    inventory_revision: u64,
+    layout_revision: u64,
+    presented_layout_revision: u64,
     lease: brood_wasm::LayoutLeaseToken,
+    waitable_panes: Vec<u64>,
     visible_panes: Vec<u64>,
     active_session: u64,
     available_windows: Vec<AvailableWindow>,
@@ -6035,6 +7889,7 @@ fn flush_renderer_plugin_resize_events(
                 width: size.width,
                 height: size.height,
                 scale: size.scale,
+                resize_epoch: None,
             },
         )?;
         renderer.mark_plugin_resize_sent(pane, size);
@@ -6044,6 +7899,85 @@ fn flush_renderer_plugin_resize_events(
         );
     }
     Ok(())
+}
+
+fn send_plugin_pane_resize_events(
+    runtime: Option<&PresentationWasmRuntime>,
+    renderer: &mut Renderer,
+    panes: &[u64],
+    resize_epoch: Option<u64>,
+) -> Result<()> {
+    let scale = renderer.window.scale_factor() as f32;
+    let extent = renderer.layout_extent();
+    for pane in panes {
+        let Some(item) = renderer.accepted_layout.pane_item(*pane) else {
+            continue;
+        };
+        let rect = item.pixel_rect(extent);
+        let Some((width, height)) = positive_rect_extent([rect.x, rect.y, rect.w, rect.h]) else {
+            continue;
+        };
+        let size = PluginPaneSize {
+            width: width as f32 / scale,
+            height: height as f32 / scale,
+            scale,
+        };
+        send_presentation_event(
+            runtime,
+            PresentationEvent::PaneResized {
+                pane: *pane,
+                width: size.width,
+                height: size.height,
+                scale: size.scale,
+                resize_epoch,
+            },
+        )?;
+        renderer.mark_plugin_resize_sent(*pane, size);
+    }
+    Ok(())
+}
+
+fn send_plugin_pane_resize_events_best_effort(
+    runtime: Option<&PresentationWasmRuntime>,
+    renderer: &mut Renderer,
+    panes: &[u64],
+    resize_epoch: Option<u64>,
+    context: &str,
+) {
+    for pane in panes {
+        if let Err(error) =
+            send_plugin_pane_resize_events(runtime, renderer, &[*pane], resize_epoch)
+        {
+            eprintln!(
+                "could not notify plugin pane resize pane={pane} resize_epoch={resize_epoch:?} context={context}: {error:#}"
+            );
+        }
+    }
+}
+
+fn promote_ready_synchronized_resize(
+    active: Option<&mut ActiveSynchronizedResize>,
+    renderer: &mut Renderer,
+    trace: &mut ResizePresentationTrace,
+) -> Result<Option<FocusChange>> {
+    let Some(active) = active else {
+        return Ok(None);
+    };
+    let SynchronizedResizePresentation::Ready {
+        degraded,
+        missing_panes,
+    } = active.presentation.clone()
+    else {
+        return Ok(None);
+    };
+    let change = renderer.promote_staged_layout(active.epoch.id, active.focus, degraded)?;
+    active.presentation = SynchronizedResizePresentation::Promoted {
+        degraded,
+        missing_panes,
+    };
+    trace.phase = if degraded { "degraded" } else { "promoted" };
+    trace.degraded = degraded;
+    Ok(change)
 }
 
 fn send_input(lane: &mut InputLane, message: ClientMessage) -> bool {
@@ -6300,7 +8234,9 @@ fn apply_key_policy_host_message(
         }
         HostMessage::SetResolvedLayout { .. }
         | HostMessage::ClaimRootLayout
-        | HostMessage::DelegateLayoutRest { .. } => {
+        | HostMessage::DelegateLayoutRest { .. }
+        | HostMessage::SubmitSynchronizedLayout(_)
+        | HostMessage::ReusePaneContent(_) => {
             return Err(anyhow!(
                 "key policy cannot mutate layout authority directly; it must message a layout actor"
             ));
@@ -6475,6 +8411,472 @@ fn pointer_target_for_cursor(
             .or(Some(grab.target));
     }
     cursor_position.and_then(|(x, y)| renderer.pointer_target_for_window_point(x, y))
+}
+
+fn lease_local_point_to_window_point(
+    position: LocalPoint,
+    lease_viewport: brood_layout::LocalTransform,
+    window_extent: (u32, u32),
+) -> Result<(f64, f64)> {
+    let root_u = lease_viewport
+        .size
+        .u
+        .mul_add((position.u + 1.0) * 0.5, lease_viewport.offset.u);
+    let root_v = lease_viewport
+        .size
+        .v
+        .mul_add((position.v + 1.0) * 0.5, lease_viewport.offset.v);
+    let x = ((root_u + 1.0) * 0.5) * f64::from(window_extent.0.max(1));
+    let y = ((root_v + 1.0) * 0.5) * f64::from(window_extent.1.max(1));
+    anyhow::ensure!(
+        x.is_finite() && y.is_finite(),
+        "modified pointer position overflows the presentation viewport"
+    );
+    Ok((x, y))
+}
+
+/// Apply the portable policy's deliberately narrow modification whitelist.
+///
+/// A modified position is forwarded for this event only; it never moves or
+/// replaces the client's physical cursor state. Events already owned by a
+/// policy capture remain consumed even when their trusted actor envelope is
+/// modified.
+fn apply_pointer_policy_result(
+    local_position: LocalPoint,
+    window_position: Option<(f64, f64)>,
+    modifiers: u32,
+    captured: bool,
+    result: &brood_wasm::PointerPolicyResult,
+    lease_viewport: brood_layout::LocalTransform,
+    window_extent: (u32, u32),
+) -> Result<EffectivePointerPolicyEvent> {
+    let modification = match result.delivery {
+        brood_wasm::PointerDelivery::Modify => Some(
+            result
+                .modification
+                .as_ref()
+                .context("modified pointer result has no modification")?,
+        ),
+        brood_wasm::PointerDelivery::PassThrough | brood_wasm::PointerDelivery::Consume => {
+            anyhow::ensure!(
+                result.modification.is_none(),
+                "unmodified pointer result supplied a modification"
+            );
+            None
+        }
+    };
+    let effective_local_position = modification
+        .and_then(|modification| modification.local_position)
+        .map_or(local_position, |position| LocalPoint {
+            u: position.u,
+            v: position.v,
+        });
+    let effective_modifiers = modification
+        .and_then(|modification| modification.modifiers)
+        .unwrap_or(modifiers);
+    let route = if captured || result.delivery == brood_wasm::PointerDelivery::Consume {
+        PointerPolicyRoute::Consumed
+    } else {
+        let position =
+            if modification.is_some_and(|modification| modification.local_position.is_some()) {
+                Some(lease_local_point_to_window_point(
+                    effective_local_position,
+                    lease_viewport,
+                    window_extent,
+                )?)
+            } else {
+                window_position
+            };
+        PointerPolicyRoute::Forward {
+            position,
+            modifiers: effective_modifiers,
+        }
+    };
+    Ok(EffectivePointerPolicyEvent {
+        local_position: effective_local_position,
+        modifiers: effective_modifiers,
+        route,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the trusted pointer envelope keeps every authority and input field explicit"
+)]
+fn encode_canonical_layout_pointer_message(
+    interaction: Option<brood_wasm::InteractionId>,
+    event_sequence: u64,
+    zone: ComposedZoneId,
+    phase: brood_wasm::PointerPhase,
+    position: LocalPoint,
+    button: Option<u32>,
+    modifiers: u32,
+    inventory_revision: u64,
+    base_layout_revision: u64,
+    provider_payload: &[u8],
+) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": "layout-pointer",
+        "interaction": interaction,
+        "event_sequence": event_sequence,
+        "lease": {
+            "id": zone.lease.0,
+            "generation": zone.lease_generation,
+        },
+        "zone": zone.local_item.0,
+        "phase": phase,
+        "position": {
+            "u": position.u,
+            "v": position.v,
+        },
+        "button": button,
+        "modifiers": modifiers,
+        "inventory_revision": inventory_revision,
+        "base_layout_revision": base_layout_revision,
+        "provider_payload": provider_payload,
+    }))
+    .context("encode canonical pointer-policy actor message")
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "capture cleanup needs the trusted layout and pointer context for its final cancel"
+)]
+fn cancel_policy_pointer_capture(
+    renderer: &mut Renderer,
+    runtime: Option<&PresentationWasmRuntime>,
+    holders: &BTreeMap<LayoutLeaseId, ActorIdentity>,
+    inventory_revision: u64,
+    base_layout_revision: u64,
+    capture: &mut Option<PolicyPointerCapture>,
+    event_sequence: &mut u64,
+    modifiers: u32,
+    reason: &str,
+) -> bool {
+    let Some(active) = capture.take() else {
+        renderer.set_zone_pointer_state(None, None, CursorRole::Default);
+        return false;
+    };
+    let sequence = event_sequence.saturating_add(1).max(1);
+    *event_sequence = sequence;
+    if let (Some(runtime), Some(holder)) = (runtime, holders.get(&active.zone.lease)) {
+        let delivery = encode_canonical_layout_pointer_message(
+            Some(active.interaction),
+            sequence,
+            active.zone,
+            brood_wasm::PointerPhase::Cancel,
+            active.local_position,
+            None,
+            modifiers,
+            inventory_revision,
+            base_layout_revision,
+            &[],
+        )
+        .and_then(|payload| {
+            runtime.send_actor_message(&holder.name, "pointer-policy".to_string(), payload)
+        });
+        if let Err(error) = delivery {
+            eprintln!(
+                "could not deliver pointer-policy cancel interaction={} reason={reason}: {error:#}",
+                active.interaction.0
+            );
+        }
+    }
+    renderer.set_zone_pointer_state(None, None, CursorRole::Default);
+    eprintln!(
+        "pointer-policy capture cancelled interaction={} event_sequence={sequence} reason={reason}",
+        active.interaction.0
+    );
+    true
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pointer routing keeps the independently owned policy, lease, capture, and event-loop state explicit"
+)]
+fn route_layout_zone_pointer(
+    renderer: &mut Renderer,
+    policy: &mut Option<ClientPointerPolicy>,
+    runtime: Option<&PresentationWasmRuntime>,
+    holders: &BTreeMap<LayoutLeaseId, ActorIdentity>,
+    inventory_revision: u64,
+    base_layout_revision: u64,
+    capture: &mut Option<PolicyPointerCapture>,
+    next_interaction: &mut u64,
+    event_sequence: &mut u64,
+    cursor_position: Option<(f64, f64)>,
+    phase: brood_wasm::PointerPhase,
+    event_mask: PointerEventMask,
+    button: Option<u32>,
+    modifiers: u32,
+) -> Result<PointerPolicyRoute> {
+    let position = cursor_position;
+    let hit = capture.as_ref().map_or_else(
+        || position.and_then(|(x, y)| renderer.zone_at_window_point(x, y, event_mask)),
+        |active| {
+            position
+                .and_then(|(x, y)| renderer.captured_zone_at_window_point(active.zone, x, y))
+                .or_else(|| {
+                    renderer
+                        .presented_zones
+                        .iter()
+                        .find(|zone| zone.id == active.zone)
+                        .map(|zone| ZoneHitResult {
+                            zone: zone.id,
+                            local_position: active.local_position,
+                            event_mask: zone.event_mask,
+                            cursor: zone.cursor,
+                            input: zone.input,
+                        })
+                })
+        },
+    );
+    let Some(hit) = hit else {
+        let cancelled = cancel_policy_pointer_capture(
+            renderer,
+            runtime,
+            holders,
+            inventory_revision,
+            base_layout_revision,
+            capture,
+            event_sequence,
+            modifiers,
+            "composed zone disappeared",
+        );
+        return Ok(if cancelled {
+            PointerPolicyRoute::Consumed
+        } else {
+            PointerPolicyRoute::Forward {
+                position,
+                modifiers,
+            }
+        });
+    };
+
+    let captured_before = capture.is_some();
+    let captured_zone = capture.as_ref().map(|active| active.zone);
+    renderer.set_zone_pointer_state(
+        (!captured_before).then_some(hit.zone),
+        captured_zone,
+        hit.cursor,
+    );
+    if !zone_has_actor_policy_authority(hit.zone) {
+        if captured_before {
+            cancel_policy_pointer_capture(
+                renderer,
+                runtime,
+                holders,
+                inventory_revision,
+                base_layout_revision,
+                capture,
+                event_sequence,
+                modifiers,
+                "synthetic fallback zone cannot own policy capture",
+            );
+            return Ok(PointerPolicyRoute::Consumed);
+        }
+        return Ok(PointerPolicyRoute::Forward {
+            position,
+            modifiers,
+        });
+    }
+    if !hit.event_mask.intersects(event_mask) && !captured_before {
+        return Ok(PointerPolicyRoute::Forward {
+            position,
+            modifiers,
+        });
+    }
+    let Some(policy) = policy.as_mut().filter(|policy| policy.is_available()) else {
+        if captured_before {
+            cancel_policy_pointer_capture(
+                renderer,
+                runtime,
+                holders,
+                inventory_revision,
+                base_layout_revision,
+                capture,
+                event_sequence,
+                modifiers,
+                "pointer provider became unavailable",
+            );
+            return Ok(PointerPolicyRoute::Consumed);
+        }
+        return Ok(PointerPolicyRoute::Forward {
+            position,
+            modifiers,
+        });
+    };
+
+    let sequence = event_sequence.saturating_add(1).max(1);
+    *event_sequence = sequence;
+    let query_interaction = capture.as_ref().map(|active| active.interaction);
+    let result = match policy.evaluate(brood_wasm::PointerPolicyQuery {
+        interaction: query_interaction,
+        event_sequence: sequence,
+        lease: brood_wasm::LayoutLeaseToken {
+            id: hit.zone.lease.0,
+            generation: hit.zone.lease_generation,
+        },
+        zone: brood_wasm::LayoutItemId(hit.zone.local_item.0),
+        phase,
+        local_position: brood_wasm::LocalPoint {
+            u: hit.local_position.u,
+            v: hit.local_position.v,
+        },
+        button,
+        modifiers,
+        captured: captured_before,
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            cancel_policy_pointer_capture(
+                renderer,
+                runtime,
+                holders,
+                inventory_revision,
+                base_layout_revision,
+                capture,
+                event_sequence,
+                modifiers,
+                "provider evaluation failed",
+            );
+            return Err(error);
+        }
+    };
+    let lease_viewport = renderer
+        .presented_zones
+        .iter()
+        .find(|zone| zone.id == hit.zone)
+        .context("pointer-policy zone disappeared before applying its result")?
+        .lease_viewport;
+    let window_size = renderer.window.inner_size();
+    let effective = match apply_pointer_policy_result(
+        hit.local_position,
+        position,
+        modifiers,
+        captured_before,
+        &result,
+        lease_viewport,
+        (window_size.width, window_size.height),
+    ) {
+        Ok(effective) => effective,
+        Err(error) => {
+            cancel_policy_pointer_capture(
+                renderer,
+                runtime,
+                holders,
+                inventory_revision,
+                base_layout_revision,
+                capture,
+                event_sequence,
+                modifiers,
+                "invalid modified pointer delivery",
+            );
+            return Err(error);
+        }
+    };
+
+    if result.capture == brood_wasm::PointerCapture::Acquire && capture.is_none() {
+        let interaction = brood_wasm::InteractionId((*next_interaction).max(1));
+        *next_interaction = interaction.0.saturating_add(1);
+        let mut buttons = BTreeSet::new();
+        if let Some(button) = button {
+            buttons.insert(button);
+        }
+        *capture = Some(PolicyPointerCapture {
+            interaction,
+            zone: hit.zone,
+            buttons,
+            event_sequence: sequence,
+            local_position: effective.local_position,
+        });
+        renderer.set_zone_pointer_state(None, Some(hit.zone), hit.cursor);
+        eprintln!(
+            "pointer-policy capture acquired interaction={} lease={} generation={} zone={} event_sequence={sequence}",
+            interaction.0, hit.zone.lease.0, hit.zone.lease_generation, hit.zone.local_item.0
+        );
+    } else if let Some(active) = capture.as_mut() {
+        active.event_sequence = sequence;
+        active.local_position = effective.local_position;
+        if phase == brood_wasm::PointerPhase::ButtonPress {
+            if let Some(button) = button {
+                active.buttons.insert(button);
+            }
+        } else if phase == brood_wasm::PointerPhase::ButtonRelease
+            && let Some(button) = button
+        {
+            active.buttons.remove(&button);
+        }
+    }
+
+    let interaction = capture.as_ref().map(|active| active.interaction);
+    let delivery = (|| -> Result<()> {
+        let holder = holders
+            .get(&hit.zone.lease)
+            .context("pointer-policy zone lease has no actor holder")?;
+        for message in result.messages {
+            anyhow::ensure!(
+                message.actor == holder.name,
+                "pointer policy tried to address actor {:?}, but zone lease {} belongs to {:?}",
+                message.actor,
+                hit.zone.lease.0,
+                holder.name
+            );
+            let payload = encode_canonical_layout_pointer_message(
+                interaction,
+                sequence,
+                hit.zone,
+                phase,
+                effective.local_position,
+                button,
+                effective.modifiers,
+                inventory_revision,
+                base_layout_revision,
+                &message.payload,
+            )?;
+            runtime
+                .context("pointer-policy actor runtime is unavailable")?
+                .send_actor_message(&holder.name, "pointer-policy".to_string(), payload)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = delivery {
+        cancel_policy_pointer_capture(
+            renderer,
+            runtime,
+            holders,
+            inventory_revision,
+            base_layout_revision,
+            capture,
+            event_sequence,
+            modifiers,
+            "actor delivery failed",
+        );
+        return Err(error);
+    }
+
+    let release_capture = capture.as_ref().is_some_and(|active| {
+        result.capture == brood_wasm::PointerCapture::Release
+            || (phase == brood_wasm::PointerPhase::ButtonRelease && active.buttons.is_empty())
+            || phase == brood_wasm::PointerPhase::Cancel
+    });
+    if release_capture {
+        let Some(released) = capture.take() else {
+            return Ok(effective.route);
+        };
+        let hover = position
+            .and_then(|(x, y)| renderer.zone_at_window_point(x, y, PointerEventMask::SUPPORTED));
+        renderer.set_zone_pointer_state(
+            hover.map(|hit| hit.zone),
+            None,
+            hover.map_or(CursorRole::Default, |hit| hit.cursor),
+        );
+        eprintln!(
+            "pointer-policy capture released interaction={} event_sequence={sequence} phase={phase:?}",
+            released.interaction.0
+        );
+    }
+    Ok(effective.route)
 }
 
 fn route_pointer_motion(
@@ -7105,6 +9507,59 @@ fn create_placeholder_pipeline(
     })
 }
 
+fn create_solid_pipeline(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+    label: &str,
+    color: [f32; 4],
+) -> wgpu::RenderPipeline {
+    let source = format!(
+        "@vertex fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {{
+            var positions = array<vec2<f32>, 3>(
+                vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+            return vec4<f32>(positions[index], 0.0, 1.0);
+        }}
+        @fragment fn fragment() -> @location(0) vec4<f32> {{
+            return vec4<f32>({:.7}, {:.7}, {:.7}, {:.7});
+        }}",
+        color[0], color[1], color[2], color[3]
+    );
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fragment"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn dmabuf_texture_formats(fourcc: u32) -> Result<(wgpu::TextureFormat, wgpu::TextureFormat)> {
     const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
     const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -7227,6 +9682,24 @@ impl Renderer {
         let (frame_bind_group_layout, frame_sampler, frame_pipeline) =
             create_frame_pipeline(&device, config.format);
         let placeholder_pipeline = create_placeholder_pipeline(&device, config.format);
+        let divider_pipeline = create_solid_pipeline(
+            &device,
+            config.format,
+            "native divider",
+            [0.48, 0.54, 0.64, 1.0],
+        );
+        let divider_hover_pipeline = create_solid_pipeline(
+            &device,
+            config.format,
+            "hovered native divider",
+            [0.35, 0.66, 0.95, 1.0],
+        );
+        let divider_active_pipeline = create_solid_pipeline(
+            &device,
+            config.format,
+            "captured native divider",
+            [0.20, 0.78, 1.0, 1.0],
+        );
         let plugin_canvas =
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
         surface.configure(&device, &config);
@@ -7249,6 +9722,9 @@ impl Renderer {
             frame_sampler,
             frame_pipeline,
             placeholder_pipeline,
+            divider_pipeline,
+            divider_hover_pipeline,
+            divider_active_pipeline,
             plugin_canvas,
             imported_frames: HashMap::new(),
             frame_keys: BTreeMap::new(),
@@ -7262,10 +9738,22 @@ impl Renderer {
             current_sequences: BTreeMap::new(),
             plugin_graphics,
             plugin_panes: BTreeMap::new(),
+            staged_plugin_panes: BTreeMap::new(),
             plugin_pane_realms: BTreeMap::new(),
             focused_pane: None,
             pending_focus_pane: None,
             accepted_layout: ResolvedLayout::empty(),
+            accepted_zones: Vec::new(),
+            accepted_dividers: Vec::new(),
+            presented_layout: ResolvedLayout::empty(),
+            presented_zones: Vec::new(),
+            presented_dividers: Vec::new(),
+            settled_layout: ResolvedLayout::empty(),
+            settled_zones: Vec::new(),
+            settled_dividers: Vec::new(),
+            staged_layouts: BTreeMap::new(),
+            hovered_zone: None,
+            captured_zone: None,
             layout_source: LayoutSource::NativeFallback,
             layout_state_dirty: true,
             sent_managed_sizes: HashMap::new(),
@@ -7596,7 +10084,7 @@ impl Renderer {
 
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
         let Some(target) = focus_request_target(
-            &self.accepted_layout,
+            &self.presented_layout,
             pane,
             self.focus_target_for_pane(pane),
         ) else {
@@ -7648,7 +10136,7 @@ impl Renderer {
             h: i32::try_from(height).unwrap_or(i32::MAX).max(1),
         };
         let hit = self
-            .accepted_layout
+            .presented_layout
             .hit_stack(LocalPoint::from_pixel_in_rect(x, y, bounds))
             .into_iter()
             .next()?;
@@ -7656,6 +10144,109 @@ impl Renderer {
             return None;
         };
         Some(pane)
+    }
+
+    fn root_point_for_window_point(&self, x: f64, y: f64) -> LocalPoint {
+        let (x, y) = self.scene_position_for_window_point(x, y);
+        let (width, height) = self.composition_extent();
+        LocalPoint {
+            u: (x / f64::from(width.max(1))).mul_add(2.0, -1.0),
+            v: (y / f64::from(height.max(1))).mul_add(2.0, -1.0),
+        }
+    }
+
+    fn zone_at_window_point(
+        &self,
+        x: f64,
+        y: f64,
+        event: PointerEventMask,
+    ) -> Option<ZoneHitResult> {
+        let point = self.root_point_for_window_point(x, y);
+        let candidate = self
+            .presented_zones
+            .iter()
+            .enumerate()
+            .filter(|(_, zone)| zone.event_mask.intersects(event))
+            .filter_map(|(index, zone)| {
+                local_point_in_transform(point, zone.transform, true)
+                    .and_then(|_| local_point_in_transform(point, zone.lease_viewport, false))
+                    .map(|local_position| (zone.z, index, zone, local_position))
+            })
+            .max_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+            })
+            .map(|(_, _, zone, local_position)| ZoneHitResult {
+                zone: zone.id,
+                local_position,
+                event_mask: zone.event_mask,
+                cursor: zone.cursor,
+                input: zone.input,
+            })?;
+        let zone_z = self
+            .presented_zones
+            .iter()
+            .find(|zone| zone.id == candidate.zone)
+            .map_or(f64::MIN, |zone| zone.z);
+        let item_above = self
+            .presented_layout
+            .hit_stack(point)
+            .first()
+            .and_then(|hit| {
+                self.presented_layout
+                    .items
+                    .iter()
+                    .find(|item| item.id == hit.item)
+            })
+            .is_some_and(|item| item.z > zone_z);
+        (!item_above).then_some(candidate)
+    }
+
+    fn captured_zone_at_window_point(
+        &self,
+        id: ComposedZoneId,
+        x: f64,
+        y: f64,
+    ) -> Option<ZoneHitResult> {
+        let point = self.root_point_for_window_point(x, y);
+        let zone = self.presented_zones.iter().find(|zone| zone.id == id)?;
+        Some(ZoneHitResult {
+            zone: zone.id,
+            local_position: local_point_in_transform(point, zone.lease_viewport, false)?,
+            event_mask: zone.event_mask,
+            cursor: zone.cursor,
+            input: zone.input,
+        })
+    }
+
+    fn set_zone_pointer_state(
+        &mut self,
+        hovered: Option<ComposedZoneId>,
+        captured: Option<ComposedZoneId>,
+        cursor: CursorRole,
+    ) {
+        let changed = self.hovered_zone != hovered || self.captured_zone != captured;
+        self.hovered_zone = hovered;
+        self.captured_zone = captured;
+        self.window.set_cursor(match cursor {
+            CursorRole::Default => CursorIcon::Default,
+            CursorRole::Pointer => CursorIcon::Pointer,
+            CursorRole::ColResize => CursorIcon::ColResize,
+            CursorRole::RowResize => CursorIcon::RowResize,
+        });
+        if changed {
+            self.window.request_redraw();
+        }
+    }
+
+    fn primary_divider_x(&self) -> i32 {
+        self.presented_dividers
+            .iter()
+            .find(|divider| divider.axis == brood_layout::DividerAxis::Vertical)
+            .map_or(-1, |divider| {
+                snapped_divider_rect(*divider, self.layout_extent())[0]
+            })
     }
 
     fn set_focus(&mut self, target: FocusedPane) -> Option<FocusChange> {
@@ -7706,21 +10297,55 @@ impl Renderer {
         y: f64,
     ) -> Option<PanePointerTarget> {
         let (x, y) = self.scene_position_for_window_point(x, y);
-        if let Some(plugin) = self.plugin_panes.get(&pane) {
+        let item = self.presented_layout.pane_item(pane)?;
+        let rect = item.pixel_rect(self.layout_extent());
+        let rect = [rect.x, rect.y, rect.w, rect.h];
+        if self.plugin_panes.contains_key(&pane) {
             let scale = self.window.scale_factor() as f32;
-            let (x, y) = plugin_local_point(x, y, plugin.rect, scale);
+            let (x, y) = plugin_local_point(x, y, rect, scale);
             return Some(PanePointerTarget::Plugin { pane, x, y });
         }
         let window = self
             .current_windows
             .iter()
             .find(|window| window.window_id == pane)?;
-        let (x, y) = project_point_between_rects(x, y, window.rect, window.source_rect);
+        let (x, y) = project_point_between_rects(x, y, rect, window.source_rect);
         Some(PanePointerTarget::Managed { pane, x, y })
     }
 
     fn composition_extent(&self) -> (u32, u32) {
         (self.config.width.max(1), self.config.height.max(1))
+    }
+
+    fn note_frame_presented(&mut self) {
+        self.presented_layout = self.accepted_layout.clone();
+        self.presented_zones = self.accepted_zones.clone();
+        self.presented_dividers = self.accepted_dividers.clone();
+    }
+
+    fn accepted_layout_differs_from_presented(&self) -> bool {
+        self.accepted_layout != self.presented_layout
+            || self.accepted_zones != self.presented_zones
+            || self.accepted_dividers != self.presented_dividers
+    }
+
+    fn reset_accepted_to_presented(&mut self) -> Option<FocusChange> {
+        self.accepted_layout = self.presented_layout.clone();
+        self.accepted_zones = self.presented_zones.clone();
+        self.accepted_dividers = self.presented_dividers.clone();
+        let change = self.project_accepted_layout(None);
+        self.window.request_redraw();
+        change
+    }
+
+    fn settle_promoted_layout(&mut self) {
+        self.settled_layout = self.accepted_layout.clone();
+        self.settled_zones = self.accepted_zones.clone();
+        self.settled_dividers = self.accepted_dividers.clone();
+    }
+
+    fn staged_layout_count(&self) -> usize {
+        self.staged_layouts.len()
     }
 
     fn reconcile_layout(&mut self) -> Option<FocusChange> {
@@ -7764,19 +10389,37 @@ impl Renderer {
 
     fn commit_actor_layout(
         &mut self,
-        layout: ResolvedLayout,
-        focus: Option<u64>,
-    ) -> (Option<FocusChange>, bool) {
+        composed: ComposedLayout,
+    ) -> (Option<FocusChange>, bool, bool) {
         let panes = self.pane_inventory();
-        match layout.validate_for_panes(&panes) {
+        match composed.layout.clone().validate_for_panes(&panes) {
             Ok(layout) => {
                 let pending_focus = self
                     .pending_focus_pane
                     .filter(|pane| layout.pane_item(*pane).is_some());
-                let change =
-                    self.commit_layout(layout, pending_focus.or(focus), LayoutSource::Actor);
+                let focus = pending_focus.or(composed.focus);
+                let layout_changed = durable_composed_layout_differs(
+                    &self.presented_layout,
+                    &self.presented_zones,
+                    &self.presented_dividers,
+                    &ComposedLayout {
+                        layout: layout.clone(),
+                        zones: composed.zones.clone(),
+                        dividers: composed.dividers.clone(),
+                        focus,
+                    },
+                );
+                let change = self.commit_composed_layout(
+                    ComposedLayout {
+                        layout,
+                        zones: composed.zones,
+                        dividers: composed.dividers,
+                        focus,
+                    },
+                    LayoutSource::Actor,
+                );
                 self.clear_fulfilled_pending_focus(pending_focus);
-                (change, true)
+                (change, true, layout_changed)
             }
             Err(error) => self.reject_actor_layout(&error),
         }
@@ -7785,10 +10428,10 @@ impl Renderer {
     fn reject_actor_layout(
         &mut self,
         error: &dyn std::fmt::Display,
-    ) -> (Option<FocusChange>, bool) {
+    ) -> (Option<FocusChange>, bool, bool) {
         if self.layout_source == LayoutSource::Actor {
             eprintln!("rejected actor-submitted layout; retaining last accepted layout: {error}");
-            return (self.project_accepted_layout(None), false);
+            return (self.project_accepted_layout(None), false, false);
         }
         eprintln!("rejected actor-submitted layout; using native fallback: {error}");
         let visible = self.default_visible_pane_inventory();
@@ -7800,6 +10443,7 @@ impl Renderer {
                 focus,
                 LayoutSource::NativeFallback,
             ),
+            false,
             false,
         )
     }
@@ -7818,8 +10462,124 @@ impl Renderer {
             eprintln!("presentation layout source changed source={source}");
         }
         self.layout_source = source;
+        let fallback_dividers = if source == LayoutSource::NativeFallback {
+            native_flat_dividers(&layout, self.layout_extent())
+        } else {
+            Vec::new()
+        };
+        let fallback_zones = if source == LayoutSource::NativeFallback {
+            native_flat_interaction_zones(&fallback_dividers, self.layout_extent())
+        } else {
+            Vec::new()
+        };
         self.accepted_layout = layout;
-        self.project_accepted_layout(focus)
+        self.accepted_zones = fallback_zones;
+        self.accepted_dividers = fallback_dividers;
+        self.staged_layouts.clear();
+        self.staged_plugin_panes.clear();
+        let change = self.project_accepted_layout(focus);
+        self.window.request_redraw();
+        change
+    }
+
+    fn commit_composed_layout(
+        &mut self,
+        composed: ComposedLayout,
+        source: LayoutSource,
+    ) -> Option<FocusChange> {
+        if self.layout_source != source {
+            eprintln!("presentation layout source changed source=actor");
+        }
+        self.layout_source = source;
+        self.accepted_layout = composed.layout;
+        self.accepted_zones = composed.zones;
+        self.accepted_dividers = composed.dividers;
+        self.staged_layouts.clear();
+        self.staged_plugin_panes.clear();
+        let change = self.project_accepted_layout(composed.focus);
+        self.window.request_redraw();
+        change
+    }
+
+    fn project_staged_layout(
+        &mut self,
+        resize_epoch: u64,
+        composed: ComposedLayout,
+    ) -> Option<FocusChange> {
+        self.staged_layouts.clear();
+        self.staged_layouts.insert(resize_epoch, composed.clone());
+        self.staged_plugin_panes
+            .retain(|(_pane, epoch), _scene| *epoch == resize_epoch);
+        self.accepted_layout = composed.layout;
+        self.accepted_zones = composed.zones;
+        self.accepted_dividers = composed.dividers;
+        let change = self.project_accepted_layout(None);
+        self.window.request_redraw();
+        change
+    }
+
+    fn abort_staged_layout(
+        &mut self,
+        resize_epoch: u64,
+    ) -> Result<(Option<FocusChange>, Vec<DeferredPluginScene>)> {
+        let was_pre_promotion = self.staged_layouts.remove(&resize_epoch).is_some();
+        self.staged_plugin_panes
+            .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
+        let active_panes = self.plugin_graphics.active_resize_panes(resize_epoch)?;
+        let deferred = self.plugin_graphics.abort_resize_epoch(resize_epoch)?;
+        let mut change = self.reset_accepted_to_presented();
+        let current_inventory = self.pane_inventory().into_iter().collect::<BTreeSet<_>>();
+        let (refresh_panes, force_visible_restore) =
+            aborted_plugin_refresh_plan(was_pre_promotion, active_panes, &deferred);
+        for pane in refresh_panes {
+            if !current_inventory.contains(&pane) {
+                continue;
+            }
+            let refreshed = if force_visible_restore {
+                // A tagged texture may have replaced the old texture before
+                // a render which was skipped or reconfigured. Restore the
+                // bridge-visible scene even though its sequence is older,
+                // without treating the texture replacement as inventory.
+                self.restore_bridge_visible_plugin_graphics(pane)?
+            } else {
+                self.refresh_plugin_graphics(pane, 0)?
+            };
+            if let Some(refreshed) = refreshed {
+                change = Some(refreshed);
+            }
+        }
+        Ok((change, deferred))
+    }
+
+    fn promote_staged_layout(
+        &mut self,
+        resize_epoch: u64,
+        focus: Option<u64>,
+        degraded: bool,
+    ) -> Result<Option<FocusChange>> {
+        let composed = self
+            .staged_layouts
+            .remove(&resize_epoch)
+            .context("promoted resize epoch has no staged layout")?;
+        let layout = composed.layout;
+        let staged = std::mem::take(&mut self.staged_plugin_panes);
+        for ((pane, epoch), scene) in staged {
+            if staged_plugin_scene_is_promotable(epoch, resize_epoch, degraded) {
+                let rect = layout.pane_item(pane).map_or([0, 0, 0, 0], |item| {
+                    let rect = item.pixel_rect(self.layout_extent());
+                    [rect.x, rect.y, rect.w, rect.h]
+                });
+                self.plugin_panes
+                    .insert(pane, PluginPaneTexture { scene, rect });
+            }
+        }
+        self.accepted_layout = layout;
+        self.accepted_zones = composed.zones;
+        self.accepted_dividers = composed.dividers;
+        self.staged_layouts.clear();
+        let change = self.project_accepted_layout(focus);
+        self.window.request_redraw();
+        Ok(change)
     }
 
     fn project_accepted_layout(&mut self, requested_focus: Option<u64>) -> Option<FocusChange> {
@@ -7888,11 +10648,17 @@ impl Renderer {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the layout-state publication keeps each lease-scoped authority field explicit"
+    )]
     fn layout_state_message(
         &self,
         revision: u64,
+        layout_revision: u64,
         lease: brood_layout::LayoutLeaseToken,
         owned_panes: &[u64],
+        waitable_panes: &[u64],
         focused_pane: Option<u64>,
         size: LayoutSize,
         rest: bool,
@@ -7910,10 +10676,18 @@ impl Renderer {
         LayoutStateMessage {
             message_type: "layout-state",
             revision,
+            inventory_revision: revision,
+            layout_revision,
+            presented_layout_revision: layout_revision,
             lease: brood_wasm::LayoutLeaseToken {
                 id: lease.id.0,
                 generation: lease.generation,
             },
+            waitable_panes: waitable_panes
+                .iter()
+                .copied()
+                .filter(|pane| self.plugin_pane_realms.contains_key(pane))
+                .collect(),
             visible_panes,
             active_session: self.active_session,
             available_windows: self
@@ -8010,7 +10784,27 @@ impl Renderer {
         pane: u64,
         expected_sequence: u64,
     ) -> Result<Option<FocusChange>> {
-        let Some(snapshot) = self.plugin_graphics.snapshot(pane)? else {
+        self.refresh_plugin_graphics_inner(pane, expected_sequence, false)
+    }
+
+    fn restore_bridge_visible_plugin_graphics(&mut self, pane: u64) -> Result<Option<FocusChange>> {
+        self.refresh_plugin_graphics_inner(pane, 0, true)
+    }
+
+    fn refresh_plugin_graphics_inner(
+        &mut self,
+        pane: u64,
+        expected_sequence: u64,
+        force_visible_restore: bool,
+    ) -> Result<Option<FocusChange>> {
+        let snapshot = self.plugin_graphics.snapshot(pane)?;
+        let Some(snapshot) = snapshot else {
+            if force_visible_restore {
+                self.plugin_panes.remove(&pane);
+                let change = self.reconcile_layout();
+                self.window.request_redraw();
+                return Ok(change);
+            }
             return Ok(None);
         };
         if snapshot.sequence < expected_sequence {
@@ -8022,10 +10816,10 @@ impl Renderer {
                 || current.scene.height != target.1
                 || current.scene.scale.to_bits() != target.2.to_bits()
         });
-        if self
-            .plugin_panes
-            .get(&pane)
-            .is_some_and(|current| current.scene.sequence >= snapshot.sequence && !target_changed)
+        if !force_visible_restore
+            && self.plugin_panes.get(&pane).is_some_and(|current| {
+                current.scene.sequence >= snapshot.sequence && !target_changed
+            })
         {
             return Ok(None);
         }
@@ -8065,7 +10859,8 @@ impl Renderer {
         );
         self.plugin_panes
             .insert(pane, PluginPaneTexture { scene, rect });
-        self.layout_state_dirty |= new_plugin_pane;
+        self.layout_state_dirty |=
+            plugin_refresh_changes_layout_inventory(new_plugin_pane, force_visible_restore);
         let focus_change = self.reconcile_layout();
         let updated_target = self.plugin_scene_extent(pane);
         if updated_target.0 != target.0
@@ -8087,8 +10882,62 @@ impl Renderer {
         Ok(focus_change)
     }
 
+    fn refresh_staged_plugin_graphics(
+        &mut self,
+        pane: u64,
+        resize_epoch: u64,
+        expected_sequence: u64,
+    ) -> Result<Option<FocusChange>> {
+        let Some(layout) = self.staged_layouts.get(&resize_epoch) else {
+            eprintln!("discarded stale tagged plugin draw pane={pane} resize_epoch={resize_epoch}");
+            self.plugin_graphics.discard_staged_epoch(resize_epoch)?;
+            return Ok(None);
+        };
+        let Some(snapshot) = self.plugin_graphics.staged_snapshot(pane, resize_epoch)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            snapshot.resize_epoch == Some(resize_epoch),
+            "staged plugin snapshot epoch does not match its storage key"
+        );
+        if snapshot.sequence < expected_sequence {
+            return Ok(None);
+        }
+        let scale = self.window.scale_factor() as f32;
+        let item = layout
+            .layout
+            .pane_item(pane)
+            .context("tagged plugin draw pane is absent from staged layout")?;
+        let rect = item.pixel_rect(self.layout_extent());
+        let (width, height) = positive_rect_extent([rect.x, rect.y, rect.w, rect.h])
+            .context("tagged plugin draw has an empty staged allocation")?;
+        let previous = self
+            .staged_plugin_panes
+            .get(&(pane, resize_epoch))
+            .or_else(|| self.plugin_panes.get(&pane).map(|pane| &pane.scene));
+        let scene = self.plugin_canvas.compile(
+            &self.device,
+            &self.queue,
+            &snapshot,
+            (width, height, scale),
+            previous,
+        )?;
+        self.staged_plugin_panes.insert((pane, resize_epoch), scene);
+        eprintln!(
+            "staged plugin draw pane={pane} sequence={} resize_epoch={resize_epoch} gpu_target={width}x{height} scale={scale:.2}",
+            snapshot.sequence
+        );
+        self.window.request_redraw();
+        Ok(None)
+    }
+
     fn sync_plugin_graphics_extents(&mut self) -> Result<()> {
-        if self.window_resize_in_progress {
+        // During ScaleThenAtomic, the visible scene deliberately keeps its old
+        // render target and is sampled into the projected pane rectangle. Only
+        // the epoch-tagged scene is compiled at the target extent. Recompiling
+        // the visible packet here would crop guest coordinates at the new
+        // target instead of smoothly projecting the complete old frame.
+        if self.window_resize_in_progress || !self.staged_layouts.is_empty() {
             return Ok(());
         }
         let scenes = self
@@ -8103,10 +10952,14 @@ impl Renderer {
     }
 
     fn remove_plugin_pane(&mut self, pane: u64) -> Option<FocusChange> {
-        let removed = self.plugin_panes.remove(&pane).is_some();
-        self.plugin_pane_realms.remove(&pane);
+        let removed_visible = self.plugin_panes.remove(&pane).is_some();
+        let removed_realm = self.plugin_pane_realms.remove(&pane).is_some();
+        let staged_before = self.staged_plugin_panes.len();
+        self.staged_plugin_panes
+            .retain(|(staged_pane, _epoch), _scene| *staged_pane != pane);
+        let removed_staged = self.staged_plugin_panes.len() != staged_before;
         self.sent_plugin_sizes.remove(&pane);
-        if !removed {
+        if !removed_visible && !removed_realm && !removed_staged {
             return None;
         }
         self.layout_state_dirty = true;
@@ -8245,7 +11098,36 @@ impl Renderer {
                 multiview_mask: None,
             });
             let extent = self.composition_extent();
-            for pane in self.layout_panes_in_render_order() {
+            for target in self.layout_paint_targets() {
+                let LayoutPaintTarget::Pane(pane) = target else {
+                    let LayoutPaintTarget::Divider(divider) = target else {
+                        continue;
+                    };
+                    let line = snapped_divider_rect(divider, self.layout_extent());
+                    let Some(line) = clip_rect_to_extent(line, extent) else {
+                        continue;
+                    };
+                    let viewport =
+                        scaled_viewport(line, extent, (self.config.width, self.config.height));
+                    render_pass.set_viewport(
+                        viewport[0],
+                        viewport[1],
+                        viewport[2],
+                        viewport[3],
+                        0.0,
+                        1.0,
+                    );
+                    let pipeline = if self.captured_zone == Some(divider.zone) {
+                        &self.divider_active_pipeline
+                    } else if self.hovered_zone == Some(divider.zone) {
+                        &self.divider_hover_pipeline
+                    } else {
+                        &self.divider_pipeline
+                    };
+                    render_pass.set_pipeline(pipeline);
+                    render_pass.draw(0..3, 0..1);
+                    continue;
+                };
                 if let Some(plugin) = self.plugin_panes.get(&pane) {
                     let Some(rect) = clip_rect_to_extent(plugin.rect, extent) else {
                         continue;
@@ -8341,26 +11223,32 @@ impl Renderer {
         }
     }
 
-    fn layout_panes_in_render_order(&self) -> Vec<u64> {
-        let mut panes = self
+    fn layout_paint_targets(&self) -> Vec<LayoutPaintTarget> {
+        let mut targets = self
             .accepted_layout
             .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| match item.kind {
-                LayoutItemKind::Pane { pane } => Some((item.z, index, pane)),
+                LayoutItemKind::Pane { pane } => {
+                    Some((item.z, index, LayoutPaintTarget::Pane(pane)))
+                }
                 LayoutItemKind::Placeholder
                 | LayoutItemKind::Handle
                 | LayoutItemKind::Chrome
                 | LayoutItemKind::Overlay => None,
             })
             .collect::<Vec<_>>();
-        panes.sort_by(|left, right| {
+        let base = targets.len();
+        targets.extend(self.accepted_dividers.iter().copied().enumerate().map(
+            |(index, divider)| (divider.z, base + index, LayoutPaintTarget::Divider(divider)),
+        ));
+        targets.sort_by(|left, right| {
             left.0
                 .total_cmp(&right.0)
                 .then_with(|| left.1.cmp(&right.1))
         });
-        panes.into_iter().map(|(_, _, pane)| pane).collect()
+        targets.into_iter().map(|(_, _, target)| target).collect()
     }
 
     fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32)> {
@@ -8470,6 +11358,190 @@ fn clip_rect_to_extent(rect: [i32; 4], extent: (u32, u32)) -> Option<[i32; 4]> {
     let width = width.max(0).min(extent_width - x);
     let height = height.max(0).min(extent_height - y);
     (width > 0 && height > 0).then_some([x, y, width, height])
+}
+
+fn snapped_divider_rect(divider: ComposedDivider, extent: LayoutSize) -> [i32; 4] {
+    let rect = divider.pixel_rect(extent);
+    match divider.axis {
+        brood_layout::DividerAxis::Vertical => [
+            normalized_layout_coordinate(
+                divider
+                    .transform
+                    .size
+                    .u
+                    .mul_add(0.5, divider.transform.offset.u),
+                extent.w,
+            ),
+            rect.y,
+            1,
+            rect.h.max(1),
+        ],
+        brood_layout::DividerAxis::Horizontal => [
+            rect.x,
+            normalized_layout_coordinate(
+                divider
+                    .transform
+                    .size
+                    .v
+                    .mul_add(0.5, divider.transform.offset.v),
+                extent.h,
+            ),
+            rect.w.max(1),
+            1,
+        ],
+    }
+}
+
+fn normalized_layout_coordinate(coordinate: f64, extent: i32) -> i32 {
+    let extent = extent.max(0);
+    let value = ((coordinate + 1.0) * 0.5) * f64::from(extent);
+    if value.is_nan() {
+        return 0;
+    }
+    value
+        .round()
+        .to_i32()
+        .unwrap_or_else(|| {
+            if value.is_sign_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        })
+        .clamp(0, extent)
+}
+
+fn local_point_in_transform(
+    point: LocalPoint,
+    transform: brood_layout::LocalTransform,
+    require_inside: bool,
+) -> Option<LocalPoint> {
+    if !point.u.is_finite()
+        || !point.v.is_finite()
+        || !transform.offset.u.is_finite()
+        || !transform.offset.v.is_finite()
+        || !transform.size.u.is_finite()
+        || !transform.size.v.is_finite()
+        || transform.size.u <= 0.0
+        || transform.size.v <= 0.0
+    {
+        return None;
+    }
+    if require_inside
+        && (point.u < transform.offset.u
+            || point.v < transform.offset.v
+            || point.u >= transform.offset.u + transform.size.u
+            || point.v >= transform.offset.v + transform.size.v)
+    {
+        return None;
+    }
+    Some(LocalPoint {
+        u: ((point.u - transform.offset.u) / transform.size.u).mul_add(2.0, -1.0),
+        v: ((point.v - transform.offset.v) / transform.size.v).mul_add(2.0, -1.0),
+    })
+}
+
+fn changed_layout_panes(
+    visible: &ResolvedLayout,
+    target: &ResolvedLayout,
+    extent: LayoutSize,
+) -> BTreeSet<u64> {
+    let panes = visible
+        .items
+        .iter()
+        .chain(&target.items)
+        .filter_map(|item| match item.kind {
+            LayoutItemKind::Pane { pane } => Some(pane),
+            LayoutItemKind::Placeholder
+            | LayoutItemKind::Handle
+            | LayoutItemKind::Chrome
+            | LayoutItemKind::Overlay => None,
+        })
+        .collect::<BTreeSet<_>>();
+    panes
+        .into_iter()
+        .filter(|pane| {
+            visible.pane_item(*pane).map(|item| item.pixel_rect(extent))
+                != target.pane_item(*pane).map(|item| item.pixel_rect(extent))
+        })
+        .collect()
+}
+
+fn durable_composed_layout_differs(
+    settled_layout: &ResolvedLayout,
+    settled_zones: &[ComposedInteractionZone],
+    settled_dividers: &[ComposedDivider],
+    target: &ComposedLayout,
+) -> bool {
+    settled_layout != &target.layout
+        || settled_zones != target.zones
+        || settled_dividers != target.dividers
+}
+
+fn synchronized_plugin_notification_sets(
+    affected_panes: &BTreeSet<u64>,
+    wait_panes: &BTreeSet<u64>,
+    plugin_panes: &BTreeSet<u64>,
+) -> (Vec<u64>, Vec<u64>) {
+    let tagged = wait_panes
+        .intersection(plugin_panes)
+        .copied()
+        .collect::<Vec<_>>();
+    let ordinary = affected_panes
+        .difference(wait_panes)
+        .filter(|pane| plugin_panes.contains(pane))
+        .copied()
+        .collect::<Vec<_>>();
+    (tagged, ordinary)
+}
+
+fn should_defer_ordinary_plugin_refresh(
+    resize_epoch: Option<u64>,
+    pane: u64,
+    active_wait_panes: Option<&BTreeSet<u64>>,
+) -> bool {
+    resize_epoch.is_none() && active_wait_panes.is_some_and(|wait_panes| wait_panes.contains(&pane))
+}
+
+const fn staged_plugin_scene_is_promotable(
+    scene_epoch: u64,
+    target_epoch: u64,
+    degraded: bool,
+) -> bool {
+    !degraded && scene_epoch == target_epoch
+}
+
+fn synchronized_resize_recovery_panes(wait_panes: &BTreeSet<u64>, degraded: bool) -> Vec<u64> {
+    if degraded {
+        wait_panes.iter().copied().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn aborted_plugin_refresh_plan(
+    was_pre_promotion: bool,
+    active_panes: Vec<u64>,
+    deferred: &[DeferredPluginScene],
+) -> (Vec<u64>, bool) {
+    if was_pre_promotion {
+        (
+            deferred
+                .iter()
+                .map(|(pane, _sequence, _terminal_input_sequence)| *pane)
+                .collect(),
+            false,
+        )
+    } else {
+        (active_panes, true)
+    }
+}
+
+const fn plugin_refresh_changes_layout_inventory(
+    new_plugin_pane: bool,
+    force_visible_restore: bool,
+) -> bool {
+    new_plugin_pane && !force_visible_restore
 }
 
 fn scene_focus_target(
@@ -8614,7 +11686,607 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brood_layout::LayoutItemId;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    fn test_pane_item(pane: u64, left: f64, width: f64) -> brood_layout::ResolvedLayoutItem {
+        brood_layout::ResolvedLayoutItem {
+            id: brood_layout::LayoutItemId(pane),
+            kind: LayoutItemKind::Pane { pane },
+            z: pane as f64,
+            transform: brood_layout::LocalTransform {
+                offset: LocalPoint { u: left, v: -1.0 },
+                size: LocalPoint { u: width, v: 2.0 },
+            },
+            input: brood_layout::InputBehavior::Pane,
+        }
+    }
+
+    #[test]
+    fn affected_set_is_derived_from_pixel_allocations() {
+        let visible = ResolvedLayout {
+            items: vec![test_pane_item(1, -1.0, 1.0), test_pane_item(2, 0.0, 1.0)],
+        };
+        let target = ResolvedLayout {
+            items: vec![test_pane_item(1, -1.0, 1.2), test_pane_item(2, 0.2, 0.8)],
+        };
+
+        assert_eq!(
+            changed_layout_panes(&visible, &target, LayoutSize { w: 1000, h: 600 }),
+            BTreeSet::from([1, 2])
+        );
+        assert!(changed_layout_panes(&target, &target, LayoutSize { w: 1000, h: 600 }).is_empty());
+    }
+
+    #[test]
+    fn interaction_chain_accepts_only_revisions_from_its_current_lineage() {
+        assert!(synchronized_base_is_applicable(8, 8, None));
+        assert!(!synchronized_base_is_applicable(7, 8, None));
+        assert!(synchronized_base_is_applicable(5, 8, Some(5)));
+        assert!(synchronized_base_is_applicable(7, 8, Some(5)));
+        assert!(synchronized_base_is_applicable(8, 8, Some(5)));
+        assert!(!synchronized_base_is_applicable(4, 8, Some(5)));
+        assert!(!synchronized_base_is_applicable(9, 8, Some(5)));
+    }
+
+    fn active_resize_with_inventory(
+        presentation: SynchronizedResizePresentation,
+    ) -> Result<ActiveSynchronizedResize> {
+        let mut target_tree = LayoutLeaseTree::default();
+        target_tree.update_inventory(1, &[7, 8])?;
+        let root = target_tree.root_token();
+        let now = Instant::now();
+        Ok(ActiveSynchronizedResize {
+            request_id: 11,
+            interaction: None,
+            event_sequence: 1,
+            chain_base_layout_revision: 1,
+            epoch: brood_wasm::ResizeEpoch {
+                id: 41,
+                lease: root.id.0,
+                lease_generation: root.generation,
+                base_layout_revision: 1,
+                target_layout_revision: 2,
+            },
+            requester: ActorIdentity {
+                name: "layout".to_string(),
+                generation: 7,
+            },
+            target_tree,
+            focus: None,
+            wait_panes: BTreeSet::from([7, 8]),
+            ready_panes: BTreeSet::new(),
+            affected_panes: BTreeSet::from([7, 8]),
+            started: now,
+            deadline: now + SYNCHRONIZED_RESIZE_TIMEOUT,
+            presentation,
+        })
+    }
+
+    #[test]
+    fn inventory_mutation_invalidates_waiting_and_ready_transactions() -> Result<()> {
+        for presentation in [
+            SynchronizedResizePresentation::Waiting,
+            SynchronizedResizePresentation::Ready {
+                degraded: false,
+                missing_panes: Vec::new(),
+            },
+        ] {
+            let active = active_resize_with_inventory(presentation)?;
+            anyhow::ensure!(synchronized_resize_inventory_matches(&active, &[7, 8]));
+            anyhow::ensure!(!synchronized_resize_inventory_matches(&active, &[7]));
+            anyhow::ensure!(!synchronized_resize_inventory_matches(&active, &[7, 8, 9]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_actor_ingress_revalidates_generation_and_mailbox_liveness() {
+        let old = ActorIdentity {
+            name: "layout".to_string(),
+            generation: 7,
+        };
+        let replacement = ActorIdentity {
+            name: "layout".to_string(),
+            generation: 8,
+        };
+        assert!(deferred_actor_sender_is_current(
+            Some(&old),
+            Some(&old),
+            false
+        ));
+        assert!(!deferred_actor_sender_is_current(
+            Some(&old),
+            Some(&replacement),
+            false
+        ));
+        assert!(!deferred_actor_sender_is_current(
+            Some(&old),
+            Some(&old),
+            true
+        ));
+        assert!(deferred_actor_sender_is_current(None, None, false));
+    }
+
+    fn rejected_resize_notification(request_id: u64) -> brood_wasm::SynchronizedLayoutNotification {
+        brood_wasm::SynchronizedLayoutNotification::Rejected(
+            brood_wasm::SynchronizedLayoutRejected {
+                request_id,
+                reason: brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                message: "test backpressure".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn synchronized_terminal_queue_is_ordered_generation_keyed_and_bounded() {
+        let actor = ActorIdentity {
+            name: "layout".to_string(),
+            generation: 7,
+        };
+        let mut application = Application::default();
+        assert!(
+            application
+                .queue_synchronized_layout_terminal_notification(
+                    &actor,
+                    rejected_resize_notification(1),
+                )
+                .is_ok()
+        );
+        assert!(
+            application
+                .queue_synchronized_layout_terminal_notification(
+                    &actor,
+                    rejected_resize_notification(1),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            application.pending_synchronized_layout_notifications.len(),
+            1
+        );
+
+        for request_id in 2..=MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS as u64 {
+            assert!(
+                application
+                    .queue_synchronized_layout_terminal_notification(
+                        &actor,
+                        rejected_resize_notification(request_id),
+                    )
+                    .is_ok()
+            );
+        }
+        let ordered = application
+            .pending_synchronized_layout_notifications
+            .iter()
+            .map(|pending| pending.request_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            (1..=MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS as u64).collect::<Vec<_>>()
+        );
+        assert!(
+            application
+                .queue_synchronized_layout_terminal_notification(
+                    &actor,
+                    rejected_resize_notification(10_000),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            application.pending_synchronized_layout_notifications.len(),
+            MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS
+        );
+    }
+
+    #[test]
+    fn terminal_backpressure_preserves_deferred_actor_ingress() {
+        let actor = ActorIdentity {
+            name: "layout".to_string(),
+            generation: 9,
+        };
+        let mut application = Application::default();
+        application
+            .deferred_actor_host_messages
+            .push_back(HostActorMessage {
+                sender: Some(actor.clone()),
+                payload: br#"{"type":"claim-root-layout"}"#.to_vec(),
+            });
+        assert!(
+            application
+                .queue_synchronized_layout_terminal_notification(
+                    &actor,
+                    rejected_resize_notification(42),
+                )
+                .is_ok()
+        );
+
+        assert!(application.apply_actor_host_messages().is_ok());
+        assert_eq!(application.deferred_actor_host_messages.len(), 1);
+        assert_eq!(
+            application.pending_synchronized_layout_notifications.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn presented_layout_revision_advances_for_every_durable_commit() {
+        assert_eq!(next_presented_layout_revision(0), Some(1));
+        assert_eq!(next_presented_layout_revision(7), Some(8));
+        assert_eq!(next_presented_layout_revision(u64::MAX), None);
+
+        let mut application = Application::default();
+        application.layout_publications.insert(LayoutLeaseId(1), 4);
+        assert!(matches!(
+            application.schedule_presented_layout_revision(),
+            Ok(1)
+        ));
+        assert!(matches!(
+            application.schedule_presented_layout_revision(),
+            Ok(1)
+        ));
+        assert_eq!(application.presented_layout_revision, 0);
+        application.complete_presented_layout_revision();
+        assert_eq!(application.presented_layout_revision, 1);
+        assert!(application.pending_presented_layout_revision.is_none());
+        assert!(application.layout_publications.is_empty());
+        drop(application);
+
+        let settled = ResolvedLayout { items: Vec::new() };
+        let unchanged = ComposedLayout {
+            layout: settled.clone(),
+            zones: Vec::new(),
+            dividers: Vec::new(),
+            focus: None,
+        };
+        assert!(!durable_composed_layout_differs(
+            &settled,
+            &[],
+            &[],
+            &unchanged
+        ));
+        let changed = ComposedLayout {
+            layout: ResolvedLayout {
+                items: vec![test_pane_item(7, -1.0, 2.0)],
+            },
+            ..unchanged
+        };
+        assert!(durable_composed_layout_differs(
+            &settled,
+            &[],
+            &[],
+            &changed
+        ));
+    }
+
+    #[test]
+    fn completed_interaction_lineage_accepts_only_its_queued_release() {
+        let requester = ActorIdentity {
+            name: "workspace".to_string(),
+            generation: 3,
+        };
+        let lease = brood_layout::LayoutLeaseToken {
+            id: LayoutLeaseId(5),
+            generation: 2,
+        };
+        let lineage = SynchronizedResizeLineage {
+            interaction: brood_wasm::InteractionId(17),
+            requester: requester.clone(),
+            lease: lease.id,
+            lease_generation: lease.generation,
+            inventory_revision: 9,
+            origin_layout_revision: 4,
+            last_event_sequence: 21,
+        };
+
+        assert!(lineage.matches(Some(brood_wasm::InteractionId(17)), &requester, lease, 9));
+        assert!(synchronized_base_is_applicable(
+            5,
+            7,
+            Some(lineage.origin_layout_revision)
+        ));
+        assert!(synchronized_event_sequence_advances(
+            22,
+            Some(lineage.last_event_sequence)
+        ));
+        assert!(!synchronized_event_sequence_advances(
+            21,
+            Some(lineage.last_event_sequence)
+        ));
+        assert!(!lineage.matches(Some(brood_wasm::InteractionId(18)), &requester, lease, 9));
+        let restarted_requester = ActorIdentity {
+            generation: 4,
+            ..requester.clone()
+        };
+        assert!(!lineage.matches(
+            Some(brood_wasm::InteractionId(17)),
+            &restarted_requester,
+            lease,
+            9
+        ));
+        assert!(!lineage.matches(
+            Some(brood_wasm::InteractionId(17)),
+            &requester,
+            brood_layout::LayoutLeaseToken {
+                generation: 3,
+                ..lease
+            },
+            9
+        ));
+        assert!(!lineage.matches(Some(brood_wasm::InteractionId(17)), &requester, lease, 10));
+    }
+
+    #[test]
+    fn synchronized_plugin_notifications_tag_only_wait_panes() {
+        let affected = BTreeSet::from([1, 2, 4]);
+        let wait = BTreeSet::from([1, 3]);
+        let plugins = BTreeSet::from([1, 2, 3]);
+
+        assert_eq!(
+            synchronized_plugin_notification_sets(&affected, &wait, &plugins),
+            (vec![1, 3], vec![2])
+        );
+        assert!(should_defer_ordinary_plugin_refresh(None, 1, Some(&wait)));
+        assert!(!should_defer_ordinary_plugin_refresh(
+            Some(9),
+            1,
+            Some(&wait)
+        ));
+        assert!(!should_defer_ordinary_plugin_refresh(None, 2, Some(&wait)));
+    }
+
+    #[test]
+    fn degraded_timeout_promotes_no_partial_waited_content() {
+        let target_epoch = 41;
+        let wait_panes = BTreeSet::from([7, 8]);
+        let ready_staged_scenes = [(7, target_epoch)];
+
+        assert!(staged_plugin_scene_is_promotable(41, 41, false));
+        assert!(!staged_plugin_scene_is_promotable(40, 41, false));
+        assert!(
+            ready_staged_scenes.into_iter().all(|(_pane, scene_epoch)| {
+                !staged_plugin_scene_is_promotable(scene_epoch, target_epoch, true)
+            }),
+            "the fast pane from a timed-out fast/stall pair must keep its old visible content"
+        );
+        assert_eq!(
+            synchronized_resize_recovery_panes(&wait_panes, true),
+            vec![7, 8],
+            "every waited pane is redrawn untagged after the staged epoch is discarded"
+        );
+        assert!(synchronized_resize_recovery_panes(&wait_panes, false).is_empty());
+    }
+
+    #[test]
+    fn waiting_supersession_does_not_rebuild_panes_or_dirty_layout_inventory() {
+        let (waiting_refresh, waiting_force) = aborted_plugin_refresh_plan(true, vec![7, 8], &[]);
+        assert!(waiting_refresh.is_empty());
+        assert!(!waiting_force);
+
+        let released = vec![(8, 6, Some(20))];
+        let (released_refresh, released_force) =
+            aborted_plugin_refresh_plan(true, vec![7, 8], &released);
+        assert_eq!(released_refresh, vec![8]);
+        assert!(!released_force);
+        assert!(!plugin_refresh_changes_layout_inventory(
+            false,
+            released_force
+        ));
+
+        let (promoted_refresh, promoted_force) =
+            aborted_plugin_refresh_plan(false, vec![7, 8], &released);
+        assert_eq!(promoted_refresh, vec![7, 8]);
+        assert!(promoted_force);
+        assert!(!plugin_refresh_changes_layout_inventory(
+            true,
+            promoted_force
+        ));
+    }
+
+    #[test]
+    fn synthetic_fallback_zones_are_hover_only() {
+        let synthetic = ComposedZoneId {
+            lease: LayoutLeaseId(1),
+            lease_generation: 0,
+            local_item: LayoutItemId(9),
+        };
+        assert!(!zone_has_actor_policy_authority(synthetic));
+        assert!(zone_has_actor_policy_authority(ComposedZoneId {
+            lease_generation: 3,
+            ..synthetic
+        }));
+    }
+
+    #[test]
+    fn pointer_modify_rewrites_context_and_forwards_one_effective_event() {
+        let lease_viewport = brood_layout::LocalTransform {
+            offset: LocalPoint { u: -1.0, v: -1.0 },
+            size: LocalPoint { u: 1.0, v: 2.0 },
+        };
+        let result = brood_wasm::PointerPolicyResult {
+            delivery: brood_wasm::PointerDelivery::Modify,
+            capture: brood_wasm::PointerCapture::Unchanged,
+            modification: Some(brood_wasm::PointerModification {
+                local_position: Some(brood_wasm::LocalPoint { u: 0.5, v: -0.5 }),
+                modifiers: Some(4),
+            }),
+            messages: Vec::new(),
+        };
+        let effective = apply_pointer_policy_result(
+            LocalPoint { u: 0.0, v: 0.0 },
+            Some((600.0, 400.0)),
+            1,
+            false,
+            &result,
+            lease_viewport,
+            (1_000, 800),
+        )
+        .unwrap();
+        assert_eq!(effective.local_position, LocalPoint { u: 0.5, v: -0.5 });
+        assert_eq!(effective.modifiers, 4);
+        assert_eq!(
+            effective.route,
+            PointerPolicyRoute::Forward {
+                position: Some((375.0, 200.0)),
+                modifiers: 4,
+            }
+        );
+
+        let zone = ComposedZoneId {
+            lease: LayoutLeaseId(2),
+            lease_generation: 3,
+            local_item: brood_layout::LayoutItemId(9),
+        };
+        let message: serde_json::Value = serde_json::from_slice(
+            &encode_canonical_layout_pointer_message(
+                None,
+                7,
+                zone,
+                brood_wasm::PointerPhase::Motion,
+                effective.local_position,
+                None,
+                effective.modifiers,
+                11,
+                13,
+                b"modified",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(message["position"]["u"], 0.5);
+        assert_eq!(message["position"]["v"], -0.5);
+        assert_eq!(message["modifiers"], 4);
+
+        let captured = apply_pointer_policy_result(
+            LocalPoint { u: 0.0, v: 0.0 },
+            Some((600.0, 400.0)),
+            1,
+            true,
+            &result,
+            lease_viewport,
+            (1_000, 800),
+        )
+        .unwrap();
+        assert_eq!(captured.local_position, effective.local_position);
+        assert_eq!(captured.modifiers, effective.modifiers);
+        assert_eq!(captured.route, PointerPolicyRoute::Consumed);
+
+        let pass_through = apply_pointer_policy_result(
+            LocalPoint { u: 0.0, v: 0.0 },
+            Some((600.0, 400.0)),
+            1,
+            false,
+            &brood_wasm::PointerPolicyResult::default(),
+            lease_viewport,
+            (1_000, 800),
+        )
+        .unwrap();
+        assert_eq!(
+            pass_through.route,
+            PointerPolicyRoute::Forward {
+                position: Some((600.0, 400.0)),
+                modifiers: 1,
+            }
+        );
+
+        let consumed = apply_pointer_policy_result(
+            LocalPoint { u: 0.0, v: 0.0 },
+            Some((600.0, 400.0)),
+            1,
+            false,
+            &brood_wasm::PointerPolicyResult {
+                delivery: brood_wasm::PointerDelivery::Consume,
+                ..brood_wasm::PointerPolicyResult::default()
+            },
+            lease_viewport,
+            (1_000, 800),
+        )
+        .unwrap();
+        assert_eq!(consumed.route, PointerPolicyRoute::Consumed);
+    }
+
+    #[test]
+    fn ordinary_layout_messages_conflict_with_active_synchronized_resize() {
+        let layout = HostMessage::SetResolvedLayout {
+            lease: None,
+            revision: None,
+            layout: brood_wasm::ResolvedLayout {
+                items: Vec::new(),
+                zones: Vec::new(),
+                dividers: Vec::new(),
+            },
+            rest: None,
+            focus: None,
+        };
+        assert!(ordinary_layout_message_conflicts_with_synchronized_resize(
+            &layout
+        ));
+        assert!(!ordinary_layout_message_conflicts_with_synchronized_resize(
+            &HostMessage::ClaimRootLayout
+        ));
+    }
+
+    #[test]
+    fn captured_pointer_coordinates_remain_finite_outside_the_lease() {
+        let transform = brood_layout::LocalTransform {
+            offset: LocalPoint { u: -0.5, v: -0.5 },
+            size: LocalPoint { u: 1.0, v: 1.0 },
+        };
+        assert!(local_point_in_transform(LocalPoint { u: 0.8, v: 0.0 }, transform, true).is_none());
+        assert_eq!(
+            local_point_in_transform(LocalPoint { u: 0.8, v: 0.0 }, transform, false),
+            Some(LocalPoint { u: 1.6, v: 0.0 })
+        );
+    }
+
+    #[test]
+    fn divider_chrome_snaps_to_one_device_pixel() {
+        let zone = ComposedZoneId {
+            lease: LayoutLeaseId(2),
+            lease_generation: 4,
+            local_item: brood_layout::LayoutItemId(80),
+        };
+        let divider = ComposedDivider {
+            id: brood_layout::ComposedDividerId {
+                lease: zone.lease,
+                lease_generation: zone.lease_generation,
+                local_item: brood_layout::LayoutItemId(81),
+            },
+            zone,
+            z: 3.0,
+            transform: brood_layout::LocalTransform {
+                offset: LocalPoint { u: 0.1, v: -1.0 },
+                size: LocalPoint { u: 0.02, v: 2.0 },
+            },
+            axis: brood_layout::DividerAxis::Vertical,
+            role: brood_layout::DividerRole::Split,
+        };
+
+        let line = snapped_divider_rect(divider, LayoutSize { w: 1250, h: 720 });
+        assert_eq!(line[2], 1);
+        assert_eq!(line[1], 0);
+        assert_eq!(line[3], 720);
+
+        let width = 1_001;
+        let fractional = ComposedDivider {
+            transform: brood_layout::LocalTransform {
+                offset: LocalPoint {
+                    u: 0.2 - 1.0 / f64::from(width),
+                    v: -1.0,
+                },
+                size: LocalPoint {
+                    u: 2.0 / f64::from(width),
+                    v: 2.0,
+                },
+            },
+            ..divider
+        };
+        assert_eq!(
+            snapped_divider_rect(fractional, LayoutSize { w: width, h: 720 })[0],
+            601,
+            "divider center must round with the adjacent pane boundary"
+        );
+    }
 
     #[test]
     fn native_logical_characters_fill_missing_text_events() {

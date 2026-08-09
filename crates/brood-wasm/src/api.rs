@@ -103,6 +103,16 @@ impl Registry {
         self.mailboxes.actor_id_for_name(name)
     }
 
+    /// Report whether `name` still names `actor_id` but its receiver is gone.
+    #[must_use]
+    pub fn actor_mailbox_is_closed(&self, name: &str, actor_id: ActorId) -> bool {
+        self.actor_id_for_name(name) != Some(actor_id)
+            || self
+                .mailboxes
+                .actor_mailbox_is_closed(actor_id)
+                .unwrap_or(true)
+    }
+
     pub fn unregister_actor(&mut self, name: &str) -> bool {
         self.mailboxes.unregister_actor(name)
     }

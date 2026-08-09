@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-25
+last-reviewed: 2026-08-09
 ---
 
 # Plugin UI And Pane Rendering
@@ -72,15 +72,23 @@ pane shell and routes lifecycle and pane-local input events to the actor:
 
 ```text
 Client -> Actor: PaneCreated { pane, size, scale, capabilities }
-Client -> Actor: PaneResized / PaneFocused / PaneHidden / PaneDestroyed
+Client -> Actor: PaneResized { optional resize epoch } / PaneFocused / PaneHidden / PaneDestroyed
 Client -> Actor: Pointer / Key / Text / Ime / Frame
-Actor -> Client: SubmitDrawPacket { pane, bytes }
+Actor -> Client: SubmitDrawPacket { pane, optional resize epoch, bytes }
+Actor -> Client: ReusePaneContent { pane, resize epoch }
 Actor -> Client: RequestFrame / CommandRequest / Status
 ```
 
 The actor returns from each dispatch without waiting for I/O, a worker, or GPU
 execution. It may delegate unrelated work and update the pane when a completion
 arrives. Drawing is normal actor output, not a synchronous key decision lane.
+
+A resize-epoch-tagged packet is staged rather than replacing the visible pane
+immediately. When a synchronized layout waits for that pane, only a packet or
+explicit content-reuse response carrying the accepted epoch marks it ready.
+The client promotes the full waited set with its target geometry and native
+chrome in one frame. Untagged packets remain the ordinary redraw path and never
+satisfy a resize barrier accidentally.
 
 The bundled terminal presentation actor follows this lifecycle without a
 terminal-specific pane API. It converts pane size to rows and columns using the

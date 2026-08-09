@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-24
+last-reviewed: 2026-08-09
 ---
 
 # Input And Keyboard Shortcuts
@@ -92,6 +92,15 @@ accessibility tools, or similar UI that genuinely needs raw input. It is
 exclusive for its scope, explicitly activated, bounded, and revocable. Global
 pointer, touch, or gesture capture follows the same rule; normal pointer input
 continues to use layout hit testing.
+
+A layout interaction zone may nominate its lease holder's pointer policy. The
+client chooses the top zone from the presented layout, then makes at most one
+bounded synchronous policy call for that event. The result may consume or pass
+the event, acquire or release capture, and enqueue actor messages. It cannot
+submit layout, create a resize epoch, or wait for drawing. Captured events retain
+one interaction ID and monotonically increasing event sequence even after the
+pointer leaves the original hit zone; focus loss, invalid authority, or provider
+failure releases capture and sends cancellation through the same actor route.
 
 ## Key Policy Provider
 

@@ -52,6 +52,8 @@ pub enum TestCommand {
     Nested(NestedTestArgs),
     /// Run the external-client Neovim editor workload.
     Editor(NestedTestArgs),
+    /// Capture and validate synchronized divider resizing frame by frame.
+    Resize(NestedTestArgs),
     /// Deploy to an SSH host and verify one client against local and remote backends.
     Ssh(SshTestArgs),
 }
@@ -452,4 +454,24 @@ pub struct CtlArgs {
     /// Command to send to the session service.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_test_command_accepts_an_artifact_directory() {
+        let parsed = Args::try_parse_from(["brood", "test", "resize", "--out-dir", "resize-proof"]);
+        assert!(matches!(
+            parsed,
+            Ok(Args {
+                command: Some(Command::Test(TestArgs {
+                    command: Some(TestCommand::Resize(NestedTestArgs {
+                        out_dir: Some(out_dir),
+                    })),
+                })),
+            }) if out_dir == std::path::Path::new("resize-proof")
+        ));
+    }
 }

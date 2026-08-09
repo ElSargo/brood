@@ -2,7 +2,7 @@
 status: current
 type: reference
 authority: implementation
-last-reviewed: 2026-07-22
+last-reviewed: 2026-08-09
 code-links:
   - crates/brood-wasm/src/module.rs
   - crates/brood-wasm/src/module_link.rs
@@ -10,6 +10,9 @@ code-links:
   - crates/brood-wasm/src/actor_link.rs
   - crates/brood-wasm/src/global_key_policy.rs
   - crates/brood-wasm/src/global_key_policy_link.rs
+  - crates/brood-wasm/src/pointer_policy.rs
+  - crates/brood-wasm/src/pointer_policy_link.rs
+  - crates/brood-wasm/src/resize.rs
   - crates/brood-wasm/src/resolved_layout.rs
   - crates/brood-wasm/src/policy_provider.rs
   - crates/brood-wasm/src/test_harness.rs
@@ -59,6 +62,21 @@ worker. The daemon does not host presentation key policy.
 See `global_key_policy.rs`, `global_key_policy_link.rs`, and
 `policy_provider.rs` for the exact export, descriptor, bounds, and decision
 encoding.
+
+## Presentation Pointer Policy
+
+A layout lease holder may expose a named pointer policy. The client invokes it
+only after selecting an applicable interaction zone from the currently
+presented layout. Its bounded query includes the lease token, local zone,
+interaction ID, event sequence, phase, position, button state, and capture
+state. The result controls immediate consume/pass and capture behavior and may
+enqueue bounded actor messages. The adapter validates descriptors, payloads,
+coordinates, and result combinations before routing continues.
+
+The policy lane has no layout or paint authority. Synchronized layout requests,
+tagged draws, and content-reuse responses leave ordinary actor host outboxes;
+see `pointer_policy.rs`, `pointer_policy_link.rs`, and `resize.rs` for the exact
+wire bounds and shapes.
 
 ## Presentation Layout Actors
 

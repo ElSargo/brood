@@ -1,10 +1,14 @@
 //! Canvas submission and text-resource helpers.
 
+use std::sync::Mutex;
+
 use brood_graphics::{Color, Packet};
 
 use crate::brood::plugin::host;
 
 pub use brood_graphics::{Command, PacketError, Rect, theme};
+
+static DEFERRED_RESOURCE_DROPS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Construct the common UI text shape while keeping width bounded.
 #[must_use]
@@ -57,9 +61,45 @@ pub fn submit_packet(pane: u64, packet: &Packet) -> Result<u64, String> {
         .map_err(|error| format!("submit plugin draw packet: {error:?}"))
 }
 
+/// Encode and submit a packet for one synchronized resize epoch.
+///
+/// Unlike [`submit_packet`], the host stages this packet until the matching
+/// resize transaction is presented or discarded.
+pub fn submit_tagged_packet(pane: u64, resize_epoch: u64, packet: &Packet) -> Result<u64, String> {
+    let bytes = packet
+        .encode()
+        .map_err(|error| format!("encode tagged plugin draw packet: {error}"))?;
+    host::graphics_submit_tagged_draw_packet(pane, resize_epoch, &bytes)
+        .map_err(|error| format!("submit tagged plugin draw packet: {error:?}"))
+}
+
+/// Mark one synchronized resize ready using the pane's current visible content.
+pub fn reuse_pane_content(pane: u64, resize_epoch: u64) -> Result<(), String> {
+    host::graphics_reuse_pane_content(pane, resize_epoch)
+        .map_err(|error| format!("reuse plugin pane content: {error:?}"))
+}
+
 /// Best-effort release of resources no longer referenced by the active packet.
+///
+/// Resources still held by visible or staged content are retried on the next
+/// call, after a synchronized resize has had an opportunity to promote.
 pub fn drop_resources(pane: u64, resources: impl IntoIterator<Item = u64>) {
-    for resource in resources {
-        let _drop_result = host::graphics_drop_resource(pane, resource);
+    let mut pending = DEFERRED_RESOURCE_DROPS.lock().map_or_else(
+        |_poisoned| Vec::new(),
+        |mut pending| std::mem::take(&mut *pending),
+    );
+    pending.extend(resources.into_iter().map(|resource| (pane, resource)));
+
+    let mut deferred = Vec::new();
+    for (pane, resource) in pending {
+        if matches!(
+            host::graphics_drop_resource(pane, resource),
+            Err(host::GraphicsError::ResourceInUse)
+        ) {
+            deferred.push((pane, resource));
+        }
+    }
+    if let Ok(mut pending) = DEFERRED_RESOURCE_DROPS.lock() {
+        pending.extend(deferred);
     }
 }

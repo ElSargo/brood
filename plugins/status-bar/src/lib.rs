@@ -7,7 +7,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage,
         PresentationEvent, SessionEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
 };
 use serde::Deserialize;
 
@@ -90,7 +90,7 @@ impl Guest for StatusBar {
                 if resized.pane == state.pane {
                     state.width = resized.width.max(240.0);
                     state.height = resized.height.max(24.0);
-                    redraw_or_record_error(&mut state);
+                    redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
                 }
                 Vec::new()
             }
@@ -137,12 +137,16 @@ impl Guest for StatusBar {
 }
 
 fn redraw_or_record_error(state: &mut StatusBarState) {
-    if let Err(error) = redraw(state) {
+    redraw_for_resize_or_record_error(state, None);
+}
+
+fn redraw_for_resize_or_record_error(state: &mut StatusBarState, resize_epoch: Option<u64>) {
+    if let Err(error) = redraw(state, resize_epoch) {
         state.error = error;
     }
 }
 
-fn redraw(state: &mut StatusBarState) -> Result<(), String> {
+fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), String> {
     if state.pane == 0 {
         return Ok(());
     }
@@ -170,7 +174,7 @@ fn redraw(state: &mut StatusBarState) -> Result<(), String> {
             // Establish the pane's canvas even if text shaping is temporarily
             // unavailable. The accepted layout can then resize the pane and a
             // later resize/session event retries the complete packet.
-            submit_packet(state.pane, &packet)?;
+            submit_redraw_packet(state.pane, resize_epoch, &packet)?;
             drop_resources(state.pane, stale_resources);
             state.text_resources.clear();
             return Err(format!("layout status bar text: {error}"));
@@ -182,11 +186,22 @@ fn redraw(state: &mut StatusBarState) -> Result<(), String> {
         x: 12.0,
         y: ((state.height - 16.0) * 0.5).max(3.0),
     });
-    submit_packet(state.pane, &packet)?;
+    submit_redraw_packet(state.pane, resize_epoch, &packet)?;
     drop_resources(state.pane, stale_resources);
     state.text_resources = vec![handle];
     state.error.clear();
     Ok(())
+}
+
+fn submit_redraw_packet(
+    pane: u64,
+    resize_epoch: Option<u64>,
+    packet: &Packet,
+) -> Result<u64, String> {
+    resize_epoch.map_or_else(
+        || submit_packet(pane, packet),
+        |resize_epoch| submit_tagged_packet(pane, resize_epoch, packet),
+    )
 }
 
 fn status_bar_text(state: &StatusBarState, width: f32) -> String {

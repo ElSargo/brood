@@ -16,16 +16,20 @@ mod epoch_clock;
 mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
+pub mod host_message;
 mod hosted_actor;
 mod legacy_runtime;
 mod lifecycle;
 pub mod mailbox;
 pub mod module;
 mod module_link;
+pub mod pointer_policy;
+mod pointer_policy_link;
 pub mod policy_provider;
 mod policy_provider_link;
 pub mod presentation;
 pub mod preview1_worker;
+pub mod resize;
 pub mod resolved_layout;
 mod resource_limits;
 pub mod runtime_io;
@@ -66,13 +70,13 @@ pub use global_key_policy::{
     ABI_INPUT_MODE_NORMAL, ABI_INPUT_MODE_PASSTHROUGH, ABI_KEY_PRESSED, ABI_KEY_RELEASED,
     ABI_MOD_ALT, ABI_MOD_CTRL, ABI_MOD_SHIFT, DEFAULT_GLOBAL_KEY_POLICY_ARENA_BYTES,
     GlobalKeyActorMessage, GlobalKeyDecision, GlobalKeyPolicyInput, GlobalKeyPolicyInvocation,
-    GlobalKeyPolicyOutcome, HOST_ACTOR_NAME, HostMessage, MAX_GLOBAL_KEY_POLICY_ARENA_BYTES,
+    GlobalKeyPolicyOutcome, HOST_ACTOR_NAME, MAX_GLOBAL_KEY_POLICY_ARENA_BYTES,
     MAX_GLOBAL_KEY_POLICY_QUERY_BYTES, MAX_GLOBAL_KEY_POLICY_RESULT_BYTES, WasmGlobalKeyPolicy,
-    host_message,
 };
 pub use global_key_policy_link::{
     GLOBAL_KEY_POLICY_RESULT_ABSTAIN, GLOBAL_KEY_POLICY_RESULT_ERROR, GLOBAL_KEY_POLICY_RESULT_OK,
 };
+pub use host_message::HostMessage;
 pub use hosted_actor::{HostedWasmActor, aggregate_preview1_compat_stats};
 pub use legacy_runtime::{LegacyWasmActorGeneration, LegacyWasmRuntimeEvent};
 pub use lifecycle::{
@@ -89,6 +93,13 @@ pub use module::{
     WasmPluginConfig, WasmPluginModule,
 };
 pub use module_link::{ACTOR_EXPORT_PREFIX, ACTOR_EXPORT_SUFFIX, ACTOR_SUBSCRIPTION_INFIX};
+pub use pointer_policy::{
+    DEFAULT_POINTER_POLICY_ARENA_BYTES, MAX_POINTER_POLICY_ACTOR_BYTES,
+    MAX_POINTER_POLICY_ARENA_BYTES, MAX_POINTER_POLICY_MESSAGE_BYTES, MAX_POINTER_POLICY_MESSAGES,
+    MAX_POINTER_POLICY_QUERY_BYTES, MAX_POINTER_POLICY_RESULT_BYTES, PointerCapture,
+    PointerDelivery, PointerModification, PointerPhase, PointerPolicyActorMessage,
+    PointerPolicyInvocation, PointerPolicyQuery, PointerPolicyResult, WasmPointerPolicy,
+};
 pub use policy_provider::{
     DEFAULT_PUBLICATION_SLOT, POLICY_PROVIDER_RESPONSE_ABSTAIN, POLICY_PROVIDER_RESPONSE_ERROR,
     POLICY_PROVIDER_RESPONSE_OK, PolicyProviderDeclaration, PolicyProviderKind,
@@ -108,9 +119,16 @@ pub use preview1_worker::{
     Preview1WorkerRuntime, SHARED_MEMORY_IMPORT_MODULE, SHARED_MEMORY_IMPORT_NAME,
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
 };
+pub use resize::{
+    InteractionId, PresentationMode, ResizeEpoch, ReusePaneContent, SubmitSynchronizedLayout,
+    SynchronizedLayoutAccepted, SynchronizedLayoutCompleted, SynchronizedLayoutDegraded,
+    SynchronizedLayoutFragment, SynchronizedLayoutNotification, SynchronizedLayoutRejected,
+    SynchronizedLayoutRejectionReason, SynchronizedLayoutSuperseded,
+};
 pub use resolved_layout::{
-    InputBehavior, LayoutChildSlot, LayoutItemId, LayoutItemKind, LayoutLeaseToken, LocalPoint,
-    LocalTransform, ResolvedLayout, ResolvedLayoutItem,
+    CursorRole, DividerAxis, DividerRole, InputBehavior, InteractionZone, LayoutChildSlot,
+    LayoutDivider, LayoutItemId, LayoutItemKind, LayoutLeaseToken, LocalPoint, LocalTransform,
+    PointerEventMask, ResolvedLayout, ResolvedLayoutItem, ZoneInputBehavior,
 };
 pub use resource_limits::WasmResourceLimits;
 pub use runtime_io::{

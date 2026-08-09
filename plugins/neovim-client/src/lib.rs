@@ -87,6 +87,7 @@ struct ClientState {
     saves: HashMap<u64, SaveTransfer>,
     pending_runner_opens: HashMap<String, String>,
     queued_opens: VecDeque<EditorOpen>,
+    pending_resize_epoch: Option<u64>,
 }
 
 impl ClientState {
@@ -130,6 +131,7 @@ impl ClientState {
             saves: HashMap::new(),
             pending_runner_opens: HashMap::new(),
             queued_opens: VecDeque::new(),
+            pending_resize_epoch: None,
         }
     }
 
@@ -517,13 +519,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.width = resized.width.max(1.0);
             state.height = resized.height.max(1.0);
             state.scale = resized.scale.max(0.1);
+            state.pending_resize_epoch = resized.resize_epoch;
             let (rows, columns) = state.grid_size();
             if let Err(error) = state.queue_runner_value(
                 &json!({"v": 1, "type": "resize", "columns": columns, "rows": rows}),
             ) {
                 state.record_error(error);
             }
-            redraw_or_record_error(state);
+            redraw_for_resize_or_record_error(state, resized.resize_epoch);
         }
         PresentationEvent::PaneFocused(focused) if focused.pane == state.pane => {
             state.focused = focused.focused;
@@ -1329,7 +1332,8 @@ fn handle_notification(event: NotificationEvent) -> Vec<Command> {
         }
     }
     commands.extend(start_queued_opens(state));
-    redraw_or_record_error(state);
+    let resize_epoch = state.pending_resize_epoch;
+    redraw_for_resize_or_record_error(state, resize_epoch);
     commands
 }
 
@@ -1446,17 +1450,26 @@ fn runner_failed(message: String) -> Vec<Command> {
 }
 
 fn redraw_or_record_error(state: &mut ClientState) {
+    redraw_for_resize_or_record_error(state, None);
+}
+
+fn redraw_for_resize_or_record_error(state: &mut ClientState, resize_epoch: Option<u64>) {
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state) {
-        state.record_error(error);
+    match redraw(state, resize_epoch) {
+        Ok(()) => {
+            if resize_epoch.is_some() && state.pending_resize_epoch == resize_epoch {
+                state.pending_resize_epoch = None;
+            }
+        }
+        Err(error) => state.record_error(error),
     }
 }
 
-fn redraw(state: &mut ClientState) -> Result<(), String> {
+fn redraw(state: &mut ClientState, resize_epoch: Option<u64>) -> Result<(), String> {
     let mut layouts = std::mem::take(&mut state.layouts);
-    let result = redraw_with_layouts(state, &mut layouts);
+    let result = redraw_with_layouts(state, &mut layouts, resize_epoch);
     state.layouts = layouts;
     result
 }
@@ -1464,6 +1477,7 @@ fn redraw(state: &mut ClientState) -> Result<(), String> {
 fn redraw_with_layouts(
     state: &ClientState,
     layouts: &mut BTreeMap<LayoutKey, u64>,
+    resize_epoch: Option<u64>,
 ) -> Result<(), String> {
     let mut packet = Packet::new();
     let mut used = BTreeSet::new();
@@ -1593,16 +1607,30 @@ fn redraw_with_layouts(
         )?;
     }
     let bytes = packet.encode().map_err(|error| error.to_string())?;
-    host::graphics_submit_draw_packet(state.pane, &bytes)
-        .map_err(|error| format!("submit Neovim screen: {error:?}"))?;
+    resize_epoch.map_or_else(
+        || {
+            host::graphics_submit_draw_packet(state.pane, &bytes)
+                .map_err(|error| format!("submit Neovim screen: {error:?}"))
+        },
+        |resize_epoch| {
+            host::graphics_submit_tagged_draw_packet(state.pane, resize_epoch, &bytes)
+                .map_err(|error| format!("submit tagged Neovim screen: {error:?}"))
+        },
+    )?;
 
     let stale = layouts
         .iter()
         .filter_map(|(key, handle)| (!used.contains(handle)).then_some(key.clone()))
         .collect::<Vec<_>>();
     for key in stale {
-        if let Some(handle) = layouts.remove(&key) {
-            let _ = host::graphics_drop_resource(state.pane, handle);
+        let Some(handle) = layouts.get(&key).copied() else {
+            continue;
+        };
+        if matches!(
+            host::graphics_drop_resource(state.pane, handle),
+            Ok(()) | Err(host::GraphicsError::InvalidResource)
+        ) {
+            layouts.remove(&key);
         }
     }
     Ok(())

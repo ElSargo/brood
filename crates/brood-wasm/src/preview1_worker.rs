@@ -1897,6 +1897,12 @@ impl Preview1WorkerRuntime {
         Ok(())
     }
 
+    /// Whether the actor runtime has stopped receiving mailbox commands.
+    #[must_use]
+    pub fn mailbox_is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     /// Snapshot daemon-observable lifecycle counters.
     pub fn stats(&self) -> Preview1CompatStats {
         let coordination = self.kernel.coordination_stats();
@@ -2131,6 +2137,12 @@ impl Preview1CompatActor {
         payload: Vec<u8>,
     ) -> Result<(), Preview1WorkerError> {
         self.runtime.try_send_message(sender, payload)
+    }
+
+    /// Whether the compatibility runtime has stopped receiving mailbox commands.
+    #[must_use]
+    pub fn mailbox_is_closed(&self) -> bool {
+        self.runtime.mailbox_is_closed()
     }
 
     /// Current lifecycle counters, including the reload generation.

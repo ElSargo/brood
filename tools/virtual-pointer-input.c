@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -100,14 +101,38 @@ static void fail(const char *message) {
     exit(1);
 }
 
-static uint32_t parse_u32(const char *value, const char *name) {
+static void print_usage(FILE *stream) {
+    fprintf(
+        stream,
+        "usage: virtual-pointer-input drag <start-x> <start-y> <end-x> "
+        "<end-y> <steps> <extent-x> <extent-y> | scroll <x> <y> "
+        "<delta> <steps> <extent-x> <extent-y> | click <x> <y> "
+        "<extent-x> <extent-y> | hover <x> <y> <hold-ms> <extent-x> "
+        "<extent-y> | sequence <extent-x> <extent-y>\n"
+        "sequence stdin commands: motion <x> <y> | press | release | quit | cancel\n"
+    );
+}
+
+static bool parse_u32_value(const char *value, uint32_t *result) {
+    if (value[0] == '-') {
+        return false;
+    }
     char *end = NULL;
     unsigned long parsed = strtoul(value, &end, 10);
     if (end == value || *end != '\0' || parsed > UINT32_MAX) {
+        return false;
+    }
+    *result = (uint32_t)parsed;
+    return true;
+}
+
+static uint32_t parse_u32(const char *value, const char *name) {
+    uint32_t parsed = 0;
+    if (!parse_u32_value(value, &parsed)) {
         fprintf(stderr, "virtual-pointer-input: %s must be an unsigned 32-bit integer\n", name);
         exit(1);
     }
-    return (uint32_t)parsed;
+    return parsed;
 }
 
 static double parse_double(const char *value, const char *name) {
@@ -228,32 +253,258 @@ static void pointer_axis(struct virtual_pointer *pointer, double delta) {
     );
 }
 
+static size_t split_sequence_command(char *line, char **fields, size_t capacity) {
+    size_t count = 0;
+    char *save = NULL;
+    for (char *field = strtok_r(line, " \t\r\n", &save); field != NULL;
+         field = strtok_r(NULL, " \t\r\n", &save)) {
+        if (count == capacity) {
+            return capacity + 1;
+        }
+        fields[count++] = field;
+    }
+    return count;
+}
+
+static int sequence_error(uint64_t line, const char *message) {
+    fprintf(stderr, "virtual-pointer-input: sequence line %" PRIu64 ": %s\n", line, message);
+    return 1;
+}
+
+static int sequence_roundtrip(
+    struct wl_display *display,
+    uint64_t line,
+    const char *action,
+    uint32_t *elapsed_ms
+) {
+    uint32_t started_ms = monotonic_milliseconds();
+    if (wl_display_roundtrip(display) >= 0) {
+        *elapsed_ms = monotonic_milliseconds() - started_ms;
+        return 0;
+    }
+    fprintf(
+        stderr,
+        "virtual-pointer-input: sequence line %" PRIu64
+        ": compositor rejected %s\n",
+        line,
+        action
+    );
+    return 1;
+}
+
+static void sequence_ack(
+    uint64_t sequence,
+    const char *action,
+    uint32_t x,
+    uint32_t y,
+    uint32_t roundtrip_ms
+) {
+    printf(
+        "ack sequence=%" PRIu64 " action=%s x=%" PRIu32 " y=%" PRIu32
+        " roundtrip_ms=%" PRIu32 "\n",
+        sequence,
+        action,
+        x,
+        y,
+        roundtrip_ms
+    );
+    if (fflush(stdout) == EOF) {
+        fail("could not write the sequence acknowledgement");
+    }
+}
+
+/*
+ * Keep one virtual pointer alive while an external harness interleaves input,
+ * presentation tracing, and capture.  An acknowledgement means the outer
+ * compositor completed its round trip; the harness still waits for the
+ * corresponding Brood-presented frame before it sends the next command.
+ */
+static int run_sequence(
+    struct wl_display *display,
+    struct virtual_pointer *pointer,
+    uint32_t extent_x,
+    uint32_t extent_y
+) {
+    char *line = NULL;
+    size_t line_capacity = 0;
+    uint64_t line_number = 0;
+    uint64_t sequence = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    bool positioned = false;
+    bool pressed = false;
+    int result = 0;
+
+    printf("ready extent_x=%" PRIu32 " extent_y=%" PRIu32 "\n", extent_x, extent_y);
+    if (fflush(stdout) == EOF) {
+        free(line);
+        fail("could not write the sequence readiness acknowledgement");
+    }
+
+    while (getline(&line, &line_capacity, stdin) >= 0) {
+        line_number += 1;
+        char *fields[3] = {0};
+        size_t count = split_sequence_command(line, fields, 3);
+        if (count == 0 || fields[0][0] == '#') {
+            continue;
+        }
+        if (count > 3) {
+            result = sequence_error(line_number, "too many command fields");
+            break;
+        }
+
+        if (strcmp(fields[0], "motion") == 0) {
+            uint32_t next_x = 0;
+            uint32_t next_y = 0;
+            if (count != 3 || !parse_u32_value(fields[1], &next_x) ||
+                !parse_u32_value(fields[2], &next_y)) {
+                result = sequence_error(
+                    line_number,
+                    "motion requires unsigned 32-bit x and y coordinates"
+                );
+                break;
+            }
+            if (next_x > extent_x || next_y > extent_y) {
+                result = sequence_error(line_number, "motion lies outside the declared extent");
+                break;
+            }
+            absolute_motion(pointer, next_x, next_y, extent_x, extent_y);
+            uint32_t roundtrip_ms = 0;
+            if (sequence_roundtrip(
+                    display,
+                    line_number,
+                    "pointer motion",
+                    &roundtrip_ms
+                ) != 0) {
+                result = 1;
+                break;
+            }
+            x = next_x;
+            y = next_y;
+            positioned = true;
+            sequence += 1;
+            sequence_ack(sequence, "motion", x, y, roundtrip_ms);
+            continue;
+        }
+
+        if (strcmp(fields[0], "press") == 0) {
+            if (count != 1) {
+                result = sequence_error(line_number, "press does not accept arguments");
+                break;
+            }
+            if (!positioned) {
+                result = sequence_error(line_number, "press requires an earlier motion");
+                break;
+            }
+            if (pressed) {
+                result = sequence_error(line_number, "the left button is already pressed");
+                break;
+            }
+            pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
+            uint32_t roundtrip_ms = 0;
+            if (sequence_roundtrip(display, line_number, "pointer press", &roundtrip_ms) != 0) {
+                result = 1;
+                break;
+            }
+            pressed = true;
+            sequence += 1;
+            sequence_ack(sequence, "press", x, y, roundtrip_ms);
+            continue;
+        }
+
+        if (strcmp(fields[0], "release") == 0) {
+            if (count != 1) {
+                result = sequence_error(line_number, "release does not accept arguments");
+                break;
+            }
+            if (!pressed) {
+                result = sequence_error(line_number, "the left button is not pressed");
+                break;
+            }
+            pointer_button(pointer, WL_POINTER_BUTTON_STATE_RELEASED);
+            uint32_t roundtrip_ms = 0;
+            if (sequence_roundtrip(display, line_number, "pointer release", &roundtrip_ms) != 0) {
+                result = 1;
+                break;
+            }
+            pressed = false;
+            sequence += 1;
+            sequence_ack(sequence, "release", x, y, roundtrip_ms);
+            continue;
+        }
+
+        if (strcmp(fields[0], "quit") == 0 || strcmp(fields[0], "cancel") == 0) {
+            if (count != 1) {
+                result = sequence_error(line_number, "quit and cancel do not accept arguments");
+                break;
+            }
+            if (strcmp(fields[0], "quit") == 0 && pressed) {
+                result = sequence_error(
+                    line_number,
+                    "quit requires a released button; use cancel to disconnect while captured"
+                );
+                break;
+            }
+            printf(
+                "done sequence=%" PRIu64 " reason=%s\n",
+                sequence,
+                fields[0]
+            );
+            if (fflush(stdout) == EOF) {
+                free(line);
+                fail("could not write the sequence completion acknowledgement");
+            }
+            free(line);
+            return 0;
+        }
+
+        result = sequence_error(line_number, "unknown command");
+        break;
+    }
+
+    if (result == 0 && ferror(stdin)) {
+        result = sequence_error(line_number + 1, "could not read stdin");
+    } else if (result == 0 && pressed) {
+        result = sequence_error(
+            line_number + 1,
+            "stdin ended while the left button was pressed; send release or cancel"
+        );
+    }
+    free(line);
+    return result;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        print_usage(stdout);
+        return 0;
+    }
+
     bool drag = argc == 9 && strcmp(argv[1], "drag") == 0;
     bool scroll = argc == 8 && strcmp(argv[1], "scroll") == 0;
     bool click = argc == 6 && strcmp(argv[1], "click") == 0;
     bool hover = argc == 7 && strcmp(argv[1], "hover") == 0;
-    if (!drag && !scroll && !click && !hover) {
-        fail(
-            "usage: virtual-pointer-input drag <start-x> <start-y> <end-x> "
-            "<end-y> <steps> <extent-x> <extent-y> | scroll <x> <y> "
-            "<delta> <steps> <extent-x> <extent-y> | click <x> <y> "
-            "<extent-x> <extent-y> | hover <x> <y> <hold-ms> <extent-x> "
-            "<extent-y>"
-        );
+    bool sequence_mode = argc == 4 && strcmp(argv[1], "sequence") == 0;
+    if (!drag && !scroll && !click && !hover && !sequence_mode) {
+        print_usage(stderr);
+        return 1;
     }
 
-    uint32_t x = parse_u32(argv[2], "x");
-    uint32_t y = parse_u32(argv[3], "y");
-    double end_or_delta =
-        click || hover ? 0.0 : parse_double(argv[4], drag ? "end-x" : "delta");
+    uint32_t x = sequence_mode ? 0 : parse_u32(argv[2], "x");
+    uint32_t y = sequence_mode ? 0 : parse_u32(argv[3], "y");
+    double end_or_delta = sequence_mode || click || hover
+        ? 0.0
+        : parse_double(argv[4], drag ? "end-x" : "delta");
     uint32_t end_y = drag ? parse_u32(argv[5], "end-y") : 0;
-    uint32_t steps =
-        click || hover ? 1 : parse_u32(argv[drag ? 6 : 5], "steps");
-    uint32_t extent_x =
-        parse_u32(argv[click ? 4 : (hover ? 5 : (drag ? 7 : 6))], "extent-x");
-    uint32_t extent_y =
-        parse_u32(argv[click ? 5 : (hover ? 6 : (drag ? 8 : 7))], "extent-y");
+    uint32_t steps = sequence_mode || click || hover
+        ? 1
+        : parse_u32(argv[drag ? 6 : 5], "steps");
+    uint32_t extent_x = sequence_mode
+        ? parse_u32(argv[2], "extent-x")
+        : parse_u32(argv[click ? 4 : (hover ? 5 : (drag ? 7 : 6))], "extent-x");
+    uint32_t extent_y = sequence_mode
+        ? parse_u32(argv[3], "extent-y")
+        : parse_u32(argv[click ? 5 : (hover ? 6 : (drag ? 8 : 7))], "extent-y");
     if (steps == 0 || extent_x == 0 || extent_y == 0) {
         fail("steps and extents must be non-zero");
     }
@@ -282,15 +533,20 @@ int main(int argc, char **argv) {
         fail("the compositor rejected the virtual pointer");
     }
 
-    absolute_motion(pointer, x, y, extent_x, extent_y);
-    if (wl_display_roundtrip(display) < 0) {
-        fail("the compositor rejected initial pointer motion");
+    int result = 0;
+    if (sequence_mode) {
+        result = run_sequence(display, pointer, extent_x, extent_y);
+    } else {
+        absolute_motion(pointer, x, y, extent_x, extent_y);
+        if (wl_display_roundtrip(display) < 0) {
+            fail("the compositor rejected initial pointer motion");
+        }
+        usleep(50000);
     }
-    usleep(50000);
-    if (hover) {
+    if (!sequence_mode && hover) {
         uint32_t hold_milliseconds = parse_u32(argv[4], "hold milliseconds");
         usleep((useconds_t)hold_milliseconds * 1000);
-    } else if (click) {
+    } else if (!sequence_mode && click) {
         pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer press");
@@ -301,7 +557,7 @@ int main(int argc, char **argv) {
             fail("the compositor rejected the pointer release");
         }
         usleep(50000);
-    } else if (drag) {
+    } else if (!sequence_mode && drag) {
         uint32_t end_x = (uint32_t)end_or_delta;
         pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
         if (wl_display_roundtrip(display) < 0) {
@@ -322,7 +578,7 @@ int main(int argc, char **argv) {
             fail("the compositor rejected the pointer release");
         }
         usleep(50000);
-    } else {
+    } else if (!sequence_mode) {
         wl_proxy_marshal_flags(
             (struct wl_proxy *)pointer,
             5,
@@ -354,10 +610,12 @@ int main(int argc, char **argv) {
         );
     }
 
-    if (wl_display_roundtrip(display) < 0) {
-        fail("the compositor rejected virtual pointer input");
+    if (!sequence_mode) {
+        if (wl_display_roundtrip(display) < 0) {
+            fail("the compositor rejected virtual pointer input");
+        }
+        usleep(100000);
     }
-    usleep(100000);
     wl_proxy_marshal_flags(
         (struct wl_proxy *)pointer,
         8,
@@ -369,5 +627,5 @@ int main(int argc, char **argv) {
     wl_seat_destroy(globals.seat);
     wl_registry_destroy(registry);
     wl_display_disconnect(display);
-    return 0;
+    return result;
 }

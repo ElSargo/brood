@@ -11,7 +11,9 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet},
+    graphics::{
+        drop_resources, layout_ui_text, reuse_pane_content, submit_packet, submit_tagged_packet,
+    },
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::run_process,
 };
@@ -268,6 +270,11 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             let width = resized.width.max(480.0);
             let height = resized.height.max(320.0);
             if (state.width - width).abs() < 0.5 && (state.height - height).abs() < 0.5 {
+                if let Some(resize_epoch) = resized.resize_epoch
+                    && let Err(error) = reuse_pane_content(state.pane, resize_epoch)
+                {
+                    state.error = Some(error);
+                }
                 return Vec::new();
             }
             state.width = width;
@@ -277,7 +284,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.refresh_hovered = false;
             state.refresh_pressed = false;
             state.clamp_scroll();
-            redraw_or_record_error(&mut state);
+            redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
             Vec::new()
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
@@ -434,17 +441,21 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
 }
 
 fn redraw_or_record_error(state: &mut ViewerState) {
+    redraw_for_resize_or_record_error(state, None);
+}
+
+fn redraw_for_resize_or_record_error(state: &mut ViewerState, resize_epoch: Option<u64>) {
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state) {
+    if let Err(error) = redraw(state, resize_epoch) {
         state.error = Some(error);
     }
 }
 
-fn redraw(state: &mut ViewerState) -> Result<(), String> {
+fn redraw(state: &mut ViewerState, resize_epoch: Option<u64>) -> Result<(), String> {
     let mut text_layouts = std::mem::take(&mut state.text_layouts);
-    let result = redraw_with_layouts(state, &mut text_layouts);
+    let result = redraw_with_layouts(state, &mut text_layouts, resize_epoch);
     state.text_layouts = text_layouts;
     result
 }
@@ -452,6 +463,7 @@ fn redraw(state: &mut ViewerState) -> Result<(), String> {
 fn redraw_with_layouts(
     state: &ViewerState,
     text_layouts: &mut BTreeMap<TextLayoutKey, u64>,
+    resize_epoch: Option<u64>,
 ) -> Result<(), String> {
     let mut packet = Packet::new();
     let mut used_layouts = BTreeSet::new();
@@ -654,7 +666,10 @@ fn redraw_with_layouts(
         state.width - 28.0,
     )?;
 
-    submit_packet(state.pane, &packet)?;
+    resize_epoch.map_or_else(
+        || submit_packet(state.pane, &packet),
+        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
+    )?;
 
     let stale = text_resources
         .layouts

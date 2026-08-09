@@ -10,6 +10,7 @@ pub fn run(args: TestArgs) -> Result<()> {
     {
         TestCommand::Nested(args) => run_nested(args),
         TestCommand::Editor(args) => run_editor(args),
+        TestCommand::Resize(args) => run_resize(args),
         TestCommand::Ssh(args) => run_ssh(args),
     }
 }
@@ -44,6 +45,23 @@ fn run_editor(args: NestedTestArgs) -> Result<()> {
         .with_context(|| format!("run {}", script.display()))?;
     if !status.success() {
         bail!("nested editor proof exited with {status}");
+    }
+    Ok(())
+}
+
+fn run_resize(args: NestedTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let script = root.join("tools/test-resize-overhaul-nested.sh");
+    let mut command = Command::new("bash");
+    command.arg(&script).current_dir(&root);
+    if let Some(out_dir) = args.out_dir {
+        command.env("BROOD_RESIZE_OUT", out_dir);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("nested resize proof exited with {status}");
     }
     Ok(())
 }

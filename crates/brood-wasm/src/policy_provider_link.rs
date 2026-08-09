@@ -7,6 +7,7 @@ pub const POLICY_PROVIDER_EXPORT_PREFIX: &str = "brood_policy_provider_";
 pub fn parse_policy_provider_export_tail(tail: &str) -> Option<(PolicyProviderKind, String)> {
     for (prefix, kind) in [
         ("key_", PolicyProviderKind::Key),
+        ("pointer_", PolicyProviderKind::Pointer),
         ("map_", PolicyProviderKind::Map),
         ("focus_", PolicyProviderKind::Focus),
     ] {

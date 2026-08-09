@@ -18,6 +18,7 @@ const MAX_RETAINED_PUBLICATION_FRAMES: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyProviderKind {
     Key,
+    Pointer,
     Map,
     Focus,
 }

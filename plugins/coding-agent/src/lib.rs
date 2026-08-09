@@ -12,7 +12,7 @@ use brood_plugin_sdk::{
         ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
         WorkerEvent, WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
 };
 use serde::{Deserialize, Serialize};
@@ -1029,7 +1029,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             ui.height = resized.height.max(360.0);
             ui.hovered = None;
             ui.pressed = None;
-            (Vec::new(), true)
+            redraw_ui_for_resize(ui, resized.resize_epoch);
+            return Vec::new();
         }
         PresentationEvent::PaneFocused(focused) if focused.pane == ui.pane && !focused.focused => {
             ui.hovered = None;
@@ -1657,6 +1658,10 @@ fn cancel_selected(ui: &UiState) -> Option<ActorCommand> {
 }
 
 fn redraw_ui(ui: &mut UiState) {
+    redraw_ui_for_resize(ui, None);
+}
+
+fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     if ui.pane == 0 {
         return;
     }
@@ -1672,10 +1677,15 @@ fn redraw_ui(ui: &mut UiState) {
     draw_toolbar(ui, &mut packet);
     draw_transcript(ui, &mut packet);
     draw_prompt(ui, &mut packet);
-    let submitted = ui
-        .draw_error
-        .take()
-        .map_or_else(|| submit_packet(ui.pane, &packet).map(|_| ()), Err);
+    let submitted = ui.draw_error.take().map_or_else(
+        || {
+            resize_epoch.map_or_else(
+                || submit_packet(ui.pane, &packet).map(|_| ()),
+                |resize_epoch| submit_tagged_packet(ui.pane, resize_epoch, &packet).map(|_| ()),
+            )
+        },
+        Err,
+    );
     match submitted {
         Ok(()) => {
             drop_resources(ui.pane, ui.retired_image_previews.drain(..));

@@ -6,7 +6,7 @@ use brood_plugin_sdk::{
     exports::brood::plugin::actor::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::one_line,
 };
@@ -192,7 +192,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.hovered = None;
             state.pressed = None;
             clamp_scroll(&mut state);
-            redraw_or_record_error(&mut state);
+            redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
             Vec::new()
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
@@ -276,12 +276,16 @@ fn clamp_scroll(state: &mut InboxState) {
 }
 
 fn redraw_or_record_error(state: &mut InboxState) {
-    if let Err(error) = redraw(state) {
+    redraw_for_resize_or_record_error(state, None);
+}
+
+fn redraw_for_resize_or_record_error(state: &mut InboxState, resize_epoch: Option<u64>) {
+    if let Err(error) = redraw(state, resize_epoch) {
         state.error = error;
     }
 }
 
-fn redraw(state: &mut InboxState) -> Result<(), String> {
+fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), String> {
     if state.pane == 0 {
         return Ok(());
     }
@@ -429,7 +433,10 @@ fn redraw(state: &mut InboxState) -> Result<(), String> {
             state.width - 24.0,
         )?;
     }
-    submit_packet(state.pane, &packet)?;
+    resize_epoch.map_or_else(
+        || submit_packet(state.pane, &packet),
+        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
+    )?;
     drop_resources(state.pane, stale_resources);
     state.text_resources = resources;
     state.error.clear();

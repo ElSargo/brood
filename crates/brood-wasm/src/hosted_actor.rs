@@ -23,6 +23,15 @@ impl HostedWasmActor {
         }
     }
 
+    /// Whether this actor generation has stopped receiving mailbox commands.
+    #[must_use]
+    pub fn mailbox_is_closed(&self) -> bool {
+        match self {
+            Self::Component(actor) => actor.mailbox_is_closed(),
+            Self::Preview1(actor) => actor.mailbox_is_closed(),
+        }
+    }
+
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Component(_) => "wasm-component",

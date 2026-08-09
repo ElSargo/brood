@@ -8,7 +8,7 @@ use brood_plugin_sdk::{
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::truncate_to_width,
 };
@@ -325,7 +325,7 @@ fn handle_presentation(
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.resize(resized.width, resized.height);
-            redraw_or_record_error(state);
+            redraw_for_resize_or_record_error(state, resized.resize_epoch);
             Vec::new()
         }
         PresentationEvent::Key(key) if key.pane == state.pane && !key.repeat => {
@@ -652,16 +652,20 @@ fn binding_label(binding: Binding) -> String {
 }
 
 fn redraw_or_record_error(state: &mut KeybindingsState) {
+    redraw_for_resize_or_record_error(state, None);
+}
+
+fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch: Option<u64>) {
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state) {
+    if let Err(error) = redraw(state, resize_epoch) {
         state.error = true;
         state.status = error;
     }
 }
 
-fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
+fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(), String> {
     let window = state.window();
     let width = window.width;
     let height = window.height;
@@ -934,7 +938,10 @@ fn redraw(state: &mut KeybindingsState) -> Result<(), String> {
     });
     packet.push(Command::Restore);
 
-    submit_packet(state.pane, &packet)?;
+    resize_epoch.map_or_else(
+        || submit_packet(state.pane, &packet),
+        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
+    )?;
     drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())
