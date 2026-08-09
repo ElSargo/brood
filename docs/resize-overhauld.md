@@ -339,10 +339,12 @@ SubmitSynchronizedLayout {
     request_id: u64,
     interaction: Option<InteractionId>,
     event_sequence: Option<u64>,
+    native_resize_revision: Option<u64>,
     lease: LayoutLeaseToken,
     inventory_revision: u64,
     base_layout_revision: u64,
     fragment: LayoutFragment,
+    focus: Option<PaneId>,
     wait_for_panes: Vec<PaneId>,
     presentation: PresentationMode,
 }
@@ -353,6 +355,9 @@ This single command prevents an ordering race between geometry and synchronizati
 
 The actor can use this command without a pointer interaction.
 For example, a keyboard action can request the same synchronized behavior.
+Focus is promoted with the fragment rather than through a later ordinary
+layout update. A native-window request echoes the host-issued resize revision;
+other request sources omit it.
 
 ### 10.2 Wait set
 
@@ -371,6 +376,12 @@ This permission does not give placement or input authority for that pane.
 
 The lease state must publish a read-only `waitable_panes` list.
 The list contains eligible pane identities in the lease subtree.
+
+The lease state also publishes `presented_panes`, filtered to the same lease
+subtree from the composition that actually reached the screen. A wrapper uses
+that snapshot when its target keeps a delegated `rest` region: it can wait for
+the currently presented child panes without acquiring their placement
+authority or guessing the child's private fragment.
 
 ### 10.3 Affected panes
 
@@ -617,9 +628,28 @@ A native window resize does not use a pointer policy provider.
 The host must resize the presentation surface immediately.
 The host must show a projected visible layout during continuous native resize.
 
-After a settlement interval, the host sends a region-resize message to the root layout actor.
-The root actor can submit a synchronized layout request.
-The request uses the same resize-epoch and wait-set mechanism.
+After a settlement interval and one presented projected frame, the host
+publishes the final viewport size and a monotonic native-resize revision to the
+root layout actor. The actor echoes that revision in a synchronized layout
+request. The host accepts it only from the current root lease holder and only
+for the pending native revision.
+
+The native transaction covers every plugin pane present in the composed root
+target, including direct sidebar panes and panes in the delegated `rest`
+subtree. A wrapper actor uses the presented subtree pane list from layout state
+to make ordinary sidebar show, hide, and overlay changes use the same atomic
+path. Panes whose extent is unchanged can explicitly reuse their visible
+content for the epoch.
+
+When a root wrapper allocates persistent side panes, it also owns one divider
+and a wider invisible drag zone at each adjustable boundary. With a delegated
+main region, session sidebar, and inbox visible, the main/sidebar boundary
+resizes the first two allocations while preserving the inbox edge; the
+sidebar/inbox boundary resizes the latter two while preserving the main edge.
+The wrapper keeps requested and durable widths separately and submits every
+captured motion and final release through the same synchronized path. Hiding a
+side pane preserves its durable width for the next show, and viewport changes
+clamp all visible panes while reserving a usable main region.
 
 This path replaces the separate durable native-resize reconciliation path.
 It keeps immediate surface feedback and actor-owned final layout behavior.
@@ -935,7 +965,33 @@ Send many real pointer-motion events during one capture.
 Confirm that staged transaction count stays bounded.
 Confirm that the final release position becomes durable actor state.
 
-### 22.8 Managed-pane test
+### 22.8 Native-window root test
+
+Drive real compositor configures through a continuous resize and capture every
+projected frame. Confirm that intermediate configures remain live projections,
+only the settled size publishes a native-resize revision, and the root wrapper
+finishes it with one synchronized transaction covering direct and delegated
+plugin panes.
+
+The final trace and screenshot must follow an actual surface presentation.
+Confirm that no ordinary layout commit can interleave between native revision
+publication and the synchronized promotion.
+
+### 22.9 Sidebar shell test
+
+Use real shortcut input to hide and show the session sidebar and inbox while a
+delegated workspace remains visible. Capture the projected and promoted frame
+for each action. Confirm that focus, shell chrome, direct shell panes, and
+waited child content promote together, while unchanged panes satisfy the epoch
+only through explicit reuse.
+
+With all three columns visible, use captured pointer input on both root-owned
+dividers. Capture every projected and promoted motion and the final releases.
+Confirm that the main region, session sidebar, and inbox can each change width,
+that both divider hit zones retain capture, and that the final widths become
+durable without a mixed child/sidebar/inbox frame.
+
+### 22.10 Managed-pane test
 
 Use real managed Wayland clients.
 Send concurrent resize requests with one resize epoch.
@@ -943,13 +999,13 @@ Send concurrent resize requests with one resize epoch.
 Confirm configure-serial and frame correlation.
 Confirm that an old buffer cannot satisfy the wait set.
 
-### 22.9 Failure tests
+### 22.11 Failure tests
 
 Test actor failure, pane removal, backend disconnect, and timeout.
 Confirm that no test can leave a permanent paint barrier.
 Confirm that diagnostics identify every degraded pane.
 
-### 22.10 Visual proof
+### 22.12 Visual proof
 
 Use real pointer input, screenshots, and transaction metrics.
 Verify thin shared borders at normal and fractional scale factors.
@@ -977,16 +1033,20 @@ The overhaul is complete when all these statements are true:
 
 ## 24. Initial Delivery Boundary
 
-The first complete delivery uses this limited scope:
+The complete plugin-pane delivery uses this scope:
 
-- One root workspace layout actor.
-- One pointer policy provider for that actor.
+- One root wrapper layout actor with one delegated `rest` workspace actor.
+- One pointer policy provider for the workspace actor.
 - Divider drag for plugin panes.
 - Explicit wait sets.
 - `ScaleThenAtomic` presentation.
-- One active transaction in the workspace region.
+- One active transaction in the composed root region.
 - Tagged plugin draws and reuse responses.
 - Native divider rendering.
+- Atomic sidebar, inbox, and overlay layout transitions with focus.
+- Immediate native-window projection followed by one root-owned synchronized
+  final layout.
 
 This delivery proves the complete ownership and synchronization loop.
-Later deliveries add recursive child actors, managed panes, and native window resize.
+Later deliveries add independently recomputed child-region fragments and
+managed-pane configure/frame correlation.

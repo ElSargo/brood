@@ -12,7 +12,9 @@ use brood_plugin_sdk::{
         LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
         SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
+    graphics::{
+        drop_resources, layout_ui_text, reuse_pane_content, submit_packet, submit_tagged_packet,
+    },
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
     text::truncate_to_width,
 };
@@ -47,7 +49,19 @@ const PROJECT_ROW_HEIGHT: f32 = 34.0;
 const SIDE_MARGIN: f32 = 14.0;
 const SIDEBAR_WIDTH: f64 = 320.0;
 const INBOX_WIDTH: f64 = 320.0;
+const MIN_SHELL_PANE_WIDTH: f64 = 160.0;
+const MIN_MAIN_AREA_WIDTH: f64 = 240.0;
+const PRIMARY_BUTTON: u32 = 0x110;
+// These IDs are part of the built-in workspace pointer-policy contract. Keep
+// them stable and outside both pane-ID allocator ranges.
+const SIDEBAR_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5301;
+const INBOX_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5302;
+const SIDEBAR_DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_5311;
+const INBOX_DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_5312;
+const DIVIDER_EVENT_MASK: u8 = 0b1111;
 const STATUS_BAR_HEIGHT: f64 = 34.0;
+const MAX_PENDING_LAYOUT_REQUESTS: usize = 64;
+const MAX_NATIVE_RESIZE_RETRIES: u8 = 2;
 
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
@@ -123,6 +137,7 @@ struct SwitcherState {
     sidebar_visible: bool,
     width: f32,
     height: f32,
+    resize_extent: (f32, f32, f32),
     sessions: Vec<ViewSession>,
     backends: Vec<(u64, String)>,
     collapsed_projects: BTreeSet<String>,
@@ -155,7 +170,14 @@ struct SwitcherState {
     keybindings_visible: bool,
     inbox_pane: Option<u64>,
     inbox_visible: bool,
+    sidebar_width: f64,
+    inbox_width: f64,
     status_bar_pane: Option<u64>,
+    next_layout_request: u64,
+    native_resize_revision: Option<u64>,
+    durable_shell_layout: Option<ShellLayoutState>,
+    pending_shell_layouts: BTreeMap<u64, PendingShellLayout>,
+    pointer_drag: Option<ShellDividerDrag>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
 }
@@ -165,7 +187,15 @@ struct LayoutStateMessage {
     #[serde(rename = "type")]
     message_type: serde_json_core::heapless::String<32>,
     revision: u64,
+    #[serde(default)]
+    presented_layout_revision: Option<u64>,
+    #[serde(default)]
+    native_resize_revision: Option<u64>,
     lease: LayoutLeaseToken,
+    #[serde(default, alias = "waitable_plugin_panes")]
+    waitable_panes: serde_json_core::heapless::Vec<u64, 64>,
+    #[serde(default)]
+    presented_panes: serde_json_core::heapless::Vec<u64, 64>,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
     #[serde(default)]
     available_windows: serde_json_core::heapless::Vec<AvailableWindow, 64>,
@@ -182,7 +212,7 @@ struct AvailableWindow {
     session: u64,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 struct LayoutLeaseToken {
     id: u64,
     generation: u64,
@@ -198,11 +228,87 @@ struct LayoutStateSize {
 #[derive(Clone)]
 struct LayoutContext {
     revision: u64,
+    presented_layout_revision: u64,
     lease: LayoutLeaseToken,
+    waitable_panes: serde_json_core::heapless::Vec<u64, 64>,
+    presented_panes: serde_json_core::heapless::Vec<u64, 64>,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
     focused_pane: Option<u64>,
     size: LayoutStateSize,
     rest: bool,
+}
+
+#[derive(Deserialize)]
+struct LayoutPointerMessage {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+    interaction: Option<u64>,
+    event_sequence: u64,
+    lease: LayoutLeaseToken,
+    zone: u64,
+    phase: serde_json_core::heapless::String<32>,
+    position: LayoutPoint,
+    button: Option<u32>,
+    #[serde(default)]
+    inventory_revision: Option<u64>,
+    #[serde(default)]
+    base_layout_revision: Option<u64>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct LayoutPoint {
+    u: f64,
+    v: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShellDividerDrag {
+    interaction: u64,
+    zone: u64,
+    last_event_sequence: u64,
+    pointer_offset_u: f64,
+    fixed_edge_px: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ShellLayoutState {
+    sidebar_visible: bool,
+    picker_visible: bool,
+    keybindings_visible: bool,
+    inbox_visible: bool,
+    sidebar_width: f64,
+    inbox_width: f64,
+    focus: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingShellLayout {
+    state: ShellLayoutState,
+    native_resize_revision: Option<u64>,
+    native_retry_count: u8,
+}
+
+#[derive(Deserialize)]
+struct LayoutTransactionNotification {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+    request_id: u64,
+    #[serde(default)]
+    reason: Option<serde_json_core::heapless::String<32>>,
+    #[serde(default)]
+    resize_epoch: Option<LayoutNotificationEpoch>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct LayoutNotificationEpoch {
+    target_layout_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizePaintPlan {
+    OrdinaryRedraw,
+    TaggedRedraw(u64),
+    Reuse(u64),
 }
 
 #[derive(Deserialize)]
@@ -459,6 +565,7 @@ impl SwitcherState {
             sidebar_visible: true,
             width: 320.0,
             height: 720.0,
+            resize_extent: (320.0, 720.0, 1.0),
             sessions: Vec::new(),
             backends: Vec::new(),
             collapsed_projects: BTreeSet::new(),
@@ -491,7 +598,14 @@ impl SwitcherState {
             keybindings_visible: false,
             inbox_pane: None,
             inbox_visible: false,
+            sidebar_width: SIDEBAR_WIDTH,
+            inbox_width: INBOX_WIDTH,
             status_bar_pane: None,
+            next_layout_request: 0,
+            native_resize_revision: None,
+            durable_shell_layout: None,
+            pending_shell_layouts: BTreeMap::new(),
+            pointer_drag: None,
             hovered: None,
             pressed: None,
         }
@@ -847,6 +961,9 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == "layout-host" => {
                 handle_layout_message(&message.body)
             }
+            Event::Mailbox(message) if message.sender == "pointer-policy" => {
+                handle_layout_pointer_message(&message.body)
+            }
             Event::Mailbox(message) if message.sender == "key-policy" => {
                 handle_key_policy_action(&message.body)
             }
@@ -913,7 +1030,7 @@ fn handle_inbox_message(bytes: &[u8]) -> Vec<ActorCommand> {
         }
         "inbox-show" if state.inbox_pane == Some(message.pane) => {
             state.inbox_visible = true;
-            publish_layout(&state, false, Some(message.pane))
+            publish_synchronized_layout(&mut state, Some(message.pane), "inbox", None)
         }
         _ => Vec::new(),
     }
@@ -1187,18 +1304,24 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.workspace_focus = None;
             state.width = created.width.max(240.0);
             state.height = created.height.max(240.0);
+            state.resize_extent = (created.width, created.height, created.scale);
             redraw_or_record_error(&mut state);
             vec![ActorCommand::SendHostMessage(
                 br#"{"type":"claim-root-layout"}"#.to_vec(),
             )]
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
-            state.width = resized.width.max(240.0);
-            state.height = resized.height.max(240.0);
+            let width = resized.width.max(240.0);
+            let height = resized.height.max(240.0);
+            let target_extent = (resized.width, resized.height, resized.scale);
+            let paint = resize_paint_plan(state.resize_extent, target_extent, resized.resize_epoch);
+            state.width = width;
+            state.height = height;
+            state.resize_extent = target_extent;
             state.hovered = None;
             state.pressed = None;
             state.ensure_selected_visible();
-            redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
+            paint_for_resize_or_record_error(&mut state, paint);
             Vec::new()
         }
         PresentationEvent::PaneFocused(focused) if focused.pane == state.pane => {
@@ -1297,6 +1420,12 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
 }
 
 fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Some(notification) = decode_layout_transaction_notification(bytes) {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        return apply_layout_transaction_notification(&mut state, &notification);
+    }
     let Ok((message, consumed)) = serde_json_core::from_slice::<LayoutStateMessage>(bytes) else {
         return Vec::new();
     };
@@ -1333,19 +1462,286 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         }
     }
     let requested_focus = shell_requested_focus(&state, message.focused_pane);
+    let native_resize_revision = message
+        .native_resize_revision
+        .filter(|revision| *revision != 0 && Some(*revision) != state.native_resize_revision);
     state.layout = Some(LayoutContext {
         revision: message.revision,
+        presented_layout_revision: message.presented_layout_revision.unwrap_or(0),
         lease: message.lease,
+        waitable_panes: message.waitable_panes,
+        presented_panes: message.presented_panes,
         visible_panes: message.visible_panes,
         focused_pane: requested_focus,
         size: message.size,
         rest: message.rest,
     });
-    let mut commands = publish_layout(&state, true, requested_focus);
+    if state.pending_shell_layouts.is_empty() {
+        state.durable_shell_layout = Some(shell_layout_state(&state, requested_focus));
+    }
+    let mut commands = if let Some(native_resize_revision) = native_resize_revision {
+        let commands = publish_synchronized_layout(
+            &mut state,
+            requested_focus,
+            "native",
+            Some(native_resize_revision),
+        );
+        if !commands.is_empty() {
+            state.native_resize_revision = Some(native_resize_revision);
+        }
+        commands
+    } else {
+        publish_layout(&state, true, requested_focus)
+    };
     if realm_changed {
         commands.push(subscribe_agent_registry(state.backend_id, state.session_id));
     }
     commands
+}
+
+fn handle_layout_pointer_message(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<LayoutPointerMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len()
+        || message.message_type.as_str() != "layout-pointer"
+        || !message.position.u.is_finite()
+        || !message.position.v.is_finite()
+        || !matches!(
+            message.zone,
+            SIDEBAR_DIVIDER_ZONE_ID | INBOX_DIVIDER_ZONE_ID
+        )
+    {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    apply_layout_pointer_message(&mut state, &message)
+}
+
+fn apply_layout_pointer_message(
+    state: &mut SwitcherState,
+    message: &LayoutPointerMessage,
+) -> Vec<ActorCommand> {
+    let Some(interaction) = message.interaction.filter(|interaction| *interaction != 0) else {
+        return Vec::new();
+    };
+    let pane = state.pane;
+    let requested_sidebar_visible = state.sidebar_visible;
+    let requested_inbox_visible = state.inbox_visible;
+    let inbox_exists = state.inbox_pane.is_some();
+    let Some(layout) = state.layout.as_mut() else {
+        return Vec::new();
+    };
+    if layout.lease != message.lease || !layout.rest {
+        return Vec::new();
+    }
+    if let Some(inventory_revision) = message.inventory_revision {
+        layout.revision = inventory_revision;
+    }
+    if let Some(base_layout_revision) = message.base_layout_revision {
+        layout.presented_layout_revision = base_layout_revision;
+    }
+    let width = f64::from(layout.size.w.max(1));
+    let sidebar_visible = requested_sidebar_visible && layout.visible_panes.contains(&pane);
+    let inbox_visible = requested_inbox_visible && inbox_exists;
+    if (message.zone == SIDEBAR_DIVIDER_ZONE_ID && !sidebar_visible)
+        || (message.zone == INBOX_DIVIDER_ZONE_ID && !inbox_visible)
+    {
+        return Vec::new();
+    }
+    let columns = shell_column_geometry(
+        width,
+        true,
+        sidebar_visible,
+        inbox_visible,
+        state.sidebar_width,
+        state.inbox_width,
+    );
+
+    if message.phase.as_str() == "button-press" && message.button == Some(PRIMARY_BUTTON) {
+        let boundary_px = if message.zone == SIDEBAR_DIVIDER_ZONE_ID {
+            columns.rest_width
+        } else {
+            width - columns.inbox_width
+        };
+        let boundary_u = boundary_px * 2.0 / width - 1.0;
+        state.pointer_drag = Some(ShellDividerDrag {
+            interaction,
+            zone: message.zone,
+            last_event_sequence: message.event_sequence,
+            pointer_offset_u: boundary_u - message.position.u,
+            fixed_edge_px: if message.zone == SIDEBAR_DIVIDER_ZONE_ID {
+                columns.rest_width + columns.sidebar_width
+            } else {
+                columns.rest_width
+            },
+        });
+        return Vec::new();
+    }
+
+    let Some(drag) = state.pointer_drag else {
+        return Vec::new();
+    };
+    if drag.interaction != interaction
+        || drag.zone != message.zone
+        || message.event_sequence <= drag.last_event_sequence
+    {
+        return Vec::new();
+    }
+    if message.phase.as_str() == "cancel" {
+        state.pointer_drag = None;
+        return Vec::new();
+    }
+    if message.phase.as_str() != "motion"
+        && !(message.phase.as_str() == "button-release" && message.button == Some(PRIMARY_BUTTON))
+    {
+        return Vec::new();
+    }
+
+    let requested_u = message.position.u + drag.pointer_offset_u;
+    let requested_boundary = ((requested_u + 1.0) * 0.5 * width).clamp(0.0, width);
+    if message.zone == SIDEBAR_DIVIDER_ZONE_ID {
+        let minimum_main = MIN_MAIN_AREA_WIDTH.min(drag.fixed_edge_px * 0.5);
+        let minimum_sidebar =
+            MIN_SHELL_PANE_WIDTH.min((drag.fixed_edge_px - minimum_main).max(0.0));
+        let boundary = requested_boundary.clamp(
+            minimum_main,
+            (drag.fixed_edge_px - minimum_sidebar).max(minimum_main),
+        );
+        state.sidebar_width = drag.fixed_edge_px - boundary;
+    } else if sidebar_visible {
+        let available = (width - drag.fixed_edge_px).max(0.0);
+        let minimum_shell = MIN_SHELL_PANE_WIDTH.min(available * 0.5);
+        let boundary =
+            requested_boundary.clamp(drag.fixed_edge_px + minimum_shell, width - minimum_shell);
+        state.sidebar_width = boundary - drag.fixed_edge_px;
+        state.inbox_width = width - boundary;
+    } else {
+        let minimum_main = MIN_MAIN_AREA_WIDTH.min(width * 0.5);
+        let minimum_inbox = MIN_SHELL_PANE_WIDTH.min((width - minimum_main).max(0.0));
+        let boundary = requested_boundary.clamp(minimum_main, width - minimum_inbox);
+        state.inbox_width = width - boundary;
+    }
+    if let Some(active) = state.pointer_drag.as_mut() {
+        active.last_event_sequence = message.event_sequence;
+    }
+    let reason = if message.zone == SIDEBAR_DIVIDER_ZONE_ID {
+        "sidebar-resize"
+    } else {
+        "inbox-resize"
+    };
+    let commands =
+        publish_synchronized_pointer_layout(state, interaction, message.event_sequence, reason);
+    if commands.is_empty() {
+        restore_latest_submitted_or_durable_shell_layout(state);
+    }
+    if message.phase.as_str() == "button-release" {
+        state.pointer_drag = None;
+    }
+    commands
+}
+
+fn decode_layout_transaction_notification(bytes: &[u8]) -> Option<LayoutTransactionNotification> {
+    let (notification, consumed) =
+        serde_json_core::from_slice::<LayoutTransactionNotification>(bytes).ok()?;
+    (consumed == bytes.len()
+        && matches!(
+            notification.message_type.as_str(),
+            "accepted" | "completed" | "degraded" | "rejected" | "superseded"
+        ))
+    .then_some(notification)
+}
+
+fn shell_layout_state(state: &SwitcherState, focus: Option<u64>) -> ShellLayoutState {
+    ShellLayoutState {
+        sidebar_visible: state.sidebar_visible,
+        picker_visible: state.picker_visible,
+        keybindings_visible: state.keybindings_visible,
+        inbox_visible: state.inbox_visible,
+        sidebar_width: state.sidebar_width,
+        inbox_width: state.inbox_width,
+        focus,
+    }
+}
+
+fn restore_shell_layout_state(state: &mut SwitcherState, shell: &ShellLayoutState) {
+    state.sidebar_visible = shell.sidebar_visible;
+    state.picker_visible = shell.picker_visible;
+    state.keybindings_visible = shell.keybindings_visible;
+    state.inbox_visible = shell.inbox_visible;
+    state.sidebar_width = shell.sidebar_width;
+    state.inbox_width = shell.inbox_width;
+    if let Some(layout) = state.layout.as_mut() {
+        layout.focused_pane = shell.focus;
+    }
+}
+
+fn restore_latest_submitted_or_durable_shell_layout(state: &mut SwitcherState) {
+    let restore = state
+        .pending_shell_layouts
+        .last_key_value()
+        .map(|(_request, pending)| pending.state.clone())
+        .or_else(|| state.durable_shell_layout.clone());
+    if let Some(restore) = restore {
+        restore_shell_layout_state(state, &restore);
+    }
+}
+
+fn apply_layout_transaction_notification(
+    state: &mut SwitcherState,
+    notification: &LayoutTransactionNotification,
+) -> Vec<ActorCommand> {
+    match notification.message_type.as_str() {
+        "completed" | "degraded" => {
+            if let Some(completed) = state.pending_shell_layouts.remove(&notification.request_id) {
+                state.durable_shell_layout = Some(completed.state);
+            }
+            if let Some(target_layout_revision) = notification
+                .resize_epoch
+                .map(|epoch| epoch.target_layout_revision)
+                && let Some(layout) = state.layout.as_mut()
+            {
+                layout.presented_layout_revision = target_layout_revision;
+            }
+        }
+        "rejected" => {
+            let rejected = state.pending_shell_layouts.remove(&notification.request_id);
+            restore_latest_submitted_or_durable_shell_layout(state);
+            if let Some(rejected) = rejected
+                && let Some(native_resize_revision) = rejected.native_resize_revision
+                && state.native_resize_revision == Some(native_resize_revision)
+            {
+                if notification.reason.as_ref().map(|reason| reason.as_str()) == Some("busy")
+                    && rejected.native_retry_count < MAX_NATIVE_RESIZE_RETRIES
+                {
+                    let focus = rejected.state.focus;
+                    return publish_synchronized_layout_attempt(
+                        state,
+                        focus,
+                        "native",
+                        Some(native_resize_revision),
+                        rejected.native_retry_count + 1,
+                        None,
+                        None,
+                    );
+                }
+                if rejected.native_retry_count < MAX_NATIVE_RESIZE_RETRIES {
+                    // A stale or invalid request did not consume the host's
+                    // next publication. If the same nonce is legitimately
+                    // republished, allow the layout-state path to submit it.
+                    state.native_resize_revision = None;
+                }
+            }
+        }
+        "superseded" => {
+            state.pending_shell_layouts.remove(&notification.request_id);
+        }
+        "accepted" => {}
+        _ => unreachable!("notification kind was validated before dispatch"),
+    }
+    Vec::new()
 }
 
 fn shell_requested_focus(state: &SwitcherState, fallback: Option<u64>) -> Option<u64> {
@@ -1459,7 +1855,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Some(layout) = state.layout.as_mut() {
         layout.focused_pane = requested_focus;
     }
-    publish_layout(&state, false, requested_focus)
+    publish_synchronized_layout(&mut state, requested_focus, "sidebar", None)
 }
 
 fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
@@ -1972,7 +2368,7 @@ fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Some(layout) = state.layout.as_mut() {
         layout.focused_pane = focus;
     }
-    publish_layout(&state, false, focus)
+    publish_synchronized_layout(&mut state, focus, "picker", None)
 }
 
 fn handle_keybindings_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -2000,7 +2396,7 @@ fn handle_keybindings_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if let Some(layout) = state.layout.as_mut() {
         layout.focused_pane = focus;
     }
-    publish_layout(&state, false, focus)
+    publish_synchronized_layout(&mut state, focus, "keybindings", None)
 }
 
 fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -2558,6 +2954,98 @@ fn stop_terminal_command(backend_id: u64, session_id: u64, ui_actor: &str) -> Op
     }))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ShellColumnGeometry {
+    width: f64,
+    rest_width: f64,
+    sidebar_width: f64,
+    inbox_width: f64,
+}
+
+impl ShellColumnGeometry {
+    fn rest_fraction(self) -> f64 {
+        self.rest_width / self.width
+    }
+
+    fn sidebar_fraction(self) -> f64 {
+        self.sidebar_width / self.width
+    }
+
+    fn inbox_fraction(self) -> f64 {
+        self.inbox_width / self.width
+    }
+}
+
+fn shell_column_geometry(
+    width: f64,
+    has_rest: bool,
+    sidebar_visible: bool,
+    inbox_visible: bool,
+    requested_sidebar_width: f64,
+    requested_inbox_width: f64,
+) -> ShellColumnGeometry {
+    let width = width.max(1.0);
+    let visible_shell_panes = usize::from(sidebar_visible) + usize::from(inbox_visible);
+    let minimum_main = if has_rest {
+        MIN_MAIN_AREA_WIDTH.min(width / (visible_shell_panes as f64 + 1.0))
+    } else {
+        0.0
+    };
+    let minimum_shell = if visible_shell_panes > 0 {
+        MIN_SHELL_PANE_WIDTH.min((width - minimum_main).max(0.0) / visible_shell_panes as f64)
+    } else {
+        0.0
+    };
+    let maximum_shell_total = (width - minimum_main).max(0.0);
+    let mut sidebar_width = if sidebar_visible {
+        requested_sidebar_width
+            .max(minimum_shell)
+            .min(maximum_shell_total)
+    } else {
+        0.0
+    };
+    let mut inbox_width = if inbox_visible {
+        requested_inbox_width
+            .max(minimum_shell)
+            .min(maximum_shell_total)
+    } else {
+        0.0
+    };
+    let excess = (sidebar_width + inbox_width - maximum_shell_total).max(0.0);
+    if excess > 0.0 {
+        let adjustable_sidebar = (sidebar_width - minimum_shell).max(0.0);
+        let adjustable_inbox = (inbox_width - minimum_shell).max(0.0);
+        let adjustable = adjustable_sidebar + adjustable_inbox;
+        if adjustable > 0.0 {
+            sidebar_width -= excess * adjustable_sidebar / adjustable;
+            inbox_width -= excess * adjustable_inbox / adjustable;
+        }
+    }
+    let rest_width = (width - sidebar_width - inbox_width).max(0.0);
+    ShellColumnGeometry {
+        width,
+        rest_width,
+        sidebar_width,
+        inbox_width,
+    }
+}
+
+fn divider_json(id: u64, zone: u64, center: f64, width: f64, content_size: f64) -> String {
+    let divider_width = (2.0 / width).clamp(0.001, 0.02);
+    format!(
+        "{{\"id\":{id},\"zone\":{zone},\"z\":81,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{divider_width},\"v\":{content_size}}}}},\"axis\":\"vertical\",\"role\":\"split\"}}",
+        center - divider_width * 0.5,
+    )
+}
+
+fn divider_zone_json(id: u64, center: f64, width: f64, content_size: f64) -> String {
+    let zone_width = (16.0 / width).clamp(0.005, 0.05);
+    format!(
+        "{{\"id\":{id},\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{zone_width},\"v\":{content_size}}}}},\"z\":80,\"event_mask\":{DIVIDER_EVENT_MASK},\"cursor\":\"col-resize\",\"input\":\"drag\"}}",
+        center - zone_width * 0.5,
+    )
+}
+
 fn publish_layout(
     state: &SwitcherState,
     allow_delegation: bool,
@@ -2615,25 +3103,17 @@ fn publish_layout(
     let status_bar_visible = status_bar_pane.is_some();
     let width = f64::from(message.size.w.max(1));
     let height = f64::from(message.size.height.max(1));
-    let mut sidebar_fraction = if pane_visible {
-        (SIDEBAR_WIDTH / width).clamp(0.18, 0.38)
-    } else {
-        0.0
-    };
-    let mut inbox_fraction = if inbox_visible {
-        (INBOX_WIDTH / width).clamp(0.18, 0.38)
-    } else {
-        0.0
-    };
-    if has_rest {
-        let chrome = sidebar_fraction + inbox_fraction;
-        if chrome > 0.68 {
-            let scale = 0.68 / chrome;
-            sidebar_fraction *= scale;
-            inbox_fraction *= scale;
-        }
-    }
-    let rest_fraction = (1.0 - sidebar_fraction - inbox_fraction).max(0.0);
+    let columns = shell_column_geometry(
+        width,
+        has_rest,
+        pane_visible,
+        inbox_visible,
+        state.sidebar_width,
+        state.inbox_width,
+    );
+    let sidebar_fraction = columns.sidebar_fraction();
+    let inbox_fraction = columns.inbox_fraction();
+    let rest_fraction = columns.rest_fraction();
     let sidebar_offset = -1.0 + 2.0 * rest_fraction;
     let sidebar_size = 2.0 * sidebar_fraction;
     let inbox_offset = 1.0 - 2.0 * inbox_fraction;
@@ -2704,6 +3184,50 @@ fn publish_layout(
         ));
     }
     let layout_items = layout_items.join(",");
+    let mut zones = Vec::new();
+    let mut dividers = Vec::new();
+    if has_rest && pane_visible {
+        let center = -1.0 + 2.0 * rest_fraction;
+        zones.push(divider_zone_json(
+            SIDEBAR_DIVIDER_ZONE_ID,
+            center,
+            width,
+            content_size,
+        ));
+        dividers.push(divider_json(
+            SIDEBAR_DIVIDER_ITEM_ID,
+            SIDEBAR_DIVIDER_ZONE_ID,
+            center,
+            width,
+            content_size,
+        ));
+    }
+    if has_rest && inbox_visible {
+        let center = 1.0 - 2.0 * inbox_fraction;
+        zones.push(divider_zone_json(
+            INBOX_DIVIDER_ZONE_ID,
+            center,
+            width,
+            content_size,
+        ));
+        dividers.push(divider_json(
+            INBOX_DIVIDER_ITEM_ID,
+            INBOX_DIVIDER_ZONE_ID,
+            center,
+            width,
+            content_size,
+        ));
+    }
+    let zones = if zones.is_empty() {
+        String::new()
+    } else {
+        format!(",\"zones\":[{}]", zones.join(","))
+    };
+    let dividers = if dividers.is_empty() {
+        String::new()
+    } else {
+        format!(",\"dividers\":[{}]", dividers.join(","))
+    };
     let rest = if has_rest {
         let mut rest = format!(
             ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{rest_size},\"v\":"
@@ -2717,17 +3241,236 @@ fn publish_layout(
     let focus = requested_focus.map_or_else(|| "null".to_string(), |focus| focus.to_string());
     commands.push(ActorCommand::SendHostMessage(
         format!(
-            "{{\"type\":\"set-resolved-layout\",\"lease\":{{\"id\":{},\"generation\":{}}},\"revision\":{},\"layout\":{{\"items\":[{}]}}{},\"focus\":{}}}",
+            "{{\"type\":\"set-resolved-layout\",\"lease\":{{\"id\":{},\"generation\":{}}},\"revision\":{},\"layout\":{{\"items\":[{}]{}{}}}{},\"focus\":{}}}",
             message.lease.id,
             message.lease.generation,
             message.revision,
             layout_items,
+            zones,
+            dividers,
             rest,
             focus
         )
         .into_bytes(),
     ));
     commands
+}
+
+fn publish_synchronized_layout(
+    state: &mut SwitcherState,
+    requested_focus: Option<u64>,
+    reason: &'static str,
+    native_resize_revision: Option<u64>,
+) -> Vec<ActorCommand> {
+    publish_synchronized_layout_attempt(
+        state,
+        requested_focus,
+        reason,
+        native_resize_revision,
+        0,
+        None,
+        None,
+    )
+}
+
+fn publish_synchronized_pointer_layout(
+    state: &mut SwitcherState,
+    interaction: u64,
+    event_sequence: u64,
+    reason: &'static str,
+) -> Vec<ActorCommand> {
+    let focus = state.layout.as_ref().and_then(|layout| layout.focused_pane);
+    publish_synchronized_layout_attempt(
+        state,
+        focus,
+        reason,
+        None,
+        0,
+        Some(interaction),
+        Some(event_sequence),
+    )
+}
+
+fn publish_synchronized_layout_attempt(
+    state: &mut SwitcherState,
+    requested_focus: Option<u64>,
+    reason: &'static str,
+    native_resize_revision: Option<u64>,
+    native_retry_count: u8,
+    interaction: Option<u64>,
+    pointer_event_sequence: Option<u64>,
+) -> Vec<ActorCommand> {
+    if state.pending_shell_layouts.len() >= MAX_PENDING_LAYOUT_REQUESTS {
+        restore_latest_submitted_or_durable_shell_layout(state);
+        state.error = true;
+        state.status = "Layout transaction backlog is full".to_string();
+        return Vec::new();
+    }
+    let ordinary = publish_layout(state, false, requested_focus);
+    let [ActorCommand::SendHostMessage(ordinary)] = ordinary.as_slice() else {
+        return Vec::new();
+    };
+    let Ok(mut ordinary) = serde_json::from_slice::<serde_json::Value>(ordinary) else {
+        return Vec::new();
+    };
+    let Some(layout) = ordinary.get_mut("layout").map(serde_json::Value::take) else {
+        return Vec::new();
+    };
+    let rest = ordinary
+        .get_mut("rest")
+        .map(serde_json::Value::take)
+        .filter(|rest| !rest.is_null());
+    let Some(context) = state.layout.as_ref() else {
+        return Vec::new();
+    };
+    if rest.is_some() && !context.rest {
+        // The initial root publication may have identified delegated panes
+        // before the host has installed the child lease. Keep the requested
+        // shell state, but do not submit a fragment whose rest slot cannot yet
+        // validate. The next post-delegation layout-state republishes it.
+        return Vec::new();
+    }
+
+    let explicit_panes = layout["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["kind"]["pane"].as_u64())
+        .collect::<BTreeSet<_>>();
+    let shell_panes = [
+        Some(state.pane),
+        state.picker_pane,
+        state.keybindings_pane,
+        state.inbox_pane,
+        state.status_bar_pane,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    let mut target_panes = explicit_panes.clone();
+    if rest.is_some() {
+        target_panes.extend(
+            context
+                .presented_panes
+                .iter()
+                .copied()
+                .filter(|pane| !shell_panes.contains(pane) || explicit_panes.contains(pane)),
+        );
+    }
+    let wait_for_panes = context
+        .waitable_panes
+        .iter()
+        .copied()
+        .filter(|pane| target_panes.contains(pane))
+        .collect::<Vec<_>>();
+
+    let item_extent = |pane: Option<u64>, axis: &str, pixels: f64| {
+        pane.and_then(|pane| {
+            layout["items"]
+                .as_array()?
+                .iter()
+                .find(|item| item["kind"]["pane"].as_u64() == Some(pane))?["transform"]["size"]
+                [axis]
+                .as_f64()
+                .map(|normalized| normalized * pixels / 2.0)
+        })
+        .unwrap_or(0.0)
+    };
+    let rest_width = rest
+        .as_ref()
+        .and_then(|rest| rest["transform"]["size"]["u"].as_f64())
+        .map_or(0.0, |normalized| {
+            normalized * f64::from(context.size.w.max(1)) / 2.0
+        });
+    let rest_height = rest
+        .as_ref()
+        .and_then(|rest| rest["transform"]["size"]["v"].as_f64())
+        .map_or(0.0, |normalized| {
+            normalized * f64::from(context.size.height.max(1)) / 2.0
+        });
+    let sidebar_width = item_extent(Some(state.pane), "u", f64::from(context.size.w.max(1)));
+    let inbox_width = item_extent(state.inbox_pane, "u", f64::from(context.size.w.max(1)));
+    let status_height = item_extent(
+        state.status_bar_pane,
+        "v",
+        f64::from(context.size.height.max(1)),
+    );
+
+    let Some(request_id) = state.next_layout_request.checked_add(1) else {
+        state.error = true;
+        state.status = "Layout transaction identity space is exhausted".to_string();
+        return Vec::new();
+    };
+    state.next_layout_request = request_id;
+    let event_sequence = pointer_event_sequence.unwrap_or(request_id);
+    eprintln!(
+        "session-switcher-layout-transaction request_id={request_id} reason={reason} event_sequence={event_sequence} native_resize_revision={} rest_width={rest_width:.3} rest_height={rest_height:.3} sidebar_width={sidebar_width:.3} inbox_width={inbox_width:.3} status_height={status_height:.3} focus={} wait_for_panes={wait_for_panes:?}",
+        native_resize_revision.unwrap_or(0),
+        requested_focus.unwrap_or(0),
+    );
+    let mut fragment = serde_json::Map::new();
+    fragment.insert("layout".to_string(), layout);
+    if let Some(rest) = rest {
+        fragment.insert("rest".to_string(), rest);
+    }
+    let mut request = serde_json::Map::new();
+    request.insert(
+        "type".to_string(),
+        serde_json::Value::String("submit-synchronized-layout".to_string()),
+    );
+    request.insert("request_id".to_string(), request_id.into());
+    request.insert("event_sequence".to_string(), event_sequence.into());
+    if let Some(interaction) = interaction {
+        request.insert("interaction".to_string(), interaction.into());
+    }
+    if let Some(native_resize_revision) = native_resize_revision {
+        request.insert(
+            "native_resize_revision".to_string(),
+            native_resize_revision.into(),
+        );
+    }
+    request.insert(
+        "lease".to_string(),
+        serde_json::json!({
+            "id": context.lease.id,
+            "generation": context.lease.generation,
+        }),
+    );
+    request.insert("inventory_revision".to_string(), context.revision.into());
+    request.insert(
+        "base_layout_revision".to_string(),
+        context.presented_layout_revision.into(),
+    );
+    request.insert("fragment".to_string(), fragment.into());
+    if let Some(focus) = requested_focus {
+        request.insert("focus".to_string(), focus.into());
+    }
+    request.insert(
+        "wait_for_panes".to_string(),
+        serde_json::Value::Array(
+            wait_for_panes
+                .iter()
+                .copied()
+                .map(serde_json::Value::from)
+                .collect(),
+        ),
+    );
+    request.insert(
+        "presentation".to_string(),
+        serde_json::Value::String("scale-then-atomic".to_string()),
+    );
+    let Ok(body) = serde_json::to_vec(&request) else {
+        return Vec::new();
+    };
+    state.pending_shell_layouts.insert(
+        request_id,
+        PendingShellLayout {
+            state: shell_layout_state(state, requested_focus),
+            native_resize_revision,
+            native_retry_count,
+        },
+    );
+    vec![ActorCommand::SendHostMessage(body)]
 }
 
 fn switcher_target_at(state: &SwitcherState, x: f32, y: f32) -> Option<SwitcherTarget> {
@@ -3150,6 +3893,31 @@ fn backend_session_command(
 
 fn redraw_or_record_error(state: &mut SwitcherState) {
     redraw_for_resize_or_record_error(state, None);
+}
+
+fn resize_paint_plan(
+    current: (f32, f32, f32),
+    target: (f32, f32, f32),
+    resize_epoch: Option<u64>,
+) -> ResizePaintPlan {
+    match resize_epoch {
+        Some(resize_epoch) if current == target => ResizePaintPlan::Reuse(resize_epoch),
+        Some(resize_epoch) => ResizePaintPlan::TaggedRedraw(resize_epoch),
+        None => ResizePaintPlan::OrdinaryRedraw,
+    }
+}
+
+fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePaintPlan) {
+    let result = match paint {
+        ResizePaintPlan::OrdinaryRedraw => redraw(state, None),
+        ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch)),
+        ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch)
+            .or_else(|_reuse_error| redraw(state, Some(resize_epoch)).map(|_| ())),
+    };
+    if let Err(error) = result {
+        state.error = true;
+        state.status = error;
+    }
 }
 
 fn redraw_for_resize_or_record_error(state: &mut SwitcherState, resize_epoch: Option<u64>) {
@@ -3592,12 +4360,14 @@ mod tests {
     use brood_protocol::backend_catalogue::BackendCatalogueEntry;
 
     use super::{
-        ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutStateSize, SwitcherState,
-        actor_realm, apply_backend_sessions, authenticated_neovim_client,
+        ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutStateSize, ResizePaintPlan,
+        SwitcherState, actor_realm, apply_backend_sessions, apply_layout_pointer_message,
+        apply_layout_transaction_notification, authenticated_neovim_client,
         ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
-        open_creation_backend_picker, publish_layout, request_creation_backend_picker,
-        request_editor, sender_actor_is, shell_requested_focus, show_diff, start_neovim_client,
-        submit, truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
+        open_creation_backend_picker, publish_layout, publish_synchronized_layout,
+        request_creation_backend_picker, request_editor, resize_paint_plan, sender_actor_is,
+        shell_layout_state, shell_requested_focus, show_diff, start_neovim_client, submit,
+        truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
     };
 
     #[test]
@@ -3612,10 +4382,13 @@ mod tests {
         assert!(visible_panes.extend_from_slice(&[1, 2, 3]).is_ok());
         state.layout = Some(LayoutContext {
             revision: 9,
+            presented_layout_revision: 3,
             lease: LayoutLeaseToken {
                 id: 4,
                 generation: 2,
             },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
             visible_panes,
             focused_pane: Some(1),
             size: LayoutStateSize {
@@ -3656,10 +4429,13 @@ mod tests {
         assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
         state.layout = Some(LayoutContext {
             revision: 9,
+            presented_layout_revision: 3,
             lease: LayoutLeaseToken {
                 id: 4,
                 generation: 2,
             },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
             visible_panes,
             focused_pane: Some(6),
             size: LayoutStateSize {
@@ -3691,6 +4467,504 @@ mod tests {
             layout["layout"]["items"]
                 .as_array()
                 .is_some_and(|items| items.iter().any(|item| item["id"] == 5))
+        );
+    }
+
+    #[test]
+    fn sidebar_transaction_carries_focus_native_revision_and_visible_subtree_wait_set() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        state.status_bar_pane = Some(5);
+        state.inbox_visible = true;
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
+        let mut waitable_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(
+            waitable_panes
+                .extend_from_slice(&[1, 2, 3, 4, 5, 6])
+                .is_ok()
+        );
+        let mut presented_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(presented_panes.extend_from_slice(&[1, 2, 5, 6]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 17,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes,
+            presented_panes,
+            visible_panes,
+            focused_pane: Some(6),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: true,
+        });
+
+        let commands = publish_synchronized_layout(&mut state, Some(4), "native", Some(23));
+        let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
+            panic!("sidebar update did not produce one synchronized transaction");
+        };
+        let value: serde_json::Value = serde_json::from_slice(body).expect("transaction JSON");
+        assert_eq!(value["type"], "submit-synchronized-layout");
+        assert_eq!(value["request_id"], 1);
+        assert_eq!(value["event_sequence"], 1);
+        assert_eq!(value["native_resize_revision"], 23);
+        assert_eq!(value["inventory_revision"], 9);
+        assert_eq!(value["base_layout_revision"], 17);
+        assert_eq!(value["focus"], 4);
+        assert_eq!(value["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));
+        assert!(value["fragment"]["rest"].is_object());
+        assert_eq!(state.pending_shell_layouts.len(), 1);
+
+        assert!(apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"completed","request_id":1,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#,
+            )
+            .expect("completed notification"),
+        )
+        .is_empty());
+        state.sidebar_visible = false;
+        let follow_up = publish_synchronized_layout(&mut state, Some(6), "sidebar", None);
+        let [ActorCommand::SendHostMessage(body)] = follow_up.as_slice() else {
+            panic!("follow-up sidebar update did not produce a synchronized transaction");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(body).expect("follow-up transaction JSON");
+        assert_eq!(value["request_id"], 2);
+        assert_eq!(value["base_layout_revision"], 18);
+    }
+
+    #[test]
+    fn three_column_shell_dividers_resize_main_sidebar_and_inbox_atomically() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        state.status_bar_pane = Some(5);
+        state.inbox_visible = true;
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
+        let mut waitable_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(waitable_panes.extend_from_slice(&[1, 4, 5, 6]).is_ok());
+        let mut presented_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(presented_panes.extend_from_slice(&[1, 4, 5, 6]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 17,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes,
+            presented_panes,
+            visible_panes,
+            focused_pane: Some(6),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: true,
+        });
+        state.durable_shell_layout = Some(shell_layout_state(&state, Some(6)));
+
+        let initial = publish_layout(&state, false, Some(6));
+        let [ActorCommand::SendHostMessage(initial)] = initial.as_slice() else {
+            panic!("three-column shell did not publish one root fragment");
+        };
+        let initial: serde_json::Value =
+            serde_json::from_slice(initial).expect("initial layout JSON");
+        assert_eq!(initial["layout"]["zones"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            initial["layout"]["dividers"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            initial["layout"]["zones"][0]["id"],
+            super::SIDEBAR_DIVIDER_ZONE_ID
+        );
+        assert_eq!(
+            initial["layout"]["zones"][1]["id"],
+            super::INBOX_DIVIDER_ZONE_ID
+        );
+
+        let pointer = |zone: u64, phase: &str, sequence: u64, u: f64, button: Option<u32>| {
+            serde_json::from_value::<super::LayoutPointerMessage>(serde_json::json!({
+                "type": "layout-pointer",
+                "interaction": 99,
+                "event_sequence": sequence,
+                "lease": {"id": 4, "generation": 2},
+                "zone": zone,
+                "phase": phase,
+                "position": {"u": u, "v": 0.0},
+                "button": button,
+                "inventory_revision": 9,
+                "base_layout_revision": 17,
+            }))
+            .expect("pointer message")
+        };
+        assert!(
+            apply_layout_pointer_message(
+                &mut state,
+                &pointer(
+                    super::SIDEBAR_DIVIDER_ZONE_ID,
+                    "button-press",
+                    1,
+                    0.0,
+                    Some(super::PRIMARY_BUTTON),
+                ),
+            )
+            .is_empty()
+        );
+        let motion = apply_layout_pointer_message(
+            &mut state,
+            &pointer(super::SIDEBAR_DIVIDER_ZONE_ID, "motion", 2, -0.125, None),
+        );
+        let [ActorCommand::SendHostMessage(motion)] = motion.as_slice() else {
+            panic!("sidebar divider motion did not submit one synchronized layout");
+        };
+        let motion: serde_json::Value = serde_json::from_slice(motion).expect("motion JSON");
+        assert_eq!(motion["interaction"], 99);
+        assert_eq!(motion["event_sequence"], 2);
+        assert_eq!(motion["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));
+        let rest_width = motion["fragment"]["rest"]["transform"]["size"]["u"]
+            .as_f64()
+            .expect("rest width")
+            * 640.0;
+        let sidebar = motion["fragment"]["layout"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"] == 1)
+            .expect("sidebar");
+        let sidebar_width = sidebar["transform"]["size"]["u"]
+            .as_f64()
+            .expect("sidebar width")
+            * 640.0;
+        assert!((rest_width - 560.0).abs() < 0.01);
+        assert!((sidebar_width - 400.0).abs() < 0.01);
+        assert!((state.inbox_width - 320.0).abs() < f64::EPSILON);
+
+        assert!(apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"completed","request_id":1,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#,
+            )
+            .expect("completed divider transaction"),
+        )
+        .is_empty());
+        assert_eq!(
+            state
+                .durable_shell_layout
+                .as_ref()
+                .map(|layout| layout.sidebar_width),
+            Some(400.0)
+        );
+        assert!(
+            apply_layout_pointer_message(
+                &mut state,
+                &pointer(super::SIDEBAR_DIVIDER_ZONE_ID, "cancel", 3, -0.125, None,),
+            )
+            .is_empty()
+        );
+        assert!(
+            apply_layout_pointer_message(
+                &mut state,
+                &pointer(
+                    super::INBOX_DIVIDER_ZONE_ID,
+                    "button-press",
+                    4,
+                    0.5,
+                    Some(super::PRIMARY_BUTTON),
+                ),
+            )
+            .is_empty()
+        );
+        let inbox_motion = apply_layout_pointer_message(
+            &mut state,
+            &pointer(super::INBOX_DIVIDER_ZONE_ID, "motion", 5, 0.625, None),
+        );
+        let [ActorCommand::SendHostMessage(inbox_motion)] = inbox_motion.as_slice() else {
+            panic!("inbox divider motion did not submit one synchronized layout");
+        };
+        let inbox_motion: serde_json::Value =
+            serde_json::from_slice(inbox_motion).expect("inbox motion JSON");
+        assert_eq!(inbox_motion["request_id"], 2);
+        assert_eq!(inbox_motion["event_sequence"], 5);
+        let sidebar = inbox_motion["fragment"]["layout"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"] == 1)
+            .expect("sidebar");
+        let inbox = inbox_motion["fragment"]["layout"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["id"] == 4)
+            .expect("inbox");
+        assert!(
+            (sidebar["transform"]["size"]["u"]
+                .as_f64()
+                .expect("sidebar width")
+                * 640.0
+                - 480.0)
+                .abs()
+                < 0.01
+        );
+        assert!(
+            (inbox["transform"]["size"]["u"]
+                .as_f64()
+                .expect("inbox width")
+                * 640.0
+                - 240.0)
+                .abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn busy_native_transaction_retries_the_same_nonce_with_a_strict_bound() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        state.status_bar_pane = Some(5);
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
+        let mut waitable_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(
+            waitable_panes
+                .extend_from_slice(&[1, 2, 3, 4, 5, 6])
+                .is_ok()
+        );
+        let mut presented_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(presented_panes.extend_from_slice(&[1, 5, 6]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 17,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes,
+            presented_panes,
+            visible_panes,
+            focused_pane: Some(6),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: true,
+        });
+        state.native_resize_revision = Some(23);
+        let first = publish_synchronized_layout(&mut state, Some(6), "native", Some(23));
+        assert_eq!(first.len(), 1);
+
+        for rejected_request in 1..=2 {
+            let notification = format!(
+                r#"{{"type":"rejected","request_id":{rejected_request},"reason":"busy","message":"transient host backpressure"}}"#
+            );
+            let commands = apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(notification.as_bytes())
+                    .expect("busy rejection"),
+            );
+            let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
+                panic!("busy native rejection did not produce one retry");
+            };
+            let request: serde_json::Value =
+                serde_json::from_slice(body).expect("native retry JSON");
+            assert_eq!(request["request_id"], rejected_request + 1);
+            assert_eq!(request["native_resize_revision"], 23);
+            assert_eq!(request["base_layout_revision"], 17);
+        }
+
+        let exhausted = apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"rejected","request_id":3,"reason":"busy","message":"still busy"}"#,
+            )
+            .expect("final busy rejection"),
+        );
+        assert!(exhausted.is_empty());
+        assert!(state.pending_shell_layouts.is_empty());
+        assert_eq!(state.native_resize_revision, Some(23));
+    }
+
+    #[test]
+    fn layout_backlog_overflow_restores_the_latest_submitted_shell_proposal() {
+        let mut state = SwitcherState::new();
+        state.layout = Some(LayoutContext {
+            revision: 5,
+            presented_layout_revision: 7,
+            lease: LayoutLeaseToken {
+                id: 1,
+                generation: 1,
+            },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
+            visible_panes: serde_json_core::heapless::Vec::new(),
+            focused_pane: Some(9),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+        state.sidebar_visible = false;
+        state.picker_visible = true;
+        state.keybindings_visible = false;
+        state.inbox_visible = true;
+        let latest_submitted = shell_layout_state(&state, Some(9));
+        for request_id in 1..=super::MAX_PENDING_LAYOUT_REQUESTS as u64 {
+            state.pending_shell_layouts.insert(
+                request_id,
+                super::PendingShellLayout {
+                    state: latest_submitted.clone(),
+                    native_resize_revision: None,
+                    native_retry_count: 0,
+                },
+            );
+        }
+
+        // The caller applies its requested state before it asks the common
+        // publisher to serialize the transaction. This 65th target must not
+        // survive when the bounded pending set cannot record it.
+        state.sidebar_visible = true;
+        state.picker_visible = false;
+        state.keybindings_visible = true;
+        state.inbox_visible = false;
+        if let Some(layout) = state.layout.as_mut() {
+            layout.focused_pane = Some(1);
+        }
+        let commands = publish_synchronized_layout(&mut state, Some(1), "sidebar", None);
+
+        assert!(commands.is_empty());
+        assert_eq!(
+            state.pending_shell_layouts.len(),
+            super::MAX_PENDING_LAYOUT_REQUESTS
+        );
+        assert_eq!(
+            shell_layout_state(
+                &state,
+                state.layout.as_ref().and_then(|layout| layout.focused_pane)
+            ),
+            latest_submitted
+        );
+        assert!(state.error);
+        assert_eq!(state.status, "Layout transaction backlog is full");
+    }
+
+    #[test]
+    fn rejected_sidebar_transaction_rolls_back_but_completed_state_becomes_durable() {
+        let mut state = SwitcherState::new();
+        state.durable_shell_layout = Some(shell_layout_state(&state, Some(9)));
+        state.layout = Some(LayoutContext {
+            revision: 5,
+            presented_layout_revision: 7,
+            lease: LayoutLeaseToken {
+                id: 1,
+                generation: 1,
+            },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
+            visible_panes: serde_json_core::heapless::Vec::new(),
+            focused_pane: Some(9),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+        state.sidebar_visible = false;
+        state.pending_shell_layouts.insert(
+            1,
+            super::PendingShellLayout {
+                state: shell_layout_state(&state, Some(9)),
+                native_resize_revision: None,
+                native_retry_count: 0,
+            },
+        );
+        assert!(
+            apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(
+                    br#"{"type":"rejected","request_id":1}"#,
+                )
+                .expect("rejected notification"),
+            )
+            .is_empty()
+        );
+        assert!(state.sidebar_visible);
+        assert!(state.pending_shell_layouts.is_empty());
+
+        state.sidebar_visible = false;
+        state.pending_shell_layouts.insert(
+            2,
+            super::PendingShellLayout {
+                state: shell_layout_state(&state, Some(9)),
+                native_resize_revision: None,
+                native_retry_count: 0,
+            },
+        );
+        assert!(apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"completed","request_id":2,"resize_epoch":{"id":41,"lease":1,"lease_generation":1,"base_layout_revision":7,"target_layout_revision":8}}"#,
+            )
+            .expect("completed notification"),
+        )
+        .is_empty());
+        assert!(!state.sidebar_visible);
+        assert_eq!(
+            state
+                .durable_shell_layout
+                .as_ref()
+                .map(|layout| layout.sidebar_visible),
+            Some(false)
+        );
+        assert_eq!(
+            state
+                .layout
+                .as_ref()
+                .map(|layout| layout.presented_layout_revision),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn synchronized_resize_reuses_equal_extents_and_tags_changed_extents() {
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (320.0, 720.0, 1.0), Some(41)),
+            ResizePaintPlan::Reuse(41)
+        );
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (300.0, 720.0, 1.0), Some(42)),
+            ResizePaintPlan::TaggedRedraw(42)
+        );
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (300.0, 720.0, 1.0), None),
+            ResizePaintPlan::OrdinaryRedraw
+        );
+        assert_eq!(
+            resize_paint_plan((220.0, 240.0, 1.0), (230.0, 240.0, 1.0), Some(43)),
+            ResizePaintPlan::TaggedRedraw(43),
+            "clamped UI dimensions must not hide a real allocation change"
+        );
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (320.0, 720.0, 2.0), Some(44)),
+            ResizePaintPlan::TaggedRedraw(44),
+            "content from a different output scale is not reusable"
         );
     }
 

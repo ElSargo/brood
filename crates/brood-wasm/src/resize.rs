@@ -56,10 +56,20 @@ pub struct SubmitSynchronizedLayout {
     pub interaction: Option<InteractionId>,
     #[serde(default)]
     pub event_sequence: Option<u64>,
+    /// Host-issued identity for a settled native-window resize.
+    ///
+    /// Pointer-driven requests leave this unset. A layout actor echoes the
+    /// current value from its lease-scoped layout state so the host can reject
+    /// a late response from an older native viewport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_resize_revision: Option<u64>,
     pub lease: LayoutLeaseToken,
     pub inventory_revision: u64,
     pub base_layout_revision: u64,
     pub fragment: SynchronizedLayoutFragment,
+    /// Focus to promote in the same presented frame as the target fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<u64>,
     pub wait_for_panes: Vec<u64>,
     #[serde(default)]
     pub presentation: PresentationMode,

@@ -6,7 +6,9 @@ use brood_plugin_sdk::{
     exports::brood::plugin::actor::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
+    graphics::{
+        drop_resources, layout_ui_text, reuse_pane_content, submit_packet, submit_tagged_packet,
+    },
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::one_line,
 };
@@ -59,6 +61,7 @@ struct InboxState {
     pane: u64,
     width: f32,
     height: f32,
+    resize_extent: (f32, f32, f32),
     items: VecDeque<InboxItem>,
     scroll: usize,
     text_resources: Vec<u64>,
@@ -67,12 +70,20 @@ struct InboxState {
     pressed: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizePaintPlan {
+    OrdinaryRedraw,
+    TaggedRedraw(u64),
+    Reuse(u64),
+}
+
 impl InboxState {
     const fn new() -> Self {
         Self {
             pane: 0,
             width: 320.0,
             height: 720.0,
+            resize_extent: (320.0, 720.0, 1.0),
             items: VecDeque::new(),
             scroll: 0,
             text_resources: Vec::new(),
@@ -180,6 +191,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.pane = created.pane;
             state.width = created.width.max(220.0);
             state.height = created.height.max(160.0);
+            state.resize_extent = (created.width, created.height, created.scale);
             redraw_or_record_error(&mut state);
             vec![Command::SendLocalMessage(LocalActorMessage {
                 actor: SHELL_ACTOR_ID.to_string(),
@@ -187,12 +199,17 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             })]
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
-            state.width = resized.width.max(220.0);
-            state.height = resized.height.max(160.0);
+            let width = resized.width.max(220.0);
+            let height = resized.height.max(160.0);
+            let target_extent = (resized.width, resized.height, resized.scale);
+            let paint = resize_paint_plan(state.resize_extent, target_extent, resized.resize_epoch);
+            state.width = width;
+            state.height = height;
+            state.resize_extent = target_extent;
             state.hovered = None;
             state.pressed = None;
             clamp_scroll(&mut state);
-            redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
+            paint_for_resize_or_record_error(&mut state, paint);
             Vec::new()
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
@@ -277,6 +294,30 @@ fn clamp_scroll(state: &mut InboxState) {
 
 fn redraw_or_record_error(state: &mut InboxState) {
     redraw_for_resize_or_record_error(state, None);
+}
+
+fn resize_paint_plan(
+    current: (f32, f32, f32),
+    target: (f32, f32, f32),
+    resize_epoch: Option<u64>,
+) -> ResizePaintPlan {
+    match resize_epoch {
+        Some(resize_epoch) if current == target => ResizePaintPlan::Reuse(resize_epoch),
+        Some(resize_epoch) => ResizePaintPlan::TaggedRedraw(resize_epoch),
+        None => ResizePaintPlan::OrdinaryRedraw,
+    }
+}
+
+fn paint_for_resize_or_record_error(state: &mut InboxState, paint: ResizePaintPlan) {
+    let result = match paint {
+        ResizePaintPlan::OrdinaryRedraw => redraw(state, None),
+        ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch)),
+        ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch)
+            .or_else(|_reuse_error| redraw(state, Some(resize_epoch)).map(|_| ())),
+    };
+    if let Err(error) = result {
+        state.error = error;
+    }
 }
 
 fn redraw_for_resize_or_record_error(state: &mut InboxState, resize_epoch: Option<u64>) {
@@ -543,6 +584,32 @@ mod tests {
                 if actor == SHELL_ACTOR_ID
                     && body == br#"{"kind":"inbox-show","pane":42}"#
         ));
+    }
+
+    #[test]
+    fn synchronized_resize_reuses_equal_extents_and_tags_changed_extents() {
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (320.0, 720.0, 1.0), Some(41)),
+            ResizePaintPlan::Reuse(41)
+        );
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (300.0, 720.0, 1.0), Some(42)),
+            ResizePaintPlan::TaggedRedraw(42)
+        );
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (300.0, 720.0, 1.0), None),
+            ResizePaintPlan::OrdinaryRedraw
+        );
+        assert_eq!(
+            resize_paint_plan((200.0, 160.0, 1.0), (210.0, 160.0, 1.0), Some(43)),
+            ResizePaintPlan::TaggedRedraw(43),
+            "clamped UI dimensions must not hide a real allocation change"
+        );
+        assert_eq!(
+            resize_paint_plan((320.0, 720.0, 1.0), (320.0, 720.0, 2.0), Some(44)),
+            ResizePaintPlan::TaggedRedraw(44),
+            "content from a different output scale is not reusable"
+        );
     }
 }
 

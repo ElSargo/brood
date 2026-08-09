@@ -3,7 +3,7 @@
 #[cfg(test)]
 extern crate std;
 
-use brood_keybindings::{ACTIONS, Action, Binding};
+use brood_keybindings::{Action, Binding, ACTIONS};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{ptr, slice};
@@ -38,6 +38,11 @@ const PRIMARY_BUTTON: u32 = 0x110;
 // pane IDs grow down from `u64::MAX`, so chrome must use neither allocator end.
 const DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_4401;
 const DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_4402;
+// Root-shell divider IDs are owned by the session-switcher lease, but the
+// built-in workspace component is also the configured global pointer-policy
+// provider. Route these captures back to their authenticated lease holder.
+const SIDEBAR_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5301;
+const INBOX_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5302;
 const DIVIDER_EVENT_MASK: u8 = 0b1111;
 const MIN_PRIMARY_SPLIT_RATIO: f32 = 0.15;
 const MAX_PRIMARY_SPLIT_RATIO: f32 = 0.85;
@@ -127,6 +132,8 @@ struct WorkspaceMessage {
     #[serde(default)]
     request_id: Option<u64>,
     #[serde(default)]
+    resize_epoch: Option<LayoutNotificationEpoch>,
+    #[serde(default)]
     visible_panes: PaneList,
     #[serde(default)]
     pane_realms: FixedVec<PaneRealm, MAX_PANES>,
@@ -144,6 +151,8 @@ struct WorkspaceMessage {
     presented_layout_revision: Option<u64>,
     #[serde(default)]
     layout_revision: Option<u64>,
+    #[serde(default)]
+    native_resize_revision: Option<u64>,
     #[serde(default)]
     lease: Option<LayoutLeaseToken>,
     #[serde(default)]
@@ -188,6 +197,23 @@ struct LayoutStateSize {
 struct LayoutPoint {
     u: f64,
     v: f64,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct LayoutNotificationEpoch {
+    target_layout_revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SynchronizedRequestContext {
+    focus: Option<u64>,
+    fullscreen: bool,
+    lease: LayoutLeaseToken,
+    interaction: Option<u64>,
+    event_sequence: u64,
+    request_id: u64,
+    native_resize_revision: Option<u64>,
+    split_ratio: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -333,23 +359,30 @@ pub extern "C" fn brood_policy_provider_pointer_workspace(
     let Some(query) = decode_json::<PointerPolicyQuery>(query) else {
         return OUTPUT_ERROR;
     };
-    let Some(capture) = pointer_capture_decision(&query) else {
+    let Some((capture, actor)) = pointer_capture_decision(&query) else {
         return OUTPUT_ABSTAIN;
     };
-    finish_response(write_pointer_policy_result(response_buffer_mut(), capture))
+    finish_response(write_pointer_policy_result(
+        response_buffer_mut(),
+        capture,
+        actor,
+    ))
 }
 
-fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<&'static str> {
-    if query.zone != DIVIDER_ZONE_ID {
-        return None;
-    }
-    Some(match query.phase.as_str() {
+fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<(&'static str, &'static str)> {
+    let actor = match query.zone {
+        DIVIDER_ZONE_ID => "workspace",
+        SIDEBAR_DIVIDER_ZONE_ID | INBOX_DIVIDER_ZONE_ID => "session-switcher",
+        _ => return None,
+    };
+    let capture = match query.phase.as_str() {
         "button-press" if !query.captured && query.button == Some(PRIMARY_BUTTON) => "acquire",
         "motion" if query.captured => "unchanged",
         "button-release" if query.captured && query.button == Some(PRIMARY_BUTTON) => "release",
         "cancel" if query.captured => "release",
         _ => return None,
-    })
+    };
+    Some((capture, actor))
 }
 
 #[no_mangle]
@@ -384,16 +417,40 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
             message.size,
         );
         let (panes, pane_backends, focus, fullscreen, lease, revision) = layout_actor_state();
-        let len = write_layout_actor_outbox(
-            output,
-            &message.pane_app_ids,
-            panes,
-            pane_backends,
-            focus,
-            fullscreen,
+        let len = if let (Some(native_resize_revision), Some(lease)) = (
+            message
+                .native_resize_revision
+                .filter(|revision| *revision != 0),
             lease,
-            revision,
-        );
+        ) {
+            let request_id = next_layout_request_id();
+            write_synchronized_layout_outbox(
+                output,
+                panes,
+                pane_backends,
+                SynchronizedRequestContext {
+                    focus,
+                    fullscreen,
+                    lease,
+                    interaction: None,
+                    event_sequence: request_id,
+                    request_id,
+                    native_resize_revision: Some(native_resize_revision),
+                    split_ratio: durable_primary_split_ratio(),
+                },
+            )
+        } else {
+            write_layout_actor_outbox(
+                output,
+                &message.pane_app_ids,
+                panes,
+                pane_backends,
+                focus,
+                fullscreen,
+                lease,
+                revision,
+            )
+        };
         if len <= 0 {
             return -2;
         }
@@ -1034,6 +1091,12 @@ fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
     match message.message_type.as_str() {
         "accepted" => true,
         "completed" | "degraded" => {
+            if let Some(epoch) = message.resize_epoch {
+                unsafe {
+                    LAYOUT_BASE_PRESENTED_REVISION =
+                        LAYOUT_BASE_PRESENTED_REVISION.max(epoch.target_layout_revision);
+                }
+            }
             if let Some(request_id) = message.request_id {
                 commit_resize_proposal(request_id);
             }
@@ -1162,11 +1225,16 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
         output,
         panes,
         pane_backends,
-        focus,
-        lease,
-        interaction,
-        event_sequence,
-        request_id,
+        SynchronizedRequestContext {
+            focus,
+            fullscreen: false,
+            lease,
+            interaction: Some(interaction),
+            event_sequence,
+            request_id,
+            native_resize_revision: None,
+            split_ratio: primary_split_ratio(),
+        },
     );
     if len > 0 {
         remember_resize_proposal(request_id, primary_split_ratio());
@@ -1196,19 +1264,11 @@ fn clear_pointer_interaction() {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the synchronized request identity and complete layout snapshot are emitted together"
-)]
 fn write_synchronized_layout_outbox(
     output: &mut [u8],
     panes: &[u64],
     pane_backends: &[u64],
-    focus: Option<u64>,
-    lease: LayoutLeaseToken,
-    interaction: u64,
-    event_sequence: u64,
-    request_id: u64,
+    request: SynchronizedRequestContext,
 ) -> i32 {
     let (inventory_revision, base_layout_revision) =
         unsafe { (LAYOUT_REVISION, LAYOUT_BASE_PRESENTED_REVISION) };
@@ -1216,15 +1276,21 @@ fn write_synchronized_layout_outbox(
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
     payload.bytes(br#"{"type":"submit-synchronized-layout","request_id":"#);
-    payload.u64(request_id);
-    payload.bytes(br#", "interaction":"#);
-    payload.u64(interaction);
+    payload.u64(request.request_id);
+    if let Some(interaction) = request.interaction {
+        payload.bytes(br#", "interaction":"#);
+        payload.u64(interaction);
+    }
     payload.bytes(br#", "event_sequence":"#);
-    payload.u64(event_sequence);
+    payload.u64(request.event_sequence);
+    if let Some(native_resize_revision) = request.native_resize_revision {
+        payload.bytes(br#", "native_resize_revision":"#);
+        payload.u64(native_resize_revision);
+    }
     payload.bytes(br#", "lease":{"id":"#);
-    payload.u64(lease.id);
+    payload.u64(request.lease.id);
     payload.bytes(br#", "generation":"#);
-    payload.u64(lease.generation);
+    payload.u64(request.lease.generation);
     payload.bytes(br#"},"inventory_revision":"#);
     payload.u64(inventory_revision);
     payload.bytes(br#", "base_layout_revision":"#);
@@ -1234,14 +1300,30 @@ fn write_synchronized_layout_outbox(
         &mut payload,
         panes,
         pane_backends,
-        focus,
-        false,
-        primary_split_ratio(),
+        request.focus,
+        request.fullscreen,
+        request.split_ratio,
     );
-    payload.bytes(br#"},"wait_for_panes":["#);
+    payload.bytes(br#"}"#);
+    if let Some(focus) = request.focus {
+        payload.bytes(br#", "focus":"#);
+        payload.u64(focus);
+    }
+    payload.bytes(br#", "wait_for_panes":["#);
+    let fullscreen_pane = request
+        .fullscreen
+        .then(|| {
+            request
+                .focus
+                .filter(|focus| panes.contains(focus))
+                .or_else(|| panes.first().copied())
+        })
+        .flatten();
     let mut first = true;
     for pane in panes {
-        if !layout_waitable_panes().contains(pane) {
+        if !layout_waitable_panes().contains(pane)
+            || fullscreen_pane.is_some_and(|visible| visible != *pane)
+        {
             continue;
         }
         if !first {
@@ -1474,14 +1556,16 @@ fn write_consume(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
     finish_response(write_consume_payload(output, messages))
 }
 
-fn write_pointer_policy_result(output: &mut [u8], capture: &str) -> i32 {
+fn write_pointer_policy_result(output: &mut [u8], capture: &str, actor: &str) -> i32 {
     const PROVIDER_PAYLOAD: &[u8] = br#"{"kind":"divider"}"#;
 
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"delivery":"consume","capture":"#);
     writer.byte(b'"');
     writer.bytes(capture.as_bytes());
-    writer.bytes(br#"","messages":[{"actor":"workspace","payload":["#);
+    writer.bytes(br#"","messages":[{"actor":""#);
+    writer.bytes(actor.as_bytes());
+    writer.bytes(br#"","payload":["#);
     let mut index = 0;
     while index < PROVIDER_PAYLOAD.len() {
         if index > 0 {
@@ -1876,7 +1960,7 @@ mod tests {
     use std::{format, string::ToString, vec::Vec};
 
     use super::*;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     fn host_payload(output: &[u8], len: i32) -> Value {
         assert!(len > 0);
@@ -1907,6 +1991,16 @@ mod tests {
         decode_json(format!(r#"{{"type":"{kind}","request_id":{request_id}}}"#).as_bytes()).unwrap()
     }
 
+    fn completed_notification(request_id: u64, target_layout_revision: u64) -> WorkspaceMessage {
+        decode_json(
+            format!(
+                r#"{{"type":"completed","request_id":{request_id},"resize_epoch":{{"target_layout_revision":{target_layout_revision}}}}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn divider_policy_and_actor_preserve_one_synchronized_drag() {
         let layout_state: WorkspaceMessage = decode_json(
@@ -1925,7 +2019,10 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
-        assert_eq!(pointer_capture_decision(&press), Some("acquire"));
+        assert_eq!(
+            pointer_capture_decision(&press),
+            Some(("acquire", "workspace"))
+        );
         let motion: PointerPolicyQuery = decode_json(
             format!(
                 "{{\"zone\":{DIVIDER_ZONE_ID},\"phase\":\"motion\",\"button\":null,\"captured\":true}}"
@@ -1933,13 +2030,31 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
-        assert_eq!(pointer_capture_decision(&motion), Some("unchanged"));
+        assert_eq!(
+            pointer_capture_decision(&motion),
+            Some(("unchanged", "workspace"))
+        );
         let mut policy_output = [0_u8; 512];
-        let policy_len = write_pointer_policy_result(&mut policy_output, "unchanged");
+        let policy_len = write_pointer_policy_result(&mut policy_output, "unchanged", "workspace");
         let policy: Value = serde_json::from_slice(&policy_output[..policy_len as usize]).unwrap();
         assert_eq!(policy["delivery"], "consume");
         assert_eq!(policy["capture"], "unchanged");
         assert_eq!(policy["messages"][0]["actor"], "workspace");
+        let shell_zone: PointerPolicyQuery = decode_json(
+            format!(
+                "{{\"zone\":{INBOX_DIVIDER_ZONE_ID},\"phase\":\"button-press\",\"button\":{PRIMARY_BUTTON},\"captured\":false}}"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            pointer_capture_decision(&shell_zone),
+            Some(("acquire", "session-switcher"))
+        );
+        let policy_len =
+            write_pointer_policy_result(&mut policy_output, "acquire", "session-switcher");
+        let policy: Value = serde_json::from_slice(&policy_output[..policy_len as usize]).unwrap();
+        assert_eq!(policy["messages"][0]["actor"], "session-switcher");
         let other_zone: PointerPolicyQuery =
             decode_json(br#"{"zone":7,"phase":"motion","button":null,"captured":true}"#).unwrap();
         assert_eq!(pointer_capture_decision(&other_zone), None);
@@ -1991,6 +2106,8 @@ mod tests {
         assert_eq!(motion["event_sequence"], 2);
         assert_eq!(motion["inventory_revision"], 7);
         assert_eq!(motion["base_layout_revision"], 3);
+        assert_eq!(motion["focus"], 11);
+        assert!(motion.get("native_resize_revision").is_none());
         assert_eq!(motion["wait_for_panes"], json!([11, 22]));
         assert_eq!(motion["presentation"], "scale-then-atomic");
         assert_eq!(
@@ -2006,10 +2123,10 @@ mod tests {
             .unwrap();
         let zone_physical_width = zone_width * 1280.0 * 0.5;
         assert!((7.5..=9.0).contains(&zone_physical_width));
-        let motion_primary_width =
-            motion["fragment"]["layout"]["items"][0]["transform"]["size"]["u"]
-                .as_f64()
-                .unwrap();
+        let motion_primary_width = motion["fragment"]["layout"]["items"][0]["transform"]["size"]
+            ["u"]
+            .as_f64()
+            .unwrap();
         assert!((motion_primary_width - 1.4).abs() < 0.01);
 
         let release_len = handle_layout_pointer(
@@ -2049,8 +2166,9 @@ mod tests {
             &synchronized_notification("superseded", 1)
         ));
         assert!(handle_synchronized_layout_notification(
-            &synchronized_notification("completed", 2)
+            &completed_notification(2, 8)
         ));
+        assert_eq!(unsafe { LAYOUT_BASE_PRESENTED_REVISION }, 8);
         let len = write_layout_actor_update_outbox(
             &mut output,
             &panes,
@@ -2086,14 +2204,81 @@ mod tests {
             PRIMARY_SPLIT_RATIO = 0.7;
         }
         assert!(handle_synchronized_layout_notification(
-            &synchronized_notification("completed", 10)
+            &completed_notification(10, 9)
         ));
+        assert_eq!(unsafe { LAYOUT_BASE_PRESENTED_REVISION }, 9);
         assert!((durable_primary_split_ratio() - 0.6).abs() < f32::EPSILON);
         assert!((primary_split_ratio() - 0.7).abs() < f32::EPSILON);
         assert!(handle_synchronized_layout_notification(
             &synchronized_notification("rejected", 11)
         ));
         assert!((primary_split_ratio() - 0.6).abs() < f32::EPSILON);
+        assert_native_window_resize_request();
+    }
+
+    fn assert_native_window_resize_request() {
+        let message: WorkspaceMessage = decode_json(
+            br#"{"type":"layout-state","revision":7,"presented_layout_revision":3,"native_resize_revision":41,"lease":{"id":5,"generation":2},"waitable_panes":[11,22],"visible_panes":[11,22],"focused_pane":22,"size":{"w":800,"h":720}}"#,
+        )
+        .unwrap();
+        assert_eq!(message.native_resize_revision, Some(41));
+        let panes = [11, 22];
+        let realms = [
+            PaneRealm {
+                pane: 11,
+                backend: 1,
+            },
+            PaneRealm {
+                pane: 22,
+                backend: 1,
+            },
+        ];
+        store_layout_actor_state(
+            &panes,
+            &realms,
+            message.focused_pane,
+            message.lease,
+            message.revision,
+            message.presented_layout_revision,
+            &message.waitable_panes,
+            message.size,
+        );
+        let mut output = [0_u8; OUTBOX_BYTES];
+        let len = write_synchronized_layout_outbox(
+            &mut output,
+            &panes,
+            &[1, 1],
+            SynchronizedRequestContext {
+                focus: Some(22),
+                fullscreen: true,
+                lease: LayoutLeaseToken {
+                    id: 5,
+                    generation: 2,
+                },
+                interaction: None,
+                event_sequence: 9,
+                request_id: 9,
+                native_resize_revision: Some(41),
+                split_ratio: durable_primary_split_ratio(),
+            },
+        );
+        let request = host_payload(&output, len);
+        assert_eq!(request["type"], "submit-synchronized-layout");
+        assert_eq!(request["native_resize_revision"], 41);
+        assert_eq!(request["event_sequence"], 9);
+        assert_eq!(request["focus"], 22);
+        assert!(request.get("interaction").is_none());
+        assert_eq!(request["wait_for_panes"], json!([22]));
+        assert_eq!(
+            request["fragment"]["layout"]["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            request["fragment"]["layout"]["items"][0]["kind"]["pane"],
+            22
+        );
     }
 }
 

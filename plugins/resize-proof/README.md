@@ -12,6 +12,10 @@ instance IDs; the lifecycle instance ID selects its deterministic behavior:
   host's untagged degraded-recovery resize, then submits later epochs
   immediately to prove recovery. Superseding motion cannot accidentally bypass
   the timeout fixture.
+- `resize-proof-stall-after-first` submits the first tagged epoch immediately,
+  then behaves like `resize-proof-stall`. The nested harness uses this mode to
+  let its deterministic startup-native transaction complete before forcing the
+  later pointer-resize timeout and recovery.
 
 The checked-in build and nested harness produce
 `brood_resize_proof_plugin.component.wasm` from the core WASM artifact.
@@ -22,7 +26,7 @@ Every frame is made only from solid rectangles, so its markers are stable
 without font or image resources.
 
 - Untagged initial content has background RGBA `(0.04, 0.08, 0.18, 1)`.
-- The stall instance delays its first post-timeout untagged recovery by 120 ms.
+- The stall instances delay their first post-timeout untagged recovery by 120 ms.
   That sharp recovery frame has background `(0.08, 0.36, 0.16, 1)` and an
   all-one top barcode, so it cannot be mistaken for initial or tagged content.
 - Tagged content for epoch `e` has background channels

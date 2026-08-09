@@ -250,7 +250,8 @@ start_proof_client() {
   local second_mode="${second_actor#resize-proof-}"
   [[ "$second_mode" != stall ]] || second_mode=stall-once
   local final_diagnostics_line=""
-  local target_draws="0"
+  local target_scene_panes="0"
+  local startup_native_line=""
   CLIENT_LOG="$CLIENT_LOG_NORMAL"
   if [[ "$lane" == degraded ]]; then
     CLIENT_LOG="$CLIENT_LOG_DEGRADED"
@@ -286,7 +287,8 @@ start_proof_client() {
       -v expected_width="$EXPECTED_PANE_LOGICAL_WIDTH" \
       -v expected_height="$LOGICAL_HEIGHT" \
       -v second_mode="$second_mode" '
-        index($0, "resize-proof-untagged-resize") == 0 { next }
+        index($0, "resize-proof-untagged-resize") == 0 \
+          && index($0, "resize-proof-tagged") == 0 { next }
         index($0, sprintf("\"width\":%d.000", expected_width)) == 0 { next }
         index($0, sprintf("\"height\":%d.000", expected_height)) == 0 { next }
         index($0, "\"mode\":\"fast\"") != 0 { fast = NR }
@@ -295,19 +297,87 @@ start_proof_client() {
           if (fast > 0 && second > 0) print (fast > second ? fast : second)
         }
       ' "$CLIENT_LOG")"
-    target_draws="$(awk \
+    target_scene_panes="$(awk \
       -v target="gpu_target=${EXPECTED_PANE_DEVICE_WIDTH}x${MODE_HEIGHT}" \
       -v scale="scale=${EXPECTED_OUTPUT_SCALE}" '
-        index($0, "accepted plugin draw packet pane=") != 0 \
-          && index($0, target) != 0 && index($0, scale) != 0 { count += 1 }
-        END { print count + 0 }
+        function field(name,    field_index, pair) {
+          for (field_index = 1; field_index <= NF; field_index += 1) {
+            split($field_index, pair, "=")
+            if (pair[1] == name) return pair[2]
+          }
+          return ""
+        }
+        (index($0, "accepted plugin draw packet pane=") != 0 \
+          || index($0, "staged plugin draw pane=") != 0) \
+          && index($0, target) != 0 && index($0, scale) != 0 {
+            pane = field("pane")
+            if (pane != "") seen[pane] = 1
+          }
+        END {
+          for (pane in seen) count += 1
+          print count + 0
+        }
+      ' "$CLIENT_LOG")"
+    startup_native_line="$(awk '
+        function field(name,    field_index, pair) {
+          for (field_index = 1; field_index <= NF; field_index += 1) {
+            split($field_index, pair, "=")
+            if (pair[1] == name) return pair[2]
+          }
+          return ""
+        }
+        index($0, "accepted synchronized layout actor=workspace ") != 0 \
+          && field("native_resize_revision") + 0 > 0 {
+            request = field("request")
+            native = field("native_resize_revision")
+            epoch = field("epoch")
+            target_revision = field("target_revision")
+            accepted = NR
+            common_promoted = completed = window_promoted = lease_ack = 0
+            next
+          }
+        accepted > 0 && completed == 0 \
+          && index($0, "resize-present ") != 0 \
+          && field("epoch") == epoch && field("phase") == "promoted" \
+          && field("staged_count") == "0" && field("degraded") == "false" {
+            common_promoted = NR
+            next
+          }
+        common_promoted > 0 \
+          && index($0, "completed synchronized layout actor=workspace ") != 0 \
+          && field("request") == request \
+          && field("native_resize_revision") == native \
+          && field("epoch") == epoch {
+            completed = NR
+            next
+          }
+        completed > 0 && window_promoted == 0 \
+          && index($0, "window-resize-present ") != 0 \
+          && field("native_resize_revision") == native \
+          && field("epoch") == epoch && field("phase") == "promoted" \
+          && field("staged_count") == "0" && field("degraded") == "false" {
+            window_promoted = NR
+            next
+          }
+        window_promoted > 0 && lease_ack == 0 \
+          && index($0, "accepted unchanged leased actor layout ") != 0 \
+          && field("presented_layout_revision") == target_revision {
+            lease_ack = NR
+          }
+        END {
+          if (accepted < common_promoted && common_promoted < completed \
+              && completed < window_promoted && window_promoted < lease_ack) {
+            print lease_ack
+          }
+        }
       ' "$CLIENT_LOG")"
     if rg -q 'loaded presentation pointer policy provider=workspace ' "$CLIENT_LOG" \
       && rg -q 'started presentation WASM actor id=resize-proof-fast ' "$CLIENT_LOG" \
       && rg -q "started presentation WASM actor id=$second_actor " "$CLIENT_LOG" \
       && rg -q 'started presentation WASM actor id=session-switcher ' "$CLIENT_LOG" \
       && rg -q "settled presentation window resize .*to=${MODE_WIDTH}x${MODE_HEIGHT} " "$CLIENT_LOG" \
-      && [[ -n "$final_diagnostics_line" && "$target_draws" -ge 4 ]] \
+      && [[ -n "$final_diagnostics_line" && "$target_scene_panes" -eq 2 ]] \
+      && [[ -n "$startup_native_line" ]] \
       && rg -q 'resize-present .*event_sequence=0 .*divider_x=[0-9]+ .*phase=settled ' "$CLIENT_LOG"; then
       return 0
     fi
@@ -323,11 +393,13 @@ start_proof_client() {
 }
 
 stop_proof_client() {
+  local stopped_pid="$CLIENT_PID"
   terminate_process "$CLIENT_PID"
   CLIENT_PID=""
   for _ in $(seq 1 200); do
     if ! wayland_env swaymsg -t get_tree -r \
-      | jq -e '.. | objects | select(.app_id? == "brood-client")' > /dev/null; then
+      | jq -e --argjson pid "$stopped_pid" \
+        '.. | objects | select(.pid? == $pid)' > /dev/null; then
       return 0
     fi
     sleep 0.025
@@ -713,8 +785,6 @@ done
 send_pointer_command release release
 record_burst_ack release
 BURST_RELEASE_SEQUENCE="$ACK_SEQUENCE"
-BURST_RELEASE_X="$ACK_X"
-BURST_RELEASE_Y="$ACK_Y"
 
 wait_resize_trace "$BURST_RELEASE_SEQUENCE" projected 1
 BURST_PROJECTED_TRACE="$TRACE_TEXT"
@@ -774,7 +844,7 @@ trace_pattern = re.compile(
 accepted_pattern = re.compile(
     r"accepted synchronized layout actor=workspace request=(?P<request>\d+) "
     r"interaction=(?P<interaction>\d+) event_sequence=(?P<event_sequence>\d+) "
-    r"epoch=(?P<epoch>\d+) "
+    r"native_resize_revision=(?P<native_resize_revision>\d+) epoch=(?P<epoch>\d+) "
 )
 terminal_pattern = re.compile(
     r"(?P<outcome>completed|degraded) synchronized layout actor=workspace "
@@ -957,7 +1027,7 @@ then
   exit 1
 fi
 
-start_proof_client degraded resize-proof-stall
+start_proof_client degraded resize-proof-stall-after-first
 wait_resize_trace 0 settled 1
 capture_frame timeout-initial-settled 0 initial -1 -1
 TIMEOUT_DIVIDER_X="$(sed -n 's/.* divider_x=\(-\{0,1\}[0-9][0-9]*\) .*/\1/p' <<< "$TRACE_TEXT")"
@@ -1012,6 +1082,24 @@ capture_frame recovery-release-promoted "$ACK_SEQUENCE" "$ACK_ACTION" "$ACK_X" "
 finish_pointer_sequence
 stop_proof_client
 cat "$POINTER_PROTOCOL_LOG" "$POINTER_STDERR_LOG" > "$POINTER_LOG"
+
+# Continue in the same headless compositor with the production root-layout
+# actor tree.  Its artifacts are intentionally separate so the original 44
+# frame-locked drag/timeout captures remain stable and directly comparable.
+EXTENDED_OUT="$OUT/window-shell"
+EXTENDED_PROOF="$EXTENDED_OUT/proof.json"
+EXTENDED_METRICS="$EXTENDED_OUT/metrics.json"
+env \
+  BROOD_RESIZE_EXTENDED_OUT="$EXTENDED_OUT" \
+  BROOD_RESIZE_CLIENT="$CLIENT_BIN" \
+  BROOD_RESIZE_WORKSPACE_MODULE="$WORKSPACE_MODULE" \
+  BROOD_RESIZE_PROOF_COMPONENT="$RESIZE_PROOF_COMPONENT" \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  SWAYSOCK="$SWAY_SOCKET" \
+  RUST_LOG="$RUST_LOG" \
+  "$ROOT/tools/test-resize-overhaul-window-shell-nested.sh"
+[[ -s "$EXTENDED_PROOF" && -s "$EXTENDED_METRICS" ]]
 
 python3 - \
   "$CLIENT_LOG_NORMAL" \
@@ -1799,7 +1887,17 @@ if set(degraded) != required_degraded:
         f"expected={sorted(required_degraded)}"
     )
 timeout_projected = degraded["timeout-projected"]
-if {pane["epoch"] for pane in timeout_projected["panes"].values()} != {0}:
+timeout_initial = degraded["timeout-initial-settled"]
+old_timeout_epochs = {
+    pane["epoch"] for pane in timeout_initial["panes"].values()
+}
+if len(old_timeout_epochs) != 1:
+    raise SystemExit(
+        f"timeout lane did not start with a coherent waited pair: {timeout_initial}"
+    )
+if {
+    pane["epoch"] for pane in timeout_projected["panes"].values()
+} != old_timeout_epochs:
     raise SystemExit(f"timeout projection did not retain old/old content: {timeout_projected}")
 timeout = degraded["timeout-degraded"]
 timeout_trace = timeout["trace"]
@@ -1811,7 +1909,7 @@ if not (
     and timeout_trace["staged_count"] == 0
 ):
     raise SystemExit(f"timeout did not clear its bounded staged barrier: {timeout_trace}")
-if {pane["epoch"] for pane in timeout["panes"].values()} != {0}:
+if {pane["epoch"] for pane in timeout["panes"].values()} != old_timeout_epochs:
     raise SystemExit(
         f"degraded frame exposed a partial waited set instead of old/old content: {timeout}"
     )
@@ -1884,10 +1982,11 @@ then
 fi
 
 MERGED_METRICS="$OUT/metrics-merged.json"
-jq --slurp '.[0] + {fiducials: .[1], burst: .[2]}' \
+jq --slurp '.[0] + {fiducials: .[1], burst: .[2], window_shell: .[3]}' \
   "$METRICS" \
   "$FIDUCIAL_METRICS" \
   "$BURST_METRICS" \
+  "$EXTENDED_METRICS" \
   > "$MERGED_METRICS"
 mv "$MERGED_METRICS" "$METRICS"
 
@@ -1920,6 +2019,7 @@ python3 - \
   "$LOGICAL_HEIGHT" \
   "$MODE_WIDTH" \
   "$MODE_HEIGHT" \
+  "$EXTENDED_PROOF" \
   > "$PROOF" <<'PY'
 import json
 import pathlib
@@ -1931,6 +2031,7 @@ metrics_path = pathlib.Path(sys.argv[3])
 frames = [json.loads(line) for line in manifest_path.read_text().splitlines() if line]
 events = [json.loads(line) for line in events_path.read_text().splitlines() if line]
 metrics = json.loads(metrics_path.read_text())
+extended_proof = json.loads(pathlib.Path(sys.argv[11]).read_text())
 frame_locked_commands = sum(
     max(
         (frame["pointer_ack"]["sequence"] for frame in frames if frame["lane"] == lane),
@@ -1941,6 +2042,8 @@ frame_locked_commands = sum(
 frame_roundtrip = metrics["input_roundtrip_ms"]
 burst_commands = metrics["burst"]["input"]["command_count"]
 burst_roundtrip = metrics["burst"]["input"]["roundtrip_ms"]
+extended_commands = metrics["window_shell"]["input"]["count"]
+extended_captures = metrics["window_shell"]["captures"]["total"]
 roundtrip_samples = frame_roundtrip["samples"] + burst_roundtrip["samples"]
 combined_roundtrip = {
     "samples": roundtrip_samples,
@@ -1961,11 +2064,18 @@ proof = {
         "mode_size": [int(sys.argv[9]), int(sys.argv[10])],
     },
     "input": {
-        "protocol": "virtual-pointer-input sequence",
-        "commands": frame_locked_commands + burst_commands,
+        "protocols": [
+            "virtual-pointer-input sequence",
+            "Sway IPC compositor configure with ordered acknowledgement",
+            "virtual-keyboard-key compositor roundtrip",
+        ],
+        "commands": frame_locked_commands + burst_commands + extended_commands,
         "frame_locked_commands": frame_locked_commands,
         "burst_commands": burst_commands,
-        "captures": len(frames),
+        "window_shell_commands": extended_commands,
+        "captures": len(frames) + extended_captures,
+        "frame_locked_captures": len(frames),
+        "window_shell_captures": extended_captures,
         "roundtrip_ms": combined_roundtrip,
         "frame_locked_roundtrip_ms": frame_roundtrip,
         "burst_roundtrip_ms": burst_roundtrip,
@@ -2015,6 +2125,33 @@ proof = {
             and metrics["burst"]["release"]["matches_projected_target"]
             and metrics["burst"]["release"]["matches_pointer_coordinate"]
         ),
+        "native_window_live_projection": metrics["window_shell"]["assertions"]["native_window_live_projection"],
+        "native_window_root_synchronization": (
+            metrics["window_shell"]["assertions"]["native_uses_root_synchronization"]
+            and metrics["window_shell"]["assertions"]["native_revision_echoed"]
+            and extended_proof["assertions"]["native_configure_burst_settles_once"]
+            and extended_proof["assertions"]["no_ordinary_layout_during_native_completion"]
+        ),
+        "recursive_root_atomicity": (
+            metrics["window_shell"]["assertions"]["atomic_old_old_then_new_new"]
+            and metrics["window_shell"]["assertions"]["no_mixed_waited_pairs"]
+            and metrics["window_shell"]["assertions"]["staging_bounded"]
+            and metrics["window_shell"]["assertions"]["no_degraded_final"]
+        ),
+        "session_switcher_owned_layouts": (
+            metrics["window_shell"]["assertions"]["sidebar_root_transactions"]
+            and metrics["window_shell"]["assertions"]["session_switcher_visibility"]
+            and extended_proof["assertions"]["production_shell_claims_root"]
+            and extended_proof["assertions"]["workspace_owns_only_recursive_rest"]
+        ),
+        "inbox_owned_layouts": metrics["window_shell"]["assertions"]["inbox_visibility"],
+        "recursive_exact_extents_and_chrome": (
+            metrics["window_shell"]["assertions"]["one_device_pixel_divider"]
+            and metrics["window_shell"]["assertions"]["exact_gpu_logical_extents"]
+            and metrics["window_shell"]["assertions"]["status_bar_extent_stable"]
+            and metrics["window_shell"]["assertions"]["fractional_scale_fiducials"]
+        ),
+        "shell_synchronized_real_input": metrics["window_shell"]["assertions"]["synchronized_real_input"],
     },
     "artifacts": {
         "frame_manifest": "frame-manifest.jsonl",
@@ -2028,6 +2165,12 @@ proof = {
         "pointer_log": "pointer.log",
         "burst_input": "burst-input.jsonl",
         "burst_metrics": "burst-metrics.json",
+        "window_shell_proof": "window-shell/proof.json",
+        "window_shell_metrics": "window-shell/metrics.json",
+        "window_frame_manifest": "window-shell/window-frame-manifest.jsonl",
+        "sidebar_frame_manifest": "window-shell/sidebar-frame-manifest.jsonl",
+        "window_contact_sheet": "window-shell/window-contact-sheet.png",
+        "sidebar_contact_sheet": "window-shell/sidebar-contact-sheet.png",
     },
 }
 print(json.dumps(proof, indent=2, sort_keys=True))
@@ -2057,6 +2200,13 @@ jq -e '
   and .assertions.burst_staging_bounded == true
   and .assertions.burst_client_survives == true
   and .assertions.burst_release_becomes_durable == true
+  and .assertions.native_window_live_projection == true
+  and .assertions.native_window_root_synchronization == true
+  and .assertions.recursive_root_atomicity == true
+  and .assertions.session_switcher_owned_layouts == true
+  and .assertions.inbox_owned_layouts == true
+  and .assertions.recursive_exact_extents_and_chrome == true
+  and .assertions.shell_synchronized_real_input == true
   and .output.fractional_scale_1_25 == true
 ' "$PROOF" > /dev/null
 
@@ -2066,5 +2216,6 @@ echo "metrics=$METRICS"
 echo "manifest=$FRAME_MANIFEST"
 echo "events=$RESIZE_EVENTS"
 echo "burst=$BURST_METRICS"
+echo "window_shell=$EXTENDED_PROOF"
 echo "contact_sheet=$OUT/contact-sheet.png"
 echo "animation=$OUT/resize.gif"

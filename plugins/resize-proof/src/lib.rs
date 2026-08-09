@@ -16,6 +16,7 @@ const INIT_ACTOR_ID: &str = "brood.client-init";
 const FAST_ACTOR_ID: &str = "resize-proof-fast";
 const SLOW_ACTOR_ID: &str = "resize-proof-slow";
 const STALL_ACTOR_ID: &str = "resize-proof-stall";
+const STALL_AFTER_FIRST_ACTOR_ID: &str = "resize-proof-stall-after-first";
 const COMPONENT_FILE: &str = "brood_resize_proof_plugin.component.wasm";
 const DELAY_MS: u64 = 120;
 const DELAY_PAYLOAD: &[u8] = b"resize-proof-delay-v1";
@@ -34,12 +35,15 @@ enum ProofMode {
     Fast,
     Slow,
     StallOnce,
+    StallAfterFirst,
 }
 
 impl ProofMode {
     fn for_instance(instance_id: &str) -> Self {
         if instance_id.ends_with("-slow") {
             Self::Slow
+        } else if instance_id.ends_with("-stall-after-first") {
+            Self::StallAfterFirst
         } else if instance_id.ends_with("-stall") {
             Self::StallOnce
         } else {
@@ -52,6 +56,7 @@ impl ProofMode {
             Self::Fast => "fast",
             Self::Slow => "slow",
             Self::StallOnce => "stall-once",
+            Self::StallAfterFirst => "stall-after-first",
         }
     }
 
@@ -60,6 +65,7 @@ impl ProofMode {
             Self::Fast => FAST_ACTOR_ID,
             Self::Slow => SLOW_ACTOR_ID,
             Self::StallOnce => STALL_ACTOR_ID,
+            Self::StallAfterFirst => STALL_AFTER_FIRST_ACTOR_ID,
         }
     }
 
@@ -67,8 +73,12 @@ impl ProofMode {
         match self {
             Self::Fast => FAST_MARKER,
             Self::Slow => SLOW_MARKER,
-            Self::StallOnce => STALL_MARKER,
+            Self::StallOnce | Self::StallAfterFirst => STALL_MARKER,
         }
+    }
+
+    const fn stalls(self) -> bool {
+        matches!(self, Self::StallOnce | Self::StallAfterFirst)
     }
 }
 
@@ -192,6 +202,7 @@ struct ProofState {
     recovery_pending: Option<UntaggedTarget>,
     recovery_worker: Option<u64>,
     recovery_delayed: bool,
+    first_tagged_submitted: bool,
     last_submitted: Option<PaintTarget>,
     error: Option<String>,
 }
@@ -210,6 +221,7 @@ impl ProofState {
             recovery_pending: None,
             recovery_worker: None,
             recovery_delayed: false,
+            first_tagged_submitted: false,
             last_submitted: None,
             error: None,
         }
@@ -223,6 +235,14 @@ impl ProofState {
             self.stalled = None;
             false
         }
+    }
+
+    fn stall_after_optional_warmup(&mut self, target: PaintTarget) -> bool {
+        if self.mode == ProofMode::StallAfterFirst && !self.first_tagged_submitted {
+            self.first_tagged_submitted = true;
+            return false;
+        }
+        self.stall_until_recovery(target)
     }
 
     fn schedule_first_recovery(&mut self, target: UntaggedTarget) -> RecoveryAction {
@@ -292,6 +312,7 @@ fn handle_start(instance_id: &str) -> Vec<ActorCommand> {
             start_global_actor(FAST_ACTOR_ID, COMPONENT_FILE, Vec::new()),
             start_global_actor(SLOW_ACTOR_ID, COMPONENT_FILE, Vec::new()),
             start_global_actor(STALL_ACTOR_ID, COMPONENT_FILE, Vec::new()),
+            start_global_actor(STALL_AFTER_FIRST_ACTOR_ID, COMPONENT_FILE, Vec::new()),
             ActorCommand::LifecycleComplete(Ok(())),
         ];
     }
@@ -344,7 +365,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     height: state.height,
                     scale: state.scale,
                 };
-                if mode == ProofMode::StallOnce {
+                if mode.stalls() {
                     match state.schedule_first_recovery(untagged) {
                         RecoveryAction::Spawn(worker) => {
                             drop(state);
@@ -418,8 +439,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     drop(state);
                     apply_delay_action(action, mode)
                 }
-                ProofMode::StallOnce => {
-                    if state.stall_until_recovery(target) {
+                ProofMode::StallOnce | ProofMode::StallAfterFirst => {
+                    if state.stall_after_optional_warmup(target) {
                         drop(state);
                         vec![diagnostic_command(
                             "resize-proof-stalled",
@@ -457,7 +478,7 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    if state.mode == ProofMode::StallOnce {
+    if state.mode.stalls() {
         let recovery = state.finish_recovery(worker);
         let mode = state.mode;
         drop(state);
@@ -733,6 +754,10 @@ mod tests {
             ProofMode::for_instance(STALL_ACTOR_ID),
             ProofMode::StallOnce
         );
+        assert_eq!(
+            ProofMode::for_instance(STALL_AFTER_FIRST_ACTOR_ID),
+            ProofMode::StallAfterFirst
+        );
         assert_eq!(ProofMode::for_instance("resize-proof"), ProofMode::Fast);
     }
 
@@ -803,6 +828,30 @@ mod tests {
             RecoveryAction::Spawn(RECOVERY_WORKER)
         );
         assert!(!state.stall_until_recovery(target(103, 460.0)));
+    }
+
+    #[test]
+    fn stall_after_first_tags_native_warmup_then_stalls_until_recovery() {
+        let mut state = ProofState::new(ProofMode::StallAfterFirst);
+        let native = target(1, 400.0);
+        let pointer = target(2, 420.0);
+        let superseding_pointer = target(3, 440.0);
+
+        assert!(!state.stall_after_optional_warmup(native));
+        assert!(state.stall_after_optional_warmup(pointer));
+        assert!(state.stall_after_optional_warmup(superseding_pointer));
+
+        let untagged = UntaggedTarget {
+            pane: 7,
+            width: 440.0,
+            height: 240.0,
+            scale: 1.0,
+        };
+        assert_eq!(
+            state.schedule_first_recovery(untagged),
+            RecoveryAction::Spawn(RECOVERY_WORKER)
+        );
+        assert!(!state.stall_after_optional_warmup(target(4, 460.0)));
     }
 
     #[test]

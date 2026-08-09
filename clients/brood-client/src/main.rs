@@ -53,7 +53,7 @@ use serde::Deserialize;
 use wgpu::{Color, CurrentSurfaceTexture};
 use winit::{
     application::ApplicationHandler,
-    dpi::LogicalSize,
+    dpi::{LogicalSize, PhysicalSize},
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
@@ -2572,8 +2572,64 @@ struct WindowResizeTransaction {
     started: Instant,
     settle_at: Instant,
     events: u32,
+    configure_sequence: u64,
     initial_size: (u32, u32),
     latest_size: (u32, u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeWindowResizeStage {
+    AwaitingBasePresentation,
+    AwaitingRootLayout,
+    FallbackReady,
+}
+
+struct PendingNativeWindowResize {
+    native_resize_revision: Option<u64>,
+    base_presented_layout_revision: u64,
+    configure_sequence: u64,
+    size: (u32, u32),
+    started: Instant,
+    deadline: Option<Instant>,
+    stage: NativeWindowResizeStage,
+}
+
+impl PendingNativeWindowResize {
+    const fn new(
+        base_presented_layout_revision: u64,
+        configure_sequence: u64,
+        size: (u32, u32),
+        started: Instant,
+    ) -> Self {
+        Self {
+            native_resize_revision: None,
+            base_presented_layout_revision,
+            configure_sequence,
+            size,
+            started,
+            deadline: None,
+            stage: NativeWindowResizeStage::AwaitingBasePresentation,
+        }
+    }
+
+    fn publish(&mut self, native_resize_revision: u64, now: Instant, timeout: Duration) {
+        self.native_resize_revision = Some(native_resize_revision);
+        self.deadline = Some(now + timeout);
+        self.stage = NativeWindowResizeStage::AwaitingRootLayout;
+    }
+
+    const fn published_revision(&self) -> Option<u64> {
+        if matches!(self.stage, NativeWindowResizeStage::AwaitingRootLayout) {
+            self.native_resize_revision
+        } else {
+            None
+        }
+    }
+
+    fn ready_for_fallback(&self, now: Instant) -> bool {
+        matches!(self.stage, NativeWindowResizeStage::AwaitingRootLayout)
+            && self.deadline.is_some_and(|deadline| now >= deadline)
+    }
 }
 
 #[derive(Debug)]
@@ -2605,6 +2661,7 @@ struct ActiveSynchronizedResize {
     request_id: u64,
     interaction: Option<brood_wasm::InteractionId>,
     event_sequence: u64,
+    native_resize_revision: Option<u64>,
     chain_base_layout_revision: u64,
     epoch: brood_wasm::ResizeEpoch,
     requester: ActorIdentity,
@@ -2690,6 +2747,123 @@ fn synchronized_event_sequence_advances(requested: u64, previous: Option<u64>) -
     previous.is_none_or(|previous| requested > previous)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeResizeRequestDisposition {
+    Ordinary,
+    Matching,
+    Busy,
+    Stale,
+}
+
+const fn native_resize_request_disposition(
+    pending: Option<&PendingNativeWindowResize>,
+    requested_revision: Option<u64>,
+    native_transaction_active: bool,
+    continuous_resize_active: bool,
+) -> NativeResizeRequestDisposition {
+    if continuous_resize_active {
+        return NativeResizeRequestDisposition::Busy;
+    }
+    let Some(pending) = pending else {
+        return if requested_revision.is_some() {
+            NativeResizeRequestDisposition::Stale
+        } else {
+            NativeResizeRequestDisposition::Ordinary
+        };
+    };
+    let Some(published) = pending.published_revision() else {
+        return if requested_revision.is_some() {
+            NativeResizeRequestDisposition::Stale
+        } else {
+            NativeResizeRequestDisposition::Busy
+        };
+    };
+    match requested_revision {
+        Some(requested) if requested == published && !native_transaction_active => {
+            NativeResizeRequestDisposition::Matching
+        }
+        Some(requested) if requested == published => NativeResizeRequestDisposition::Busy,
+        Some(_) => NativeResizeRequestDisposition::Stale,
+        None => NativeResizeRequestDisposition::Busy,
+    }
+}
+
+fn target_present_plugin_panes(
+    target: &ResolvedLayout,
+    waitable_plugin_panes: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    target
+        .items
+        .iter()
+        .filter_map(|item| match item.kind {
+            LayoutItemKind::Pane { pane } if waitable_plugin_panes.contains(&pane) => Some(pane),
+            LayoutItemKind::Pane { .. }
+            | LayoutItemKind::Placeholder
+            | LayoutItemKind::Handle
+            | LayoutItemKind::Chrome
+            | LayoutItemKind::Overlay => None,
+        })
+        .collect()
+}
+
+fn layout_inventory_requires_update(leases: &LayoutLeaseTree, panes: &[u64]) -> bool {
+    leases.inventory_revision() == 0
+        || leases
+            .waitable_panes(leases.root_token())
+            .is_none_or(|current| current != panes)
+}
+
+const fn native_resize_allows_layout_publication(
+    pending: Option<&PendingNativeWindowResize>,
+) -> bool {
+    match pending {
+        Some(pending) => matches!(pending.stage, NativeWindowResizeStage::AwaitingRootLayout),
+        None => true,
+    }
+}
+
+fn lease_receives_layout_publication(
+    lease: LayoutLeaseId,
+    root: LayoutLeaseId,
+    native_resize_revision: Option<u64>,
+) -> bool {
+    native_resize_revision.is_none() || lease == root
+}
+
+fn trace_pane_ids(panes: &BTreeSet<u64>) -> String {
+    panes
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn trace_layout_pane_rects(layout: &ResolvedLayout, extent: LayoutSize) -> String {
+    let mut rects = layout
+        .items
+        .iter()
+        .filter_map(|item| match item.kind {
+            LayoutItemKind::Pane { pane } => {
+                let rect = item.pixel_rect(extent);
+                Some((
+                    pane,
+                    format!("{pane}:{}:{}:{}:{}", rect.x, rect.y, rect.w, rect.h),
+                ))
+            }
+            LayoutItemKind::Placeholder
+            | LayoutItemKind::Handle
+            | LayoutItemKind::Chrome
+            | LayoutItemKind::Overlay => None,
+        })
+        .collect::<Vec<_>>();
+    rects.sort_unstable_by_key(|(pane, _rect)| *pane);
+    rects
+        .into_iter()
+        .map(|(_pane, rect)| rect)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn deferred_actor_sender_is_current(
     sender: Option<&ActorIdentity>,
     current: Option<&ActorIdentity>,
@@ -2706,8 +2880,16 @@ const fn zone_has_actor_policy_authority(zone: ComposedZoneId) -> bool {
     zone.lease_generation != 0
 }
 
-const fn ordinary_layout_message_conflicts_with_synchronized_resize(message: &HostMessage) -> bool {
+const fn ordinary_layout_message_conflicts_with_unsettled_resize(
+    message: &HostMessage,
+    synchronized_resize_active: bool,
+    continuous_window_resize_active: bool,
+    native_window_resize_pending: bool,
+) -> bool {
     matches!(message, HostMessage::SetResolvedLayout { .. })
+        && (synchronized_resize_active
+            || continuous_window_resize_active
+            || native_window_resize_pending)
 }
 
 const fn synchronized_layout_notification_request_id(
@@ -2743,6 +2925,37 @@ struct ResizePresentationTrace {
     degraded: bool,
 }
 
+#[derive(Clone, Copy)]
+struct NativeResizePresentationTrace {
+    native_resize_revision: u64,
+    configure_sequence: u64,
+    width: u32,
+    height: u32,
+    epoch: u64,
+    phase: &'static str,
+    wait_ready: usize,
+    wait_total: usize,
+    degraded: bool,
+    pending_emit: bool,
+}
+
+impl Default for NativeResizePresentationTrace {
+    fn default() -> Self {
+        Self {
+            native_resize_revision: 0,
+            configure_sequence: 0,
+            width: 0,
+            height: 0,
+            epoch: 0,
+            phase: "settled",
+            wait_ready: 0,
+            wait_total: 0,
+            degraded: false,
+            pending_emit: false,
+        }
+    }
+}
+
 impl Default for ResizePresentationTrace {
     fn default() -> Self {
         Self {
@@ -2773,19 +2986,26 @@ fn drop_frontend_wayland_state<DropBridge, Frontend, Clipboard>(
 }
 
 impl WindowResizeTransaction {
-    fn new(now: Instant, initial_size: (u32, u32), latest_size: (u32, u32)) -> Self {
+    fn new(
+        now: Instant,
+        configure_sequence: u64,
+        initial_size: (u32, u32),
+        latest_size: (u32, u32),
+    ) -> Self {
         Self {
             started: now,
             settle_at: now + WINDOW_RESIZE_SETTLE_DELAY,
             events: 1,
+            configure_sequence,
             initial_size,
             latest_size,
         }
     }
 
-    fn observe(&mut self, now: Instant, latest_size: (u32, u32)) {
+    fn observe(&mut self, now: Instant, configure_sequence: u64, latest_size: (u32, u32)) {
         self.settle_at = now + WINDOW_RESIZE_SETTLE_DELAY;
         self.events = self.events.saturating_add(1);
+        self.configure_sequence = configure_sequence;
         self.latest_size = latest_size;
     }
 
@@ -2836,12 +3056,16 @@ struct Application {
     layout_revision: u64,
     presented_layout_revision: u64,
     pending_presented_layout_revision: Option<u64>,
+    next_native_resize_revision: u64,
+    window_configure_sequence: u64,
+    pending_native_window_resize: Option<PendingNativeWindowResize>,
     next_resize_epoch: u64,
     active_synchronized_resize: Option<ActiveSynchronizedResize>,
     synchronized_resize_lineage: Option<SynchronizedResizeLineage>,
     pending_synchronized_layout_notifications: VecDeque<PendingSynchronizedLayoutNotification>,
     deferred_actor_host_messages: VecDeque<HostActorMessage>,
     resize_presentation_trace: ResizePresentationTrace,
+    native_resize_presentation_trace: NativeResizePresentationTrace,
     layout_leases: LayoutLeaseTree,
     root_layout_actor: Option<ActorIdentity>,
     layout_holders: BTreeMap<LayoutLeaseId, ActorIdentity>,
@@ -3771,6 +3995,12 @@ impl Application {
         if self.window_resize.is_some() {
             return Ok(());
         }
+        if !native_resize_allows_layout_publication(self.pending_native_window_resize.as_ref()) {
+            // The root must never receive a nonce for geometry which has not
+            // reached queue.present. A timed-out fallback is likewise kept
+            // private until its projected old-content frame is presented.
+            return Ok(());
+        }
         let synchronized_inventory_changed = self
             .active_synchronized_resize
             .as_ref()
@@ -3954,52 +4184,73 @@ impl Application {
                         .context("presented fallback layout revision limit exceeded")?,
                 );
             }
-            self.layout_revision = self
-                .layout_revision
-                .checked_add(1)
-                .context("layout state revision limit exceeded")?;
             let panes = renderer.pane_inventory();
-            let previously_owned = self
-                .layout_leases
-                .lease_tokens()
-                .into_iter()
-                .flat_map(|token| self.layout_leases.owned_panes(token).unwrap_or_default())
-                .collect::<HashSet<_>>();
-            let new_global_panes = newly_declared_global_plugin_panes(
-                &previously_owned,
-                &panes,
-                &renderer.plugin_pane_realms,
-            );
-            self.layout_leases
-                .update_inventory(self.layout_revision, &panes)?;
-            self.synchronized_resize_lineage = None;
-            if !new_global_panes.is_empty() {
+            if layout_inventory_requires_update(&self.layout_leases, &panes) {
+                self.layout_revision = self
+                    .layout_revision
+                    .checked_add(1)
+                    .context("layout inventory revision limit exceeded")?;
+                let previously_owned = self
+                    .layout_leases
+                    .lease_tokens()
+                    .into_iter()
+                    .flat_map(|token| self.layout_leases.owned_panes(token).unwrap_or_default())
+                    .collect::<HashSet<_>>();
+                let new_global_panes = newly_declared_global_plugin_panes(
+                    &previously_owned,
+                    &panes,
+                    &renderer.plugin_pane_realms,
+                );
                 self.layout_leases
-                    .assign_panes(self.layout_leases.root_token(), &new_global_panes)?;
-            }
-            if let Some(runtime) = self.wasm_runtime.as_ref() {
-                for token in self.layout_leases.lease_tokens() {
-                    let Some(holder) = self.layout_holders.get(&token.id) else {
-                        continue;
-                    };
-                    let Some(pane) = runtime.pane_for_actor(holder) else {
-                        continue;
-                    };
-                    if panes.contains(&pane) {
-                        self.layout_leases.assign_panes(token, &[pane])?;
+                    .update_inventory(self.layout_revision, &panes)?;
+                self.synchronized_resize_lineage = None;
+                if !new_global_panes.is_empty() {
+                    self.layout_leases
+                        .assign_panes(self.layout_leases.root_token(), &new_global_panes)?;
+                }
+                if let Some(runtime) = self.wasm_runtime.as_ref() {
+                    for token in self.layout_leases.lease_tokens() {
+                        let Some(holder) = self.layout_holders.get(&token.id) else {
+                            continue;
+                        };
+                        let Some(pane) = runtime.pane_for_actor(holder) else {
+                            continue;
+                        };
+                        if panes.contains(&pane) {
+                            self.layout_leases.assign_panes(token, &[pane])?;
+                        }
                     }
                 }
             }
-            self.layout_publications.clear();
+            if self
+                .pending_native_window_resize
+                .as_ref()
+                .and_then(PendingNativeWindowResize::published_revision)
+                .is_some()
+            {
+                self.layout_publications
+                    .remove(&self.layout_leases.root_token().id);
+            } else {
+                self.layout_publications.clear();
+            }
             renderer.layout_state_dirty = false;
         }
-        if self.layout_revision == 0 {
+        let inventory_revision = self.layout_leases.inventory_revision();
+        if inventory_revision == 0 {
             return Ok(());
         }
 
         let tokens = self.layout_leases.lease_tokens();
+        let root_lease = self.layout_leases.root_token().id;
+        let native_resize_revision = self
+            .pending_native_window_resize
+            .as_ref()
+            .and_then(PendingNativeWindowResize::published_revision);
         for lease in tokens {
-            if self.layout_publications.get(&lease.id) == Some(&self.layout_revision) {
+            if !lease_receives_layout_publication(lease.id, root_lease, native_resize_revision) {
+                continue;
+            }
+            if self.layout_publications.get(&lease.id) == Some(&inventory_revision) {
                 continue;
             }
             let Some(viewport) = self.layout_leases.viewport_transform(lease) else {
@@ -4021,11 +4272,16 @@ impl Application {
                 .filter(|pane| self.layout_leases.subtree_contains(lease, *pane));
             let viewport = viewport.pixel_rect(renderer.layout_extent());
             let message = renderer.layout_state_message(
-                self.layout_revision,
+                inventory_revision,
                 self.presented_layout_revision,
                 lease,
                 &owned_panes,
                 &waitable_panes,
+                if lease.id == root_lease {
+                    native_resize_revision
+                } else {
+                    None
+                },
                 focused_pane,
                 LayoutSize {
                     w: viewport.w,
@@ -4054,15 +4310,15 @@ impl Application {
             if let Err(error) = result {
                 eprintln!(
                     "deferred layout-state revision={} lease={} actor={} after mailbox error: {error:#}",
-                    self.layout_revision, lease.id.0, holder.name
+                    inventory_revision, lease.id.0, holder.name
                 );
                 continue;
             }
             self.layout_publications
-                .insert(lease.id, self.layout_revision);
+                .insert(lease.id, inventory_revision);
             eprintln!(
                 "queued layout-state revision={} lease={} actor={}",
-                self.layout_revision, lease.id.0, holder.name
+                inventory_revision, lease.id.0, holder.name
             );
         }
         Ok(())
@@ -4220,17 +4476,232 @@ impl Application {
         Ok(revision)
     }
 
-    fn complete_presented_layout_revision(&mut self) {
+    fn complete_presented_layout_revision(&mut self) -> Result<()> {
         let Some(revision) = self.pending_presented_layout_revision.take() else {
-            return;
+            return Ok(());
         };
         self.presented_layout_revision = revision;
         self.synchronized_resize_lineage = None;
-        self.layout_publications.clear();
+        let publishes_native_resize =
+            self.pending_native_window_resize
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.stage == NativeWindowResizeStage::AwaitingBasePresentation
+                        && pending.base_presented_layout_revision == revision
+                });
+        if publishes_native_resize {
+            self.layout_publications
+                .remove(&self.layout_leases.root_token().id);
+        } else {
+            self.layout_publications.clear();
+        }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.settle_promoted_layout();
         }
+        if publishes_native_resize {
+            let native_resize_revision = self
+                .next_native_resize_revision
+                .checked_add(1)
+                .context("native resize revision limit exceeded")?;
+            self.next_native_resize_revision = native_resize_revision;
+            let pending = self
+                .pending_native_window_resize
+                .as_mut()
+                .context("native resize settlement disappeared after its base presentation")?;
+            pending.publish(
+                native_resize_revision,
+                Instant::now(),
+                SYNCHRONIZED_RESIZE_TIMEOUT,
+            );
+            self.native_resize_presentation_trace = NativeResizePresentationTrace {
+                native_resize_revision,
+                configure_sequence: pending.configure_sequence,
+                width: pending.size.0,
+                height: pending.size.1,
+                phase: "awaiting-layout",
+                pending_emit: true,
+                ..NativeResizePresentationTrace::default()
+            };
+            eprintln!(
+                "published settled native window resize native_resize_revision={native_resize_revision} configure_sequence={} base_presented_layout_revision={} size={}x{}",
+                pending.configure_sequence,
+                pending.base_presented_layout_revision,
+                pending.size.0,
+                pending.size.1,
+            );
+        }
         eprintln!("presented committed layout revision={revision}");
+        Ok(())
+    }
+
+    fn settle_native_window_resize_timeout(&mut self) {
+        let now = Instant::now();
+        let matching_transaction_active = self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| active.native_resize_revision.is_some());
+        let Some(pending) = self.pending_native_window_resize.as_mut() else {
+            return;
+        };
+        if matching_transaction_active || !pending.ready_for_fallback(now) {
+            return;
+        }
+        pending.stage = NativeWindowResizeStage::FallbackReady;
+        pending.deadline = None;
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.window.request_redraw();
+        }
+        eprintln!(
+            "native window resize timed out awaiting root layout native_resize_revision={} configure_sequence={} size={}x{} elapsed_ms={}; scheduling projected fallback",
+            pending.native_resize_revision.unwrap_or(0),
+            pending.configure_sequence,
+            pending.size.0,
+            pending.size.1,
+            pending.started.elapsed().as_millis(),
+        );
+    }
+
+    fn finalize_native_window_resize_renderer(&mut self) -> Result<Option<FocusChange>> {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(None);
+        };
+        let focus_change = renderer.complete_window_resize()?;
+        if let Some(sender) = self.input_sender.as_mut() {
+            send_presentation_configuration(sender, renderer);
+        }
+        flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+        flush_renderer_plugin_resize_events_best_effort(
+            self.wasm_runtime.as_ref(),
+            renderer,
+            "native window resize finalization",
+        );
+        Ok(focus_change)
+    }
+
+    fn complete_presented_native_window_resize_fallback(&mut self) -> Result<Option<FocusChange>> {
+        let fallback_ready = self
+            .pending_native_window_resize
+            .as_ref()
+            .is_some_and(|pending| pending.stage == NativeWindowResizeStage::FallbackReady);
+        if !fallback_ready {
+            return Ok(None);
+        }
+        let pending = self
+            .pending_native_window_resize
+            .take()
+            .context("native window resize fallback disappeared after presentation")?;
+        let focus_change = self.finalize_native_window_resize_renderer()?;
+        self.native_resize_presentation_trace = NativeResizePresentationTrace {
+            native_resize_revision: pending.native_resize_revision.unwrap_or(0),
+            configure_sequence: pending.configure_sequence,
+            width: pending.size.0,
+            height: pending.size.1,
+            phase: "degraded",
+            degraded: true,
+            pending_emit: true,
+            ..NativeResizePresentationTrace::default()
+        };
+        self.layout_publications.clear();
+        eprintln!(
+            "degraded native window resize after root-layout timeout native_resize_revision={} configure_sequence={} size={}x{} elapsed_ms={}",
+            pending.native_resize_revision.unwrap_or(0),
+            pending.configure_sequence,
+            pending.size.0,
+            pending.size.1,
+            pending.started.elapsed().as_millis(),
+        );
+        Ok(focus_change)
+    }
+
+    fn complete_native_window_resize_after_synchronized_present(
+        &mut self,
+        native_resize_revision: u64,
+        epoch: u64,
+        wait_ready: usize,
+        wait_total: usize,
+        degraded: bool,
+    ) -> Result<Option<FocusChange>> {
+        let matches = self
+            .pending_native_window_resize
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.stage == NativeWindowResizeStage::AwaitingRootLayout
+                    && pending.native_resize_revision == Some(native_resize_revision)
+            });
+        anyhow::ensure!(
+            matches,
+            "presented native synchronized layout has no matching window resize"
+        );
+        let pending = self
+            .pending_native_window_resize
+            .take()
+            .context("native window resize disappeared after synchronized presentation")?;
+        let focus_change = self.finalize_native_window_resize_renderer()?;
+        self.native_resize_presentation_trace = NativeResizePresentationTrace {
+            native_resize_revision,
+            configure_sequence: pending.configure_sequence,
+            width: pending.size.0,
+            height: pending.size.1,
+            epoch,
+            phase: if degraded { "degraded" } else { "promoted" },
+            wait_ready,
+            wait_total,
+            degraded,
+            pending_emit: true,
+        };
+        eprintln!(
+            "finalized native window resize native_resize_revision={native_resize_revision} configure_sequence={} epoch={epoch} size={}x{} ready={wait_ready}/{wait_total} degraded={degraded} elapsed_ms={}",
+            pending.configure_sequence,
+            pending.size.0,
+            pending.size.1,
+            pending.started.elapsed().as_millis(),
+        );
+        Ok(focus_change)
+    }
+
+    fn emit_native_window_resize_trace(&mut self) {
+        if !self.native_resize_presentation_trace.pending_emit {
+            return;
+        }
+        let trace = self.native_resize_presentation_trace;
+        if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+            let staged_count = self
+                .renderer
+                .as_ref()
+                .map_or(0, Renderer::staged_layout_count);
+            eprintln!(
+                "window-resize-present native_resize_revision={} configure_sequence={} width={} height={} epoch={} phase={} wait_ready={}/{} staged_count={} degraded={}",
+                trace.native_resize_revision,
+                trace.configure_sequence,
+                trace.width,
+                trace.height,
+                trace.epoch,
+                trace.phase,
+                trace.wait_ready,
+                trace.wait_total,
+                staged_count,
+                trace.degraded,
+            );
+        }
+        self.native_resize_presentation_trace.pending_emit = false;
+    }
+
+    fn restore_native_resize_awaiting_layout_trace(&mut self) {
+        let Some(pending) = self.pending_native_window_resize.as_ref() else {
+            return;
+        };
+        let Some(native_resize_revision) = pending.published_revision() else {
+            return;
+        };
+        self.native_resize_presentation_trace = NativeResizePresentationTrace {
+            native_resize_revision,
+            configure_sequence: pending.configure_sequence,
+            width: pending.size.0,
+            height: pending.size.1,
+            phase: "awaiting-layout",
+            pending_emit: true,
+            ..NativeResizePresentationTrace::default()
+        };
     }
 
     fn cancel_active_layout_capture(&mut self, reason: &str) {
@@ -4273,6 +4744,7 @@ impl Application {
         self.cancel_active_layout_capture(reason);
         let mut focus_change = None;
         if let Some(active) = self.active_synchronized_resize.take() {
+            let aborted_native_resize = active.native_resize_revision.is_some();
             if let Some(renderer) = self.renderer.as_mut() {
                 let (change, deferred) = renderer.abort_staged_layout(active.epoch.id)?;
                 focus_change = change;
@@ -4293,8 +4765,12 @@ impl Application {
                 active.requester.name, active.request_id, active.epoch.id
             );
             self.resize_presentation_trace = ResizePresentationTrace::default();
+            if aborted_native_resize {
+                self.restore_native_resize_awaiting_layout_trace();
+            }
         }
         if self.pending_presented_layout_revision.is_some()
+            && self.pending_native_window_resize.is_none()
             && self
                 .renderer
                 .as_ref()
@@ -4329,6 +4805,7 @@ impl Application {
             .active_synchronized_resize
             .take()
             .context("active synchronized resize disappeared during inventory abort")?;
+        let aborted_native_resize = active.native_resize_revision.is_some();
         let mut focus_change = None;
         let mut deferred = Vec::new();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -4341,6 +4818,9 @@ impl Application {
         self.mark_deferred_plugin_scenes_ready(&deferred);
         self.synchronized_resize_lineage = None;
         self.resize_presentation_trace = ResizePresentationTrace::default();
+        if aborted_native_resize {
+            self.restore_native_resize_awaiting_layout_trace();
+        }
         self.reject_synchronized_layout(
             &active.requester,
             active.request_id,
@@ -4354,6 +4834,41 @@ impl Application {
         Ok(focus_change)
     }
 
+    fn abort_synchronized_resize_for_native_window_resize(
+        &mut self,
+        reason: &str,
+    ) -> Result<Option<FocusChange>> {
+        self.cancel_active_layout_capture(reason);
+        let Some(active) = self.active_synchronized_resize.take() else {
+            self.synchronized_resize_lineage = None;
+            return Ok(None);
+        };
+        let mut focus_change = None;
+        let deferred = if let Some(renderer) = self.renderer.as_mut() {
+            let (change, deferred) = renderer.abort_staged_layout(active.epoch.id)?;
+            focus_change = change;
+            deferred
+        } else if let Some(graphics) = self.plugin_graphics.as_ref() {
+            graphics.abort_resize_epoch(active.epoch.id)?
+        } else {
+            Vec::new()
+        };
+        self.mark_deferred_plugin_scenes_ready(&deferred);
+        self.synchronized_resize_lineage = None;
+        self.resize_presentation_trace = ResizePresentationTrace::default();
+        self.reject_synchronized_layout(
+            &active.requester,
+            active.request_id,
+            brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+            reason,
+        )?;
+        eprintln!(
+            "aborted synchronized layout for native window resize actor={} request={} epoch={} reason={reason}",
+            active.requester.name, active.request_id, active.epoch.id,
+        );
+        Ok(focus_change)
+    }
+
     fn rollback_unannounced_synchronized_resize(
         &mut self,
         reason: &str,
@@ -4361,6 +4876,7 @@ impl Application {
         let Some(active) = self.active_synchronized_resize.take() else {
             return Ok(None);
         };
+        let aborted_native_resize = active.native_resize_revision.is_some();
         let cancel_matching_capture = active.interaction.is_some_and(|interaction| {
             self.policy_pointer_capture
                 .as_ref()
@@ -4417,6 +4933,9 @@ impl Application {
         }
         self.synchronized_resize_lineage = None;
         self.resize_presentation_trace = ResizePresentationTrace::default();
+        if aborted_native_resize {
+            self.restore_native_resize_awaiting_layout_trace();
+        }
         self.reject_synchronized_layout(
             &active.requester,
             active.request_id,
@@ -4477,6 +4996,37 @@ impl Application {
             )?;
             return Ok(None);
         }
+        let native_disposition = native_resize_request_disposition(
+            self.pending_native_window_resize.as_ref(),
+            request.native_resize_revision,
+            self.active_synchronized_resize
+                .as_ref()
+                .is_some_and(|active| active.native_resize_revision.is_some()),
+            self.window_resize.is_some(),
+        );
+        match native_disposition {
+            NativeResizeRequestDisposition::Busy => {
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                    "native window geometry is awaiting its root layout transaction",
+                )?;
+                return Ok(None);
+            }
+            NativeResizeRequestDisposition::Stale => {
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::StaleBaseLayoutRevision,
+                    "native resize revision is no longer current",
+                )?;
+                return Ok(None);
+            }
+            NativeResizeRequestDisposition::Ordinary | NativeResizeRequestDisposition::Matching => {
+            }
+        }
+        let native_resize_request = native_disposition == NativeResizeRequestDisposition::Matching;
         if self.pending_presented_layout_revision.is_some() {
             self.reject_synchronized_layout(
                 sender,
@@ -4518,6 +5068,38 @@ impl Application {
                 "layout lease generation is no longer current",
             )?;
             return Ok(None);
+        }
+        if native_resize_request {
+            let root_lease = self.layout_leases.root_token();
+            let authenticated_root = submitted_lease == root_lease
+                && self.root_layout_actor.as_ref() == Some(sender)
+                && self.layout_holders.get(&root_lease.id) == Some(sender);
+            if !authenticated_root || request.interaction.is_some() {
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                    "native window resize must be submitted without a pointer interaction by the authenticated root layout holder",
+                )?;
+                return Ok(None);
+            }
+            let base_presented_layout_revision = self
+                .pending_native_window_resize
+                .as_ref()
+                .map(|pending| pending.base_presented_layout_revision)
+                .context("matching native window resize disappeared during validation")?;
+            if request.base_layout_revision != base_presented_layout_revision {
+                self.reject_synchronized_layout(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::StaleBaseLayoutRevision,
+                    format!(
+                        "native window resize base {} does not match presented base {base_presented_layout_revision}",
+                        request.base_layout_revision
+                    ),
+                )?;
+                return Ok(None);
+            }
         }
         let inventory_revision = self.layout_leases.inventory_revision();
         if request.inventory_revision != inventory_revision {
@@ -4601,7 +5183,7 @@ impl Application {
             return Ok(None);
         }
 
-        let unique_wait = request
+        let mut unique_wait = request
             .wait_for_panes
             .iter()
             .copied()
@@ -4639,7 +5221,7 @@ impl Application {
             submitted_lease,
             request.inventory_revision,
             convert_actor_layout_fragment(request.fragment.layout, request.fragment.rest),
-            None,
+            request.focus,
         ) {
             self.reject_synchronized_layout(
                 sender,
@@ -4664,6 +5246,18 @@ impl Application {
         let Some(renderer) = self.renderer.as_ref() else {
             return Ok(None);
         };
+        if native_resize_request {
+            let waitable_plugin_panes = target_tree
+                .waitable_panes(submitted_lease)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|pane| renderer.plugin_pane_realms.contains_key(pane))
+                .collect::<BTreeSet<_>>();
+            unique_wait.extend(target_present_plugin_panes(
+                &composed.layout,
+                &waitable_plugin_panes,
+            ));
+        }
         if let Some(pane) = unique_wait.iter().find(|pane| {
             !renderer.plugin_pane_realms.contains_key(pane)
                 || composed.layout.pane_item(**pane).is_none()
@@ -4676,11 +5270,14 @@ impl Application {
             )?;
             return Ok(None);
         }
-        let affected_panes = changed_layout_panes(
+        let mut affected_panes = changed_layout_panes(
             &renderer.presented_layout,
             &composed.layout,
             renderer.layout_extent(),
         );
+        if native_resize_request {
+            affected_panes.extend(unique_wait.iter().copied());
+        }
         let epoch_id = self.next_resize_epoch.max(1);
         self.next_resize_epoch = epoch_id.saturating_add(1);
         let Some(target_layout_revision) = next_presented_layout_revision(current_base) else {
@@ -4752,6 +5349,7 @@ impl Application {
             request_id,
             interaction: request.interaction,
             event_sequence,
+            native_resize_revision: request.native_resize_revision,
             chain_base_layout_revision: interaction_chain_base
                 .unwrap_or(request.base_layout_revision),
             epoch,
@@ -4780,6 +5378,24 @@ impl Application {
         if let Some(renderer) = self.renderer.as_mut() {
             let _focus_change = renderer.project_staged_layout(epoch.id, composed);
         }
+        if let Some(native_resize_revision) = request.native_resize_revision
+            && let Some(pending) = self.pending_native_window_resize.as_ref()
+        {
+            self.native_resize_presentation_trace = NativeResizePresentationTrace {
+                native_resize_revision,
+                configure_sequence: pending.configure_sequence,
+                width: pending.size.0,
+                height: pending.size.1,
+                epoch: epoch.id,
+                phase: "projected",
+                wait_total: self
+                    .active_synchronized_resize
+                    .as_ref()
+                    .map_or(0, |active| active.wait_panes.len()),
+                pending_emit: true,
+                ..NativeResizePresentationTrace::default()
+            };
+        }
         if let Err(error) = self.send_synchronized_layout_notification(sender, notification) {
             let reason =
                 format!("host could not deliver synchronized layout acceptance: {error:#}");
@@ -4787,12 +5403,25 @@ impl Application {
             return Ok(focus_change);
         }
         self.notify_synchronized_plugin_panes();
+        let (accepted_focus, accepted_wait_panes) = self
+            .active_synchronized_resize
+            .as_ref()
+            .map_or((0, String::new()), |active| {
+                (
+                    active.focus.unwrap_or(0),
+                    trace_pane_ids(&active.wait_panes),
+                )
+            });
+        let target_rects = self.renderer.as_ref().map_or_else(String::new, |renderer| {
+            trace_layout_pane_rects(&renderer.accepted_layout, renderer.layout_extent())
+        });
         eprintln!(
-            "accepted synchronized layout actor={} request={} interaction={} event_sequence={} epoch={} base_revision={} target_revision={} wait={} affected={} mode={:?}",
+            "accepted synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} base_revision={} target_revision={} wait={} affected={} mode={:?} actor_generation={} focus={} wait_for_panes=[{}] target_rects=[{}]",
             sender.name,
             request_id,
             request.interaction.map_or(0, |interaction| interaction.0),
             event_sequence,
+            request.native_resize_revision.unwrap_or(0),
             epoch.id,
             epoch.base_layout_revision,
             epoch.target_layout_revision,
@@ -4803,6 +5432,10 @@ impl Application {
                 .as_ref()
                 .map_or(0, |active| active.affected_panes.len()),
             request.presentation,
+            sender.generation,
+            accepted_focus,
+            accepted_wait_panes,
+            target_rects,
         );
         if self
             .active_synchronized_resize
@@ -4874,6 +5507,10 @@ impl Application {
         }
         active.ready_panes.insert(pane);
         self.resize_presentation_trace.wait_ready = active.ready_panes.len();
+        if active.native_resize_revision.is_some() {
+            self.native_resize_presentation_trace.wait_ready = active.ready_panes.len();
+            self.native_resize_presentation_trace.pending_emit = true;
+        }
         if active.ready_panes == active.wait_panes {
             return self.finish_synchronized_resize(false);
         }
@@ -5024,18 +5661,30 @@ impl Application {
         };
         self.queue_synchronized_layout_terminal_notification(&active.requester, notification)?;
         eprintln!(
-            "{} synchronized layout actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} ready={}/{} missing={missing_panes:?} duration_us={}",
+            "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} ready={}/{} missing={missing_panes:?} duration_us={}",
             if degraded { "degraded" } else { "completed" },
             active.requester.name,
             active.request_id,
             active.interaction.map_or(0, |interaction| interaction.0),
             active.event_sequence,
+            active.native_resize_revision.unwrap_or(0),
             active.epoch.id,
             active.epoch.target_layout_revision,
             active.ready_panes.len(),
             active.wait_panes.len(),
             active.started.elapsed().as_micros(),
         );
+        if let Some(native_resize_revision) = active.native_resize_revision
+            && let Some(change) = self.complete_native_window_resize_after_synchronized_present(
+                native_resize_revision,
+                active.epoch.id,
+                active.ready_panes.len(),
+                active.wait_panes.len(),
+                degraded,
+            )?
+        {
+            focus_change = Some(change);
+        }
         Ok(focus_change)
     }
 
@@ -5098,11 +5747,14 @@ impl Application {
                     continue;
                 }
             };
-            if ordinary_layout_message_conflicts_with_synchronized_resize(&message)
-                && self.active_synchronized_resize.is_some()
-            {
+            if ordinary_layout_message_conflicts_with_unsettled_resize(
+                &message,
+                self.active_synchronized_resize.is_some(),
+                self.window_resize.is_some(),
+                self.pending_native_window_resize.is_some(),
+            ) {
                 eprintln!(
-                    "rejected ordinary SetResolvedLayout while a synchronized resize is active: Busy"
+                    "rejected ordinary SetResolvedLayout while synchronized or native resize geometry is unsettled: Busy"
                 );
                 continue;
             }
@@ -5180,6 +5832,12 @@ impl Application {
                     match self.layout_leases.grant_rest(lease, &panes) {
                         Ok(child) => {
                             self.layout_holders.insert(child.id, child_holder.clone());
+                            // Granting `rest` changes the parent's publication contract as
+                            // well as creating the child. Republish the parent so it sees
+                            // `rest=true`; if a native resize nonce is pending, this also
+                            // gives the root holder a chance to answer it with the now-valid
+                            // recursive fragment.
+                            self.layout_publications.remove(&lease.id);
                             self.layout_publications.remove(&child.id);
                             eprintln!(
                                 "granted rest layout lease parent={} child={} actor={} panes={}",
@@ -5709,7 +6367,7 @@ impl Application {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        let focus_change = renderer.finish_window_resize()?;
+        let focus_change = renderer.settle_window_resize_projection();
         if let Some(change) = focus_change {
             dispatch_focus_change(
                 self.wasm_runtime.as_ref(),
@@ -5721,15 +6379,37 @@ impl Application {
         if let Some(sender) = self.input_sender.as_mut() {
             send_presentation_configuration(sender, renderer);
         }
-        flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
-        flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
-        if transaction.initial_size != transaction.latest_size
-            && self.active_synchronized_resize.is_none()
-        {
+        if transaction.initial_size == transaction.latest_size {
+            let focus_change = self.finalize_native_window_resize_renderer()?;
+            if let Some(change) = focus_change {
+                dispatch_focus_change(
+                    self.wasm_runtime.as_ref(),
+                    self.input_sender.as_mut(),
+                    change,
+                    self.window_focused,
+                )?;
+            }
+            self.native_resize_presentation_trace = NativeResizePresentationTrace {
+                configure_sequence: transaction.configure_sequence,
+                width: transaction.latest_size.0,
+                height: transaction.latest_size.1,
+                phase: "settled",
+                pending_emit: true,
+                ..NativeResizePresentationTrace::default()
+            };
+        } else {
             let pending_revision = self.schedule_presented_layout_revision()?;
+            self.pending_native_window_resize = Some(PendingNativeWindowResize::new(
+                pending_revision,
+                transaction.configure_sequence,
+                transaction.latest_size,
+                transaction.started,
+            ));
             eprintln!(
-                "scheduled settled window geometry revision={pending_revision} size={}x{}",
-                transaction.latest_size.0, transaction.latest_size.1
+                "scheduled settled native window base revision={pending_revision} configure_sequence={} size={}x{}",
+                transaction.configure_sequence,
+                transaction.latest_size.0,
+                transaction.latest_size.1
             );
         }
         eprintln!(
@@ -5742,6 +6422,81 @@ impl Application {
             transaction.started.elapsed().as_millis(),
         );
         Ok(())
+    }
+
+    fn handle_window_resized(&mut self, event_loop: &ActiveEventLoop, size: PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let Some(previous_size) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| (renderer.config.width, renderer.config.height))
+        else {
+            return;
+        };
+        if self.window_resize.is_none() && previous_size == (size.width, size.height) {
+            return;
+        }
+        let Some(configure_sequence) = self.window_configure_sequence.checked_add(1) else {
+            self.fail(
+                event_loop,
+                anyhow!("window configure sequence limit exceeded"),
+            );
+            return;
+        };
+        self.window_configure_sequence = configure_sequence;
+        let reason = format!(
+            "native window configure sequence {configure_sequence} changed the presentation extent"
+        );
+        let focus_change = match self.abort_synchronized_resize_for_native_window_resize(&reason) {
+            Ok(change) => change,
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
+            }
+        };
+        if let Some(cancelled) = self.pending_native_window_resize.take() {
+            eprintln!(
+                "superseded native window settlement native_resize_revision={} configure_sequence={} with configure_sequence={configure_sequence}",
+                cancelled.native_resize_revision.unwrap_or(0),
+                cancelled.configure_sequence,
+            );
+        }
+        let now = Instant::now();
+        if let Some(transaction) = self.window_resize.as_mut() {
+            transaction.observe(now, configure_sequence, (size.width, size.height));
+        } else {
+            self.window_resize = Some(WindowResizeTransaction::new(
+                now,
+                configure_sequence,
+                previous_size,
+                (size.width, size.height),
+            ));
+        }
+        self.native_resize_presentation_trace = NativeResizePresentationTrace {
+            configure_sequence,
+            width: size.width,
+            height: size.height,
+            phase: "projected",
+            pending_emit: true,
+            ..NativeResizePresentationTrace::default()
+        };
+        let resize_focus_change = self
+            .renderer
+            .as_mut()
+            .and_then(|renderer| renderer.resize_window_live(size.width, size.height));
+        for change in focus_change.into_iter().chain(resize_focus_change) {
+            if let Err(error) = dispatch_focus_change(
+                self.wasm_runtime.as_ref(),
+                self.input_sender.as_mut(),
+                change,
+                self.window_focused,
+            ) {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
     }
 
     fn allocate_renderer_generation(&mut self) -> Result<u64> {
@@ -5769,7 +6524,6 @@ impl Application {
             .renderer
             .take()
             .context("lost renderer during recovery")?;
-        self.window_resize = None;
         // Recompile from bridge-visible snapshots. A failed render may already
         // have installed epoch-tagged GPU scenes, but those must not become the
         // replacement renderer's visible baseline before a successful present.
@@ -5783,6 +6537,7 @@ impl Application {
         let pending_focus_pane = old.pending_focus_pane;
         let layout_source = old.layout_source;
         let layout_state_dirty = old.layout_state_dirty;
+        let window_resize_in_progress = old.window_resize_in_progress;
         let accepted_layout = old.accepted_layout.clone();
         let accepted_zones = old.accepted_zones.clone();
         let accepted_dividers = old.accepted_dividers.clone();
@@ -5815,6 +6570,7 @@ impl Application {
         replacement.plugin_pane_realms = plugin_pane_realms;
         replacement.pending_focus_pane = pending_focus_pane;
         replacement.layout_source = layout_source;
+        replacement.window_resize_in_progress = window_resize_in_progress;
         let recovering_synchronized_resize = self.active_synchronized_resize.is_some();
         replacement.accepted_layout = if recovering_synchronized_resize {
             presented_layout.clone()
@@ -6578,6 +7334,7 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.fail(event_loop, error);
             return;
         }
+        self.settle_native_window_resize_timeout();
         match self.settle_synchronized_resize() {
             Ok(Some(change)) => {
                 if let Err(error) = dispatch_focus_change(
@@ -6660,6 +7417,15 @@ impl ApplicationHandler<ClientEvent> for Application {
             .active_synchronized_resize
             .as_ref()
             .map(|active| active.deadline);
+        let native_resize_deadline = self
+            .pending_native_window_resize
+            .as_ref()
+            .and_then(|pending| pending.deadline);
+        let resize_deadline = match (synchronized_resize_deadline, native_resize_deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         if input_backpressured
             || actor_message_backpressured
             || synchronized_notification_backpressured
@@ -6684,11 +7450,11 @@ impl ApplicationHandler<ClientEvent> for Application {
             if let Some(scroll_benchmark_deadline) = scroll_benchmark_deadline {
                 deadline = deadline.min(scroll_benchmark_deadline);
             }
-            if let Some(synchronized_resize_deadline) = synchronized_resize_deadline {
-                deadline = deadline.min(synchronized_resize_deadline);
+            if let Some(resize_deadline) = resize_deadline {
+                deadline = deadline.min(resize_deadline);
             }
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-        } else if let Some(deadline) = synchronized_resize_deadline {
+        } else if let Some(deadline) = resize_deadline {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 scroll_benchmark_deadline.map_or(deadline, |other| deadline.min(other)),
             ));
@@ -6717,45 +7483,23 @@ impl ApplicationHandler<ClientEvent> for Application {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
         if renderer.window.id() != window_id {
             return;
         }
 
+        if let WindowEvent::Resized(size) = &event {
+            self.handle_window_resized(event_loop, *size);
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                if size.width == 0 || size.height == 0 {
-                    return;
-                }
-                let now = Instant::now();
-                let previous_size = (renderer.config.width, renderer.config.height);
-                if self.window_resize.is_none() && previous_size == (size.width, size.height) {
-                    return;
-                }
-                if let Some(transaction) = self.window_resize.as_mut() {
-                    transaction.observe(now, (size.width, size.height));
-                } else {
-                    self.window_resize = Some(WindowResizeTransaction::new(
-                        now,
-                        previous_size,
-                        (size.width, size.height),
-                    ));
-                }
-                let focus_change = renderer.resize_window_live(size.width, size.height);
-                if let Some(change) = focus_change
-                    && let Err(error) = dispatch_focus_change(
-                        self.wasm_runtime.as_ref(),
-                        self.input_sender.as_mut(),
-                        change,
-                        self.window_focused,
-                    )
-                {
-                    self.fail(event_loop, error);
-                }
-            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
                 let zone_route = match route_layout_zone_pointer(
@@ -7516,7 +8260,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 }
                             }
                         }
-                        self.complete_presented_layout_revision();
+                        if let Err(error) = self.complete_presented_layout_revision() {
+                            self.fail(event_loop, error);
+                            return;
+                        }
                         match self.complete_presented_synchronized_resize() {
                             Ok(Some(change)) => {
                                 if let Err(error) = dispatch_focus_change(
@@ -7535,6 +8282,25 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 return;
                             }
                         }
+                        match self.complete_presented_native_window_resize_fallback() {
+                            Ok(Some(change)) => {
+                                if let Err(error) = dispatch_focus_change(
+                                    self.wasm_runtime.as_ref(),
+                                    self.input_sender.as_mut(),
+                                    change,
+                                    self.window_focused,
+                                ) {
+                                    self.fail(event_loop, error);
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.fail(event_loop, error);
+                                return;
+                            }
+                        }
+                        self.emit_native_window_resize_trace();
                     }
                     RenderOutcome::Skipped => {
                         if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
@@ -7772,7 +8538,10 @@ struct LayoutStateMessage {
     presented_layout_revision: u64,
     lease: brood_wasm::LayoutLeaseToken,
     waitable_panes: Vec<u64>,
+    presented_panes: Vec<u64>,
     visible_panes: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_resize_revision: Option<u64>,
     active_session: u64,
     available_windows: Vec<AvailableWindow>,
     pane_realms: Vec<LayoutPaneRealm>,
@@ -7899,6 +8668,19 @@ fn flush_renderer_plugin_resize_events(
         );
     }
     Ok(())
+}
+
+fn flush_renderer_plugin_resize_events_best_effort(
+    runtime: Option<&PresentationWasmRuntime>,
+    renderer: &mut Renderer,
+    context: &str,
+) {
+    let panes = renderer
+        .pending_plugin_resize_events()
+        .into_iter()
+        .map(|(pane, _size)| pane)
+        .collect::<Vec<_>>();
+    send_plugin_pane_resize_events_best_effort(runtime, renderer, &panes, None, context);
 }
 
 fn send_plugin_pane_resize_events(
@@ -10659,6 +11441,7 @@ impl Renderer {
         lease: brood_layout::LayoutLeaseToken,
         owned_panes: &[u64],
         waitable_panes: &[u64],
+        native_resize_revision: Option<u64>,
         focused_pane: Option<u64>,
         size: LayoutSize,
         rest: bool,
@@ -10673,6 +11456,15 @@ impl Renderer {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let waitable_plugin_panes = waitable_panes
+            .iter()
+            .copied()
+            .filter(|pane| self.plugin_pane_realms.contains_key(pane))
+            .collect::<BTreeSet<_>>();
+        let presented_panes =
+            target_present_plugin_panes(&self.presented_layout, &waitable_plugin_panes)
+                .into_iter()
+                .collect();
         LayoutStateMessage {
             message_type: "layout-state",
             revision,
@@ -10683,12 +11475,10 @@ impl Renderer {
                 id: lease.id.0,
                 generation: lease.generation,
             },
-            waitable_panes: waitable_panes
-                .iter()
-                .copied()
-                .filter(|pane| self.plugin_pane_realms.contains_key(pane))
-                .collect(),
+            waitable_panes: waitable_plugin_panes.into_iter().collect(),
+            presented_panes,
             visible_panes,
+            native_resize_revision,
             active_session: self.active_session,
             available_windows: self
                 .available_windows
@@ -11026,13 +11816,18 @@ impl Renderer {
         focus_change
     }
 
-    fn finish_window_resize(&mut self) -> Result<Option<FocusChange>> {
-        self.window_resize_in_progress = false;
+    fn settle_window_resize_projection(&mut self) -> Option<FocusChange> {
         self.layout_state_dirty = true;
         let focus_change = self.reconcile_layout();
+        self.window.request_redraw();
+        focus_change
+    }
+
+    fn complete_window_resize(&mut self) -> Result<Option<FocusChange>> {
+        self.window_resize_in_progress = false;
         self.sync_plugin_graphics_extents()?;
         self.window.request_redraw();
-        Ok(focus_change)
+        Ok(None)
     }
 
     fn reconfigure(&self) {
@@ -11740,6 +12535,7 @@ mod tests {
             request_id: 11,
             interaction: None,
             event_sequence: 1,
+            native_resize_revision: None,
             chain_base_layout_revision: 1,
             epoch: brood_wasm::ResizeEpoch {
                 id: 41,
@@ -11926,7 +12722,7 @@ mod tests {
             Ok(1)
         ));
         assert_eq!(application.presented_layout_revision, 0);
-        application.complete_presented_layout_revision();
+        assert!(application.complete_presented_layout_revision().is_ok());
         assert_eq!(application.presented_layout_revision, 1);
         assert!(application.pending_presented_layout_revision.is_none());
         assert!(application.layout_publications.is_empty());
@@ -12218,11 +13014,14 @@ mod tests {
             rest: None,
             focus: None,
         };
-        assert!(ordinary_layout_message_conflicts_with_synchronized_resize(
-            &layout
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &layout, true, false, false
         ));
-        assert!(!ordinary_layout_message_conflicts_with_synchronized_resize(
-            &HostMessage::ClaimRootLayout
+        assert!(!ordinary_layout_message_conflicts_with_unsettled_resize(
+            &HostMessage::ClaimRootLayout,
+            true,
+            false,
+            false,
         ));
     }
 
@@ -12372,19 +13171,241 @@ mod tests {
     #[test]
     fn native_resize_events_extend_one_settlement_transaction() {
         let started = Instant::now();
-        let mut transaction = WindowResizeTransaction::new(started, (800, 600), (810, 610));
+        let mut transaction = WindowResizeTransaction::new(started, 1, (800, 600), (810, 610));
         for step in 1..12 {
             transaction.observe(
                 started + Duration::from_millis(step * 16),
+                step + 1,
                 (810 + step as u32, 610 + step as u32),
             );
         }
 
         assert_eq!(transaction.events, 12);
+        assert_eq!(transaction.configure_sequence, 12);
         assert_eq!(transaction.initial_size, (800, 600));
         assert_eq!(transaction.latest_size, (821, 621));
         assert!(!transaction.ready(started + Duration::from_millis(295)));
         assert!(transaction.ready(started + Duration::from_millis(296)));
+    }
+
+    #[test]
+    fn native_resize_nonce_is_published_only_after_its_base_presents() {
+        let started = Instant::now();
+        let mut pending = PendingNativeWindowResize::new(8, 17, (1440, 900), started);
+        assert_eq!(pending.published_revision(), None);
+        assert!(!native_resize_allows_layout_publication(Some(&pending)));
+        assert_eq!(
+            native_resize_request_disposition(Some(&pending), None, false, false),
+            NativeResizeRequestDisposition::Busy
+        );
+        assert_eq!(
+            native_resize_request_disposition(Some(&pending), Some(3), false, false),
+            NativeResizeRequestDisposition::Stale
+        );
+
+        pending.publish(3, started, SYNCHRONIZED_RESIZE_TIMEOUT);
+        assert_eq!(pending.published_revision(), Some(3));
+        assert!(native_resize_allows_layout_publication(Some(&pending)));
+        assert_eq!(
+            native_resize_request_disposition(Some(&pending), Some(3), false, false),
+            NativeResizeRequestDisposition::Matching
+        );
+        assert_eq!(
+            native_resize_request_disposition(Some(&pending), Some(3), true, false),
+            NativeResizeRequestDisposition::Busy
+        );
+        assert_eq!(
+            native_resize_request_disposition(Some(&pending), None, false, false),
+            NativeResizeRequestDisposition::Busy
+        );
+        assert_eq!(
+            native_resize_request_disposition(Some(&pending), Some(2), false, false),
+            NativeResizeRequestDisposition::Stale
+        );
+        let immediately_before_timeout = SYNCHRONIZED_RESIZE_TIMEOUT
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap_or_default();
+        assert!(!pending.ready_for_fallback(started + immediately_before_timeout));
+        assert!(pending.ready_for_fallback(started + SYNCHRONIZED_RESIZE_TIMEOUT));
+    }
+
+    #[test]
+    fn ordinary_layout_cannot_commit_before_native_settlement_presents() {
+        let ordinary = HostMessage::SetResolvedLayout {
+            lease: None,
+            revision: None,
+            layout: brood_wasm::ResolvedLayout {
+                items: Vec::new(),
+                zones: Vec::new(),
+                dividers: Vec::new(),
+            },
+            rest: None,
+            focus: None,
+        };
+        assert!(!ordinary_layout_message_conflicts_with_unsettled_resize(
+            &ordinary, false, false, false
+        ));
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &ordinary, false, false, true
+        ));
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &ordinary, false, true, false
+        ));
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &ordinary, true, false, false
+        ));
+        assert!(!ordinary_layout_message_conflicts_with_unsettled_resize(
+            &HostMessage::ClaimRootLayout,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn presented_native_base_allocates_nonce_at_post_present_boundary() {
+        let started = Instant::now();
+        let mut application = Application {
+            pending_presented_layout_revision: Some(5),
+            pending_native_window_resize: Some(PendingNativeWindowResize::new(
+                5,
+                11,
+                (1280, 800),
+                started,
+            )),
+            ..Application::default()
+        };
+
+        assert_eq!(
+            application
+                .pending_native_window_resize
+                .as_ref()
+                .and_then(PendingNativeWindowResize::published_revision),
+            None
+        );
+        assert!(application.complete_presented_layout_revision().is_ok());
+        assert_eq!(application.presented_layout_revision, 5);
+        assert_eq!(application.next_native_resize_revision, 1);
+        assert_eq!(
+            application
+                .pending_native_window_resize
+                .as_ref()
+                .and_then(PendingNativeWindowResize::published_revision),
+            Some(1)
+        );
+        assert_eq!(
+            application.native_resize_presentation_trace.phase,
+            "awaiting-layout"
+        );
+        drop(application);
+    }
+
+    #[test]
+    fn native_root_barrier_includes_every_target_present_plugin_pane() {
+        let target = ResolvedLayout {
+            items: vec![
+                test_pane_item(9, -1.0, 0.5),
+                test_pane_item(3, -0.5, 0.5),
+                test_pane_item(7, 0.0, 1.0),
+            ],
+        };
+        let waitable_plugins = BTreeSet::from([3, 7, 8]);
+        assert_eq!(
+            target_present_plugin_panes(&target, &waitable_plugins),
+            BTreeSet::from([3, 7])
+        );
+        assert_eq!(
+            trace_layout_pane_rects(&target, LayoutSize { w: 100, h: 80 }),
+            "3:25:0:25:80,7:50:0:50:80,9:0:0:25:80"
+        );
+    }
+
+    #[test]
+    fn layout_state_publishes_presented_panes_and_root_native_nonce_additively() {
+        let mut message = LayoutStateMessage {
+            message_type: "layout-state",
+            revision: 4,
+            inventory_revision: 4,
+            layout_revision: 8,
+            presented_layout_revision: 8,
+            lease: brood_wasm::LayoutLeaseToken {
+                id: 1,
+                generation: 2,
+            },
+            waitable_panes: vec![3, 7, 9],
+            presented_panes: vec![3, 7],
+            visible_panes: vec![3],
+            native_resize_revision: Some(11),
+            active_session: 5,
+            available_windows: Vec::new(),
+            pane_realms: Vec::new(),
+            focused_pane: Some(3),
+            pane_app_ids: Vec::new(),
+            size: LayoutStateSize { w: 1440, h: 900 },
+            rest: true,
+        };
+        let encoded = serde_json::to_value(&message).expect("layout state must serialize");
+        assert_eq!(encoded["presented_panes"], serde_json::json!([3, 7]));
+        assert_eq!(encoded["native_resize_revision"], 11);
+
+        message.native_resize_revision = None;
+        let child = serde_json::to_value(&message).expect("child layout state must serialize");
+        assert!(child.get("native_resize_revision").is_none());
+        let root = LayoutLeaseId(1);
+        let child = LayoutLeaseId(2);
+        assert!(lease_receives_layout_publication(root, root, Some(11)));
+        assert!(!lease_receives_layout_publication(child, root, Some(11)));
+        assert!(lease_receives_layout_publication(child, root, None));
+    }
+
+    #[test]
+    fn size_only_layout_publication_preserves_root_and_child_fragments() -> Result<()> {
+        let mut leases = LayoutLeaseTree::default();
+        leases.update_inventory(4, &[1, 2])?;
+        let root = leases.root_token();
+        let child = leases.grant_rest(root, &[2])?;
+        leases.submit(
+            root,
+            4,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![test_pane_item(1, -1.0, 1.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: Some(brood_layout::LayoutChildSlot {
+                    z: 0.0,
+                    transform: brood_layout::LocalTransform {
+                        offset: LocalPoint { u: 0.0, v: -1.0 },
+                        size: LocalPoint { u: 1.0, v: 2.0 },
+                    },
+                }),
+            },
+            None,
+        )?;
+        leases.submit(
+            child,
+            4,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![test_pane_item(2, -1.0, 2.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            },
+            None,
+        )?;
+        let before = leases.compose()?;
+
+        anyhow::ensure!(!layout_inventory_requires_update(&leases, &[1, 2]));
+        anyhow::ensure!(layout_inventory_requires_update(&leases, &[1, 2, 3]));
+        // A viewport/focus publication clears delivery acknowledgements, but
+        // deliberately does not call update_inventory and lose fragments.
+        let after = leases.compose()?;
+        anyhow::ensure!(leases.inventory_revision() == 4);
+        anyhow::ensure!(before == after);
+        Ok(())
     }
 
     #[test]
