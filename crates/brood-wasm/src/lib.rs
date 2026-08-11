@@ -122,15 +122,17 @@ pub use preview1_worker::{
     WORKER_RELEASE_EXPORT, WORKER_RESERVE_EXPORT, declares_preview1_compat,
 };
 pub use resize::{
-    InteractionId, PresentationMode, ResizeEpoch, ReusePaneContent, SubmitSynchronizedLayout,
+    FailLayoutRegion, InteractionId, LayoutRegionNotification, LayoutRegionRejectionReason,
+    LayoutRegionResized, LayoutRegionResponseNotification, PresentationMode, ResizeEpoch,
+    ReuseLayoutRegion, ReusePaneContent, SubmitLayoutRegion, SubmitSynchronizedLayout,
     SynchronizedLayoutAccepted, SynchronizedLayoutCompleted, SynchronizedLayoutDegraded,
     SynchronizedLayoutFragment, SynchronizedLayoutNotification, SynchronizedLayoutRejected,
     SynchronizedLayoutRejectionReason, SynchronizedLayoutSuperseded,
 };
 pub use resolved_layout::{
     CursorRole, DividerAxis, DividerRole, InputBehavior, InteractionZone, LayoutChildSlot,
-    LayoutDivider, LayoutItemId, LayoutItemKind, LayoutLeaseToken, LocalPoint, LocalTransform,
-    PointerEventMask, ResolvedLayout, ResolvedLayoutItem, ZoneInputBehavior,
+    LayoutDivider, LayoutItemId, LayoutItemKind, LayoutLeaseToken, LayoutSize, LocalPoint,
+    LocalTransform, PointerEventMask, ResolvedLayout, ResolvedLayoutItem, ZoneInputBehavior,
 };
 pub use resource_limits::WasmResourceLimits;
 pub use runtime_io::{

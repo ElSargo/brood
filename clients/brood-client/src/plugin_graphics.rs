@@ -332,13 +332,20 @@ impl PluginGraphicsBridge {
         Ok(())
     }
 
-    /// Admit tagged presentation work only for panes in the current resize.
-    pub fn activate_resize_epoch(&self, resize_epoch: u64, panes: &[u64]) -> Result<()> {
+    /// Add panes to the current epoch without revoking panes which an
+    /// independent resolved branch already admitted.
+    pub fn admit_resize_epoch_panes(&self, resize_epoch: u64, panes: &[u64]) -> Result<()> {
         let mut state = self
             .shared
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
-        state.active_resize_epochs.clear();
+        anyhow::ensure!(
+            state
+                .active_resize_epochs
+                .values()
+                .all(|active| *active == resize_epoch),
+            "plugin graphics has panes admitted for another resize epoch"
+        );
         state
             .active_resize_epochs
             .extend(panes.iter().copied().map(|pane| (pane, resize_epoch)));

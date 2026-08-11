@@ -159,6 +159,24 @@ The outermost valid focus request wins. If a wrapper does not request focus,
 the accepted request from its child remains eligible. The client still verifies
 that the resulting pane is visible and belongs to the submitting subtree.
 
+When a synchronized parent fragment changes its `rest` viewport, the host sends
+`layout-region-resized` with the same resize epoch to the exact child lease
+holder. The child must submit a new fragment, explicitly reuse its durable
+fragment, or report failure for that epoch. A changed descendant `rest` repeats
+the same process. The old child fragment can supply temporary projected content,
+but it cannot become durable until the branch responds or the host records
+bounded recovery at the transaction deadline.
+
+The region size uses the same composition-pixel units as `layout-state`. The
+message carries the presentation scale as separate metadata.
+
+Region resolution is a geometry dependency. It is separate from the fixed,
+explicit pane paint wait set. The host notifies directly owned panes while an
+independent child region is still resolving. It notifies panes inside that child
+branch only after the child response defines their final target bounds. Thus a
+region can block final geometry without adding an unnamed pane to the paint
+barrier, and only panes named by the accepted request can block paint readiness.
+
 ## Flat Resolved Layout
 
 A resolved layout is a flat, client-validated presentation description. It may

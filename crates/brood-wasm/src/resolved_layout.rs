@@ -22,6 +22,12 @@ pub struct LayoutLeaseToken {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutSize {
+    pub w: i32,
+    pub h: i32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct LayoutChildSlot {
     pub z: f64,

@@ -36,8 +36,8 @@ use brood_cli::{
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use brood_layout::{
     ComposedDivider, ComposedInteractionZone, ComposedLayout, ComposedZoneId, CursorRole,
-    LayoutAction, LayoutItemKind, LayoutLeaseId, LayoutLeaseTree, LayoutRect, LayoutSize,
-    LocalPoint, PointerEventMask, ResolvedLayout, ZoneHitResult,
+    LayoutAction, LayoutItemKind, LayoutLeaseId, LayoutLeaseToken, LayoutLeaseTree, LayoutRect,
+    LayoutSize, LocalPoint, PointerEventMask, ResolvedLayout, ZoneHitResult,
 };
 use brood_protocol::{
     ArtifactManifest, ArtifactRealm, BackendActorRealm, BackendId, ClientLifecycle, ClientMessage,
@@ -100,6 +100,8 @@ const MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS: usize = 64;
 const MAX_DEFERRED_ACTOR_HOST_MESSAGES: usize = 128;
 const MAX_POINTER_INTERACTIONS: usize = 64;
 const MAX_POINTER_INTERACTION_SEQUENCES: usize = 64;
+const MAX_ACTIVE_RESIZE_REGIONS: usize = 32;
+const MAX_LAYOUT_REGION_TEXT_BYTES: usize = 512;
 const DEFAULT_WINDOW_WIDTH: f64 = 1440.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 900.0;
 const MAX_AGENT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -3075,7 +3077,13 @@ struct ActiveSynchronizedResize {
     superseded_epochs: u64,
     epoch: brood_wasm::ResizeEpoch,
     requester: ActorIdentity,
+    base_tree: LayoutLeaseTree,
     target_tree: LayoutLeaseTree,
+    target_extent: LayoutSize,
+    regions: BTreeMap<LayoutLeaseId, LayoutRegionDependency>,
+    wait_pane_owners: BTreeMap<u64, LayoutLeaseToken>,
+    notified_panes: BTreeSet<u64>,
+    recovered_regions: BTreeSet<LayoutLeaseId>,
     focus: Option<u64>,
     wait_panes: BTreeSet<u64>,
     ready_panes: BTreeSet<u64>,
@@ -3083,6 +3091,35 @@ struct ActiveSynchronizedResize {
     started: Instant,
     deadline: Instant,
     presentation: SynchronizedResizePresentation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LayoutRegionResolutionState {
+    Pending,
+    Fragment,
+    Reuse,
+    RecoveredFailure { reason: String },
+}
+
+#[derive(Clone, Debug)]
+struct LayoutRegionDependency {
+    lease: LayoutLeaseToken,
+    holder: ActorIdentity,
+    source_viewport: brood_layout::LayoutRect,
+    target_viewport: brood_layout::LayoutRect,
+    issued_at: Instant,
+    delivered: bool,
+    state: LayoutRegionResolutionState,
+}
+
+enum LayoutRegionActorResponse {
+    Fragment {
+        inventory_revision: u64,
+        fragment: brood_wasm::SynchronizedLayoutFragment,
+        focus: Option<u64>,
+    },
+    Reuse,
+    Failure(String),
 }
 
 type DeferredPluginScene = (u64, u64, Option<u64>);
@@ -3126,6 +3163,128 @@ fn synchronized_resize_inventory_matches(
         .target_tree
         .waitable_panes(active.target_tree.root_token())
         .is_some_and(|target_inventory| target_inventory == current_inventory)
+}
+
+fn lease_viewport_rect(
+    tree: &LayoutLeaseTree,
+    lease: LayoutLeaseToken,
+    extent: LayoutSize,
+) -> Option<LayoutRect> {
+    Some(tree.viewport_transform(lease)?.pixel_rect(extent))
+}
+
+fn changed_rest_child(
+    base: &LayoutLeaseTree,
+    target: &LayoutLeaseTree,
+    parent: LayoutLeaseToken,
+    extent: LayoutSize,
+) -> Option<(LayoutLeaseToken, LayoutRect, LayoutRect)> {
+    let child = target.rest_token(parent)?;
+    let source = lease_viewport_rect(base, child, extent)?;
+    let destination = lease_viewport_rect(target, child, extent)?;
+    (source != destination).then_some((child, source, destination))
+}
+
+fn region_state_is_final(state: &LayoutRegionResolutionState) -> bool {
+    !matches!(state, LayoutRegionResolutionState::Pending)
+}
+
+fn resize_regions_are_final(active: &ActiveSynchronizedResize) -> bool {
+    active
+        .regions
+        .values()
+        .all(|region| region_state_is_final(&region.state))
+}
+
+fn synchronized_resize_requires_degraded_completion(active: &ActiveSynchronizedResize) -> bool {
+    !active.recovered_regions.is_empty()
+}
+
+fn synchronized_timeout_recovery_extent(
+    target_extent: LayoutSize,
+    current_extent: Option<LayoutSize>,
+) -> (LayoutSize, bool) {
+    (
+        target_extent,
+        current_extent.is_some_and(|current| current != target_extent),
+    )
+}
+
+fn trace_region_ids(regions: &BTreeSet<LayoutLeaseId>) -> String {
+    regions
+        .iter()
+        .map(|lease| lease.0.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn changed_region_chain_is_final(active: &ActiveSynchronizedResize, extent: LayoutSize) -> bool {
+    let mut parent = LayoutLeaseToken {
+        id: LayoutLeaseId(active.epoch.lease),
+        generation: active.epoch.lease_generation,
+    };
+    for _ in 0..MAX_ACTIVE_RESIZE_REGIONS {
+        let Some(child) = active.target_tree.rest_token(parent) else {
+            return true;
+        };
+        let Some(source) = lease_viewport_rect(&active.base_tree, child, extent) else {
+            return false;
+        };
+        let Some(target) = lease_viewport_rect(&active.target_tree, child, extent) else {
+            return false;
+        };
+        if source != target
+            && !active
+                .regions
+                .get(&child.id)
+                .is_some_and(|region| region.lease == child && region_state_is_final(&region.state))
+        {
+            return false;
+        }
+        parent = child;
+    }
+    active.target_tree.rest_token(parent).is_none()
+}
+
+fn removed_fixed_wait_pane(layout: &ResolvedLayout, wait_panes: &BTreeSet<u64>) -> Option<u64> {
+    wait_panes
+        .iter()
+        .copied()
+        .find(|pane| layout.pane_item(*pane).is_none())
+}
+
+fn pane_branch_is_final(active: &ActiveSynchronizedResize, pane: u64) -> bool {
+    active.regions.values().all(|region| {
+        region_state_is_final(&region.state)
+            || !active.target_tree.subtree_contains(region.lease, pane)
+    })
+}
+
+fn truncate_layout_region_text(message: &str) -> String {
+    let mut end = message.len().min(MAX_LAYOUT_REGION_TEXT_BYTES);
+    while !message.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    message[..end].to_string()
+}
+
+fn layout_region_notification(
+    epoch: brood_wasm::ResizeEpoch,
+    region: &LayoutRegionDependency,
+    scale: f32,
+) -> brood_wasm::LayoutRegionNotification {
+    brood_wasm::LayoutRegionNotification::Resized(brood_wasm::LayoutRegionResized {
+        resize_epoch: epoch,
+        lease: brood_wasm::LayoutLeaseToken {
+            id: region.lease.id.0,
+            generation: region.lease.generation,
+        },
+        size: brood_wasm::LayoutSize {
+            w: region.target_viewport.w,
+            h: region.target_viewport.h,
+        },
+        scale,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3272,10 +3431,12 @@ const fn ordinary_layout_message_conflicts_with_unsettled_resize(
     continuous_window_resize_active: bool,
     native_window_resize_pending: bool,
 ) -> bool {
-    matches!(message, HostMessage::SetResolvedLayout { .. })
-        && (synchronized_resize_active
-            || continuous_window_resize_active
-            || native_window_resize_pending)
+    matches!(
+        message,
+        HostMessage::SetResolvedLayout { .. } | HostMessage::DelegateLayoutRest { .. }
+    ) && (synchronized_resize_active
+        || continuous_window_resize_active
+        || native_window_resize_pending)
 }
 
 const fn synchronized_layout_notification_request_id(
@@ -5437,6 +5598,18 @@ impl Application {
             })
     }
 
+    fn synchronized_target_tree_for_request(
+        &self,
+        submitted_lease: LayoutLeaseToken,
+        inventory_revision: u64,
+        fragment: brood_layout::LayoutFragment,
+        focus: Option<u64>,
+    ) -> Result<LayoutLeaseTree> {
+        let mut target = self.layout_leases.clone();
+        target.submit(submitted_lease, inventory_revision, fragment, focus)?;
+        Ok(target)
+    }
+
     fn submit_synchronized_layout(
         &mut self,
         sender: &ActorIdentity,
@@ -5670,10 +5843,7 @@ impl Application {
             )?;
             return Ok(None);
         }
-        let base_tree = self.active_synchronized_resize.as_ref().map_or_else(
-            || self.layout_leases.clone(),
-            |active| active.target_tree.clone(),
-        );
+        let base_tree = self.layout_leases.clone();
         let waitable = base_tree
             .waitable_panes(submitted_lease)
             .unwrap_or_default()
@@ -5690,22 +5860,27 @@ impl Application {
             return Ok(None);
         }
 
-        let mut target_tree = base_tree;
-        if let Err(error) = target_tree.submit(
+        // Each epoch starts from the durable lease tree. The interaction
+        // revision chain can authorize supersession, but it cannot authorize
+        // carrying an unpromoted descendant response into the new epoch.
+        let target_tree = match self.synchronized_target_tree_for_request(
             submitted_lease,
             request.inventory_revision,
             convert_actor_layout_fragment(request.fragment.layout, request.fragment.rest),
             request.focus,
         ) {
-            self.reject_synchronized_layout_for_claim(
-                sender,
-                request_id,
-                brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
-                error.to_string(),
-                interaction_claim_key,
-            )?;
-            return Ok(None);
-        }
+            Ok(target) => target,
+            Err(error) => {
+                self.reject_synchronized_layout_for_claim(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                    error.to_string(),
+                    interaction_claim_key,
+                )?;
+                return Ok(None);
+            }
+        };
         let composed = match target_tree.compose() {
             Ok(composed) => composed,
             Err(error) => {
@@ -5729,6 +5904,7 @@ impl Application {
             )?;
             return Ok(None);
         };
+        let target_extent = renderer.layout_extent();
         if native_resize_request {
             let waitable_plugin_panes = target_tree
                 .waitable_panes(submitted_lease)
@@ -5781,6 +5957,52 @@ impl Application {
             base_layout_revision: current_base,
             target_layout_revision,
         };
+
+        let wait_pane_owners = unique_wait
+            .iter()
+            .filter_map(|pane| target_tree.pane_owner(*pane).map(|owner| (*pane, owner)))
+            .collect::<BTreeMap<_, _>>();
+        if wait_pane_owners.len() != unique_wait.len() {
+            self.reject_synchronized_layout_for_claim(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::IneligibleWaitPane,
+                "a fixed wait pane has no layout lease owner",
+                interaction_claim_key,
+            )?;
+            return Ok(None);
+        }
+
+        let mut regions = BTreeMap::new();
+        if let Some((child, source_viewport, target_viewport)) = changed_rest_child(
+            &base_tree,
+            &target_tree,
+            submitted_lease,
+            renderer.layout_extent(),
+        ) {
+            let Some(holder) = self.layout_holders.get(&child.id).cloned() else {
+                self.reject_synchronized_layout_for_claim(
+                    sender,
+                    request_id,
+                    brood_wasm::SynchronizedLayoutRejectionReason::StaleLease,
+                    format!("changed child lease {} has no current holder", child.id.0),
+                    interaction_claim_key,
+                )?;
+                return Ok(None);
+            };
+            regions.insert(
+                child.id,
+                LayoutRegionDependency {
+                    lease: child,
+                    holder,
+                    source_viewport,
+                    target_viewport,
+                    issued_at: Instant::now(),
+                    delivered: false,
+                    state: LayoutRegionResolutionState::Pending,
+                },
+            );
+        }
 
         if let Some(previous) = self.active_synchronized_resize.take() {
             let superseded_epochs = request.interaction.map_or(0, |interaction| {
@@ -5857,7 +6079,13 @@ impl Application {
             superseded_epochs,
             epoch,
             requester: sender.clone(),
+            base_tree,
             target_tree,
+            target_extent,
+            regions,
+            wait_pane_owners,
+            notified_panes: BTreeSet::new(),
+            recovered_regions: BTreeSet::new(),
             focus,
             wait_panes: unique_wait,
             ready_panes: BTreeSet::new(),
@@ -5906,6 +6134,7 @@ impl Application {
             let focus_change = self.rollback_unannounced_synchronized_resize(&reason)?;
             return Ok(focus_change);
         }
+        self.discover_and_dispatch_layout_regions()?;
         self.notify_synchronized_plugin_panes();
         let (accepted_focus, accepted_wait_panes) = self
             .active_synchronized_resize
@@ -5920,7 +6149,7 @@ impl Application {
             trace_layout_pane_rects(&renderer.accepted_layout, renderer.layout_extent())
         });
         eprintln!(
-            "accepted synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} base_revision={} target_revision={} wait={} affected={} mode={:?} actor_generation={} focus={} wait_for_panes=[{}] target_rects=[{}]",
+            "accepted synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} base_revision={} target_revision={} region_final=0/{} pane_ready=0/{} wait={} affected={} mode={:?} actor_generation={} focus={} recovered_regions=[] wait_for_panes=[{}] target_rects=[{}]",
             sender.name,
             request_id,
             request.interaction.map_or(0, |interaction| interaction.0),
@@ -5929,6 +6158,12 @@ impl Application {
             epoch.id,
             epoch.base_layout_revision,
             epoch.target_layout_revision,
+            self.active_synchronized_resize
+                .as_ref()
+                .map_or(0, |active| active.regions.len()),
+            self.active_synchronized_resize
+                .as_ref()
+                .map_or(0, |active| active.wait_panes.len()),
             self.active_synchronized_resize
                 .as_ref()
                 .map_or(0, |active| active.wait_panes.len()),
@@ -5951,13 +6186,462 @@ impl Application {
         Ok(None)
     }
 
+    fn discover_changed_rest_region(&mut self, parent: LayoutLeaseToken) -> Result<()> {
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            return Ok(());
+        };
+        let extent = active.target_extent;
+        let Some((child, source_viewport, target_viewport)) =
+            changed_rest_child(&active.base_tree, &active.target_tree, parent, extent)
+        else {
+            return Ok(());
+        };
+        if active.regions.contains_key(&child.id) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            active.regions.len() < MAX_ACTIVE_RESIZE_REGIONS,
+            "active resize region dependency limit is exhausted"
+        );
+        let holder = self
+            .layout_holders
+            .get(&child.id)
+            .cloned()
+            .with_context(|| format!("changed child lease {} has no holder", child.id.0))?;
+        let active = self
+            .active_synchronized_resize
+            .as_mut()
+            .context("active resize disappeared while adding child region")?;
+        active.regions.insert(
+            child.id,
+            LayoutRegionDependency {
+                lease: child,
+                holder,
+                source_viewport,
+                target_viewport,
+                issued_at: Instant::now(),
+                delivered: false,
+                state: LayoutRegionResolutionState::Pending,
+            },
+        );
+        Ok(())
+    }
+
+    fn reproject_active_region_target(&mut self) -> Result<Option<FocusChange>> {
+        let active = self
+            .active_synchronized_resize
+            .as_ref()
+            .context("active resize disappeared while composing a region target")?;
+        let epoch = active.epoch.id;
+        let composed = active.target_tree.compose()?;
+        let Some(renderer) = self.renderer.as_ref() else {
+            return Ok(None);
+        };
+        let extent = renderer.layout_extent();
+        let affected_panes =
+            changed_layout_panes(&renderer.presented_layout, &composed.layout, extent);
+        self.active_synchronized_resize
+            .as_mut()
+            .context("active resize disappeared while updating region allocations")?
+            .affected_panes = affected_panes;
+        Ok(self
+            .renderer
+            .as_mut()
+            .and_then(|renderer| renderer.project_staged_layout(epoch, composed)))
+    }
+
+    fn reject_layout_region_response(
+        &self,
+        sender: &ActorIdentity,
+        resize_epoch: brood_wasm::ResizeEpoch,
+        lease: brood_wasm::LayoutLeaseToken,
+        reason: brood_wasm::LayoutRegionRejectionReason,
+        message: impl AsRef<str>,
+    ) {
+        let message = truncate_layout_region_text(message.as_ref());
+        let (region_final, region_total, pane_ready, pane_total, recovered) = self
+            .active_synchronized_resize
+            .as_ref()
+            .map_or((0, 0, 0, 0, String::new()), |active| {
+                (
+                    active
+                        .regions
+                        .values()
+                        .filter(|region| region_state_is_final(&region.state))
+                        .count(),
+                    active.regions.len(),
+                    active.ready_panes.len(),
+                    active.wait_panes.len(),
+                    trace_region_ids(&active.recovered_regions),
+                )
+            });
+        eprintln!(
+            "layout-region response-rejected epoch={} lease={} lease_generation={} actor={} actor_generation={} reason={reason:?} region_final={region_final}/{region_total} pane_ready={pane_ready}/{pane_total} recovered_regions=[{recovered}] message={message}",
+            resize_epoch.id, lease.id, lease.generation, sender.name, sender.generation,
+        );
+        let Some(runtime) = self.wasm_runtime.as_ref() else {
+            return;
+        };
+        if runtime.actor_identity(&sender.name).as_ref() != Some(sender) {
+            eprintln!(
+                "discarded layout-region rejection for stale actor generation actor={} actor_generation={}",
+                sender.name, sender.generation
+            );
+            return;
+        }
+        let notification = brood_wasm::LayoutRegionResponseNotification::Rejected {
+            resize_epoch,
+            lease,
+            reason,
+            message,
+        };
+        let delivery = serde_json::to_vec(&notification)
+            .context("encode layout region rejection")
+            .and_then(|payload| {
+                runtime.send_actor_message(&sender.name, "layout-host".to_string(), payload)
+            });
+        if let Err(error) = delivery {
+            eprintln!(
+                "could not deliver layout-region rejection actor={} actor_generation={}: {error:#}",
+                sender.name, sender.generation
+            );
+        }
+    }
+
+    fn handle_layout_region_response(
+        &mut self,
+        sender: &ActorIdentity,
+        resize_epoch: brood_wasm::ResizeEpoch,
+        actor_lease: brood_wasm::LayoutLeaseToken,
+        response: LayoutRegionActorResponse,
+    ) -> Result<Option<FocusChange>> {
+        let lease = convert_actor_layout_lease(actor_lease);
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::StaleEpoch,
+                "the parent resize epoch is no longer active",
+            );
+            return Ok(None);
+        };
+        if active.epoch != resize_epoch {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::StaleEpoch,
+                "the region response does not match the active parent epoch",
+            );
+            return Ok(None);
+        }
+        if Instant::now() >= active.deadline {
+            let recovery_extent = active.target_extent;
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::StaleEpoch,
+                "the region response arrived after the synchronized resize deadline",
+            );
+            self.recover_pending_layout_regions_at(recovery_extent)?;
+            return if self.renderer.is_some() {
+                self.finish_synchronized_resize(true)
+            } else {
+                Ok(None)
+            };
+        }
+        let Some(region) = active.regions.get(&lease.id).cloned() else {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::UnexpectedResponse,
+                "the host did not issue this child region for the active epoch",
+            );
+            return Ok(None);
+        };
+        if region.lease != lease {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::StaleLease,
+                "the child lease generation is no longer current",
+            );
+            return Ok(None);
+        }
+        let durable_token_is_current = self.layout_leases.lease_tokens().contains(&lease);
+        let target_token_is_current = active.target_tree.lease_tokens().contains(&lease);
+        if !durable_token_is_current || !target_token_is_current {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::StaleLease,
+                "the full child lease token is no longer current",
+            );
+            return Ok(None);
+        }
+        let current_holder = self.layout_holders.get(&lease.id);
+        if &region.holder != sender || current_holder != Some(sender) {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::StaleActor,
+                "the actor is not the exact child lease holder for this region",
+            );
+            return Ok(None);
+        }
+        if !matches!(region.state, LayoutRegionResolutionState::Pending) {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::UnexpectedResponse,
+                "the child region already has a final response",
+            );
+            return Ok(None);
+        }
+
+        let mut candidate = active.target_tree.clone();
+        let wait_panes = active.wait_panes.clone();
+        let inventory_revision = active.target_tree.inventory_revision();
+        let next_state = match response {
+            LayoutRegionActorResponse::Fragment {
+                inventory_revision: response_revision,
+                fragment,
+                focus,
+            } => {
+                if response_revision != inventory_revision {
+                    self.reject_layout_region_response(
+                        sender,
+                        resize_epoch,
+                        actor_lease,
+                        brood_wasm::LayoutRegionRejectionReason::StaleInventoryRevision,
+                        "the child fragment inventory revision is no longer current",
+                    );
+                    return Ok(None);
+                }
+                if let Err(error) = candidate.submit(
+                    lease,
+                    response_revision,
+                    convert_actor_layout_fragment(fragment.layout, fragment.rest),
+                    focus,
+                ) {
+                    self.reject_layout_region_response(
+                        sender,
+                        resize_epoch,
+                        actor_lease,
+                        brood_wasm::LayoutRegionRejectionReason::InvalidFragment,
+                        error.to_string(),
+                    );
+                    return Ok(None);
+                }
+                LayoutRegionResolutionState::Fragment
+            }
+            LayoutRegionActorResponse::Reuse => {
+                if let Err(error) = candidate.reuse_accepted_fragment_from(&active.base_tree, lease)
+                {
+                    self.reject_layout_region_response(
+                        sender,
+                        resize_epoch,
+                        actor_lease,
+                        brood_wasm::LayoutRegionRejectionReason::InvalidFragment,
+                        error.to_string(),
+                    );
+                    return Ok(None);
+                }
+                LayoutRegionResolutionState::Reuse
+            }
+            LayoutRegionActorResponse::Failure(message) => {
+                if let Err(error) = candidate.reuse_accepted_fragment_from(&active.base_tree, lease)
+                {
+                    self.reject_layout_region_response(
+                        sender,
+                        resize_epoch,
+                        actor_lease,
+                        brood_wasm::LayoutRegionRejectionReason::InvalidFragment,
+                        error.to_string(),
+                    );
+                    return Ok(None);
+                }
+                LayoutRegionResolutionState::RecoveredFailure {
+                    reason: truncate_layout_region_text(&message),
+                }
+            }
+        };
+        let composed = match candidate.compose() {
+            Ok(composed) => composed,
+            Err(error) => {
+                self.reject_layout_region_response(
+                    sender,
+                    resize_epoch,
+                    actor_lease,
+                    brood_wasm::LayoutRegionRejectionReason::InvalidFragment,
+                    error.to_string(),
+                );
+                return Ok(None);
+            }
+        };
+        if let Some(pane) = removed_fixed_wait_pane(&composed.layout, &wait_panes) {
+            self.reject_layout_region_response(
+                sender,
+                resize_epoch,
+                actor_lease,
+                brood_wasm::LayoutRegionRejectionReason::InvalidFragment,
+                format!("child fragment removed fixed wait pane {pane}"),
+            );
+            return Ok(None);
+        }
+
+        let elapsed_us = region.issued_at.elapsed().as_micros();
+        let response_kind = match &next_state {
+            LayoutRegionResolutionState::Fragment => "fragment",
+            LayoutRegionResolutionState::Reuse => "reuse",
+            LayoutRegionResolutionState::RecoveredFailure { .. } => "failure",
+            LayoutRegionResolutionState::Pending => "pending",
+        };
+        if let Some(active) = self.active_synchronized_resize.as_mut() {
+            active.target_tree = candidate;
+            if let Some(current) = active.regions.get_mut(&lease.id) {
+                current.state = next_state.clone();
+            }
+            if matches!(
+                next_state,
+                LayoutRegionResolutionState::RecoveredFailure { .. }
+            ) {
+                active.recovered_regions.insert(lease.id);
+            }
+        }
+        let focus_change = self.reproject_active_region_target()?;
+        eprintln!(
+            "layout-region response-accepted epoch={} lease={} lease_generation={} actor={} actor_generation={} kind={response_kind} response_us={elapsed_us}",
+            resize_epoch.id, lease.id.0, lease.generation, sender.name, sender.generation,
+        );
+        self.discover_changed_rest_region(lease)?;
+        self.discover_and_dispatch_layout_regions()?;
+        self.notify_synchronized_plugin_panes();
+        let ready = self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| {
+                resize_regions_are_final(active) && active.ready_panes == active.wait_panes
+            });
+        if ready {
+            return self.finish_synchronized_resize(false);
+        }
+        Ok(focus_change)
+    }
+
+    fn discover_and_dispatch_layout_regions(&mut self) -> Result<()> {
+        loop {
+            let next = self.active_synchronized_resize.as_ref().and_then(|active| {
+                active
+                    .regions
+                    .values()
+                    .find(|region| {
+                        matches!(region.state, LayoutRegionResolutionState::Pending)
+                            && !region.delivered
+                    })
+                    .cloned()
+            });
+            let Some(region) = next else {
+                return Ok(());
+            };
+            let epoch = self
+                .active_synchronized_resize
+                .as_ref()
+                .context("active resize disappeared before region delivery")?
+                .epoch;
+            let scale = self
+                .renderer
+                .as_ref()
+                .map_or(1.0, |renderer| renderer.window.scale_factor())
+                .max(f64::EPSILON);
+            let message = layout_region_notification(epoch, &region, scale as f32);
+            let payload = serde_json::to_vec(&message).context("encode layout region resize")?;
+            let delivery = self
+                .wasm_runtime
+                .as_ref()
+                .context("layout actor runtime is unavailable")
+                .and_then(|runtime| {
+                    anyhow::ensure!(
+                        runtime.actor_identity(&region.holder.name).as_ref()
+                            == Some(&region.holder),
+                        "layout region holder generation is no longer current"
+                    );
+                    runtime.send_actor_message(
+                        &region.holder.name,
+                        "layout-host".to_string(),
+                        payload,
+                    )
+                });
+            if let Some(active) = self.active_synchronized_resize.as_mut()
+                && let Some(current) = active.regions.get_mut(&region.lease.id)
+            {
+                current.delivered = true;
+            }
+            match delivery {
+                Ok(()) => {
+                    eprintln!(
+                        "layout-region issued epoch={} lease={} lease_generation={} holder={} holder_generation={} source={}:{}:{}:{} target={}:{}:{}:{} accepted_us={}",
+                        epoch.id,
+                        region.lease.id.0,
+                        region.lease.generation,
+                        region.holder.name,
+                        region.holder.generation,
+                        region.source_viewport.x,
+                        region.source_viewport.y,
+                        region.source_viewport.w,
+                        region.source_viewport.h,
+                        region.target_viewport.x,
+                        region.target_viewport.y,
+                        region.target_viewport.w,
+                        region.target_viewport.h,
+                        self.active_synchronized_resize
+                            .as_ref()
+                            .map_or(0, |active| active.started.elapsed().as_micros()),
+                    );
+                }
+                Err(error) => {
+                    let reason = truncate_layout_region_text(&format!(
+                        "region mailbox delivery failed: {error:#}"
+                    ));
+                    if let Some(active) = self.active_synchronized_resize.as_mut() {
+                        active
+                            .target_tree
+                            .reuse_accepted_fragment_from(&active.base_tree, region.lease)?;
+                        if let Some(current) = active.regions.get_mut(&region.lease.id) {
+                            current.state = LayoutRegionResolutionState::RecoveredFailure {
+                                reason: reason.clone(),
+                            };
+                        }
+                        active.recovered_regions.insert(region.lease.id);
+                    }
+                    let _focus_change = self.reproject_active_region_target()?;
+                    eprintln!(
+                        "layout-region recovered epoch={} lease={} lease_generation={} reason={reason}",
+                        epoch.id, region.lease.id.0, region.lease.generation,
+                    );
+                    self.discover_changed_rest_region(region.lease)?;
+                    self.notify_synchronized_plugin_panes();
+                }
+            }
+        }
+    }
+
     fn notify_synchronized_plugin_panes(&mut self) {
         let Some(active) = self.active_synchronized_resize.as_ref() else {
             return;
         };
         let epoch = active.epoch.id;
-        let affected_panes = active.affected_panes.clone();
-        let wait_panes = active.wait_panes.clone();
+        let (affected_panes, wait_panes) = pending_synchronized_notification_panes(active);
+        if affected_panes.is_empty() && wait_panes.is_empty() {
+            return;
+        }
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -5969,7 +6653,7 @@ impl Application {
         let (tagged, ordinary) =
             synchronized_plugin_notification_sets(&affected_panes, &wait_panes, &plugin_panes);
         if let Some(graphics) = self.plugin_graphics.as_ref() {
-            if let Err(error) = graphics.activate_resize_epoch(epoch, &tagged) {
+            if let Err(error) = graphics.admit_resize_epoch_panes(epoch, &tagged) {
                 eprintln!(
                     "could not admit synchronized graphics epoch={epoch}; waiting for degraded recovery: {error:#}"
                 );
@@ -5993,6 +6677,26 @@ impl Application {
             None,
             "synchronized non-wait pane",
         );
+        if let Some(active) = self.active_synchronized_resize.as_mut() {
+            let notification_panes = affected_panes
+                .union(&wait_panes)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            active
+                .notified_panes
+                .extend(notification_panes.iter().copied());
+            let accepted_us = active.started.elapsed().as_micros();
+            for pane in notification_panes {
+                let owner = active
+                    .wait_pane_owners
+                    .get(&pane)
+                    .map_or(0, |lease| lease.id.0);
+                eprintln!(
+                    "layout-region pane-notified epoch={epoch} pane={pane} owner_lease={owner} wait={} accepted_us={accepted_us}",
+                    active.wait_panes.contains(&pane),
+                );
+            }
+        }
     }
 
     fn note_synchronized_pane_ready(
@@ -6006,6 +6710,14 @@ impl Application {
         if active.epoch.id != resize_epoch || !active.wait_panes.contains(&pane) {
             return Ok(None);
         }
+        if !active.notified_panes.contains(&pane) || !pane_branch_is_final(active, pane) {
+            eprintln!(
+                "ignored early synchronized pane readiness epoch={resize_epoch} pane={pane} branch_final={} admitted={}",
+                pane_branch_is_final(active, pane),
+                active.notified_panes.contains(&pane),
+            );
+            return Ok(None);
+        }
         if !matches!(active.presentation, SynchronizedResizePresentation::Waiting) {
             return Ok(None);
         }
@@ -6015,19 +6727,25 @@ impl Application {
             self.native_resize_presentation_trace.wait_ready = active.ready_panes.len();
             self.native_resize_presentation_trace.pending_emit = true;
         }
-        if active.ready_panes == active.wait_panes {
+        if active.ready_panes == active.wait_panes && resize_regions_are_final(active) {
             return self.finish_synchronized_resize(false);
         }
         Ok(None)
     }
 
     fn finish_synchronized_resize(&mut self, degraded: bool) -> Result<Option<FocusChange>> {
-        let Some(active) = self.active_synchronized_resize.as_mut() else {
+        if self.active_synchronized_resize.is_none() {
             return Ok(None);
-        };
+        }
+        let active = self.active_synchronized_resize.as_mut().unwrap();
+        let extent = active.target_extent;
         if !matches!(active.presentation, SynchronizedResizePresentation::Waiting) {
             return Ok(None);
         }
+        if !resize_regions_are_final(active) || !changed_region_chain_is_final(active, extent) {
+            return Ok(None);
+        }
+        let degraded = degraded || synchronized_resize_requires_degraded_completion(active);
         let missing = active
             .wait_panes
             .difference(&active.ready_panes)
@@ -6045,15 +6763,23 @@ impl Application {
             .window
             .request_redraw();
         eprintln!(
-            "synchronized layout ready actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} ready={}/{} missing={missing:?} degraded={degraded} duration_us={}",
+            "synchronized layout ready actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} missing={missing:?} degraded={degraded} duration_us={}",
             active.requester.name,
             active.request_id,
             active.interaction.map_or(0, |interaction| interaction.0),
             active.event_sequence,
             active.epoch.id,
             active.epoch.target_layout_revision,
+            active
+                .regions
+                .values()
+                .filter(|region| region_state_is_final(&region.state))
+                .count(),
+            active.regions.len(),
             active.ready_panes.len(),
             active.wait_panes.len(),
+            trace_region_ids(&active.recovered_regions),
+            active.recovered_regions.len(),
             active.started.elapsed().as_micros(),
         );
         Ok(None)
@@ -6158,7 +6884,7 @@ impl Application {
             active.interaction_claim,
         )?;
         eprintln!(
-            "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} ready={}/{} missing={missing_panes:?} duration_us={}",
+            "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} missing={missing_panes:?} duration_us={}",
             if degraded { "degraded" } else { "completed" },
             active.requester.name,
             active.request_id,
@@ -6167,8 +6893,16 @@ impl Application {
             active.native_resize_revision.unwrap_or(0),
             active.epoch.id,
             active.epoch.target_layout_revision,
+            active
+                .regions
+                .values()
+                .filter(|region| region_state_is_final(&region.state))
+                .count(),
+            active.regions.len(),
             active.ready_panes.len(),
             active.wait_panes.len(),
+            trace_region_ids(&active.recovered_regions),
+            active.recovered_regions.len(),
             active.started.elapsed().as_micros(),
         );
         if let Some(native_resize_revision) = active.native_resize_revision
@@ -6194,9 +6928,124 @@ impl Application {
                     && Instant::now() >= active.deadline
             })
         {
+            self.recover_pending_layout_regions_for_timeout()?;
             return self.finish_synchronized_resize(true);
         }
         Ok(None)
+    }
+
+    fn recover_pending_layout_regions_for_timeout(&mut self) -> Result<()> {
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            return Ok(());
+        };
+        let current_extent = self.renderer.as_ref().map(Renderer::layout_extent);
+        let (extent, renderer_extent_drifted) =
+            synchronized_timeout_recovery_extent(active.target_extent, current_extent);
+        if renderer_extent_drifted {
+            eprintln!(
+                "synchronized region timeout uses fixed epoch extent={}x{} current_renderer_extent={}x{}",
+                extent.w,
+                extent.h,
+                current_extent.map_or(0, |current| current.w),
+                current_extent.map_or(0, |current| current.h),
+            );
+        }
+        self.recover_pending_layout_regions_at(extent)
+    }
+
+    fn recover_pending_layout_regions_at(&mut self, extent: LayoutSize) -> Result<()> {
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            return Ok(());
+        };
+        let mut parent = LayoutLeaseToken {
+            id: LayoutLeaseId(active.epoch.lease),
+            generation: active.epoch.lease_generation,
+        };
+        let mut changed = Vec::new();
+        let mut reached_leaf = false;
+        for _ in 0..MAX_ACTIVE_RESIZE_REGIONS {
+            let Some(child) = active.target_tree.rest_token(parent) else {
+                reached_leaf = true;
+                break;
+            };
+            let source = lease_viewport_rect(&active.base_tree, child, extent)
+                .context("durable child viewport is unavailable during timeout recovery")?;
+            let target = lease_viewport_rect(&active.target_tree, child, extent)
+                .context("target child viewport is unavailable during timeout recovery")?;
+            if source != target {
+                changed.push((child, source, target));
+            }
+            parent = child;
+        }
+        anyhow::ensure!(
+            reached_leaf || active.target_tree.rest_token(parent).is_none(),
+            "resize region chain exceeds the active dependency bound"
+        );
+        let active = self
+            .active_synchronized_resize
+            .as_mut()
+            .context("active resize disappeared during timeout recovery")?;
+        let mut recovered = Vec::new();
+        for (lease, source_viewport, target_viewport) in changed {
+            let needs_recovery = active
+                .regions
+                .get(&lease.id)
+                .is_none_or(|region| !region_state_is_final(&region.state));
+            if !needs_recovery {
+                continue;
+            }
+            active
+                .target_tree
+                .reuse_accepted_fragment_from(&active.base_tree, lease)?;
+            let holder = self
+                .layout_holders
+                .get(&lease.id)
+                .cloned()
+                .unwrap_or_else(|| ActorIdentity {
+                    name: "unavailable".to_string(),
+                    generation: 0,
+                });
+            let reason = "global synchronized resize deadline expired".to_string();
+            active
+                .regions
+                .entry(lease.id)
+                .and_modify(|region| {
+                    region.state = LayoutRegionResolutionState::RecoveredFailure {
+                        reason: reason.clone(),
+                    };
+                })
+                .or_insert(LayoutRegionDependency {
+                    lease,
+                    holder,
+                    source_viewport,
+                    target_viewport,
+                    issued_at: active.started,
+                    delivered: false,
+                    state: LayoutRegionResolutionState::RecoveredFailure {
+                        reason: reason.clone(),
+                    },
+                });
+            active.recovered_regions.insert(lease.id);
+            recovered.push(lease.id.0);
+        }
+        let composed = active.target_tree.compose()?;
+        if let Some(renderer) = self.renderer.as_ref() {
+            active.affected_panes =
+                changed_layout_panes(&renderer.presented_layout, &composed.layout, extent);
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.project_staged_layout(active.epoch.id, composed);
+        }
+        eprintln!(
+            "layout-region timeout-recovery epoch={} recovered_leases=[{}]",
+            active.epoch.id,
+            recovered
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Ok(())
     }
 
     fn apply_actor_host_messages(&mut self) -> Result<()> {
@@ -6251,7 +7100,7 @@ impl Application {
                 self.pending_native_window_resize.is_some(),
             ) {
                 eprintln!(
-                    "rejected ordinary SetResolvedLayout while synchronized or native resize geometry is unsettled: Busy"
+                    "rejected ordinary layout-tree mutation while synchronized or native resize geometry is unsettled: Busy"
                 );
                 continue;
             }
@@ -6522,6 +7371,46 @@ impl Application {
                         continue;
                     };
                     self.submit_synchronized_layout(sender, request)?
+                }
+                HostMessage::SubmitLayoutRegion(response) => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored layout-region fragment without actor identity");
+                        continue;
+                    };
+                    self.handle_layout_region_response(
+                        sender,
+                        response.resize_epoch,
+                        response.lease,
+                        LayoutRegionActorResponse::Fragment {
+                            inventory_revision: response.inventory_revision,
+                            fragment: response.fragment,
+                            focus: response.focus,
+                        },
+                    )?
+                }
+                HostMessage::ReuseLayoutRegion(response) => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored layout-region reuse without actor identity");
+                        continue;
+                    };
+                    self.handle_layout_region_response(
+                        sender,
+                        response.resize_epoch,
+                        response.lease,
+                        LayoutRegionActorResponse::Reuse,
+                    )?
+                }
+                HostMessage::FailLayoutRegion(response) => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored layout-region failure without actor identity");
+                        continue;
+                    };
+                    self.handle_layout_region_response(
+                        sender,
+                        response.resize_epoch,
+                        response.lease,
+                        LayoutRegionActorResponse::Failure(response.message),
+                    )?
                 }
                 HostMessage::ReusePaneContent(reuse) => {
                     let Some(sender) = actor_message.sender.as_ref() else {
@@ -9695,7 +10584,10 @@ fn apply_key_policy_host_message(
         | HostMessage::DelegateLayoutRest { .. }
         | HostMessage::SetPointerPolicy { .. }
         | HostMessage::SubmitSynchronizedLayout(_)
-        | HostMessage::ReusePaneContent(_) => {
+        | HostMessage::ReusePaneContent(_)
+        | HostMessage::SubmitLayoutRegion(_)
+        | HostMessage::ReuseLayoutRegion(_)
+        | HostMessage::FailLayoutRegion(_) => {
             return Err(anyhow!(
                 "key policy cannot mutate layout authority directly; it must message a layout actor"
             ));
@@ -13289,6 +14181,21 @@ fn synchronized_plugin_notification_sets(
     (tagged, ordinary)
 }
 
+fn pending_synchronized_notification_panes(
+    active: &ActiveSynchronizedResize,
+) -> (BTreeSet<u64>, BTreeSet<u64>) {
+    let eligible =
+        |pane: &&u64| !active.notified_panes.contains(pane) && pane_branch_is_final(active, **pane);
+    let affected = active
+        .affected_panes
+        .iter()
+        .filter(eligible)
+        .copied()
+        .collect();
+    let wait = active.wait_panes.iter().filter(eligible).copied().collect();
+    (affected, wait)
+}
+
 fn should_defer_ordinary_plugin_refresh(
     resize_epoch: Option<u64>,
     pane: u64,
@@ -13613,6 +14520,7 @@ mod tests {
         target_tree.update_inventory(1, &[7, 8])?;
         let root = target_tree.root_token();
         let now = Instant::now();
+        let base_tree = target_tree.clone();
         Ok(ActiveSynchronizedResize {
             request_id: 11,
             interaction: None,
@@ -13631,7 +14539,13 @@ mod tests {
                 name: "layout".to_string(),
                 generation: 7,
             },
+            base_tree,
             target_tree,
+            target_extent: LayoutSize { w: 1000, h: 600 },
+            regions: BTreeMap::new(),
+            wait_pane_owners: BTreeMap::from([(7, root), (8, root)]),
+            notified_panes: BTreeSet::new(),
+            recovered_regions: BTreeSet::new(),
             focus: None,
             wait_panes: BTreeSet::from([7, 8]),
             ready_panes: BTreeSet::new(),
@@ -13640,6 +14554,795 @@ mod tests {
             deadline: now + SYNCHRONIZED_RESIZE_TIMEOUT,
             presentation,
         })
+    }
+
+    fn active_resize_with_region_chain() -> Result<ActiveSynchronizedResize> {
+        let mut base_tree = LayoutLeaseTree::default();
+        base_tree.update_inventory(1, &[1, 2, 3])?;
+        let root = base_tree.root_token();
+        let middle = base_tree.grant_rest(root, &[2, 3])?;
+        let leaf = base_tree.grant_rest(middle, &[3])?;
+        let child_slot = |offset_u, size_u| brood_layout::LayoutChildSlot {
+            z: 0.0,
+            transform: brood_layout::LocalTransform {
+                offset: LocalPoint {
+                    u: offset_u,
+                    v: -1.0,
+                },
+                size: LocalPoint { u: size_u, v: 2.0 },
+            },
+        };
+        base_tree.submit(
+            root,
+            1,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![test_pane_item(1, -1.0, 0.5)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: Some(child_slot(-0.5, 1.5)),
+            },
+            Some(1),
+        )?;
+        base_tree.submit(
+            middle,
+            1,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![test_pane_item(2, -1.0, 1.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: Some(child_slot(0.0, 1.0)),
+            },
+            Some(2),
+        )?;
+        base_tree.submit(
+            leaf,
+            1,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![test_pane_item(3, -1.0, 2.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            },
+            Some(3),
+        )?;
+        let mut target_tree = base_tree.clone();
+        target_tree.submit(
+            root,
+            1,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![test_pane_item(1, -1.0, 0.7)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: Some(child_slot(-0.3, 1.3)),
+            },
+            Some(1),
+        )?;
+        let now = Instant::now();
+        Ok(ActiveSynchronizedResize {
+            request_id: 11,
+            interaction: None,
+            event_sequence: 1,
+            interaction_claim: None,
+            native_resize_revision: None,
+            superseded_epochs: 0,
+            epoch: brood_wasm::ResizeEpoch {
+                id: 41,
+                lease: root.id.0,
+                lease_generation: root.generation,
+                base_layout_revision: 1,
+                target_layout_revision: 2,
+            },
+            requester: ActorIdentity {
+                name: "root".to_string(),
+                generation: 7,
+            },
+            base_tree,
+            target_tree,
+            target_extent: LayoutSize { w: 1000, h: 600 },
+            regions: BTreeMap::from([
+                (
+                    middle.id,
+                    LayoutRegionDependency {
+                        lease: middle,
+                        holder: ActorIdentity {
+                            name: "middle".to_string(),
+                            generation: 8,
+                        },
+                        source_viewport: LayoutRect {
+                            x: 250,
+                            y: 0,
+                            w: 750,
+                            h: 600,
+                        },
+                        target_viewport: LayoutRect {
+                            x: 350,
+                            y: 0,
+                            w: 650,
+                            h: 600,
+                        },
+                        issued_at: now,
+                        delivered: true,
+                        state: LayoutRegionResolutionState::Pending,
+                    },
+                ),
+                (
+                    leaf.id,
+                    LayoutRegionDependency {
+                        lease: leaf,
+                        holder: ActorIdentity {
+                            name: "leaf".to_string(),
+                            generation: 9,
+                        },
+                        source_viewport: LayoutRect {
+                            x: 625,
+                            y: 0,
+                            w: 375,
+                            h: 600,
+                        },
+                        target_viewport: LayoutRect {
+                            x: 675,
+                            y: 0,
+                            w: 325,
+                            h: 600,
+                        },
+                        issued_at: now,
+                        delivered: false,
+                        state: LayoutRegionResolutionState::Pending,
+                    },
+                ),
+            ]),
+            wait_pane_owners: BTreeMap::from([(1, root), (2, middle), (3, leaf)]),
+            notified_panes: BTreeSet::new(),
+            recovered_regions: BTreeSet::new(),
+            focus: Some(1),
+            wait_panes: BTreeSet::from([1, 2, 3]),
+            ready_panes: BTreeSet::new(),
+            affected_panes: BTreeSet::from([1, 2, 3]),
+            started: now,
+            deadline: now + SYNCHRONIZED_RESIZE_TIMEOUT,
+            presentation: SynchronizedResizePresentation::Waiting,
+        })
+    }
+
+    fn application_with_region_chain() -> Result<(Application, LayoutRegionDependency)> {
+        let active = active_resize_with_region_chain()?;
+        let middle = active.regions[&LayoutLeaseId(2)].clone();
+        let mut application = Application {
+            layout_leases: active.base_tree.clone(),
+            active_synchronized_resize: Some(active),
+            ..Application::default()
+        };
+        application
+            .layout_holders
+            .insert(middle.lease.id, middle.holder.clone());
+        let leaf = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .regions[&LayoutLeaseId(3)]
+            .clone();
+        application
+            .layout_holders
+            .insert(leaf.lease.id, leaf.holder);
+        Ok((application, middle))
+    }
+
+    fn actor_lease(token: LayoutLeaseToken) -> brood_wasm::LayoutLeaseToken {
+        brood_wasm::LayoutLeaseToken {
+            id: token.id.0,
+            generation: token.generation,
+        }
+    }
+
+    fn actor_test_pane_item(pane: u64, left: f64, width: f64) -> brood_wasm::ResolvedLayoutItem {
+        brood_wasm::ResolvedLayoutItem {
+            id: brood_wasm::LayoutItemId(pane),
+            kind: brood_wasm::LayoutItemKind::Pane { pane },
+            z: pane as f64,
+            transform: brood_wasm::LocalTransform {
+                offset: brood_wasm::LocalPoint { u: left, v: -1.0 },
+                size: brood_wasm::LocalPoint { u: width, v: 2.0 },
+            },
+            input: brood_wasm::InputBehavior::Pane,
+        }
+    }
+
+    fn accepted_middle_fragment_response() -> LayoutRegionActorResponse {
+        LayoutRegionActorResponse::Fragment {
+            inventory_revision: 1,
+            fragment: brood_wasm::SynchronizedLayoutFragment {
+                layout: brood_wasm::ResolvedLayout {
+                    items: vec![actor_test_pane_item(2, -1.0, 0.8)],
+                    zones: Vec::new(),
+                    dividers: Vec::new(),
+                },
+                rest: Some(brood_wasm::LayoutChildSlot {
+                    z: 0.0,
+                    transform: brood_wasm::LocalTransform {
+                        offset: brood_wasm::LocalPoint { u: -0.2, v: -1.0 },
+                        size: brood_wasm::LocalPoint { u: 1.2, v: 2.0 },
+                    },
+                }),
+            },
+            focus: Some(2),
+        }
+    }
+
+    fn root_fragment(
+        pane_width: f64,
+        rest_left: f64,
+        rest_width: f64,
+    ) -> brood_layout::LayoutFragment {
+        brood_layout::LayoutFragment {
+            layout: ResolvedLayout {
+                items: vec![test_pane_item(1, -1.0, pane_width)],
+            },
+            zones: Vec::new(),
+            dividers: Vec::new(),
+            rest: Some(brood_layout::LayoutChildSlot {
+                z: 0.0,
+                transform: brood_layout::LocalTransform {
+                    offset: LocalPoint {
+                        u: rest_left,
+                        v: -1.0,
+                    },
+                    size: LocalPoint {
+                        u: rest_width,
+                        v: 2.0,
+                    },
+                },
+            }),
+        }
+    }
+
+    fn accept_epoch_a_middle_fragment(
+        application: &mut Application,
+        middle: &LayoutRegionDependency,
+    ) -> Result<brood_wasm::ResizeEpoch> {
+        let epoch = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .epoch;
+        application.handle_layout_region_response(
+            &middle.holder,
+            epoch,
+            actor_lease(middle.lease),
+            accepted_middle_fragment_response(),
+        )?;
+        assert!(matches!(
+            application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .regions[&middle.lease.id]
+                .state,
+            LayoutRegionResolutionState::Fragment
+        ));
+        Ok(epoch)
+    }
+
+    #[test]
+    fn superseding_request_that_restores_durable_viewport_drops_epoch_a_child_fragment()
+    -> Result<()> {
+        let (mut application, middle) = application_with_region_chain()?;
+        accept_epoch_a_middle_fragment(&mut application, &middle)?;
+        let epoch_a_target = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .compose()?;
+        let mut carried_epoch_a_tree = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .clone();
+        let durable = application.layout_leases.compose()?;
+        assert_ne!(epoch_a_target, durable);
+
+        let root = application.layout_leases.root_token();
+        carried_epoch_a_tree.submit(root, 1, root_fragment(0.5, -0.5, 1.5), Some(1))?;
+        let epoch_b_target = application.synchronized_target_tree_for_request(
+            root,
+            1,
+            root_fragment(0.5, -0.5, 1.5),
+            Some(1),
+        )?;
+        assert_eq!(epoch_b_target.compose()?, durable);
+        assert_ne!(epoch_b_target.compose()?, carried_epoch_a_tree.compose()?);
+        assert!(
+            changed_rest_child(
+                &application.layout_leases,
+                &epoch_b_target,
+                root,
+                LayoutSize { w: 1000, h: 600 },
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn superseding_request_with_changed_viewport_restarts_child_region_from_durable() -> Result<()>
+    {
+        let (mut application, middle) = application_with_region_chain()?;
+        let epoch_a = accept_epoch_a_middle_fragment(&mut application, &middle)?;
+        let epoch_a_target = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .compose()?;
+        let mut carried_epoch_a_tree = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .clone();
+
+        let root = application.layout_leases.root_token();
+        carried_epoch_a_tree.submit(root, 1, root_fragment(0.7, -0.3, 1.3), Some(1))?;
+        let epoch_b_target = application.synchronized_target_tree_for_request(
+            root,
+            1,
+            root_fragment(0.7, -0.3, 1.3),
+            Some(1),
+        )?;
+        let (child, source_viewport, target_viewport) = changed_rest_child(
+            &application.layout_leases,
+            &epoch_b_target,
+            root,
+            LayoutSize { w: 1000, h: 600 },
+        )
+        .expect("superseding viewport must issue a fresh child region");
+        assert_eq!(child, middle.lease);
+        assert_ne!(epoch_b_target.compose()?, epoch_a_target);
+        assert_ne!(epoch_b_target.compose()?, carried_epoch_a_tree.compose()?);
+
+        let epoch_b = brood_wasm::ResizeEpoch {
+            id: epoch_a.id + 1,
+            target_layout_revision: epoch_a.target_layout_revision + 1,
+            ..epoch_a
+        };
+        let active = application.active_synchronized_resize.as_mut().unwrap();
+        active.epoch = epoch_b;
+        active.base_tree = application.layout_leases.clone();
+        active.target_tree = epoch_b_target;
+        active.regions = BTreeMap::from([(
+            child.id,
+            LayoutRegionDependency {
+                lease: child,
+                holder: middle.holder.clone(),
+                source_viewport,
+                target_viewport,
+                issued_at: Instant::now(),
+                delivered: true,
+                state: LayoutRegionResolutionState::Pending,
+            },
+        )]);
+        active.ready_panes.clear();
+        active.notified_panes.clear();
+        active.recovered_regions.clear();
+        let before_stale_reply = active.target_tree.compose()?;
+
+        application.handle_layout_region_response(
+            &middle.holder,
+            epoch_a,
+            actor_lease(middle.lease),
+            accepted_middle_fragment_response(),
+        )?;
+        let active = application.active_synchronized_resize.as_ref().unwrap();
+        assert!(matches!(
+            active.regions[&middle.lease.id].state,
+            LayoutRegionResolutionState::Pending
+        ));
+        assert_eq!(active.target_tree.compose()?, before_stale_reply);
+        Ok(())
+    }
+
+    #[test]
+    fn region_geometry_and_fixed_pane_waits_are_separate_dependencies() -> Result<()> {
+        let mut active = active_resize_with_region_chain()?;
+        active.wait_panes.clear();
+        assert!(active.ready_panes == active.wait_panes);
+        assert!(!resize_regions_are_final(&active));
+        assert!(pane_branch_is_final(&active, 1));
+        assert!(!pane_branch_is_final(&active, 2));
+        assert!(!pane_branch_is_final(&active, 3));
+
+        active.regions.get_mut(&LayoutLeaseId(2)).unwrap().state =
+            LayoutRegionResolutionState::Fragment;
+        assert!(pane_branch_is_final(&active, 2));
+        assert!(!pane_branch_is_final(&active, 3));
+        active.regions.get_mut(&LayoutLeaseId(3)).unwrap().state =
+            LayoutRegionResolutionState::Reuse;
+        assert!(resize_regions_are_final(&active));
+        assert!(changed_region_chain_is_final(
+            &active,
+            LayoutSize { w: 1000, h: 600 }
+        ));
+        assert!(pane_branch_is_final(&active, 3));
+        active.regions.remove(&LayoutLeaseId(3));
+        assert!(resize_regions_are_final(&active));
+        assert!(!changed_region_chain_is_final(
+            &active,
+            LayoutSize { w: 1000, h: 600 }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_region_reply_does_not_resolve_the_pending_branch() -> Result<()> {
+        let active = active_resize_with_region_chain()?;
+        let middle = active.regions[&LayoutLeaseId(2)].clone();
+        let mut application = Application {
+            active_synchronized_resize: Some(active),
+            ..Application::default()
+        };
+        let stale_epoch = brood_wasm::ResizeEpoch {
+            id: 40,
+            ..application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .epoch
+        };
+        let before_target = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .compose()?;
+        let before_ready = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .ready_panes
+            .clone();
+        application.handle_layout_region_response(
+            &middle.holder,
+            stale_epoch,
+            brood_wasm::LayoutLeaseToken {
+                id: middle.lease.id.0,
+                generation: middle.lease.generation,
+            },
+            LayoutRegionActorResponse::Reuse,
+        )?;
+        assert!(matches!(
+            application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .regions[&middle.lease.id]
+                .state,
+            LayoutRegionResolutionState::Pending
+        ));
+        let active = application.active_synchronized_resize.as_ref().unwrap();
+        assert_eq!(active.target_tree.compose()?, before_target);
+        assert_eq!(active.ready_panes, before_ready);
+        Ok(())
+    }
+
+    #[test]
+    fn region_reply_authentication_rejects_token_actor_duplicate_and_rollover() -> Result<()> {
+        let cases = ["token", "actor", "duplicate", "rollover"];
+        for case in cases {
+            let (mut application, middle) = application_with_region_chain()?;
+            let mut sender = middle.holder.clone();
+            let mut lease = middle.lease;
+            match case {
+                "token" => lease.generation = lease.generation.saturating_add(1),
+                "actor" => sender.generation = sender.generation.saturating_add(1),
+                "duplicate" => {
+                    application
+                        .active_synchronized_resize
+                        .as_mut()
+                        .unwrap()
+                        .regions
+                        .get_mut(&middle.lease.id)
+                        .unwrap()
+                        .state = LayoutRegionResolutionState::Reuse;
+                }
+                "rollover" => {
+                    let root = application.layout_leases.root_token();
+                    let promoted = application.layout_leases.collapse_wrapper(root)?;
+                    assert_eq!(promoted.id, middle.lease.id);
+                    assert_ne!(promoted.generation, middle.lease.generation);
+                }
+                _ => unreachable!(),
+            }
+            let before_ready = application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .ready_panes
+                .clone();
+            let before_target = application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .target_tree
+                .compose()?;
+            application.handle_layout_region_response(
+                &sender,
+                application
+                    .active_synchronized_resize
+                    .as_ref()
+                    .unwrap()
+                    .epoch,
+                actor_lease(lease),
+                LayoutRegionActorResponse::Reuse,
+            )?;
+            let active = application.active_synchronized_resize.as_ref().unwrap();
+            assert_eq!(active.ready_panes, before_ready, "case={case}");
+            assert_eq!(active.target_tree.compose()?, before_target, "case={case}");
+            if case != "duplicate" {
+                assert!(matches!(
+                    active.regions[&middle.lease.id].state,
+                    LayoutRegionResolutionState::Pending
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn child_response_that_removes_fixed_wait_pane_leaves_branch_pending() -> Result<()> {
+        let (mut application, middle) = application_with_region_chain()?;
+        let before_ready = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .ready_panes
+            .clone();
+        let before_target = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .compose()?;
+        let response = LayoutRegionActorResponse::Fragment {
+            inventory_revision: 1,
+            fragment: brood_wasm::SynchronizedLayoutFragment {
+                layout: brood_wasm::ResolvedLayout::empty(),
+                rest: Some(brood_wasm::LayoutChildSlot {
+                    z: 0.0,
+                    transform: brood_wasm::LocalTransform {
+                        offset: brood_wasm::LocalPoint { u: 0.0, v: -1.0 },
+                        size: brood_wasm::LocalPoint { u: 1.0, v: 2.0 },
+                    },
+                }),
+            },
+            focus: None,
+        };
+        application.handle_layout_region_response(
+            &middle.holder,
+            application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .epoch,
+            actor_lease(middle.lease),
+            response,
+        )?;
+        let active = application.active_synchronized_resize.as_ref().unwrap();
+        assert!(matches!(
+            active.regions[&middle.lease.id].state,
+            LayoutRegionResolutionState::Pending
+        ));
+        assert_eq!(active.ready_panes, before_ready);
+        assert_eq!(active.target_tree.compose()?, before_target);
+        Ok(())
+    }
+
+    #[test]
+    fn pane_readiness_before_branch_admission_cannot_satisfy_the_wait_set() -> Result<()> {
+        let mut active = active_resize_with_region_chain()?;
+        active.notified_panes.insert(1);
+        let epoch = active.epoch.id;
+        let mut application = Application {
+            active_synchronized_resize: Some(active),
+            ..Application::default()
+        };
+        application.note_synchronized_pane_ready(2, epoch)?;
+        assert!(
+            !application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .ready_panes
+                .contains(&2)
+        );
+        {
+            let active = application.active_synchronized_resize.as_mut().unwrap();
+            active.regions.get_mut(&LayoutLeaseId(2)).unwrap().state =
+                LayoutRegionResolutionState::Fragment;
+        }
+        application.note_synchronized_pane_ready(2, epoch)?;
+        assert!(
+            !application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .ready_panes
+                .contains(&2)
+        );
+        application
+            .active_synchronized_resize
+            .as_mut()
+            .unwrap()
+            .notified_panes
+            .insert(2);
+        application.note_synchronized_pane_ready(2, epoch)?;
+        assert!(
+            application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .ready_panes
+                .contains(&2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_closes_every_changed_projected_descendant() -> Result<()> {
+        let (mut application, _middle) = application_with_region_chain()?;
+        application.recover_pending_layout_regions_for_timeout()?;
+        let active = application.active_synchronized_resize.as_ref().unwrap();
+        assert_eq!(
+            active.recovered_regions,
+            BTreeSet::from([LayoutLeaseId(2), LayoutLeaseId(3)])
+        );
+        assert!(resize_regions_are_final(active));
+        assert!(changed_region_chain_is_final(
+            active,
+            LayoutSize { w: 1000, h: 600 }
+        ));
+        assert!(synchronized_resize_requires_degraded_completion(active));
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_recovery_keeps_the_fixed_epoch_extent_when_the_renderer_drifts() {
+        let target_extent = LayoutSize { w: 1000, h: 600 };
+        let current_extent = LayoutSize { w: 1500, h: 900 };
+        let (recovery_extent, drifted) =
+            synchronized_timeout_recovery_extent(target_extent, Some(current_extent));
+        assert_eq!(recovery_extent, target_extent);
+        assert!(drifted);
+        let (recovery_extent, drifted) =
+            synchronized_timeout_recovery_extent(target_extent, Some(target_extent));
+        assert_eq!(recovery_extent, target_extent);
+        assert!(!drifted);
+    }
+
+    #[test]
+    fn explicit_and_mailbox_region_failures_require_degraded_completion() -> Result<()> {
+        let (mut explicit, middle) = application_with_region_chain()?;
+        explicit.handle_layout_region_response(
+            &middle.holder,
+            explicit.active_synchronized_resize.as_ref().unwrap().epoch,
+            actor_lease(middle.lease),
+            LayoutRegionActorResponse::Failure("child failed".to_string()),
+        )?;
+        let active = explicit.active_synchronized_resize.as_ref().unwrap();
+        assert!(active.recovered_regions.contains(&middle.lease.id));
+        assert!(synchronized_resize_requires_degraded_completion(active));
+
+        let (mut delivery, middle) = application_with_region_chain()?;
+        delivery
+            .active_synchronized_resize
+            .as_mut()
+            .unwrap()
+            .regions
+            .get_mut(&middle.lease.id)
+            .unwrap()
+            .delivered = false;
+        delivery.discover_and_dispatch_layout_regions()?;
+        let active = delivery.active_synchronized_resize.as_ref().unwrap();
+        assert!(active.recovered_regions.contains(&middle.lease.id));
+        assert!(synchronized_resize_requires_degraded_completion(active));
+        Ok(())
+    }
+
+    #[test]
+    fn response_after_deadline_recovers_instead_of_winning() -> Result<()> {
+        let (mut application, middle) = application_with_region_chain()?;
+        application
+            .active_synchronized_resize
+            .as_mut()
+            .unwrap()
+            .deadline = Instant::now() - Duration::from_millis(1);
+        application.handle_layout_region_response(
+            &middle.holder,
+            application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .epoch,
+            actor_lease(middle.lease),
+            LayoutRegionActorResponse::Reuse,
+        )?;
+        let active = application.active_synchronized_resize.as_ref().unwrap();
+        assert!(matches!(
+            active.regions[&middle.lease.id].state,
+            LayoutRegionResolutionState::RecoveredFailure { .. }
+        ));
+        assert!(synchronized_resize_requires_degraded_completion(active));
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_epoch_reply_cannot_change_the_new_target() -> Result<()> {
+        let (mut application, middle) = application_with_region_chain()?;
+        let current = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .epoch;
+        let stale = brood_wasm::ResizeEpoch {
+            id: current.id.saturating_sub(1),
+            target_layout_revision: current.target_layout_revision.saturating_sub(1),
+            ..current
+        };
+        let before_target = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .target_tree
+            .compose()?;
+        let before_ready = application
+            .active_synchronized_resize
+            .as_ref()
+            .unwrap()
+            .ready_panes
+            .clone();
+        application.handle_layout_region_response(
+            &middle.holder,
+            stale,
+            actor_lease(middle.lease),
+            LayoutRegionActorResponse::Reuse,
+        )?;
+        assert!(matches!(
+            application
+                .active_synchronized_resize
+                .as_ref()
+                .unwrap()
+                .regions[&middle.lease.id]
+                .state,
+            LayoutRegionResolutionState::Pending
+        ));
+        let active = application.active_synchronized_resize.as_ref().unwrap();
+        assert_eq!(active.target_tree.compose()?, before_target);
+        assert_eq!(active.ready_panes, before_ready);
+        Ok(())
+    }
+
+    #[test]
+    fn fractional_scale_region_notification_keeps_composition_pixel_size() -> Result<()> {
+        let active = active_resize_with_region_chain()?;
+        let region = &active.regions[&LayoutLeaseId(2)];
+        let notification = layout_region_notification(active.epoch, region, 1.5);
+        let brood_wasm::LayoutRegionNotification::Resized(message) = notification;
+        assert_eq!(message.size.w, region.target_viewport.w);
+        assert_eq!(message.size.h, region.target_viewport.h);
+        assert_eq!(message.size, brood_wasm::LayoutSize { w: 650, h: 600 });
+        assert!((message.scale - 1.5).abs() < f32::EPSILON);
+        let encoded = serde_json::to_value(notification)?;
+        assert_eq!(encoded["type"], "layout-region-resized");
+        assert_eq!(encoded["size"], serde_json::json!({"w": 650, "h": 600}));
+        Ok(())
     }
 
     #[test]
@@ -14245,6 +15948,62 @@ mod tests {
     }
 
     #[test]
+    fn another_interaction_is_busy_while_one_resize_transaction_is_active() -> Result<()> {
+        let actor = ActorIdentity {
+            name: "workspace".to_string(),
+            generation: 3,
+        };
+        let interaction = brood_wasm::InteractionId(23);
+        let mut application = Application {
+            active_synchronized_resize: Some(active_resize_with_inventory(
+                SynchronizedResizePresentation::Waiting,
+            )?),
+            ..Application::default()
+        };
+        let lease = application.layout_leases.root_token();
+        let binding = PointerPolicyBindingKey {
+            lease,
+            holder_name: actor.name.clone(),
+            holder_generation: actor.generation,
+            provider: "workspace".to_string(),
+        };
+        let zone = ComposedZoneId {
+            lease: lease.id,
+            lease_generation: lease.generation,
+            local_item: LayoutItemId(17),
+        };
+        application.layout_holders.insert(lease.id, actor.clone());
+        application
+            .pointer_interactions
+            .issue(interaction, binding, zone)?;
+        deliver_test_interaction_sequence(
+            &mut application.pointer_interactions,
+            interaction,
+            31,
+            brood_wasm::PointerPhase::Motion,
+            false,
+        );
+        application.submit_synchronized_layout(
+            &actor,
+            test_synchronized_request(lease, Some(interaction), Some(31)),
+        )?;
+        let Some(PendingSynchronizedLayoutNotification {
+            notification: brood_wasm::SynchronizedLayoutNotification::Rejected(rejected),
+            ..
+        }) = application
+            .pending_synchronized_layout_notifications
+            .front()
+        else {
+            return Err(anyhow!("busy interaction did not produce a rejection"));
+        };
+        assert_eq!(
+            rejected.reason,
+            brood_wasm::SynchronizedLayoutRejectionReason::Busy
+        );
+        Ok(())
+    }
+
+    #[test]
     fn interaction_and_event_sequence_must_be_present_together() {
         let actor = ActorIdentity {
             name: "workspace".to_string(),
@@ -14289,6 +16048,68 @@ mod tests {
             Some(&wait)
         ));
         assert!(!should_defer_ordinary_plugin_refresh(None, 2, Some(&wait)));
+    }
+
+    #[test]
+    fn unchanged_final_release_still_notifies_fixed_wait_panes() -> Result<()> {
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        active.affected_panes.clear();
+
+        let (affected, wait) = pending_synchronized_notification_panes(&active);
+        assert!(affected.is_empty());
+        assert_eq!(wait, BTreeSet::from([7, 8]));
+        assert_eq!(
+            synchronized_plugin_notification_sets(&affected, &wait, &BTreeSet::from([7, 8])),
+            (vec![7, 8], Vec::new())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_wait_pane_notification_is_branch_gated() -> Result<()> {
+        let mut active = active_resize_with_region_chain()?;
+        active.affected_panes.clear();
+
+        let (_, wait) = pending_synchronized_notification_panes(&active);
+        assert_eq!(wait, BTreeSet::from([1]));
+        active.regions.get_mut(&LayoutLeaseId(2)).unwrap().state =
+            LayoutRegionResolutionState::Fragment;
+        let (_, wait) = pending_synchronized_notification_panes(&active);
+        assert_eq!(wait, BTreeSet::from([1, 2]));
+        active.regions.get_mut(&LayoutLeaseId(3)).unwrap().state =
+            LayoutRegionResolutionState::Reuse;
+        let (_, wait) = pending_synchronized_notification_panes(&active);
+        assert_eq!(wait, BTreeSet::from([1, 2, 3]));
+        Ok(())
+    }
+
+    #[test]
+    fn synchronized_pane_is_not_notified_twice_for_one_epoch() -> Result<()> {
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        active.affected_panes.clear();
+        active.notified_panes.insert(7);
+
+        let (affected, wait) = pending_synchronized_notification_panes(&active);
+        assert!(affected.is_empty());
+        assert_eq!(wait, BTreeSet::from([8]));
+        active.notified_panes.insert(8);
+        let (affected, wait) = pending_synchronized_notification_panes(&active);
+        assert!(affected.is_empty());
+        assert!(wait.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn child_fragment_cannot_remove_a_fixed_wait_pane() {
+        let wait = BTreeSet::from([2, 3]);
+        let complete = ResolvedLayout {
+            items: vec![test_pane_item(2, -1.0, 1.0), test_pane_item(3, 0.0, 1.0)],
+        };
+        assert_eq!(removed_fixed_wait_pane(&complete, &wait), None);
+        let missing = ResolvedLayout {
+            items: vec![test_pane_item(2, -1.0, 2.0)],
+        };
+        assert_eq!(removed_fixed_wait_pane(&missing, &wait), Some(3));
     }
 
     #[test]
@@ -14480,6 +16301,39 @@ mod tests {
         assert!(!ordinary_layout_message_conflicts_with_unsettled_resize(
             &HostMessage::ClaimRootLayout,
             true,
+            false,
+            false,
+        ));
+        let delegation = HostMessage::DelegateLayoutRest {
+            lease: brood_wasm::LayoutLeaseToken {
+                id: 1,
+                generation: 1,
+            },
+            revision: 1,
+            actor: "child".to_string(),
+            panes: vec![2],
+        };
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &delegation,
+            true,
+            false,
+            false,
+        ));
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &delegation,
+            false,
+            true,
+            false,
+        ));
+        assert!(ordinary_layout_message_conflicts_with_unsettled_resize(
+            &delegation,
+            false,
+            false,
+            true,
+        ));
+        assert!(!ordinary_layout_message_conflicts_with_unsettled_resize(
+            &delegation,
+            false,
             false,
             false,
         ));

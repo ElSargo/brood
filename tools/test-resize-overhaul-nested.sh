@@ -1113,6 +1113,24 @@ env \
   "$ROOT/tools/test-resize-overhaul-window-shell-nested.sh"
 [[ -s "$EXTENDED_PROOF" && -s "$EXTENDED_METRICS" ]]
 
+# Prove recursive region recomputation with the production root actor and an
+# explicit three-level lease chain. Keep this trace and its strict pixel checks
+# separate from the established drag and window-shell evidence.
+REGION_TREE_OUT="$OUT/region-tree"
+REGION_TREE_PROOF="$REGION_TREE_OUT/proof.json"
+REGION_TREE_METRICS="$REGION_TREE_OUT/metrics.json"
+env \
+  BROOD_RESIZE_REGION_OUT="$REGION_TREE_OUT" \
+  BROOD_RESIZE_CLIENT="$CLIENT_BIN" \
+  BROOD_RESIZE_WORKSPACE_MODULE="$WORKSPACE_MODULE" \
+  BROOD_RESIZE_PROOF_COMPONENT="$RESIZE_PROOF_COMPONENT" \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  SWAYSOCK="$SWAY_SOCKET" \
+  RUST_LOG="$RUST_LOG" \
+  "$ROOT/tools/test-resize-region-tree-nested.sh"
+[[ -s "$REGION_TREE_PROOF" && -s "$REGION_TREE_METRICS" ]]
+
 if ! python3 - \
   "$CLIENT_LOG_NORMAL" \
   "$BURST_INPUT" \
@@ -2135,11 +2153,12 @@ then
 fi
 
 MERGED_METRICS="$OUT/metrics-merged.json"
-jq --slurp '.[0] + {fiducials: .[1], burst: .[2], window_shell: .[3], interaction_lifecycle: .[4]}' \
+jq --slurp '.[0] + {fiducials: .[1], burst: .[2], window_shell: .[3], region_tree: .[4], interaction_lifecycle: .[5]}' \
   "$METRICS" \
   "$FIDUCIAL_METRICS" \
   "$BURST_METRICS" \
   "$EXTENDED_METRICS" \
+  "$REGION_TREE_METRICS" \
   "$LIFECYCLE_METRICS" \
   > "$MERGED_METRICS"
 mv "$MERGED_METRICS" "$METRICS"
@@ -2174,6 +2193,7 @@ python3 - \
   "$MODE_WIDTH" \
   "$MODE_HEIGHT" \
   "$EXTENDED_PROOF" \
+  "$REGION_TREE_PROOF" \
   > "$PROOF" <<'PY'
 import json
 import pathlib
@@ -2186,6 +2206,7 @@ frames = [json.loads(line) for line in manifest_path.read_text().splitlines() if
 events = [json.loads(line) for line in events_path.read_text().splitlines() if line]
 metrics = json.loads(metrics_path.read_text())
 extended_proof = json.loads(pathlib.Path(sys.argv[11]).read_text())
+region_tree_proof = json.loads(pathlib.Path(sys.argv[12]).read_text())
 frame_locked_commands = sum(
     max(
         (frame["pointer_ack"]["sequence"] for frame in frames if frame["lane"] == lane),
@@ -2324,6 +2345,10 @@ proof = {
             and metrics["window_shell"]["assertions"]["fractional_scale_fiducials"]
         ),
         "shell_synchronized_real_input": metrics["window_shell"]["assertions"]["synchronized_real_input"],
+        "recursive_region_tree": (
+            region_tree_proof["verified"]
+            and all(region_tree_proof["assertions"].values())
+        ),
     },
     "artifacts": {
         "frame_manifest": "frame-manifest.jsonl",
@@ -2344,6 +2369,9 @@ proof = {
         "sidebar_frame_manifest": "window-shell/sidebar-frame-manifest.jsonl",
         "window_contact_sheet": "window-shell/window-contact-sheet.png",
         "sidebar_contact_sheet": "window-shell/sidebar-contact-sheet.png",
+        "region_tree_proof": "region-tree/proof.json",
+        "region_tree_metrics": "region-tree/metrics.json",
+        "region_tree_frame_manifest": "region-tree/frame-manifest.jsonl",
     },
 }
 print(json.dumps(proof, indent=2, sort_keys=True))
@@ -2385,6 +2413,7 @@ jq -e '
   and .assertions.inbox_owned_layouts == true
   and .assertions.recursive_exact_extents_and_chrome == true
   and .assertions.shell_synchronized_real_input == true
+  and .assertions.recursive_region_tree == true
   and .output.fractional_scale_1_25 == true
 ' "$PROOF" > /dev/null
 
@@ -2395,5 +2424,6 @@ echo "manifest=$FRAME_MANIFEST"
 echo "events=$RESIZE_EVENTS"
 echo "burst=$BURST_METRICS"
 echo "window_shell=$EXTENDED_PROOF"
+echo "region_tree=$REGION_TREE_PROOF"
 echo "contact_sheet=$OUT/contact-sheet.png"
 echo "animation=$OUT/resize.gif"

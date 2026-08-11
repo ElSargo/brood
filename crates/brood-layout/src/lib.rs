@@ -498,6 +498,27 @@ impl LayoutLeaseTree {
         Ok(())
     }
 
+    pub fn reuse_accepted_fragment_from(
+        &mut self,
+        source: &Self,
+        token: LayoutLeaseToken,
+    ) -> Result<(), LayoutLeaseError> {
+        self.validate_token(token)?;
+        source.validate_token(token)?;
+        if self.inventory_revision != source.inventory_revision {
+            return Err(LayoutLeaseError(
+                "layout fragment reuse inventory revision does not match".into(),
+            ));
+        }
+        let accepted = source
+            .node(token.id)?
+            .accepted
+            .clone()
+            .ok_or_else(|| LayoutLeaseError("durable layout fragment is unavailable".into()))?;
+        self.node_mut(token.id)?.accepted = Some(accepted);
+        Ok(())
+    }
+
     pub fn compose(&self) -> Result<ComposedLayout, LayoutLeaseError> {
         let root_viewport = LocalTransform {
             offset: LocalPoint {
@@ -588,6 +609,16 @@ impl LayoutLeaseTree {
     pub fn owned_panes(&self, token: LayoutLeaseToken) -> Option<Vec<u64>> {
         self.validate_token(token).ok()?;
         Some(self.node(token.id).ok()?.owned_panes.clone())
+    }
+
+    #[must_use]
+    pub fn pane_owner(&self, pane: u64) -> Option<LayoutLeaseToken> {
+        self.nodes.iter().find_map(|(id, node)| {
+            node.owned_panes
+                .contains(&pane)
+                .then(|| self.token_for(*id).ok())
+                .flatten()
+        })
     }
 
     /// Panes this lease may name in a synchronized wait set. This includes the
@@ -2245,6 +2276,85 @@ mod tests {
             }),
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn composed_focus_follows_hierarchy_not_fragment_submission_order()
+    -> Result<(), LayoutLeaseError> {
+        fn tree(child_first: bool) -> Result<LayoutLeaseTree, LayoutLeaseError> {
+            let mut tree = LayoutLeaseTree::default();
+            tree.update_inventory(1, &[1, 2])?;
+            let root = tree.root_token();
+            let child = tree.grant_rest(root, &[2])?;
+            let root_fragment = LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(1, 1, 0.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: Some(LayoutChildSlot {
+                    z: 0.0,
+                    transform: transform(0.0, -1.0, 1.0, 2.0),
+                }),
+            };
+            let child_fragment = LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(2, 2, 0.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            };
+            if child_first {
+                tree.submit(child, 1, child_fragment, Some(2))?;
+                tree.submit(root, 1, root_fragment, Some(1))?;
+            } else {
+                tree.submit(root, 1, root_fragment, Some(1))?;
+                tree.submit(child, 1, child_fragment, Some(2))?;
+            }
+            Ok(tree)
+        }
+
+        assert_eq!(tree(false)?.compose()?.focus, Some(1));
+        assert_eq!(tree(true)?.compose()?.focus, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_fragment_reuse_preserves_child_focus() -> Result<(), LayoutLeaseError> {
+        let mut durable = LayoutLeaseTree::default();
+        durable.update_inventory(1, &[1])?;
+        let root = durable.root_token();
+        durable.submit(
+            root,
+            1,
+            LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(1, 1, 0.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            },
+            Some(1),
+        )?;
+        let mut candidate = durable.clone();
+        candidate.submit(
+            root,
+            1,
+            LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(1, 1, 1.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            },
+            None,
+        )?;
+        candidate.reuse_accepted_fragment_from(&durable, root)?;
+        assert_eq!(candidate.compose()?.focus, Some(1));
         Ok(())
     }
 }

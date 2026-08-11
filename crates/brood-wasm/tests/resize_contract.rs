@@ -1,7 +1,8 @@
 use brood_wasm::{
-    HostMessage, InteractionId, LayoutLeaseToken, PresentationMode, ResizeEpoch, ResolvedLayout,
-    ReusePaneContent, SubmitSynchronizedLayout, SynchronizedLayoutAccepted,
-    SynchronizedLayoutFragment, SynchronizedLayoutNotification,
+    FailLayoutRegion, HostMessage, InteractionId, LayoutLeaseToken, LayoutRegionNotification,
+    LayoutRegionResized, LayoutSize, PresentationMode, ResizeEpoch, ResolvedLayout,
+    ReuseLayoutRegion, ReusePaneContent, SubmitLayoutRegion, SubmitSynchronizedLayout,
+    SynchronizedLayoutAccepted, SynchronizedLayoutFragment, SynchronizedLayoutNotification,
 };
 use serde_json::{Value, json};
 
@@ -172,4 +173,82 @@ fn synchronized_layout_notification_is_typed_and_round_trips() {
         serde_json::from_value::<SynchronizedLayoutNotification>(encoded).ok(),
         Some(notification)
     );
+}
+
+fn test_resize_epoch() -> ResizeEpoch {
+    ResizeEpoch {
+        id: 61,
+        lease: 31,
+        lease_generation: 37,
+        base_layout_revision: 43,
+        target_layout_revision: 67,
+    }
+}
+
+#[test]
+fn delegated_region_message_carries_the_exact_parent_epoch_and_lease() {
+    let resized = LayoutRegionResized {
+        resize_epoch: test_resize_epoch(),
+        lease: LayoutLeaseToken {
+            id: 71,
+            generation: 73,
+        },
+        size: LayoutSize { w: 800, h: 600 },
+        scale: 1.5,
+    };
+    let message = LayoutRegionNotification::Resized(resized);
+    let encoded = serde_json::to_value(message).expect("region message encodes");
+    assert_eq!(encoded["type"], "layout-region-resized");
+    assert_eq!(encoded["resize_epoch"]["id"], 61);
+    assert_eq!(encoded["lease"], json!({"id": 71, "generation": 73}));
+    assert_eq!(encoded["size"], json!({"w": 800, "h": 600}));
+    assert_eq!(
+        serde_json::from_value::<LayoutRegionNotification>(encoded).ok(),
+        Some(message)
+    );
+}
+
+#[test]
+fn delegated_region_responses_are_flat_host_commands() {
+    let lease = LayoutLeaseToken {
+        id: 71,
+        generation: 73,
+    };
+    let fragment = SynchronizedLayoutFragment {
+        layout: ResolvedLayout::empty(),
+        rest: None,
+    };
+    let messages = [
+        HostMessage::SubmitLayoutRegion(SubmitLayoutRegion {
+            resize_epoch: test_resize_epoch(),
+            lease,
+            inventory_revision: 79,
+            fragment,
+            focus: None,
+        }),
+        HostMessage::ReuseLayoutRegion(ReuseLayoutRegion {
+            resize_epoch: test_resize_epoch(),
+            lease,
+        }),
+        HostMessage::FailLayoutRegion(FailLayoutRegion {
+            resize_epoch: test_resize_epoch(),
+            lease,
+            message: "bounded failure".to_string(),
+        }),
+    ];
+    let expected_types = [
+        "submit-layout-region",
+        "reuse-layout-region",
+        "fail-layout-region",
+    ];
+    for (message, expected_type) in messages.into_iter().zip(expected_types) {
+        let encoded = serde_json::to_value(&message).expect("region response encodes");
+        assert_eq!(encoded["type"], expected_type);
+        assert_eq!(encoded["resize_epoch"]["id"], 61);
+        assert_eq!(encoded["lease"]["generation"], 73);
+        assert_eq!(
+            serde_json::from_value::<HostMessage>(encoded).ok(),
+            Some(message)
+        );
+    }
 }

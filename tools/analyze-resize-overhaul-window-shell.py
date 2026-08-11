@@ -15,10 +15,10 @@ import sys
 from typing import Any
 
 
-if len(sys.argv) != 9:
+if len(sys.argv) != 10:
     raise SystemExit(
         "usage: analyze-resize-overhaul-window-shell.py "
-        "OUT WINDOW_MANIFEST SIDEBAR_MANIFEST EVENTS INPUT CLIENT_LOG SCALE OUTPUT_EXTENT"
+        "OUT WINDOW_MANIFEST SIDEBAR_MANIFEST EVENTS INPUT CLIENT_LOG GATE_EVENTS SCALE OUTPUT_EXTENT"
     )
 
 root = pathlib.Path(sys.argv[1])
@@ -27,8 +27,9 @@ sidebar_manifest = pathlib.Path(sys.argv[3])
 events_path = pathlib.Path(sys.argv[4])
 input_path = pathlib.Path(sys.argv[5])
 client_log_path = pathlib.Path(sys.argv[6])
-output_scale = float(sys.argv[7])
-output_width, output_height = map(int, sys.argv[8].split("x", 1))
+gate_events_path = pathlib.Path(sys.argv[7])
+output_scale = float(sys.argv[8])
+output_width, output_height = map(int, sys.argv[9].split("x", 1))
 
 window_records = [
     json.loads(line) for line in window_manifest.read_text().splitlines() if line
@@ -41,6 +42,9 @@ records = sorted(
 )
 events = [json.loads(line) for line in events_path.read_text().splitlines() if line]
 inputs = [json.loads(line) for line in input_path.read_text().splitlines() if line]
+gate_events = [
+    json.loads(line) for line in gate_events_path.read_text().splitlines() if line
+]
 client_lines = client_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 if len(window_records) != 11:
@@ -49,6 +53,41 @@ if len(sidebar_records) != 19:
     raise SystemExit(f"expected 19 sidebar captures, got {len(sidebar_records)}")
 if len(events) != 12:
     raise SystemExit(f"expected 12 synchronized root transactions, got {len(events)}")
+if len(gate_events) != 6:
+    raise SystemExit(f"expected three WindowSlow capture gate pairs, got {gate_events}")
+
+for capture, terminal in zip(gate_events[::2], gate_events[1::2]):
+    point_x, point_y = capture["point"]
+    pulse_x = capture["pulse_x"]
+    contains_points = all(
+        rect["x"] < x < rect["x"] + rect["width"]
+        and rect["y"] < point_y < rect["y"] + rect["height"]
+        for rect in (capture["current_pane_rect"], capture["intended_pane_rect"])
+        for x in (point_x, pulse_x)
+    )
+    if (
+        capture["epoch"] != terminal["epoch"]
+        or capture["accepted_log_line"] >= capture["held_log_line"]
+        or capture["accept_to_held_us"] < 0
+        or capture["held_to_pulse_us"] < 0
+        or pulse_x != point_x + 1
+        or not contains_points
+        or not (
+            capture["accepted_observed_ns"]
+            <= capture["held_observed_ns"]
+            < capture["grim_started_ns"]
+            < capture["pulse_ack_ns"]
+            < capture["grim_completed_ns"]
+        )
+        or not (
+            capture["held_log_line"]
+            < capture["gate_release_log_line"]
+            < terminal["ready_log_line"]
+            <= terminal["promoted_log_line"]
+        )
+        or terminal["ready_duration_us"] >= 250_000
+    ):
+        raise SystemExit(f"invalid WindowSlow capture gate order: {capture} {terminal}")
 
 
 def fields(text: str, prefix: str) -> dict[str, str]:
@@ -922,6 +961,15 @@ if [event["action"] for event in keyboard_inputs] != [
     raise SystemExit(f"unexpected real key sequence: {keyboard_inputs}")
 pointer_inputs = [event for event in inputs if event["kind"] == "virtual-pointer"]
 if [event["action"] for event in pointer_inputs] != [
+    "window-slow-gate-arm",
+    "window-slow-gate-pulse",
+    "window-slow-gate-release",
+    "window-slow-gate-arm",
+    "window-slow-gate-pulse",
+    "window-slow-gate-release",
+    "window-slow-gate-arm",
+    "window-slow-gate-pulse",
+    "window-slow-gate-release",
     "sidebar-divider-hover",
     "sidebar-divider-press",
     "sidebar-divider-motion",
@@ -1036,8 +1084,9 @@ result = {
         == 1,
         "root_chrome_content_every_frame": len(root_frame_content) == len(decoded),
         "synchronized_real_input": len(keyboard_inputs) == 5
-        and len(pointer_inputs) == 8
+        and len(pointer_inputs) == 17
         and max(input_durations) < 5_000,
+        "projected_capture_gate_ordered": len(gate_events) == 6,
         "client_survived": True,
     },
 }

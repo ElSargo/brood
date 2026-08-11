@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::resolved_layout::{LayoutChildSlot, LayoutLeaseToken, ResolvedLayout};
+use crate::resolved_layout::{LayoutChildSlot, LayoutLeaseToken, LayoutSize, ResolvedLayout};
 
 /// Stable identity for one captured pointer interaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -80,6 +80,74 @@ pub struct SubmitSynchronizedLayout {
 pub struct ReusePaneContent {
     pub pane: u64,
     pub resize_epoch: u64,
+}
+
+/// One host-issued change to a delegated layout lease viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LayoutRegionResized {
+    pub resize_epoch: ResizeEpoch,
+    pub lease: LayoutLeaseToken,
+    pub size: LayoutSize,
+    pub scale: f32,
+}
+
+/// Typed host-to-layout-actor notification for delegated region work.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum LayoutRegionNotification {
+    #[serde(rename = "layout-region-resized")]
+    Resized(LayoutRegionResized),
+}
+
+/// A child layout actor's new fragment for a host-issued region resize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubmitLayoutRegion {
+    pub resize_epoch: ResizeEpoch,
+    pub lease: LayoutLeaseToken,
+    pub inventory_revision: u64,
+    pub fragment: SynchronizedLayoutFragment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<u64>,
+}
+
+/// Explicitly retain the durable child fragment for one resize epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReuseLayoutRegion {
+    pub resize_epoch: ResizeEpoch,
+    pub lease: LayoutLeaseToken,
+}
+
+/// Report that a child cannot calculate a fragment for one resize epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailLayoutRegion {
+    pub resize_epoch: ResizeEpoch,
+    pub lease: LayoutLeaseToken,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LayoutRegionRejectionReason {
+    StaleEpoch,
+    StaleLease,
+    StaleActor,
+    UnexpectedResponse,
+    StaleInventoryRevision,
+    InvalidFragment,
+    LimitExceeded,
+}
+
+/// A bounded host reply for one rejected region response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum LayoutRegionResponseNotification {
+    #[serde(rename = "layout-region-response-rejected")]
+    Rejected {
+        resize_epoch: ResizeEpoch,
+        lease: LayoutLeaseToken,
+        reason: LayoutRegionRejectionReason,
+        message: String,
+    },
 }
 
 /// Stable rejection classes which actors can handle without parsing prose.

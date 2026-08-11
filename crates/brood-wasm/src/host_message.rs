@@ -82,4 +82,7 @@ pub enum HostMessage {
     },
     SubmitSynchronizedLayout(crate::resize::SubmitSynchronizedLayout),
     ReusePaneContent(crate::resize::ReusePaneContent),
+    SubmitLayoutRegion(crate::resize::SubmitLayoutRegion),
+    ReuseLayoutRegion(crate::resize::ReuseLayoutRegion),
+    FailLayoutRegion(crate::resize::FailLayoutRegion),
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # This is the recursive/root-layout continuation of test-resize-overhaul-nested.sh.
 # The parent proof owns the headless compositor and the deterministic proof
@@ -9,6 +9,29 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+check_gated_capture_release_structure() {
+  local actual expected
+  actual="$(awk '
+    /^capture_window_gated\(\)/ { in_function = 1 }
+    in_function && /^  wait "\$CAPTURE_PID"$/ { in_window = 1 }
+    in_window { print }
+    in_window && /^  release_window_capture_gate "\$epoch"$/ { exit }
+  ' "${BASH_SOURCE[0]}")"
+  expected='  wait "$CAPTURE_PID"
+  grim_completed_ns="$(date +%s%N)"
+  release_window_capture_gate "$epoch"'
+  if [[ "$actual" != "$expected" ]]; then
+    echo "ERR gated capture must release immediately after grim completion" >&2
+    printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+    return 1
+  fi
+}
+
+check_gated_capture_release_structure
+if [[ "${1:-}" == --check-window-gate-structure ]]; then
+  exit 0
+fi
 
 for tool in cargo cc grim jq magick pkg-config python3 rg sha256sum swaymsg; do
   if ! command -v "$tool" > /dev/null 2>&1; then
@@ -39,6 +62,7 @@ PROOF="$OUT/proof.json"
 ANALYSIS_LOG="$OUT/analysis-errors.log"
 STARTUP_READINESS="$OUT/startup-readiness.json"
 OVERLAY_METRICS="$OUT/overlay-pane-metrics.json"
+WINDOW_GATE_EVENTS="$OUT/window-gate-events.jsonl"
 OVERLAY_FRAMES="$OUT/overlay-frames"
 KEYBINDINGS_PATH="$OUT/keybindings.json"
 DATA_HOME="$OUT/data"
@@ -49,15 +73,22 @@ mkdir -p "$PACKAGE" "$WINDOW_FRAMES" "$SIDEBAR_FRAMES" "$OVERLAY_FRAMES" "$DATA_
 : > "$SIDEBAR_MANIFEST"
 : > "$EVENTS"
 : > "$ANALYSIS_LOG"
+: > "$WINDOW_GATE_EVENTS"
 
 CLIENT_PID=""
 POINTER_PID=""
+CAPTURE_PID=""
+WINDOW_CAPTURE_GATE_ACTIVE=false
 cleanup() {
   local result=$?
   set +e
   if [[ -n "$POINTER_PID" ]] && kill -0 "$POINTER_PID" 2> /dev/null; then
     kill "$POINTER_PID" > /dev/null 2>&1 || true
     wait "$POINTER_PID" > /dev/null 2>&1 || true
+  fi
+  if [[ -n "$CAPTURE_PID" ]] && kill -0 "$CAPTURE_PID" 2> /dev/null; then
+    kill "$CAPTURE_PID" > /dev/null 2>&1 || true
+    wait "$CAPTURE_PID" > /dev/null 2>&1 || true
   fi
   if [[ -n "$CLIENT_PID" ]] && kill -0 "$CLIENT_PID" 2> /dev/null; then
     kill "$CLIENT_PID" > /dev/null 2>&1 || true
@@ -88,7 +119,23 @@ cleanup() {
   fi
   return "$result"
 }
-trap 'echo "ERR command=$BASH_COMMAND line=$LINENO" >&2' ERR
+report_shell_error() {
+  local status="$1"
+  local command="$2"
+  local line="$3"
+  local functions="$4"
+  local bash_lines="$5"
+  local pipeline_statuses="$6"
+  local record="ERR command=$command line=$line status=$status"
+  record+=" functions=[$functions] bash_lines=[$bash_lines]"
+  record+=" pipeline=[$pipeline_statuses]"
+  printf '%s\n' "$record" >&2
+  if [[ -n "${ANALYSIS_LOG:-}" ]]; then
+    printf '%s\n' "$record" >> "$ANALYSIS_LOG"
+  fi
+  return "$status"
+}
+trap 'report_shell_error "$?" "$BASH_COMMAND" "$LINENO" "${FUNCNAME[*]}" "${BASH_LINENO[*]}" "${PIPESTATUS[*]}"' ERR
 trap cleanup EXIT
 
 wayland_env() {
@@ -772,6 +819,176 @@ send_root_pointer() {
     "$INPUT_DURATION_MS" "$INPUT_LOG_CURSOR" "$ack"
 }
 
+exchange_root_pointer() {
+  local command="$1"
+  local ack
+  printf '%s\n' "$command" >&"$POINTER_WRITE_FD"
+  IFS= read -r -t 5 -u "$POINTER_READ_FD" ack
+  [[ "$ack" == ack*"action=${command%% *}"* ]]
+  printf '%s' "$ack"
+}
+
+prepare_window_capture_gate_geometry() {
+  local intended_width="$1"
+  local intended_height="$2"
+  local fullscreen="$3"
+  local rect geometry_line
+  local -a geometry
+  rect="$(window_rect_json)"
+  geometry_line="$(rg "accepted synchronized layout .*target_rects=\\[.*${SLOW_PANE}:" "$CLIENT_LOG" | tail -1)"
+  [[ -n "$geometry_line" ]]
+  mapfile -t geometry < <(python3 tools/resize-window-gate-geometry.py \
+    "$rect" "$geometry_line" "$SLOW_PANE" "$OUTPUT_SCALE" \
+    "$intended_width" "$intended_height" "$fullscreen")
+  read -r WINDOW_GATE_POINT_X WINDOW_GATE_POINT_Y WINDOW_GATE_PULSE_X <<< "${geometry[0]}"
+  WINDOW_GATE_CURRENT_PANE_RECT="${geometry[1]}"
+  WINDOW_GATE_INTENDED_PANE_RECT="${geometry[2]}"
+  WINDOW_GATE_CAPTURE_RECT="${geometry[3]}"
+}
+
+wait_window_gate_diagnostic() {
+  local after_line="$1"
+  local kind="$2"
+  local epoch="$3"
+  local result=""
+  for _ in $(seq 1 400); do
+    result="$(sed -n "$((after_line + 1)),\$p" "$CLIENT_LOG" \
+      | rg -m1 "\\\"kind\\\":\\\"${kind}\\\".*\\\"epoch\\\":${epoch}([,}])" || true)"
+    if [[ -n "$result" ]]; then
+      WINDOW_GATE_DIAGNOSTIC_LINE="$(rg -n -F "$result" "$CLIENT_LOG" | tail -1 | cut -d: -f1)"
+      WINDOW_GATE_DIAGNOSTIC_TEXT="$result"
+      return 0
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || return 1
+    sleep 0.01
+  done
+  echo "ERR timed out waiting for WindowSlow gate diagnostic kind=$kind epoch=$epoch" >&2
+  return 1
+}
+
+capture_window_gated() {
+  local label="$1"
+  local trace_kind="$2"
+  local trace_line="$3"
+  local trace_text="$4"
+  local input_index="$5"
+  local epoch="$6"
+  local held_line="$7"
+  local accepted_line="$8"
+  local accepted_observed_ns="$9"
+  local held_observed_ns="${10}"
+  local frame path rect x y width height
+  local pulse_cursor pulse_ack started_ns ended_ns grim_started_ns grim_completed_ns
+  local client_after_pulse
+  rect="$WINDOW_GATE_CAPTURE_RECT"
+  [[ -n "$rect" && "$rect" != null ]]
+  read -r x y width height < <(jq -r '[.x,.y,.width,.height] | @tsv' <<< "$rect")
+  printf -v frame '%03d' "$WINDOW_FRAME_INDEX"
+  path="window-frames/frame-${frame}-${label}.png"
+
+  wayland_env grim -l 0 -g "${x},${y} ${width}x${height}" "$OUT/$path" &
+  CAPTURE_PID=$!
+  grim_started_ns="$(date +%s%N)"
+  kill -0 "$CAPTURE_PID" 2> /dev/null
+
+  INPUT_INDEX=$((INPUT_INDEX + 1))
+  pulse_cursor="$(wc -l < "$CLIENT_LOG")"
+  started_ns="$(date +%s%N)"
+  pulse_ack="$(exchange_root_pointer "motion $WINDOW_GATE_PULSE_X $WINDOW_GATE_POINT_Y")"
+  ended_ns="$(date +%s%N)"
+  INPUT_DURATION_MS=$(((ended_ns - started_ns) / 1000000))
+  record_input virtual-pointer window-slow-gate-pulse \
+    "motion $WINDOW_GATE_PULSE_X $WINDOW_GATE_POINT_Y" "$INPUT_DURATION_MS" "$pulse_cursor" "$pulse_ack"
+
+  wait "$CAPTURE_PID"
+  grim_completed_ns="$(date +%s%N)"
+  release_window_capture_gate "$epoch"
+  CAPTURE_PID=""
+  [[ -s "$OUT/$path" ]]
+  client_after_pulse="$(wc -l < "$CLIENT_LOG")"
+  if sed -n "$((pulse_cursor + 1)),${client_after_pulse}p" "$CLIENT_LOG" \
+    | rg -q 'accepted synchronized layout |resize-proof-window-gate-replaced'; then
+    echo "ERR WindowSlow capture pulse changed synchronization or replaced the held target" >&2
+    return 1
+  fi
+  if sed -n "$((held_line + 1)),${client_after_pulse}p" "$CLIENT_LOG" \
+    | rg -q "synchronized layout ready .* epoch=${epoch} .*degraded=true"; then
+    echo "ERR WindowSlow capture pulse missed the synchronized deadline epoch=$epoch" >&2
+    return 1
+  fi
+  record_capture "$WINDOW_MANIFEST" window "$label" "$path" \
+    "$trace_kind" "$trace_line" "$trace_text" "$input_index" "$rect"
+  WINDOW_FRAME_INDEX=$((WINDOW_FRAME_INDEX + 1))
+
+  jq -cn \
+    --argjson epoch "$epoch" \
+    --argjson accepted_log_line "$accepted_line" \
+    --argjson held_log_line "$held_line" \
+    --argjson accepted_observed_ns "$accepted_observed_ns" \
+    --argjson held_observed_ns "$held_observed_ns" \
+    --argjson accept_to_held_us "$(((held_observed_ns - accepted_observed_ns) / 1000))" \
+    --argjson held_to_pulse_us "$(((ended_ns - held_observed_ns) / 1000))" \
+    --argjson grim_started_ns "$grim_started_ns" \
+    --argjson pulse_ack_ns "$ended_ns" \
+    --argjson grim_completed_ns "$grim_completed_ns" \
+    --argjson gate_release_log_line "$WINDOW_GATE_DIAGNOSTIC_LINE" \
+    --argjson current_pane_rect "$WINDOW_GATE_CURRENT_PANE_RECT" \
+    --argjson intended_pane_rect "$WINDOW_GATE_INTENDED_PANE_RECT" \
+    --argjson point_x "$WINDOW_GATE_POINT_X" \
+    --argjson point_y "$WINDOW_GATE_POINT_Y" \
+    --argjson pulse_x "$WINDOW_GATE_PULSE_X" \
+    '{epoch:$epoch,accepted_log_line:$accepted_log_line,held_log_line:$held_log_line,
+      accepted_observed_ns:$accepted_observed_ns,held_observed_ns:$held_observed_ns,
+      accept_to_held_us:$accept_to_held_us,held_to_pulse_us:$held_to_pulse_us,
+      grim_started_ns:$grim_started_ns,
+      pulse_ack_ns:$pulse_ack_ns,grim_completed_ns:$grim_completed_ns,
+      gate_release_log_line:$gate_release_log_line,current_pane_rect:$current_pane_rect,
+      intended_pane_rect:$intended_pane_rect,point:[$point_x,$point_y],pulse_x:$pulse_x}' \
+    >> "$WINDOW_GATE_EVENTS"
+}
+
+arm_window_capture_gate() {
+  local intended_width="$1"
+  local intended_height="$2"
+  local fullscreen="$3"
+  local cursor started_ns ended_ns motion_ack press_ack release_ack
+  prepare_window_capture_gate_geometry "$intended_width" "$intended_height" "$fullscreen"
+  cursor="$(wc -l < "$CLIENT_LOG")"
+  INPUT_INDEX=$((INPUT_INDEX + 1))
+  INPUT_LOG_CURSOR="$cursor"
+  started_ns="$(date +%s%N)"
+  start_root_pointer_sequence
+  motion_ack="$(exchange_root_pointer "motion $WINDOW_GATE_POINT_X $WINDOW_GATE_POINT_Y")"
+  press_ack="$(exchange_root_pointer press-right)"
+  release_ack="$(exchange_root_pointer release-right)"
+  ended_ns="$(date +%s%N)"
+  INPUT_DURATION_MS=$(((ended_ns - started_ns) / 1000000))
+  record_input virtual-pointer window-slow-gate-arm \
+    "motion $WINDOW_GATE_POINT_X $WINDOW_GATE_POINT_Y; right-button-click" \
+    "$INPUT_DURATION_MS" "$INPUT_LOG_CURSOR" \
+    "$motion_ack | $press_ack | $release_ack"
+  wait_window_gate_diagnostic "$cursor" resize-proof-window-gate-armed 0
+  WINDOW_CAPTURE_GATE_ACTIVE=true
+}
+
+release_window_capture_gate() {
+  local epoch="$1"
+  local cursor started_ns ended_ns press_ack release_ack
+  cursor="$(wc -l < "$CLIENT_LOG")"
+  INPUT_INDEX=$((INPUT_INDEX + 1))
+  INPUT_LOG_CURSOR="$cursor"
+  started_ns="$(date +%s%N)"
+  press_ack="$(exchange_root_pointer press)"
+  release_ack="$(exchange_root_pointer release)"
+  ended_ns="$(date +%s%N)"
+  INPUT_DURATION_MS=$(((ended_ns - started_ns) / 1000000))
+  record_input virtual-pointer window-slow-gate-release left-button-click \
+    "$INPUT_DURATION_MS" "$INPUT_LOG_CURSOR" "$press_ack | $release_ack"
+  wait_window_gate_diagnostic "$cursor" resize-proof-window-gate-released "$epoch"
+  stop_root_pointer_sequence
+  WINDOW_CAPTURE_GATE_ACTIVE=false
+}
+
 stop_root_pointer_sequence() {
   printf 'quit\n' >&"$POINTER_WRITE_FD"
   local completion
@@ -807,6 +1024,7 @@ append_transaction_event() {
   local projected_text="$4"
   local promoted_line="$5"
   local promoted_text="$6"
+  local input_index="${7:-$INPUT_INDEX}"
   local native_settle_line=0
   if [[ "$lane" == window ]]; then
     native_settle_line="$NATIVE_SETTLE_LINE"
@@ -814,7 +1032,7 @@ append_transaction_event() {
   jq -cn \
     --arg lane "$lane" \
     --arg action "$action" \
-    --argjson input_index "$INPUT_INDEX" \
+    --argjson input_index "$input_index" \
     --argjson diagnostic_line "$DIAGNOSTIC_LINE" \
     --argjson diagnostic "$DIAGNOSTIC_JSON" \
     --argjson accepted_line "$ACCEPTED_LINE" \
@@ -835,6 +1053,16 @@ append_transaction_event() {
     >> "$EVENTS"
 }
 
+assert_transaction_event_join() {
+  local input_index="$1"
+  local promoted_line="$2"
+  jq -es --argjson input_index "$input_index" --argjson promoted_line "$promoted_line" '
+    any(.[];
+      .input_index == $input_index
+      and .promoted.log_line == $promoted_line)
+  ' "$EVENTS" > /dev/null
+}
+
 complete_native_transaction() {
   local action="$1"
   local after_line="$2"
@@ -844,8 +1072,12 @@ complete_native_transaction() {
   local record_transaction="${6:-true}"
   local projected_line projected_text promoted_line promoted_text
   local common_promoted_line common_promoted_text
+  local transaction_input_index="$INPUT_INDEX"
+  local gated_transaction="$WINDOW_CAPTURE_GATE_ACTIVE"
+  local accepted_observed_ns held_observed_ns
 
   wait_session_request "$after_line" nonzero native
+  accepted_observed_ns="$(date +%s%N)"
   assert_diagnostic_matches_acceptance
   NATIVE_SETTLE_LINE="$(awk \
     -v start="$after_line" \
@@ -864,20 +1096,56 @@ complete_native_transaction() {
   projected_line="$RESIZE_TRACE_LINE"
   projected_text="$RESIZE_TRACE_TEXT"
   if [[ "$record_transaction" == true ]]; then
-    capture_window "${capture_prefix}-root-projected" resize-present \
-      "$projected_line" "$projected_text" "$INPUT_INDEX"
+    if [[ "$WINDOW_CAPTURE_GATE_ACTIVE" == true ]]; then
+      wait_window_gate_diagnostic "$after_line" resize-proof-window-gate-held \
+        "$ACCEPTED_EPOCH"
+      held_observed_ns="$(date +%s%N)"
+      capture_window_gated "${capture_prefix}-root-projected" resize-present \
+        "$projected_line" "$projected_text" "$transaction_input_index" \
+        "$ACCEPTED_EPOCH" "$WINDOW_GATE_DIAGNOSTIC_LINE" "$ACCEPTED_LINE" \
+        "$accepted_observed_ns" "$held_observed_ns"
+    else
+      capture_window "${capture_prefix}-root-projected" resize-present \
+        "$projected_line" "$projected_text" "$transaction_input_index"
+    fi
   fi
   wait_window_trace 'promoted' "$expected_width" "$expected_height" "$projected_line"
   promoted_line="$WINDOW_TRACE_LINE"
   promoted_text="$WINDOW_TRACE_TEXT"
   if [[ "$record_transaction" == true ]]; then
     capture_window "${capture_prefix}-promoted" window-resize-present \
-      "$promoted_line" "$promoted_text" "$INPUT_INDEX"
+      "$promoted_line" "$promoted_text" "$transaction_input_index"
   fi
   wait_resize_trace "$ACCEPTED_EVENT_SEQUENCE" "$ACCEPTED_EPOCH" promoted "$projected_line"
   common_promoted_line="$RESIZE_TRACE_LINE"
   common_promoted_text="$RESIZE_TRACE_TEXT"
   wait_session_completed "$ACCEPTED_REQUEST" "$common_promoted_line"
+  if [[ "$gated_transaction" == true ]]; then
+    local ready_line ready_text ready_duration_us release_line
+    ready_line="$(awk -v start="$projected_line" -v stop="$common_promoted_line" \
+      -v epoch="$ACCEPTED_EPOCH" '
+        NR > start && NR <= stop &&
+          index($0, "synchronized layout ready ") != 0 &&
+          index($0, " epoch=" epoch " ") != 0 { print NR; exit }
+      ' "$CLIENT_LOG")"
+    [[ -n "$ready_line" ]]
+    ready_text="$(sed -n "${ready_line}p" "$CLIENT_LOG")"
+    ready_duration_us="$(sed -n 's/.* duration_us=\([0-9][0-9]*\).*/\1/p' <<< "$ready_text")"
+    release_line="$(tail -1 "$WINDOW_GATE_EVENTS" | jq -r '.gate_release_log_line')"
+    if ! ((release_line < ready_line && ready_line <= common_promoted_line \
+        && ready_duration_us < 250000)); then
+      echo "ERR WindowSlow gate order/deadline invalid epoch=$ACCEPTED_EPOCH release=$release_line ready=$ready_line promoted=$common_promoted_line duration_us=$ready_duration_us" >&2
+      return 1
+    fi
+    jq -cn \
+      --argjson epoch "$ACCEPTED_EPOCH" \
+      --argjson ready_log_line "$ready_line" \
+      --argjson promoted_log_line "$common_promoted_line" \
+      --argjson ready_duration_us "$ready_duration_us" \
+      '{epoch:$epoch,ready_log_line:$ready_log_line,
+        promoted_log_line:$promoted_log_line,ready_duration_us:$ready_duration_us}' \
+      >> "$WINDOW_GATE_EVENTS"
+  fi
   if ((TERMINAL_LINE >= promoted_line)); then
     echo "ERR native post-present ordering is not common-promoted < completed < window-promoted" >&2
     echo "common_promoted=$common_promoted_line completed=$TERMINAL_LINE window_promoted=$promoted_line" >&2
@@ -886,7 +1154,8 @@ complete_native_transaction() {
   assert_no_ordinary_layout_between "$NATIVE_SETTLE_LINE" "$TERMINAL_LINE"
   if [[ "$record_transaction" == true ]]; then
     append_transaction_event window "$action" \
-      "$projected_line" "$projected_text" "$common_promoted_line" "$common_promoted_text"
+      "$projected_line" "$projected_text" "$common_promoted_line" "$common_promoted_text" \
+      "$transaction_input_index"
   fi
 }
 
@@ -897,6 +1166,7 @@ run_single_native_resize() {
   local capture_prefix="$4"
   local expected_width expected_height live_line live_text
   read -r expected_width expected_height < <(physical_extent "$logical_width" "$logical_height")
+  arm_window_capture_gate "$expected_width" "$expected_height" false
   send_sway_command "$action" \
     "[pid=$CLIENT_PID] resize set $logical_width $logical_height"
   wait_window_trace projected "$expected_width" "$expected_height" "$INPUT_LOG_CURSOR"
@@ -995,6 +1265,8 @@ run_single_native_resize floating-baseline 816 480 window-baseline
 NATIVE_BURST_START_LINE="$(wc -l < "$CLIENT_LOG")"
 NATIVE_LIVE_INDEX=0
 NATIVE_BURST_SEND_TIMES_MS=()
+read -r GATE_TARGET_WIDTH GATE_TARGET_HEIGHT < <(physical_extent 760 456)
+arm_window_capture_gate "$GATE_TARGET_WIDTH" "$GATE_TARGET_HEIGHT" false
 for logical_extent in '776 448' '856 496' '760 456'; do
   read -r logical_width logical_height <<< "$logical_extent"
   NATIVE_LIVE_INDEX=$((NATIVE_LIVE_INDEX + 1))
@@ -1054,16 +1326,21 @@ fi
 # Return to the full output before exercising root-owned sidebars.  Fullscreen
 # is itself a native configure and therefore goes through the same final root
 # synchronization path.
+arm_window_capture_gate "$MODE_WIDTH" "$MODE_HEIGHT" true
 send_sway_command fullscreen-enable "[pid=$CLIENT_PID] fullscreen enable"
+FULLSCREEN_TRANSACTION_INPUT_INDEX="$INPUT_INDEX"
 FULLSCREEN_CURSOR="$INPUT_LOG_CURSOR"
 wait_window_trace projected "$MODE_WIDTH" "$MODE_HEIGHT" "$FULLSCREEN_CURSOR"
 capture_window window-restore-live-projected window-resize-present \
-  "$WINDOW_TRACE_LINE" "$WINDOW_TRACE_TEXT" "$INPUT_INDEX"
+  "$WINDOW_TRACE_LINE" "$WINDOW_TRACE_TEXT" "$FULLSCREEN_TRANSACTION_INPUT_INDEX"
 complete_native_transaction fullscreen-restore "$FULLSCREEN_CURSOR" \
   "$MODE_WIDTH" "$MODE_HEIGHT" window-restore
 
 # The restored promoted frame is also the stable initial shell composition.
-capture_sidebar sidebar-initial "$RESIZE_TRACE_LINE" "$RESIZE_TRACE_TEXT" "$INPUT_INDEX"
+assert_transaction_event_join \
+  "$FULLSCREEN_TRANSACTION_INPUT_INDEX" "$RESIZE_TRACE_LINE"
+capture_sidebar sidebar-initial "$RESIZE_TRACE_LINE" "$RESIZE_TRACE_TEXT" \
+  "$FULLSCREEN_TRANSACTION_INPUT_INDEX"
 
 run_sidebar_transition() {
   local action="$1"
@@ -1188,6 +1465,7 @@ if ! python3 tools/analyze-resize-overhaul-window-shell.py \
   "$EVENTS" \
   "$INPUT_LOG" \
   "$CLIENT_LOG" \
+  "$WINDOW_GATE_EVENTS" \
   "$OUTPUT_SCALE" \
   "${MODE_WIDTH}x${MODE_HEIGHT}" \
   > "$METRICS" 2>> "$ANALYSIS_LOG"; then
@@ -1394,6 +1672,7 @@ jq -n \
       sidebar_frame_manifest:"sidebar-frame-manifest.jsonl",
       resize_events:"resize-events.jsonl",
       input:"input.jsonl",
+      window_gate_events:"window-gate-events.jsonl",
       metrics:"metrics.json",
       client_log:"client.log",
       startup_readiness:"startup-readiness.json",

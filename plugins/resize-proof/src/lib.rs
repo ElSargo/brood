@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{collections::BTreeMap, sync::Mutex};
 
 use brood_graphics::{Color, Command, Packet, Rect};
 use brood_plugin_sdk::{
@@ -11,6 +11,7 @@ use brood_plugin_sdk::{
     graphics::{submit_packet, submit_tagged_packet},
     runtime::sleep,
 };
+use serde::Deserialize;
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const FAST_ACTOR_ID: &str = "resize-proof-fast";
@@ -19,6 +20,8 @@ const SLOW_ACTOR_ID: &str = "resize-proof-slow";
 const WINDOW_SLOW_ACTOR_ID: &str = "resize-proof-window-slow";
 const STALL_ACTOR_ID: &str = "resize-proof-stall";
 const STALL_AFTER_FIRST_ACTOR_ID: &str = "resize-proof-stall-after-first";
+const MIDDLE_LAYOUT_ACTOR_ID: &str = "workspace";
+const LEAF_LAYOUT_ACTOR_ID: &str = "resize-proof-leaf-layout";
 const COMPONENT_FILE: &str = "brood_resize_proof_plugin.component.wasm";
 const DELAY_MS: u64 = 120;
 // Window screenshots need a longer observable projected interval, but this
@@ -30,7 +33,11 @@ const RECOVERY_DELAY_MS: u64 = 500;
 const DELAY_PAYLOAD: &[u8] = b"resize-proof-delay-v1";
 const WINDOW_DELAY_PAYLOAD: &[u8] = b"resize-proof-window-delay-v1";
 const RECOVERY_PAYLOAD: &[u8] = b"resize-proof-recovery-v1";
+const MIDDLE_REGION_DELAY_PAYLOAD: &[u8] = b"resize-proof-middle-region-v1";
+const LEAF_REGION_DELAY_PAYLOAD: &[u8] = b"resize-proof-leaf-region-v1";
 const RECOVERY_WORKER: u64 = 1;
+const LEFT_POINTER_BUTTON: u32 = 0x110;
+const RIGHT_POINTER_BUTTON: u32 = 0x111;
 const INITIAL_BACKGROUND: Color = Color::rgba(0.04, 0.08, 0.18, 1.0);
 const RECOVERY_BACKGROUND: Color = Color::rgba(0.08, 0.36, 0.16, 1.0);
 const BIT_ZERO: Color = Color::rgba(0.02, 0.02, 0.025, 1.0);
@@ -47,11 +54,17 @@ enum ProofMode {
     WindowSlow,
     StallOnce,
     StallAfterFirst,
+    MiddleLayout,
+    LeafLayout,
 }
 
 impl ProofMode {
     fn for_instance(instance_id: &str) -> Self {
-        if instance_id.ends_with("-gated-fast") {
+        if instance_id == MIDDLE_LAYOUT_ACTOR_ID {
+            Self::MiddleLayout
+        } else if instance_id == LEAF_LAYOUT_ACTOR_ID {
+            Self::LeafLayout
+        } else if instance_id.ends_with("-gated-fast") {
             Self::GatedFast
         } else if instance_id.ends_with("-window-slow") {
             Self::WindowSlow
@@ -73,6 +86,8 @@ impl ProofMode {
             Self::WindowSlow => "slow",
             Self::StallOnce => "stall-once",
             Self::StallAfterFirst => "stall-after-first",
+            Self::MiddleLayout => "middle-layout",
+            Self::LeafLayout => "leaf-layout",
         }
     }
 
@@ -84,6 +99,8 @@ impl ProofMode {
             Self::WindowSlow => WINDOW_SLOW_ACTOR_ID,
             Self::StallOnce => STALL_ACTOR_ID,
             Self::StallAfterFirst => STALL_AFTER_FIRST_ACTOR_ID,
+            Self::MiddleLayout => MIDDLE_LAYOUT_ACTOR_ID,
+            Self::LeafLayout => LEAF_LAYOUT_ACTOR_ID,
         }
     }
 
@@ -92,6 +109,8 @@ impl ProofMode {
             Self::Fast | Self::GatedFast => FAST_MARKER,
             Self::Slow | Self::WindowSlow => SLOW_MARKER,
             Self::StallOnce | Self::StallAfterFirst => STALL_MARKER,
+            Self::MiddleLayout => FAST_MARKER,
+            Self::LeafLayout => SLOW_MARKER,
         }
     }
 
@@ -100,7 +119,7 @@ impl ProofMode {
     }
 
     const fn gates_untagged_recovery(self) -> bool {
-        matches!(self, Self::GatedFast)
+        matches!(self, Self::GatedFast | Self::MiddleLayout | Self::LeafLayout)
     }
 }
 
@@ -119,6 +138,70 @@ struct UntaggedTarget {
     width: f32,
     height: f32,
     scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+struct ProofLayoutLease {
+    id: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+struct ProofLayoutSize {
+    w: i32,
+    #[serde(alias = "height")]
+    h: i32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+struct ProofResizeEpoch {
+    id: u64,
+    lease: u64,
+    lease_generation: u64,
+    base_layout_revision: u64,
+    target_layout_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProofLayoutMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    presented_layout_revision: u64,
+    lease: ProofLayoutLease,
+    #[serde(default)]
+    waitable_panes: Vec<u64>,
+    #[serde(default)]
+    size: ProofLayoutSize,
+    #[serde(default)]
+    rest: bool,
+    #[serde(default)]
+    resize_epoch: Option<ProofResizeEpoch>,
+    #[serde(default)]
+    scale: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ProofLayoutContext {
+    revision: u64,
+    presented_layout_revision: u64,
+    lease: ProofLayoutLease,
+    panes: Vec<u64>,
+    size: ProofLayoutSize,
+    rest: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingLayoutRegion {
+    epoch: ProofResizeEpoch,
+    lease: ProofLayoutLease,
+    size: ProofLayoutSize,
+    scale: f32,
+    revision: u64,
+    pane: u64,
+    has_rest: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +295,78 @@ impl DelayScheduler {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowGateOffer {
+    NotArmed,
+    Held,
+    Replaced { cancelled: PaintTarget },
+    Stale { held: PaintTarget },
+}
+
+#[derive(Debug)]
+struct WindowCaptureGate {
+    armed: bool,
+    held: Option<PaintTarget>,
+    pending_release: Option<PaintTarget>,
+}
+
+impl WindowCaptureGate {
+    const fn new() -> Self {
+        Self {
+            armed: false,
+            held: None,
+            pending_release: None,
+        }
+    }
+
+    fn arm(&mut self) -> bool {
+        if self.armed || self.held.is_some() {
+            return false;
+        }
+        self.armed = true;
+        true
+    }
+
+    fn offer(&mut self, target: PaintTarget) -> WindowGateOffer {
+        if let Some(pending) = self.pending_release {
+            if target.epoch <= pending.epoch {
+                return WindowGateOffer::Stale { held: pending };
+            }
+            self.pending_release = None;
+        }
+        if self.armed {
+            self.armed = false;
+            self.held = Some(target);
+            return WindowGateOffer::Held;
+        }
+        let Some(held) = self.held else {
+            return WindowGateOffer::NotArmed;
+        };
+        if target.epoch < held.epoch {
+            return WindowGateOffer::Stale { held };
+        }
+        self.held = Some(target);
+        WindowGateOffer::Replaced { cancelled: held }
+    }
+
+    fn release(&mut self) -> Option<PaintTarget> {
+        let target = self.held.take()?;
+        self.pending_release = Some(target);
+        Some(target)
+    }
+
+    fn take_pending_release(&mut self, epoch: u64) -> Option<PaintTarget> {
+        if self
+            .pending_release
+            .is_some_and(|target| target.epoch == epoch)
+        {
+            self.pending_release.take()
+        } else {
+            None
+        }
+    }
+}
+
 struct ProofState {
     mode: ProofMode,
     pane: u64,
@@ -219,6 +374,7 @@ struct ProofState {
     height: f32,
     scale: f32,
     delay: DelayScheduler,
+    window_capture_gate: WindowCaptureGate,
     stalled: Option<PaintTarget>,
     recovery_observed: bool,
     recovery_pending: Option<UntaggedTarget>,
@@ -228,6 +384,11 @@ struct ProofState {
     first_tagged_submitted: bool,
     last_submitted: Option<PaintTarget>,
     error: Option<String>,
+    layout: Option<ProofLayoutContext>,
+    layout_region_count: u64,
+    region_proof_armed: bool,
+    region_proof_arm_count: u64,
+    pending_layout_regions: BTreeMap<u64, PendingLayoutRegion>,
 }
 
 impl ProofState {
@@ -239,6 +400,7 @@ impl ProofState {
             height: 1.0,
             scale: 1.0,
             delay: DelayScheduler::new(),
+            window_capture_gate: WindowCaptureGate::new(),
             stalled: None,
             recovery_observed: false,
             recovery_pending: None,
@@ -248,6 +410,11 @@ impl ProofState {
             first_tagged_submitted: false,
             last_submitted: None,
             error: None,
+            layout: None,
+            layout_region_count: 0,
+            region_proof_armed: false,
+            region_proof_arm_count: 0,
+            pending_layout_regions: BTreeMap::new(),
         }
     }
 
@@ -324,12 +491,27 @@ impl Guest for ResizeProof {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
             Event::Presentation(event) => handle_presentation(event),
+            Event::Mailbox(message) if message.sender == "layout-host" => {
+                handle_layout_mailbox(&message.body)
+            }
+            Event::Mailbox(message) if message.sender == LEAF_LAYOUT_ACTOR_ID => {
+                handle_region_proof_control(&message.body)
+            }
+            Event::Mailbox(message) if message.sender == WINDOW_SLOW_ACTOR_ID => {
+                handle_window_gate_control(&message.body)
+            }
             Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
         }
     }
 
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        if let Some(delay_ms) = region_delay_ms(&payload) {
+            sleep(delay_ms)
+                .await
+                .map_err(|error| format!("resize proof region delay: {error}"))?;
+            return Ok(payload);
+        }
         if payload != DELAY_PAYLOAD
             && payload != WINDOW_DELAY_PAYLOAD
             && payload != RECOVERY_PAYLOAD
@@ -348,6 +530,25 @@ impl Guest for ResizeProof {
     }
 }
 
+fn region_delay_payload(mode: ProofMode, delay_ms: u64) -> Vec<u8> {
+    let mut payload = match mode {
+        ProofMode::MiddleLayout => MIDDLE_REGION_DELAY_PAYLOAD.to_vec(),
+        ProofMode::LeafLayout => LEAF_REGION_DELAY_PAYLOAD.to_vec(),
+        _ => Vec::new(),
+    };
+    payload.push(b':');
+    payload.extend_from_slice(delay_ms.to_string().as_bytes());
+    payload
+}
+
+fn region_delay_ms(payload: &[u8]) -> Option<u64> {
+    let suffix = payload
+        .strip_prefix(MIDDLE_REGION_DELAY_PAYLOAD)
+        .or_else(|| payload.strip_prefix(LEAF_REGION_DELAY_PAYLOAD))?
+        .strip_prefix(b":")?;
+    std::str::from_utf8(suffix).ok()?.parse().ok()
+}
+
 fn handle_start(instance_id: &str) -> Vec<ActorCommand> {
     if instance_id == INIT_ACTOR_ID {
         return vec![
@@ -362,6 +563,253 @@ fn handle_start(instance_id: &str) -> Vec<ActorCommand> {
         *state = ProofState::new(ProofMode::for_instance(instance_id));
     }
     vec![ActorCommand::LifecycleComplete(Ok(()))]
+}
+
+fn handle_layout_mailbox(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok(message) = serde_json::from_slice::<ProofLayoutMessage>(bytes) else {
+        return Vec::new();
+    };
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let mode = state.mode;
+    if !matches!(mode, ProofMode::MiddleLayout | ProofMode::LeafLayout) {
+        return Vec::new();
+    }
+    match message.message_type.as_str() {
+        "layout-state" => {
+            let context = ProofLayoutContext {
+                revision: message.revision,
+                presented_layout_revision: message.presented_layout_revision,
+                lease: message.lease,
+                panes: message.waitable_panes,
+                size: message.size,
+                rest: message.rest,
+            };
+            state.layout = Some(context.clone());
+            let pane = state.pane;
+            drop(state);
+            publish_proof_layout(mode, pane, &context)
+        }
+        "layout-region-resized" => {
+            let Some(epoch) = message.resize_epoch else {
+                return Vec::new();
+            };
+            let Some(context) = state.layout.as_ref().cloned() else {
+                return Vec::new();
+            };
+            if context.lease != message.lease {
+                return Vec::new();
+            }
+            state.layout_region_count = state.layout_region_count.saturating_add(1);
+            let response_index = state.layout_region_count;
+            let proof_armed = state.region_proof_armed;
+            let arm_count = state.region_proof_arm_count;
+            let pane = state.pane;
+            let pending = PendingLayoutRegion {
+                epoch,
+                lease: message.lease,
+                size: message.size,
+                scale: message.scale,
+                revision: context.revision,
+                pane,
+                has_rest: mode == ProofMode::MiddleLayout && context.rest,
+            };
+            if mode == ProofMode::MiddleLayout && proof_armed && response_index == 4 {
+                drop(state);
+                return vec![layout_region_diagnostic(
+                    "resize-proof-region-withheld",
+                    mode,
+                    &pending,
+                    response_index,
+                )];
+            }
+            let delay_ms = match (mode, proof_armed, arm_count, response_index) {
+                (ProofMode::MiddleLayout, true, 1, 1) => 210,
+                (ProofMode::MiddleLayout, true, 1, 2) => 150,
+                (ProofMode::MiddleLayout, _, _, _) => 80,
+                (ProofMode::LeafLayout, _, _, _) => 30,
+                _ => 0,
+            };
+            let worker = 10_000_u64.saturating_add(response_index);
+            state.pending_layout_regions.insert(worker, pending.clone());
+            drop(state);
+            vec![
+                layout_region_diagnostic(
+                    "resize-proof-region-received",
+                    mode,
+                    &pending,
+                    response_index,
+                ),
+                ActorCommand::SpawnWorker(WorkerRequest {
+                    worker,
+                    payload: region_delay_payload(mode, delay_ms),
+                }),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn handle_region_proof_control(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    if message["kind"] != "arm-resize-region-proof" {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if state.mode != ProofMode::MiddleLayout {
+        return Vec::new();
+    }
+    state.layout_region_count = 0;
+    state.region_proof_armed = true;
+    state.region_proof_arm_count = state.region_proof_arm_count.saturating_add(1);
+    state.pending_layout_regions.clear();
+    vec![send_local(
+        MIDDLE_LAYOUT_ACTOR_ID,
+        r#"{"kind":"resize-proof-region-armed"}"#.to_string(),
+    )]
+}
+
+fn publish_proof_layout(
+    mode: ProofMode,
+    pane: u64,
+    context: &ProofLayoutContext,
+) -> Vec<ActorCommand> {
+    if pane == 0 || !context.panes.contains(&pane) {
+        return Vec::new();
+    }
+    let mut commands = Vec::new();
+    if mode == ProofMode::MiddleLayout && !context.rest {
+        let delegated = context
+            .panes
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != pane)
+            .collect::<Vec<_>>();
+        if !delegated.is_empty() {
+            commands.push(ActorCommand::SendHostMessage(
+                serde_json::to_vec(&serde_json::json!({
+                    "type": "delegate-layout-rest",
+                    "lease": {"id": context.lease.id, "generation": context.lease.generation},
+                    "revision": context.revision,
+                    "actor": LEAF_LAYOUT_ACTOR_ID,
+                    "panes": delegated,
+                }))
+                .unwrap_or_default(),
+            ));
+            return commands;
+        }
+    }
+    let (layout, rest) = proof_layout_fragment(mode, pane, context.rest);
+    commands.push(ActorCommand::SendHostMessage(
+        serde_json::to_vec(&serde_json::json!({
+            "type": "set-resolved-layout",
+            "lease": {"id": context.lease.id, "generation": context.lease.generation},
+            "revision": context.revision,
+            "layout": layout,
+            "rest": rest,
+            "focus": pane,
+        }))
+        .unwrap_or_default(),
+    ));
+    commands.push(send_local(
+        mode.actor_id(),
+        format!(
+            r#"{{"kind":"resize-proof-layout-state","mode":"{}","pane":{pane},"lease":{},"lease_generation":{},"revision":{},"presented_layout_revision":{},"width":{},"height":{},"rest":{}}}"#,
+            mode.label(),
+            context.lease.id,
+            context.lease.generation,
+            context.revision,
+            context.presented_layout_revision,
+            context.size.w,
+            context.size.h,
+            context.rest,
+        ),
+    ));
+    commands
+}
+
+fn proof_layout_fragment(
+    mode: ProofMode,
+    pane: u64,
+    has_rest: bool,
+) -> (serde_json::Value, serde_json::Value) {
+    let (offset, size) = if mode == ProofMode::MiddleLayout && has_rest {
+        (-1.0, 0.8)
+    } else {
+        (-1.0, 2.0)
+    };
+    let layout = serde_json::json!({
+        "items": [{
+            "id": pane,
+            "kind": {"type": "pane", "pane": pane},
+            "z": 1.0,
+            "transform": {
+                "offset": {"u": offset, "v": -1.0},
+                "size": {"u": size, "v": 2.0}
+            },
+            "input": "pane"
+        }]
+    });
+    let rest = if mode == ProofMode::MiddleLayout && has_rest {
+        serde_json::json!({
+            "z": 0.0,
+            "transform": {
+                "offset": {"u": -0.2, "v": -1.0},
+                "size": {"u": 1.2, "v": 2.0}
+            }
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    (layout, rest)
+}
+
+fn layout_region_response(mode: ProofMode, pending: &PendingLayoutRegion) -> ActorCommand {
+    let (layout, rest) = proof_layout_fragment(mode, pending.pane, pending.has_rest);
+    ActorCommand::SendHostMessage(
+        serde_json::to_vec(&serde_json::json!({
+            "type": "submit-layout-region",
+            "resize_epoch": {
+                "id": pending.epoch.id,
+                "lease": pending.epoch.lease,
+                "lease_generation": pending.epoch.lease_generation,
+                "base_layout_revision": pending.epoch.base_layout_revision,
+                "target_layout_revision": pending.epoch.target_layout_revision,
+            },
+            "lease": {"id": pending.lease.id, "generation": pending.lease.generation},
+            "inventory_revision": pending.revision,
+            "fragment": {"layout": layout, "rest": rest},
+            "focus": pending.pane,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+fn layout_region_diagnostic(
+    kind: &str,
+    mode: ProofMode,
+    pending: &PendingLayoutRegion,
+    response_index: u64,
+) -> ActorCommand {
+    send_local(
+        mode.actor_id(),
+        format!(
+            r#"{{"kind":"{kind}","mode":"{}","response_index":{response_index},"pane":{},"epoch":{},"lease":{},"lease_generation":{},"width":{},"height":{},"scale":{:.3}}}"#,
+            mode.label(),
+            pending.pane,
+            pending.epoch.id,
+            pending.lease.id,
+            pending.lease.generation,
+            pending.size.w,
+            pending.size.h,
+            pending.scale,
+        ),
+    )
 }
 
 fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
@@ -387,6 +835,40 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 width,
                 height,
                 result.is_ok(),
+            )]
+        }
+        PresentationEvent::PointerButton(button) => {
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            if state.mode == ProofMode::WindowSlow
+                && button.pane == state.pane
+                && button.pressed
+            {
+                if button.button == RIGHT_POINTER_BUTTON && state.window_capture_gate.arm() {
+                    let pane = state.pane;
+                    drop(state);
+                    return vec![window_gate_diagnostic(
+                        "resize-proof-window-gate-armed",
+                        pane,
+                        None,
+                        None,
+                    )];
+                }
+                if button.button == LEFT_POINTER_BUTTON {
+                    let target = state.window_capture_gate.release();
+                    drop(state);
+                    return target.map_or_else(Vec::new, window_gate_release_commands);
+                }
+                return Vec::new();
+            }
+            if state.mode != ProofMode::LeafLayout || button.pane != state.pane || !button.pressed {
+                return Vec::new();
+            }
+            drop(state);
+            vec![send_local(
+                MIDDLE_LAYOUT_ACTOR_ID,
+                r#"{"kind":"arm-resize-region-proof"}"#.to_string(),
             )]
         }
         PresentationEvent::PaneResized(resized) => {
@@ -508,7 +990,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     drop(state);
                     submit_target(target, mode)
                 }
-                ProofMode::GatedFast => {
+                ProofMode::GatedFast | ProofMode::MiddleLayout | ProofMode::LeafLayout => {
                     let cancelled = state.cancel_recovery();
                     drop(state);
                     let mut commands = cancelled
@@ -518,10 +1000,50 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     commands.extend(submit_target(target, mode));
                     commands
                 }
-                ProofMode::Slow | ProofMode::WindowSlow => {
+                ProofMode::Slow => {
                     let action = state.delay.offer(target);
                     drop(state);
                     apply_delay_action(action, mode)
+                }
+                ProofMode::WindowSlow => {
+                    let gate = state.window_capture_gate.offer(target);
+                    if gate == WindowGateOffer::NotArmed {
+                        let action = state.delay.offer(target);
+                        drop(state);
+                        return apply_delay_action(action, mode);
+                    }
+                    let cancelled_worker = state.delay.reset();
+                    drop(state);
+                    let mut commands = cancelled_worker
+                        .map(ActorCommand::CancelWorker)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    match gate {
+                        WindowGateOffer::Held => commands.push(window_gate_diagnostic(
+                            "resize-proof-window-gate-held",
+                            target.pane,
+                            Some(target),
+                            None,
+                        )),
+                        WindowGateOffer::Replaced { cancelled } => {
+                            commands.push(window_gate_diagnostic(
+                                "resize-proof-window-gate-replaced",
+                                target.pane,
+                                Some(target),
+                                Some(cancelled.epoch),
+                            ));
+                        }
+                        WindowGateOffer::Stale { held } => {
+                            commands.push(window_gate_diagnostic(
+                                "resize-proof-window-gate-stale",
+                                target.pane,
+                                Some(held),
+                                Some(target.epoch),
+                            ));
+                        }
+                        WindowGateOffer::NotArmed => {}
+                    }
+                    commands
                 }
                 ProofMode::StallOnce | ProofMode::StallAfterFirst => {
                     if state.stall_after_optional_warmup(target) {
@@ -562,6 +1084,28 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
+    if let Some(pending) = state.pending_layout_regions.remove(&worker) {
+        let mode = state.mode;
+        let response_index = worker.saturating_sub(10_000);
+        drop(state);
+        if failed {
+            return vec![layout_region_diagnostic(
+                "resize-proof-region-worker-failed",
+                mode,
+                &pending,
+                response_index,
+            )];
+        }
+        return vec![
+            layout_region_diagnostic(
+                "resize-proof-region-responded",
+                mode,
+                &pending,
+                response_index,
+            ),
+            layout_region_response(mode, &pending),
+        ];
+    }
     if state.mode.stalls() || state.mode.gates_untagged_recovery() {
         let recovery = state.finish_recovery(worker);
         let mode = state.mode;
@@ -693,6 +1237,74 @@ fn diagnostic_command(
             mode.label()
         ),
     )
+}
+
+fn window_gate_diagnostic(
+    kind: &str,
+    pane: u64,
+    held: Option<PaintTarget>,
+    cancelled_epoch: Option<u64>,
+) -> ActorCommand {
+    let epoch = held.map_or(0, |target| target.epoch);
+    let held_target = held.map_or_else(
+        || "null".to_string(),
+        |target| {
+            format!(
+                r#"{{"pane":{},"epoch":{},"width":{:.3},"height":{:.3},"scale":{:.3}}}"#,
+                target.pane, target.epoch, target.width, target.height, target.scale,
+            )
+        },
+    );
+    let cancelled_epoch = cancelled_epoch.map_or(0, |epoch| epoch);
+    send_local(
+        WINDOW_SLOW_ACTOR_ID,
+        format!(
+            r#"{{"kind":"{kind}","mode":"slow","pane":{pane},"epoch":{epoch},"held_target":{held_target},"cancelled_epoch":{cancelled_epoch}}}"#,
+        ),
+    )
+}
+
+fn window_gate_release_commands(target: PaintTarget) -> Vec<ActorCommand> {
+    vec![
+        window_gate_diagnostic(
+            "resize-proof-window-gate-released",
+            target.pane,
+            Some(target),
+            None,
+        ),
+        send_local(
+            WINDOW_SLOW_ACTOR_ID,
+            format!(
+                r#"{{"kind":"resize-proof-window-gate-submit","epoch":{}}}"#,
+                target.epoch
+            ),
+        ),
+    ]
+}
+
+fn handle_window_gate_control(body: &[u8]) -> Vec<ActorCommand> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    if value.get("kind").and_then(serde_json::Value::as_str)
+        != Some("resize-proof-window-gate-submit")
+    {
+        return Vec::new();
+    }
+    let Some(epoch) = value.get("epoch").and_then(serde_json::Value::as_u64) else {
+        return Vec::new();
+    };
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if state.mode != ProofMode::WindowSlow {
+        return Vec::new();
+    }
+    let target = state.window_capture_gate.take_pending_release(epoch);
+    drop(state);
+    target.map_or_else(Vec::new, |target| {
+        submit_target(target, ProofMode::WindowSlow)
+    })
 }
 
 fn proof_packet(
@@ -857,7 +1469,100 @@ mod tests {
             ProofMode::for_instance(STALL_AFTER_FIRST_ACTOR_ID),
             ProofMode::StallAfterFirst
         );
+        assert_eq!(
+            ProofMode::for_instance(MIDDLE_LAYOUT_ACTOR_ID),
+            ProofMode::MiddleLayout
+        );
+        assert_eq!(
+            ProofMode::for_instance(LEAF_LAYOUT_ACTOR_ID),
+            ProofMode::LeafLayout
+        );
         assert_eq!(ProofMode::for_instance("resize-proof"), ProofMode::Fast);
+    }
+
+    #[test]
+    fn region_delay_payload_round_trips_each_layout_role() {
+        for (mode, delay) in [(ProofMode::MiddleLayout, 150), (ProofMode::LeafLayout, 30)] {
+            assert_eq!(
+                region_delay_ms(&region_delay_payload(mode, delay)),
+                Some(delay)
+            );
+        }
+        assert_eq!(region_delay_ms(b"resize-proof-delay-v1"), None);
+    }
+
+    #[test]
+    fn middle_fragment_has_one_direct_pane_and_one_explicit_rest_slot() {
+        let (layout, rest) = proof_layout_fragment(ProofMode::MiddleLayout, 17, true);
+        assert_eq!(layout["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(layout["items"][0]["kind"]["pane"], 17);
+        assert_eq!(layout["items"][0]["transform"]["size"]["u"], 0.8);
+        assert_eq!(rest["transform"]["offset"]["u"], -0.2);
+        assert_eq!(rest["transform"]["size"]["u"], 1.2);
+
+        let (layout, rest) = proof_layout_fragment(ProofMode::LeafLayout, 19, false);
+        assert_eq!(layout["items"][0]["kind"]["pane"], 19);
+        assert_eq!(layout["items"][0]["transform"]["size"]["u"], 2.0);
+        assert!(rest.is_null());
+    }
+
+    #[test]
+    fn middle_delegates_only_non_owned_panes_before_publishing_rest() {
+        let context = ProofLayoutContext {
+            revision: 9,
+            presented_layout_revision: 3,
+            lease: ProofLayoutLease {
+                id: 4,
+                generation: 2,
+            },
+            panes: vec![17, 19],
+            size: ProofLayoutSize { w: 800, h: 600 },
+            rest: false,
+        };
+        let commands = publish_proof_layout(ProofMode::MiddleLayout, 17, &context);
+        let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
+            panic!("middle did not publish one delegation command");
+        };
+        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(value["type"], "delegate-layout-rest");
+        assert_eq!(value["actor"], LEAF_LAYOUT_ACTOR_ID);
+        assert_eq!(value["panes"], serde_json::json!([19]));
+    }
+
+    #[test]
+    fn region_response_echoes_exact_epoch_lease_and_pixel_extent_diagnostic() {
+        let pending = PendingLayoutRegion {
+            epoch: ProofResizeEpoch {
+                id: 31,
+                lease: 1,
+                lease_generation: 2,
+                base_layout_revision: 7,
+                target_layout_revision: 8,
+            },
+            lease: ProofLayoutLease {
+                id: 4,
+                generation: 3,
+            },
+            size: ProofLayoutSize { w: 650, h: 480 },
+            scale: 1.25,
+            revision: 9,
+            pane: 17,
+            has_rest: true,
+        };
+        let ActorCommand::SendHostMessage(body) =
+            layout_region_response(ProofMode::MiddleLayout, &pending)
+        else {
+            panic!("region response did not use the host mailbox");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "submit-layout-region");
+        assert_eq!(value["resize_epoch"]["id"], 31);
+        assert_eq!(
+            value["lease"],
+            serde_json::json!({"id": 4, "generation": 3})
+        );
+        assert_eq!(value["inventory_revision"], 9);
+        assert!(value["fragment"]["rest"].is_object());
     }
 
     #[test]
@@ -904,6 +1609,117 @@ mod tests {
         };
         assert_eq!(scheduler.finish(worker), DelayAction::Draw(final_target));
         assert_eq!(scheduler.finish(worker), DelayAction::None);
+    }
+
+    #[test]
+    fn window_capture_gate_arms_holds_and_releases_one_target() {
+        let mut gate = WindowCaptureGate::new();
+        let held = target(21, 520.0);
+        assert!(gate.arm());
+        assert!(!gate.arm());
+        assert_eq!(gate.offer(held), WindowGateOffer::Held);
+        assert_eq!(gate.release(), Some(held));
+    }
+
+    #[test]
+    fn window_capture_gate_supersession_replaces_the_held_target() {
+        let mut gate = WindowCaptureGate::new();
+        let obsolete = target(21, 520.0);
+        let current = target(22, 560.0);
+        assert!(gate.arm());
+        assert_eq!(gate.offer(obsolete), WindowGateOffer::Held);
+        assert_eq!(
+            gate.offer(current),
+            WindowGateOffer::Replaced {
+                cancelled: obsolete
+            }
+        );
+        assert_eq!(gate.release(), Some(current));
+    }
+
+    #[test]
+    fn window_capture_gate_duplicate_release_submits_nothing() {
+        let mut gate = WindowCaptureGate::new();
+        let held = target(21, 520.0);
+        assert!(gate.arm());
+        assert_eq!(gate.offer(held), WindowGateOffer::Held);
+        assert_eq!(gate.release(), Some(held));
+        assert_eq!(gate.release(), None);
+    }
+
+    #[test]
+    fn window_capture_gate_stale_epoch_cannot_replace_the_current_target() {
+        let mut gate = WindowCaptureGate::new();
+        let stale = target(21, 520.0);
+        let current = target(22, 560.0);
+        assert!(gate.arm());
+        assert_eq!(gate.offer(current), WindowGateOffer::Held);
+        assert_eq!(
+            gate.offer(stale),
+            WindowGateOffer::Stale { held: current }
+        );
+        assert_eq!(gate.release(), Some(current));
+    }
+
+    #[test]
+    fn window_capture_gate_release_commands_log_before_exact_epoch_submit() {
+        let held = target(22, 560.0);
+        let commands = window_gate_release_commands(held);
+        let [ActorCommand::SendLocalMessage(released), ActorCommand::SendLocalMessage(submit)] =
+            commands.as_slice()
+        else {
+            panic!("release did not produce two ordered local messages");
+        };
+        assert_eq!(released.actor, WINDOW_SLOW_ACTOR_ID);
+        assert_eq!(submit.actor, WINDOW_SLOW_ACTOR_ID);
+        let released: serde_json::Value = serde_json::from_slice(&released.body).unwrap();
+        let submit: serde_json::Value = serde_json::from_slice(&submit.body).unwrap();
+        assert_eq!(released["kind"], "resize-proof-window-gate-released");
+        assert_eq!(released["held_target"]["epoch"], 22);
+        assert_eq!(submit["kind"], "resize-proof-window-gate-submit");
+        assert_eq!(submit["epoch"], 22);
+    }
+
+    #[test]
+    fn window_capture_gate_submit_requires_exact_epoch_and_consumes_once() {
+        let mut gate = WindowCaptureGate::new();
+        let held = target(22, 560.0);
+        assert!(gate.arm());
+        assert_eq!(gate.offer(held), WindowGateOffer::Held);
+        assert_eq!(gate.release(), Some(held));
+        assert_eq!(gate.take_pending_release(21), None);
+        assert_eq!(gate.take_pending_release(22), Some(held));
+        assert_eq!(gate.take_pending_release(22), None);
+    }
+
+    #[test]
+    fn window_capture_gate_supersession_invalidates_stale_submit_message() {
+        let mut gate = WindowCaptureGate::new();
+        let obsolete = target(21, 520.0);
+        let current = target(22, 560.0);
+        assert!(gate.arm());
+        assert_eq!(gate.offer(obsolete), WindowGateOffer::Held);
+        assert_eq!(
+            gate.offer(current),
+            WindowGateOffer::Replaced {
+                cancelled: obsolete
+            }
+        );
+        assert_eq!(gate.release(), Some(current));
+        assert_eq!(gate.take_pending_release(21), None);
+        assert_eq!(gate.take_pending_release(22), Some(current));
+    }
+
+    #[test]
+    fn newer_target_cancels_a_pending_old_release() {
+        let mut gate = WindowCaptureGate::new();
+        let obsolete = target(21, 520.0);
+        let current = target(22, 560.0);
+        assert!(gate.arm());
+        assert_eq!(gate.offer(obsolete), WindowGateOffer::Held);
+        assert_eq!(gate.release(), Some(obsolete));
+        assert_eq!(gate.offer(current), WindowGateOffer::NotArmed);
+        assert_eq!(gate.take_pending_release(21), None);
     }
 
     #[test]

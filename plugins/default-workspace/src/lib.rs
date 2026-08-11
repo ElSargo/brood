@@ -196,6 +196,14 @@ struct LayoutPoint {
 
 #[derive(Clone, Copy, Deserialize)]
 struct LayoutNotificationEpoch {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    lease: u64,
+    #[serde(default)]
+    lease_generation: u64,
+    #[serde(default)]
+    base_layout_revision: u64,
     target_layout_revision: u64,
 }
 
@@ -440,6 +448,48 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
                 revision,
             )
         };
+        if len <= 0 {
+            return -2;
+        }
+        return pack_actor_outbox(output.as_ptr() as i32, len);
+    }
+
+    if message.message_type == "layout-region-resized" {
+        let Some(epoch) = message.resize_epoch else {
+            return 0;
+        };
+        let Some(lease) = message.lease else {
+            return 0;
+        };
+        let (panes, pane_backends, focus, fullscreen, current_lease, revision) =
+            layout_actor_state();
+        if current_lease != Some(lease)
+            || epoch.id == 0
+            || epoch.lease == 0
+            || epoch.lease_generation == 0
+            || revision.is_none()
+        {
+            return 0;
+        }
+        let old_size = unsafe { (LAYOUT_VIEWPORT_WIDTH, LAYOUT_VIEWPORT_HEIGHT) };
+        unsafe {
+            LAYOUT_VIEWPORT_WIDTH = message.size.w.max(1);
+            LAYOUT_VIEWPORT_HEIGHT = message.size.h.max(1);
+        }
+        let len = write_layout_region_outbox(
+            output,
+            panes,
+            pane_backends,
+            focus,
+            fullscreen,
+            lease,
+            revision.unwrap_or(0),
+            epoch,
+        );
+        unsafe {
+            LAYOUT_VIEWPORT_WIDTH = old_size.0;
+            LAYOUT_VIEWPORT_HEIGHT = old_size.1;
+        }
         if len <= 0 {
             return -2;
         }
@@ -1341,6 +1391,58 @@ fn write_synchronized_layout_outbox(
         payload.u64(*pane);
     }
     payload.bytes(br#"],"presentation":"scale-then-atomic"}"#);
+    writer.bytes(br#"]}]}"#);
+    writer.finish()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact host epoch and current lease fragment form one bounded response"
+)]
+fn write_layout_region_outbox(
+    output: &mut [u8],
+    panes: &[u64],
+    pane_backends: &[u64],
+    focus: Option<u64>,
+    fullscreen: bool,
+    lease: LayoutLeaseToken,
+    inventory_revision: u64,
+    epoch: LayoutNotificationEpoch,
+) -> i32 {
+    let mut writer = Writer::new(output);
+    writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    let mut payload = PayloadWriter::new(&mut writer);
+    payload.bytes(br#"{"type":"submit-layout-region","resize_epoch":{"id":"#);
+    payload.u64(epoch.id);
+    payload.bytes(br#", "lease":"#);
+    payload.u64(epoch.lease);
+    payload.bytes(br#", "lease_generation":"#);
+    payload.u64(epoch.lease_generation);
+    payload.bytes(br#", "base_layout_revision":"#);
+    payload.u64(epoch.base_layout_revision);
+    payload.bytes(br#", "target_layout_revision":"#);
+    payload.u64(epoch.target_layout_revision);
+    payload.bytes(br#"},"lease":{"id":"#);
+    payload.u64(lease.id);
+    payload.bytes(br#", "generation":"#);
+    payload.u64(lease.generation);
+    payload.bytes(br#"},"inventory_revision":"#);
+    payload.u64(inventory_revision);
+    payload.bytes(br#", "fragment":{"layout":"#);
+    write_resolved_layout_payload(
+        &mut payload,
+        panes,
+        pane_backends,
+        focus,
+        fullscreen,
+        durable_primary_split_ratio(),
+    );
+    payload.bytes(br#"}"#);
+    if let Some(focus) = focus {
+        payload.bytes(br#", "focus":"#);
+        payload.u64(focus);
+    }
+    payload.byte(b'}');
     writer.bytes(br#"]}]}"#);
     writer.finish()
 }
@@ -2318,6 +2420,53 @@ mod tests {
         assert_eq!(
             request["fragment"]["layout"]["items"][0]["kind"]["pane"],
             22
+        );
+    }
+
+    #[test]
+    fn delegated_region_reply_echoes_the_exact_host_epoch_and_lease() {
+        let decoded: WorkspaceMessage = decode_json(
+            br#"{"type":"layout-region-resized","resize_epoch":{"id":31,"lease":1,"lease_generation":4,"base_layout_revision":7,"target_layout_revision":8},"lease":{"id":5,"generation":2},"size":{"w":900,"h":600},"scale":1.5}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.message_type.as_str(), "layout-region-resized");
+        assert_eq!(decoded.resize_epoch.map(|epoch| epoch.id), Some(31));
+        assert_eq!(decoded.lease.map(|lease| lease.generation), Some(2));
+        assert_eq!((decoded.size.w, decoded.size.h), (900, 600));
+        let mut output = [0_u8; OUTBOX_BYTES];
+        let epoch = LayoutNotificationEpoch {
+            id: 31,
+            lease: 1,
+            lease_generation: 4,
+            base_layout_revision: 7,
+            target_layout_revision: 8,
+        };
+        let len = write_layout_region_outbox(
+            &mut output,
+            &[11, 22],
+            &[1, 1],
+            Some(11),
+            false,
+            LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            },
+            9,
+            epoch,
+        );
+        let response = host_payload(&output, len);
+        assert_eq!(response["type"], "submit-layout-region");
+        assert_eq!(response["resize_epoch"]["id"], 31);
+        assert_eq!(response["resize_epoch"]["lease"], 1);
+        assert_eq!(response["resize_epoch"]["lease_generation"], 4);
+        assert_eq!(response["lease"], json!({"id": 5, "generation": 2}));
+        assert_eq!(response["inventory_revision"], 9);
+        assert_eq!(response["focus"], 11);
+        assert_eq!(
+            response["fragment"]["layout"]["items"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
         );
     }
 }

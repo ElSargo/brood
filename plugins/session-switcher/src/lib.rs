@@ -212,13 +212,13 @@ struct AvailableWindow {
     session: u64,
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
 struct LayoutLeaseToken {
     id: u64,
     generation: u64,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct LayoutStateSize {
     w: i32,
     #[serde(rename = "h")]
@@ -299,9 +299,27 @@ struct LayoutTransactionNotification {
     resize_epoch: Option<LayoutNotificationEpoch>,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 struct LayoutNotificationEpoch {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    lease: u64,
+    #[serde(default)]
+    lease_generation: u64,
+    #[serde(default)]
+    base_layout_revision: u64,
     target_layout_revision: u64,
+}
+
+#[derive(Deserialize)]
+struct LayoutRegionResizeMessage {
+    #[serde(rename = "type")]
+    message_type: serde_json_core::heapless::String<32>,
+    resize_epoch: LayoutNotificationEpoch,
+    lease: LayoutLeaseToken,
+    size: LayoutStateSize,
+    scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1426,6 +1444,13 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         };
         return apply_layout_transaction_notification(&mut state, &notification);
     }
+    if let Ok((message, consumed)) =
+        serde_json_core::from_slice::<LayoutRegionResizeMessage>(bytes)
+        && consumed == bytes.len()
+        && message.message_type.as_str() == "layout-region-resized"
+    {
+        return handle_layout_region_resize(message);
+    }
     let Ok((message, consumed)) = serde_json_core::from_slice::<LayoutStateMessage>(bytes) else {
         return Vec::new();
     };
@@ -1497,6 +1522,103 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         commands.push(subscribe_agent_registry(state.backend_id, state.session_id));
     }
     commands
+}
+
+fn handle_layout_region_resize(message: LayoutRegionResizeMessage) -> Vec<ActorCommand> {
+    if !message.scale.is_finite() || message.scale <= 0.0 {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    publish_layout_region_response(&mut state, &message)
+}
+
+fn publish_layout_region_response(
+    state: &mut SwitcherState,
+    message: &LayoutRegionResizeMessage,
+) -> Vec<ActorCommand> {
+    let Some(context) = state.layout.as_ref() else {
+        return Vec::new();
+    };
+    if context.lease != message.lease {
+        return Vec::new();
+    }
+    let revision = context.revision;
+    let focus = context.focused_pane;
+    let old_size = context.size;
+    if let Some(context) = state.layout.as_mut() {
+        context.size = message.size;
+    }
+    let ordinary_commands = publish_layout(state, false, focus);
+    if let Some(context) = state.layout.as_mut() {
+        context.size = old_size;
+    }
+    let Some(mut ordinary) = ordinary_commands.iter().find_map(|command| {
+        let ActorCommand::SendHostMessage(body) = command else {
+            return None;
+        };
+        let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+        (value["type"] == "set-resolved-layout").then_some(value)
+    }) else {
+        return vec![layout_region_failure_command(
+            message,
+            "the shell fragment is not available",
+        )];
+    };
+    let Some(layout) = ordinary.get_mut("layout").map(serde_json::Value::take) else {
+        return vec![layout_region_failure_command(
+            message,
+            "the shell fragment has no layout",
+        )];
+    };
+    let rest = ordinary
+        .get_mut("rest")
+        .map(serde_json::Value::take)
+        .filter(|rest| !rest.is_null());
+    let mut fragment = serde_json::Map::new();
+    fragment.insert("layout".to_string(), layout);
+    if let Some(rest) = rest {
+        fragment.insert("rest".to_string(), rest);
+    }
+    let mut response = serde_json::Map::new();
+    response.insert(
+        "type".to_string(),
+        serde_json::Value::String("submit-layout-region".to_string()),
+    );
+    let Ok(epoch) = serde_json::to_value(message.resize_epoch) else {
+        return Vec::new();
+    };
+    let Ok(lease) = serde_json::to_value(message.lease) else {
+        return Vec::new();
+    };
+    response.insert("resize_epoch".to_string(), epoch);
+    response.insert("lease".to_string(), lease);
+    response.insert("inventory_revision".to_string(), revision.into());
+    response.insert("fragment".to_string(), fragment.into());
+    if let Some(focus) = focus {
+        response.insert("focus".to_string(), focus.into());
+    }
+    serde_json::to_vec(&response)
+        .ok()
+        .map(ActorCommand::SendHostMessage)
+        .into_iter()
+        .collect()
+}
+
+fn layout_region_failure_command(
+    message: &LayoutRegionResizeMessage,
+    reason: &'static str,
+) -> ActorCommand {
+    ActorCommand::SendHostMessage(
+        serde_json::to_vec(&serde_json::json!({
+            "type": "fail-layout-region",
+            "resize_epoch": message.resize_epoch,
+            "lease": message.lease,
+            "message": reason,
+        }))
+        .unwrap_or_default(),
+    )
 }
 
 fn handle_layout_pointer_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -4392,14 +4514,16 @@ mod tests {
     use brood_protocol::backend_catalogue::BackendCatalogueEntry;
 
     use super::{
-        ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutStateSize, ResizePaintPlan,
-        SwitcherState, actor_realm, apply_backend_sessions, apply_layout_pointer_message,
+        ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
+        LayoutStateSize, ResizePaintPlan, SwitcherState, actor_realm,
+        apply_backend_sessions, apply_layout_pointer_message,
         apply_layout_transaction_notification, authenticated_neovim_client,
         ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
         open_creation_backend_picker, publish_layout, publish_synchronized_layout,
-        request_creation_backend_picker, request_editor, resize_paint_plan, sender_actor_is,
-        shell_layout_state, shell_requested_focus, show_diff, start_neovim_client, submit,
-        truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
+        publish_layout_region_response, request_creation_backend_picker, request_editor,
+        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus, show_diff,
+        start_neovim_client, submit, truncate_to_width, update_creation_backend_picker,
+        valid_editor_actor_target,
     };
 
     fn host_command<'a>(commands: &'a [ActorCommand], message_type: &str) -> &'a [u8] {
@@ -4467,6 +4591,49 @@ mod tests {
         assert_eq!(switcher["transform"]["size"]["u"], 0.5);
         assert!(!items.iter().any(|item| item["id"] == 3));
         assert!(value.get("rest").is_none());
+    }
+
+    #[test]
+    fn region_resize_returns_one_exact_epoch_fragment_and_restores_durable_size() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.status_bar_pane = Some(2);
+        state.inbox_pane = Some(3);
+        state.picker_pane = Some(4);
+        state.keybindings_pane = Some(5);
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 3,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes: visible_panes.clone(),
+            presented_panes: visible_panes.clone(),
+            visible_panes,
+            focused_pane: Some(6),
+            size: LayoutStateSize { w: 800, height: 600 },
+            rest: true,
+        });
+        let bytes = br#"{"type":"layout-region-resized","resize_epoch":{"id":31,"lease":1,"lease_generation":1,"base_layout_revision":3,"target_layout_revision":4},"lease":{"id":4,"generation":2},"size":{"w":1200,"h":700},"scale":1.5}"#;
+        let (message, consumed) =
+            serde_json_core::from_slice::<LayoutRegionResizeMessage>(bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(message.message_type.as_str(), "layout-region-resized");
+        assert_eq!(message.resize_epoch.id, 31);
+        assert_eq!((message.size.w, message.size.height), (1200, 700));
+        assert!((message.scale - 1.5).abs() < f32::EPSILON);
+        let commands = publish_layout_region_response(&mut state, &message);
+        let body = host_command(&commands, "submit-layout-region");
+        let response: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(response["resize_epoch"]["id"], 31);
+        assert_eq!(response["lease"], serde_json::json!({"id": 4, "generation": 2}));
+        assert_eq!(response["inventory_revision"], 9);
+        assert!(response["fragment"]["rest"].is_object());
+        let restored = state.layout.as_ref().unwrap().size;
+        assert_eq!((restored.w, restored.height), (800, 600));
     }
 
     #[test]

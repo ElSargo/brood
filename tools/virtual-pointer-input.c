@@ -109,7 +109,8 @@ static void print_usage(FILE *stream) {
         "<delta> <steps> <extent-x> <extent-y> | click <x> <y> "
         "<extent-x> <extent-y> | hover <x> <y> <hold-ms> <extent-x> "
         "<extent-y> | sequence <extent-x> <extent-y>\n"
-        "sequence stdin commands: motion <x> <y> | press | release | quit | cancel\n"
+        "sequence stdin commands: motion <x> <y> | press | release | "
+        "press-right | release-right | quit | cancel\n"
     );
 }
 
@@ -222,8 +223,12 @@ static void absolute_motion(
     );
 }
 
-static void pointer_button(struct virtual_pointer *pointer, uint32_t state) {
-    pointer_request(pointer, 2, monotonic_milliseconds(), BTN_LEFT, state, 0, 0);
+static void pointer_button(
+    struct virtual_pointer *pointer,
+    uint32_t button,
+    uint32_t state
+) {
+    pointer_request(pointer, 2, monotonic_milliseconds(), button, state, 0, 0);
     wl_proxy_marshal_flags(
         (struct wl_proxy *)pointer,
         4,
@@ -332,7 +337,7 @@ static int run_sequence(
     uint32_t x = 0;
     uint32_t y = 0;
     bool positioned = false;
-    bool pressed = false;
+    uint32_t pressed_button = 0;
     int result = 0;
 
     printf("ready extent_x=%" PRIu32 " extent_y=%" PRIu32 "\n", extent_x, extent_y);
@@ -387,7 +392,11 @@ static int run_sequence(
             continue;
         }
 
-        if (strcmp(fields[0], "press") == 0) {
+        if (strcmp(fields[0], "press") == 0 ||
+            strcmp(fields[0], "press-right") == 0) {
+            uint32_t button = strcmp(fields[0], "press-right") == 0
+                ? BTN_RIGHT
+                : BTN_LEFT;
             if (count != 1) {
                 result = sequence_error(line_number, "press does not accept arguments");
                 break;
@@ -396,40 +405,44 @@ static int run_sequence(
                 result = sequence_error(line_number, "press requires an earlier motion");
                 break;
             }
-            if (pressed) {
-                result = sequence_error(line_number, "the left button is already pressed");
+            if (pressed_button != 0) {
+                result = sequence_error(line_number, "a pointer button is already pressed");
                 break;
             }
-            pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
+            pointer_button(pointer, button, WL_POINTER_BUTTON_STATE_PRESSED);
             uint32_t roundtrip_ms = 0;
             if (sequence_roundtrip(display, line_number, "pointer press", &roundtrip_ms) != 0) {
                 result = 1;
                 break;
             }
-            pressed = true;
+            pressed_button = button;
             sequence += 1;
-            sequence_ack(sequence, "press", x, y, roundtrip_ms);
+            sequence_ack(sequence, fields[0], x, y, roundtrip_ms);
             continue;
         }
 
-        if (strcmp(fields[0], "release") == 0) {
+        if (strcmp(fields[0], "release") == 0 ||
+            strcmp(fields[0], "release-right") == 0) {
+            uint32_t button = strcmp(fields[0], "release-right") == 0
+                ? BTN_RIGHT
+                : BTN_LEFT;
             if (count != 1) {
                 result = sequence_error(line_number, "release does not accept arguments");
                 break;
             }
-            if (!pressed) {
-                result = sequence_error(line_number, "the left button is not pressed");
+            if (pressed_button != button) {
+                result = sequence_error(line_number, "the requested pointer button is not pressed");
                 break;
             }
-            pointer_button(pointer, WL_POINTER_BUTTON_STATE_RELEASED);
+            pointer_button(pointer, button, WL_POINTER_BUTTON_STATE_RELEASED);
             uint32_t roundtrip_ms = 0;
             if (sequence_roundtrip(display, line_number, "pointer release", &roundtrip_ms) != 0) {
                 result = 1;
                 break;
             }
-            pressed = false;
+            pressed_button = 0;
             sequence += 1;
-            sequence_ack(sequence, "release", x, y, roundtrip_ms);
+            sequence_ack(sequence, fields[0], x, y, roundtrip_ms);
             continue;
         }
 
@@ -438,10 +451,10 @@ static int run_sequence(
                 result = sequence_error(line_number, "quit and cancel do not accept arguments");
                 break;
             }
-            if (strcmp(fields[0], "quit") == 0 && pressed) {
+            if (strcmp(fields[0], "quit") == 0 && pressed_button != 0) {
                 result = sequence_error(
                     line_number,
-                    "quit requires a released button; use cancel to disconnect while captured"
+                    "quit requires released buttons; use cancel to disconnect while captured"
                 );
                 break;
             }
@@ -464,10 +477,10 @@ static int run_sequence(
 
     if (result == 0 && ferror(stdin)) {
         result = sequence_error(line_number + 1, "could not read stdin");
-    } else if (result == 0 && pressed) {
+    } else if (result == 0 && pressed_button != 0) {
         result = sequence_error(
             line_number + 1,
-            "stdin ended while the left button was pressed; send release or cancel"
+            "stdin ended while a pointer button was pressed; send release or cancel"
         );
     }
     free(line);
@@ -547,19 +560,19 @@ int main(int argc, char **argv) {
         uint32_t hold_milliseconds = parse_u32(argv[4], "hold milliseconds");
         usleep((useconds_t)hold_milliseconds * 1000);
     } else if (!sequence_mode && click) {
-        pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
+        pointer_button(pointer, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer press");
         }
         usleep(20000);
-        pointer_button(pointer, WL_POINTER_BUTTON_STATE_RELEASED);
+        pointer_button(pointer, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer release");
         }
         usleep(50000);
     } else if (!sequence_mode && drag) {
         uint32_t end_x = (uint32_t)end_or_delta;
-        pointer_button(pointer, WL_POINTER_BUTTON_STATE_PRESSED);
+        pointer_button(pointer, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer press");
         }
@@ -573,7 +586,7 @@ int main(int argc, char **argv) {
             }
             usleep(16000);
         }
-        pointer_button(pointer, WL_POINTER_BUTTON_STATE_RELEASED);
+        pointer_button(pointer, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
         if (wl_display_roundtrip(display) < 0) {
             fail("the compositor rejected the pointer release");
         }
