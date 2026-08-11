@@ -23,6 +23,7 @@ POINTER_PROTOCOL_LOG="$OUT/pointer-protocol.log"
 POINTER_STDERR_LOG="$OUT/pointer-stderr.log"
 BURST_INPUT="$OUT/burst-input.jsonl"
 BURST_METRICS="$OUT/burst-metrics.json"
+LIFECYCLE_METRICS="$OUT/interaction-lifecycle.json"
 FRAME_MANIFEST="$OUT/frame-manifest.jsonl"
 RESIZE_EVENTS="$OUT/resize-events.jsonl"
 METRICS="$OUT/metrics.json"
@@ -534,7 +535,8 @@ pattern = re.compile(
     r"phase=(?P<phase>settled|projected|promoted|degraded) "
     r"wait_ready=(?P<wait_ready>\d+)/(?P<wait_total>\d+) "
     r"staged_count=(?P<staged_count>\d+) "
-    r"degraded=(?P<degraded>true|false)$"
+    r"degraded=(?P<degraded>true|false) "
+    r"superseded_epochs=(?P<superseded_epochs>\d+)$"
 )
 match = pattern.match(sys.argv[12])
 if match is None:
@@ -566,6 +568,7 @@ record = {
         "wait_total": int(trace["wait_total"]),
         "staged_count": int(trace["staged_count"]),
         "degraded": trace["degraded"] == "true",
+        "superseded_epochs": int(trace["superseded_epochs"]),
     },
 }
 print(json.dumps(record, sort_keys=True))
@@ -843,7 +846,8 @@ trace_pattern = re.compile(
     r"phase=(?P<phase>settled|projected|promoted|degraded) "
     r"wait_ready=(?P<wait_ready>\d+)/(?P<wait_total>\d+) "
     r"staged_count=(?P<staged_count>\d+) "
-    r"degraded=(?P<degraded>true|false)$"
+    r"degraded=(?P<degraded>true|false) "
+    r"superseded_epochs=(?P<superseded_epochs>\d+)$"
 )
 accepted_pattern = re.compile(
     r"accepted synchronized layout actor=workspace request=(?P<request>\d+) "
@@ -870,6 +874,7 @@ def parse_trace(text):
         "wait_total": int(fields["wait_total"]),
         "staged_count": int(fields["staged_count"]),
         "degraded": fields["degraded"] == "true",
+        "superseded_epochs": int(fields["superseded_epochs"]),
     }
 
 inputs = [json.loads(line) for line in input_path.read_text().splitlines() if line]
@@ -1107,6 +1112,147 @@ env \
   RUST_LOG="$RUST_LOG" \
   "$ROOT/tools/test-resize-overhaul-window-shell-nested.sh"
 [[ -s "$EXTENDED_PROOF" && -s "$EXTENDED_METRICS" ]]
+
+if ! python3 - \
+  "$CLIENT_LOG_NORMAL" \
+  "$BURST_INPUT" \
+  "$BURST_TRACE_START_LINE" \
+  > "$LIFECYCLE_METRICS" 2>> "$ANALYSIS_LOG" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+log_path = pathlib.Path(sys.argv[1])
+input_path = pathlib.Path(sys.argv[2])
+burst_start_line = int(sys.argv[3])
+lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+inputs = [json.loads(line) for line in input_path.read_text().splitlines() if line]
+release = next((event for event in reversed(inputs) if event["action"] == "release"), None)
+if release is None:
+    raise SystemExit("burst input has no final release")
+release_sequence = int(release["sequence"])
+
+event_pattern = re.compile(
+    r"pointer-interaction event interaction=(?P<interaction>\d+) "
+    r"event_sequence=(?P<sequence>\d+) .* phase=ButtonRelease terminal=true$"
+)
+capture_pattern = re.compile(
+    r"pointer-policy capture released interaction=(?P<interaction>\d+) "
+    r"event_sequence=(?P<sequence>\d+) phase=ButtonRelease$"
+)
+claim_pattern = re.compile(
+    r"pointer-interaction claimed interaction=(?P<interaction>\d+) "
+    r"event_sequence=(?P<sequence>\d+) .* request=(?P<request>\d+)$"
+)
+accepted_pattern = re.compile(
+    r"accepted synchronized layout actor=workspace request=(?P<request>\d+) "
+    r"interaction=(?P<interaction>\d+) event_sequence=(?P<sequence>\d+) "
+)
+mailbox_pattern = re.compile(
+    r"accepted synchronized layout terminal mailbox actor=workspace "
+    r"actor_generation=\d+ request=(?P<request>\d+) "
+    r"interaction=(?P<interaction>\d+) event_sequence=(?P<sequence>\d+)$"
+)
+
+def find_after(start, pattern, predicate):
+    for index in range(start, len(lines)):
+        match = pattern.search(lines[index])
+        if match is not None and predicate(match):
+            return index + 1, match
+    raise SystemExit(f"missing lifecycle evidence after line {start}: {pattern.pattern}")
+
+event_line, event = find_after(
+    burst_start_line,
+    event_pattern,
+    lambda match: int(match["sequence"]) == release_sequence,
+)
+interaction = int(event["interaction"])
+capture_line, _ = find_after(
+    event_line,
+    capture_pattern,
+    lambda match: (
+        int(match["interaction"]) == interaction
+        and int(match["sequence"]) == release_sequence
+    ),
+)
+claim_line, claim = find_after(
+    capture_line,
+    claim_pattern,
+    lambda match: (
+        int(match["interaction"]) == interaction
+        and int(match["sequence"]) == release_sequence
+    ),
+)
+request = int(claim["request"])
+accepted_line, _ = find_after(
+    claim_line,
+    accepted_pattern,
+    lambda match: (
+        int(match["request"]) == request
+        and int(match["interaction"]) == interaction
+        and int(match["sequence"]) == release_sequence
+    ),
+)
+mailbox_line, _ = find_after(
+    accepted_line,
+    mailbox_pattern,
+    lambda match: (
+        int(match["request"]) == request
+        and int(match["interaction"]) == interaction
+        and int(match["sequence"]) == release_sequence
+    ),
+)
+retired_pattern = re.compile(
+    rf"pointer-interaction retired interaction={interaction} "
+    r"reason=terminal-request-notification-delivered$"
+)
+retired_line, _ = find_after(mailbox_line, retired_pattern, lambda _match: True)
+
+paint_pattern = re.compile(
+    r"resize-paint-order ordinary_panes=(?P<ordinary>\d+) "
+    r"dividers=(?P<dividers>\d+) explicit_overlay_panes=(?P<overlay>\d+) "
+    r"elevated_overlay_panes=(?P<elevated>\d+) "
+    r"low_z_divider_over_ordinary=true$"
+)
+paint_line, paint = find_after(0, paint_pattern, lambda match: (
+    int(match["ordinary"]) > 0 and int(match["dividers"]) > 0
+))
+
+ordering = [event_line, capture_line, claim_line, accepted_line, mailbox_line, retired_line]
+if ordering != sorted(ordering) or len(set(ordering)) != len(ordering):
+    raise SystemExit(f"interaction lifecycle order is invalid: {ordering}")
+
+print(json.dumps({
+    "interaction": interaction,
+    "event_sequence": release_sequence,
+    "request_id": request,
+    "lines": {
+        "released_recorded": event_line,
+        "capture_cleared": capture_line,
+        "exact_pair_claimed": claim_line,
+        "request_accepted": accepted_line,
+        "terminal_mailbox_accepted": mailbox_line,
+        "exact_claim_retired": retired_line,
+        "low_z_paint": paint_line,
+    },
+    "paint": {
+        "ordinary_panes": int(paint["ordinary"]),
+        "dividers": int(paint["dividers"]),
+        "low_z_divider_over_ordinary": True,
+    },
+    "assertions": {
+        "release_registry_precedes_capture_clear": event_line < capture_line,
+        "final_release_accepted_after_capture_clear": capture_line < accepted_line,
+        "exact_claim_retires_after_terminal_mailbox": mailbox_line < retired_line,
+        "low_z_divider_fixture_presented": True,
+    },
+}, indent=2, sort_keys=True))
+PY
+then
+  cat "$ANALYSIS_LOG" >&2
+  exit 1
+fi
 
 python3 - \
   "$CLIENT_LOG_NORMAL" \
@@ -1989,11 +2135,12 @@ then
 fi
 
 MERGED_METRICS="$OUT/metrics-merged.json"
-jq --slurp '.[0] + {fiducials: .[1], burst: .[2], window_shell: .[3]}' \
+jq --slurp '.[0] + {fiducials: .[1], burst: .[2], window_shell: .[3], interaction_lifecycle: .[4]}' \
   "$METRICS" \
   "$FIDUCIAL_METRICS" \
   "$BURST_METRICS" \
   "$EXTENDED_METRICS" \
+  "$LIFECYCLE_METRICS" \
   > "$MERGED_METRICS"
 mv "$MERGED_METRICS" "$METRICS"
 
@@ -2132,6 +2279,24 @@ proof = {
             and metrics["burst"]["release"]["matches_projected_target"]
             and metrics["burst"]["release"]["matches_pointer_coordinate"]
         ),
+        "low_z_divider_visible_over_ordinary_pane": (
+            metrics["one_device_pixel_divider_every_frame"]
+            and metrics["interaction_lifecycle"]["assertions"]["low_z_divider_fixture_presented"]
+        ),
+        "release_registry_precedes_capture_clear": (
+            metrics["interaction_lifecycle"]["assertions"]["release_registry_precedes_capture_clear"]
+        ),
+        "final_release_accepted_after_capture_clear": (
+            metrics["interaction_lifecycle"]["assertions"]["final_release_accepted_after_capture_clear"]
+        ),
+        "exact_claim_retires_after_terminal_mailbox": (
+            metrics["interaction_lifecycle"]["assertions"]["exact_claim_retires_after_terminal_mailbox"]
+        ),
+        "explicit_picker_and_keybindings_overlays": (
+            extended_proof["assertions"]["picker_is_explicit_elevated_overlay"]
+            and extended_proof["assertions"]["keybindings_is_explicit_elevated_overlay"]
+            and extended_proof["assertions"]["overlay_close_removes_paint_partition"]
+        ),
         "native_window_live_projection": metrics["window_shell"]["assertions"]["native_window_live_projection"],
         "native_window_root_synchronization": (
             metrics["window_shell"]["assertions"]["native_uses_root_synchronization"]
@@ -2172,6 +2337,7 @@ proof = {
         "pointer_log": "pointer.log",
         "burst_input": "burst-input.jsonl",
         "burst_metrics": "burst-metrics.json",
+        "interaction_lifecycle": "interaction-lifecycle.json",
         "window_shell_proof": "window-shell/proof.json",
         "window_shell_metrics": "window-shell/metrics.json",
         "window_frame_manifest": "window-shell/window-frame-manifest.jsonl",
@@ -2207,6 +2373,11 @@ jq -e '
   and .assertions.burst_staging_bounded == true
   and .assertions.burst_client_survives == true
   and .assertions.burst_release_becomes_durable == true
+  and .assertions.low_z_divider_visible_over_ordinary_pane == true
+  and .assertions.release_registry_precedes_capture_clear == true
+  and .assertions.final_release_accepted_after_capture_clear == true
+  and .assertions.exact_claim_retires_after_terminal_mailbox == true
+  and .assertions.explicit_picker_and_keybindings_overlays == true
   and .assertions.native_window_live_projection == true
   and .assertions.native_window_root_synchronization == true
   and .assertions.recursive_root_atomicity == true

@@ -38,9 +38,11 @@ METRICS="$OUT/metrics.json"
 PROOF="$OUT/proof.json"
 ANALYSIS_LOG="$OUT/analysis-errors.log"
 STARTUP_READINESS="$OUT/startup-readiness.json"
+OVERLAY_METRICS="$OUT/overlay-pane-metrics.json"
+OVERLAY_FRAMES="$OUT/overlay-frames"
 KEYBINDINGS_PATH="$OUT/keybindings.json"
 DATA_HOME="$OUT/data"
-mkdir -p "$PACKAGE" "$WINDOW_FRAMES" "$SIDEBAR_FRAMES" "$DATA_HOME"
+mkdir -p "$PACKAGE" "$WINDOW_FRAMES" "$SIDEBAR_FRAMES" "$OVERLAY_FRAMES" "$DATA_HOME"
 : > "$CLIENT_LOG"
 : > "$INPUT_LOG"
 : > "$WINDOW_MANIFEST"
@@ -694,6 +696,55 @@ send_shell_key() {
     "$INPUT_DURATION_MS" "$INPUT_LOG_CURSOR" compositor-roundtrip
 }
 
+send_overlay_probe_key() {
+  local modifier_mode="$1"
+  local keycode="$2"
+  INPUT_LOG_CURSOR="$(wc -l < "$CLIENT_LOG")"
+  if [[ "$modifier_mode" == "--ctrl-alt" ]]; then
+    wayland_env "$OUT/virtual-keyboard-key" "$keycode"
+  else
+    wayland_env "$OUT/virtual-keyboard-key" "$modifier_mode" "$keycode"
+  fi
+}
+
+wait_overlay_paint_order() {
+  local after_line="$1"
+  local expected_visible="$2"
+  local result=""
+  for _ in $(seq 1 800); do
+    result="$(awk \
+      -v start="$after_line" \
+      -v expected="$expected_visible" '
+        NR <= start || index($0, "resize-paint-order ") == 0 { next }
+        {
+          overlay = elevated = -1
+          for (field_index = 1; field_index <= NF; field_index += 1) {
+            split($field_index, pair, "=")
+            if (pair[1] == "explicit_overlay_panes") overlay = pair[2] + 0
+            if (pair[1] == "elevated_overlay_panes") elevated = pair[2] + 0
+          }
+          if ((expected == 1 && overlay > 0 && elevated > 0) \
+              || (expected == 0 && overlay == 0 && elevated == 0)) {
+            print NR "\t" substr($0, index($0, "resize-paint-order "))
+            exit
+          }
+        }
+      ' "$CLIENT_LOG")"
+    if [[ -n "$result" ]]; then
+      OVERLAY_PAINT_LINE="${result%%$'\t'*}"
+      OVERLAY_PAINT_TEXT="${result#*$'\t'}"
+      return 0
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || {
+      echo "ERR production shell client exited waiting for overlay paint order" >&2
+      return 1
+    }
+    sleep 0.025
+  done
+  echo "ERR timed out waiting for overlay paint order expected_visible=$expected_visible" >&2
+  return 1
+}
+
 start_root_pointer_sequence() {
   coproc ROOT_POINTER {
     wayland_env "$OUT/virtual-pointer-input" sequence "$LOGICAL_WIDTH" "$LOGICAL_HEIGHT"
@@ -1144,6 +1195,124 @@ if ! python3 tools/analyze-resize-overhaul-window-shell.py \
   exit 1
 fi
 
+# Exercise both production overlay actors after the fixed capture set has been
+# analyzed. Each actor must publish an explicit OverlayPane that the renderer
+# places after the applicable native dividers. Closing it must remove that
+# overlay classification again.
+OVERLAY_PROBES="$OUT/overlay-probes.jsonl"
+: > "$OVERLAY_PROBES"
+probe_explicit_overlay() {
+  local name="$1"
+  local modifier_mode="$2"
+  local keycode="$3"
+  local reason="$4"
+  local open_request open_accepted_line open_promoted_line open_terminal_line
+  local visible_paint_line visible_paint_text hidden_paint_line hidden_paint_text
+  local close_request close_accepted_line close_promoted_line close_terminal_line
+
+  send_overlay_probe_key "$modifier_mode" "$keycode"
+  wait_session_request "$INPUT_LOG_CURSOR" zero "$reason"
+  open_request="$ACCEPTED_REQUEST"
+  open_accepted_line="$ACCEPTED_LINE"
+  wait_resize_trace "$ACCEPTED_EVENT_SEQUENCE" "$ACCEPTED_EPOCH" projected "$ACCEPTED_LINE"
+  wait_resize_trace "$ACCEPTED_EVENT_SEQUENCE" "$ACCEPTED_EPOCH" promoted "$RESIZE_TRACE_LINE"
+  open_promoted_line="$RESIZE_TRACE_LINE"
+  wait_session_completed "$ACCEPTED_REQUEST" "$RESIZE_TRACE_LINE"
+  open_terminal_line="$TERMINAL_LINE"
+  wait_overlay_paint_order "$open_accepted_line" 1
+  visible_paint_line="$OVERLAY_PAINT_LINE"
+  visible_paint_text="$OVERLAY_PAINT_TEXT"
+  wayland_env grim -l 0 -o "$OUTPUT_NAME" "$OVERLAY_FRAMES/${name}-visible.png"
+  [[ -s "$OVERLAY_FRAMES/${name}-visible.png" ]]
+
+  send_overlay_probe_key --none 1
+  wait_session_request "$INPUT_LOG_CURSOR" zero "$reason"
+  close_request="$ACCEPTED_REQUEST"
+  close_accepted_line="$ACCEPTED_LINE"
+  wait_resize_trace "$ACCEPTED_EVENT_SEQUENCE" "$ACCEPTED_EPOCH" projected "$ACCEPTED_LINE"
+  wait_resize_trace "$ACCEPTED_EVENT_SEQUENCE" "$ACCEPTED_EPOCH" promoted "$RESIZE_TRACE_LINE"
+  close_promoted_line="$RESIZE_TRACE_LINE"
+  wait_session_completed "$ACCEPTED_REQUEST" "$RESIZE_TRACE_LINE"
+  close_terminal_line="$TERMINAL_LINE"
+  wait_overlay_paint_order "$close_accepted_line" 0
+  hidden_paint_line="$OVERLAY_PAINT_LINE"
+  hidden_paint_text="$OVERLAY_PAINT_TEXT"
+
+  jq -cn \
+    --arg actor "$name" \
+    --argjson open_request "$open_request" \
+    --argjson open_accepted_line "$open_accepted_line" \
+    --argjson open_promoted_line "$open_promoted_line" \
+    --argjson open_terminal_line "$open_terminal_line" \
+    --argjson visible_paint_line "$visible_paint_line" \
+    --arg visible_paint "$visible_paint_text" \
+    --argjson close_request "$close_request" \
+    --argjson close_accepted_line "$close_accepted_line" \
+    --argjson close_promoted_line "$close_promoted_line" \
+    --argjson close_terminal_line "$close_terminal_line" \
+    --argjson hidden_paint_line "$hidden_paint_line" \
+    --arg hidden_paint "$hidden_paint_text" \
+    '{actor:$actor,
+      open:{request:$open_request,accepted_line:$open_accepted_line,
+        promoted_line:$open_promoted_line,terminal_line:$open_terminal_line,
+        paint_line:$visible_paint_line,paint:$visible_paint},
+      close:{request:$close_request,accepted_line:$close_accepted_line,
+        promoted_line:$close_promoted_line,terminal_line:$close_terminal_line,
+        paint_line:$hidden_paint_line,paint:$hidden_paint}}' \
+    >> "$OVERLAY_PROBES"
+}
+
+# Linux evdev KEY_P=25, KEY_SLASH=53, and KEY_ESC=1.
+probe_explicit_overlay picker --ctrl-alt 25 picker
+probe_explicit_overlay keybindings --ctrl-shift-only 53 keybindings
+
+python3 - "$OVERLAY_PROBES" > "$OVERLAY_METRICS" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+    if line
+]
+paint_pattern = re.compile(
+    r"resize-paint-order ordinary_panes=(?P<ordinary>\d+) "
+    r"dividers=(?P<dividers>\d+) explicit_overlay_panes=(?P<overlay>\d+) "
+    r"elevated_overlay_panes=(?P<elevated>\d+) "
+    r"low_z_divider_over_ordinary=(?:true|false)$"
+)
+if [record["actor"] for record in records] != ["picker", "keybindings"]:
+    raise SystemExit(f"wrong production overlay probes: {records}")
+for record in records:
+    visible = paint_pattern.fullmatch(record["open"]["paint"])
+    hidden = paint_pattern.fullmatch(record["close"]["paint"])
+    if visible is None or hidden is None:
+        raise SystemExit(f"invalid overlay paint trace: {record}")
+    if int(visible["overlay"]) < 1 or int(visible["elevated"]) < 1:
+        raise SystemExit(f"visible actor was not elevated above divider chrome: {record}")
+    if int(hidden["overlay"]) != 0 or int(hidden["elevated"]) != 0:
+        raise SystemExit(f"closed actor remained in the paint partition: {record}")
+    for phase in ("open", "close"):
+        evidence = record[phase]
+        if not (
+            evidence["accepted_line"] < evidence["promoted_line"]
+            < evidence["terminal_line"]
+        ):
+            raise SystemExit(f"overlay transaction order is invalid: {record}")
+
+print(json.dumps({
+    "verified": True,
+    "actors": records,
+    "assertions": {
+        "picker_is_explicit_elevated_overlay": True,
+        "keybindings_is_explicit_elevated_overlay": True,
+        "overlay_close_removes_paint_partition": True,
+    },
+}, indent=2, sort_keys=True))
+PY
+
 mapfile -t WINDOW_FRAME_FILES < <(
   find "$WINDOW_FRAMES" -maxdepth 1 -name '*.png' -type f | sort
 )
@@ -1178,6 +1347,7 @@ fi
 jq -n \
   --slurpfile metrics "$METRICS" \
   --slurpfile startup "$STARTUP_READINESS" \
+  --slurpfile overlays "$OVERLAY_METRICS" \
   --arg output_name "$OUTPUT_NAME" \
   --argjson output_scale "$OUTPUT_SCALE" \
   --argjson native_burst_elapsed_ms "$NATIVE_BURST_ELAPSED_MS" \
@@ -1191,6 +1361,7 @@ jq -n \
     output:{name:$output_name,scale:$output_scale},
     metrics:$metrics[0],
     startup_readiness:$startup[0],
+    overlay_panes:$overlays[0],
     native_configure_burst:{
       captured_steps:3,
       elapsed_ms:$native_burst_elapsed_ms,
@@ -1210,7 +1381,13 @@ jq -n \
       native_configure_burst_input_spacing_bounded:
         ($native_burst_max_input_spacing_ms < 120),
       native_configure_burst_has_no_rejections:true,
-      no_ordinary_layout_during_native_completion:true
+      no_ordinary_layout_during_native_completion:true,
+      picker_is_explicit_elevated_overlay:
+        $overlays[0].assertions.picker_is_explicit_elevated_overlay,
+      keybindings_is_explicit_elevated_overlay:
+        $overlays[0].assertions.keybindings_is_explicit_elevated_overlay,
+      overlay_close_removes_paint_partition:
+        $overlays[0].assertions.overlay_close_removes_paint_partition
     }),
     artifacts:{
       window_frame_manifest:"window-frame-manifest.jsonl",
@@ -1220,6 +1397,8 @@ jq -n \
       metrics:"metrics.json",
       client_log:"client.log",
       startup_readiness:"startup-readiness.json",
+      overlay_pane_metrics:"overlay-pane-metrics.json",
+      overlay_frames:"overlay-frames",
       window_contact_sheet:"window-contact-sheet.png",
       window_animation:"window-resize.gif",
       sidebar_contact_sheet:"sidebar-contact-sheet.png",

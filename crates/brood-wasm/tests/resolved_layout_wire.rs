@@ -1,6 +1,7 @@
 use brood_wasm::{
-    CursorRole, DividerAxis, DividerRole, InteractionZone, LayoutDivider, LayoutItemId, LocalPoint,
-    LocalTransform, PointerEventMask, ResolvedLayout, ZoneInputBehavior,
+    CursorRole, DividerAxis, DividerRole, InputBehavior, InteractionZone, LayoutDivider,
+    LayoutItemId, LayoutItemKind, LocalPoint, LocalTransform, PointerEventMask, ResolvedLayout,
+    ResolvedLayoutItem, ZoneInputBehavior,
 };
 
 const fn transform(u: f64, v: f64, width: f64, height: f64) -> LocalTransform {
@@ -11,6 +12,26 @@ const fn transform(u: f64, v: f64, width: f64, height: f64) -> LocalTransform {
             v: height,
         },
     }
+}
+
+#[test]
+fn overlay_pane_has_an_explicit_wire_kind() {
+    let item = ResolvedLayoutItem {
+        id: LayoutItemId(9),
+        kind: LayoutItemKind::OverlayPane { pane: 41 },
+        z: 100.0,
+        transform: transform(-0.5, -0.5, 1.0, 1.0),
+        input: InputBehavior::Pane,
+    };
+    let encoded = serde_json::to_value(item).expect("encode overlay pane");
+    assert_eq!(encoded["kind"]["type"], "overlay-pane");
+    assert_eq!(encoded["kind"]["pane"], 41);
+    assert_eq!(
+        serde_json::from_value::<ResolvedLayoutItem>(encoded)
+            .expect("decode overlay pane")
+            .kind,
+        LayoutItemKind::OverlayPane { pane: 41 }
+    );
 }
 
 #[test]

@@ -3173,7 +3173,7 @@ fn publish_layout(
         let picker_width = (720.0 / width).clamp(0.45, 0.88);
         let picker_height = (480.0 / height).clamp(0.40, 0.82);
         layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":100,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
+            "{{\"id\":{},\"kind\":{{\"type\":\"overlay-pane\",\"pane\":{}}},\"z\":100,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
             picker,
             picker,
             -picker_width,
@@ -3184,7 +3184,7 @@ fn publish_layout(
     }
     if keybindings_visible && let Some(keybindings) = keybindings_pane {
         layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":110,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":2,\"v\":2}}}},\"input\":\"pane\"}}",
+            "{{\"id\":{},\"kind\":{{\"type\":\"overlay-pane\",\"pane\":{}}},\"z\":110,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":2,\"v\":2}}}},\"input\":\"pane\"}}",
             keybindings,
             keybindings
         ));
@@ -3349,11 +3349,16 @@ fn publish_synchronized_layout_attempt(
         return Vec::new();
     }
 
+    let item_pane = |item: &serde_json::Value| {
+        item["kind"]["pane"]
+            .as_u64()
+            .or_else(|| item["kind"]["overlay-pane"]["pane"].as_u64())
+    };
     let explicit_panes = layout["items"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|item| item["kind"]["pane"].as_u64())
+        .filter_map(item_pane)
         .collect::<BTreeSet<_>>();
     let shell_panes = [
         Some(state.pane),
@@ -3387,8 +3392,7 @@ fn publish_synchronized_layout_attempt(
             layout["items"]
                 .as_array()?
                 .iter()
-                .find(|item| item["kind"]["pane"].as_u64() == Some(pane))?["transform"]["size"]
-                [axis]
+                .find(|item| item_pane(item) == Some(pane))?["transform"]["size"][axis]
                 .as_f64()
                 .map(|normalized| normalized * pixels / 2.0)
         })
@@ -3420,7 +3424,7 @@ fn publish_synchronized_layout_attempt(
         return Vec::new();
     };
     state.next_layout_request = request_id;
-    let event_sequence = pointer_event_sequence.unwrap_or(request_id);
+    let event_sequence = pointer_event_sequence.unwrap_or(0);
     eprintln!(
         "session-switcher-layout-transaction request_id={request_id} reason={reason} event_sequence={event_sequence} native_resize_revision={} rest_width={rest_width:.3} rest_height={rest_height:.3} sidebar_width={sidebar_width:.3} inbox_width={inbox_width:.3} status_height={status_height:.3} focus={} wait_for_panes={wait_for_panes:?}",
         native_resize_revision.unwrap_or(0),
@@ -3437,7 +3441,9 @@ fn publish_synchronized_layout_attempt(
         serde_json::Value::String("submit-synchronized-layout".to_string()),
     );
     request.insert("request_id".to_string(), request_id.into());
-    request.insert("event_sequence".to_string(), event_sequence.into());
+    if let Some(event_sequence) = pointer_event_sequence {
+        request.insert("event_sequence".to_string(), event_sequence.into());
+    }
     if let Some(interaction) = interaction {
         request.insert("interaction".to_string(), interaction.into());
     }
@@ -4464,6 +4470,51 @@ mod tests {
     }
 
     #[test]
+    fn picker_and_keybinding_surfaces_are_explicit_overlay_panes() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.status_bar_pane = Some(2);
+        state.inbox_pane = Some(3);
+        state.picker_pane = Some(4);
+        state.keybindings_pane = Some(5);
+        state.picker_visible = true;
+        state.keybindings_visible = true;
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 3,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
+            visible_panes,
+            focused_pane: Some(4),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+
+        let commands = publish_layout(&state, true, Some(5));
+        let value: serde_json::Value =
+            serde_json::from_slice(host_command(&commands, "set-resolved-layout"))
+                .expect("valid layout JSON");
+        let items = value["layout"]["items"].as_array().expect("layout items");
+        for pane in [4, 5] {
+            let item = items
+                .iter()
+                .find(|item| item["id"] == pane)
+                .expect("overlay pane item");
+            assert_eq!(item["kind"]["type"], "overlay-pane");
+            assert_eq!(item["kind"]["pane"], pane);
+        }
+    }
+
+    #[test]
     fn initial_root_layout_waits_for_the_complete_shell_catalogue() {
         let mut state = SwitcherState::new();
         state.pane = 1;
@@ -4546,20 +4597,25 @@ mod tests {
         });
 
         let commands = publish_synchronized_layout(&mut state, Some(4), "native", Some(23));
-        let [ActorCommand::SendHostMessage(policy), ActorCommand::SendHostMessage(body)] =
-            commands.as_slice()
+        let [
+            ActorCommand::SendHostMessage(policy),
+            ActorCommand::SendHostMessage(body),
+        ] = commands.as_slice()
         else {
             panic!("native update did not select policy before its synchronized transaction");
         };
         let policy: serde_json::Value =
             serde_json::from_slice(policy).expect("pointer-policy JSON");
         assert_eq!(policy["type"], "set-pointer-policy");
-        assert_eq!(policy["lease"], serde_json::json!({"id": 4, "generation": 2}));
+        assert_eq!(
+            policy["lease"],
+            serde_json::json!({"id": 4, "generation": 2})
+        );
         assert_eq!(policy["provider"], "workspace");
         let value: serde_json::Value = serde_json::from_slice(body).expect("transaction JSON");
         assert_eq!(value["type"], "submit-synchronized-layout");
         assert_eq!(value["request_id"], 1);
-        assert_eq!(value["event_sequence"], 1);
+        assert!(value.get("event_sequence").is_none());
         assert_eq!(value["native_resize_revision"], 23);
         assert_eq!(value["inventory_revision"], 9);
         assert_eq!(value["base_layout_revision"], 17);
@@ -4814,11 +4870,8 @@ mod tests {
         let first = publish_synchronized_layout(&mut state, Some(6), "native", Some(23));
         assert_eq!(first.len(), 2);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(host_command(
-                &first,
-                "set-pointer-policy"
-            ))
-            .expect("initial native pointer policy")["lease"],
+            serde_json::from_slice::<serde_json::Value>(host_command(&first, "set-pointer-policy"))
+                .expect("initial native pointer policy")["lease"],
             serde_json::json!({"id": 4, "generation": 2})
         );
 
@@ -4831,15 +4884,20 @@ mod tests {
                 &super::decode_layout_transaction_notification(notification.as_bytes())
                     .expect("busy rejection"),
             );
-            let [ActorCommand::SendHostMessage(policy), ActorCommand::SendHostMessage(body)] =
-                commands.as_slice()
+            let [
+                ActorCommand::SendHostMessage(policy),
+                ActorCommand::SendHostMessage(body),
+            ] = commands.as_slice()
             else {
                 panic!("busy native rejection did not select policy before its retry");
             };
             let policy: serde_json::Value =
                 serde_json::from_slice(policy).expect("native retry pointer-policy JSON");
             assert_eq!(policy["type"], "set-pointer-policy");
-            assert_eq!(policy["lease"], serde_json::json!({"id": 4, "generation": 2}));
+            assert_eq!(
+                policy["lease"],
+                serde_json::json!({"id": 4, "generation": 2})
+            );
             let request: serde_json::Value =
                 serde_json::from_slice(body).expect("native retry JSON");
             assert_eq!(request["request_id"], rejected_request + 1);

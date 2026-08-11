@@ -162,8 +162,15 @@ that the resulting pane is visible and belongs to the submitting subtree.
 ## Flat Resolved Layout
 
 A resolved layout is a flat, client-validated presentation description. It may
-contain pane items, placeholders, handles, chrome, and overlays. Each item has
-a stable item ID, normalized transform, z value, and input behavior.
+contain pane items, overlay pane items, placeholders, handles, chrome, and
+overlay metadata. Each item has a stable item ID, normalized transform, z
+value, and input behavior.
+
+An ordinary pane is base content. The client paints all ordinary panes before
+native dividers and chrome, even when a pane has a higher z value. An explicit
+overlay pane can paint after the intersecting dividers that have a lower z
+value. If an intersecting divider has a higher z value, the overlay pane stays
+in the base pane phase. Overlay metadata does not create visual content.
 
 Pane items must reference an available pane identity in the current client
 catalog and may appear at most once. Frame readiness is not part of layout
@@ -191,6 +198,14 @@ message. The layout actor owns the durable split ratio. If that message changes
 geometry, the actor submits one synchronized layout command containing its
 lease token, inventory and base-layout revisions, target fragment, presentation
 mode, and explicit pane wait set.
+
+The host issues each interaction ID and records each event sequence only after
+normal actor delivery succeeds. The record is bound to the exact lease token
+and holder actor generation. An interaction-bound synchronized request is valid
+only when its interaction and event sequence match this host record. The host
+keeps the final release or cancel sequence after capture ends, so the actor can
+submit the final layout request. It removes the record only after the actor
+mailbox accepts the terminal result for that request.
 
 After validation, the client allocates a resize epoch, projects the last visible
 content into the target geometry, and notifies all affected panes together.

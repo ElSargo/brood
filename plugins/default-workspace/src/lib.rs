@@ -205,7 +205,7 @@ struct SynchronizedRequestContext {
     fullscreen: bool,
     lease: LayoutLeaseToken,
     interaction: Option<u64>,
-    event_sequence: u64,
+    event_sequence: Option<u64>,
     request_id: u64,
     native_resize_revision: Option<u64>,
     split_ratio: f32,
@@ -422,7 +422,7 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
                     fullscreen,
                     lease,
                     interaction: None,
-                    event_sequence: request_id,
+                    event_sequence: None,
                     request_id,
                     native_resize_revision: Some(native_resize_revision),
                     split_ratio: durable_primary_split_ratio(),
@@ -1233,7 +1233,7 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
             fullscreen: false,
             lease,
             interaction: Some(interaction),
-            event_sequence,
+            event_sequence: Some(event_sequence),
             request_id,
             native_resize_revision: None,
             split_ratio: primary_split_ratio(),
@@ -1287,8 +1287,10 @@ fn write_synchronized_layout_outbox(
         payload.bytes(br#", "interaction":"#);
         payload.u64(interaction);
     }
-    payload.bytes(br#", "event_sequence":"#);
-    payload.u64(request.event_sequence);
+    if let Some(event_sequence) = request.event_sequence {
+        payload.bytes(br#", "event_sequence":"#);
+        payload.u64(event_sequence);
+    }
     if let Some(native_resize_revision) = request.native_resize_revision {
         payload.bytes(br#", "native_resize_revision":"#);
         payload.u64(native_resize_revision);
@@ -1434,10 +1436,7 @@ fn write_set_resolved_layout_payload(
     payload.byte(b'}');
 }
 
-fn write_set_pointer_policy_payload(
-    payload: &mut PayloadWriter<'_, '_>,
-    lease: LayoutLeaseToken,
-) {
+fn write_set_pointer_policy_payload(payload: &mut PayloadWriter<'_, '_>, lease: LayoutLeaseToken) {
     payload.bytes(br#"{"type":"set-pointer-policy","lease":{"id":"#);
     payload.u64(lease.id);
     payload.bytes(br#", "generation":"#);
@@ -1554,7 +1553,10 @@ fn write_divider_payload(payload: &mut PayloadWriter<'_, '_>, transform: LayoutT
     writer.u64(DIVIDER_ITEM_ID);
     writer.bytes(br#", "zone":"#);
     writer.u64(DIVIDER_ZONE_ID);
-    writer.bytes(br#", "z":1001,"transform":{"offset":{"u":"#);
+    // Native chrome is a separate paint phase. Keep this divider below the
+    // ordinary pane items so the real proof detects any z-only paint-order
+    // regression.
+    writer.bytes(br#", "z":-100,"transform":{"offset":{"u":"#);
     writer.f32(transform.offset_u);
     writer.bytes(br#", "v":"#);
     writer.f32(transform.offset_v);
@@ -2137,6 +2139,20 @@ mod tests {
             motion["fragment"]["layout"]["dividers"][0]["zone"],
             DIVIDER_ZONE_ID
         );
+        assert!(
+            motion["fragment"]["layout"]["dividers"][0]["z"]
+                .as_f64()
+                .is_some_and(|divider_z| {
+                    motion["fragment"]["layout"]["items"]
+                        .as_array()
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["z"].as_f64().is_some_and(|pane_z| pane_z > divider_z)
+                            })
+                        })
+                }),
+            "the real actor fixture must keep its divider below ordinary pane content"
+        );
         let zone_width = motion["fragment"]["layout"]["zones"][0]["transform"]["size"]["u"]
             .as_f64()
             .unwrap();
@@ -2275,7 +2291,7 @@ mod tests {
                     generation: 2,
                 },
                 interaction: None,
-                event_sequence: 9,
+                event_sequence: None,
                 request_id: 9,
                 native_resize_revision: Some(41),
                 split_ratio: durable_primary_split_ratio(),
@@ -2284,15 +2300,12 @@ mod tests {
         let messages = host_payloads(&output, len);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["type"], "set-pointer-policy");
-        assert_eq!(
-            messages[0]["lease"],
-            json!({"id": 5, "generation": 2})
-        );
+        assert_eq!(messages[0]["lease"], json!({"id": 5, "generation": 2}));
         assert_eq!(messages[0]["provider"], "workspace");
         let request = &messages[1];
         assert_eq!(request["type"], "submit-synchronized-layout");
         assert_eq!(request["native_resize_revision"], 41);
-        assert_eq!(request["event_sequence"], 9);
+        assert!(request.get("event_sequence").is_none());
         assert_eq!(request["focus"], 22);
         assert!(request.get("interaction").is_none());
         assert_eq!(request["wait_for_panes"], json!([22]));

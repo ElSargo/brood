@@ -21,6 +21,9 @@ pub fn convert_actor_layout(layout: brood_wasm::ResolvedLayout) -> ResolvedLayou
                 id: LayoutItemId(item.id.0),
                 kind: match item.kind {
                     brood_wasm::LayoutItemKind::Pane { pane } => LayoutItemKind::Pane { pane },
+                    brood_wasm::LayoutItemKind::OverlayPane { pane } => {
+                        LayoutItemKind::OverlayPane { pane }
+                    }
                     brood_wasm::LayoutItemKind::Placeholder => LayoutItemKind::Placeholder,
                     brood_wasm::LayoutItemKind::Handle => LayoutItemKind::Handle,
                     brood_wasm::LayoutItemKind::Chrome => LayoutItemKind::Chrome,
@@ -165,7 +168,9 @@ pub fn native_flat_dividers(layout: &ResolvedLayout, extent: LayoutSize) -> Vec<
         .items
         .iter()
         .filter_map(|item| match item.kind {
-            LayoutItemKind::Pane { .. } => Some(item.pixel_rect(extent)),
+            LayoutItemKind::Pane { .. } | LayoutItemKind::OverlayPane { .. } => {
+                Some(item.pixel_rect(extent))
+            }
             LayoutItemKind::Placeholder
             | LayoutItemKind::Handle
             | LayoutItemKind::Chrome

@@ -156,6 +156,7 @@ pub struct ResolvedLayoutItem {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LayoutItemKind {
     Pane { pane: u64 },
+    OverlayPane { pane: u64 },
     Placeholder,
     Handle,
     Chrome,

@@ -83,7 +83,7 @@ impl ResolvedLayout {
             }
             item.transform.validate(item.id)?;
             match item.kind {
-                LayoutItemKind::Pane { pane } => {
+                LayoutItemKind::Pane { pane } | LayoutItemKind::OverlayPane { pane } => {
                     if !valid_panes.contains(&pane) {
                         return Err(ResolvedLayoutError(format!(
                             "resolved layout references unknown pane {pane}"
@@ -96,7 +96,7 @@ impl ResolvedLayout {
                     }
                     if item.input != InputBehavior::Pane {
                         return Err(ResolvedLayoutError(format!(
-                            "pane item {} must use pane input behavior",
+                            "pane content item {} must use pane input behavior",
                             item.id.0
                         )));
                     }
@@ -152,10 +152,14 @@ impl ResolvedLayout {
 
     #[must_use]
     pub fn pane_item(&self, pane: u64) -> Option<&ResolvedLayoutItem> {
-        self.items
-            .iter()
-            .rev()
-            .find(|item| item.kind == LayoutItemKind::Pane { pane })
+        self.items.iter().rev().find(|item| {
+            matches!(
+                item.kind,
+                LayoutItemKind::Pane { pane: item_pane }
+                    | LayoutItemKind::OverlayPane { pane: item_pane }
+                    if item_pane == pane
+            )
+        })
     }
 
     #[must_use]
@@ -170,7 +174,12 @@ impl ResolvedLayout {
     pub fn pane_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| matches!(item.kind, LayoutItemKind::Pane { .. }))
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    LayoutItemKind::Pane { .. } | LayoutItemKind::OverlayPane { .. }
+                )
+            })
             .count()
     }
 }
@@ -1246,6 +1255,7 @@ impl ResolvedLayoutItem {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum LayoutItemKind {
     Pane { pane: u64 },
+    OverlayPane { pane: u64 },
     Placeholder,
     Handle,
     Chrome,
