@@ -52,8 +52,8 @@ const INBOX_WIDTH: f64 = 320.0;
 const MIN_SHELL_PANE_WIDTH: f64 = 160.0;
 const MIN_MAIN_AREA_WIDTH: f64 = 240.0;
 const PRIMARY_BUTTON: u32 = 0x110;
-// These IDs are part of the built-in workspace pointer-policy contract. Keep
-// them stable and outside both pane-ID allocator ranges.
+// These are stable lease-local layout identities. Keep them outside both
+// pane-ID allocator ranges so shell chrome cannot collide with pane items.
 const SIDEBAR_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5301;
 const INBOX_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5302;
 const SIDEBAR_DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_5311;
@@ -3128,7 +3128,13 @@ fn publish_layout(
     let status_offset = 1.0 - 2.0 * status_fraction;
     let status_size = 2.0 * status_fraction;
 
-    let mut commands = Vec::new();
+    let mut commands = vec![ActorCommand::SendHostMessage(
+        format!(
+            "{{\"type\":\"set-pointer-policy\",\"lease\":{{\"id\":{},\"generation\":{}}},\"provider\":\"workspace\"}}",
+            message.lease.id, message.lease.generation
+        )
+        .into_bytes(),
+    )];
     if needs_rest {
         let panes = delegated
             .iter()
@@ -3306,11 +3312,23 @@ fn publish_synchronized_layout_attempt(
         state.status = "Layout transaction backlog is full".to_string();
         return Vec::new();
     }
-    let ordinary = publish_layout(state, false, requested_focus);
-    let [ActorCommand::SendHostMessage(ordinary)] = ordinary.as_slice() else {
-        return Vec::new();
-    };
-    let Ok(mut ordinary) = serde_json::from_slice::<serde_json::Value>(ordinary) else {
+    let ordinary_commands = publish_layout(state, false, requested_focus);
+    let pointer_selection = native_resize_revision.and_then(|_| {
+        ordinary_commands.iter().find_map(|command| {
+            let ActorCommand::SendHostMessage(body) = command else {
+                return None;
+            };
+            let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+            (value["type"] == "set-pointer-policy").then(|| body.clone())
+        })
+    });
+    let Some(mut ordinary) = ordinary_commands.iter().find_map(|command| {
+        let ActorCommand::SendHostMessage(body) = command else {
+            return None;
+        };
+        let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+        (value["type"] == "set-resolved-layout").then_some(value)
+    }) else {
         return Vec::new();
     };
     let Some(layout) = ordinary.get_mut("layout").map(serde_json::Value::take) else {
@@ -3470,7 +3488,15 @@ fn publish_synchronized_layout_attempt(
             native_retry_count,
         },
     );
-    vec![ActorCommand::SendHostMessage(body)]
+    let mut commands = Vec::with_capacity(2);
+    if native_resize_revision.is_some() {
+        let Some(pointer_selection) = pointer_selection else {
+            return Vec::new();
+        };
+        commands.push(ActorCommand::SendHostMessage(pointer_selection));
+    }
+    commands.push(ActorCommand::SendHostMessage(body));
+    commands
 }
 
 fn switcher_target_at(state: &SwitcherState, x: f32, y: f32) -> Option<SwitcherTarget> {
@@ -4370,6 +4396,19 @@ mod tests {
         truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
     };
 
+    fn host_command<'a>(commands: &'a [ActorCommand], message_type: &str) -> &'a [u8] {
+        commands
+            .iter()
+            .find_map(|command| {
+                let ActorCommand::SendHostMessage(body) = command else {
+                    return None;
+                };
+                let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+                (value["type"] == message_type).then_some(body.as_slice())
+            })
+            .unwrap_or_else(|| panic!("missing host command type {message_type}"))
+    }
+
     #[test]
     fn empty_startup_layout_shows_switcher_and_status_but_hides_inbox() {
         let mut state = SwitcherState::new();
@@ -4399,9 +4438,12 @@ mod tests {
         });
 
         let commands = publish_layout(&state, true, Some(1));
-        let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
-            panic!("empty startup layout should publish one complete root fragment");
-        };
+        assert_eq!(commands.len(), 2);
+        let body = host_command(&commands, "set-resolved-layout");
+        let policy = host_command(&commands, "set-pointer-policy");
+        let policy: serde_json::Value =
+            serde_json::from_slice(policy).expect("valid pointer-policy selection JSON");
+        assert_eq!(policy["provider"], "workspace");
         let value: serde_json::Value = serde_json::from_slice(body).expect("valid layout JSON");
         let items = value["layout"]["items"].as_array().expect("layout items");
         assert_eq!(items.len(), 2);
@@ -4452,13 +4494,9 @@ mod tests {
 
         state.status_bar_pane = Some(5);
         let commands = publish_layout(&state, true, Some(6));
-        let [
-            ActorCommand::SendHostMessage(delegate),
-            ActorCommand::SendHostMessage(layout),
-        ] = commands.as_slice()
-        else {
-            panic!("complete shell catalogue should delegate and publish exactly once");
-        };
+        assert_eq!(commands.len(), 3);
+        let delegate = host_command(&commands, "delegate-layout-rest");
+        let layout = host_command(&commands, "set-resolved-layout");
         let delegate: serde_json::Value =
             serde_json::from_slice(delegate).expect("valid delegation JSON");
         assert_eq!(delegate["panes"], serde_json::json!([6]));
@@ -4508,9 +4546,16 @@ mod tests {
         });
 
         let commands = publish_synchronized_layout(&mut state, Some(4), "native", Some(23));
-        let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
-            panic!("sidebar update did not produce one synchronized transaction");
+        let [ActorCommand::SendHostMessage(policy), ActorCommand::SendHostMessage(body)] =
+            commands.as_slice()
+        else {
+            panic!("native update did not select policy before its synchronized transaction");
         };
+        let policy: serde_json::Value =
+            serde_json::from_slice(policy).expect("pointer-policy JSON");
+        assert_eq!(policy["type"], "set-pointer-policy");
+        assert_eq!(policy["lease"], serde_json::json!({"id": 4, "generation": 2}));
+        assert_eq!(policy["provider"], "workspace");
         let value: serde_json::Value = serde_json::from_slice(body).expect("transaction JSON");
         assert_eq!(value["type"], "submit-synchronized-layout");
         assert_eq!(value["request_id"], 1);
@@ -4577,9 +4622,8 @@ mod tests {
         state.durable_shell_layout = Some(shell_layout_state(&state, Some(6)));
 
         let initial = publish_layout(&state, false, Some(6));
-        let [ActorCommand::SendHostMessage(initial)] = initial.as_slice() else {
-            panic!("three-column shell did not publish one root fragment");
-        };
+        assert_eq!(initial.len(), 2);
+        let initial = host_command(&initial, "set-resolved-layout");
         let initial: serde_json::Value =
             serde_json::from_slice(initial).expect("initial layout JSON");
         assert_eq!(initial["layout"]["zones"].as_array().map(Vec::len), Some(2));
@@ -4768,7 +4812,15 @@ mod tests {
         });
         state.native_resize_revision = Some(23);
         let first = publish_synchronized_layout(&mut state, Some(6), "native", Some(23));
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(host_command(
+                &first,
+                "set-pointer-policy"
+            ))
+            .expect("initial native pointer policy")["lease"],
+            serde_json::json!({"id": 4, "generation": 2})
+        );
 
         for rejected_request in 1..=2 {
             let notification = format!(
@@ -4779,9 +4831,15 @@ mod tests {
                 &super::decode_layout_transaction_notification(notification.as_bytes())
                     .expect("busy rejection"),
             );
-            let [ActorCommand::SendHostMessage(body)] = commands.as_slice() else {
-                panic!("busy native rejection did not produce one retry");
+            let [ActorCommand::SendHostMessage(policy), ActorCommand::SendHostMessage(body)] =
+                commands.as_slice()
+            else {
+                panic!("busy native rejection did not select policy before its retry");
             };
+            let policy: serde_json::Value =
+                serde_json::from_slice(policy).expect("native retry pointer-policy JSON");
+            assert_eq!(policy["type"], "set-pointer-policy");
+            assert_eq!(policy["lease"], serde_json::json!({"id": 4, "generation": 2}));
             let request: serde_json::Value =
                 serde_json::from_slice(body).expect("native retry JSON");
             assert_eq!(request["request_id"], rejected_request + 1);

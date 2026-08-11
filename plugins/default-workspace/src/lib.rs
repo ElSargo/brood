@@ -38,11 +38,6 @@ const PRIMARY_BUTTON: u32 = 0x110;
 // pane IDs grow down from `u64::MAX`, so chrome must use neither allocator end.
 const DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_4401;
 const DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_4402;
-// Root-shell divider IDs are owned by the session-switcher lease, but the
-// built-in workspace component is also the configured global pointer-policy
-// provider. Route these captures back to their authenticated lease holder.
-const SIDEBAR_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5301;
-const INBOX_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5302;
 const DIVIDER_EVENT_MASK: u8 = 0b1111;
 const MIN_PRIMARY_SPLIT_RATIO: f32 = 0.15;
 const MAX_PRIMARY_SPLIT_RATIO: f32 = 0.85;
@@ -226,7 +221,6 @@ struct LayoutTransform {
 
 #[derive(Deserialize)]
 struct PointerPolicyQuery {
-    zone: u64,
     phase: FixedString<MAX_POINTER_PHASE_BYTES>,
     #[serde(default)]
     button: Option<u32>,
@@ -359,22 +353,17 @@ pub extern "C" fn brood_policy_provider_pointer_workspace(
     let Some(query) = decode_json::<PointerPolicyQuery>(query) else {
         return OUTPUT_ERROR;
     };
-    let Some((capture, actor)) = pointer_capture_decision(&query) else {
+    let Some(capture) = pointer_capture_decision(&query) else {
         return OUTPUT_ABSTAIN;
     };
     finish_response(write_pointer_policy_result(
         response_buffer_mut(),
         capture,
-        actor,
+        "lease-holder",
     ))
 }
 
-fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<(&'static str, &'static str)> {
-    let actor = match query.zone {
-        DIVIDER_ZONE_ID => "workspace",
-        SIDEBAR_DIVIDER_ZONE_ID | INBOX_DIVIDER_ZONE_ID => "session-switcher",
-        _ => return None,
-    };
+fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<&'static str> {
     let capture = match query.phase.as_str() {
         "button-press" if !query.captured && query.button == Some(PRIMARY_BUTTON) => "acquire",
         "motion" if query.captured => "unchanged",
@@ -382,7 +371,7 @@ fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<(&'static str,
         "cancel" if query.captured => "release",
         _ => return None,
     };
-    Some((capture, actor))
+    Some(capture)
 }
 
 #[no_mangle]
@@ -773,7 +762,14 @@ fn write_layout_actor_outbox(
     revision: Option<u64>,
 ) -> i32 {
     let mut writer = Writer::new(output);
-    writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    writer.bytes(br#"{"messages":["#);
+    if let Some(lease) = lease {
+        writer.bytes(br#"{"actor":"host","payload":["#);
+        let mut payload = PayloadWriter::new(&mut writer);
+        write_set_pointer_policy_payload(&mut payload, lease);
+        writer.bytes(br#"]},"#);
+    }
+    writer.bytes(br#"{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
     write_set_resolved_layout_payload(
         &mut payload,
@@ -851,7 +847,14 @@ fn write_layout_actor_update_outbox(
     revision: Option<u64>,
 ) -> i32 {
     let mut writer = Writer::new(output);
-    writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    writer.bytes(br#"{"messages":["#);
+    if let Some(lease) = lease {
+        writer.bytes(br#"{"actor":"host","payload":["#);
+        let mut payload = PayloadWriter::new(&mut writer);
+        write_set_pointer_policy_payload(&mut payload, lease);
+        writer.bytes(br#"]},"#);
+    }
+    writer.bytes(br#"{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
     write_set_resolved_layout_payload(
         &mut payload,
@@ -1274,6 +1277,9 @@ fn write_synchronized_layout_outbox(
         unsafe { (LAYOUT_REVISION, LAYOUT_BASE_PRESENTED_REVISION) };
     let mut writer = Writer::new(output);
     writer.bytes(br#"{"messages":[{"actor":"host","payload":["#);
+    let mut selection = PayloadWriter::new(&mut writer);
+    write_set_pointer_policy_payload(&mut selection, request.lease);
+    writer.bytes(br#"]},{"actor":"host","payload":["#);
     let mut payload = PayloadWriter::new(&mut writer);
     payload.bytes(br#"{"type":"submit-synchronized-layout","request_id":"#);
     payload.u64(request.request_id);
@@ -1426,6 +1432,17 @@ fn write_set_resolved_layout_payload(
         payload.bytes(b"null");
     }
     payload.byte(b'}');
+}
+
+fn write_set_pointer_policy_payload(
+    payload: &mut PayloadWriter<'_, '_>,
+    lease: LayoutLeaseToken,
+) {
+    payload.bytes(br#"{"type":"set-pointer-policy","lease":{"id":"#);
+    payload.u64(lease.id);
+    payload.bytes(br#", "generation":"#);
+    payload.u64(lease.generation);
+    payload.bytes(br#"},"provider":"workspace"}"#);
 }
 
 fn write_resolved_layout_payload(
@@ -1962,16 +1979,27 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    fn host_payload(output: &[u8], len: i32) -> Value {
+    fn host_payloads(output: &[u8], len: i32) -> Vec<Value> {
         assert!(len > 0);
         let envelope: Value = serde_json::from_slice(&output[..len as usize]).unwrap();
-        let encoded = envelope["messages"][0]["payload"]
+        envelope["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|byte| byte.as_u64().unwrap() as u8)
-            .collect::<Vec<_>>();
-        serde_json::from_slice(&encoded).unwrap()
+            .map(|message| {
+                let encoded = message["payload"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+                    .collect::<Vec<_>>();
+                serde_json::from_slice(&encoded).unwrap()
+            })
+            .collect()
+    }
+
+    fn host_payload(output: &[u8], len: i32) -> Value {
+        host_payloads(output, len).pop().unwrap()
     }
 
     fn pointer_message(
@@ -2019,10 +2047,7 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
-        assert_eq!(
-            pointer_capture_decision(&press),
-            Some(("acquire", "workspace"))
-        );
+        assert_eq!(pointer_capture_decision(&press), Some("acquire"));
         let motion: PointerPolicyQuery = decode_json(
             format!(
                 "{{\"zone\":{DIVIDER_ZONE_ID},\"phase\":\"motion\",\"button\":null,\"captured\":true}}"
@@ -2030,34 +2055,28 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
-        assert_eq!(
-            pointer_capture_decision(&motion),
-            Some(("unchanged", "workspace"))
-        );
+        assert_eq!(pointer_capture_decision(&motion), Some("unchanged"));
         let mut policy_output = [0_u8; 512];
-        let policy_len = write_pointer_policy_result(&mut policy_output, "unchanged", "workspace");
+        let policy_len =
+            write_pointer_policy_result(&mut policy_output, "unchanged", "lease-holder");
         let policy: Value = serde_json::from_slice(&policy_output[..policy_len as usize]).unwrap();
         assert_eq!(policy["delivery"], "consume");
         assert_eq!(policy["capture"], "unchanged");
-        assert_eq!(policy["messages"][0]["actor"], "workspace");
-        let shell_zone: PointerPolicyQuery = decode_json(
+        assert_eq!(policy["messages"][0]["actor"], "lease-holder");
+        let arbitrary_zone: PointerPolicyQuery = decode_json(
             format!(
-                "{{\"zone\":{INBOX_DIVIDER_ZONE_ID},\"phase\":\"button-press\",\"button\":{PRIMARY_BUTTON},\"captured\":false}}"
+                "{{\"zone\":7,\"phase\":\"button-press\",\"button\":{PRIMARY_BUTTON},\"captured\":false}}"
             )
             .as_bytes(),
         )
         .unwrap();
-        assert_eq!(
-            pointer_capture_decision(&shell_zone),
-            Some(("acquire", "session-switcher"))
-        );
-        let policy_len =
-            write_pointer_policy_result(&mut policy_output, "acquire", "session-switcher");
+        assert_eq!(pointer_capture_decision(&arbitrary_zone), Some("acquire"));
+        let policy_len = write_pointer_policy_result(&mut policy_output, "acquire", "lease-holder");
         let policy: Value = serde_json::from_slice(&policy_output[..policy_len as usize]).unwrap();
-        assert_eq!(policy["messages"][0]["actor"], "session-switcher");
+        assert_eq!(policy["messages"][0]["actor"], "lease-holder");
         let other_zone: PointerPolicyQuery =
             decode_json(br#"{"zone":7,"phase":"motion","button":null,"captured":true}"#).unwrap();
-        assert_eq!(pointer_capture_decision(&other_zone), None);
+        assert_eq!(pointer_capture_decision(&other_zone), Some("unchanged"));
 
         clear_pointer_interaction();
         reset_resize_proposal_state(0.5);
@@ -2262,7 +2281,15 @@ mod tests {
                 split_ratio: durable_primary_split_ratio(),
             },
         );
-        let request = host_payload(&output, len);
+        let messages = host_payloads(&output, len);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"], "set-pointer-policy");
+        assert_eq!(
+            messages[0]["lease"],
+            json!({"id": 5, "generation": 2})
+        );
+        assert_eq!(messages[0]["provider"], "workspace");
+        let request = &messages[1];
         assert_eq!(request["type"], "submit-synchronized-layout");
         assert_eq!(request["native_resize_revision"], 41);
         assert_eq!(request["event_sequence"], 9);

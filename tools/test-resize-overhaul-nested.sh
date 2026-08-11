@@ -247,6 +247,7 @@ CAPTURE_LANE="normal"
 start_proof_client() {
   local lane="$1"
   local second_actor="$2"
+  local first_actor="${3:-resize-proof-fast}"
   local second_mode="${second_actor#resize-proof-}"
   [[ "$second_mode" != stall ]] || second_mode=stall-once
   local final_diagnostics_line=""
@@ -275,7 +276,7 @@ start_proof_client() {
     "$CLIENT_BIN" \
     --no-server \
     --no-init \
-    --wasm-actor "resize-proof-fast=$RESIZE_PROOF_COMPONENT" \
+    --wasm-actor "$first_actor=$RESIZE_PROOF_COMPONENT" \
     --wasm-actor "$second_actor=$RESIZE_PROOF_COMPONENT" \
     --wasm-actor "session-switcher=$OUT/resize-session-switcher-shim.wasm" \
     --wasm-key-policy workspace "$WORKSPACE_MODULE" \
@@ -371,8 +372,9 @@ start_proof_client() {
           }
         }
       ' "$CLIENT_LOG")"
-    if rg -q 'loaded presentation pointer policy provider=workspace ' "$CLIENT_LOG" \
-      && rg -q 'started presentation WASM actor id=resize-proof-fast ' "$CLIENT_LOG" \
+    if rg -q 'registered pointer-policy provider=workspace ' "$CLIENT_LOG" \
+      && rg -q 'bound pointer-policy provider=workspace .*actor=workspace ' "$CLIENT_LOG" \
+      && rg -q "started presentation WASM actor id=$first_actor " "$CLIENT_LOG" \
       && rg -q "started presentation WASM actor id=$second_actor " "$CLIENT_LOG" \
       && rg -q 'started presentation WASM actor id=session-switcher ' "$CLIENT_LOG" \
       && rg -q "settled presentation window resize .*to=${MODE_WIDTH}x${MODE_HEIGHT} " "$CLIENT_LOG" \
@@ -499,7 +501,9 @@ capture_frame() {
   printf -v frame_number '%04d' "$FRAME_INDEX"
   frame_relative="frames/frame-${frame_number}.png"
   frame_path="$OUT/$frame_relative"
-  wayland_env grim -o "$OUTPUT_NAME" "$frame_path"
+  # Reduce PNG work after the compositor supplies the output buffer. The
+  # proof actors provide the observable trace-to-capture interval.
+  wayland_env grim -l 0 -o "$OUTPUT_NAME" "$frame_path"
   [[ -s "$frame_path" ]]
   digest="$(sha256sum "$frame_path" | awk '{print $1}')"
   captured_ms="$(date +%s%3N)"
@@ -762,7 +766,7 @@ PY
 # Establish a fresh pointer capture, then admit exactly the first motion.  Once
 # that transaction is active, the remaining captured motions and final release
 # are sent back-to-back with only the virtual-pointer roundtrip ACK between
-# them.  The 120ms slow proof pane keeps the first request in flight, making
+# them.  The 120 ms slow proof pane keeps the first request in flight, making
 # the host supersession path deterministic without presentation backpressure.
 send_pointer_command press press
 record_burst_ack capture-press
@@ -1027,7 +1031,10 @@ then
   exit 1
 fi
 
-start_proof_client degraded resize-proof-stall-after-first
+start_proof_client \
+  degraded \
+  resize-proof-stall-after-first \
+  resize-proof-gated-fast
 wait_resize_trace 0 settled 1
 capture_frame timeout-initial-settled 0 initial -1 -1
 TIMEOUT_DIVIDER_X="$(sed -n 's/.* divider_x=\(-\{0,1\}[0-9][0-9]*\) .*/\1/p' <<< "$TRACE_TEXT")"

@@ -20,6 +20,7 @@ use crate::{
     },
     resize::InteractionId,
     resolved_layout::{LayoutItemId, LayoutLeaseToken, LocalPoint},
+    resource_limits::{GenerationStoreLimits, WasmResourceLimits},
 };
 
 pub const DEFAULT_POINTER_POLICY_ARENA_BYTES: usize = 128 * 1024;
@@ -29,6 +30,10 @@ pub const MAX_POINTER_POLICY_RESULT_BYTES: usize = 64 * 1024;
 pub const MAX_POINTER_POLICY_MESSAGES: usize = 64;
 pub const MAX_POINTER_POLICY_ACTOR_BYTES: usize = 256;
 pub const MAX_POINTER_POLICY_MESSAGE_BYTES: usize = 64 * 1024;
+pub const MAX_POINTER_POLICY_MEMORY_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_POINTER_POLICY_TABLE_ELEMENTS: usize = 4096;
+pub const POINTER_POLICY_FUEL_PER_CALL: u64 = 1_000_000;
+pub const POINTER_POLICY_LEASE_HOLDER: &str = "lease-holder";
 
 const POINTER_MODIFIER_MASK: u32 = 0b1111;
 
@@ -108,10 +113,14 @@ pub struct PointerPolicyInvocation<'a> {
 }
 
 pub struct WasmPointerPolicy {
-    store: Store<()>,
+    store: Store<PointerPolicyStore>,
     allocator: GuestArenaAllocator,
     arena: Option<GuestArena>,
     entry: WasmPointerPolicyEntry,
+}
+
+struct PointerPolicyStore {
+    limits: GenerationStoreLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,14 +152,17 @@ impl<'a> PointerPolicyInvocation<'a> {
 
 impl WasmPointerPolicy {
     pub fn load(path: &Path, provider_name: &str) -> Result<Self> {
-        let engine = Engine::default();
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config)
+            .map_err(|error| anyhow::anyhow!("create bounded pointer-policy engine: {error}"))?;
         let module = Module::from_file(&engine, path)
             .map_err(|error| anyhow::anyhow!("load {}: {error}", path.display()))?;
         let declaration = discover_pointer_provider(&module, provider_name)?;
         Self::load_from_module(engine, &module, &declaration)
     }
 
-    pub fn load_from_module(
+    fn load_from_module(
         engine: Engine,
         module: &Module,
         declaration: &PolicyProviderDeclaration,
@@ -172,15 +184,25 @@ impl WasmPointerPolicy {
                     "define inert actor read_message import for pointer provider module: {error}"
                 )
             })?;
-        let mut store = Store::new(&engine, ());
+        let limits = WasmResourceLimits {
+            generation_memory_bytes: MAX_POINTER_POLICY_MEMORY_BYTES,
+            store_table_elements: MAX_POINTER_POLICY_TABLE_ELEMENTS,
+            ..WasmResourceLimits::default()
+        }
+        .store_limits();
+        let mut store = Store::new(&engine, PointerPolicyStore { limits });
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(POINTER_POLICY_FUEL_PER_CALL)
+            .map_err(|error| anyhow::anyhow!("set pointer-policy instantiation fuel: {error}"))?;
         let instance = linker
             .instantiate(&mut store, module)
             .map_err(|error| anyhow::anyhow!("instantiate WASM pointer policy: {error}"))?;
         Self::load_from_instance(store, &instance, declaration)
     }
 
-    pub fn load_from_instance(
-        mut store: Store<()>,
+    fn load_from_instance(
+        mut store: Store<PointerPolicyStore>,
         instance: &Instance,
         declaration: &PolicyProviderDeclaration,
     ) -> Result<Self> {
@@ -200,6 +222,9 @@ impl WasmPointerPolicy {
         &mut self,
         invocation: PointerPolicyInvocation<'_>,
     ) -> Result<PointerPolicyResult> {
+        self.store
+            .set_fuel(POINTER_POLICY_FUEL_PER_CALL)
+            .map_err(|error| anyhow::anyhow!("reset pointer-policy call fuel: {error}"))?;
         validate_pointer_query(invocation.query())?;
         let query = serde_json::to_vec(invocation.query())
             .context("encode pointer policy invocation context")?;

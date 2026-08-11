@@ -14,12 +14,21 @@ use brood_plugin_sdk::{
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const FAST_ACTOR_ID: &str = "resize-proof-fast";
+const GATED_FAST_ACTOR_ID: &str = "resize-proof-gated-fast";
 const SLOW_ACTOR_ID: &str = "resize-proof-slow";
+const WINDOW_SLOW_ACTOR_ID: &str = "resize-proof-window-slow";
 const STALL_ACTOR_ID: &str = "resize-proof-stall";
 const STALL_AFTER_FIRST_ACTOR_ID: &str = "resize-proof-stall-after-first";
 const COMPONENT_FILE: &str = "brood_resize_proof_plugin.component.wasm";
 const DELAY_MS: u64 = 120;
+// Window screenshots need a longer observable projected interval, but this
+// remains below the host's 250 ms synchronized-resize deadline.
+const WINDOW_DELAY_MS: u64 = 180;
+// Keep post-timeout recovery out of the frame-locked degraded capture. The
+// next tagged recovery epoch cancels this proof-only worker immediately.
+const RECOVERY_DELAY_MS: u64 = 500;
 const DELAY_PAYLOAD: &[u8] = b"resize-proof-delay-v1";
+const WINDOW_DELAY_PAYLOAD: &[u8] = b"resize-proof-window-delay-v1";
 const RECOVERY_PAYLOAD: &[u8] = b"resize-proof-recovery-v1";
 const RECOVERY_WORKER: u64 = 1;
 const INITIAL_BACKGROUND: Color = Color::rgba(0.04, 0.08, 0.18, 1.0);
@@ -33,14 +42,20 @@ const STALL_MARKER: Color = Color::rgba(0.96, 0.58, 0.08, 1.0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProofMode {
     Fast,
+    GatedFast,
     Slow,
+    WindowSlow,
     StallOnce,
     StallAfterFirst,
 }
 
 impl ProofMode {
     fn for_instance(instance_id: &str) -> Self {
-        if instance_id.ends_with("-slow") {
+        if instance_id.ends_with("-gated-fast") {
+            Self::GatedFast
+        } else if instance_id.ends_with("-window-slow") {
+            Self::WindowSlow
+        } else if instance_id.ends_with("-slow") {
             Self::Slow
         } else if instance_id.ends_with("-stall-after-first") {
             Self::StallAfterFirst
@@ -53,8 +68,9 @@ impl ProofMode {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Fast => "fast",
+            Self::Fast | Self::GatedFast => "fast",
             Self::Slow => "slow",
+            Self::WindowSlow => "slow",
             Self::StallOnce => "stall-once",
             Self::StallAfterFirst => "stall-after-first",
         }
@@ -63,7 +79,9 @@ impl ProofMode {
     const fn actor_id(self) -> &'static str {
         match self {
             Self::Fast => FAST_ACTOR_ID,
+            Self::GatedFast => GATED_FAST_ACTOR_ID,
             Self::Slow => SLOW_ACTOR_ID,
+            Self::WindowSlow => WINDOW_SLOW_ACTOR_ID,
             Self::StallOnce => STALL_ACTOR_ID,
             Self::StallAfterFirst => STALL_AFTER_FIRST_ACTOR_ID,
         }
@@ -71,14 +89,18 @@ impl ProofMode {
 
     const fn marker(self) -> Color {
         match self {
-            Self::Fast => FAST_MARKER,
-            Self::Slow => SLOW_MARKER,
+            Self::Fast | Self::GatedFast => FAST_MARKER,
+            Self::Slow | Self::WindowSlow => SLOW_MARKER,
             Self::StallOnce | Self::StallAfterFirst => STALL_MARKER,
         }
     }
 
     const fn stalls(self) -> bool {
         matches!(self, Self::StallOnce | Self::StallAfterFirst)
+    }
+
+    const fn gates_untagged_recovery(self) -> bool {
+        matches!(self, Self::GatedFast)
     }
 }
 
@@ -202,6 +224,7 @@ struct ProofState {
     recovery_pending: Option<UntaggedTarget>,
     recovery_worker: Option<u64>,
     recovery_delayed: bool,
+    tagged_observed: bool,
     first_tagged_submitted: bool,
     last_submitted: Option<PaintTarget>,
     error: Option<String>,
@@ -221,6 +244,7 @@ impl ProofState {
             recovery_pending: None,
             recovery_worker: None,
             recovery_delayed: false,
+            tagged_observed: false,
             first_tagged_submitted: false,
             last_submitted: None,
             error: None,
@@ -263,6 +287,16 @@ impl ProofState {
         RecoveryAction::Spawn(RECOVERY_WORKER)
     }
 
+    fn schedule_gated_recovery(&mut self, target: UntaggedTarget) -> RecoveryAction {
+        if self.recovery_worker.is_some() {
+            self.recovery_pending = Some(target);
+            return RecoveryAction::Pending;
+        }
+        self.recovery_pending = Some(target);
+        self.recovery_worker = Some(RECOVERY_WORKER);
+        RecoveryAction::Spawn(RECOVERY_WORKER)
+    }
+
     fn finish_recovery(&mut self, worker: u64) -> Option<UntaggedTarget> {
         if self.recovery_worker != Some(worker) {
             return None;
@@ -296,10 +330,18 @@ impl Guest for ResizeProof {
     }
 
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-        if payload != DELAY_PAYLOAD && payload != RECOVERY_PAYLOAD {
+        if payload != DELAY_PAYLOAD
+            && payload != WINDOW_DELAY_PAYLOAD
+            && payload != RECOVERY_PAYLOAD
+        {
             return Err("resize proof worker received an unknown payload".to_string());
         }
-        sleep(DELAY_MS)
+        let delay_ms = match payload.as_slice() {
+            WINDOW_DELAY_PAYLOAD => WINDOW_DELAY_MS,
+            RECOVERY_PAYLOAD => RECOVERY_DELAY_MS,
+            _ => DELAY_MS,
+        };
+        sleep(delay_ms)
             .await
             .map_err(|error| format!("resize proof delay: {error}"))?;
         Ok(payload)
@@ -365,6 +407,37 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     height: state.height,
                     scale: state.scale,
                 };
+                if mode.gates_untagged_recovery() && state.tagged_observed {
+                    let action = state.schedule_gated_recovery(untagged);
+                    drop(state);
+                    return match action {
+                        RecoveryAction::Spawn(worker) => vec![
+                            diagnostic_command(
+                                "resize-proof-recovery-delayed",
+                                mode,
+                                untagged.pane,
+                                None,
+                                untagged.width,
+                                untagged.height,
+                                true,
+                            ),
+                            ActorCommand::SpawnWorker(WorkerRequest {
+                                worker,
+                                payload: RECOVERY_PAYLOAD.to_vec(),
+                            }),
+                        ],
+                        RecoveryAction::Pending => vec![diagnostic_command(
+                            "resize-proof-recovery-updated",
+                            mode,
+                            untagged.pane,
+                            None,
+                            untagged.width,
+                            untagged.height,
+                            true,
+                        )],
+                        RecoveryAction::Immediate => Vec::new(),
+                    };
+                }
                 if mode.stalls() {
                     match state.schedule_first_recovery(untagged) {
                         RecoveryAction::Spawn(worker) => {
@@ -429,12 +502,23 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 height: state.height,
                 scale: state.scale,
             };
+            state.tagged_observed = true;
             match mode {
                 ProofMode::Fast => {
                     drop(state);
                     submit_target(target, mode)
                 }
-                ProofMode::Slow => {
+                ProofMode::GatedFast => {
+                    let cancelled = state.cancel_recovery();
+                    drop(state);
+                    let mut commands = cancelled
+                        .map(ActorCommand::CancelWorker)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    commands.extend(submit_target(target, mode));
+                    commands
+                }
+                ProofMode::Slow | ProofMode::WindowSlow => {
                     let action = state.delay.offer(target);
                     drop(state);
                     apply_delay_action(action, mode)
@@ -478,13 +562,13 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    if state.mode.stalls() {
+    if state.mode.stalls() || state.mode.gates_untagged_recovery() {
         let recovery = state.finish_recovery(worker);
         let mode = state.mode;
         drop(state);
         return recovery.map_or_else(Vec::new, |target| submit_recovery(target, mode));
     }
-    if state.mode != ProofMode::Slow {
+    if !matches!(state.mode, ProofMode::Slow | ProofMode::WindowSlow) {
         return Vec::new();
     }
     let action = if failed {
@@ -500,10 +584,17 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
 fn apply_delay_action(action: DelayAction, mode: ProofMode) -> Vec<ActorCommand> {
     match action {
         DelayAction::None => Vec::new(),
-        DelayAction::Spawn { worker, .. } => vec![ActorCommand::SpawnWorker(WorkerRequest {
-            worker,
-            payload: DELAY_PAYLOAD.to_vec(),
-        })],
+        DelayAction::Spawn { worker, .. } => {
+            let payload = if mode == ProofMode::WindowSlow {
+                WINDOW_DELAY_PAYLOAD
+            } else {
+                DELAY_PAYLOAD
+            };
+            vec![ActorCommand::SpawnWorker(WorkerRequest {
+                worker,
+                payload: payload.to_vec(),
+            })]
+        }
         DelayAction::Draw(target) => submit_target(target, mode),
     }
 }
@@ -749,7 +840,15 @@ mod tests {
     #[test]
     fn instance_suffix_selects_fast_slow_and_stall_modes() {
         assert_eq!(ProofMode::for_instance(FAST_ACTOR_ID), ProofMode::Fast);
+        assert_eq!(
+            ProofMode::for_instance(GATED_FAST_ACTOR_ID),
+            ProofMode::GatedFast
+        );
         assert_eq!(ProofMode::for_instance(SLOW_ACTOR_ID), ProofMode::Slow);
+        assert_eq!(
+            ProofMode::for_instance(WINDOW_SLOW_ACTOR_ID),
+            ProofMode::WindowSlow
+        );
         assert_eq!(
             ProofMode::for_instance(STALL_ACTOR_ID),
             ProofMode::StallOnce
@@ -877,6 +976,46 @@ mod tests {
             RecoveryAction::Pending
         );
         assert_eq!(state.finish_recovery(RECOVERY_WORKER), Some(final_target));
+    }
+
+    #[test]
+    fn tagged_recovery_cancels_the_delayed_untagged_frame() {
+        let mut state = ProofState::new(ProofMode::StallAfterFirst);
+        assert!(!state.stall_after_optional_warmup(target(1, 400.0)));
+        assert!(state.stall_after_optional_warmup(target(2, 420.0)));
+        let untagged = UntaggedTarget {
+            pane: 7,
+            width: 420.0,
+            height: 240.0,
+            scale: 1.0,
+        };
+        assert_eq!(
+            state.schedule_first_recovery(untagged),
+            RecoveryAction::Spawn(RECOVERY_WORKER)
+        );
+
+        assert!(!state.stall_after_optional_warmup(target(3, 440.0)));
+        assert_eq!(state.cancel_recovery(), Some(RECOVERY_WORKER));
+        assert_eq!(state.finish_recovery(RECOVERY_WORKER), None);
+    }
+
+    #[test]
+    fn tagged_epoch_cancels_the_fast_panes_delayed_ordinary_recovery() {
+        let mut state = ProofState::new(ProofMode::GatedFast);
+        state.tagged_observed = true;
+        let untagged = UntaggedTarget {
+            pane: 7,
+            width: 420.0,
+            height: 240.0,
+            scale: 1.0,
+        };
+        assert_eq!(
+            state.schedule_gated_recovery(untagged),
+            RecoveryAction::Spawn(RECOVERY_WORKER)
+        );
+
+        assert_eq!(state.cancel_recovery(), Some(RECOVERY_WORKER));
+        assert_eq!(state.finish_recovery(RECOVERY_WORKER), None);
     }
 
     #[test]

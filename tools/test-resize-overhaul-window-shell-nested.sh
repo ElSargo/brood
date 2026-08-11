@@ -168,7 +168,7 @@ env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   --no-server \
   --init-actor "$INIT_COMPONENT" \
   --wasm-actor "resize-proof-fast=$RESIZE_PROOF_COMPONENT" \
-  --wasm-actor "resize-proof-slow=$RESIZE_PROOF_COMPONENT" \
+  --wasm-actor "resize-proof-window-slow=$RESIZE_PROOF_COMPONENT" \
   --wasm-key-policy workspace "$WORKSPACE_MODULE" \
   > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
@@ -202,7 +202,7 @@ for _ in $(seq 1 1200); do
       }
     ' "$CLIENT_LOG")"
   if rg -q 'started presentation WASM actor id=resize-proof-fast ' "$CLIENT_LOG" \
-    && rg -q 'started presentation WASM actor id=resize-proof-slow ' "$CLIENT_LOG" \
+    && rg -q 'started presentation WASM actor id=resize-proof-window-slow ' "$CLIENT_LOG" \
     && rg -q 'started presentation WASM actor id=session-switcher ' "$CLIENT_LOG" \
     && rg -q 'started presentation WASM actor id=inbox ' "$CLIENT_LOG" \
     && rg -q 'started presentation WASM actor id=status-bar ' "$CLIENT_LOG" \
@@ -224,7 +224,7 @@ rg -q 'granted rest layout lease .* actor=workspace panes=2' "$CLIENT_LOG"
 [[ -n "$ROOT_TREE_READY_LINE" ]]
 
 FAST_PANE="$(sed -n 's/.*started presentation WASM actor id=resize-proof-fast .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
-SLOW_PANE="$(sed -n 's/.*started presentation WASM actor id=resize-proof-slow .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
+SLOW_PANE="$(sed -n 's/.*started presentation WASM actor id=resize-proof-window-slow .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
 SWITCHER_PANE="$(sed -n 's/.*started presentation WASM actor id=session-switcher .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
 INBOX_PANE="$(sed -n 's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
 STATUS_PANE="$(sed -n 's/.*started presentation WASM actor id=status-bar .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
@@ -561,7 +561,9 @@ capture_window() {
   read -r x y width height < <(jq -r '[.x,.y,.width,.height] | @tsv' <<< "$rect")
   printf -v frame '%03d' "$WINDOW_FRAME_INDEX"
   path="window-frames/frame-${frame}-${label}.png"
-  wayland_env grim -g "${x},${y} ${width}x${height}" "$OUT/$path"
+  # Reduce PNG work after the compositor supplies the output buffer. The
+  # window-specific slow actor provides the observable projected interval.
+  wayland_env grim -l 0 -g "${x},${y} ${width}x${height}" "$OUT/$path"
   [[ -s "$OUT/$path" ]]
   record_capture "$WINDOW_MANIFEST" window "$label" "$path" \
     "$trace_kind" "$trace_line" "$trace_text" "$input_index" "$rect"

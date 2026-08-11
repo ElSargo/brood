@@ -76,6 +76,10 @@ pub enum HostMessage {
         actor: String,
         panes: Vec<u64>,
     },
+    SetPointerPolicy {
+        lease: crate::resolved_layout::LayoutLeaseToken,
+        provider: String,
+    },
     SubmitSynchronizedLayout(crate::resize::SubmitSynchronizedLayout),
     ReusePaneContent(crate::resize::ReusePaneContent),
 }

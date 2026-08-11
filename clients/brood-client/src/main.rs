@@ -91,7 +91,7 @@ use layout::{
 };
 use plugin_gpu::{GpuCanvasRenderer, GpuCanvasScene};
 use plugin_graphics::PluginGraphicsBridge;
-use pointer_policy::ClientPointerPolicy;
+use pointer_policy::{ClientPointerPolicy, PointerPolicyBindingKey};
 
 pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
@@ -2636,6 +2636,7 @@ impl PendingNativeWindowResize {
 struct PolicyPointerCapture {
     interaction: brood_wasm::InteractionId,
     zone: ComposedZoneId,
+    binding: PointerPolicyBindingKey,
     buttons: BTreeSet<u32>,
     event_sequence: u64,
     local_position: LocalPoint,
@@ -4241,6 +4242,9 @@ impl Application {
         }
 
         let tokens = self.layout_leases.lease_tokens();
+        if let Some(policy) = self.pointer_policy.as_mut() {
+            policy.retain_current(&tokens, &self.layout_holders);
+        }
         let root_lease = self.layout_leases.root_token().id;
         let native_resize_revision = self
             .pending_native_window_resize
@@ -4742,6 +4746,12 @@ impl Application {
     fn abort_layout_authority_state(&mut self, reason: &str) -> Result<Option<FocusChange>> {
         self.clear_synchronized_layout_terminal_notifications(reason);
         self.cancel_active_layout_capture(reason);
+        if let Some(policy) = self.pointer_policy.as_mut() {
+            policy.revoke_all();
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.projected_plugin_scenes.clear();
+        }
         let mut focus_change = None;
         if let Some(active) = self.active_synchronized_resize.take() {
             let aborted_native_resize = active.native_resize_revision.is_some();
@@ -5850,6 +5860,61 @@ impl Application {
                         Err(error) => {
                             eprintln!("rejected rest layout delegation: {error}");
                         }
+                    }
+                    None
+                }
+                HostMessage::SetPointerPolicy { lease, provider } => {
+                    let Some(sender) = actor_message.sender.as_ref() else {
+                        eprintln!("ignored pointer-policy selection without actor identity");
+                        continue;
+                    };
+                    let lease = convert_actor_layout_lease(lease);
+                    let current_lease = self
+                        .layout_leases
+                        .lease_tokens()
+                        .into_iter()
+                        .find(|token| token.id == lease.id);
+                    if current_lease != Some(lease)
+                        || self.layout_holders.get(&lease.id) != Some(sender)
+                    {
+                        eprintln!(
+                            "ignored stale or unauthorized pointer-policy selection actor={} actor_generation={} lease={} lease_generation={} provider={provider}",
+                            sender.name, sender.generation, lease.id.0, lease.generation
+                        );
+                        continue;
+                    }
+                    let replaces_capture =
+                        self.policy_pointer_capture.as_ref().is_some_and(|capture| {
+                            capture.binding.lease == lease
+                                && (capture.binding.holder_name != sender.name
+                                    || capture.binding.holder_generation != sender.generation
+                                    || capture.binding.provider != provider)
+                        });
+                    if replaces_capture {
+                        self.cancel_active_layout_capture(
+                            "pointer-policy selection replaced the captured provider binding",
+                        );
+                    }
+                    let Some(policy) = self.pointer_policy.as_mut() else {
+                        eprintln!(
+                            "ignored pointer-policy selection because the catalogue is unavailable actor={} lease={} provider={provider}",
+                            sender.name, lease.id.0
+                        );
+                        continue;
+                    };
+                    match policy.bind(lease, sender, &provider) {
+                        Ok(binding) => eprintln!(
+                            "bound pointer-policy provider={} lease={} lease_generation={} actor={} actor_generation={}",
+                            binding.provider,
+                            binding.lease.id.0,
+                            binding.lease.generation,
+                            binding.holder_name,
+                            binding.holder_generation
+                        ),
+                        Err(error) => eprintln!(
+                            "rejected pointer-policy selection actor={} actor_generation={} lease={} lease_generation={} provider={provider}: {error:#}",
+                            sender.name, sender.generation, lease.id.0, lease.generation
+                        ),
                     }
                     None
                 }
@@ -8411,6 +8476,9 @@ struct Renderer {
     current_sequences: BTreeMap<BackendId, u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_panes: BTreeMap<u64, PluginPaneTexture>,
+    /// Visible scenes intentionally sampled into newer layout geometry after
+    /// degraded presentation or an accepted `ReusePaneContent` response.
+    projected_plugin_scenes: ProjectedPluginScenes,
     staged_plugin_panes: BTreeMap<(u64, u64), GpuCanvasScene>,
     plugin_pane_realms: BTreeMap<u64, Option<(BackendId, u64)>>,
     focused_pane: Option<FocusedPane>,
@@ -8601,6 +8669,106 @@ struct PluginPaneTexture {
     rect: [i32; 4],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectedPluginScene {
+    resize_epoch: u64,
+    visible_sequence: u64,
+    target_rect: [i32; 4],
+}
+
+#[derive(Default)]
+struct ProjectedPluginScenes {
+    panes: BTreeMap<u64, ProjectedPluginScene>,
+}
+
+impl ProjectedPluginScenes {
+    fn mark(&mut self, pane: u64, resize_epoch: u64, visible_sequence: u64, target_rect: [i32; 4]) {
+        if self
+            .panes
+            .get(&pane)
+            .is_none_or(|current| resize_epoch >= current.resize_epoch)
+        {
+            self.panes.insert(
+                pane,
+                ProjectedPluginScene {
+                    resize_epoch,
+                    visible_sequence,
+                    target_rect,
+                },
+            );
+        }
+    }
+
+    fn blocks_extent_sync(&self, pane: u64, sequence: u64) -> bool {
+        self.panes
+            .get(&pane)
+            .is_some_and(|projection| sequence <= projection.visible_sequence)
+    }
+
+    fn accept_ordinary(&mut self, pane: u64, sequence: u64) -> bool {
+        let accepted = self
+            .panes
+            .get(&pane)
+            .is_some_and(|projection| sequence > projection.visible_sequence);
+        if accepted {
+            self.panes.remove(&pane);
+        }
+        accepted
+    }
+
+    fn promote_tagged(&mut self, pane: u64, resize_epoch: u64, sequence: u64) -> bool {
+        let promoted = self.panes.get(&pane).is_some_and(|projection| {
+            resize_epoch > projection.resize_epoch && sequence > projection.visible_sequence
+        });
+        if promoted {
+            self.panes.remove(&pane);
+        }
+        promoted
+    }
+
+    fn promote_reuse(
+        &mut self,
+        pane: u64,
+        resize_epoch: u64,
+        visible_sequence: u64,
+        target_rect: [i32; 4],
+    ) -> bool {
+        let current_epoch = self
+            .panes
+            .get(&pane)
+            .map(|projection| projection.resize_epoch);
+        if current_epoch.is_some_and(|current| resize_epoch <= current) {
+            return false;
+        }
+        self.panes.insert(
+            pane,
+            ProjectedPluginScene {
+                resize_epoch,
+                visible_sequence,
+                target_rect,
+            },
+        );
+        true
+    }
+
+    fn retain_layout(&mut self, layout: &ResolvedLayout, extent: LayoutSize) {
+        self.panes.retain(|pane, projection| {
+            layout.pane_item(*pane).is_some_and(|item| {
+                let rect = item.pixel_rect(extent);
+                projection.target_rect == [rect.x, rect.y, rect.w, rect.h]
+            })
+        });
+    }
+
+    fn remove(&mut self, pane: u64) {
+        self.panes.remove(&pane);
+    }
+
+    fn clear(&mut self) {
+        self.panes.clear();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PluginPaneSize {
     width: f32,
@@ -8752,7 +8920,12 @@ fn promote_ready_synchronized_resize(
     else {
         return Ok(None);
     };
-    let change = renderer.promote_staged_layout(active.epoch.id, active.focus, degraded)?;
+    let change = renderer.promote_staged_layout(
+        active.epoch.id,
+        active.focus,
+        degraded,
+        &active.wait_panes,
+    )?;
     active.presentation = SynchronizedResizePresentation::Promoted {
         degraded,
         missing_panes,
@@ -9017,6 +9190,7 @@ fn apply_key_policy_host_message(
         HostMessage::SetResolvedLayout { .. }
         | HostMessage::ClaimRootLayout
         | HostMessage::DelegateLayoutRest { .. }
+        | HostMessage::SetPointerPolicy { .. }
         | HostMessage::SubmitSynchronizedLayout(_)
         | HostMessage::ReusePaneContent(_) => {
             return Err(anyhow!(
@@ -9341,7 +9515,13 @@ fn cancel_policy_pointer_capture(
     };
     let sequence = event_sequence.saturating_add(1).max(1);
     *event_sequence = sequence;
-    if let (Some(runtime), Some(holder)) = (runtime, holders.get(&active.zone.lease)) {
+    let holder = holders.get(&active.zone.lease).filter(|holder| {
+        holder.name == active.binding.holder_name
+            && holder.generation == active.binding.holder_generation
+            && active.binding.lease.id == active.zone.lease
+            && active.binding.lease.generation == active.zone.lease_generation
+    });
+    if let (Some(runtime), Some(holder)) = (runtime, holder) {
         let delivery = encode_canonical_layout_pointer_message(
             Some(active.interaction),
             sequence,
@@ -9468,7 +9648,11 @@ fn route_layout_zone_pointer(
             modifiers,
         });
     }
-    let Some(policy) = policy.as_mut().filter(|policy| policy.is_available()) else {
+    let zone_lease = brood_layout::LayoutLeaseToken {
+        id: hit.zone.lease,
+        generation: hit.zone.lease_generation,
+    };
+    let Some(policy) = policy.as_mut() else {
         if captured_before {
             cancel_policy_pointer_capture(
                 renderer,
@@ -9488,29 +9672,71 @@ fn route_layout_zone_pointer(
             modifiers,
         });
     };
+    let binding = if let Some(active) = capture.as_ref() {
+        let current_holder = holders.get(&hit.zone.lease);
+        let binding_is_current = active.binding.lease == zone_lease
+            && current_holder.is_some_and(|holder| {
+                holder.name == active.binding.holder_name
+                    && holder.generation == active.binding.holder_generation
+            })
+            && policy.contains_binding(&active.binding);
+        if !binding_is_current {
+            cancel_policy_pointer_capture(
+                renderer,
+                runtime,
+                holders,
+                inventory_revision,
+                base_layout_revision,
+                capture,
+                event_sequence,
+                modifiers,
+                "captured pointer provider binding was revoked",
+            );
+            return Ok(PointerPolicyRoute::Consumed);
+        }
+        active.binding.clone()
+    } else {
+        let Some(holder) = holders.get(&hit.zone.lease) else {
+            return Ok(PointerPolicyRoute::Forward {
+                position,
+                modifiers,
+            });
+        };
+        let Some(binding) = policy.binding_key(zone_lease, holder) else {
+            return Ok(PointerPolicyRoute::Forward {
+                position,
+                modifiers,
+            });
+        };
+        binding
+    };
 
     let sequence = event_sequence.saturating_add(1).max(1);
     *event_sequence = sequence;
     let query_interaction = capture.as_ref().map(|active| active.interaction);
-    let result = match policy.evaluate(brood_wasm::PointerPolicyQuery {
-        interaction: query_interaction,
-        event_sequence: sequence,
-        lease: brood_wasm::LayoutLeaseToken {
-            id: hit.zone.lease.0,
-            generation: hit.zone.lease_generation,
+    let result = match policy.evaluate(
+        &binding,
+        brood_wasm::PointerPolicyQuery {
+            interaction: query_interaction,
+            event_sequence: sequence,
+            lease: brood_wasm::LayoutLeaseToken {
+                id: hit.zone.lease.0,
+                generation: hit.zone.lease_generation,
+            },
+            zone: brood_wasm::LayoutItemId(hit.zone.local_item.0),
+            phase,
+            local_position: brood_wasm::LocalPoint {
+                u: hit.local_position.u,
+                v: hit.local_position.v,
+            },
+            button,
+            modifiers,
+            captured: captured_before,
         },
-        zone: brood_wasm::LayoutItemId(hit.zone.local_item.0),
-        phase,
-        local_position: brood_wasm::LocalPoint {
-            u: hit.local_position.u,
-            v: hit.local_position.v,
-        },
-        button,
-        modifiers,
-        captured: captured_before,
-    }) {
+    ) {
         Ok(result) => result,
         Err(error) => {
+            policy.revoke(&binding);
             cancel_policy_pointer_capture(
                 renderer,
                 runtime,
@@ -9568,6 +9794,7 @@ fn route_layout_zone_pointer(
         *capture = Some(PolicyPointerCapture {
             interaction,
             zone: hit.zone,
+            binding: binding.clone(),
             buttons,
             event_sequence: sequence,
             local_position: effective.local_position,
@@ -9596,9 +9823,16 @@ fn route_layout_zone_pointer(
         let holder = holders
             .get(&hit.zone.lease)
             .context("pointer-policy zone lease has no actor holder")?;
+        anyhow::ensure!(
+            holder.name == binding.holder_name
+                && holder.generation == binding.holder_generation
+                && binding.lease == zone_lease,
+            "pointer policy binding authority changed before actor delivery"
+        );
         for message in result.messages {
             anyhow::ensure!(
-                message.actor == holder.name,
+                message.actor == brood_wasm::POINTER_POLICY_LEASE_HOLDER
+                    || message.actor == holder.name,
                 "pointer policy tried to address actor {:?}, but zone lease {} belongs to {:?}",
                 message.actor,
                 hit.zone.lease.0,
@@ -10520,6 +10754,7 @@ impl Renderer {
             current_sequences: BTreeMap::new(),
             plugin_graphics,
             plugin_panes: BTreeMap::new(),
+            projected_plugin_scenes: ProjectedPluginScenes::default(),
             staged_plugin_panes: BTreeMap::new(),
             plugin_pane_realms: BTreeMap::new(),
             focused_pane: None,
@@ -11112,6 +11347,7 @@ impl Renderer {
     }
 
     fn reset_accepted_to_presented(&mut self) -> Option<FocusChange> {
+        self.projected_plugin_scenes.clear();
         self.accepted_layout = self.presented_layout.clone();
         self.accepted_zones = self.presented_zones.clone();
         self.accepted_dividers = self.presented_dividers.clone();
@@ -11259,6 +11495,7 @@ impl Renderer {
         self.accepted_dividers = fallback_dividers;
         self.staged_layouts.clear();
         self.staged_plugin_panes.clear();
+        self.projected_plugin_scenes.clear();
         let change = self.project_accepted_layout(focus);
         self.window.request_redraw();
         change
@@ -11273,6 +11510,9 @@ impl Renderer {
             eprintln!("presentation layout source changed source=actor");
         }
         self.layout_source = source;
+        let extent = self.layout_extent();
+        self.projected_plugin_scenes
+            .retain_layout(&composed.layout, extent);
         self.accepted_layout = composed.layout;
         self.accepted_zones = composed.zones;
         self.accepted_dividers = composed.dividers;
@@ -11338,21 +11578,62 @@ impl Renderer {
         resize_epoch: u64,
         focus: Option<u64>,
         degraded: bool,
+        wait_panes: &BTreeSet<u64>,
     ) -> Result<Option<FocusChange>> {
         let composed = self
             .staged_layouts
             .remove(&resize_epoch)
             .context("promoted resize epoch has no staged layout")?;
         let layout = composed.layout;
+        if degraded {
+            let extent = self.layout_extent();
+            for pane in wait_panes {
+                let Some(plugin) = self.plugin_panes.get(pane) else {
+                    continue;
+                };
+                let Some(item) = layout.pane_item(*pane) else {
+                    continue;
+                };
+                let rect = item.pixel_rect(extent);
+                self.projected_plugin_scenes.mark(
+                    *pane,
+                    resize_epoch,
+                    plugin.scene.sequence,
+                    [rect.x, rect.y, rect.w, rect.h],
+                );
+            }
+        }
         let staged = std::mem::take(&mut self.staged_plugin_panes);
+        let mut tagged_promotions = BTreeSet::new();
         for ((pane, epoch), scene) in staged {
             if staged_plugin_scene_is_promotable(epoch, resize_epoch, degraded) {
+                self.projected_plugin_scenes
+                    .promote_tagged(pane, resize_epoch, scene.sequence);
                 let rect = layout.pane_item(pane).map_or([0, 0, 0, 0], |item| {
                     let rect = item.pixel_rect(self.layout_extent());
                     [rect.x, rect.y, rect.w, rect.h]
                 });
                 self.plugin_panes
                     .insert(pane, PluginPaneTexture { scene, rect });
+                tagged_promotions.insert(pane);
+            }
+        }
+        if !degraded {
+            let extent = self.layout_extent();
+            for pane in wait_panes.difference(&tagged_promotions) {
+                let Some(plugin) = self.plugin_panes.get(pane) else {
+                    continue;
+                };
+                let Some(item) = layout.pane_item(*pane) else {
+                    continue;
+                };
+                let rect = item.pixel_rect(extent);
+                self.projected_plugin_scenes.promote_reuse(
+                    *pane,
+                    resize_epoch,
+                    plugin.scene.sequence,
+                    [rect.x, rect.y, rect.w, rect.h],
+                );
             }
         }
         self.accepted_layout = layout;
@@ -11600,6 +11881,12 @@ impl Renderer {
         if snapshot.sequence < expected_sequence {
             return Ok(None);
         }
+        if self
+            .projected_plugin_scenes
+            .blocks_extent_sync(pane, snapshot.sequence)
+        {
+            return Ok(None);
+        }
         let target = self.plugin_scene_extent(pane);
         let target_changed = self.plugin_panes.get(&pane).is_none_or(|current| {
             current.scene.width != target.0
@@ -11649,6 +11936,8 @@ impl Renderer {
         );
         self.plugin_panes
             .insert(pane, PluginPaneTexture { scene, rect });
+        self.projected_plugin_scenes
+            .accept_ordinary(pane, snapshot.sequence);
         self.layout_state_dirty |=
             plugin_refresh_changes_layout_inventory(new_plugin_pane, force_visible_restore);
         let focus_change = self.reconcile_layout();
@@ -11742,6 +12031,7 @@ impl Renderer {
     }
 
     fn remove_plugin_pane(&mut self, pane: u64) -> Option<FocusChange> {
+        self.projected_plugin_scenes.remove(pane);
         let removed_visible = self.plugin_panes.remove(&pane).is_some();
         let removed_realm = self.plugin_pane_realms.remove(&pane).is_some();
         let staged_before = self.staged_plugin_panes.len();
@@ -12511,6 +12801,89 @@ mod tests {
             BTreeSet::from([1, 2])
         );
         assert!(changed_layout_panes(&target, &target, LayoutSize { w: 1000, h: 600 }).is_empty());
+    }
+
+    fn degraded_projection() -> ProjectedPluginScenes {
+        let mut projections = ProjectedPluginScenes::default();
+        projections.mark(7, 41, 10, [0, 0, 500, 600]);
+        projections
+    }
+
+    #[test]
+    fn timeout_keeps_the_exact_visible_scene_projected() {
+        let projections = degraded_projection();
+        assert!(projections.blocks_extent_sync(7, 10));
+        assert_eq!(
+            projections.panes.get(&7),
+            Some(&ProjectedPluginScene {
+                resize_epoch: 41,
+                visible_sequence: 10,
+                target_rect: [0, 0, 500, 600],
+            })
+        );
+    }
+
+    #[test]
+    fn accepted_newer_ordinary_scene_ends_degraded_projection() {
+        let mut projections = degraded_projection();
+        assert!(projections.accept_ordinary(7, 11));
+        assert!(!projections.blocks_extent_sync(7, 11));
+    }
+
+    #[test]
+    fn later_tagged_promotion_ends_degraded_projection() {
+        let mut projections = degraded_projection();
+        assert!(!projections.promote_tagged(7, 41, 11));
+        assert!(!projections.promote_tagged(7, 42, 10));
+        assert!(projections.promote_tagged(7, 42, 11));
+        assert!(projections.panes.is_empty());
+    }
+
+    #[test]
+    fn successful_reuse_carries_projected_scene_to_the_new_transaction() {
+        let mut projections = degraded_projection();
+        assert!(projections.promote_reuse(7, 42, 10, [0, 0, 620, 600]));
+        assert_eq!(
+            projections.panes.get(&7),
+            Some(&ProjectedPluginScene {
+                resize_epoch: 42,
+                visible_sequence: 10,
+                target_rect: [0, 0, 620, 600],
+            })
+        );
+        assert!(projections.blocks_extent_sync(7, 10));
+        assert!(!projections.promote_reuse(7, 41, 10, [0, 0, 500, 600]));
+    }
+
+    #[test]
+    fn stale_draw_cannot_end_or_recompile_degraded_projection() {
+        let mut projections = degraded_projection();
+        assert!(projections.blocks_extent_sync(7, 9));
+        assert!(!projections.accept_ordinary(7, 9));
+        assert!(!projections.accept_ordinary(7, 10));
+        assert!(projections.blocks_extent_sync(7, 10));
+    }
+
+    #[test]
+    fn degraded_projection_cleans_up_on_pane_layout_and_authority_reset() {
+        let extent = LayoutSize { w: 1000, h: 600 };
+        let pane = test_pane_item(8, -1.0, 1.0);
+        let rect = pane.pixel_rect(extent);
+        let layout = ResolvedLayout { items: vec![pane] };
+        let mut projections = degraded_projection();
+        projections.mark(8, 42, 12, [rect.x, rect.y, rect.w, rect.h]);
+        projections.remove(7);
+        projections.retain_layout(&layout, extent);
+        assert!(projections.panes.contains_key(&8));
+
+        let changed = ResolvedLayout {
+            items: vec![test_pane_item(8, -1.0, 1.2)],
+        };
+        projections.retain_layout(&changed, extent);
+        assert!(projections.panes.is_empty());
+        projections.mark(9, 43, 13, [0, 0, 1000, 600]);
+        projections.clear();
+        assert!(projections.panes.is_empty());
     }
 
     #[test]

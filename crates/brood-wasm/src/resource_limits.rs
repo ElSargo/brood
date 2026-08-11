@@ -82,6 +82,9 @@ impl WasmResourceLimits {
             memory_limit: self.generation_memory_bytes,
             memory_bytes: 0,
             pending_memory_growth: 0,
+            table_limit: self.store_table_elements,
+            table_elements: 0,
+            pending_table_growth: 0,
         }
     }
 
@@ -118,14 +121,17 @@ impl WasmResourceLimits {
     }
 }
 
-/// Store limiter which applies the memory ceiling across all memories in a
-/// component instance, rather than independently to each linear memory.
+/// Store limiter which applies aggregate memory and table-element ceilings
+/// across all resources in one component instance.
 #[derive(Debug)]
 pub struct GenerationStoreLimits {
     inner: StoreLimits,
     memory_limit: usize,
     memory_bytes: usize,
     pending_memory_growth: usize,
+    table_limit: usize,
+    table_elements: usize,
+    pending_table_growth: usize,
 }
 
 impl ResourceLimiter for GenerationStoreLimits {
@@ -159,10 +165,24 @@ impl ResourceLimiter for GenerationStoreLimits {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        self.inner.table_growing(current, desired, maximum)
+        let additional = desired.saturating_sub(current);
+        self.pending_table_growth = 0;
+        if additional > self.table_limit.saturating_sub(self.table_elements) {
+            return Ok(false);
+        }
+        if !self.inner.table_growing(current, desired, maximum)? {
+            return Ok(false);
+        }
+        self.table_elements += additional;
+        self.pending_table_growth = additional;
+        Ok(true)
     }
 
     fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.table_elements = self
+            .table_elements
+            .saturating_sub(self.pending_table_growth);
+        self.pending_table_growth = 0;
         self.inner.table_grow_failed(error)
     }
 
