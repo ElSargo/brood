@@ -63,6 +63,45 @@ Screenshots should cover visible, picker-overlay, hidden, and restored states.
 Logs should record lease generations, revisions, accepted recursive
 composition, picker focus and sizing, and managed-pane size convergence.
 
+## Synchronized Resize Proof
+
+The built-in resize proof runs through the checked-in test CLI in the Nix
+environment. It starts a real presentation client under the private compositor
+and retains parent, window-shell, recursive-region, and managed-client proof
+artifacts. The synchronized protocol deadline remains 250 ms. Screenshot
+completion is not part of transaction control.
+
+The managed lane uses real XDG shared-memory clients at fractional scale 1.5.
+It correlates protocol version 22 records across client and server diagnostics:
+accepted epoch and route generation, configure serial, configured size tuple,
+new commit samples, exact snapshot, scene sequence and transport resource,
+client stage, readiness, and atomic promotion. Normal pointer and native resize
+must combine plugin and managed waits without a partial waited-set frame.
+
+The proof also supplies an acknowledged configure with an old or insufficient
+buffer, supersedes one epoch and delivers its late tag, withholds one managed
+pane through timeout, and removes a named pane during an accepted transaction.
+It must show:
+
+- unsuitable buffers cannot satisfy readiness;
+- a stale tagged resource cannot replace the active epoch;
+- timeout occurs from 250 ms through less than 750 ms and presents one complete
+  old or placeholder managed set before ordinary recovery;
+- staged resources and expectations remain bounded and clear at terminal
+  transitions;
+- ordinary recovery starts only after a later untagged commit;
+- removal aborts with the exact unavailable pane, never promotes that target,
+  and publishes later inventory without the pane;
+- the final pointer release remains authenticated after capture ends and
+  converges normally;
+- pane content and one-device-pixel native chrome align in the same presented
+  geometry.
+
+Stored analyzers join evidence by epoch, backend route, connection generation,
+pane, configure serial, surface commit, scene sequence, resource, and exact size
+tuple. They do not infer success from response order or from the presence of a
+screenshot alone.
+
 `tools/test-bundled-plugins.sh` audits the bundled plugin inventory against
 `tools/bundled-plugin-e2e.tsv` and routes each plugin to a Nix-backed real
 workload lane. A row is complete only when synthetic input reaches the plugin

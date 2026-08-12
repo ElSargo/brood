@@ -124,6 +124,7 @@ let
     pkgs.sway
     pkgs.vulkan-tools
     pkgs.wayland-scanner
+    pkgs.wayland-protocols
     pkgs.wayland-utils
     pkgs.wlr-protocols
     pkgs.wtype

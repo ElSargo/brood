@@ -91,8 +91,15 @@ impl BackendRegistry {
         removed
     }
 
+    #[cfg(test)]
     pub(crate) fn is_connected(&self, backend: BackendId) -> bool {
         self.backends.contains_key(&backend)
+    }
+
+    pub(crate) fn connection_generation(&self, backend: BackendId) -> Option<u64> {
+        self.backends
+            .get(&backend)
+            .and_then(|state| state.generation)
     }
 
     /// Return the stable presentation-local handle for one backend pane.
@@ -152,9 +159,7 @@ impl BackendRegistry {
 
     #[cfg(test)]
     fn generation(&self, backend: BackendId) -> Option<u64> {
-        self.backends
-            .get(&backend)
-            .and_then(|state| state.generation)
+        self.connection_generation(backend)
     }
 }
 

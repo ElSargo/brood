@@ -2,7 +2,8 @@ use brood_wasm::{
     FailLayoutRegion, HostMessage, InteractionId, LayoutLeaseToken, LayoutRegionNotification,
     LayoutRegionResized, LayoutSize, PresentationMode, ResizeEpoch, ResolvedLayout,
     ReuseLayoutRegion, ReusePaneContent, SubmitLayoutRegion, SubmitSynchronizedLayout,
-    SynchronizedLayoutAccepted, SynchronizedLayoutFragment, SynchronizedLayoutNotification,
+    SynchronizedLayoutAborted, SynchronizedLayoutAccepted, SynchronizedLayoutFragment,
+    SynchronizedLayoutNotification, SynchronizedLayoutRejectionReason,
 };
 use serde_json::{Value, json};
 
@@ -169,6 +170,27 @@ fn synchronized_layout_notification_is_typed_and_round_trips() {
     );
     assert_eq!(encoded.get("request_id").and_then(Value::as_u64), Some(59));
     assert!(encoded.get("payload").is_none());
+    assert_eq!(
+        serde_json::from_value::<SynchronizedLayoutNotification>(encoded).ok(),
+        Some(notification)
+    );
+}
+
+#[test]
+fn accepted_layout_abort_carries_the_exact_epoch_and_reason() {
+    let notification = SynchronizedLayoutNotification::Aborted(SynchronizedLayoutAborted {
+        request_id: 59,
+        resize_epoch: test_resize_epoch(),
+        reason: SynchronizedLayoutRejectionReason::StaleInventoryRevision,
+        message: "managed pane disappeared".to_string(),
+        unavailable_panes: vec![47],
+    });
+    let encoded = serde_json::to_value(&notification).unwrap();
+    assert_eq!(encoded["type"], "aborted");
+    assert_eq!(encoded["request_id"], 59);
+    assert_eq!(encoded["resize_epoch"]["id"], 61);
+    assert_eq!(encoded["reason"], "stale-inventory-revision");
+    assert_eq!(encoded["unavailable_panes"], json!([47]));
     assert_eq!(
         serde_json::from_value::<SynchronizedLayoutNotification>(encoded).ok(),
         Some(notification)

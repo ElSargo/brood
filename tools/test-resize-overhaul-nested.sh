@@ -291,6 +291,7 @@ start_proof_client() {
       -v second_mode="$second_mode" '
         index($0, "resize-proof-untagged-resize") == 0 \
           && index($0, "resize-proof-tagged") == 0 { next }
+        $0 !~ /}$/ { next }
         index($0, sprintf("\"width\":%d.000", expected_width)) == 0 { next }
         index($0, sprintf("\"height\":%d.000", expected_height)) == 0 { next }
         index($0, "\"mode\":\"fast\"") != 0 { fast = NR }
@@ -311,7 +312,8 @@ start_proof_client() {
         }
         (index($0, "accepted plugin draw packet pane=") != 0 \
           || index($0, "staged plugin draw pane=") != 0) \
-          && index($0, target) != 0 && index($0, scale) != 0 {
+          && index($0, target) != 0 && index($0, scale) != 0 \
+          && $0 ~ / scale=[0-9]+\.[0-9]+$/ {
             pane = field("pane")
             if (pane != "") seen[pane] = 1
           }
@@ -329,6 +331,7 @@ start_proof_client() {
           return ""
         }
         index($0, "accepted synchronized layout actor=workspace ") != 0 \
+          && $0 ~ / target_rects=\[[^]]*\]$/ \
           && field("native_resize_revision") + 0 > 0 {
             request = field("request")
             native = field("native_resize_revision")
@@ -340,6 +343,7 @@ start_proof_client() {
           }
         accepted > 0 && completed == 0 \
           && index($0, "resize-present ") != 0 \
+          && $0 ~ / superseded_epochs=[0-9]+$/ \
           && field("epoch") == epoch && field("phase") == "promoted" \
           && field("staged_count") == "0" && field("degraded") == "false" {
             common_promoted = NR
@@ -347,6 +351,7 @@ start_proof_client() {
           }
         common_promoted > 0 \
           && index($0, "completed synchronized layout actor=workspace ") != 0 \
+          && $0 ~ / duration_us=[0-9]+$/ \
           && field("request") == request \
           && field("native_resize_revision") == native \
           && field("epoch") == epoch {
@@ -355,6 +360,7 @@ start_proof_client() {
           }
         completed > 0 && window_promoted == 0 \
           && index($0, "window-resize-present ") != 0 \
+          && $0 ~ / degraded=(true|false)$/ \
           && field("native_resize_revision") == native \
           && field("epoch") == epoch && field("phase") == "promoted" \
           && field("staged_count") == "0" && field("degraded") == "false" {
@@ -363,6 +369,7 @@ start_proof_client() {
           }
         window_promoted > 0 && lease_ack == 0 \
           && index($0, "accepted unchanged leased actor layout ") != 0 \
+          && $0 ~ / presented_layout_revision=[0-9]+$/ \
           && field("presented_layout_revision") == target_revision {
             lease_ack = NR
           }
@@ -373,15 +380,15 @@ start_proof_client() {
           }
         }
       ' "$CLIENT_LOG")"
-    if rg -q 'registered pointer-policy provider=workspace ' "$CLIENT_LOG" \
-      && rg -q 'bound pointer-policy provider=workspace .*actor=workspace ' "$CLIENT_LOG" \
-      && rg -q "started presentation WASM actor id=$first_actor " "$CLIENT_LOG" \
-      && rg -q "started presentation WASM actor id=$second_actor " "$CLIENT_LOG" \
-      && rg -q 'started presentation WASM actor id=session-switcher ' "$CLIENT_LOG" \
-      && rg -q "settled presentation window resize .*to=${MODE_WIDTH}x${MODE_HEIGHT} " "$CLIENT_LOG" \
+    if rg -q 'registered pointer-policy provider=workspace .*path=[^[:space:]]+$' "$CLIENT_LOG" \
+      && rg -q 'bound pointer-policy provider=workspace .*actor=workspace .*actor_generation=[0-9]+$' "$CLIENT_LOG" \
+      && rg -q "started presentation WASM actor id=$first_actor .*path=[^[:space:]]+$" "$CLIENT_LOG" \
+      && rg -q "started presentation WASM actor id=$second_actor .*path=[^[:space:]]+$" "$CLIENT_LOG" \
+      && rg -q 'started presentation WASM actor id=session-switcher .*path=[^[:space:]]+$' "$CLIENT_LOG" \
+      && rg -q "settled presentation window resize .*to=${MODE_WIDTH}x${MODE_HEIGHT} .*elapsed_ms=[0-9]+$" "$CLIENT_LOG" \
       && [[ -n "$final_diagnostics_line" && "$target_scene_panes" -eq 2 ]] \
       && [[ -n "$startup_native_line" ]] \
-      && rg -q 'resize-present .*event_sequence=0 .*divider_x=[0-9]+ .*phase=settled ' "$CLIENT_LOG"; then
+      && rg -q 'resize-present .*event_sequence=0 .*divider_x=[0-9]+ .*phase=settled .*superseded_epochs=[0-9]+$' "$CLIENT_LOG"; then
       return 0
     fi
     kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -424,7 +431,8 @@ wait_resize_trace() {
       -v wanted_sequence="$event_sequence" \
       -v wanted_phases="$phases" \
       -v require_divider="$require_divider" '
-        NR <= start || index($0, "resize-present ") == 0 { next }
+        NR <= start || index($0, "resize-present ") == 0 \
+          || $0 !~ / superseded_epochs=[0-9]+$/ { next }
         {
           sequence = "";
           phase = "";
@@ -471,6 +479,8 @@ wait_synchronized_layout_log() {
       -v wanted_outcome="$outcome" '
         NR <= start { next }
         index($0, wanted_outcome " synchronized layout actor=workspace ") == 0 { next }
+        wanted_outcome == "accepted" && $0 !~ / target_rects=\[[^]]*\]$/ { next }
+        wanted_outcome != "accepted" && $0 !~ / duration_us=[0-9]+$/ { next }
         index($0, "event_sequence=" wanted_sequence " ") != 0 {
           print NR
           exit
@@ -532,9 +542,12 @@ pattern = re.compile(
     r"^resize-present interaction=(?P<interaction>\d+) "
     r"event_sequence=(?P<event_sequence>\d+) epoch=(?P<epoch>\d+) "
     r"divider_x=(?P<divider_x>-?\d+) "
+    r"composition_size=(?P<composition_width>\d+)x(?P<composition_height>\d+) "
     r"phase=(?P<phase>settled|projected|promoted|degraded) "
     r"wait_ready=(?P<wait_ready>\d+)/(?P<wait_total>\d+) "
     r"staged_count=(?P<staged_count>\d+) "
+    r"managed_expectations=(?P<managed_expectations>\d+) "
+    r"managed_staged_resources=(?P<managed_staged_resources>\d+) "
     r"degraded=(?P<degraded>true|false) "
     r"superseded_epochs=(?P<superseded_epochs>\d+)$"
 )
@@ -843,9 +856,12 @@ trace_pattern = re.compile(
     r"^resize-present interaction=(?P<interaction>\d+) "
     r"event_sequence=(?P<event_sequence>\d+) epoch=(?P<epoch>\d+) "
     r"divider_x=(?P<divider_x>-?\d+) "
+    r"composition_size=(?P<composition_width>\d+)x(?P<composition_height>\d+) "
     r"phase=(?P<phase>settled|projected|promoted|degraded) "
     r"wait_ready=(?P<wait_ready>\d+)/(?P<wait_total>\d+) "
     r"staged_count=(?P<staged_count>\d+) "
+    r"managed_expectations=(?P<managed_expectations>\d+) "
+    r"managed_staged_resources=(?P<managed_staged_resources>\d+) "
     r"degraded=(?P<degraded>true|false) "
     r"superseded_epochs=(?P<superseded_epochs>\d+)$"
 )
@@ -1131,6 +1147,23 @@ env \
   "$ROOT/tools/test-resize-region-tree-nested.sh"
 [[ -s "$REGION_TREE_PROOF" && -s "$REGION_TREE_METRICS" ]]
 
+# Exercise exact epoch/configure/frame correlation with two real XDG SHM
+# clients. This lane shares only the outer compositor with the other proofs.
+MANAGED_OUT="$OUT/managed"
+MANAGED_PROOF="$MANAGED_OUT/proof.json"
+MANAGED_METRICS="$MANAGED_OUT/metrics.json"
+env \
+  BROOD_RESIZE_MANAGED_OUT="$MANAGED_OUT" \
+  BROOD_RESIZE_CLIENT="$CLIENT_BIN" \
+  BROOD_RESIZE_WORKSPACE_MODULE="$WORKSPACE_MODULE" \
+  BROOD_RESIZE_PROOF_COMPONENT="$RESIZE_PROOF_COMPONENT" \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  SWAYSOCK="$SWAY_SOCKET" \
+  RUST_LOG="$RUST_LOG" \
+  "$ROOT/tools/test-resize-managed-nested.sh"
+[[ -s "$MANAGED_PROOF" && -s "$MANAGED_METRICS" ]]
+
 if ! python3 - \
   "$CLIENT_LOG_NORMAL" \
   "$BURST_INPUT" \
@@ -1285,9 +1318,12 @@ pattern = re.compile(
     r"resize-present interaction=(?P<interaction>\d+) "
     r"event_sequence=(?P<event_sequence>\d+) epoch=(?P<epoch>\d+) "
     r"divider_x=(?P<divider_x>-?\d+) "
+    r"composition_size=(?P<composition_width>\d+)x(?P<composition_height>\d+) "
     r"phase=(?P<phase>settled|projected|promoted|degraded) "
     r"wait_ready=(?P<wait_ready>\d+)/(?P<wait_total>\d+) "
     r"staged_count=(?P<staged_count>\d+) "
+    r"managed_expectations=(?P<managed_expectations>\d+) "
+    r"managed_staged_resources=(?P<managed_staged_resources>\d+) "
     r"degraded=(?P<degraded>true|false)"
 )
 burst_start_line = int(sys.argv[3])
@@ -2194,6 +2230,7 @@ python3 - \
   "$MODE_HEIGHT" \
   "$EXTENDED_PROOF" \
   "$REGION_TREE_PROOF" \
+  "$MANAGED_PROOF" \
   > "$PROOF" <<'PY'
 import json
 import pathlib
@@ -2207,6 +2244,7 @@ events = [json.loads(line) for line in events_path.read_text().splitlines() if l
 metrics = json.loads(metrics_path.read_text())
 extended_proof = json.loads(pathlib.Path(sys.argv[11]).read_text())
 region_tree_proof = json.loads(pathlib.Path(sys.argv[12]).read_text())
+managed_proof = json.loads(pathlib.Path(sys.argv[13]).read_text())
 frame_locked_commands = sum(
     max(
         (frame["pointer_ack"]["sequence"] for frame in frames if frame["lane"] == lane),
@@ -2349,6 +2387,10 @@ proof = {
             region_tree_proof["verified"]
             and all(region_tree_proof["assertions"].values())
         ),
+        "managed_resize_epoch_correlation": (
+            managed_proof["verified"]
+            and all(managed_proof["assertions"].values())
+        ),
     },
     "artifacts": {
         "frame_manifest": "frame-manifest.jsonl",
@@ -2372,6 +2414,9 @@ proof = {
         "region_tree_proof": "region-tree/proof.json",
         "region_tree_metrics": "region-tree/metrics.json",
         "region_tree_frame_manifest": "region-tree/frame-manifest.jsonl",
+        "managed_proof": "managed/proof.json",
+        "managed_metrics": "managed/metrics.json",
+        "managed_frame_manifest": "managed/frame-manifest.jsonl",
     },
 }
 print(json.dumps(proof, indent=2, sort_keys=True))
@@ -2414,6 +2459,7 @@ jq -e '
   and .assertions.recursive_exact_extents_and_chrome == true
   and .assertions.shell_synchronized_real_input == true
   and .assertions.recursive_region_tree == true
+  and .assertions.managed_resize_epoch_correlation == true
   and .output.fractional_scale_1_25 == true
 ' "$PROOF" > /dev/null
 
@@ -2425,5 +2471,6 @@ echo "events=$RESIZE_EVENTS"
 echo "burst=$BURST_METRICS"
 echo "window_shell=$EXTENDED_PROOF"
 echo "region_tree=$REGION_TREE_PROOF"
+echo "managed=$MANAGED_PROOF"
 echo "contact_sheet=$OUT/contact-sheet.png"
 echo "animation=$OUT/resize.gif"

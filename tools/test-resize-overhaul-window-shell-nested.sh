@@ -310,6 +310,7 @@ wait_window_trace() {
       -v wanted_width="$width" \
       -v wanted_height="$height" '
         NR <= start || index($0, "window-resize-present ") == 0 { next }
+        $0 !~ / managed_staged_resources=[0-9]+ degraded=(true|false)$/ { next }
         {
           phase = ""; actual_width = -1; actual_height = -1;
           for (field_index = 1; field_index <= NF; field_index += 1) {
@@ -354,6 +355,7 @@ wait_resize_trace() {
       -v wanted_phases="$phases" '
         NR <= start || index($0, "resize-present ") == 0 { next }
         index($0, "window-resize-present ") != 0 { next }
+        $0 !~ / managed_staged_resources=[0-9]+ degraded=(true|false) superseded_epochs=[0-9]+$/ { next }
         {
           sequence = ""; epoch = ""; phase = "";
           for (field_index = 1; field_index <= NF; field_index += 1) {
@@ -391,6 +393,9 @@ wait_session_request() {
   for _ in $(seq 1 800); do
     result="$(awk -v start="$after_line" '
       NR <= start || index($0, "accepted synchronized layout actor=session-switcher ") == 0 { next }
+      $0 !~ / request=[0-9]+ / || $0 !~ / event_sequence=[0-9]+ / \
+        || $0 !~ / native_resize_revision=[0-9]+ / || $0 !~ / epoch=[0-9]+ / \
+        || $0 !~ / target_rects=[[][^]]*[]]$/ { next }
       { print NR "\t" substr($0, index($0, "accepted synchronized layout ")); exit }
     ' "$CLIENT_LOG")"
     if [[ -n "$result" ]]; then
@@ -509,7 +514,7 @@ wait_session_completed() {
     result="$(awk -v start="$after_line" -v request="$request" '
       NR <= start { next }
       index($0, "completed synchronized layout actor=session-switcher ") == 0 { next }
-      index($0, "request=" request " ") != 0 { print NR; exit }
+      index($0, "request=" request " ") != 0 && $0 ~ / duration_us=[0-9]+$/ { print NR; exit }
     ' "$CLIENT_LOG")"
     if [[ -n "$result" ]]; then
       TERMINAL_LINE="$result"

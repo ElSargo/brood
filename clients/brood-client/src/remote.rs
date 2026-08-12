@@ -305,6 +305,8 @@ async fn run_connection(
         critical_receive,
         proxy.clone(),
         disconnect_acknowledged,
+        backend,
+        generation,
     ));
     let mut actor_send_task = tokio::spawn(send_actor_messages(
         [session0_send, session1_send, session2_send, session3_send],
@@ -340,6 +342,7 @@ async fn run_connection(
         frame_receive,
         proxy.clone(),
         backend,
+        generation,
     ));
     let artifact_exchange = ArtifactExchange::new(
         ArtifactRealm::Client,
@@ -497,11 +500,18 @@ async fn receive_critical_messages(
     mut lane: NetworkReceiveLane,
     proxy: EventLoopProxy<ClientEvent>,
     disconnect_acknowledged: Arc<tokio::sync::Notify>,
+    backend: BackendId,
+    connection_generation: u64,
 ) -> Result<()> {
     loop {
         let event = match lane.receive_server_message().await? {
             ServerMessage::FocusPresentation => ClientEvent::FocusPresentation,
             ServerMessage::ClosePresentation => ClientEvent::ClosePresentation,
+            ServerMessage::ManagedResizeStatus(status) => ClientEvent::ManagedResizeStatus {
+                backend,
+                connection_generation,
+                status,
+            },
             ServerMessage::DisconnectAcknowledged => {
                 lane.wait_for_finish().await?;
                 disconnect_acknowledged.notify_one();
@@ -827,6 +837,7 @@ fn handle_reliable_message(
         }
         ServerMessage::Scene(_)
         | ServerMessage::Artifact(_)
+        | ServerMessage::ManagedResizeStatus(_)
         | ServerMessage::FocusPresentation
         | ServerMessage::ClosePresentation
         | ServerMessage::DisconnectAcknowledged => {
@@ -916,6 +927,7 @@ async fn receive_scenes(
     frames: NetworkReceiveLane,
     proxy: EventLoopProxy<ClientEvent>,
     backend: BackendId,
+    connection_generation: u64,
 ) -> Result<()> {
     let (sender, mut events) = tokio_mpsc::channel(16);
     let scene_task = tokio::spawn(receive_scene_messages(latest, sender.clone()));
@@ -954,6 +966,7 @@ async fn receive_scenes(
             &mut pending_frames,
             &proxy,
             backend,
+            connection_generation,
             &mut last_published,
         )
         .await?;
@@ -1008,6 +1021,7 @@ async fn publish_ready_scenes(
     frames: &mut HashMap<(u64, u64), NetworkFramePacket>,
     proxy: &EventLoopProxy<ClientEvent>,
     backend: BackendId,
+    connection_generation: u64,
     last_published: &mut Option<u64>,
 ) -> Result<()> {
     loop {
@@ -1049,6 +1063,7 @@ async fn publish_ready_scenes(
         proxy
             .send_event(ClientEvent::SceneFrame {
                 backend,
+                connection_generation,
                 sequence,
                 width: windows.extent[0],
                 height: windows.extent[1],
@@ -1102,10 +1117,12 @@ fn decode_scene_windows(
         let pixels = packet.pixels()?;
         windows.push(SceneWindowUpdate {
             backend: scene.backend,
+            backend_window_id: window.pane,
             window_id: window.pane,
             resource_id: resource,
             rect: window.source,
             active: window.active,
+            resize_epoch: window.resize_epoch,
             resource: Some(FrameResource::Network(NetworkFrame {
                 width: packet.width,
                 height: packet.height,

@@ -125,9 +125,9 @@ pub use resize::{
     FailLayoutRegion, InteractionId, LayoutRegionNotification, LayoutRegionRejectionReason,
     LayoutRegionResized, LayoutRegionResponseNotification, PresentationMode, ResizeEpoch,
     ReuseLayoutRegion, ReusePaneContent, SubmitLayoutRegion, SubmitSynchronizedLayout,
-    SynchronizedLayoutAccepted, SynchronizedLayoutCompleted, SynchronizedLayoutDegraded,
-    SynchronizedLayoutFragment, SynchronizedLayoutNotification, SynchronizedLayoutRejected,
-    SynchronizedLayoutRejectionReason, SynchronizedLayoutSuperseded,
+    SynchronizedLayoutAborted, SynchronizedLayoutAccepted, SynchronizedLayoutCompleted,
+    SynchronizedLayoutDegraded, SynchronizedLayoutFragment, SynchronizedLayoutNotification,
+    SynchronizedLayoutRejected, SynchronizedLayoutRejectionReason, SynchronizedLayoutSuperseded,
 };
 pub use resolved_layout::{
     CursorRole, DividerAxis, DividerRole, InputBehavior, InteractionZone, LayoutChildSlot,

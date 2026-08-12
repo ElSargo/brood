@@ -19,7 +19,9 @@ pub use brood_protocol::{
     FrameColorSpace, FramePixelFormat, UnsupportedFrameColorSpace, UnsupportedFramePixelFormat,
 };
 pub use local_protocol::{
-    LocalProtocolError, decode_client_record, encode_client_record, is_coalescible_client_record,
+    LocalProtocolError, LocalWindowFrame, decode_client_record,
+    decode_managed_resize_status_record, decode_window_frame_record, encode_client_record,
+    encode_managed_resize_status_record, encode_window_frame_record, is_coalescible_client_record,
 };
 pub use shared_image::{
     SharedImageConsumer, SharedImageError, SharedImageMetadata, SharedImageProducer,
@@ -49,7 +51,10 @@ const CRITICAL_CAPACITY_U32: u32 = 64;
 
 /// Keyboard key changed; arguments are xkb keycode and pressed boolean.
 pub const INPUT_KEYBOARD_KEY: u32 = 3;
-/// Presentation configuration changed; arguments are width, height, and refresh mHz.
+/// Presentation configuration changed.
+///
+/// Arguments are physical width, physical height, refresh mHz, and scale in
+/// 120ths of one logical output unit.
 pub const INPUT_PRESENTATION_SIZE: u32 = 5;
 /// A frame reached the presentation queue; argument zero is its frame sequence.
 pub const INPUT_FRAME_PRESENTED: u32 = 6;
@@ -57,10 +62,12 @@ pub const INPUT_FRAME_PRESENTED: u32 = 6;
 pub const INPUT_CLIENT_DISCONNECT: u32 = 7;
 /// The presentation client selected a hosted window; argument zero is its window ID.
 pub const INPUT_WINDOW_FOCUS: u32 = 8;
-/// Request one managed window's logical content size.
+/// Request one managed window's logical and physical target sizes.
 ///
-/// Arguments are window ID, logical width, and logical height. Placement is
-/// deliberately absent: final layout belongs to the presentation client.
+/// Arguments are window ID, packed logical width/height, packed physical
+/// width/height, scale in 120ths, and resize epoch. A zero epoch is untagged.
+/// Placement is deliberately absent: final layout belongs to the presentation
+/// client.
 pub const INPUT_WINDOW_RESIZE: u32 = 9;
 /// Move the pointer over one managed pane using pane-local logical coordinates.
 ///
@@ -96,6 +103,8 @@ pub const INPUT_KEYBOARD_RESET: u32 = 15;
 /// Argument zero is the focused boolean. This is lifecycle metadata, not pane
 /// layout or hit-test state.
 pub const INPUT_PRESENTATION_FOCUS: u32 = 16;
+/// Release one generation-local frame resource after it is no longer visible or staged.
+pub const INPUT_RELEASE_RESOURCE: u32 = 17;
 /// Begin one atomic client-composed scene.
 ///
 /// Arguments are window count, scene width, and scene height.
@@ -103,14 +112,25 @@ pub const FRAME_SCENE_BEGIN: u32 = 0x100;
 /// One separately transported window in the current scene batch.
 ///
 /// Arguments are window ID, resource ID, packed source x/y, packed source
-/// width/height, and whether the window is active. These coordinates describe
-/// content within the resource; they are not presentation placement.
+/// width/height, and resize epoch. A zero epoch is untagged. Bit zero of the
+/// record flags is the active-window flag; all other flag bits are reserved.
+/// These coordinates describe content within the resource; they are not
+/// presentation placement.
 pub const FRAME_WINDOW_DMABUF: u32 = 0x101;
 /// One shared-memory image window in the current scene batch.
 ///
 /// Arguments match [`FRAME_WINDOW_DMABUF`], but the resource ID names a
 /// size-sealed shared-image mapping instead of a DMA-BUF.
 pub const FRAME_WINDOW_SHM: u32 = 0x105;
+/// Admission status for one tagged managed resize.
+///
+/// Arguments are pane, epoch, packed logical size, packed physical size, and
+/// scale in 120ths. The flags encode configured or one bounded rejection.
+pub const FRAME_MANAGED_RESIZE_STATUS: u32 = 0x106;
+/// The managed window is active in its scene.
+pub const FRAME_WINDOW_FLAG_ACTIVE: u32 = 1;
+/// All currently defined managed-window frame flags.
+pub const FRAME_WINDOW_FLAGS: u32 = FRAME_WINDOW_FLAG_ACTIVE;
 /// End and publish the current atomic scene batch.
 pub const FRAME_SCENE_END: u32 = 0x102;
 /// Ask the external presentation client to focus its operating-system window.
@@ -145,6 +165,41 @@ pub fn encode_i32_argument(value: i32) -> u64 {
 pub fn decode_i32_argument(value: u64) -> i32 {
     let value = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
     i32::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// Pack two signed 32-bit protocol values into one record argument.
+#[must_use]
+pub fn encode_i32_pair(first: i32, second: i32) -> u64 {
+    encode_u32_pair(
+        u32::from_ne_bytes(first.to_ne_bytes()),
+        u32::from_ne_bytes(second.to_ne_bytes()),
+    )
+}
+
+/// Recover two signed 32-bit protocol values from one record argument.
+#[must_use]
+pub const fn decode_i32_pair(value: u64) -> (i32, i32) {
+    let (first, second) = decode_u32_pair(value);
+    (
+        i32::from_ne_bytes(first.to_ne_bytes()),
+        i32::from_ne_bytes(second.to_ne_bytes()),
+    )
+}
+
+/// Pack two unsigned 32-bit protocol values into one record argument.
+#[must_use]
+pub fn encode_u32_pair(first: u32, second: u32) -> u64 {
+    u64::from(first) | (u64::from(second) << 32)
+}
+
+/// Recover two unsigned 32-bit protocol values from one record argument.
+#[must_use]
+pub const fn decode_u32_pair(value: u64) -> (u32, u32) {
+    let bytes = value.to_le_bytes();
+    (
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+    )
 }
 
 /// Non-blocking eventfd used to wake a critical-lane consumer.

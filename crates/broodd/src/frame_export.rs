@@ -14,12 +14,14 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     env, fmt, fs,
     io::Error as IoError,
     mem::size_of,
     os::fd::OwnedFd,
     path::PathBuf,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -225,6 +227,14 @@ pub fn request_redraw(state: &mut Brood) {
         fast_path.pending_redraw = true;
         return;
     }
+    if fast_path.managed_resizes.ordinary_recovery_commit_pending() {
+        // An untagged recovery resize retired old epoch authority. Keep the
+        // last complete scene until the addressed pane supplies a later
+        // ordinary commit; exporting its current surface here could mix a
+        // ready pane's discarded tagged pixels with another pane's old ones.
+        fast_path.pending_redraw = true;
+        return;
+    }
     let Some(exporter) = state.dmabuf.exporter.clone() else {
         record_failure(
             state,
@@ -361,12 +371,66 @@ struct ExternalWindowFrame {
     source_w: i32,
     source_h: i32,
     active: bool,
+    resize_epoch: Option<u64>,
+    tagged_surface_commit: Option<u64>,
     window: Window,
 }
 
-enum RenderedWindowBacking {
+#[derive(Clone)]
+pub(crate) enum ManagedSnapshotBacking {
     Dmabuf(Dmabuf),
-    SharedMemory(Vec<u8>),
+    SharedMemory(Arc<[u8]>),
+}
+
+type RenderedWindowBacking = ManagedSnapshotBacking;
+
+pub(crate) fn capture_managed_commit_snapshot(
+    state: &mut Brood,
+    window: &Window,
+    pane: u64,
+    pixel_size: (i32, i32),
+) -> std::result::Result<ManagedSnapshotBacking, FrameExportFailure> {
+    let profile = state
+        .dmabuf
+        .fast_path
+        .as_ref()
+        .map(|fast_path| fast_path.profile.frames)
+        .ok_or_else(|| FrameExportFailure::new("capture_managed_commit", "fast path closed"))?;
+    let exporter =
+        state.dmabuf.exporter.clone().ok_or_else(|| {
+            FrameExportFailure::new("capture_managed_commit", "exporter unavailable")
+        })?;
+    let frame = ExternalWindowFrame {
+        window_id: pane,
+        app_id: state.window_app_id(window).unwrap_or_default(),
+        source_x: 0,
+        source_y: 0,
+        source_w: pixel_size.0,
+        source_h: pixel_size.1,
+        active: state.active_presentation_client_window().as_ref() == Some(window),
+        resize_epoch: None,
+        tagged_surface_commit: None,
+        window: window.clone(),
+    };
+    match profile {
+        brood_protocol::FrameTransportKind::Dmabuf => {
+            let size: Size<i32, Physical> = pixel_size.into();
+            let mut dmabuf = exporter
+                .borrow_mut()
+                .create_exportable_dmabuf(size)
+                .map_err(|error| FrameExportFailure::new("allocate_managed_snapshot", error))?;
+            render_window_dmabuf(&mut exporter.borrow_mut(), state, &frame, &mut dmabuf)?;
+            Ok(ManagedSnapshotBacking::Dmabuf(dmabuf))
+        }
+        brood_protocol::FrameTransportKind::SharedMemory => {
+            let pixels = render_window_shared_memory(&mut exporter.borrow_mut(), state, &frame)?;
+            Ok(ManagedSnapshotBacking::SharedMemory(pixels.into()))
+        }
+        brood_protocol::FrameTransportKind::Network => Err(FrameExportFailure::new(
+            "capture_managed_commit",
+            "network frame transport reached local exporter",
+        )),
+    }
 }
 
 fn render_external_client_scene(
@@ -382,23 +446,41 @@ fn render_external_client_scene(
             FrameExportFailure::new("render_window_scene", "fast path is unavailable")
         })?;
     let active_window = state.active_presentation_client_window();
+    let scale = state.session_output.current_scale().fractional_scale();
     let mut windows = state
         .space
         .elements()
         .filter(|window| state.window_available_to_presentation_client(window))
         .enumerate()
         .filter_map(|(index, window)| {
-            let source_size = window.geometry().size;
-            (source_size.w > 0 && source_size.h > 0).then(|| ExternalWindowFrame {
-                window_id: state
-                    .window_pane_id(window)
-                    .unwrap_or_else(|| state.window_test_marker_id(window, index)),
+            let logical_size = window.geometry().size;
+            let window_id = state
+                .window_pane_id(window)
+                .unwrap_or_else(|| state.window_test_marker_id(window, index));
+            let snapshot = state
+                .dmabuf
+                .fast_path
+                .as_ref()
+                .and_then(|fast_path| fast_path.managed_resizes.queued_snapshot(window_id));
+            let source_size = snapshot.as_ref().map_or_else(
+                || {
+                    (
+                        (f64::from(logical_size.w) * scale).round() as i32,
+                        (f64::from(logical_size.h) * scale).round() as i32,
+                    )
+                },
+                |snapshot| snapshot.pixel_size,
+            );
+            (source_size.0 > 0 && source_size.1 > 0).then(|| ExternalWindowFrame {
+                window_id,
                 app_id: state.window_app_id(window).unwrap_or_default(),
                 source_x: 0,
                 source_y: 0,
-                source_w: source_size.w,
-                source_h: source_size.h,
+                source_w: source_size.0,
+                source_h: source_size.1,
                 active: active_window.as_ref() == Some(window),
+                resize_epoch: snapshot.as_ref().map(|snapshot| snapshot.epoch),
+                tagged_surface_commit: snapshot.as_ref().map(|snapshot| snapshot.surface_commit),
                 window: window.clone(),
             })
         })
@@ -418,6 +500,15 @@ fn render_external_client_scene(
 
     let mut rendered = Vec::with_capacity(windows.len());
     for window in windows {
+        let snapshot = state
+            .dmabuf
+            .fast_path
+            .as_ref()
+            .and_then(|fast_path| fast_path.managed_resizes.queued_snapshot(window.window_id));
+        if let Some(snapshot) = snapshot {
+            rendered.push((window, snapshot.backing));
+            continue;
+        }
         let size: Size<i32, Physical> = (window.source_w.max(1), window.source_h.max(1)).into();
         let backing = match frame_transport {
             brood_protocol::FrameTransportKind::Dmabuf => {
@@ -445,9 +536,9 @@ fn render_external_client_scene(
                 RenderedWindowBacking::Dmabuf(dmabuf)
             }
             brood_protocol::FrameTransportKind::SharedMemory => {
-                RenderedWindowBacking::SharedMemory(render_window_shared_memory(
-                    exporter, state, &window,
-                )?)
+                RenderedWindowBacking::SharedMemory(
+                    render_window_shared_memory(exporter, state, &window)?.into(),
+                )
             }
             brood_protocol::FrameTransportKind::Network => {
                 return Err(FrameExportFailure::new(
@@ -597,6 +688,8 @@ fn publish_window_scene(
         fast_path.pending_redraw = true;
         return Ok(());
     }
+    cleanup_provisional_tagged_resources(fast_path);
+    let mut tagged = Vec::new();
     fast_path
         .frames
         .try_send(brood_ipc::CriticalRecord {
@@ -618,7 +711,15 @@ fn publish_window_scene(
         let (opcode, resource_id) = match backing {
             RenderedWindowBacking::Dmabuf(dmabuf) => {
                 let weak_dmabuf = dmabuf.weak();
-                let resource_id = if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
+                let tagged_identity = window
+                    .resize_epoch
+                    .zip(window.tagged_surface_commit)
+                    .map(|(epoch, surface_commit)| (window.window_id, epoch, surface_commit));
+                let resource_id = if let Some(id) = tagged_identity
+                    .and_then(|identity| fast_path.tagged_dmabuf_resources.get(&identity))
+                {
+                    *id
+                } else if let Some(id) = fast_path.resources.get(&weak_dmabuf) {
                     *id
                 } else {
                     fast_path.resources.retain(|buffer, _| !buffer.is_gone());
@@ -629,6 +730,11 @@ fn publish_window_scene(
                     fast_path.resource_app_ids.insert(id, window.app_id.clone());
                     id
                 };
+                if let Some(identity) = tagged_identity {
+                    fast_path
+                        .tagged_dmabuf_resources
+                        .insert(identity, resource_id);
+                }
                 (brood_ipc::FRAME_WINDOW_DMABUF, resource_id)
             }
             RenderedWindowBacking::SharedMemory(pixels) => {
@@ -646,40 +752,17 @@ fn publish_window_scene(
                     pixel_format: brood_protocol::FramePixelFormat::Rgba8,
                     color_space: brood_protocol::FrameColorSpace::Srgb,
                 };
-                let existing = fast_path
-                    .window_shared_image_resources
-                    .get(&window.window_id)
-                    .copied()
-                    .filter(|resource| {
-                        fast_path
-                            .shared_images
-                            .get(resource)
-                            .is_some_and(|(_, image)| image.metadata() == metadata)
-                    });
-                let resource_id = if let Some(resource) = existing {
-                    resource
-                } else {
-                    if let Some(stale) = fast_path
-                        .window_shared_image_resources
-                        .remove(&window.window_id)
-                    {
-                        fast_path.shared_images.remove(&stale);
-                    }
-                    let resource = fast_path.next_resource_id;
-                    fast_path.next_resource_id = resource.wrapping_add(1);
-                    let image =
-                        brood_ipc::SharedImageProducer::create(fast_path.generation, metadata)
-                            .map_err(|error| {
-                                FrameExportFailure::new("create_shared_image", error)
-                            })?;
-                    fast_path
-                        .shared_images
-                        .insert(resource, (window.app_id.clone(), image));
-                    fast_path
-                        .window_shared_image_resources
-                        .insert(window.window_id, resource);
-                    resource
-                };
+                let resource_id = shared_image_resource(
+                    fast_path.generation,
+                    &mut fast_path.next_resource_id,
+                    &mut fast_path.shared_images,
+                    &mut fast_path.window_shared_image_resources,
+                    &mut fast_path.tagged_shared_image_resources,
+                    window.window_id,
+                    &window.app_id,
+                    window.resize_epoch.zip(window.tagged_surface_commit),
+                    metadata,
+                )?;
                 let (_, image) =
                     fast_path
                         .shared_images
@@ -691,27 +774,37 @@ fn publish_window_scene(
                             )
                         })?;
                 image
-                    .publish(sequence, &pixels)
+                    .publish(sequence, pixels.as_ref())
                     .map_err(|error| FrameExportFailure::new("publish_shared_image", error))?;
                 (brood_ipc::FRAME_WINDOW_SHM, resource_id)
             }
         };
+        let record = brood_ipc::encode_window_frame_record(
+            opcode,
+            fast_path.generation,
+            sequence,
+            brood_ipc::LocalWindowFrame {
+                pane: window.window_id,
+                resource: resource_id,
+                source: [
+                    window.source_x,
+                    window.source_y,
+                    window.source_w,
+                    window.source_h,
+                ],
+                active: window.active,
+                resize_epoch: window.resize_epoch,
+            },
+        )
+        .map_err(|error| FrameExportFailure::new("encode_window_frame", error))?;
         fast_path
             .frames
-            .try_send(brood_ipc::CriticalRecord {
-                opcode,
-                connection_generation: fast_path.generation,
-                sequence,
-                arguments: [
-                    window.window_id,
-                    resource_id,
-                    pack_i32_pair(window.source_x, window.source_y),
-                    pack_i32_pair(window.source_w, window.source_h),
-                    u64::from(window.active),
-                ],
-                ..brood_ipc::CriticalRecord::default()
-            })
+            .try_send(record)
             .map_err(|error| FrameExportFailure::new("publish_window_frame", error))?;
+        if let Some((epoch, surface_commit)) = window.resize_epoch.zip(window.tagged_surface_commit)
+        {
+            tagged.push((window.window_id, epoch, surface_commit, resource_id));
+        }
     }
     fast_path
         .frames
@@ -727,12 +820,103 @@ fn publish_window_scene(
         .notify()
         .map_err(|error| FrameExportFailure::new("notify_window_scene", error))?;
     fast_path.in_flight_sequence = Some(sequence);
+    for (pane, epoch, surface_commit, resource_id) in tagged {
+        fast_path.managed_resizes.mark_scene_in_flight(
+            pane,
+            epoch,
+            surface_commit,
+            sequence,
+            resource_id,
+        );
+    }
     Ok(())
 }
 
-fn pack_i32_pair(first: i32, second: i32) -> u64 {
-    u64::from(u32::from_ne_bytes(first.to_ne_bytes()))
-        | (u64::from(u32::from_ne_bytes(second.to_ne_bytes())) << 32)
+pub(crate) fn cleanup_provisional_tagged_resources(
+    fast_path: &mut crate::state::PresentationFastPath,
+) {
+    let stale_shared = take_stale_provisional_resources(
+        &mut fast_path.tagged_shared_image_resources,
+        |identity| {
+            fast_path
+                .managed_resizes
+                .contains_snapshot(identity.0, identity.1, identity.2)
+        },
+    );
+    for resource in stale_shared {
+        fast_path.shared_images.remove(&resource);
+    }
+    let stale_dmabuf =
+        take_stale_provisional_resources(&mut fast_path.tagged_dmabuf_resources, |identity| {
+            fast_path
+                .managed_resizes
+                .contains_snapshot(identity.0, identity.1, identity.2)
+        });
+    for resource in stale_dmabuf {
+        fast_path.buffers.remove(&resource);
+        fast_path.resource_app_ids.remove(&resource);
+        fast_path.resources.retain(|_buffer, id| *id != resource);
+    }
+}
+
+fn take_stale_provisional_resources(
+    resources: &mut HashMap<(u64, u64, u64), u64>,
+    mut is_live: impl FnMut(&(u64, u64, u64)) -> bool,
+) -> Vec<u64> {
+    let stale = resources
+        .iter()
+        .filter_map(|(identity, resource)| (!is_live(identity)).then_some(*resource))
+        .collect::<Vec<_>>();
+    resources.retain(|identity, _resource| is_live(identity));
+    stale
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "resource selection keeps ordinary and exact tagged ownership maps explicit"
+)]
+fn shared_image_resource(
+    generation: u64,
+    next_resource_id: &mut u64,
+    shared_images: &mut HashMap<u64, (String, brood_ipc::SharedImageProducer)>,
+    ordinary_resources: &mut HashMap<u64, u64>,
+    tagged_resources: &mut HashMap<(u64, u64, u64), u64>,
+    pane: u64,
+    app_id: &str,
+    tagged: Option<(u64, u64)>,
+    metadata: brood_ipc::SharedImageMetadata,
+) -> std::result::Result<u64, FrameExportFailure> {
+    let tagged_identity = tagged.map(|(epoch, surface_commit)| (pane, epoch, surface_commit));
+    let existing = tagged_identity
+        .and_then(|identity| tagged_resources.get(&identity).copied())
+        .or_else(|| {
+            tagged.is_none().then(|| {
+                ordinary_resources.get(&pane).copied().filter(|resource| {
+                    shared_images
+                        .get(resource)
+                        .is_some_and(|(_, image)| image.metadata() == metadata)
+                })
+            })?
+        });
+    if let Some(resource) = existing {
+        return Ok(resource);
+    }
+    if tagged.is_none()
+        && let Some(stale) = ordinary_resources.remove(&pane)
+    {
+        shared_images.remove(&stale);
+    }
+    let resource = *next_resource_id;
+    *next_resource_id = resource.wrapping_add(1);
+    let image = brood_ipc::SharedImageProducer::create(generation, metadata)
+        .map_err(|error| FrameExportFailure::new("create_shared_image", error))?;
+    shared_images.insert(resource, (app_id.to_string(), image));
+    if let Some(identity) = tagged_identity {
+        tagged_resources.insert(identity, resource);
+    } else {
+        ordinary_resources.insert(pane, resource);
+    }
+    Ok(resource)
 }
 
 pub fn send_external_client_frame_callbacks(state: &mut Brood) -> u64 {
@@ -1017,4 +1201,123 @@ pub fn sanitize_status_value(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, os::fd::AsFd};
+
+    use brood_protocol::{FrameColorSpace, FramePixelFormat};
+
+    use super::{shared_image_resource, take_stale_provisional_resources};
+
+    #[test]
+    fn tagged_shared_image_has_stable_dedicated_ownership_until_release() {
+        let generation = 9;
+        let metadata = brood_ipc::SharedImageMetadata {
+            width: 2,
+            height: 1,
+            stride: 8,
+            pixel_format: FramePixelFormat::Rgba8,
+            color_space: FrameColorSpace::Srgb,
+        };
+        let mut next_resource = 1;
+        let mut images = HashMap::new();
+        let mut ordinary = HashMap::new();
+        let mut tagged = HashMap::new();
+        let ordinary_resource = shared_image_resource(
+            generation,
+            &mut next_resource,
+            &mut images,
+            &mut ordinary,
+            &mut tagged,
+            4,
+            "fixture",
+            None,
+            metadata,
+        )
+        .unwrap();
+        let tagged_resource = shared_image_resource(
+            generation,
+            &mut next_resource,
+            &mut images,
+            &mut ordinary,
+            &mut tagged,
+            4,
+            "fixture",
+            Some((17, 3)),
+            metadata,
+        )
+        .unwrap();
+        assert_ne!(tagged_resource, ordinary_resource);
+        images
+            .get_mut(&ordinary_resource)
+            .unwrap()
+            .1
+            .publish(1, &[1; 8])
+            .unwrap();
+        images
+            .get_mut(&tagged_resource)
+            .unwrap()
+            .1
+            .publish(2, &[2; 8])
+            .unwrap();
+        let tagged_consumer = brood_ipc::SharedImageConsumer::map(
+            images.get(&tagged_resource).unwrap().1.as_fd(),
+            generation,
+        )
+        .unwrap();
+
+        let retry_resource = shared_image_resource(
+            generation,
+            &mut next_resource,
+            &mut images,
+            &mut ordinary,
+            &mut tagged,
+            4,
+            "fixture",
+            Some((17, 3)),
+            metadata,
+        )
+        .unwrap();
+        assert_eq!(retry_resource, tagged_resource);
+        images
+            .get_mut(&ordinary_resource)
+            .unwrap()
+            .1
+            .publish(3, &[9; 8])
+            .unwrap();
+        assert_eq!(tagged_consumer.pixels(2).unwrap(), &[2; 8]);
+
+        tagged.remove(&(4, 17, 3));
+        assert!(images.contains_key(&tagged_resource));
+        images.remove(&tagged_resource);
+        assert!(!images.contains_key(&tagged_resource));
+    }
+
+    #[test]
+    fn partial_tagged_attempt_cleanup_removes_both_carrier_backings() {
+        let live = (4, 17, 3);
+        let stale = (4, 18, 4);
+        let mut shared_identities = HashMap::from([(live, 41), (stale, 42)]);
+        let mut dmabuf_identities = HashMap::from([(live, 51), (stale, 52)]);
+        let mut shared_backings = HashMap::from([(41, "live"), (42, "partial")]);
+        let mut dmabuf_backings = HashMap::from([(51, "live"), (52, "partial")]);
+
+        for resource in
+            take_stale_provisional_resources(&mut shared_identities, |identity| *identity == live)
+        {
+            shared_backings.remove(&resource);
+        }
+        for resource in
+            take_stale_provisional_resources(&mut dmabuf_identities, |identity| *identity == live)
+        {
+            dmabuf_backings.remove(&resource);
+        }
+
+        assert_eq!(shared_identities, HashMap::from([(live, 41)]));
+        assert_eq!(dmabuf_identities, HashMap::from([(live, 51)]));
+        assert_eq!(shared_backings, HashMap::from([(41, "live")]));
+        assert_eq!(dmabuf_backings, HashMap::from([(51, "live")]));
+    }
 }

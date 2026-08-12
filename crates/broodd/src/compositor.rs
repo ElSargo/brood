@@ -8,7 +8,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
     backend::{
         allocator::{Buffer, dmabuf::Dmabuf},
-        renderer::{ImportDma, utils::on_commit_buffer_handler},
+        renderer::{ImportDma, buffer_dimensions, utils::on_commit_buffer_handler},
     },
     desktop::{PopupKind, Window},
     input::{Seat, SeatHandler, SeatState},
@@ -85,7 +85,7 @@ impl CompositorHandler for Brood {
         add_pre_commit_hook::<Self, _>(surface, move |state, _dh, surface| {
             let mut acquire_point = None;
             let mut has_release_point = false;
-            let maybe_dmabuf = with_states(surface, |surface_data| {
+            let (maybe_dmabuf, new_buffer_size) = with_states(surface, |surface_data| {
                 {
                     let mut syncobj_guard =
                         surface_data.cached_state.get::<DrmSyncobjCachedState>();
@@ -93,17 +93,25 @@ impl CompositorHandler for Brood {
                     acquire_point.clone_from(&syncobj_state.acquire_point);
                     has_release_point = syncobj_state.release_point.is_some();
                 }
-                surface_data
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .pending()
-                    .buffer
-                    .as_ref()
-                    .and_then(|assignment| match assignment {
-                        BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
-                        BufferAssignment::Removed => None,
-                    })
+                let mut attributes = surface_data.cached_state.get::<SurfaceAttributes>();
+                let attributes = attributes.pending();
+                let transform = smithay::utils::Transform::from(attributes.buffer_transform);
+                let new_buffer = attributes.buffer.as_ref().and_then(|assignment| {
+                    if let BufferAssignment::NewBuffer(buffer) = assignment {
+                        Some(buffer)
+                    } else {
+                        None
+                    }
+                });
+                let maybe_dmabuf = new_buffer.and_then(|buffer| get_dmabuf(buffer).cloned().ok());
+                let new_buffer_size = new_buffer
+                    .and_then(|buffer| buffer_dimensions(buffer))
+                    .map(|size| transform.transform_size(size))
+                    .map(|size| (size.w, size.h));
+                (maybe_dmabuf, new_buffer_size)
             });
+
+            state.record_managed_commit_observation(surface, new_buffer_size);
 
             if let Some(dmabuf) = maybe_dmabuf {
                 if has_release_point {
@@ -215,6 +223,7 @@ impl CompositorHandler for Brood {
         }
 
         handle_xdg_commit(self, surface);
+        self.capture_managed_resize_commit(surface);
         crate::frame_export::request_redraw(self);
     }
 }

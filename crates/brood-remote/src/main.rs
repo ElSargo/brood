@@ -383,6 +383,7 @@ struct PendingWindow {
     resource: u64,
     source: [i32; 4],
     active: bool,
+    resize_epoch: Option<u64>,
 }
 
 #[tokio::main(worker_threads = 2)]
@@ -1679,7 +1680,10 @@ fn spawn_frame_forwarder(
                             let Some(scene) = pending.as_mut() else {
                                 continue;
                             };
-                            let resource = record.arguments[1];
+                            let Ok(window) = brood_ipc::decode_window_frame_record(&record) else {
+                                return;
+                            };
+                            let resource = window.resource;
                             let Ok(mut resources) = resources.lock() else {
                                 return;
                             };
@@ -1693,14 +1697,29 @@ fn spawn_frame_forwarder(
                                 };
                                 entry.insert(Arc::new(frame));
                             }
-                            let (x, y) = unpack_i32_pair(record.arguments[2]);
-                            let (width, height) = unpack_i32_pair(record.arguments[3]);
                             scene.windows.push(PendingWindow {
-                                pane: record.arguments[0],
+                                pane: window.pane,
                                 resource,
-                                source: [x, y, width, height],
-                                active: record.arguments[4] != 0,
+                                source: window.source,
+                                active: window.active,
+                                resize_epoch: window.resize_epoch,
                             });
+                        }
+                        brood_ipc::FRAME_MANAGED_RESIZE_STATUS => {
+                            let Ok(status) =
+                                brood_ipc::decode_managed_resize_status_record(&record)
+                            else {
+                                return;
+                            };
+                            if outbound
+                                .critical
+                                .blocking_send(CriticalOutbound::Message(
+                                    ServerMessage::ManagedResizeStatus(status),
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                         brood_ipc::FRAME_SCENE_END => {
                             let Some(scene) = pending.take() else {
@@ -1779,6 +1798,7 @@ fn encode_network_scene(
             },
             source: window.source,
             active: window.active,
+            resize_epoch: window.resize_epoch,
         });
     }
     Ok(NetworkScene {
@@ -1906,6 +1926,7 @@ async fn probe(
             width: 1280,
             height: 800,
             refresh_millihz: 60_000,
+            scale_120: 120,
         }))
         .await?;
 
@@ -2158,13 +2179,4 @@ async fn acknowledge_frame(lane: &mut NetworkSendLane, sequence: u64) -> Result<
         sequence,
     }))
     .await
-}
-
-fn unpack_i32_pair(value: u64) -> (i32, i32) {
-    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
-    let high = u32::try_from(value >> 32).unwrap_or_default();
-    (
-        i32::from_ne_bytes(low.to_ne_bytes()),
-        i32::from_ne_bytes(high.to_ne_bytes()),
-    )
 }

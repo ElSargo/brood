@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 21;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 22;
+
+/// Number of fixed scale units in one logical output unit.
+pub const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
@@ -367,6 +370,7 @@ pub enum InputEvent {
         width: u32,
         height: u32,
         refresh_millihz: u32,
+        scale_120: u32,
     },
     PresentationFocus {
         focused: bool,
@@ -376,8 +380,12 @@ pub enum InputEvent {
     },
     WindowResize {
         pane: u64,
-        width: u32,
-        height: u32,
+        logical_width: u32,
+        logical_height: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+        scale_120: u32,
+        resize_epoch: Option<u64>,
     },
     PointerMotion {
         position: PanePosition,
@@ -694,6 +702,39 @@ pub struct WindowFrame {
     pub resource: FrameResourceRef,
     pub source: [i32; 4],
     pub active: bool,
+    pub resize_epoch: Option<u64>,
+}
+
+/// Stable server-side refusal classes for one tagged managed resize.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedResizeRejectionReason {
+    PaneUnavailable,
+    CorrelationCapacity,
+    ConfigureFailed,
+    SizeUnsatisfied,
+}
+
+/// Result of admitting one tagged managed resize at the session server.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedResizeStatusResult {
+    Configured {
+        logical_size: [u32; 2],
+        pixel_size: [u32; 2],
+        scale_120: u32,
+    },
+    Rejected {
+        reason: ManagedResizeRejectionReason,
+    },
+}
+
+/// Bounded admission status for one host-issued managed resize epoch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedResizeStatus {
+    pub pane: u64,
+    pub resize_epoch: u64,
+    pub result: ManagedResizeStatusResult,
 }
 
 /// One atomic collection of independently transported managed-window frames.
@@ -713,6 +754,7 @@ pub enum ServerMessage {
     Scene(FrameScene),
     Actor(ActorMessage),
     BackendResponse(BackendResponse),
+    ManagedResizeStatus(ManagedResizeStatus),
     Artifact(ArtifactMessage),
     FocusPresentation,
     ClosePresentation,
@@ -723,9 +765,10 @@ pub enum ServerMessage {
 mod tests {
     use super::{
         ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
-        ArtifactValidationError, CarrierKind, EndpointCapabilities, FrameTransportKind,
-        MAX_ARTIFACT_CHUNK_BYTES, NegotiationError, PRESENTATION_PROTOCOL_VERSION,
-        TransportProfile, negotiate_profile,
+        ArtifactValidationError, CarrierKind, EndpointCapabilities, FrameTransportKind, InputEvent,
+        MAX_ARTIFACT_CHUNK_BYTES, ManagedResizeRejectionReason, ManagedResizeStatus,
+        ManagedResizeStatusResult, NegotiationError, PRESENTATION_PROTOCOL_VERSION, ServerMessage,
+        TransportProfile, WindowFrame, negotiate_profile,
     };
 
     #[test]
@@ -767,13 +810,70 @@ mod tests {
 
     #[test]
     fn version_mismatch_is_rejected() {
+        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 22);
         let client = EndpointCapabilities::local_server(true);
         let mut server = client.clone();
-        server.protocol_version = server.protocol_version.saturating_add(1);
+        server.protocol_version = 21;
         assert_eq!(
             negotiate_profile(&client, &server),
             Err(NegotiationError::ProtocolVersion)
         );
+    }
+
+    #[test]
+    fn resize_epoch_messages_preserve_explicit_units() {
+        let input = InputEvent::WindowResize {
+            pane: 7,
+            logical_width: 200,
+            logical_height: 120,
+            pixel_width: 300,
+            pixel_height: 180,
+            scale_120: 180,
+            resize_epoch: Some(41),
+        };
+        let input_json = serde_json::to_vec(&input);
+        assert!(input_json.is_ok());
+        let Some(input_json) = input_json.ok() else {
+            return;
+        };
+        let Ok(decoded_input) = serde_json::from_slice::<InputEvent>(&input_json) else {
+            return;
+        };
+        assert_eq!(decoded_input, input);
+
+        let status = ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
+            pane: 7,
+            resize_epoch: 41,
+            result: ManagedResizeStatusResult::Rejected {
+                reason: ManagedResizeRejectionReason::CorrelationCapacity,
+            },
+        });
+        let status_json = serde_json::to_vec(&status);
+        assert!(status_json.is_ok());
+        let Some(status_json) = status_json.ok() else {
+            return;
+        };
+        let Ok(decoded_status) = serde_json::from_slice::<ServerMessage>(&status_json) else {
+            return;
+        };
+        assert_eq!(decoded_status, status);
+
+        let frame = WindowFrame {
+            pane: 7,
+            resource: super::FrameResourceRef::Network { resource: 11 },
+            source: [0, 0, 300, 180],
+            active: true,
+            resize_epoch: Some(41),
+        };
+        let frame_json = serde_json::to_vec(&frame);
+        assert!(frame_json.is_ok());
+        let Some(frame_json) = frame_json.ok() else {
+            return;
+        };
+        let Ok(decoded_frame) = serde_json::from_slice::<WindowFrame>(&frame_json) else {
+            return;
+        };
+        assert_eq!(decoded_frame, frame);
     }
 
     #[test]

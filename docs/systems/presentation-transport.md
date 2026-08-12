@@ -68,8 +68,44 @@ are not sufficient under congestion.
 Managed pane resize records carry the presentation client's resize epoch in
 addition to the requested content size. The server associates that epoch with
 the applicable Wayland configure serial and returns it only with the first
-suitable committed frame. An untagged or older frame can still refresh ordinary
-visible content, but it cannot satisfy a newer synchronized-paint wait set.
+suitable committed frame. During an active expectation, an untagged frame
+cannot replace the visible pane. The client drops each tagged frame that does
+not have an exact active expectation. This includes a frame for a retired
+epoch. Ordinary refresh resumes only when a later untagged frame arrives after
+terminal cleanup.
+
+Protocol version 22 defines this correlation on local and network carriers. A
+tagged request contains the backend pane, epoch, exact target pixel extent,
+logical viewport, and `scale_120`. The connection generation supplies route
+authority; a message cannot name another generation. A local codec rejects an
+unsupported version before dispatch. The network encoding carries the same
+fields and bounds.
+
+The server issues one distinct XDG configure serial for an accepted tagged
+request, including a same-logical-size request. `Configured` reports the exact
+logical viewport, pixel target, and scale tuple. Configure acknowledgement is
+not content readiness. A suitable commit must use the acknowledged current
+serial and a new buffer, must have the exact logical viewport, and must provide
+effective source samples greater than or equal to the target pixel extent. The
+server captures that commit into an immutable snapshot with the exact target
+pixel extent. Each pending tagged snapshot is bound to its pane, epoch, commit,
+scene sequence, and distinct transport resource. A later surface commit cannot
+replace its pixels.
+
+The exported window frame carries the epoch. `Configured` and the tagged frame
+may arrive on different lanes and in either order. The frame tag is sufficient
+to stage an exact frame; status remains bounded admission and diagnostic
+evidence. A rejection cannot follow a committed tagged snapshot. Scene
+publication and presentation keep the snapshot resource alive until the client
+releases it. Supersession, timeout, abort, pane removal, or disconnect cleans
+unpublished snapshots and advances stale-epoch authority.
+
+After bounded recovery, the client sends one untagged current-size request. The
+server retires pending tagged configure authority but does not publish the
+already-current surface as recovery. It waits for a later ordinary commit from
+that pane. This preserves one complete old or placeholder waited set before
+ordinary frame updates resume. An in-flight tagged scene completes under its
+existing ownership rules.
 
 Connection establishment compares immutable endpoint capabilities and selects
 one profile for the connection generation. Failure to agree on protocol
@@ -199,6 +235,10 @@ Both endpoints report the selected carrier, frame transport, protocol version,
 connection generation, resource IDs, frame sequences, byte counts, drops,
 backpressure, and rejection reasons. Diagnostics use semantic lane names even
 when their physical carriers differ.
+
+Managed-resize diagnostics correlate pane, epoch, configure serial, logical and
+pixel size, scale, surface commit, scene sequence, transport resource, client
+route generation, staging, promotion, recovery, and rejection.
 
 ## Verification
 

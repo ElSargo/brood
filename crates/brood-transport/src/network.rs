@@ -801,6 +801,21 @@ fn validate_server_message(message: &ServerMessage) -> Result<()> {
             }
             Ok(())
         }
+        ServerMessage::ManagedResizeStatus(status) => {
+            ensure!(status.pane != 0 && status.resize_epoch != 0);
+            if let brood_protocol::ManagedResizeStatusResult::Configured {
+                logical_size,
+                pixel_size,
+                scale_120,
+            } = status.result
+            {
+                ensure!(
+                    !logical_size.contains(&0) && !pixel_size.contains(&0) && scale_120 != 0,
+                    "managed resize status has invalid units"
+                );
+            }
+            Ok(())
+        }
         ServerMessage::FocusPresentation
         | ServerMessage::ClosePresentation
         | ServerMessage::DisconnectAcknowledged => Ok(()),
@@ -829,12 +844,38 @@ fn validate_input(input: &brood_protocol::InputEvent) -> Result<()> {
                 "network pointer axis is not finite"
             );
         }
+        brood_protocol::InputEvent::PresentationSize {
+            width,
+            height,
+            scale_120,
+            ..
+        } => {
+            ensure!(*width != 0 && *height != 0 && *scale_120 != 0);
+        }
+        brood_protocol::InputEvent::WindowResize {
+            pane,
+            logical_width,
+            logical_height,
+            pixel_width,
+            pixel_height,
+            scale_120,
+            resize_epoch,
+        } => {
+            ensure!(
+                *pane != 0
+                    && *logical_width != 0
+                    && *logical_height != 0
+                    && *pixel_width != 0
+                    && *pixel_height != 0
+                    && *scale_120 != 0
+                    && *resize_epoch != Some(0),
+                "managed resize request has invalid units"
+            );
+        }
         brood_protocol::InputEvent::KeyboardKey { .. }
         | brood_protocol::InputEvent::KeyboardReset
-        | brood_protocol::InputEvent::PresentationSize { .. }
         | brood_protocol::InputEvent::PresentationFocus { .. }
         | brood_protocol::InputEvent::WindowFocus { .. }
-        | brood_protocol::InputEvent::WindowResize { .. }
         | brood_protocol::InputEvent::PointerLeave => {}
     }
     Ok(())
@@ -921,8 +962,8 @@ fn validate_scene(scene: &brood_protocol::FrameScene) -> Result<()> {
             "network scene repeats a frame resource"
         );
         ensure!(
-            window.source[2] >= 0 && window.source[3] >= 0,
-            "network scene has a negative source extent"
+            window.source[2] > 0 && window.source[3] > 0 && window.resize_epoch != Some(0),
+            "network scene has an invalid source extent or resize epoch"
         );
     }
     Ok(())
@@ -992,6 +1033,7 @@ const fn server_message_lane(message: &ServerMessage) -> Lane {
         ServerMessage::Artifact(_) => Lane::Bulk,
         ServerMessage::FocusPresentation
         | ServerMessage::ClosePresentation
+        | ServerMessage::ManagedResizeStatus(_)
         | ServerMessage::DisconnectAcknowledged => Lane::Critical,
     }
 }
@@ -1151,8 +1193,9 @@ mod tests {
         ARTIFACT_ABI_VERSION, ActorMessage, ArtifactKind, ArtifactManifest, ArtifactMessage,
         ArtifactRealm, BackendActorRealm, BackendOperation, BackendRequest, BackendResponse,
         BackendResponseValue, ClientMessage, EndpointCapabilities, FrameColorSpace,
-        FramePixelFormat, InputEvent, Lane, MAX_ACTOR_MESSAGE_BYTES, MAX_ARTIFACT_CHUNK_BYTES,
-        PanePosition, ServerMessage,
+        FramePixelFormat, FrameResourceRef, FrameScene, InputEvent, Lane, MAX_ACTOR_MESSAGE_BYTES,
+        MAX_ARTIFACT_CHUNK_BYTES, ManagedResizeStatus, ManagedResizeStatusResult, PanePosition,
+        ServerMessage, WindowFrame,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -1160,7 +1203,7 @@ mod tests {
     use super::{
         NetworkFramePacket, accept_network_connection, client_endpoint, client_message_lane,
         connect_network, lane_priority, server_endpoint, validate_capabilities,
-        validate_client_message,
+        validate_client_message, validate_server_message,
     };
 
     #[test]
@@ -1245,6 +1288,45 @@ mod tests {
         let mut capabilities = EndpointCapabilities::remote();
         capabilities.max_frame_bytes = u64::MAX;
         assert!(validate_capabilities(&capabilities).is_err());
+    }
+
+    #[test]
+    fn managed_resize_validation_rejects_zero_units_and_epochs() {
+        let invalid_input = ClientMessage::Input(InputEvent::WindowResize {
+            pane: 7,
+            logical_width: 200,
+            logical_height: 120,
+            pixel_width: 300,
+            pixel_height: 180,
+            scale_120: 180,
+            resize_epoch: Some(0),
+        });
+        assert!(validate_client_message(&invalid_input).is_err());
+
+        let invalid_status = ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
+            pane: 7,
+            resize_epoch: 41,
+            result: ManagedResizeStatusResult::Configured {
+                logical_size: [200, 0],
+                pixel_size: [300, 180],
+                scale_120: 180,
+            },
+        });
+        assert!(validate_server_message(&invalid_status).is_err());
+
+        let invalid_scene = ServerMessage::Scene(FrameScene {
+            backend: brood_protocol::BackendId(7),
+            sequence: 2,
+            extent: [1_280, 800],
+            windows: vec![WindowFrame {
+                pane: 7,
+                resource: FrameResourceRef::Network { resource: 1 },
+                source: [0, 0, 300, 180],
+                active: true,
+                resize_epoch: Some(0),
+            }],
+        });
+        assert!(validate_server_message(&invalid_scene).is_err());
     }
 
     fn endpoints() -> (Endpoint, Endpoint, SocketAddr) {
@@ -1346,7 +1428,34 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
             connection
+                .send_server_message(&ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
+                    pane: 7,
+                    resize_epoch: 41,
+                    result: ManagedResizeStatusResult::Configured {
+                        logical_size: [200, 120],
+                        pixel_size: [300, 180],
+                        scale_120: 180,
+                    },
+                }))
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            connection
                 .send_server_message(&ServerMessage::FocusPresentation)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            connection
+                .send_server_message(&ServerMessage::Scene(FrameScene {
+                    backend: brood_protocol::BackendId(7),
+                    sequence: 2,
+                    extent: [1_280, 800],
+                    windows: vec![WindowFrame {
+                        pane: 7,
+                        resource: FrameResourceRef::Network { resource: 1 },
+                        source: [0, 0, 300, 180],
+                        active: true,
+                        resize_epoch: Some(41),
+                    }],
+                }))
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
             let frame = NetworkFramePacket::from_pixels(
@@ -1364,6 +1473,22 @@ mod tests {
                 .send_frame(&frame)
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
+            let resize = connection
+                .receive_client_message(Lane::Critical)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(
+                resize,
+                ClientMessage::Input(InputEvent::WindowResize {
+                    pane: 7,
+                    logical_width: 200,
+                    logical_height: 120,
+                    pixel_width: 300,
+                    pixel_height: 180,
+                    scale_120: 180,
+                    resize_epoch: Some(41),
+                })
+            );
             let disconnect = connection
                 .receive_client_message(Lane::Critical)
                 .await
@@ -1441,6 +1566,21 @@ mod tests {
                 .receive_server_message(Lane::Critical)
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}")),
+            ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
+                pane: 7,
+                resize_epoch: 41,
+                result: ManagedResizeStatusResult::Configured {
+                    logical_size: [200, 120],
+                    pixel_size: [300, 180],
+                    scale_120: 180,
+                },
+            })
+        );
+        assert_eq!(
+            client
+                .receive_server_message(Lane::Critical)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}")),
             ServerMessage::FocusPresentation
         );
         assert_eq!(
@@ -1460,6 +1600,36 @@ mod tests {
                 .unwrap_or_else(|error| unreachable!("{error}")),
             vec![0x44; 16]
         );
+        assert_eq!(
+            client
+                .receive_server_message(Lane::LatestState)
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            ServerMessage::Scene(FrameScene {
+                backend: brood_protocol::BackendId(7),
+                sequence: 2,
+                extent: [1_280, 800],
+                windows: vec![WindowFrame {
+                    pane: 7,
+                    resource: FrameResourceRef::Network { resource: 1 },
+                    source: [0, 0, 300, 180],
+                    active: true,
+                    resize_epoch: Some(41),
+                }],
+            })
+        );
+        client
+            .send_client_message(&ClientMessage::Input(InputEvent::WindowResize {
+                pane: 7,
+                logical_width: 200,
+                logical_height: 120,
+                pixel_width: 300,
+                pixel_height: 180,
+                scale_120: 180,
+                resize_epoch: Some(41),
+            }))
+            .await
+            .unwrap_or_else(|error| unreachable!("{error}"));
         client
             .send_client_message(&ClientMessage::Lifecycle(
                 brood_protocol::ClientLifecycle::Disconnect,

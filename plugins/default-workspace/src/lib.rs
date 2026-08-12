@@ -1155,7 +1155,7 @@ fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
             }
             true
         }
-        "rejected" | "superseded" => {
+        "rejected" | "aborted" | "superseded" => {
             if let Some(request_id) = message.request_id {
                 reject_resize_proposal(request_id);
             }
@@ -2348,6 +2348,14 @@ mod tests {
         assert!((primary_split_ratio() - 0.7).abs() < f32::EPSILON);
         assert!(handle_synchronized_layout_notification(
             &synchronized_notification("rejected", 11)
+        ));
+        assert!((primary_split_ratio() - 0.6).abs() < f32::EPSILON);
+        remember_resize_proposal(12, 0.8);
+        unsafe {
+            PRIMARY_SPLIT_RATIO = 0.8;
+        }
+        assert!(handle_synchronized_layout_notification(
+            &synchronized_notification("aborted", 12)
         ));
         assert!((primary_split_ratio() - 0.6).abs() < f32::EPSILON);
         assert_native_window_resize_request();

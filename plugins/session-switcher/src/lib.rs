@@ -1771,7 +1771,7 @@ fn decode_layout_transaction_notification(bytes: &[u8]) -> Option<LayoutTransact
     (consumed == bytes.len()
         && matches!(
             notification.message_type.as_str(),
-            "accepted" | "completed" | "degraded" | "rejected" | "superseded"
+            "accepted" | "completed" | "degraded" | "rejected" | "aborted" | "superseded"
         ))
     .then_some(notification)
 }
@@ -1828,14 +1828,15 @@ fn apply_layout_transaction_notification(
                 layout.presented_layout_revision = target_layout_revision;
             }
         }
-        "rejected" => {
+        "rejected" | "aborted" => {
             let rejected = state.pending_shell_layouts.remove(&notification.request_id);
             restore_latest_submitted_or_durable_shell_layout(state);
             if let Some(rejected) = rejected
                 && let Some(native_resize_revision) = rejected.native_resize_revision
                 && state.native_resize_revision == Some(native_resize_revision)
             {
-                if notification.reason.as_ref().map(|reason| reason.as_str()) == Some("busy")
+                if notification.message_type.as_str() == "rejected"
+                    && notification.reason.as_ref().map(|reason| reason.as_str()) == Some("busy")
                     && rejected.native_retry_count < MAX_NATIVE_RESIZE_RETRIES
                 {
                     let focus = rejected.state.focus;
@@ -1849,7 +1850,9 @@ fn apply_layout_transaction_notification(
                         None,
                     );
                 }
-                if rejected.native_retry_count < MAX_NATIVE_RESIZE_RETRIES {
+                if notification.message_type.as_str() == "rejected"
+                    && rejected.native_retry_count < MAX_NATIVE_RESIZE_RETRIES
+                {
                     // A stale or invalid request did not consume the host's
                     // next publication. If the same nonce is legitimately
                     // republished, allow the layout-state path to submit it.
@@ -5185,6 +5188,28 @@ mod tests {
                     br#"{"type":"rejected","request_id":1}"#,
                 )
                 .expect("rejected notification"),
+            )
+            .is_empty()
+        );
+        assert!(state.sidebar_visible);
+        assert!(state.pending_shell_layouts.is_empty());
+
+        state.sidebar_visible = false;
+        state.pending_shell_layouts.insert(
+            3,
+            super::PendingShellLayout {
+                state: shell_layout_state(&state, Some(9)),
+                native_resize_revision: None,
+                native_retry_count: 0,
+            },
+        );
+        assert!(
+            apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(
+                    br#"{"type":"aborted","request_id":3,"resize_epoch":{"id":43,"lease":1,"lease_generation":1,"base_layout_revision":7,"target_layout_revision":9},"reason":"stale-inventory-revision","message":"pane removed"}"#,
+                )
+                .expect("aborted notification"),
             )
             .is_empty()
         );

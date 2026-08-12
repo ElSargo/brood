@@ -163,26 +163,83 @@ ROOT_GRANT_LINE=0
 MIDDLE_GRANT_LINE=0
 LEAF_GRANT_LINE=0
 SETTLED_LINE=0
+PAINT_LINE=0
+SETTLED_REVISION=0
+SETTLED_DIVIDER=0
+SETTLED_WIDTH=0
+SETTLED_HEIGHT=0
 for _ in $(seq 1 1200); do
-  ROOT_GRANT_LINE="$(rg -n 'granted claimed root layout lease actor=session-switcher ' "$CLIENT_LOG" \
-    | tail -1 | cut -d: -f1 || true)"
-  MIDDLE_GRANT_LINE="$(rg -n 'granted rest layout lease .* actor=workspace ' "$CLIENT_LOG" \
-    | tail -1 | cut -d: -f1 || true)"
-  LEAF_GRANT_LINE="$(rg -n 'granted rest layout lease .* actor=resize-proof-leaf-layout ' "$CLIENT_LOG" \
-    | tail -1 | cut -d: -f1 || true)"
-  SETTLED_LINE="$(rg -n 'resize-present .* phase=settled ' "$CLIENT_LOG" \
-    | tail -1 | cut -d: -f1 || true)"
-  if [[ -n "$ROOT_GRANT_LINE" && -n "$MIDDLE_GRANT_LINE" && -n "$LEAF_GRANT_LINE" \
-    && -n "$SETTLED_LINE" ]] \
-    && ((ROOT_GRANT_LINE < MIDDLE_GRANT_LINE \
-      && MIDDLE_GRANT_LINE < LEAF_GRANT_LINE \
-      && LEAF_GRANT_LINE < SETTLED_LINE)); then
+  REGION_READY="$(python3 - "$CLIENT_LOG" <<'PY'
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+
+def latest(pattern):
+    found = [index for index, text in enumerate(lines, 1) if re.search(pattern, text)]
+    return found[-1] if found else 0
+
+root = latest(r"granted claimed root layout lease actor=session-switcher ")
+middle_grant = latest(r"granted rest layout lease .* actor=workspace ")
+leaf_grant = latest(r"granted rest layout lease .* actor=resize-proof-leaf-layout ")
+if not (0 < root < middle_grant < leaf_grant):
+    raise SystemExit
+
+commits = []
+for index, text in enumerate(lines, 1):
+    match = re.search(r"presented committed layout revision=(\d+)", text)
+    if index > leaf_grant and match:
+        commits.append((index, int(match.group(1))))
+for commit_line, revision in reversed(commits):
+    middle = leaf = 0
+    revision_field = f'"presented_layout_revision":{revision}'
+    for index, text in enumerate(lines[commit_line:], commit_line + 1):
+        if revision_field not in text or '"kind":"resize-proof-layout-state"' not in text:
+            continue
+        if '"mode":"middle-layout"' in text:
+            middle = index
+        elif '"mode":"leaf-layout"' in text:
+            leaf = index
+    after_states = max(middle, leaf)
+    if not (middle > commit_line and leaf > commit_line):
+        continue
+    for settled, text in enumerate(lines[after_states:], after_states + 1):
+        if not (
+            "resize-present " in text
+            and " interaction=0 " in text
+            and " epoch=0 " in text
+            and " phase=settled " in text
+            and " staged_count=0 " in text
+            and " managed_expectations=0 " in text
+            and " managed_staged_resources=0 " in text
+            and " degraded=false " in text
+        ):
+            continue
+        divider = re.search(r" divider_x=(\d+)", text)
+        size = re.search(r" composition_size=(\d+)x(\d+)", text)
+        if divider is None or size is None:
+            continue
+        paint = settled + 1
+        if paint > len(lines) or not re.search(
+            r"resize-paint-order ordinary_panes=4 dividers=1 ", lines[paint - 1]
+        ):
+            continue
+        print(
+            root, middle_grant, leaf_grant, revision, middle, leaf, settled, paint,
+            divider.group(1), size.group(1), size.group(2)
+        )
+        raise SystemExit
+PY
+)"
+  if [[ -n "$REGION_READY" ]]; then
+    read -r ROOT_GRANT_LINE MIDDLE_GRANT_LINE LEAF_GRANT_LINE SETTLED_REVISION \
+      MIDDLE_STATE_LINE LEAF_STATE_LINE SETTLED_LINE PAINT_LINE SETTLED_DIVIDER \
+      SETTLED_WIDTH SETTLED_HEIGHT <<< "$REGION_READY"
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || exit 1
   sleep 0.025
 done
-[[ -n "$SETTLED_LINE" && "$SETTLED_LINE" -gt "$LEAF_GRANT_LINE" ]]
+[[ "$SETTLED_REVISION" -gt 0 && "$SETTLED_LINE" -gt "$MIDDLE_STATE_LINE" \
+  && "$SETTLED_LINE" -gt "$LEAF_STATE_LINE" && "$PAINT_LINE" -eq $((SETTLED_LINE + 1)) ]]
 
 MIDDLE_PANE="$(sed -n 's/.*started presentation WASM actor id=workspace .* pane=\([0-9][0-9]*\) .*/\1/p' \
   "$CLIENT_LOG" | tail -1)"
@@ -239,11 +296,20 @@ stop_pointer() {
   POINTER_WRITE_FD=""
 }
 
-# The leaf occupies the right 60 percent of the delegated main region. A
-# proof-only pane click arms deterministic response delays after startup.
+# The leaf occupies the right 60 percent of the delegated main region. Derive
+# its center from the correlated settled composition and root divider.
 start_pointer
-ARM_X=$((LOGICAL_WIDTH / 2))
-ARM_Y=$((LOGICAL_HEIGHT / 2))
+read -r ARM_X ARM_Y < <(python3 - "$SETTLED_DIVIDER" "$SETTLED_HEIGHT" \
+  "$OUTPUT_SCALE" "$LOGICAL_WIDTH" "$LOGICAL_HEIGHT" <<'PY'
+import sys
+divider, height = map(int, sys.argv[1:3])
+scale = float(sys.argv[3])
+logical_width, logical_height = map(int, sys.argv[4:6])
+x = round((divider * 0.7) / scale)
+y = round((height * 0.5) / scale)
+print(min(max(x, 2), logical_width - 2), min(max(y, 2), logical_height - 2))
+PY
+)
 arm_region_proof arm
 stop_pointer
 
@@ -262,7 +328,7 @@ PY
 
 wait_acceptance() {
   local after="$1"
-  wait_for_pattern "$after" 'accepted synchronized layout actor=session-switcher '
+  wait_for_pattern "$after" 'accepted synchronized layout actor=session-switcher .*request=[0-9]+.* interaction=[0-9]+.* event_sequence=[0-9]+.* epoch=[0-9]+.*target_rects=[[][^]]*[]]$'
   ACCEPT_LINE="$WAIT_LINE"
   ACCEPT_TEXT="$WAIT_TEXT"
   read -r ACCEPT_REQUEST ACCEPT_INTERACTION ACCEPT_SEQUENCE ACCEPT_EPOCH < <(
@@ -407,7 +473,14 @@ jq -n \
   --argjson root_grant "$ROOT_GRANT_LINE" \
   --argjson middle_grant "$MIDDLE_GRANT_LINE" \
   --argjson leaf_grant "$LEAF_GRANT_LINE" \
+  --argjson settled_revision "$SETTLED_REVISION" \
+  --argjson middle_state "$MIDDLE_STATE_LINE" \
+  --argjson leaf_state "$LEAF_STATE_LINE" \
+  --argjson settled "$SETTLED_LINE" \
+  --argjson paint "$PAINT_LINE" \
   --argjson armed "$ARMED_LINE" \
+  --argjson arm_x "$ARM_X" \
+  --argjson arm_y "$ARM_Y" \
   --argjson root_pane "$ROOT_PANE" \
   --argjson middle_pane "$MIDDLE_PANE" \
   --argjson leaf_pane "$LEAF_PANE" \
@@ -449,7 +522,9 @@ jq -n \
   --argjson final_promoted "$FINAL_PROMOTED_LINE" \
   --argjson final_completed "$FINAL_COMPLETE_LINE" \
   '{topology:{root_grant:$root_grant,middle_grant:$middle_grant,leaf_grant:$leaf_grant,
-      armed:$armed,panes:{root:$root_pane,middle:$middle_pane,leaf:$leaf_pane}},
+      settled_revision:$settled_revision,middle_state:$middle_state,leaf_state:$leaf_state,
+      settled:$settled,paint:$paint,armed:$armed,arm:{x:$arm_x,y:$arm_y},
+      panes:{root:$root_pane,middle:$middle_pane,leaf:$leaf_pane}},
     supersession:{first:{request:$first_request,interaction:$first_interaction,
         sequence:$first_sequence,epoch:$first_epoch,accepted:$first_accept},
       second:{request:$second_request,interaction:$second_interaction,

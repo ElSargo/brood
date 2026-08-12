@@ -234,6 +234,46 @@ presented frame. A newer request in the same interaction supersedes the staged
 request, and every accepted request has a client-owned deadline and degraded
 fallback.
 
+## Managed Pane Correlation
+
+The host publishes each eligible plugin pane and managed pane in
+`waitable_panes`. The actor can name both pane types in one fixed wait set. The
+client resolves each managed pane to one current backend route and connection
+generation before it accepts the request. A missing route makes the request
+invalid. Loss of a named pane or its backend after acceptance aborts the target
+and keeps the durable layout.
+
+For each affected managed pane, the client sends the resize epoch, the target
+size in physical pixels, the derived logical size, and `scale_120`. The server
+sends a distinct XDG configure, including when the logical size did not change.
+An acknowledgement does not make the pane ready. The server waits for a new
+buffer that matches the configure serial and logical viewport. Its effective
+source samples must be at least the target physical extent. The server then
+captures an immutable snapshot at the exact target physical size and tags the
+exported scene with the resize epoch and exact logical-size/`scale_120` tuple.
+
+The client accepts a tagged managed frame only for the exact active backend
+route, connection generation, pane, and epoch. It also checks the source
+rectangle and transport resource extent. An exact frame becomes staged content.
+It does not become visible before the synchronized promotion. An ordinary or
+stale frame cannot replace the visible resource while the expectation is
+active. A retired epoch cannot become ordinary recovery after promotion,
+supersession, timeout, or abort.
+
+Managed panes that are in the fixed wait set block promotion until their exact
+frames are staged or the client records recovery. Other affected managed panes
+can stage and promote, but they do not block the wait set. At timeout, the
+client keeps the old visible resource when one exists. Otherwise, it uses the
+native placeholder as explicit recovered content. It then requests the current
+size once without an epoch. This request removes obsolete pending configure
+authority and permits a later untagged buffer to perform ordinary recovery.
+
+Each tagged snapshot owns a distinct transport resource. Replacement,
+supersession, timeout, abort, pane removal, and backend removal release staged
+or provisional resources. A resource in a published scene remains valid until
+the presentation client releases it. These rules also apply when a later full
+scene omits the pane.
+
 ## Pane Identity
 
 The client presents managed panes and client-local WASM panes in one flat

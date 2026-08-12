@@ -34,7 +34,10 @@ use brood_protocol::BackendActorRealm;
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
-    backend::allocator::dmabuf::{Dmabuf, WeakDmabuf},
+    backend::{
+        allocator::dmabuf::{Dmabuf, WeakDmabuf},
+        renderer::utils::with_renderer_surface_state,
+    },
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState, keyboard::XkbConfig},
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
@@ -50,7 +53,7 @@ use smithay::{
             protocol::{wl_output, wl_surface::WlSurface},
         },
     },
-    utils::{IsAlive, Logical, Point, SERIAL_COUNTER, Size, Transform},
+    utils::{IsAlive, Logical, Point, SERIAL_COUNTER, Serial, Size, Transform},
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufFeedback, DmabufGlobal, DmabufState},
@@ -1712,6 +1715,29 @@ impl Brood {
     pub fn unregister_surface(&mut self, surface: &WlSurface) {
         self.known_surfaces.retain(|known| known != surface);
         if let Some(pane) = self.pane_for_toplevel_surface(surface) {
+            if let Some(fast_path) = self.dmabuf.fast_path.as_mut() {
+                for correlation in fast_path.managed_resizes.remove_pane(pane) {
+                    if managed_resize_needs_cleanup_rejection(&correlation.state) {
+                        emit_managed_resize_status(
+                            fast_path,
+                            brood_protocol::ManagedResizeStatus {
+                                pane,
+                                resize_epoch: correlation.epoch,
+                                result: brood_protocol::ManagedResizeStatusResult::Rejected {
+                                    reason: brood_protocol::ManagedResizeRejectionReason::PaneUnavailable,
+                                },
+                            },
+                        );
+                    } else {
+                        info!(
+                            pane,
+                            epoch = correlation.epoch,
+                            "removed committed managed resize correlation without late rejection"
+                        );
+                    }
+                }
+                crate::frame_export::cleanup_provisional_tagged_resources(fast_path);
+            }
             self.presentation_client_requested_sizes.remove(&pane);
         }
     }
@@ -2326,8 +2352,9 @@ impl Brood {
         width: i32,
         height: i32,
         refresh_millihz: i32,
+        scale_120: u32,
     ) {
-        self.configure_presentation_output_inner(width, height, refresh_millihz, false);
+        self.configure_presentation_output_inner(width, height, refresh_millihz, scale_120, false);
     }
 
     fn configure_presentation_output_inner(
@@ -2335,6 +2362,7 @@ impl Brood {
         width: i32,
         height: i32,
         refresh_millihz: i32,
+        scale_120: u32,
         configure_managed_windows: bool,
     ) {
         let size = Size::from((width.max(1), height.max(1)));
@@ -2346,8 +2374,9 @@ impl Brood {
                 .map_or(SESSION_OUTPUT_REFRESH_MILLIHZ, |mode| mode.refresh)
         };
         let mode = OutputMode { size, refresh };
+        let scale = OutputScale::Fractional(f64::from(scale_120.max(1)) / 120.0);
         self.session_output
-            .change_current_state(Some(mode), None, None, None);
+            .change_current_state(Some(mode), None, Some(scale), None);
         self.session_output.set_preferred(mode);
         self.refresh_fractional_scales();
         if configure_managed_windows {
@@ -3198,6 +3227,170 @@ impl Brood {
         true
     }
 
+    pub fn restart_ordinary_presentation_client_pane_size(
+        &mut self,
+        fast_path: &mut PresentationFastPath,
+        pane: u64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let retired = fast_path
+            .managed_resizes
+            .retire_pending_for_ordinary_resize(pane);
+        crate::frame_export::cleanup_provisional_tagged_resources(fast_path);
+        if !retired.is_empty() {
+            // Do not export the already-current surface as recovery. Wait for
+            // a later untagged commit after this request. This preserves the
+            // complete old waited set during the degraded presentation.
+            fast_path
+                .managed_resizes
+                .wait_for_ordinary_recovery_commit(pane);
+            info!(
+                pane,
+                ?retired,
+                "retired managed resize epochs for ordinary recovery"
+            );
+        }
+        self.configure_presentation_client_pane_size(pane, width, height)
+    }
+
+    pub fn configure_tagged_presentation_client_pane_size(
+        &mut self,
+        fast_path: &mut PresentationFastPath,
+        pane: u64,
+        logical_size: (i32, i32),
+        pixel_size: (i32, i32),
+        scale_120: u32,
+        epoch: u64,
+    ) -> bool {
+        let reject = |fast_path: &mut PresentationFastPath,
+                      reason: brood_protocol::ManagedResizeRejectionReason| {
+            emit_managed_resize_status(
+                fast_path,
+                brood_protocol::ManagedResizeStatus {
+                    pane,
+                    resize_epoch: epoch,
+                    result: brood_protocol::ManagedResizeStatusResult::Rejected { reason },
+                },
+            );
+        };
+        let Some(surface) = self.content_surface_for_pane(pane) else {
+            reject(
+                fast_path,
+                brood_protocol::ManagedResizeRejectionReason::PaneUnavailable,
+            );
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            reject(
+                fast_path,
+                brood_protocol::ManagedResizeRejectionReason::PaneUnavailable,
+            );
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            reject(
+                fast_path,
+                brood_protocol::ManagedResizeRejectionReason::PaneUnavailable,
+            );
+            return false;
+        };
+        if epoch == 0
+            || scale_120 == 0
+            || logical_size.0 <= 0
+            || logical_size.1 <= 0
+            || pixel_size.0 <= 0
+            || pixel_size.1 <= 0
+            || self.current_scale_120() != scale_120
+            || !pixel_size_matches_scale(logical_size, pixel_size, scale_120)
+        {
+            reject(
+                fast_path,
+                brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied,
+            );
+            return false;
+        }
+        let constraints = with_states(&surface, |states| {
+            *states.cached_state.get::<SurfaceCachedState>().current()
+        });
+        let (configured_size, negotiation) = negotiate_window_size(
+            logical_size,
+            constraints.min_size.into(),
+            constraints.max_size.into(),
+        );
+        if negotiation != WindowSizeNegotiation::Requested || configured_size != logical_size {
+            reject(
+                fast_path,
+                brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied,
+            );
+            return false;
+        }
+        let reserved_bytes = match fast_path.managed_resizes.reserve(pane, epoch, pixel_size) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                reject(fast_path, reason);
+                return false;
+            }
+        };
+        crate::frame_export::cleanup_provisional_tagged_resources(fast_path);
+        let size: Size<i32, Logical> = logical_size.into();
+        toplevel.with_pending_state(|state| {
+            state.size = Some(size);
+            state.bounds = Some(size);
+        });
+        // A tagged request always sends a configure. This preserves a distinct
+        // serial when the logical size is unchanged but the epoch is new.
+        let serial = toplevel.send_configure();
+        let sent_after_commit = fast_path.managed_resizes.current_surface_commit(pane);
+        fast_path
+            .managed_resizes
+            .records
+            .entry(pane)
+            .or_default()
+            .push_back(ManagedResizeCorrelation {
+                epoch,
+                serial,
+                logical_size,
+                pixel_size,
+                sent_after_commit,
+                reserved_bytes,
+                configured_at: Instant::now(),
+                state: ManagedResizeCorrelationState::ConfigureSent,
+            });
+        self.presentation_client_requested_sizes
+            .insert(pane, logical_size);
+        emit_managed_resize_status(
+            fast_path,
+            brood_protocol::ManagedResizeStatus {
+                pane,
+                resize_epoch: epoch,
+                result: brood_protocol::ManagedResizeStatusResult::Configured {
+                    logical_size: [
+                        u32::try_from(logical_size.0).unwrap_or(u32::MAX),
+                        u32::try_from(logical_size.1).unwrap_or(u32::MAX),
+                    ],
+                    pixel_size: [
+                        u32::try_from(pixel_size.0).unwrap_or(u32::MAX),
+                        u32::try_from(pixel_size.1).unwrap_or(u32::MAX),
+                    ],
+                    scale_120,
+                },
+            },
+        );
+        info!(
+            pane,
+            epoch,
+            serial = u32::from(serial),
+            logical_width = logical_size.0,
+            logical_height = logical_size.1,
+            pixel_width = pixel_size.0,
+            pixel_height = pixel_size.1,
+            scale_120,
+            "managed resize configure issued"
+        );
+        true
+    }
+
     pub(crate) fn renegotiate_presentation_client_pane_size(
         &mut self,
         surface: &WlSurface,
@@ -3205,6 +3398,23 @@ impl Brood {
         let Some(pane) = self.pane_for_toplevel_surface(surface) else {
             return false;
         };
+        let active_correlation = self
+            .dmabuf
+            .fast_path
+            .as_ref()
+            .is_some_and(|fast_path| fast_path.managed_resizes.has_active(pane));
+        if managed_resize_suppresses_ordinary_renegotiation(
+            self.dmabuf.fast_path_input_draining,
+            active_correlation,
+        ) {
+            info!(
+                pane,
+                input_draining = self.dmabuf.fast_path_input_draining,
+                active_correlation,
+                "suppressed ordinary pane-size renegotiation during managed resize"
+            );
+            return false;
+        }
         let Some(requested) = self.presentation_client_requested_sizes.get(&pane).copied() else {
             return false;
         };
@@ -3267,6 +3477,174 @@ impl Brood {
             );
         }
         configured
+    }
+
+    fn current_scale_120(&self) -> u32 {
+        scale_120_for_fractional(self.current_fractional_scale())
+    }
+
+    pub(crate) fn record_managed_commit_observation(
+        &mut self,
+        surface: &WlSurface,
+        sample_size: Option<(i32, i32)>,
+    ) {
+        let Some(pane) = self.pane_for_toplevel_surface(surface) else {
+            return;
+        };
+        // Smithay advances `current_serial` only after pre-commit hooks. The
+        // configure serial is the exact ACK that this pending buffer commits.
+        let acknowledged_serial = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok())
+                .and_then(|data| data.configure_serial)
+        });
+        let Some((fast_path, serial)) = self.dmabuf.fast_path.as_mut().zip(acknowledged_serial)
+        else {
+            return;
+        };
+        if !fast_path.managed_resizes.has_active_serial(pane, serial) {
+            return;
+        }
+        let recorded = sample_size.is_some_and(|sample_size| {
+            fast_path
+                .managed_resizes
+                .record_commit_observation(pane, serial, sample_size)
+        });
+        info!(
+            pane,
+            serial = u32::from(serial),
+            ?sample_size,
+            recorded,
+            "observed managed resize pre-commit buffer"
+        );
+    }
+
+    pub(crate) fn capture_managed_resize_commit(&mut self, surface: &WlSurface) {
+        let Some(pane) = self.pane_for_toplevel_surface(surface) else {
+            return;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(surface) else {
+            return;
+        };
+        let Some(fast_path) = self.dmabuf.fast_path.as_mut() else {
+            return;
+        };
+        let surface_commit = fast_path.managed_resizes.next_surface_commit(pane);
+        let current_serial = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok())
+                .and_then(|data| data.current_serial)
+        });
+        let new_buffer_size = current_serial.and_then(|serial| {
+            fast_path
+                .managed_resizes
+                .take_commit_observation(pane, serial)
+        });
+        let surface_size = with_renderer_surface_state(surface, |state| {
+            state.surface_size().map(|size| (size.w, size.h))
+        })
+        .flatten();
+        let candidate = fast_path
+            .managed_resizes
+            .records
+            .get_mut(&pane)
+            .and_then(|records| {
+                records.iter_mut().rev().find(|record| {
+                    Some(record.serial) == current_serial
+                        && matches!(
+                            record.state,
+                            ManagedResizeCorrelationState::ConfigureSent
+                                | ManagedResizeCorrelationState::CurrentUnsuitable
+                        )
+                })
+            });
+        let Some(candidate) = candidate else {
+            return;
+        };
+        let suitable = managed_commit_is_suitable(
+            candidate,
+            current_serial,
+            surface_commit,
+            surface_size,
+            new_buffer_size,
+        );
+        if !suitable {
+            candidate.state = ManagedResizeCorrelationState::CurrentUnsuitable;
+            info!(
+                pane,
+                epoch = candidate.epoch,
+                serial = u32::from(candidate.serial),
+                surface_commit,
+                has_new_buffer = new_buffer_size.is_some(),
+                ?surface_size,
+                sample_size = ?new_buffer_size,
+                expected_logical_size = ?candidate.logical_size,
+                expected_pixel_size = ?candidate.pixel_size,
+                "managed resize commit is not suitable"
+            );
+            return;
+        }
+        let epoch = candidate.epoch;
+        let pixel_size = candidate.pixel_size;
+        let configured_at = candidate.configured_at;
+        let serial = candidate.serial;
+        let snapshot =
+            crate::frame_export::capture_managed_commit_snapshot(self, &window, pane, pixel_size);
+        let Some(candidate) = self
+            .dmabuf
+            .fast_path
+            .as_mut()
+            .and_then(|fast_path| fast_path.managed_resizes.records.get_mut(&pane))
+            .and_then(|records| {
+                records.iter_mut().find(|record| {
+                    record.epoch == epoch
+                        && record.serial == serial
+                        && matches!(
+                            record.state,
+                            ManagedResizeCorrelationState::ConfigureSent
+                                | ManagedResizeCorrelationState::CurrentUnsuitable
+                        )
+                })
+            })
+        else {
+            return;
+        };
+        match snapshot {
+            Ok(backing) => {
+                candidate.state = ManagedResizeCorrelationState::SnapshotQueued {
+                    surface_commit,
+                    committed_at: Instant::now(),
+                    backing,
+                };
+                info!(
+                    pane,
+                    epoch,
+                    serial = u32::from(serial),
+                    surface_commit,
+                    logical_width = candidate.logical_size.0,
+                    logical_height = candidate.logical_size.1,
+                    pixel_width = candidate.pixel_size.0,
+                    pixel_height = candidate.pixel_size.1,
+                    configure_to_snapshot_micros = configured_at.elapsed().as_micros(),
+                    "managed resize snapshot queued"
+                );
+            }
+            Err(error) => {
+                candidate.state = ManagedResizeCorrelationState::CurrentUnsuitable;
+                warn!(
+                    pane,
+                    epoch,
+                    serial = u32::from(serial),
+                    surface_commit,
+                    ?error,
+                    "managed resize snapshot capture failed"
+                );
+            }
+        }
     }
 
     pub fn active_window(&self) -> Option<Window> {
@@ -6441,10 +6819,497 @@ pub struct PresentationFastPath {
     pub window_buffers: HashMap<u64, Dmabuf>,
     pub shared_images: HashMap<u64, (String, brood_ipc::SharedImageProducer)>,
     pub window_shared_image_resources: HashMap<u64, u64>,
+    pub tagged_shared_image_resources: HashMap<(u64, u64, u64), u64>,
+    pub tagged_dmabuf_resources: HashMap<(u64, u64, u64), u64>,
     pub next_resource_id: u64,
     pub last_presented_sequence: Option<u64>,
     pub in_flight_sequence: Option<u64>,
     pub pending_redraw: bool,
+    pub managed_resizes: ManagedResizeCorrelations,
+}
+
+const MAX_MANAGED_RESIZE_SNAPSHOTS: usize = 64;
+const MAX_MANAGED_RESIZE_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MANAGED_RESIZE_SNAPSHOT_BYTES_PER_PANE: u64 = 64 * 1024 * 1024;
+
+fn scale_120_for_fractional(scale: f64) -> u32 {
+    let scaled = scale * 120.0;
+    if !scaled.is_finite() || scaled <= 0.0 {
+        return 120;
+    }
+    scaled.round().clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+fn pixel_size_matches_scale(
+    logical_size: (i32, i32),
+    pixel_size: (i32, i32),
+    scale_120: u32,
+) -> bool {
+    if scale_120 == 0 {
+        return false;
+    }
+    [
+        (logical_size.0, pixel_size.0),
+        (logical_size.1, pixel_size.1),
+    ]
+    .into_iter()
+    .all(|(logical, pixel)| {
+        if logical <= 0 || pixel <= 0 {
+            return false;
+        }
+        let Ok(pixel) = u64::try_from(pixel) else {
+            return false;
+        };
+        let Some(numerator) =
+            pixel.checked_mul(u64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))
+        else {
+            return false;
+        };
+        let denominator = u64::from(scale_120);
+        let Some(rounded) = numerator.checked_add(denominator / 2) else {
+            return false;
+        };
+        u64::try_from(logical).is_ok_and(|logical| logical == rounded / denominator)
+    })
+}
+
+fn managed_commit_is_suitable(
+    record: &ManagedResizeCorrelation,
+    current_serial: Option<Serial>,
+    surface_commit: u64,
+    surface_size: Option<(i32, i32)>,
+    new_buffer_size: Option<(i32, i32)>,
+) -> bool {
+    Some(record.serial) == current_serial
+        && surface_commit > record.sent_after_commit
+        && surface_size == Some(record.logical_size)
+        && new_buffer_size.is_some_and(|samples| {
+            samples.0 >= record.pixel_size.0 && samples.1 >= record.pixel_size.1
+        })
+}
+
+fn managed_resize_needs_cleanup_rejection(state: &ManagedResizeCorrelationState) -> bool {
+    matches!(
+        state,
+        ManagedResizeCorrelationState::ConfigureSent
+            | ManagedResizeCorrelationState::CurrentUnsuitable
+    )
+}
+
+const fn managed_resize_suppresses_ordinary_renegotiation(
+    input_draining: bool,
+    active_correlation: bool,
+) -> bool {
+    input_draining || active_correlation
+}
+
+pub(crate) struct ManagedResizeCorrelation {
+    pub epoch: u64,
+    pub serial: Serial,
+    pub logical_size: (i32, i32),
+    pub pixel_size: (i32, i32),
+    pub sent_after_commit: u64,
+    pub reserved_bytes: u64,
+    pub configured_at: Instant,
+    pub state: ManagedResizeCorrelationState,
+}
+
+pub(crate) enum ManagedResizeCorrelationState {
+    ConfigureSent,
+    CurrentUnsuitable,
+    SnapshotQueued {
+        surface_commit: u64,
+        committed_at: Instant,
+        backing: crate::frame_export::ManagedSnapshotBacking,
+    },
+    SceneInFlight {
+        surface_commit: u64,
+        scene_sequence: u64,
+        transport_resource: u64,
+    },
+}
+
+pub(crate) struct QueuedManagedSnapshot {
+    pub epoch: u64,
+    pub pixel_size: (i32, i32),
+    pub surface_commit: u64,
+    pub backing: crate::frame_export::ManagedSnapshotBacking,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedCommitObservation {
+    serial: Serial,
+    sample_size: (i32, i32),
+}
+
+#[derive(Default)]
+pub(crate) struct ManagedResizeCorrelations {
+    pub records: BTreeMap<u64, VecDeque<ManagedResizeCorrelation>>,
+    pub surface_commits: BTreeMap<u64, u64>,
+    pub reserved_bytes: u64,
+    commit_observations: BTreeMap<u64, VecDeque<ManagedCommitObservation>>,
+    ordinary_recovery_commit_floors: BTreeMap<u64, u64>,
+}
+
+impl ManagedResizeCorrelations {
+    fn has_active(&self, pane: u64) -> bool {
+        self.records
+            .get(&pane)
+            .is_some_and(|records| !records.is_empty())
+    }
+
+    fn has_active_serial(&self, pane: u64, serial: Serial) -> bool {
+        self.records.get(&pane).is_some_and(|records| {
+            records.iter().any(|record| {
+                record.serial == serial
+                    && matches!(
+                        record.state,
+                        ManagedResizeCorrelationState::ConfigureSent
+                            | ManagedResizeCorrelationState::CurrentUnsuitable
+                    )
+            })
+        })
+    }
+
+    pub fn record_commit_observation(
+        &mut self,
+        pane: u64,
+        serial: Serial,
+        sample_size: (i32, i32),
+    ) -> bool {
+        let active_serial = self.has_active_serial(pane, serial);
+        let observation_count = self
+            .commit_observations
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>();
+        if !active_serial
+            || sample_size.0 <= 0
+            || sample_size.1 <= 0
+            || observation_count >= MAX_MANAGED_RESIZE_SNAPSHOTS
+        {
+            return false;
+        }
+        self.commit_observations
+            .entry(pane)
+            .or_default()
+            .push_back(ManagedCommitObservation {
+                serial,
+                sample_size,
+            });
+        true
+    }
+
+    fn take_commit_observation(&mut self, pane: u64, serial: Serial) -> Option<(i32, i32)> {
+        let observations = self.commit_observations.get_mut(&pane)?;
+        let position = observations
+            .iter()
+            .position(|observation| observation.serial == serial)?;
+        let observation = observations.remove(position)?;
+        if observations.is_empty() {
+            self.commit_observations.remove(&pane);
+        }
+        Some(observation.sample_size)
+    }
+
+    fn reservation_bytes(pixel_size: (i32, i32)) -> Option<u64> {
+        let width = u64::try_from(pixel_size.0).ok()?;
+        let height = u64::try_from(pixel_size.1).ok()?;
+        width.checked_mul(height)?.checked_mul(4)
+    }
+
+    pub fn reserve(
+        &mut self,
+        pane: u64,
+        epoch: u64,
+        pixel_size: (i32, i32),
+    ) -> std::result::Result<u64, brood_protocol::ManagedResizeRejectionReason> {
+        let Some(bytes) = Self::reservation_bytes(pixel_size) else {
+            return Err(brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied);
+        };
+        if bytes > MAX_MANAGED_RESIZE_SNAPSHOT_BYTES_PER_PANE {
+            return Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity);
+        }
+        if self
+            .records
+            .get(&pane)
+            .is_some_and(|records| records.iter().any(|record| record.epoch == epoch))
+        {
+            return Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity);
+        }
+        let (removed_count, removed_bytes) =
+            self.records.get(&pane).map_or((0_usize, 0_u64), |records| {
+                records
+                    .iter()
+                    .fold((0_usize, 0_u64), |(count, bytes), record| {
+                        if matches!(
+                            record.state,
+                            ManagedResizeCorrelationState::SceneInFlight { .. }
+                        ) {
+                            (count, bytes)
+                        } else {
+                            (
+                                count.saturating_add(1),
+                                bytes.saturating_add(record.reserved_bytes),
+                            )
+                        }
+                    })
+            });
+        let count = self
+            .records
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>()
+            .saturating_sub(removed_count);
+        let retained_bytes = self.reserved_bytes.saturating_sub(removed_bytes);
+        if count >= MAX_MANAGED_RESIZE_SNAPSHOTS
+            || retained_bytes.saturating_add(bytes) > MAX_MANAGED_RESIZE_SNAPSHOT_BYTES
+        {
+            return Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity);
+        }
+        if let Some(records) = self.records.get_mut(&pane) {
+            records.retain(|record| {
+                matches!(
+                    record.state,
+                    ManagedResizeCorrelationState::SceneInFlight { .. }
+                )
+            });
+        }
+        self.commit_observations.remove(&pane);
+        self.records.retain(|_pane, records| !records.is_empty());
+        self.reserved_bytes = retained_bytes.saturating_add(bytes);
+        // Only admitted tagged authority supersedes an untagged recovery
+        // wait. Its exact commit snapshot has its own correlation record.
+        self.ordinary_recovery_commit_floors.remove(&pane);
+        Ok(bytes)
+    }
+
+    pub fn next_surface_commit(&mut self, pane: u64) -> u64 {
+        let commit = self.surface_commits.entry(pane).or_default();
+        *commit = commit.saturating_add(1);
+        if self
+            .ordinary_recovery_commit_floors
+            .get(&pane)
+            .is_some_and(|floor| *commit > *floor)
+        {
+            self.ordinary_recovery_commit_floors.remove(&pane);
+        }
+        *commit
+    }
+
+    pub fn wait_for_ordinary_recovery_commit(&mut self, pane: u64) -> bool {
+        let Some(floor) = self.surface_commits.get(&pane).copied() else {
+            return false;
+        };
+        self.ordinary_recovery_commit_floors.insert(pane, floor);
+        true
+    }
+
+    pub fn ordinary_recovery_commit_pending(&self) -> bool {
+        !self.ordinary_recovery_commit_floors.is_empty()
+    }
+
+    pub fn current_surface_commit(&self, pane: u64) -> u64 {
+        self.surface_commits.get(&pane).copied().unwrap_or_default()
+    }
+
+    pub fn remove_pane(&mut self, pane: u64) -> Vec<ManagedResizeCorrelation> {
+        self.surface_commits.remove(&pane);
+        self.commit_observations.remove(&pane);
+        self.ordinary_recovery_commit_floors.remove(&pane);
+        let records = self.records.remove(&pane).unwrap_or_default();
+        let records = records.into_iter().collect::<Vec<_>>();
+        let bytes = records.iter().fold(0_u64, |total, record| {
+            total.saturating_add(record.reserved_bytes)
+        });
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(bytes);
+        records
+    }
+
+    pub fn retire_pending_for_ordinary_resize(&mut self, pane: u64) -> Vec<u64> {
+        self.commit_observations.remove(&pane);
+        let mut released_bytes = 0_u64;
+        let mut retired_epochs = Vec::new();
+        if let Some(records) = self.records.get_mut(&pane) {
+            records.retain(|record| {
+                if matches!(
+                    record.state,
+                    ManagedResizeCorrelationState::SceneInFlight { .. }
+                ) {
+                    return true;
+                }
+                released_bytes = released_bytes.saturating_add(record.reserved_bytes);
+                retired_epochs.push(record.epoch);
+                false
+            });
+        }
+        self.records.retain(|_pane, records| !records.is_empty());
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(released_bytes);
+        retired_epochs
+    }
+
+    pub fn complete_scene(&mut self, sequence: u64) -> Vec<(u64, u64, u64)> {
+        let mut released = 0_u64;
+        let mut completed_snapshots = Vec::new();
+        self.records.retain(|pane, records| {
+            records.retain(|record| {
+                let complete = if let ManagedResizeCorrelationState::SceneInFlight {
+                    surface_commit,
+                    scene_sequence,
+                    transport_resource,
+                } = record.state
+                    && scene_sequence == sequence
+                {
+                    info!(
+                        pane = *pane,
+                        epoch = record.epoch,
+                        surface_commit,
+                        scene_sequence,
+                        transport_resource,
+                        "managed resize scene presented"
+                    );
+                    true
+                } else {
+                    false
+                };
+                if complete {
+                    released = released.saturating_add(record.reserved_bytes);
+                    if let ManagedResizeCorrelationState::SceneInFlight { surface_commit, .. } =
+                        record.state
+                    {
+                        completed_snapshots.push((*pane, record.epoch, surface_commit));
+                    }
+                }
+                !complete
+            });
+            !records.is_empty()
+        });
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(released);
+        self.commit_observations.retain(|pane, _observations| {
+            self.records
+                .get(pane)
+                .is_some_and(|records| !records.is_empty())
+        });
+        completed_snapshots
+    }
+
+    pub fn contains_snapshot(&self, pane: u64, epoch: u64, surface_commit: u64) -> bool {
+        self.records.get(&pane).is_some_and(|records| {
+            records.iter().any(|record| {
+                record.epoch == epoch
+                    && match record.state {
+                        ManagedResizeCorrelationState::SnapshotQueued {
+                            surface_commit: current,
+                            ..
+                        }
+                        | ManagedResizeCorrelationState::SceneInFlight {
+                            surface_commit: current,
+                            ..
+                        } => current == surface_commit,
+                        ManagedResizeCorrelationState::ConfigureSent
+                        | ManagedResizeCorrelationState::CurrentUnsuitable => false,
+                    }
+            })
+        })
+    }
+
+    pub fn queued_snapshot(&self, pane: u64) -> Option<QueuedManagedSnapshot> {
+        self.records.get(&pane)?.iter().rev().find_map(|record| {
+            let ManagedResizeCorrelationState::SnapshotQueued {
+                surface_commit,
+                backing,
+                ..
+            } = &record.state
+            else {
+                return None;
+            };
+            Some(QueuedManagedSnapshot {
+                epoch: record.epoch,
+                pixel_size: record.pixel_size,
+                surface_commit: *surface_commit,
+                backing: backing.clone(),
+            })
+        })
+    }
+
+    pub fn mark_scene_in_flight(
+        &mut self,
+        pane: u64,
+        epoch: u64,
+        surface_commit: u64,
+        scene_sequence: u64,
+        transport_resource: u64,
+    ) {
+        let Some(records) = self.records.get_mut(&pane) else {
+            return;
+        };
+        let Some(record) = records.iter_mut().find(|record| record.epoch == epoch) else {
+            return;
+        };
+        if let ManagedResizeCorrelationState::SnapshotQueued {
+            surface_commit: commit,
+            committed_at,
+            ..
+        } = &record.state
+            && *commit == surface_commit
+        {
+            info!(
+                pane,
+                epoch,
+                surface_commit,
+                scene_sequence,
+                transport_resource,
+                snapshot_to_publish_micros = committed_at.elapsed().as_micros(),
+                "managed resize scene published"
+            );
+            record.state = ManagedResizeCorrelationState::SceneInFlight {
+                surface_commit,
+                scene_sequence,
+                transport_resource,
+            };
+        }
+    }
+}
+
+pub(crate) fn emit_managed_resize_status(
+    fast_path: &mut PresentationFastPath,
+    status: brood_protocol::ManagedResizeStatus,
+) {
+    let pane = status.pane;
+    let epoch = status.resize_epoch;
+    let result = status.result;
+    let record =
+        match brood_ipc::encode_managed_resize_status_record(status, fast_path.generation, epoch) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    pane,
+                    epoch,
+                    ?error,
+                    "failed to encode managed resize status"
+                );
+                return;
+            }
+        };
+    if let Err(record) = fast_path.frames.try_send(record) {
+        warn!(
+            pane,
+            epoch,
+            opcode = record.opcode,
+            "managed resize status lane is full"
+        );
+        return;
+    }
+    if let Err(error) = fast_path.frame_notifications.notify() {
+        warn!(
+            pane,
+            epoch,
+            ?error,
+            "failed to notify managed resize status"
+        );
+        return;
+    }
+    info!(pane, epoch, ?result, "managed resize status emitted");
 }
 
 #[allow(dead_code)]
@@ -6522,5 +7387,446 @@ impl ClientData for ClientState {
             ?reason,
             "Wayland client disconnected from Brood"
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_resize_tests {
+    use super::*;
+
+    fn correlation(
+        epoch: u64,
+        reserved_bytes: u64,
+        state: ManagedResizeCorrelationState,
+    ) -> ManagedResizeCorrelation {
+        ManagedResizeCorrelation {
+            epoch,
+            serial: Serial::from(u32::try_from(epoch).unwrap_or(u32::MAX)),
+            logical_size: (200, 100),
+            pixel_size: (300, 150),
+            sent_after_commit: 4,
+            reserved_bytes,
+            configured_at: Instant::now(),
+            state,
+        }
+    }
+
+    fn reserve_and_insert(correlations: &mut ManagedResizeCorrelations, pane: u64, epoch: u64) {
+        let bytes = correlations.reserve(pane, epoch, (1, 1)).unwrap();
+        correlations
+            .records
+            .entry(pane)
+            .or_default()
+            .push_back(correlation(
+                epoch,
+                bytes,
+                ManagedResizeCorrelationState::ConfigureSent,
+            ));
+    }
+
+    #[test]
+    fn managed_resize_reservation_has_absolute_count_and_per_pane_byte_bounds() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        for pane in 1..=MAX_MANAGED_RESIZE_SNAPSHOTS as u64 {
+            reserve_and_insert(&mut correlations, pane, pane);
+        }
+        assert_eq!(
+            correlations.reserve(1000, 1000, (1, 1)),
+            Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity)
+        );
+        let mut correlations = ManagedResizeCorrelations::default();
+        assert_eq!(
+            correlations.reserve(1, 1, (4097, 4096)),
+            Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity)
+        );
+    }
+
+    #[test]
+    fn failed_reservation_does_not_discard_an_older_queued_snapshot() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 1);
+        for (pane, bytes) in [
+            (2, 64 * 1024 * 1024),
+            (3, 64 * 1024 * 1024),
+            (4, 64 * 1024 * 1024),
+            (5, 64 * 1024 * 1024 - 4),
+        ] {
+            correlations
+                .records
+                .entry(pane)
+                .or_default()
+                .push_back(correlation(
+                    pane,
+                    bytes,
+                    ManagedResizeCorrelationState::SceneInFlight {
+                        surface_commit: pane,
+                        scene_sequence: 8,
+                        transport_resource: pane,
+                    },
+                ));
+            correlations.reserved_bytes = correlations.reserved_bytes.saturating_add(bytes);
+        }
+        assert_eq!(
+            correlations.reserve(1, 3, (4096, 4096)),
+            Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity)
+        );
+        assert_eq!(
+            correlations.records[&1].front().map(|record| record.epoch),
+            Some(1)
+        );
+        assert_eq!(
+            correlations.reserve(1, 1, (1, 1)),
+            Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity)
+        );
+    }
+
+    #[test]
+    fn newer_request_replaces_only_not_published_snapshot() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 1);
+        correlations.records.get_mut(&1).unwrap()[0].state =
+            ManagedResizeCorrelationState::SceneInFlight {
+                surface_commit: 5,
+                scene_sequence: 11,
+                transport_resource: 17,
+            };
+        reserve_and_insert(&mut correlations, 1, 2);
+        reserve_and_insert(&mut correlations, 1, 3);
+        let epochs = correlations.records[&1]
+            .iter()
+            .map(|record| record.epoch)
+            .collect::<Vec<_>>();
+        assert_eq!(epochs, vec![1, 3]);
+    }
+
+    #[test]
+    fn ordinary_recovery_reports_all_pending_epochs_but_keeps_in_flight_scenes() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        let bytes = ManagedResizeCorrelations::reservation_bytes((300, 150)).unwrap();
+        let records = correlations.records.entry(1).or_default();
+        records.push_back(correlation(
+            1,
+            bytes,
+            ManagedResizeCorrelationState::SceneInFlight {
+                surface_commit: 5,
+                scene_sequence: 11,
+                transport_resource: 17,
+            },
+        ));
+        records.push_back(correlation(
+            2,
+            bytes,
+            ManagedResizeCorrelationState::ConfigureSent,
+        ));
+        records.push_back(correlation(
+            3,
+            bytes,
+            ManagedResizeCorrelationState::CurrentUnsuitable,
+        ));
+        records.push_back(correlation(
+            4,
+            bytes,
+            ManagedResizeCorrelationState::SnapshotQueued {
+                surface_commit: 9,
+                committed_at: Instant::now(),
+                backing: crate::frame_export::ManagedSnapshotBacking::SharedMemory(
+                    Arc::<[u8]>::from([]),
+                ),
+            },
+        ));
+        correlations.reserved_bytes = bytes * 4;
+        let retired = correlations.retire_pending_for_ordinary_resize(1);
+        assert_eq!(retired, vec![2, 3, 4]);
+        assert_eq!(correlations.records[&1].len(), 1);
+        assert_eq!(correlations.records[&1][0].epoch, 1);
+        assert_eq!(correlations.reserved_bytes, bytes);
+        assert!(matches!(
+            correlations.records[&1][0].state,
+            ManagedResizeCorrelationState::SceneInFlight { .. }
+        ));
+    }
+
+    #[test]
+    fn ordinary_recovery_waits_for_one_later_commit_and_cleans_up() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        assert!(!correlations.wait_for_ordinary_recovery_commit(99));
+        assert!(correlations.ordinary_recovery_commit_floors.is_empty());
+        assert_eq!(correlations.next_surface_commit(1), 1);
+        assert!(correlations.wait_for_ordinary_recovery_commit(1));
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert!(
+            correlations
+                .ordinary_recovery_commit_floors
+                .keys()
+                .all(|pane| correlations.surface_commits.contains_key(pane))
+        );
+
+        // Commits for another pane cannot release this pane's recovery gate.
+        assert_eq!(correlations.next_surface_commit(2), 1);
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.next_surface_commit(1), 2);
+        assert!(!correlations.ordinary_recovery_commit_pending());
+
+        assert!(correlations.wait_for_ordinary_recovery_commit(1));
+        correlations.remove_pane(1);
+        assert!(!correlations.ordinary_recovery_commit_pending());
+
+        assert_eq!(correlations.next_surface_commit(1), 1);
+        assert!(correlations.wait_for_ordinary_recovery_commit(1));
+        assert_eq!(
+            correlations.reserve(1, 7, (i32::MAX, i32::MAX)),
+            Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity)
+        );
+        assert!(correlations.ordinary_recovery_commit_pending());
+        correlations.reserve(1, 7, (300, 150)).unwrap();
+        assert!(!correlations.ordinary_recovery_commit_pending());
+    }
+
+    #[test]
+    fn active_managed_correlation_suppresses_ordinary_renegotiation() {
+        let states = [
+            ManagedResizeCorrelationState::ConfigureSent,
+            ManagedResizeCorrelationState::CurrentUnsuitable,
+            ManagedResizeCorrelationState::SnapshotQueued {
+                surface_commit: 9,
+                committed_at: Instant::now(),
+                backing: crate::frame_export::ManagedSnapshotBacking::SharedMemory(
+                    Arc::<[u8]>::from([]),
+                ),
+            },
+            ManagedResizeCorrelationState::SceneInFlight {
+                surface_commit: 9,
+                scene_sequence: 20,
+                transport_resource: 21,
+            },
+        ];
+        for state in states {
+            let mut correlations = ManagedResizeCorrelations::default();
+            correlations
+                .records
+                .entry(1)
+                .or_default()
+                .push_back(correlation(1, 4, state));
+            assert!(correlations.has_active(1));
+            correlations.remove_pane(1);
+            assert!(!correlations.has_active(1));
+        }
+
+        let mut correlations = ManagedResizeCorrelations::default();
+        correlations
+            .records
+            .entry(1)
+            .or_default()
+            .push_back(correlation(
+                1,
+                4,
+                ManagedResizeCorrelationState::SceneInFlight {
+                    surface_commit: 9,
+                    scene_sequence: 20,
+                    transport_resource: 21,
+                },
+            ));
+        correlations.reserved_bytes = 4;
+        correlations.complete_scene(20);
+        assert!(!correlations.has_active(1));
+
+        assert!(managed_resize_suppresses_ordinary_renegotiation(
+            true, false
+        ));
+        assert!(managed_resize_suppresses_ordinary_renegotiation(
+            false, true
+        ));
+        assert!(!managed_resize_suppresses_ordinary_renegotiation(
+            false, false
+        ));
+    }
+
+    #[test]
+    fn pre_commit_observations_are_serial_bound_bounded_and_consumed_once() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 1);
+        let serial = Serial::from(1);
+        assert!(!correlations.record_commit_observation(2, serial, (300, 150)));
+        assert!(!correlations.record_commit_observation(1, Serial::from(2), (300, 150)));
+        assert!(correlations.record_commit_observation(1, serial, (300, 150)));
+        assert!(correlations.record_commit_observation(1, serial, (301, 151)));
+        assert_eq!(
+            correlations.take_commit_observation(1, serial),
+            Some((300, 150))
+        );
+        assert_eq!(
+            correlations.take_commit_observation(1, serial),
+            Some((301, 151))
+        );
+        assert_eq!(correlations.take_commit_observation(1, serial), None);
+
+        for pane in 1..=MAX_MANAGED_RESIZE_SNAPSHOTS as u64 {
+            if pane != 1 {
+                reserve_and_insert(&mut correlations, pane, pane);
+            }
+            assert!(correlations.record_commit_observation(
+                pane,
+                Serial::from(u32::try_from(pane).unwrap()),
+                (1, 1),
+            ));
+        }
+        assert!(!correlations.record_commit_observation(1, serial, (2, 2)));
+    }
+
+    #[test]
+    fn pre_commit_observation_uses_ack_not_prior_committed_serial() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 23);
+        assert!(!correlations.record_commit_observation(1, Serial::from(21), (311, 344),));
+        assert!(correlations.record_commit_observation(1, Serial::from(23), (311, 344),));
+        assert_eq!(
+            correlations.take_commit_observation(1, Serial::from(23)),
+            Some((311, 344))
+        );
+    }
+
+    #[test]
+    fn correlation_cleanup_removes_pre_commit_observations() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 1);
+        assert!(correlations.record_commit_observation(1, Serial::from(1), (300, 150)));
+        reserve_and_insert(&mut correlations, 1, 2);
+        assert_eq!(
+            correlations.take_commit_observation(1, Serial::from(1)),
+            None
+        );
+        assert!(correlations.record_commit_observation(1, Serial::from(2), (300, 150)));
+        correlations.retire_pending_for_ordinary_resize(1);
+        assert_eq!(
+            correlations.take_commit_observation(1, Serial::from(2)),
+            None
+        );
+
+        reserve_and_insert(&mut correlations, 1, 3);
+        assert!(correlations.record_commit_observation(1, Serial::from(3), (300, 150)));
+        correlations.remove_pane(1);
+        assert_eq!(
+            correlations.take_commit_observation(1, Serial::from(3)),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_commit_requires_serial_new_buffer_and_both_sizes() {
+        let record = correlation(7, 180_000, ManagedResizeCorrelationState::ConfigureSent);
+        assert!(managed_commit_is_suitable(
+            &record,
+            Some(Serial::from(7)),
+            5,
+            Some((200, 100)),
+            Some((300, 150)),
+        ));
+        assert!(!managed_commit_is_suitable(
+            &record,
+            Some(Serial::from(6)),
+            5,
+            Some((200, 100)),
+            Some((300, 150)),
+        ));
+        assert!(!managed_commit_is_suitable(
+            &record,
+            Some(Serial::from(7)),
+            5,
+            Some((199, 100)),
+            Some((300, 150)),
+        ));
+        assert!(!managed_commit_is_suitable(
+            &record,
+            Some(Serial::from(7)),
+            5,
+            Some((200, 100)),
+            None,
+        ));
+        assert!(!managed_commit_is_suitable(
+            &record,
+            Some(Serial::from(7)),
+            5,
+            Some((200, 100)),
+            Some((299, 150)),
+        ));
+    }
+
+    #[test]
+    fn snapshot_is_owned_until_the_exact_scene_is_presented() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        let bytes = correlations.reserve(1, 1, (300, 150)).unwrap();
+        correlations
+            .records
+            .entry(1)
+            .or_default()
+            .push_back(correlation(
+                1,
+                bytes,
+                ManagedResizeCorrelationState::SnapshotQueued {
+                    surface_commit: 9,
+                    committed_at: Instant::now(),
+                    backing: crate::frame_export::ManagedSnapshotBacking::SharedMemory(
+                        Arc::<[u8]>::from([]),
+                    ),
+                },
+            ));
+        correlations.mark_scene_in_flight(1, 1, 9, 20, 31);
+        assert!(matches!(
+            correlations.records[&1][0].state,
+            ManagedResizeCorrelationState::SceneInFlight {
+                surface_commit: 9,
+                scene_sequence: 20,
+                transport_resource: 31,
+            }
+        ));
+        correlations.complete_scene(19);
+        assert_eq!(correlations.records[&1].len(), 1);
+        correlations.complete_scene(20);
+        assert!(correlations.records.is_empty());
+        assert_eq!(correlations.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn fractional_scale_uses_protocol_denominator() {
+        assert_eq!(scale_120_for_fractional(1.0), 120);
+        assert_eq!(scale_120_for_fractional(1.5), 180);
+        assert_eq!(scale_120_for_fractional(f64::NAN), 120);
+        assert!(pixel_size_matches_scale((200, 100), (300, 150), 180));
+        assert!(pixel_size_matches_scale((207, 229), (310, 343), 180));
+        assert!(!pixel_size_matches_scale((207, 229), (312, 343), 180));
+        assert!(!pixel_size_matches_scale((207, 229), (310, 343), 0));
+        assert!(!pixel_size_matches_scale((0, 229), (310, 343), 180));
+        assert!(!pixel_size_matches_scale((207, 229), (0, 343), 180));
+        assert!(!pixel_size_matches_scale(
+            (i32::MAX, i32::MAX),
+            (i32::MAX, i32::MAX),
+            1,
+        ));
+    }
+
+    #[test]
+    fn removal_rejects_only_epochs_without_a_committed_snapshot() {
+        assert!(managed_resize_needs_cleanup_rejection(
+            &ManagedResizeCorrelationState::ConfigureSent
+        ));
+        assert!(managed_resize_needs_cleanup_rejection(
+            &ManagedResizeCorrelationState::CurrentUnsuitable
+        ));
+        assert!(!managed_resize_needs_cleanup_rejection(
+            &ManagedResizeCorrelationState::SnapshotQueued {
+                surface_commit: 9,
+                committed_at: Instant::now(),
+                backing: crate::frame_export::ManagedSnapshotBacking::SharedMemory(
+                    Arc::<[u8]>::from([]),
+                ),
+            }
+        ));
+        assert!(!managed_resize_needs_cleanup_rejection(
+            &ManagedResizeCorrelationState::SceneInFlight {
+                surface_commit: 9,
+                scene_sequence: 10,
+                transport_resource: 21,
+            }
+        ));
     }
 }

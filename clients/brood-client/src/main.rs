@@ -101,6 +101,7 @@ const MAX_DEFERRED_ACTOR_HOST_MESSAGES: usize = 128;
 const MAX_POINTER_INTERACTIONS: usize = 64;
 const MAX_POINTER_INTERACTION_SEQUENCES: usize = 64;
 const MAX_ACTIVE_RESIZE_REGIONS: usize = 32;
+const MAX_SYNCHRONIZED_WAIT_PANES: usize = 128;
 const MAX_LAYOUT_REGION_TEXT_BYTES: usize = 512;
 const DEFAULT_WINDOW_WIDTH: f64 = 1440.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 900.0;
@@ -920,6 +921,10 @@ fn main() -> Result<()> {
         container_deployer: backend_deployer,
         local_server_template,
         backend_registry,
+        proof_managed_frame_gate_enabled: std::env::var_os(
+            "BROOD_MANAGED_RESIZE_PROOF_HOLD_FIRST_TAGGED",
+        )
+        .is_some(),
         ..Application::default()
     };
     application.publish_backend_sessions()?;
@@ -1051,10 +1056,16 @@ fn main() -> Result<()> {
 enum ClientEvent {
     SceneFrame {
         backend: BackendId,
+        connection_generation: u64,
         sequence: u64,
         width: u32,
         height: u32,
         windows: Vec<SceneWindowUpdate>,
+    },
+    ManagedResizeStatus {
+        backend: BackendId,
+        connection_generation: u64,
+        status: brood_protocol::ManagedResizeStatus,
     },
     FocusPresentation,
     ClosePresentation,
@@ -1409,10 +1420,12 @@ fn start_ssh_backend_deployment(
 #[derive(Debug)]
 struct SceneWindowUpdate {
     backend: BackendId,
+    backend_window_id: u64,
     window_id: u64,
     resource_id: u64,
     rect: [i32; 4],
     active: bool,
+    resize_epoch: Option<u64>,
     resource: Option<FrameResource>,
 }
 
@@ -1421,6 +1434,33 @@ enum FrameResource {
     Dmabuf(DmabufFrame),
     SharedMemory(SharedMemoryFrame),
     Network(remote::NetworkFrame),
+}
+
+impl FrameResource {
+    fn extent(&self) -> (u32, u32) {
+        match self {
+            Self::Dmabuf(frame) => (frame.width, frame.height),
+            Self::SharedMemory(frame) => {
+                let metadata = frame.image.metadata();
+                (metadata.width, metadata.height)
+            }
+            Self::Network(frame) => (frame.width, frame.height),
+        }
+    }
+}
+
+fn exact_managed_frame_size_matches(
+    expected: (u32, u32),
+    source_rect: [i32; 4],
+    resource_extent: Option<(u32, u32)>,
+) -> bool {
+    let Ok(width) = i32::try_from(expected.0) else {
+        return false;
+    };
+    let Ok(height) = i32::try_from(expected.1) else {
+        return false;
+    };
+    source_rect == [0, 0, width, height] && resource_extent == Some(expected)
 }
 
 struct PendingScene {
@@ -1671,7 +1711,13 @@ fn spawn_frame_updates(
                                     )));
                                 return;
                             }
-                            let resource_id = record.arguments[1];
+                            let Ok(frame) = brood_ipc::decode_window_frame_record(&record) else {
+                                let _send_result = proxy.send_event(ClientEvent::TransportError(
+                                    "received malformed DMA-BUF window record".to_string(),
+                                ));
+                                return;
+                            };
+                            let resource_id = frame.resource;
                             let resource = if resources.insert(resource_id) {
                                 match dmabuf_resource(&target, resource_id) {
                                     Ok(resource) => Some(FrameResource::Dmabuf(resource)),
@@ -1686,14 +1732,14 @@ fn spawn_frame_updates(
                             } else {
                                 None
                             };
-                            let (x, y) = unpack_i32_pair(record.arguments[2]);
-                            let (width, height) = unpack_i32_pair(record.arguments[3]);
                             scene.windows.push(SceneWindowUpdate {
                                 backend,
-                                window_id: record.arguments[0],
+                                backend_window_id: frame.pane,
+                                window_id: frame.pane,
                                 resource_id,
-                                rect: [x, y, width, height],
-                                active: record.arguments[4] != 0,
+                                rect: frame.source,
+                                active: frame.active,
+                                resize_epoch: frame.resize_epoch,
                                 resource,
                             });
                         }
@@ -1717,7 +1763,13 @@ fn spawn_frame_updates(
                                     )));
                                 return;
                             }
-                            let resource_id = record.arguments[1];
+                            let Ok(frame) = brood_ipc::decode_window_frame_record(&record) else {
+                                let _send_result = proxy.send_event(ClientEvent::TransportError(
+                                    "received malformed shared-memory window record".to_string(),
+                                ));
+                                return;
+                            };
+                            let resource_id = frame.resource;
                             let resource = if resources.insert(resource_id) {
                                 match shared_memory_resource(
                                     &target,
@@ -1739,16 +1791,36 @@ fn spawn_frame_updates(
                             } else {
                                 None
                             };
-                            let (x, y) = unpack_i32_pair(record.arguments[2]);
-                            let (width, height) = unpack_i32_pair(record.arguments[3]);
                             scene.windows.push(SceneWindowUpdate {
                                 backend,
-                                window_id: record.arguments[0],
+                                backend_window_id: frame.pane,
+                                window_id: frame.pane,
                                 resource_id,
-                                rect: [x, y, width, height],
-                                active: record.arguments[4] != 0,
+                                rect: frame.source,
+                                active: frame.active,
+                                resize_epoch: frame.resize_epoch,
                                 resource,
                             });
+                        }
+                        brood_ipc::FRAME_MANAGED_RESIZE_STATUS => {
+                            let Ok(status) =
+                                brood_ipc::decode_managed_resize_status_record(&record)
+                            else {
+                                let _send_result = proxy.send_event(ClientEvent::TransportError(
+                                    "received malformed managed resize status".to_string(),
+                                ));
+                                return;
+                            };
+                            if proxy
+                                .send_event(ClientEvent::ManagedResizeStatus {
+                                    backend,
+                                    connection_generation: generation,
+                                    status,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                         brood_ipc::FRAME_SCENE_END => {
                             let Some(scene) = pending_scene.take() else {
@@ -1769,6 +1841,7 @@ fn spawn_frame_updates(
                             if proxy
                                 .send_event(ClientEvent::SceneFrame {
                                     backend,
+                                    connection_generation: generation,
                                     sequence: scene.sequence,
                                     width: scene.width,
                                     height: scene.height,
@@ -1843,15 +1916,6 @@ fn spawn_actor_message_updates(
         })
         .context("spawn actor-message update worker")?;
     Ok(())
-}
-
-fn unpack_i32_pair(value: u64) -> (i32, i32) {
-    let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or_default();
-    let high = u32::try_from(value >> 32).unwrap_or_default();
-    (
-        i32::from_ne_bytes(low.to_ne_bytes()),
-        i32::from_ne_bytes(high.to_ne_bytes()),
-    )
 }
 
 enum InputLane {
@@ -2234,6 +2298,16 @@ impl InputLane {
                 .get_mut(&backend)
                 .is_some_and(|lane| lane.send(message)),
             Self::Local(_) | Self::Remote(_) => self.send(message),
+        }
+    }
+
+    fn release_local_resource_to(&mut self, backend: BackendId, resource: u64) -> bool {
+        match self {
+            Self::Local(lane) => lane.send(ClientMessage::ReleaseResource { resource }),
+            Self::Remote(_) => false,
+            Self::Multi { lanes, .. } => lanes
+                .get_mut(&backend)
+                .is_some_and(|lane| lane.release_local_resource_to(backend, resource)),
         }
     }
 
@@ -3084,6 +3158,8 @@ struct ActiveSynchronizedResize {
     wait_pane_owners: BTreeMap<u64, LayoutLeaseToken>,
     notified_panes: BTreeSet<u64>,
     recovered_regions: BTreeSet<LayoutLeaseId>,
+    recovered_managed_panes: BTreeSet<u64>,
+    recovered_managed_content: BTreeMap<u64, &'static str>,
     focus: Option<u64>,
     wait_panes: BTreeSet<u64>,
     ready_panes: BTreeSet<u64>,
@@ -3159,10 +3235,27 @@ fn synchronized_resize_inventory_matches(
     active: &ActiveSynchronizedResize,
     current_inventory: &[u64],
 ) -> bool {
+    let current_inventory = current_inventory.iter().copied().collect::<BTreeSet<_>>();
     active
         .target_tree
-        .waitable_panes(active.target_tree.root_token())
-        .is_some_and(|target_inventory| target_inventory == current_inventory)
+        .compose()
+        .ok()
+        .map(|target| named_layout_panes(&target.layout))
+        .is_some_and(|target_panes| target_panes.is_subset(&current_inventory))
+}
+
+fn named_layout_panes(layout: &ResolvedLayout) -> BTreeSet<u64> {
+    layout
+        .items
+        .iter()
+        .filter_map(|item| match item.kind {
+            LayoutItemKind::Pane { pane } | LayoutItemKind::OverlayPane { pane } => Some(pane),
+            LayoutItemKind::Placeholder
+            | LayoutItemKind::Handle
+            | LayoutItemKind::Chrome
+            | LayoutItemKind::Overlay => None,
+        })
+        .collect()
 }
 
 fn lease_viewport_rect(
@@ -3197,7 +3290,7 @@ fn resize_regions_are_final(active: &ActiveSynchronizedResize) -> bool {
 }
 
 fn synchronized_resize_requires_degraded_completion(active: &ActiveSynchronizedResize) -> bool {
-    !active.recovered_regions.is_empty()
+    !active.recovered_regions.is_empty() || !active.recovered_managed_panes.is_empty()
 }
 
 fn synchronized_timeout_recovery_extent(
@@ -3328,16 +3421,16 @@ const fn native_resize_request_disposition(
     }
 }
 
-fn target_present_plugin_panes(
+fn target_present_waitable_panes(
     target: &ResolvedLayout,
-    waitable_plugin_panes: &BTreeSet<u64>,
+    waitable_panes: &BTreeSet<u64>,
 ) -> BTreeSet<u64> {
     target
         .items
         .iter()
         .filter_map(|item| match item.kind {
             LayoutItemKind::Pane { pane } | LayoutItemKind::OverlayPane { pane }
-                if waitable_plugin_panes.contains(&pane) =>
+                if waitable_panes.contains(&pane) =>
             {
                 Some(pane)
             }
@@ -3347,6 +3440,44 @@ fn target_present_plugin_panes(
             | LayoutItemKind::Handle
             | LayoutItemKind::Chrome
             | LayoutItemKind::Overlay => None,
+        })
+        .collect()
+}
+
+fn wait_pane_has_current_managed_route(
+    pane: u64,
+    plugin_panes: &BTreeSet<u64>,
+    registry: &BackendRegistry,
+) -> bool {
+    plugin_panes.contains(&pane)
+        || registry
+            .routable_backend_pane(pane)
+            .and_then(|qualified| registry.connection_generation(qualified.backend))
+            .is_some()
+}
+
+fn unavailable_synchronized_target_panes(
+    target_panes: &[u64],
+    current_panes: &BTreeSet<u64>,
+    managed_panes: &BTreeSet<u64>,
+    registry: &BackendRegistry,
+    explicitly_unavailable_panes: &[u64],
+) -> Vec<u64> {
+    let explicitly_unavailable_panes = explicitly_unavailable_panes
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    target_panes
+        .iter()
+        .copied()
+        .filter(|pane| {
+            explicitly_unavailable_panes.contains(pane)
+                || !current_panes.contains(pane)
+                || (managed_panes.contains(pane)
+                    && registry
+                        .routable_backend_pane(*pane)
+                        .and_then(|qualified| registry.connection_generation(qualified.backend))
+                        .is_none())
         })
         .collect()
 }
@@ -3450,6 +3581,9 @@ const fn synchronized_layout_notification_request_id(
             notification.request_id
         }
         brood_wasm::SynchronizedLayoutNotification::Rejected(notification) => {
+            notification.request_id
+        }
+        brood_wasm::SynchronizedLayoutNotification::Aborted(notification) => {
             notification.request_id
         }
         brood_wasm::SynchronizedLayoutNotification::Superseded(notification) => {
@@ -3630,6 +3764,8 @@ struct Application {
     plugin_scroll_benchmark: Option<PluginScrollBenchmark>,
     plugin_scroll_auto_last_scene: Option<(u64, Instant)>,
     window_resize: Option<WindowResizeTransaction>,
+    proof_managed_frame_gate_enabled: bool,
+    proof_held_managed_frame: Option<(u64, ClientEvent)>,
 }
 
 impl Application {
@@ -3654,6 +3790,31 @@ impl Application {
             remaining > 1,
             "the only connected backend stopped: {message}"
         );
+        let abort_reason = format!(
+            "backend {} disconnected during synchronized resize: {message}",
+            backend.0
+        );
+        let unavailable_panes = self
+            .active_synchronized_resize
+            .as_ref()
+            .and_then(|active| active.target_tree.compose().ok())
+            .map(|target| named_layout_panes(&target.layout))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pane| {
+                self.backend_registry
+                    .backend_pane(*pane)
+                    .is_some_and(|qualified| qualified.backend == backend)
+            })
+            .collect::<Vec<_>>();
+        let mut focus_change = if self.active_synchronized_resize.is_some() {
+            self.abort_synchronized_resize_for_inventory_authority_change(
+                &abort_reason,
+                &unavailable_panes,
+            )?
+        } else {
+            None
+        };
         if let Some(runtime) = self.wasm_runtime.as_mut() {
             runtime.disconnect_backend(backend)?;
             runtime.drain_events()?;
@@ -3682,10 +3843,11 @@ impl Application {
         if let Some(sender) = self.input_sender.as_mut() {
             sender.set_pane_routes(self.backend_registry.all_view_routes());
         }
-        let focus_change = self
+        focus_change = self
             .renderer
             .as_mut()
-            .and_then(|renderer| renderer.disconnect_backend(backend));
+            .and_then(|renderer| renderer.disconnect_backend(backend))
+            .or(focus_change);
         if let Some(position) = self
             .remote_connections
             .iter()
@@ -4388,17 +4550,99 @@ fn cadence_diagnostics(
     }
 }
 
+fn complete_tagged_managed_scene(event: &ClientEvent) -> Option<(u64, usize)> {
+    let ClientEvent::SceneFrame { windows, .. } = event else {
+        return None;
+    };
+    complete_tagged_managed_epoch(
+        windows
+            .iter()
+            .filter_map(|window| window.resize_epoch.map(|epoch| (window.window_id, epoch))),
+    )
+}
+
+fn complete_tagged_managed_epoch(
+    tagged: impl IntoIterator<Item = (u64, u64)>,
+) -> Option<(u64, usize)> {
+    let mut tagged = tagged.into_iter().collect::<Vec<_>>();
+    tagged.sort_unstable();
+    tagged.dedup_by_key(|(pane, _epoch)| *pane);
+    if tagged.len() < 2 {
+        return None;
+    }
+    let mut epochs = tagged
+        .into_iter()
+        .map(|(_pane, epoch)| epoch)
+        .collect::<Vec<_>>();
+    epochs.sort_unstable();
+    (epochs.first() == epochs.last()).then_some((epochs[0], epochs.len()))
+}
+
+fn take_superseded_proof_frame<T>(
+    held: &mut Option<(u64, T)>,
+    active_epoch: Option<u64>,
+) -> Option<(u64, T)> {
+    held.as_ref()
+        .is_some_and(|(held_epoch, _event)| Some(*held_epoch) != active_epoch)
+        .then(|| held.take())
+        .flatten()
+}
+
 impl Application {
+    fn flush_managed_resource_releases(&mut self) {
+        let releases = self
+            .renderer
+            .as_mut()
+            .map_or_else(Vec::new, Renderer::take_managed_resource_releases);
+        for (backend, resource) in releases {
+            let released_local = self
+                .input_sender
+                .as_mut()
+                .is_some_and(|lane| lane.release_local_resource_to(backend, resource));
+            if released_local {
+                continue;
+            }
+            let result = self
+                .backend_commands
+                .as_ref()
+                .context("backend command lane is unavailable")
+                .and_then(|commands| commands.release_resource_to(backend, resource));
+            if let Err(error) = result {
+                eprintln!(
+                    "could not release retired managed resize resource backend={} resource={resource}: {error:#}",
+                    backend.0
+                );
+            }
+        }
+    }
+
     fn accept_frame(&mut self, event: ClientEvent) -> Result<()> {
-        let (backend, sequence, width, height, windows) = match event {
+        if self.proof_managed_frame_gate_enabled
+            && self.proof_held_managed_frame.is_none()
+            && let Some((epoch, count)) = complete_tagged_managed_scene(&event)
+        {
+            eprintln!(
+                "proof held complete tagged managed scene epoch={epoch} tagged_windows={count}"
+            );
+            self.proof_held_managed_frame = Some((epoch, event));
+            return Ok(());
+        }
+        let (backend, connection_generation, sequence, width, height, windows) = match event {
             ClientEvent::SceneFrame {
                 backend,
+                connection_generation,
                 sequence,
                 width,
                 height,
                 windows,
             } => {
-                if !self.backend_registry.is_connected(backend) {
+                if self.backend_registry.connection_generation(backend)
+                    != Some(connection_generation)
+                {
+                    eprintln!(
+                        "dropped scene from stale connection backend={} connection_generation={connection_generation}",
+                        backend.0
+                    );
                     return Ok(());
                 }
                 let mut windows = windows;
@@ -4411,9 +4655,21 @@ impl Application {
                 if let Some(sender) = self.input_sender.as_mut() {
                     sender.set_pane_routes(self.backend_registry.all_view_routes());
                 }
-                (backend, sequence, width, height, windows)
+                (
+                    backend,
+                    connection_generation,
+                    sequence,
+                    width,
+                    height,
+                    windows,
+                )
             }
             ClientEvent::TransportError(message) => return Err(anyhow!(message)),
+            ClientEvent::ManagedResizeStatus { .. } => {
+                return Err(anyhow!(
+                    "managed resize status reached scene transport path"
+                ));
+            }
             ClientEvent::BackendDisconnected { .. } => {
                 return Err(anyhow!("backend disconnect reached scene transport path"));
             }
@@ -4482,11 +4738,12 @@ impl Application {
                 ));
             }
         };
-        let Some(renderer) = self.renderer.as_mut() else {
+        if self.renderer.is_none() {
             self.pending_frames.insert(
                 backend,
                 ClientEvent::SceneFrame {
                     backend,
+                    connection_generation,
                     sequence,
                     width,
                     height,
@@ -4494,14 +4751,45 @@ impl Application {
                 },
             );
             return Ok(());
-        };
-        let (focus_change, released_resources) =
-            renderer.select_scene(backend, sequence, width, height, windows)?;
-        if let Some(commands) = self.backend_commands.as_ref() {
-            for resource in released_resources {
-                commands.release_resource_to(backend, resource)?;
+        }
+        let (focus_change, released_resources, ready_managed) = self
+            .renderer
+            .as_mut()
+            .context("renderer disappeared before scene selection")?
+            .select_scene(
+                backend,
+                connection_generation,
+                sequence,
+                width,
+                height,
+                windows,
+            )?;
+        for resource in released_resources {
+            let released_local = self
+                .input_sender
+                .as_mut()
+                .is_some_and(|lane| lane.release_local_resource_to(backend, resource));
+            if !released_local {
+                self.backend_commands
+                    .as_ref()
+                    .context("backend command lane is unavailable")?
+                    .release_resource_to(backend, resource)?;
             }
         }
+        for (pane, epoch) in ready_managed {
+            if let Some(change) = self.note_synchronized_pane_ready(pane, epoch)? {
+                dispatch_focus_change(
+                    self.wasm_runtime.as_ref(),
+                    self.input_sender.as_mut(),
+                    change,
+                    self.window_focused,
+                )?;
+            }
+        }
+        let renderer = self
+            .renderer
+            .as_mut()
+            .context("renderer disappeared after managed frame readiness")?;
         renderer.sync_plugin_graphics_extents()?;
         if self
             .pointer_grab
@@ -4537,7 +4825,26 @@ impl Application {
         }
         flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
         flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+        self.flush_managed_resource_releases();
         Ok(())
+    }
+
+    fn release_superseded_proof_managed_frame(&mut self) -> Result<()> {
+        let active_epoch = self
+            .active_synchronized_resize
+            .as_ref()
+            .map(|active| active.epoch.id);
+        let Some((held_epoch, held)) =
+            take_superseded_proof_frame(&mut self.proof_held_managed_frame, active_epoch)
+        else {
+            return Ok(());
+        };
+        self.proof_managed_frame_gate_enabled = false;
+        eprintln!(
+            "proof released complete tagged managed scene held_epoch={held_epoch} active_epoch={}",
+            active_epoch.unwrap_or(0),
+        );
+        self.accept_frame(held)
     }
 
     fn publish_layout_state(&mut self) -> Result<()> {
@@ -5247,8 +5554,12 @@ impl Application {
                 .renderer
                 .as_ref()
                 .map_or(0, Renderer::staged_layout_count);
+            let (managed_expectations, managed_staged_resources) = self
+                .renderer
+                .as_ref()
+                .map_or((0, 0), Renderer::managed_resize_counts);
             eprintln!(
-                "window-resize-present native_resize_revision={} configure_sequence={} width={} height={} epoch={} phase={} wait_ready={}/{} staged_count={} degraded={}",
+                "window-resize-present native_resize_revision={} configure_sequence={} width={} height={} epoch={} phase={} wait_ready={}/{} staged_count={} managed_expectations={} managed_staged_resources={} degraded={}",
                 trace.native_resize_revision,
                 trace.configure_sequence,
                 trace.width,
@@ -5258,6 +5569,8 @@ impl Application {
                 trace.wait_ready,
                 trace.wait_total,
                 staged_count,
+                managed_expectations,
+                managed_staged_resources,
                 trace.degraded,
             );
         }
@@ -5341,11 +5654,13 @@ impl Application {
             } else if let Some(graphics) = self.plugin_graphics.as_ref() {
                 graphics.abort_resize_epoch(active.epoch.id)?;
             }
-            let notification = brood_wasm::SynchronizedLayoutNotification::Rejected(
-                brood_wasm::SynchronizedLayoutRejected {
+            let notification = brood_wasm::SynchronizedLayoutNotification::Aborted(
+                brood_wasm::SynchronizedLayoutAborted {
                     request_id: active.request_id,
+                    resize_epoch: active.epoch,
                     reason: brood_wasm::SynchronizedLayoutRejectionReason::StaleLease,
                     message: reason.to_string(),
+                    unavailable_panes: Vec::new(),
                 },
             );
             self.queue_synchronized_layout_terminal_notification_for_claim(
@@ -5383,16 +5698,56 @@ impl Application {
         };
         let expected_inventory = active
             .target_tree
-            .waitable_panes(active.target_tree.root_token())
+            .compose()
+            .map(|target| named_layout_panes(&target.layout))
             .unwrap_or_default();
         let current_inventory = self
             .renderer
             .as_ref()
             .map_or_else(Vec::new, Renderer::pane_inventory);
         let reason = format!(
-            "pane inventory changed during synchronized resize (expected {expected_inventory:?}, current {current_inventory:?})"
+            "a named target pane became unavailable during synchronized resize (target {expected_inventory:?}, current {current_inventory:?})"
         );
-        self.cancel_active_layout_capture(&reason);
+        self.abort_synchronized_resize_for_inventory_authority_change(&reason, &[])
+    }
+
+    fn abort_synchronized_resize_for_inventory_authority_change(
+        &mut self,
+        reason: &str,
+        explicitly_unavailable_panes: &[u64],
+    ) -> Result<Option<FocusChange>> {
+        let Some(active) = self.active_synchronized_resize.as_ref() else {
+            return Ok(None);
+        };
+        let current = self
+            .renderer
+            .as_ref()
+            .map_or_else(BTreeSet::new, |renderer| {
+                renderer.pane_inventory().into_iter().collect()
+            });
+        let managed_panes = self
+            .renderer
+            .as_ref()
+            .map_or_else(BTreeSet::new, |renderer| {
+                renderer
+                    .available_windows
+                    .iter()
+                    .map(|window| window.pane)
+                    .collect()
+            });
+        let target_panes = active.target_tree.compose().map(|target| {
+            named_layout_panes(&target.layout)
+                .into_iter()
+                .collect::<Vec<_>>()
+        })?;
+        let unavailable_panes = unavailable_synchronized_target_panes(
+            &target_panes,
+            &current,
+            &managed_panes,
+            &self.backend_registry,
+            explicitly_unavailable_panes,
+        );
+        self.cancel_active_layout_capture(reason);
         let active = self
             .active_synchronized_resize
             .take()
@@ -5412,16 +5767,18 @@ impl Application {
         if aborted_native_resize {
             self.restore_native_resize_awaiting_layout_trace();
         }
-        self.reject_synchronized_layout_for_claim(
+        self.abort_synchronized_layout_for_claim(
             &active.requester,
             active.request_id,
+            active.epoch,
             brood_wasm::SynchronizedLayoutRejectionReason::StaleInventoryRevision,
-            &reason,
+            reason,
+            unavailable_panes.clone(),
             active.interaction_claim,
         )?;
         eprintln!(
-            "aborted synchronized layout actor={} request={} epoch={} reason={reason}",
-            active.requester.name, active.request_id, active.epoch.id
+            "aborted synchronized layout actor={} request={} epoch={} unavailable_panes={unavailable_panes:?} reason={reason}",
+            active.requester.name, active.request_id, active.epoch.id,
         );
         Ok(focus_change)
     }
@@ -5446,11 +5803,13 @@ impl Application {
         };
         self.mark_deferred_plugin_scenes_ready(&deferred);
         self.resize_presentation_trace = ResizePresentationTrace::default();
-        self.reject_synchronized_layout_for_claim(
+        self.abort_synchronized_layout_for_claim(
             &active.requester,
             active.request_id,
+            active.epoch,
             brood_wasm::SynchronizedLayoutRejectionReason::Busy,
             reason,
+            Vec::new(),
             active.interaction_claim,
         )?;
         eprintln!(
@@ -5584,6 +5943,36 @@ impl Application {
                     request_id,
                     reason,
                     message,
+                },
+            ),
+            interaction_claim,
+        )
+    }
+
+    fn abort_synchronized_layout_for_claim(
+        &mut self,
+        actor: &ActorIdentity,
+        request_id: u64,
+        resize_epoch: brood_wasm::ResizeEpoch,
+        reason: brood_wasm::SynchronizedLayoutRejectionReason,
+        message: impl Into<String>,
+        unavailable_panes: Vec<u64>,
+        interaction_claim: Option<PointerInteractionClaimKey>,
+    ) -> Result<()> {
+        let message = message.into();
+        eprintln!(
+            "aborted synchronized layout actor={} request={} epoch={} reason={reason:?}: {message}",
+            actor.name, request_id, resize_epoch.id
+        );
+        self.queue_synchronized_layout_terminal_notification_for_claim(
+            actor,
+            brood_wasm::SynchronizedLayoutNotification::Aborted(
+                brood_wasm::SynchronizedLayoutAborted {
+                    request_id,
+                    resize_epoch,
+                    reason,
+                    message,
+                    unavailable_panes,
                 },
             ),
             interaction_claim,
@@ -5906,26 +6295,54 @@ impl Application {
         };
         let target_extent = renderer.layout_extent();
         if native_resize_request {
-            let waitable_plugin_panes = target_tree
+            let waitable_target_panes = target_tree
                 .waitable_panes(submitted_lease)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|pane| renderer.plugin_pane_realms.contains_key(pane))
                 .collect::<BTreeSet<_>>();
-            unique_wait.extend(target_present_plugin_panes(
+            unique_wait.extend(target_present_waitable_panes(
                 &composed.layout,
-                &waitable_plugin_panes,
+                &waitable_target_panes,
             ));
         }
+        if unique_wait.len() > MAX_SYNCHRONIZED_WAIT_PANES {
+            self.reject_synchronized_layout_for_claim(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::InvalidRequest,
+                format!(
+                    "wait set has {} panes; the limit is {MAX_SYNCHRONIZED_WAIT_PANES}",
+                    unique_wait.len()
+                ),
+                interaction_claim_key,
+            )?;
+            return Ok(None);
+        }
         if let Some(pane) = unique_wait.iter().find(|pane| {
-            !renderer.plugin_pane_realms.contains_key(pane)
-                || composed.layout.pane_item(**pane).is_none()
+            !renderer.pane_inventory().contains(pane) || composed.layout.pane_item(**pane).is_none()
         }) {
             self.reject_synchronized_layout_for_claim(
                 sender,
                 request_id,
                 brood_wasm::SynchronizedLayoutRejectionReason::IneligibleWaitPane,
-                format!("pane {pane} cannot provide an epoch-tagged plugin scene"),
+                format!("pane {pane} cannot provide epoch-correlated content"),
+                interaction_claim_key,
+            )?;
+            return Ok(None);
+        }
+        let plugin_panes = renderer
+            .plugin_pane_realms
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some(pane) = unique_wait.iter().find(|pane| {
+            !wait_pane_has_current_managed_route(**pane, &plugin_panes, &self.backend_registry)
+        }) {
+            self.reject_synchronized_layout_for_claim(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::IneligibleWaitPane,
+                format!("managed wait pane {pane} has no current transport route"),
                 interaction_claim_key,
             )?;
             return Ok(None);
@@ -6086,6 +6503,8 @@ impl Application {
             wait_pane_owners,
             notified_panes: BTreeSet::new(),
             recovered_regions: BTreeSet::new(),
+            recovered_managed_panes: BTreeSet::new(),
+            recovered_managed_content: BTreeMap::new(),
             focus,
             wait_panes: unique_wait,
             ready_panes: BTreeSet::new(),
@@ -6135,7 +6554,7 @@ impl Application {
             return Ok(focus_change);
         }
         self.discover_and_dispatch_layout_regions()?;
-        self.notify_synchronized_plugin_panes();
+        self.notify_synchronized_panes();
         let (accepted_focus, accepted_wait_panes) = self
             .active_synchronized_resize
             .as_ref()
@@ -6176,6 +6595,7 @@ impl Application {
             accepted_wait_panes,
             target_rects,
         );
+        self.release_superseded_proof_managed_frame()?;
         if self
             .active_synchronized_resize
             .as_ref()
@@ -6523,7 +6943,7 @@ impl Application {
         );
         self.discover_changed_rest_region(lease)?;
         self.discover_and_dispatch_layout_regions()?;
-        self.notify_synchronized_plugin_panes();
+        self.notify_synchronized_panes();
         let ready = self
             .active_synchronized_resize
             .as_ref()
@@ -6627,13 +7047,13 @@ impl Application {
                         epoch.id, region.lease.id.0, region.lease.generation,
                     );
                     self.discover_changed_rest_region(region.lease)?;
-                    self.notify_synchronized_plugin_panes();
+                    self.notify_synchronized_panes();
                 }
             }
         }
     }
 
-    fn notify_synchronized_plugin_panes(&mut self) {
+    fn notify_synchronized_panes(&mut self) {
         let Some(active) = self.active_synchronized_resize.as_ref() else {
             return;
         };
@@ -6642,7 +7062,11 @@ impl Application {
         if affected_panes.is_empty() && wait_panes.is_empty() {
             return;
         }
-        let Some(renderer) = self.renderer.as_mut() else {
+        let notification_panes = affected_panes
+            .union(&wait_panes)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
         let plugin_panes = renderer
@@ -6650,8 +7074,68 @@ impl Application {
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
+        let managed_panes = renderer
+            .available_windows
+            .iter()
+            .map(|window| window.pane)
+            .collect::<BTreeSet<_>>();
+        let managed_routes = notification_panes
+            .iter()
+            .filter(|pane| managed_panes.contains(pane))
+            .filter_map(|pane| {
+                let qualified = self.backend_registry.routable_backend_pane(*pane)?;
+                let generation = self
+                    .backend_registry
+                    .connection_generation(qualified.backend)?;
+                Some(ManagedPaneRoute {
+                    backend: qualified.backend,
+                    connection_generation: generation,
+                    backend_pane: qualified.pane,
+                    view_pane: *pane,
+                })
+            })
+            .collect::<Vec<_>>();
+        let routed_managed = managed_routes
+            .iter()
+            .map(|route| route.view_pane)
+            .collect::<BTreeSet<_>>();
+        let unavailable_managed = notification_panes
+            .iter()
+            .filter(|pane| managed_panes.contains(pane) && !routed_managed.contains(pane))
+            .copied()
+            .collect::<Vec<_>>();
+        if !unavailable_managed.is_empty() {
+            let reason = format!(
+                "managed pane routes disappeared after synchronized acceptance: {unavailable_managed:?}"
+            );
+            match self.abort_synchronized_resize_for_inventory_authority_change(
+                &reason,
+                &unavailable_managed,
+            ) {
+                Ok(Some(change)) => {
+                    if let Err(error) = dispatch_focus_change(
+                        self.wasm_runtime.as_ref(),
+                        self.input_sender.as_mut(),
+                        change,
+                        self.window_focused,
+                    ) {
+                        eprintln!(
+                            "could not dispatch focus change after synchronized route loss: {error:#}"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("could not abort synchronized resize after route loss: {error:#}");
+                }
+            }
+            return;
+        }
         let (tagged, ordinary) =
             synchronized_plugin_notification_sets(&affected_panes, &wait_panes, &plugin_panes);
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
         if let Some(graphics) = self.plugin_graphics.as_ref() {
             if let Err(error) = graphics.admit_resize_epoch_panes(epoch, &tagged) {
                 eprintln!(
@@ -6677,11 +7161,34 @@ impl Application {
             None,
             "synchronized non-wait pane",
         );
+        let mut failed_managed = Vec::new();
+        for route in managed_routes {
+            let wait = wait_panes.contains(&route.view_pane);
+            if let Err(error) = renderer.admit_managed_resize_expectation(route, epoch, wait) {
+                failed_managed.push(route.view_pane);
+                eprintln!(
+                    "could not admit managed resize expectation pane={} epoch={epoch}; selected explicit recovery: {error:#}",
+                    route.view_pane
+                );
+            }
+        }
+        flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
         if let Some(active) = self.active_synchronized_resize.as_mut() {
-            let notification_panes = affected_panes
-                .union(&wait_panes)
-                .copied()
-                .collect::<BTreeSet<_>>();
+            for pane in failed_managed {
+                active.recovered_managed_panes.insert(pane);
+                let has_visible_resource = renderer
+                    .current_windows
+                    .iter()
+                    .any(|window| window.window_id == pane);
+                let content = managed_recovery_content(has_visible_resource);
+                active.recovered_managed_content.insert(pane, content);
+                if active.wait_panes.contains(&pane) {
+                    active.ready_panes.insert(pane);
+                }
+                eprintln!(
+                    "managed resize dependency recovered epoch={epoch} pane={pane} content={content} reason=expectation-admission-failed"
+                );
+            }
             active
                 .notified_panes
                 .extend(notification_panes.iter().copied());
@@ -6763,7 +7270,7 @@ impl Application {
             .window
             .request_redraw();
         eprintln!(
-            "synchronized layout ready actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} missing={missing:?} degraded={degraded} duration_us={}",
+            "synchronized layout ready actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} recovered_managed={:?} recovered_managed_content={:?} missing={missing:?} degraded={degraded} duration_us={}",
             active.requester.name,
             active.request_id,
             active.interaction.map_or(0, |interaction| interaction.0),
@@ -6780,6 +7287,8 @@ impl Application {
             active.wait_panes.len(),
             trace_region_ids(&active.recovered_regions),
             active.recovered_regions.len(),
+            active.recovered_managed_panes,
+            active.recovered_managed_content,
             active.started.elapsed().as_micros(),
         );
         Ok(None)
@@ -6884,7 +7393,7 @@ impl Application {
             active.interaction_claim,
         )?;
         eprintln!(
-            "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} missing={missing_panes:?} duration_us={}",
+            "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} recovered_managed={:?} recovered_managed_content={:?} missing={missing_panes:?} duration_us={}",
             if degraded { "degraded" } else { "completed" },
             active.requester.name,
             active.request_id,
@@ -6903,6 +7412,8 @@ impl Application {
             active.wait_panes.len(),
             trace_region_ids(&active.recovered_regions),
             active.recovered_regions.len(),
+            active.recovered_managed_panes,
+            active.recovered_managed_content,
             active.started.elapsed().as_micros(),
         );
         if let Some(native_resize_revision) = active.native_resize_revision
@@ -6920,6 +7431,7 @@ impl Application {
     }
 
     fn settle_synchronized_resize(&mut self) -> Result<Option<FocusChange>> {
+        self.reconcile_managed_resize_recovery()?;
         if self
             .active_synchronized_resize
             .as_ref()
@@ -6929,9 +7441,76 @@ impl Application {
             })
         {
             self.recover_pending_layout_regions_for_timeout()?;
+            if let Some(epoch) = self
+                .active_synchronized_resize
+                .as_ref()
+                .map(|active| active.epoch.id)
+                && let Some(renderer) = self.renderer.as_mut()
+            {
+                renderer.recover_managed_resize_timeout(epoch);
+            }
+            self.reconcile_managed_resize_recovery()?;
             return self.finish_synchronized_resize(true);
         }
         Ok(None)
+    }
+
+    fn reconcile_managed_resize_recovery(&mut self) -> Result<()> {
+        let Some(epoch) = self
+            .active_synchronized_resize
+            .as_ref()
+            .map(|active| active.epoch.id)
+        else {
+            return Ok(());
+        };
+        let recovered = self
+            .renderer
+            .as_ref()
+            .map_or_else(BTreeSet::new, |renderer| {
+                renderer.recovered_managed_dependencies(epoch)
+            });
+        if recovered.is_empty() {
+            return Ok(());
+        }
+        let recovery_content = recovered
+            .iter()
+            .map(|pane| {
+                let has_visible_resource = self.renderer.as_ref().is_some_and(|renderer| {
+                    renderer
+                        .current_windows
+                        .iter()
+                        .any(|window| window.window_id == *pane)
+                });
+                let content = managed_recovery_content(has_visible_resource);
+                (*pane, content)
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Some(active) = self.active_synchronized_resize.as_mut() {
+            for pane in recovered {
+                if active.recovered_managed_panes.insert(pane) && active.wait_panes.contains(&pane)
+                {
+                    let content = recovery_content[&pane];
+                    active.recovered_managed_content.insert(pane, content);
+                    active.ready_panes.insert(pane);
+                    eprintln!(
+                        "managed resize dependency recovered epoch={epoch} pane={pane} content={content} pane_ready={}/{}",
+                        active.ready_panes.len(),
+                        active.wait_panes.len()
+                    );
+                }
+            }
+            self.resize_presentation_trace.wait_ready = active.ready_panes.len();
+        }
+        let ready = self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| {
+                active.ready_panes == active.wait_panes && resize_regions_are_final(active)
+            });
+        if ready {
+            let _focus_change = self.finish_synchronized_resize(false)?;
+        }
+        Ok(())
     }
 
     fn recover_pending_layout_regions_for_timeout(&mut self) -> Result<()> {
@@ -8570,13 +9149,29 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                 }
                 let _backend_count = self.backend_registry.backend_count();
-                let focus_change = if let Some(renderer) = self.renderer.as_mut() {
+                let mut focus_change = if let Some(renderer) = self.renderer.as_mut() {
                     renderer.select_backend_snapshot(backend, active_session, windows)
                 } else {
                     self.pending_backend_snapshots
                         .insert(backend, (active_session, windows));
                     None
                 };
+                let synchronized_inventory_changed = self
+                    .active_synchronized_resize
+                    .as_ref()
+                    .zip(self.renderer.as_ref())
+                    .is_some_and(|(active, renderer)| {
+                        !synchronized_resize_inventory_matches(active, &renderer.pane_inventory())
+                    });
+                if synchronized_inventory_changed {
+                    match self.abort_synchronized_resize_for_inventory_change() {
+                        Ok(change) => focus_change = change.or(focus_change),
+                        Err(error) => {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                    }
+                }
                 if let Some(change) = focus_change
                     && let Err(error) = dispatch_focus_change(
                         self.wasm_runtime.as_ref(),
@@ -8745,6 +9340,75 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                 }
             }
+            ClientEvent::ManagedResizeStatus {
+                backend,
+                connection_generation,
+                status,
+            } => {
+                if self.backend_registry.connection_generation(backend)
+                    != Some(connection_generation)
+                {
+                    eprintln!(
+                        "dropped managed resize status from stale connection backend={} connection_generation={} pane={} epoch={}",
+                        backend.0, connection_generation, status.pane, status.resize_epoch
+                    );
+                    return;
+                }
+                eprintln!(
+                    "managed resize status backend={} connection_generation={} pane={} epoch={} result={:?}",
+                    backend.0,
+                    connection_generation,
+                    status.pane,
+                    status.resize_epoch,
+                    status.result
+                );
+                let mut protocol_violation = None;
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let disposition = renderer.handle_managed_resize_status(
+                        backend,
+                        connection_generation,
+                        status,
+                    );
+                    match disposition {
+                        ManagedResizeStatusDisposition::None => {}
+                        ManagedResizeStatusDisposition::Recovered { pane, wait } => {
+                            eprintln!(
+                                "managed resize status selected recovery backend={} pane={} epoch={} wait={wait}",
+                                backend.0, pane, status.resize_epoch,
+                            );
+                        }
+                        ManagedResizeStatusDisposition::ProtocolViolation { pane, epoch } => {
+                            protocol_violation = Some(format!(
+                                "contradictory managed resize status after exact frame backend={} connection_generation={} pane={pane} epoch={epoch}",
+                                backend.0, connection_generation
+                            ));
+                        }
+                    }
+                }
+                if let Some(reason) = protocol_violation {
+                    let focus_change = match self.disconnect_remote_backend(backend, &reason) {
+                        Ok(change) => change,
+                        Err(error) => {
+                            self.fail(event_loop, anyhow!("{reason}: {error:#}"));
+                            return;
+                        }
+                    };
+                    if let Some(change) = focus_change
+                        && let Err(error) = dispatch_focus_change(
+                            self.wasm_runtime.as_ref(),
+                            self.input_sender.as_mut(),
+                            change,
+                            self.window_focused,
+                        )
+                    {
+                        self.fail(event_loop, error);
+                    }
+                    return;
+                }
+                if let Err(error) = self.reconcile_managed_resize_recovery() {
+                    self.fail(event_loop, error);
+                }
+            }
             event => {
                 if let Err(error) = self.accept_frame(event) {
                     self.fail(event_loop, error);
@@ -8794,6 +9458,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 return;
             }
         }
+        self.flush_managed_resource_releases();
         self.sync_default_backend_target();
         if let Err(error) = self.publish_layout_state() {
             self.fail(event_loop, error);
@@ -9561,16 +10226,21 @@ impl ApplicationHandler<ClientEvent> for Application {
                         renderer.note_frame_presented();
                         if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
                             let trace = self.resize_presentation_trace;
+                            let layout_extent = renderer.layout_extent();
                             eprintln!(
-                                "resize-present interaction={} event_sequence={} epoch={} divider_x={} phase={} wait_ready={}/{} staged_count={} degraded={} superseded_epochs={}",
+                                "resize-present interaction={} event_sequence={} epoch={} divider_x={} composition_size={}x{} phase={} wait_ready={}/{} staged_count={} managed_expectations={} managed_staged_resources={} degraded={} superseded_epochs={}",
                                 trace.interaction,
                                 trace.event_sequence,
                                 trace.epoch,
                                 renderer.primary_divider_x(),
+                                layout_extent.w,
+                                layout_extent.h,
                                 trace.phase,
                                 trace.wait_ready,
                                 trace.wait_total,
                                 renderer.staged_layout_count(),
+                                renderer.managed_resize_counts().0,
+                                renderer.managed_resize_counts().1,
                                 trace.degraded,
                                 trace.superseded_epochs,
                             );
@@ -9841,6 +10511,298 @@ fn plugin_text_input(
         .then(|| character.to_string())
 }
 
+const MAX_MANAGED_RESIZE_EXPECTATIONS: usize = 128;
+const MAX_MANAGED_RETIRED_EPOCH_FLOORS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ManagedPaneRoute {
+    backend: BackendId,
+    connection_generation: u64,
+    backend_pane: u64,
+    view_pane: u64,
+}
+
+#[derive(Clone, Debug)]
+enum ManagedResizeExpectationState {
+    PendingSend,
+    Issued,
+    Configured,
+    Staged(SceneWindow),
+    Recovered,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedResizeExpectation {
+    route: ManagedPaneRoute,
+    epoch: u64,
+    wait: bool,
+    pixel_size: (u32, u32),
+    logical_size: (u32, u32),
+    scale_120: u32,
+    state: ManagedResizeExpectationState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedFrameDisposition {
+    Ordinary,
+    ProtectedOrdinary,
+    ExactTagged,
+    DropTagged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedResizeStatusDisposition {
+    None,
+    Recovered { pane: u64, wait: bool },
+    ProtocolViolation { pane: u64, epoch: u64 },
+}
+
+#[derive(Default)]
+struct ManagedResizeState {
+    expectations: BTreeMap<u64, ManagedResizeExpectation>,
+    retired_epoch_floors: BTreeMap<(BackendId, u64, u64), u64>,
+}
+
+impl ManagedResizeState {
+    fn expected_pixel_size(&self, pane: u64, epoch: u64) -> Option<(u32, u32)> {
+        let expectation = self.expectations.get(&pane)?;
+        (expectation.epoch == epoch).then_some(expectation.pixel_size)
+    }
+
+    fn admit(&mut self, expectation: ManagedResizeExpectation) -> Result<()> {
+        anyhow::ensure!(
+            expectation.epoch > 0
+                && expectation.route.backend_pane > 0
+                && expectation.route.view_pane > 0,
+            "managed resize expectation identity is invalid"
+        );
+        anyhow::ensure!(
+            self.expectations.len() < MAX_MANAGED_RESIZE_EXPECTATIONS
+                || self.expectations.contains_key(&expectation.route.view_pane),
+            "managed resize expectation capacity is exhausted"
+        );
+        let floor_key = (
+            expectation.route.backend,
+            expectation.route.connection_generation,
+            expectation.route.backend_pane,
+        );
+        let route_is_known = self.retired_epoch_floors.contains_key(&floor_key)
+            || self.expectations.values().any(|current| {
+                (
+                    current.route.backend,
+                    current.route.connection_generation,
+                    current.route.backend_pane,
+                ) == floor_key
+            });
+        anyhow::ensure!(
+            route_is_known
+                || self.retired_epoch_floors.len() + self.expectations.len()
+                    < MAX_MANAGED_RETIRED_EPOCH_FLOORS,
+            "managed retired epoch floor capacity is exhausted"
+        );
+        anyhow::ensure!(
+            self.retired_epoch_floors
+                .get(&floor_key)
+                .is_none_or(|floor| expectation.epoch > *floor),
+            "managed resize epoch is already retired"
+        );
+        anyhow::ensure!(
+            self.expectations
+                .get(&expectation.route.view_pane)
+                .is_none_or(|current| current.epoch == expectation.epoch),
+            "managed pane already has another active resize epoch"
+        );
+        self.expectations
+            .insert(expectation.route.view_pane, expectation);
+        Ok(())
+    }
+
+    fn disposition(
+        &self,
+        backend: BackendId,
+        generation: u64,
+        backend_pane: u64,
+        view_pane: u64,
+        epoch: Option<u64>,
+    ) -> ManagedFrameDisposition {
+        let expectation = self.expectations.get(&view_pane).filter(|expectation| {
+            expectation.route.backend == backend
+                && expectation.route.connection_generation == generation
+                && expectation.route.backend_pane == backend_pane
+        });
+        match epoch {
+            Some(epoch)
+                if expectation.is_some_and(|expectation| {
+                    expectation.epoch == epoch
+                        && matches!(
+                            expectation.state,
+                            ManagedResizeExpectationState::PendingSend
+                                | ManagedResizeExpectationState::Issued
+                                | ManagedResizeExpectationState::Configured
+                                | ManagedResizeExpectationState::Staged(_)
+                        )
+                }) =>
+            {
+                ManagedFrameDisposition::ExactTagged
+            }
+            Some(_) => ManagedFrameDisposition::DropTagged,
+            None if expectation.is_some() => ManagedFrameDisposition::ProtectedOrdinary,
+            None => ManagedFrameDisposition::Ordinary,
+        }
+    }
+
+    fn stage(&mut self, pane: u64, epoch: u64, frame: SceneWindow) -> (bool, Option<SceneWindow>) {
+        let Some(expectation) = self.expectations.get_mut(&pane) else {
+            return (false, None);
+        };
+        if expectation.epoch != epoch
+            || matches!(expectation.state, ManagedResizeExpectationState::Recovered)
+        {
+            return (false, None);
+        }
+        let previous = std::mem::replace(
+            &mut expectation.state,
+            ManagedResizeExpectationState::Staged(frame),
+        );
+        let previous = match previous {
+            ManagedResizeExpectationState::Staged(frame) => Some(frame),
+            ManagedResizeExpectationState::PendingSend
+            | ManagedResizeExpectationState::Issued
+            | ManagedResizeExpectationState::Configured
+            | ManagedResizeExpectationState::Recovered => None,
+        };
+        (true, previous)
+    }
+
+    fn configured(
+        &mut self,
+        route: ManagedPaneRoute,
+        status: brood_protocol::ManagedResizeStatus,
+    ) -> ManagedResizeStatusDisposition {
+        let Some(expectation) = self.expectations.get_mut(&route.view_pane) else {
+            return ManagedResizeStatusDisposition::None;
+        };
+        if expectation.route != route || expectation.epoch != status.resize_epoch {
+            return ManagedResizeStatusDisposition::None;
+        }
+        match status.result {
+            brood_protocol::ManagedResizeStatusResult::Configured {
+                logical_size,
+                pixel_size,
+                scale_120,
+            } => {
+                if logical_size != [expectation.logical_size.0, expectation.logical_size.1]
+                    || pixel_size != [expectation.pixel_size.0, expectation.pixel_size.1]
+                    || scale_120 != expectation.scale_120
+                {
+                    if matches!(expectation.state, ManagedResizeExpectationState::Staged(_)) {
+                        return ManagedResizeStatusDisposition::ProtocolViolation {
+                            pane: route.view_pane,
+                            epoch: expectation.epoch,
+                        };
+                    }
+                    let wait = expectation.wait;
+                    let epoch = expectation.epoch;
+                    let _ = expectation;
+                    self.recover(route.view_pane, epoch);
+                    return ManagedResizeStatusDisposition::Recovered {
+                        pane: route.view_pane,
+                        wait,
+                    };
+                }
+                if matches!(expectation.state, ManagedResizeExpectationState::Issued) {
+                    expectation.state = ManagedResizeExpectationState::Configured;
+                }
+                ManagedResizeStatusDisposition::None
+            }
+            brood_protocol::ManagedResizeStatusResult::Rejected { .. } => {
+                if matches!(expectation.state, ManagedResizeExpectationState::Staged(_)) {
+                    return ManagedResizeStatusDisposition::ProtocolViolation {
+                        pane: route.view_pane,
+                        epoch: expectation.epoch,
+                    };
+                }
+                let wait = expectation.wait;
+                let epoch = expectation.epoch;
+                let _ = expectation;
+                self.recover(route.view_pane, epoch);
+                ManagedResizeStatusDisposition::Recovered {
+                    pane: route.view_pane,
+                    wait,
+                }
+            }
+        }
+    }
+
+    fn recover(&mut self, pane: u64, epoch: u64) -> Option<bool> {
+        let expectation = self.expectations.get_mut(&pane)?;
+        if expectation.epoch != epoch
+            || matches!(expectation.state, ManagedResizeExpectationState::Staged(_))
+        {
+            return None;
+        }
+        let key = (
+            expectation.route.backend,
+            expectation.route.connection_generation,
+            expectation.route.backend_pane,
+        );
+        let wait = expectation.wait;
+        expectation.state = ManagedResizeExpectationState::Recovered;
+        let floor = self.retired_epoch_floors.entry(key).or_default();
+        *floor = (*floor).max(epoch);
+        Some(wait)
+    }
+
+    fn retire_epoch(&mut self, epoch: u64) -> Vec<ManagedResizeExpectation> {
+        let panes = self
+            .expectations
+            .iter()
+            .filter_map(|(pane, expectation)| (expectation.epoch == epoch).then_some(*pane))
+            .collect::<Vec<_>>();
+        let mut retired = Vec::with_capacity(panes.len());
+        for pane in panes {
+            let Some(expectation) = self.expectations.remove(&pane) else {
+                continue;
+            };
+            let key = (
+                expectation.route.backend,
+                expectation.route.connection_generation,
+                expectation.route.backend_pane,
+            );
+            let floor = self.retired_epoch_floors.entry(key).or_default();
+            *floor = (*floor).max(expectation.epoch);
+            retired.push(expectation);
+        }
+        retired
+    }
+
+    fn remove_backend(&mut self, backend: BackendId) -> Vec<ManagedResizeExpectation> {
+        let panes = self
+            .expectations
+            .iter()
+            .filter_map(|(pane, expectation)| {
+                (expectation.route.backend == backend).then_some(*pane)
+            })
+            .collect::<Vec<_>>();
+        let removed = panes
+            .into_iter()
+            .filter_map(|pane| self.expectations.remove(&pane))
+            .collect::<Vec<_>>();
+        self.retired_epoch_floors
+            .retain(|(owner, _generation, _pane), _epoch| *owner != backend);
+        removed
+    }
+
+    fn remove_pane(&mut self, route: ManagedPaneRoute) -> Option<ManagedResizeExpectation> {
+        self.retired_epoch_floors.remove(&(
+            route.backend,
+            route.connection_generation,
+            route.backend_pane,
+        ));
+        self.expectations.remove(&route.view_pane)
+    }
+}
+
 struct Renderer {
     generation: u64,
     window: Arc<Window>,
@@ -9893,6 +10855,9 @@ struct Renderer {
     layout_source: LayoutSource,
     layout_state_dirty: bool,
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
+    managed_resizes: ManagedResizeState,
+    pending_ordinary_managed_recovery: BTreeSet<u64>,
+    pending_managed_resource_releases: Vec<(BackendId, u64)>,
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
     window_resize_in_progress: bool,
 }
@@ -9964,9 +10929,11 @@ struct FocusChange {
     reset_keyboard: bool,
 }
 
+#[derive(Clone, Debug)]
 struct SceneWindow {
     backend: BackendId,
     window_id: u64,
+    transport_resource_id: u64,
     resource_id: u64,
     source_rect: [i32; 4],
     rect: [i32; 4],
@@ -10048,6 +11015,7 @@ struct ImportedFrame {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     source: ImportedFrameSource,
+    extent: (u32, u32),
 }
 
 enum ImportedFrameSource {
@@ -10175,32 +11143,63 @@ fn send_presentation_configuration(lane: &mut InputLane, renderer: &Renderer) {
         .current_monitor()
         .and_then(|monitor| monitor.refresh_rate_millihertz())
         .unwrap_or(60_000);
+    let scale_120 = (renderer.window.scale_factor()
+        * f64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))
+    .round()
+    .clamp(1.0, f64::from(u32::MAX)) as u32;
     send_input(
         lane,
         ClientMessage::Input(InputEvent::PresentationSize {
             width: size.width.max(1),
             height: size.height.max(1),
             refresh_millihz,
+            scale_120,
         }),
     );
 }
 
 fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer: &mut Renderer) {
     let Some(lane) = lane else {
+        let pending = renderer
+            .pending_managed_resize_requests()
+            .into_iter()
+            .filter_map(|request| request.6.map(|epoch| (request.0, epoch)))
+            .collect::<Vec<_>>();
+        for (pane, epoch) in pending {
+            renderer.recover_managed_resize_send(pane, epoch);
+        }
         return;
     };
-    for (window, width, height) in renderer.pending_managed_resize_requests() {
+    for (
+        window,
+        logical_width,
+        logical_height,
+        pixel_width,
+        pixel_height,
+        scale_120,
+        resize_epoch,
+    ) in renderer.pending_managed_resize_requests()
+    {
         if send_input(
             lane,
             ClientMessage::Input(InputEvent::WindowResize {
                 pane: window,
-                width,
-                height,
+                logical_width,
+                logical_height,
+                pixel_width,
+                pixel_height,
+                scale_120,
+                resize_epoch,
             }),
         ) {
-            renderer.mark_managed_resize_sent(window, width, height);
+            renderer.mark_managed_resize_sent(window, logical_width, logical_height, resize_epoch);
             eprintln!(
-                "requested managed window resize window_id={window} logical_size={width}x{height}"
+                "requested managed window resize window_id={window} logical_size={logical_width}x{logical_height} pixel_size={pixel_width}x{pixel_height} scale_120={scale_120} resize_epoch={resize_epoch:?}"
+            );
+        } else if let Some(epoch) = resize_epoch {
+            renderer.recover_managed_resize_send(window, epoch);
+            eprintln!(
+                "managed resize send failed pane={window} epoch={epoch}; selected explicit recovery"
             );
         }
     }
@@ -11587,7 +12586,7 @@ impl ImportedFrame {
         sequence: u64,
         frame: FrameResource,
     ) -> Result<Self> {
-        let (texture, view_format, source) = match frame {
+        let (texture, view_format, source, extent) = match frame {
             FrameResource::Dmabuf(frame) => {
                 if frame.color_space != brood_ipc::FrameColorSpace::Srgb {
                     return Err(anyhow!(
@@ -11622,7 +12621,12 @@ impl ImportedFrame {
                     frame.modifier,
                     frame.y_inverted
                 );
-                (texture, view_format, ImportedFrameSource::Dmabuf)
+                (
+                    texture,
+                    view_format,
+                    ImportedFrameSource::Dmabuf,
+                    (frame.width, frame.height),
+                )
             }
             FrameResource::SharedMemory(frame) => {
                 let metadata = frame.image.metadata();
@@ -11672,6 +12676,7 @@ impl ImportedFrame {
                     texture,
                     view_format,
                     ImportedFrameSource::SharedMemory(frame.image),
+                    (metadata.width, metadata.height),
                 )
             }
             FrameResource::Network(frame) => {
@@ -11724,7 +12729,12 @@ impl ImportedFrame {
                     frame.compressed_bytes,
                     frame.pixels.len()
                 );
-                (texture, view_format, ImportedFrameSource::Network)
+                (
+                    texture,
+                    view_format,
+                    ImportedFrameSource::Network,
+                    (frame.width, frame.height),
+                )
             }
         };
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
@@ -11750,6 +12760,7 @@ impl ImportedFrame {
             texture,
             bind_group,
             source,
+            extent,
         })
     }
 
@@ -12257,6 +13268,9 @@ impl Renderer {
             layout_source: LayoutSource::NativeFallback,
             layout_state_dirty: true,
             sent_managed_sizes: HashMap::new(),
+            managed_resizes: ManagedResizeState::default(),
+            pending_ordinary_managed_recovery: BTreeSet::new(),
+            pending_managed_resource_releases: Vec::new(),
             sent_plugin_sizes: HashMap::new(),
             window_resize_in_progress: false,
         })
@@ -12312,6 +13326,28 @@ impl Renderer {
                 )
             })
             .collect::<Vec<_>>();
+        let current_view_panes = available_windows
+            .iter()
+            .map(|window| window.pane)
+            .collect::<BTreeSet<_>>();
+        let removed_routes = self
+            .managed_resizes
+            .expectations
+            .values()
+            .filter_map(|expectation| {
+                (expectation.route.backend == backend
+                    && !current_view_panes.contains(&expectation.route.view_pane))
+                .then_some(expectation.route)
+            })
+            .collect::<Vec<_>>();
+        for route in removed_routes {
+            if let Some(expectation) = self.managed_resizes.remove_pane(route)
+                && let ManagedResizeExpectationState::Staged(frame) = expectation.state
+            {
+                self.pending_managed_resource_releases
+                    .push((frame.backend, frame.transport_resource_id));
+            }
+        }
         let mut merged_windows = self
             .available_windows
             .iter()
@@ -12342,6 +13378,12 @@ impl Renderer {
 
     fn disconnect_backend(&mut self, backend: BackendId) -> Option<FocusChange> {
         let previous_focus = self.focused_pane;
+        let removed_expectations = self.managed_resizes.remove_backend(backend);
+        for expectation in removed_expectations {
+            if let ManagedResizeExpectationState::Staged(frame) = expectation.state {
+                self.imported_frames.remove(&frame.resource_id);
+            }
+        }
         let removed_panes = self
             .available_windows
             .iter()
@@ -12425,21 +13467,31 @@ impl Renderer {
     fn select_scene(
         &mut self,
         backend: BackendId,
+        connection_generation: u64,
         sequence: u64,
         _width: u32,
         _height: u32,
         windows: Vec<SceneWindowUpdate>,
-    ) -> Result<(Option<FocusChange>, Vec<u64>)> {
+    ) -> Result<(Option<FocusChange>, Vec<u64>, Vec<(u64, u64)>)> {
         let previous_focus = self.focused_pane;
-        let live_resources = windows
-            .iter()
-            .map(|window| window.resource_id)
-            .collect::<HashSet<_>>();
+        let mut live_resources = HashSet::new();
+        let mut explicit_release_candidates = Vec::new();
+        let mut ready_managed = Vec::new();
         let previous_managed_panes = self
             .current_windows
             .iter()
             .map(|window| window.window_id)
             .collect::<Vec<_>>();
+        let protected_panes = self
+            .managed_resizes
+            .expectations
+            .values()
+            .filter_map(|expectation| {
+                (expectation.route.backend == backend
+                    && expectation.route.connection_generation == connection_generation)
+                    .then_some(expectation.route.view_pane)
+            })
+            .collect::<BTreeSet<_>>();
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
         for window in windows {
@@ -12447,6 +13499,72 @@ impl Renderer {
                 window.backend == backend,
                 "scene window backend identity does not match its scene"
             );
+            let disposition = self.managed_resizes.disposition(
+                backend,
+                connection_generation,
+                window.backend_window_id,
+                window.window_id,
+                window.resize_epoch,
+            );
+            if matches!(
+                disposition,
+                ManagedFrameDisposition::DropTagged | ManagedFrameDisposition::ProtectedOrdinary
+            ) {
+                if window.resource.is_some() {
+                    explicit_release_candidates.push(window.resource_id);
+                }
+                eprintln!(
+                    "{} managed frame backend={} connection_generation={} pane={} backend_pane={} resize_epoch={:?}",
+                    if disposition == ManagedFrameDisposition::DropTagged {
+                        "dropped stale or unissued tagged"
+                    } else {
+                        "deferred ordinary protected"
+                    },
+                    backend.0,
+                    connection_generation,
+                    window.window_id,
+                    window.backend_window_id,
+                    window.resize_epoch,
+                );
+                continue;
+            }
+            if disposition == ManagedFrameDisposition::ExactTagged {
+                let epoch = window
+                    .resize_epoch
+                    .context("exact tagged frame lost its epoch")?;
+                let expected = self
+                    .managed_resizes
+                    .expected_pixel_size(window.window_id, epoch)
+                    .context("exact tagged frame lost its managed expectation")?;
+                let source_extent = positive_rect_extent(window.rect);
+                let resource_extent =
+                    window
+                        .resource
+                        .as_ref()
+                        .map(FrameResource::extent)
+                        .or_else(|| {
+                            self.frame_keys
+                                .get(&(backend, window.resource_id))
+                                .and_then(|key| self.imported_frames.get(key))
+                                .map(|frame| frame.extent)
+                        });
+                if !exact_managed_frame_size_matches(expected, window.rect, resource_extent) {
+                    if window.resource.is_some() {
+                        explicit_release_candidates.push(window.resource_id);
+                    }
+                    eprintln!(
+                        "rejected exact managed frame size backend={} connection_generation={} pane={} backend_pane={} epoch={} expected={}x{} source={source_extent:?} resource={resource_extent:?}",
+                        backend.0,
+                        connection_generation,
+                        window.window_id,
+                        window.backend_window_id,
+                        epoch,
+                        expected.0,
+                        expected.1,
+                    );
+                    continue;
+                }
+            }
             let previous_rect = self
                 .current_windows
                 .iter()
@@ -12474,14 +13592,94 @@ impl Renderer {
             if window.active {
                 backend_focus = Some(window.window_id);
             }
-            scene_windows.push(SceneWindow {
+            let scene_window = SceneWindow {
                 backend,
                 window_id: window.window_id,
+                transport_resource_id: window.resource_id,
                 resource_id: resource_key,
                 source_rect: window.rect,
                 rect: previous_rect,
                 active: window.active,
-            });
+            };
+            live_resources.insert(window.resource_id);
+            if disposition == ManagedFrameDisposition::ExactTagged {
+                let epoch = window
+                    .resize_epoch
+                    .context("exact tagged frame lost its epoch")?;
+                let (staged, replaced) =
+                    self.managed_resizes
+                        .stage(window.window_id, epoch, scene_window);
+                if staged {
+                    if let Some(replaced) = replaced {
+                        if replaced.transport_resource_id != window.resource_id {
+                            explicit_release_candidates.push(replaced.transport_resource_id);
+                        }
+                    }
+                    if self
+                        .managed_resizes
+                        .expectations
+                        .get(&window.window_id)
+                        .is_some_and(|expectation| expectation.wait)
+                    {
+                        ready_managed.push((window.window_id, epoch));
+                    }
+                    eprintln!(
+                        "staged managed frame backend={} connection_generation={} pane={} backend_pane={} epoch={} sequence={} resource={} source={}x{} resource_extent={}x{}",
+                        backend.0,
+                        connection_generation,
+                        window.window_id,
+                        window.backend_window_id,
+                        epoch,
+                        sequence,
+                        window.resource_id,
+                        window.rect[2],
+                        window.rect[3],
+                        self.imported_frames[&resource_key].extent.0,
+                        self.imported_frames[&resource_key].extent.1,
+                    );
+                }
+                continue;
+            }
+            if std::env::var_os("BROOD_TRACE_RESIZE").is_some()
+                && disposition == ManagedFrameDisposition::Ordinary
+            {
+                eprintln!(
+                    "accepted ordinary managed frame backend={} connection_generation={} pane={} backend_pane={} sequence={} resource={}",
+                    backend.0,
+                    connection_generation,
+                    window.window_id,
+                    window.backend_window_id,
+                    sequence,
+                    window.resource_id,
+                );
+            }
+            scene_windows.push(scene_window);
+        }
+        let scene_panes = scene_windows
+            .iter()
+            .map(|window| window.window_id)
+            .collect::<BTreeSet<_>>();
+        let preserved = self
+            .current_windows
+            .iter()
+            .filter(|current| {
+                current.backend == backend
+                    && protected_panes.contains(&current.window_id)
+                    && !scene_panes.contains(&current.window_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for current in preserved {
+            live_resources.insert(current.transport_resource_id);
+            scene_windows.push(current);
+        }
+        for expectation in self.managed_resizes.expectations.values() {
+            if expectation.route.backend == backend
+                && expectation.route.connection_generation == connection_generation
+                && let ManagedResizeExpectationState::Staged(frame) = &expectation.state
+            {
+                live_resources.insert(frame.transport_resource_id);
+            }
         }
         scene_windows.sort_by_key(|window| window.window_id);
         if scene_windows
@@ -12540,15 +13738,20 @@ impl Renderer {
                 self.frame_keys.remove(qualified);
                 self.imported_frames.remove(key);
             }
-            return Ok((
-                focus_change,
-                stale_resources
+            let mut released = stale_resources
+                .into_iter()
+                .map(|((_owner, resource), _key)| resource)
+                .collect::<Vec<_>>();
+            released.extend(
+                explicit_release_candidates
                     .into_iter()
-                    .map(|((_owner, resource), _key)| resource)
-                    .collect(),
-            ));
+                    .filter(|resource| !live_resources.contains(resource)),
+            );
+            released.sort_unstable();
+            released.dedup();
+            return Ok((focus_change, released, ready_managed));
         }
-        Ok((None, Vec::new()))
+        Ok((None, Vec::new(), Vec::new()))
     }
 
     fn resource_key(&mut self, backend: BackendId, resource: u64) -> u64 {
@@ -12853,6 +14056,19 @@ impl Renderer {
         self.staged_layouts.len()
     }
 
+    fn managed_resize_counts(&self) -> (usize, usize) {
+        (
+            self.managed_resizes.expectations.len(),
+            self.managed_resizes
+                .expectations
+                .values()
+                .filter(|expectation| {
+                    matches!(&expectation.state, ManagedResizeExpectationState::Staged(_))
+                })
+                .count(),
+        )
+    }
+
     fn reconcile_layout(&mut self) -> Option<FocusChange> {
         let panes = self.pane_inventory();
         let pending_focus = self.pending_focus_pane.filter(|pane| panes.contains(pane));
@@ -13031,6 +14247,7 @@ impl Renderer {
         &mut self,
         resize_epoch: u64,
     ) -> Result<(Option<FocusChange>, Vec<DeferredPluginScene>)> {
+        self.retire_managed_resize_epoch(resize_epoch, false, false);
         let was_pre_promotion = self.staged_layouts.remove(&resize_epoch).is_some();
         self.staged_plugin_panes
             .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
@@ -13071,6 +14288,7 @@ impl Renderer {
             .staged_layouts
             .remove(&resize_epoch)
             .context("promoted resize epoch has no staged layout")?;
+        self.retire_managed_resize_epoch(resize_epoch, true, degraded);
         let layout = composed.layout;
         if degraded {
             let extent = self.layout_extent();
@@ -13228,13 +14446,9 @@ impl Renderer {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        let waitable_plugin_panes = waitable_panes
-            .iter()
-            .copied()
-            .filter(|pane| self.plugin_pane_realms.contains_key(pane))
-            .collect::<BTreeSet<_>>();
+        let waitable_panes = waitable_panes.iter().copied().collect::<BTreeSet<_>>();
         let presented_panes =
-            target_present_plugin_panes(&self.presented_layout, &waitable_plugin_panes)
+            target_present_waitable_panes(&self.presented_layout, &waitable_panes)
                 .into_iter()
                 .collect();
         LayoutStateMessage {
@@ -13247,7 +14461,7 @@ impl Renderer {
                 id: lease.id.0,
                 generation: lease.generation,
             },
-            waitable_panes: waitable_plugin_panes.into_iter().collect(),
+            waitable_panes: waitable_panes.into_iter().collect(),
             presented_panes,
             visible_panes,
             native_resize_revision,
@@ -13815,28 +15029,258 @@ impl Renderer {
         )
     }
 
-    fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32)> {
-        if self.window_resize_in_progress {
-            return Vec::new();
-        }
+    fn admit_managed_resize_expectation(
+        &mut self,
+        route: ManagedPaneRoute,
+        epoch: u64,
+        wait: bool,
+    ) -> Result<()> {
+        let item = self
+            .accepted_layout
+            .pane_item(route.view_pane)
+            .context("managed pane is absent from the synchronized target layout")?;
+        let rect = item.pixel_rect(self.layout_extent());
+        let (pixel_width, pixel_height) = positive_rect_extent([rect.x, rect.y, rect.w, rect.h])
+            .context("managed pane has an empty synchronized target")?;
         let scale = self.window.scale_factor().max(f64::EPSILON);
-        self.current_windows
+        let scale_120 = (scale * f64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let logical_width = logical_extent_for_scale_120(pixel_width, scale_120)
+            .context("managed logical width conversion overflow")?;
+        let logical_height = logical_extent_for_scale_120(pixel_height, scale_120)
+            .context("managed logical height conversion overflow")?;
+        self.managed_resizes.admit(ManagedResizeExpectation {
+            route,
+            epoch,
+            wait,
+            pixel_size: (pixel_width, pixel_height),
+            logical_size: (logical_width, logical_height),
+            scale_120,
+            state: ManagedResizeExpectationState::PendingSend,
+        })?;
+        eprintln!(
+            "admitted managed resize expectation backend={} connection_generation={} pane={} backend_pane={} epoch={epoch} wait={wait} logical_size={}x{} pixel_size={}x{} scale_120={scale_120}",
+            route.backend.0,
+            route.connection_generation,
+            route.view_pane,
+            route.backend_pane,
+            logical_width,
+            logical_height,
+            pixel_width,
+            pixel_height,
+        );
+        Ok(())
+    }
+
+    fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32, u32, u32, u32, Option<u64>)> {
+        let scale = self.window.scale_factor().max(f64::EPSILON);
+        let scale_120 = (scale * f64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let mut requests = self
+            .managed_resizes
+            .expectations
+            .values()
+            .filter_map(|expectation| {
+                matches!(
+                    expectation.state,
+                    ManagedResizeExpectationState::PendingSend
+                )
+                .then_some((
+                    expectation.route.view_pane,
+                    expectation.logical_size.0,
+                    expectation.logical_size.1,
+                    expectation.pixel_size.0,
+                    expectation.pixel_size.1,
+                    expectation.scale_120,
+                    Some(expectation.epoch),
+                ))
+            })
+            .collect::<Vec<_>>();
+        requests.extend(
+            self.pending_ordinary_managed_recovery
+                .iter()
+                .filter_map(|pane| {
+                    let window = self
+                        .current_windows
+                        .iter()
+                        .find(|window| window.window_id == *pane)?;
+                    let [_, _, width, height] = window.rect;
+                    let pixel_width = u32::try_from(width).ok().filter(|width| *width > 0)?;
+                    let pixel_height = u32::try_from(height).ok().filter(|height| *height > 0)?;
+                    Some((
+                        *pane,
+                        logical_extent_for_scale_120(pixel_width, scale_120)?,
+                        logical_extent_for_scale_120(pixel_height, scale_120)?,
+                        pixel_width,
+                        pixel_height,
+                        scale_120,
+                        None,
+                    ))
+                }),
+        );
+        if managed_resize_request_allowed(self.window_resize_in_progress, None) {
+            requests.extend(
+                self.current_windows
+                    .iter()
+                    .filter(|window| {
+                        !self
+                            .managed_resizes
+                            .expectations
+                            .contains_key(&window.window_id)
+                            && !self
+                                .pending_ordinary_managed_recovery
+                                .contains(&window.window_id)
+                    })
+                    .filter_map(|window| {
+                        let [_, _, width, height] = window.rect;
+                        if width <= 0 || height <= 0 {
+                            return None;
+                        }
+                        let pixel_width = u32::try_from(width).unwrap_or(u32::MAX);
+                        let pixel_height = u32::try_from(height).unwrap_or(u32::MAX);
+                        let logical_width = logical_extent_for_scale_120(pixel_width, scale_120)?;
+                        let logical_height = logical_extent_for_scale_120(pixel_height, scale_120)?;
+                        (self.sent_managed_sizes.get(&window.window_id)
+                            != Some(&(logical_width, logical_height)))
+                        .then_some((
+                            window.window_id,
+                            logical_width,
+                            logical_height,
+                            pixel_width,
+                            pixel_height,
+                            scale_120,
+                            None,
+                        ))
+                    }),
+            );
+        }
+        requests
+    }
+
+    fn mark_managed_resize_sent(
+        &mut self,
+        window: u64,
+        width: u32,
+        height: u32,
+        epoch: Option<u64>,
+    ) {
+        self.sent_managed_sizes.insert(window, (width, height));
+        if epoch.is_none() {
+            self.pending_ordinary_managed_recovery.remove(&window);
+        }
+        if let Some(epoch) = epoch
+            && let Some(expectation) = self.managed_resizes.expectations.get_mut(&window)
+            && expectation.epoch == epoch
+            && matches!(
+                expectation.state,
+                ManagedResizeExpectationState::PendingSend
+            )
+        {
+            expectation.state = ManagedResizeExpectationState::Issued;
+        }
+    }
+
+    fn recover_managed_resize_send(&mut self, pane: u64, epoch: u64) -> bool {
+        self.managed_resizes.recover(pane, epoch).unwrap_or(false)
+    }
+
+    fn recover_managed_resize_timeout(&mut self, epoch: u64) {
+        let panes = self
+            .managed_resizes
+            .expectations
             .iter()
-            .filter_map(|window| {
-                let [_, _, width, height] = window.rect;
-                if width <= 0 || height <= 0 {
-                    return None;
+            .filter_map(|(pane, expectation)| {
+                (expectation.epoch == epoch
+                    && expectation.wait
+                    && !matches!(expectation.state, ManagedResizeExpectationState::Staged(_)))
+                .then_some(*pane)
+            })
+            .collect::<Vec<_>>();
+        for pane in panes {
+            self.managed_resizes.recover(pane, epoch);
+        }
+    }
+
+    fn retire_managed_resize_epoch(&mut self, epoch: u64, promote: bool, degraded: bool) {
+        // Advance every route floor before any staged resource is removed.
+        let retired = self.managed_resizes.retire_epoch(epoch);
+        for expectation in retired {
+            if matches!(&expectation.state, ManagedResizeExpectationState::Recovered) {
+                schedule_ordinary_managed_recovery(
+                    &mut self.sent_managed_sizes,
+                    &mut self.pending_ordinary_managed_recovery,
+                    expectation.route.view_pane,
+                );
+            }
+            let ManagedResizeExpectationState::Staged(mut staged) = expectation.state else {
+                continue;
+            };
+            if staged_managed_frame_is_promotable(promote, degraded, expectation.wait) {
+                if let Some(current) = self
+                    .current_windows
+                    .iter_mut()
+                    .find(|window| window.window_id == expectation.route.view_pane)
+                {
+                    if current.transport_resource_id != staged.transport_resource_id {
+                        self.pending_managed_resource_releases
+                            .push((current.backend, current.transport_resource_id));
+                    }
+                    staged.rect = current.rect;
+                    *current = staged;
+                } else {
+                    if let Some(item) = self.accepted_layout.pane_item(expectation.route.view_pane)
+                    {
+                        let rect = item.pixel_rect(self.layout_extent());
+                        staged.rect = [rect.x, rect.y, rect.w, rect.h];
+                    }
+                    self.current_windows.push(staged);
+                    self.current_windows
+                        .sort_by_key(|window| (window.backend, window.window_id));
                 }
-                let width = ((f64::from(width) / scale).round() as u32).max(1);
-                let height = ((f64::from(height) / scale).round() as u32).max(1);
-                (self.sent_managed_sizes.get(&window.window_id) != Some(&(width, height)))
-                    .then_some((window.window_id, width, height))
+            } else {
+                self.pending_managed_resource_releases
+                    .push((staged.backend, staged.transport_resource_id));
+            }
+        }
+    }
+
+    fn handle_managed_resize_status(
+        &mut self,
+        backend: BackendId,
+        connection_generation: u64,
+        status: brood_protocol::ManagedResizeStatus,
+    ) -> ManagedResizeStatusDisposition {
+        let route = self
+            .managed_resizes
+            .expectations
+            .values()
+            .find(|expectation| {
+                expectation.route.backend == backend
+                    && expectation.route.connection_generation == connection_generation
+                    && expectation.route.backend_pane == status.pane
+            });
+        let Some(route) = route.map(|expectation| expectation.route) else {
+            return ManagedResizeStatusDisposition::None;
+        };
+        self.managed_resizes.configured(route, status)
+    }
+
+    fn recovered_managed_dependencies(&self, epoch: u64) -> BTreeSet<u64> {
+        self.managed_resizes
+            .expectations
+            .iter()
+            .filter_map(|(pane, expectation)| {
+                (expectation.epoch == epoch
+                    && matches!(expectation.state, ManagedResizeExpectationState::Recovered))
+                .then_some(*pane)
             })
             .collect()
     }
 
-    fn mark_managed_resize_sent(&mut self, window: u64, width: u32, height: u32) {
-        self.sent_managed_sizes.insert(window, (width, height));
+    fn take_managed_resource_releases(&mut self) -> Vec<(BackendId, u64)> {
+        std::mem::take(&mut self.pending_managed_resource_releases)
     }
 }
 
@@ -14212,12 +15656,33 @@ const fn staged_plugin_scene_is_promotable(
     !degraded && scene_epoch == target_epoch
 }
 
+const fn staged_managed_frame_is_promotable(promote: bool, degraded: bool, wait: bool) -> bool {
+    promote && (!degraded || !wait)
+}
+
 fn synchronized_resize_recovery_panes(wait_panes: &BTreeSet<u64>, degraded: bool) -> Vec<u64> {
     if degraded {
         wait_panes.iter().copied().collect()
     } else {
         Vec::new()
     }
+}
+
+const fn managed_recovery_content(has_visible_resource: bool) -> &'static str {
+    if has_visible_resource {
+        "old-projected"
+    } else {
+        "placeholder"
+    }
+}
+
+fn schedule_ordinary_managed_recovery(
+    sent_sizes: &mut HashMap<u64, (u32, u32)>,
+    pending: &mut BTreeSet<u64>,
+    pane: u64,
+) {
+    sent_sizes.remove(&pane);
+    pending.insert(pane);
 }
 
 fn aborted_plugin_refresh_plan(
@@ -14323,6 +15788,21 @@ fn positive_rect_extent(rect: [i32; 4]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+fn logical_extent_for_scale_120(pixel: u32, scale_120: u32) -> Option<u32> {
+    let numerator =
+        u64::from(pixel).checked_mul(u64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))?;
+    let denominator = u64::from(scale_120);
+    let rounded = numerator.checked_add(denominator / 2)? / denominator;
+    u32::try_from(rounded.max(1)).ok()
+}
+
+const fn managed_resize_request_allowed(
+    window_resize_in_progress: bool,
+    resize_epoch: Option<u64>,
+) -> bool {
+    resize_epoch.is_some() || !window_resize_in_progress
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     reason = "plugin pointer events use pane-local f32 logical coordinates"
@@ -14389,6 +15869,544 @@ mod tests {
     use super::*;
     use brood_layout::LayoutItemId;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    fn managed_route(view_pane: u64) -> ManagedPaneRoute {
+        ManagedPaneRoute {
+            backend: BackendId(3),
+            connection_generation: 5,
+            backend_pane: view_pane + 100,
+            view_pane,
+        }
+    }
+
+    fn managed_expectation(view_pane: u64, epoch: u64, wait: bool) -> ManagedResizeExpectation {
+        ManagedResizeExpectation {
+            route: managed_route(view_pane),
+            epoch,
+            wait,
+            pixel_size: (300, 150),
+            logical_size: (200, 100),
+            scale_120: 180,
+            state: ManagedResizeExpectationState::Issued,
+        }
+    }
+
+    fn managed_scene(view_pane: u64, resource: u64) -> SceneWindow {
+        SceneWindow {
+            backend: BackendId(3),
+            window_id: view_pane,
+            transport_resource_id: resource,
+            resource_id: resource + 1000,
+            source_rect: [0, 0, 300, 150],
+            rect: [10, 20, 300, 150],
+            active: false,
+        }
+    }
+
+    #[test]
+    fn proof_gate_requires_one_complete_same_epoch_managed_scene() {
+        assert_eq!(
+            complete_tagged_managed_epoch([(7, 41), (8, 41)]),
+            Some((41, 2))
+        );
+        assert_eq!(complete_tagged_managed_epoch([(7, 41)]), None);
+        assert_eq!(complete_tagged_managed_epoch([(7, 41), (8, 42)]), None);
+        assert_eq!(complete_tagged_managed_epoch([(7, 41), (7, 41)]), None);
+        let mut held = Some((41, "scene-a"));
+        assert_eq!(take_superseded_proof_frame(&mut held, Some(41)), None);
+        assert_eq!(held, Some((41, "scene-a")));
+        assert_eq!(
+            take_superseded_proof_frame(&mut held, Some(42)),
+            Some((41, "scene-a"))
+        );
+        assert_eq!(held, None);
+    }
+
+    #[test]
+    fn managed_frames_require_the_exact_active_route_and_epoch() -> Result<()> {
+        let route = managed_route(7);
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, true))?;
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                Some(11)
+            ),
+            ManagedFrameDisposition::ExactTagged
+        );
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                6,
+                route.backend_pane,
+                route.view_pane,
+                Some(11)
+            ),
+            ManagedFrameDisposition::DropTagged
+        );
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                Some(10)
+            ),
+            ManagedFrameDisposition::DropTagged
+        );
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                None
+            ),
+            ManagedFrameDisposition::ProtectedOrdinary
+        );
+        assert!(state.stage(7, 11, managed_scene(7, 71)).0);
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                Some(11)
+            ),
+            ManagedFrameDisposition::ExactTagged
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_status_and_frame_lanes_can_reorder_without_replacing_exact_content() -> Result<()> {
+        let route = managed_route(7);
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, true))?;
+        assert!(state.stage(7, 11, managed_scene(7, 71)).0);
+        let configured = brood_protocol::ManagedResizeStatus {
+            pane: route.backend_pane,
+            resize_epoch: 11,
+            result: brood_protocol::ManagedResizeStatusResult::Configured {
+                logical_size: [200, 100],
+                pixel_size: [300, 150],
+                scale_120: 180,
+            },
+        };
+        assert_eq!(
+            state.configured(route, configured.clone()),
+            ManagedResizeStatusDisposition::None
+        );
+        let rejected = brood_protocol::ManagedResizeStatus {
+            result: brood_protocol::ManagedResizeStatusResult::Rejected {
+                reason: brood_protocol::ManagedResizeRejectionReason::ConfigureFailed,
+            },
+            ..configured
+        };
+        assert_eq!(
+            state.configured(route, rejected),
+            ManagedResizeStatusDisposition::ProtocolViolation { pane: 7, epoch: 11 }
+        );
+        assert!(matches!(
+            state.expectations[&7].state,
+            ManagedResizeExpectationState::Staged(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_and_retirement_drop_late_tags_until_later_ordinary_content() -> Result<()> {
+        let route = managed_route(7);
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, true))?;
+        assert_eq!(state.recover(7, 11), Some(true));
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                Some(11)
+            ),
+            ManagedFrameDisposition::DropTagged
+        );
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                None
+            ),
+            ManagedFrameDisposition::ProtectedOrdinary
+        );
+        state.retire_epoch(11);
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                Some(11)
+            ),
+            ManagedFrameDisposition::DropTagged
+        );
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                None
+            ),
+            ManagedFrameDisposition::Ordinary
+        );
+        assert!(state.admit(managed_expectation(7, 11, true)).is_err());
+        state.remove_pane(route);
+        state.admit(managed_expectation(7, 11, true))?;
+        Ok(())
+    }
+
+    #[test]
+    fn unwaited_managed_stage_is_protected_but_does_not_become_a_barrier() -> Result<()> {
+        let route = managed_route(7);
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, false))?;
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                None
+            ),
+            ManagedFrameDisposition::ProtectedOrdinary
+        );
+        assert!(state.stage(7, 11, managed_scene(7, 71)).0);
+        assert_eq!(
+            state.disposition(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane,
+                route.view_pane,
+                None
+            ),
+            ManagedFrameDisposition::ProtectedOrdinary
+        );
+        assert!(!state.expectations[&7].wait);
+        Ok(())
+    }
+
+    #[test]
+    fn second_exact_managed_frame_replaces_and_returns_the_old_stage() -> Result<()> {
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, false))?;
+        assert!(state.stage(7, 11, managed_scene(7, 71)).0);
+        let (accepted, replaced) = state.stage(7, 11, managed_scene(7, 72));
+        assert!(accepted);
+        assert_eq!(replaced.map(|frame| frame.transport_resource_id), Some(71));
+        let ManagedResizeExpectationState::Staged(current) = &state.expectations[&7].state else {
+            return Err(anyhow!("replacement exact frame was not staged"));
+        };
+        assert_eq!(current.transport_resource_id, 72);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_ready_timeout_releases_stage_and_keeps_all_waited_visible_resources() -> Result<()> {
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, true))?;
+        state.admit(managed_expectation(8, 11, true))?;
+        assert!(state.stage(7, 11, managed_scene(7, 71)).0);
+        assert_eq!(state.recover(8, 11), Some(true));
+
+        let mut visible = BTreeMap::from([(7, 70_u64), (8, 80_u64)]);
+        let mut released = Vec::new();
+        for expectation in state.retire_epoch(11) {
+            let ManagedResizeExpectationState::Staged(frame) = expectation.state else {
+                continue;
+            };
+            if staged_managed_frame_is_promotable(true, true, expectation.wait) {
+                visible.insert(expectation.route.view_pane, frame.transport_resource_id);
+            } else {
+                released.push(frame.transport_resource_id);
+            }
+        }
+
+        assert_eq!(visible, BTreeMap::from([(7, 70), (8, 80)]));
+        assert_eq!(released, vec![71]);
+        assert!(state.expectations.is_empty());
+        assert_eq!(state.retired_epoch_floors[&(BackendId(3), 5, 107)], 11);
+        assert_eq!(state.retired_epoch_floors[&(BackendId(3), 5, 108)], 11);
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_managed_size_status_selects_bounded_recovery() -> Result<()> {
+        let route = managed_route(7);
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, true))?;
+        let recovered = state.configured(
+            route,
+            brood_protocol::ManagedResizeStatus {
+                pane: route.backend_pane,
+                resize_epoch: 11,
+                result: brood_protocol::ManagedResizeStatusResult::Configured {
+                    logical_size: [200, 100],
+                    pixel_size: [300, 150],
+                    scale_120: 120,
+                },
+            },
+        );
+        assert_eq!(
+            recovered,
+            ManagedResizeStatusDisposition::Recovered {
+                pane: 7,
+                wait: true
+            }
+        );
+        assert!(matches!(
+            state.expectations[&7].state,
+            ManagedResizeExpectationState::Recovered
+        ));
+        assert_eq!(
+            state.retired_epoch_floors[&(
+                route.backend,
+                route.connection_generation,
+                route.backend_pane
+            )],
+            11
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contradictory_configured_status_after_stage_is_a_protocol_violation() -> Result<()> {
+        let route = managed_route(7);
+        let mut state = ManagedResizeState::default();
+        state.admit(managed_expectation(7, 11, true))?;
+        assert!(state.stage(7, 11, managed_scene(7, 71)).0);
+        assert_eq!(
+            state.configured(
+                route,
+                brood_protocol::ManagedResizeStatus {
+                    pane: route.backend_pane,
+                    resize_epoch: 11,
+                    result: brood_protocol::ManagedResizeStatusResult::Configured {
+                        logical_size: [200, 100],
+                        pixel_size: [300, 150],
+                        scale_120: 120,
+                    },
+                }
+            ),
+            ManagedResizeStatusDisposition::ProtocolViolation { pane: 7, epoch: 11 }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn integer_scale_conversion_uses_the_wire_scale_tuple() {
+        assert_eq!(logical_extent_for_scale_120(301, 180), Some(201));
+        assert_eq!(logical_extent_for_scale_120(300, 180), Some(200));
+        assert_eq!(logical_extent_for_scale_120(1, 180), Some(1));
+        assert_eq!(logical_extent_for_scale_120(u32::MAX, 1), None);
+    }
+
+    #[test]
+    fn native_accepted_transaction_emits_tagged_resize_before_finalization() {
+        assert!(managed_resize_request_allowed(true, Some(41)));
+        assert!(!managed_resize_request_allowed(true, None));
+        assert!(managed_resize_request_allowed(false, Some(41)));
+        assert!(managed_resize_request_allowed(false, None));
+    }
+
+    #[test]
+    fn managed_recovery_without_an_old_resource_uses_the_placeholder() {
+        assert_eq!(managed_recovery_content(false), "placeholder");
+        assert_eq!(managed_recovery_content(true), "old-projected");
+    }
+
+    #[test]
+    fn terminal_managed_recovery_forces_one_ordinary_current_size_request() {
+        let mut sent = HashMap::from([(7, (200, 100))]);
+        let mut pending = BTreeSet::new();
+        schedule_ordinary_managed_recovery(&mut sent, &mut pending, 7);
+        assert!(!sent.contains_key(&7));
+        assert_eq!(pending, BTreeSet::from([7]));
+        assert!(!managed_resize_request_allowed(true, None));
+        // The forced set is emitted separately from ordinary resize traffic,
+        // including while a native resize is waiting for final presentation.
+        assert!(pending.contains(&7));
+        pending.remove(&7);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn managed_wait_pane_without_a_current_route_fails_closed() {
+        let backend = BackendId(3);
+        let mut registry = BackendRegistry::default();
+        registry.replace_panes(backend, Some(5), [107]);
+        let view = registry.view_pane(QualifiedPane { backend, pane: 107 });
+        let plugins = BTreeSet::new();
+        assert!(wait_pane_has_current_managed_route(
+            view, &plugins, &registry
+        ));
+        registry.replace_panes(backend, Some(5), []);
+        assert!(!wait_pane_has_current_managed_route(
+            view, &plugins, &registry
+        ));
+        let plugins = BTreeSet::from([view]);
+        assert!(wait_pane_has_current_managed_route(
+            view, &plugins, &registry
+        ));
+    }
+
+    #[test]
+    fn backend_loss_reports_the_exact_unavailable_target_panes() {
+        let kept_backend = BackendId(3);
+        let lost_backend = BackendId(4);
+        let mut registry = BackendRegistry::default();
+        registry.replace_panes(kept_backend, Some(5), [107]);
+        registry.replace_panes(lost_backend, Some(9), [108, 109]);
+        let kept = registry.view_pane(QualifiedPane {
+            backend: kept_backend,
+            pane: 107,
+        });
+        let lost = registry.view_pane(QualifiedPane {
+            backend: lost_backend,
+            pane: 108,
+        });
+        let hidden = registry.view_pane(QualifiedPane {
+            backend: lost_backend,
+            pane: 109,
+        });
+        let target_panes = vec![kept, lost];
+        let current = BTreeSet::from([kept, lost, hidden]);
+        let managed = current.clone();
+
+        assert_eq!(
+            unavailable_synchronized_target_panes(
+                &target_panes,
+                &current,
+                &managed,
+                &registry,
+                &[lost],
+            ),
+            vec![lost]
+        );
+        assert!(
+            unavailable_synchronized_target_panes(
+                &target_panes,
+                &current,
+                &managed,
+                &registry,
+                &[hidden],
+            )
+            .is_empty()
+        );
+
+        registry.replace_panes(lost_backend, Some(9), []);
+        assert_eq!(
+            unavailable_synchronized_target_panes(
+                &target_panes,
+                &current,
+                &managed,
+                &registry,
+                &[],
+            ),
+            vec![lost]
+        );
+    }
+
+    #[test]
+    fn exact_managed_size_validation_covers_each_frame_carrier() -> Result<()> {
+        use std::os::fd::AsFd;
+
+        let metadata = brood_ipc::SharedImageMetadata {
+            width: 300,
+            height: 150,
+            stride: 1200,
+            pixel_format: brood_protocol::FramePixelFormat::Rgba8,
+            color_space: brood_protocol::FrameColorSpace::Srgb,
+        };
+        let producer = brood_ipc::SharedImageProducer::create(5, metadata)?;
+        let shared = FrameResource::SharedMemory(SharedMemoryFrame {
+            app_id: "fixture".to_string(),
+            image: brood_ipc::SharedImageConsumer::map(producer.as_fd(), 5)?,
+        });
+        let dmabuf = FrameResource::Dmabuf(DmabufFrame {
+            sequence: 1,
+            app_id: "fixture".to_string(),
+            width: 300,
+            height: 150,
+            fourcc: 0,
+            color_space: brood_ipc::FrameColorSpace::Srgb,
+            modifier: 0,
+            stride: 1200,
+            offset: 0,
+            y_inverted: false,
+            fd: std::fs::File::open("/dev/null")?.into(),
+        });
+        let network = FrameResource::Network(remote::NetworkFrame {
+            width: 300,
+            height: 150,
+            stride: 1200,
+            pixel_format: brood_protocol::FramePixelFormat::Rgba8,
+            color_space: brood_protocol::FrameColorSpace::Srgb,
+            compressed_bytes: 0,
+            pixels: Vec::new(),
+        });
+        for resource in [&dmabuf, &shared, &network] {
+            assert!(exact_managed_frame_size_matches(
+                (300, 150),
+                [0, 0, 300, 150],
+                Some(resource.extent())
+            ));
+            assert!(!exact_managed_frame_size_matches(
+                (301, 150),
+                [0, 0, 301, 150],
+                Some(resource.extent())
+            ));
+        }
+        assert!(!exact_managed_frame_size_matches(
+            (300, 150),
+            [0, 0, 299, 150],
+            Some((300, 150))
+        ));
+        assert!(!exact_managed_frame_size_matches(
+            (300, 150),
+            [1, 0, 300, 150],
+            Some((300, 150))
+        ));
+        assert!(!exact_managed_frame_size_matches(
+            (300, 150),
+            [0, 1, 300, 150],
+            Some((300, 150))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_expectation_capacity_is_absolute() -> Result<()> {
+        let mut state = ManagedResizeState::default();
+        for pane in 1..=MAX_MANAGED_RESIZE_EXPECTATIONS as u64 {
+            state.admit(managed_expectation(pane, 11, pane % 2 == 0))?;
+        }
+        assert_eq!(state.expectations.len(), MAX_MANAGED_RESIZE_EXPECTATIONS);
+        assert!(
+            state
+                .admit(managed_expectation(
+                    MAX_MANAGED_RESIZE_EXPECTATIONS as u64 + 1,
+                    11,
+                    true
+                ))
+                .is_err()
+        );
+        Ok(())
+    }
 
     fn test_pane_item(pane: u64, left: f64, width: f64) -> brood_layout::ResolvedLayoutItem {
         brood_layout::ResolvedLayoutItem {
@@ -14517,8 +16535,27 @@ mod tests {
         presentation: SynchronizedResizePresentation,
     ) -> Result<ActiveSynchronizedResize> {
         let mut target_tree = LayoutLeaseTree::default();
-        target_tree.update_inventory(1, &[7, 8])?;
+        target_tree.update_inventory(1, &[7, 8, 9])?;
         let root = target_tree.root_token();
+        target_tree.submit(
+            root,
+            1,
+            brood_layout::LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![
+                        test_pane_item(7, -1.0, 1.0),
+                        brood_layout::ResolvedLayoutItem {
+                            kind: LayoutItemKind::OverlayPane { pane: 8 },
+                            ..test_pane_item(8, 0.0, 1.0)
+                        },
+                    ],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            },
+            Some(7),
+        )?;
         let now = Instant::now();
         let base_tree = target_tree.clone();
         Ok(ActiveSynchronizedResize {
@@ -14546,6 +16583,8 @@ mod tests {
             wait_pane_owners: BTreeMap::from([(7, root), (8, root)]),
             notified_panes: BTreeSet::new(),
             recovered_regions: BTreeSet::new(),
+            recovered_managed_panes: BTreeSet::new(),
+            recovered_managed_content: BTreeMap::new(),
             focus: None,
             wait_panes: BTreeSet::from([7, 8]),
             ready_panes: BTreeSet::new(),
@@ -14702,6 +16741,8 @@ mod tests {
             wait_pane_owners: BTreeMap::from([(1, root), (2, middle), (3, leaf)]),
             notified_panes: BTreeSet::new(),
             recovered_regions: BTreeSet::new(),
+            recovered_managed_panes: BTreeSet::new(),
+            recovered_managed_content: BTreeMap::new(),
             focus: Some(1),
             wait_panes: BTreeSet::from([1, 2, 3]),
             ready_panes: BTreeSet::new(),
@@ -15346,7 +17387,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_mutation_invalidates_waiting_and_ready_transactions() -> Result<()> {
+    fn only_named_target_pane_removal_invalidates_an_active_transaction() -> Result<()> {
         for presentation in [
             SynchronizedResizePresentation::Waiting,
             SynchronizedResizePresentation::Ready {
@@ -15355,10 +17396,51 @@ mod tests {
             },
         ] {
             let active = active_resize_with_inventory(presentation)?;
+            anyhow::ensure!(synchronized_resize_inventory_matches(&active, &[7, 8, 9]));
             anyhow::ensure!(synchronized_resize_inventory_matches(&active, &[7, 8]));
-            anyhow::ensure!(!synchronized_resize_inventory_matches(&active, &[7]));
-            anyhow::ensure!(!synchronized_resize_inventory_matches(&active, &[7, 8, 9]));
+            anyhow::ensure!(synchronized_resize_inventory_matches(
+                &active,
+                &[7, 8, 9, 10]
+            ));
+            anyhow::ensure!(!synchronized_resize_inventory_matches(&active, &[7, 9]));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_inventory_abort_reports_exact_epoch_and_claim() -> Result<()> {
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        let epoch = active.epoch;
+        let claim = PointerInteractionClaimKey {
+            interaction: brood_wasm::InteractionId(17),
+            event_sequence: 21,
+            request_id: active.request_id,
+        };
+        active.interaction_claim = Some(claim);
+        let mut application = Application {
+            active_synchronized_resize: Some(active),
+            ..Application::default()
+        };
+        application
+            .abort_synchronized_resize_for_inventory_authority_change("pane removed", &[])?;
+        let Some(PendingSynchronizedLayoutNotification {
+            notification: brood_wasm::SynchronizedLayoutNotification::Aborted(aborted),
+            interaction_claim,
+            ..
+        }) = application
+            .pending_synchronized_layout_notifications
+            .front()
+        else {
+            return Err(anyhow!("accepted inventory change did not queue an abort"));
+        };
+        assert_eq!(aborted.resize_epoch, epoch);
+        assert_eq!(
+            aborted.reason,
+            brood_wasm::SynchronizedLayoutRejectionReason::StaleInventoryRevision
+        );
+        assert_eq!(aborted.unavailable_panes, vec![7, 8]);
+        assert_eq!(*interaction_claim, Some(claim));
+        assert!(application.active_synchronized_resize.is_none());
         Ok(())
     }
 
@@ -16729,7 +18811,7 @@ mod tests {
     }
 
     #[test]
-    fn native_root_barrier_includes_every_target_present_plugin_pane() {
+    fn native_root_barrier_includes_every_target_present_waitable_pane() {
         let target = ResolvedLayout {
             items: vec![
                 test_pane_item(9, -1.0, 0.5),
@@ -16737,9 +18819,9 @@ mod tests {
                 test_pane_item(7, 0.0, 1.0),
             ],
         };
-        let waitable_plugins = BTreeSet::from([3, 7, 8]);
+        let waitable_panes = BTreeSet::from([3, 7, 8]);
         assert_eq!(
-            target_present_plugin_panes(&target, &waitable_plugins),
+            target_present_waitable_panes(&target, &waitable_panes),
             BTreeSet::from([3, 7])
         );
         assert_eq!(

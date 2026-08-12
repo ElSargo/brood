@@ -195,6 +195,16 @@ pub struct SynchronizedLayoutRejected {
     pub message: String,
 }
 
+/// An accepted transaction stopped because its target authority became invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynchronizedLayoutAborted {
+    pub request_id: u64,
+    pub resize_epoch: ResizeEpoch,
+    pub reason: SynchronizedLayoutRejectionReason,
+    pub message: String,
+    pub unavailable_panes: Vec<u64>,
+}
+
 /// A newer request from the same interaction replaced an accepted request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynchronizedLayoutSuperseded {
@@ -219,6 +229,7 @@ pub enum SynchronizedLayoutNotification {
     Accepted(SynchronizedLayoutAccepted),
     Completed(SynchronizedLayoutCompleted),
     Rejected(SynchronizedLayoutRejected),
+    Aborted(SynchronizedLayoutAborted),
     Superseded(SynchronizedLayoutSuperseded),
     Degraded(SynchronizedLayoutDegraded),
 }

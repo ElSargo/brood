@@ -179,6 +179,46 @@ DMA-BUF is a preferred local optimization rather than the frame model. Copied
 images are the correctness baseline. Remote transports preserve per-window
 identity so the client still owns final layout and composition.
 
+## Managed Resize Epochs
+
+Protocol version 22 correlates a synchronized managed resize from the accepted
+client layout to one exact server commit snapshot. Before acceptance, every
+named managed wait pane must resolve to a current backend route and connection
+generation. The fixed wait set can contain plugin and managed panes. All
+affected managed panes receive the epoch; only named panes block promotion.
+
+For each managed pane, the client records the route, epoch, target pixel extent,
+logical viewport, and `scale_120`. It derives each logical dimension with
+checked integer rounding of `pixel * 120 / scale_120`. The server configure,
+status, committed buffer, exported snapshot, and returned frame must preserve
+that tuple. A committed buffer can provide more effective source samples than
+the target. The server captures an exact target-sized immutable snapshot; the
+client requires an exact zero-origin source rectangle and resource extent for
+that snapshot.
+
+An exact tagged frame stages one generation-scoped resource for its active
+pane and epoch. A replacement exact frame releases the prior stage. A tagged
+frame for any other epoch is dropped, including after supersession, timeout,
+abort, or promotion. While an expectation is active, an untagged frame cannot
+replace visible content. Plugin and managed stages promote together only after
+the fixed wait set and recursive region dependencies are final. A managed pane
+that is affected but not waited can stage without becoming a barrier.
+
+Timeout discards every waited managed stage and keeps the complete old visible
+set. If a pane has no old resource, the native placeholder is explicit recovered
+content. The client records whether each recovered pane uses `old-projected` or
+`placeholder`, retires the epoch floor, and sends one untagged current-size
+request. The server waits for a later ordinary commit before it resumes scene
+publication. Therefore the already-current mixed surface set cannot replace
+the observable degraded frame.
+
+Supersession releases old stages and creates fresh expectations from durable
+content. Pane removal or backend-generation loss aborts a target layout that
+names the unavailable pane, clears its barrier and resources, reports the exact
+bounded unavailable-pane set, and keeps the durable layout. A hidden inventory
+pane that the target does not name does not abort the transaction. An accepted
+transaction otherwise converges independently of capture or provider lifetime.
+
 ## Recursive Layout
 
 The client combines managed windows and local plugin panes in one pane

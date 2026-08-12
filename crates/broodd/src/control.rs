@@ -2825,10 +2825,13 @@ fn open_presentation_fast_path(
         window_buffers: std::collections::HashMap::new(),
         shared_images: std::collections::HashMap::new(),
         window_shared_image_resources: std::collections::HashMap::new(),
+        tagged_shared_image_resources: std::collections::HashMap::new(),
+        tagged_dmabuf_resources: std::collections::HashMap::new(),
         next_resource_id: 1,
         last_presented_sequence: None,
         in_flight_sequence: None,
         pending_redraw: false,
+        managed_resizes: Default::default(),
     };
     state.dmabuf.fast_path = Some(fast_path);
     state.reconfigure_focus_stack();
@@ -2936,18 +2939,26 @@ fn drain_fast_path_input(state: &mut Brood) {
     state.dmabuf.fast_path_input_draining = true;
     let mut request_redraw = false;
     let mut disconnected = false;
-    while let Some(record) = fast_path.input.try_recv() {
-        if record.connection_generation != fast_path.generation {
-            continue;
-        }
-        let message = match brood_ipc::decode_client_record(&record) {
-            Ok(message) => message,
-            Err(error) => {
-                warn!(%error, opcode = record.opcode, "rejected malformed local presentation record");
-                continue;
+    loop {
+        let message = {
+            let Some(record) = fast_path.input.try_recv() else {
+                break;
+            };
+            if record.connection_generation != fast_path.generation {
+                None
+            } else {
+                match brood_ipc::decode_client_record(&record) {
+                    Ok(message) => Some(message),
+                    Err(error) => {
+                        warn!(%error, opcode = record.opcode, "rejected malformed local presentation record");
+                        None
+                    }
+                }
             }
         };
-        drop(record);
+        let Some(message) = message else {
+            continue;
+        };
         let time = monotonic_time_msec(state);
         match message {
             ClientMessage::Input(InputEvent::KeyboardKey { keycode, pressed }) => {
@@ -3026,11 +3037,13 @@ fn drain_fast_path_input(state: &mut Brood) {
                 width,
                 height,
                 refresh_millihz,
+                scale_120,
             }) => {
                 state.configure_external_presentation_output(
                     i32::try_from(width).map_or(i32::MAX, |value| value),
                     i32::try_from(height).map_or(i32::MAX, |value| value),
                     i32::try_from(refresh_millihz).map_or(i32::MAX, |value| value),
+                    scale_120,
                 );
             }
             ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence }) => {
@@ -3038,6 +3051,11 @@ fn drain_fast_path_input(state: &mut Brood) {
                 if accepted {
                     fast_path.last_presented_sequence = Some(sequence);
                     fast_path.in_flight_sequence = None;
+                    let completed = fast_path.managed_resizes.complete_scene(sequence);
+                    for identity in completed {
+                        fast_path.tagged_shared_image_resources.remove(&identity);
+                        fast_path.tagged_dmabuf_resources.remove(&identity);
+                    }
                 }
                 let redraw_pending = accepted && fast_path.pending_redraw;
                 if redraw_pending {
@@ -3064,21 +3082,59 @@ fn drain_fast_path_input(state: &mut Brood) {
             }
             ClientMessage::Input(InputEvent::WindowResize {
                 pane,
-                width,
-                height,
+                logical_width,
+                logical_height,
+                pixel_width,
+                pixel_height,
+                scale_120,
+                resize_epoch,
             }) => {
-                if state.configure_presentation_client_pane_size(
-                    pane,
-                    i32::try_from(width).map_or(i32::MAX, |value| value),
-                    i32::try_from(height).map_or(i32::MAX, |value| value),
-                ) {
+                let logical_size = (
+                    i32::try_from(logical_width).map_or(i32::MAX, |value| value),
+                    i32::try_from(logical_height).map_or(i32::MAX, |value| value),
+                );
+                let configured = if let Some(epoch) = resize_epoch {
+                    state.configure_tagged_presentation_client_pane_size(
+                        &mut fast_path,
+                        pane,
+                        logical_size,
+                        (
+                            i32::try_from(pixel_width).map_or(i32::MAX, |value| value),
+                            i32::try_from(pixel_height).map_or(i32::MAX, |value| value),
+                        ),
+                        scale_120,
+                        epoch,
+                    )
+                } else {
+                    state.restart_ordinary_presentation_client_pane_size(
+                        &mut fast_path,
+                        pane,
+                        logical_size.0,
+                        logical_size.1,
+                    )
+                };
+                if configured {
                     request_redraw = true;
                 }
             }
+            ClientMessage::ReleaseResource { resource } => {
+                fast_path.buffers.remove(&resource);
+                fast_path.resource_app_ids.remove(&resource);
+                fast_path.shared_images.remove(&resource);
+                fast_path.resources.retain(|_buffer, id| *id != resource);
+                fast_path
+                    .window_shared_image_resources
+                    .retain(|_pane, id| *id != resource);
+                fast_path
+                    .tagged_shared_image_resources
+                    .retain(|_identity, id| *id != resource);
+                fast_path
+                    .tagged_dmabuf_resources
+                    .retain(|_identity, id| *id != resource);
+            }
             ClientMessage::Actor(_)
             | ClientMessage::BackendRequest(_)
-            | ClientMessage::Artifact(_)
-            | ClientMessage::ReleaseResource { .. } => {
+            | ClientMessage::Artifact(_) => {
                 warn!("message reached the wrong local presentation lane");
             }
         }
