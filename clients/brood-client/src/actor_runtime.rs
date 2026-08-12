@@ -506,10 +506,17 @@ impl PresentationWasmRuntime {
                 ComponentActorEvent::DispatcherFailed { message } => {
                     anyhow::bail!("presentation actor {actor_id:?} dispatcher failed: {message}")
                 }
-                ComponentActorEvent::WorkerFailed { worker, message } => anyhow::bail!(
-                    "presentation actor {actor_id:?} worker {} failed: {message}",
-                    worker.raw()
-                ),
+                ComponentActorEvent::WorkerFailed { worker, message } => {
+                    // The component runtime also delivers this typed failure to
+                    // the guest actor. Workers are fallible task boundaries;
+                    // the actor decides whether to render an error, retry, or
+                    // otherwise recover. Treating the observer copy as fatal
+                    // races that recovery and tears down the whole client.
+                    eprintln!(
+                        "presentation actor worker failed actor={actor_id} worker={} message={message}",
+                        worker.raw()
+                    );
+                }
                 ComponentActorEvent::WorkerStarted { worker } => {
                     if std::env::var_os("BROOD_TRACE_PLUGIN_WORKERS").is_some()
                         && !crate::PLUGIN_SCROLL_BENCH_ACTIVE
