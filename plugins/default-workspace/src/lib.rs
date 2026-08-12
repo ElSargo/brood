@@ -37,10 +37,10 @@ const PRIMARY_BUTTON: u32 = 0x110;
 // "BROOD" namespace. Managed pane IDs grow up from the low end while plugin
 // pane IDs grow down from `u64::MAX`, so chrome must use neither allocator end.
 const DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_4401;
-const DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_4402;
+const DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_4501;
 const DIVIDER_EVENT_MASK: u8 = 0b1111;
-const MIN_PRIMARY_SPLIT_RATIO: f32 = 0.15;
-const MAX_PRIMARY_SPLIT_RATIO: f32 = 0.85;
+const MIN_PANE_SIZE_PIXELS: f32 = 96.0;
+const MAX_LAYOUT_BOUNDARIES: usize = MAX_PANES * 2;
 const MAX_PENDING_RESIZE_PROPOSALS: usize = 256;
 
 static mut HEAP: [u8; HEAP_BYTES] = [0; HEAP_BYTES];
@@ -64,19 +64,35 @@ static mut LAYOUT_VIEWPORT_WIDTH: i32 = 1280;
 static mut LAYOUT_VIEWPORT_HEIGHT: i32 = 800;
 static mut LAYOUT_WAITABLE_PANES: [u64; 64] = [0; 64];
 static mut LAYOUT_WAITABLE_PANE_COUNT: usize = 0;
-// Pointer motion updates the requested ratio immediately so later samples in
-// the same drag stay continuous. Ordinary layout publications use the durable
-// ratio until the host confirms that a synchronized request was presented.
-static mut PRIMARY_SPLIT_RATIO: f32 = 0.5;
-static mut DURABLE_PRIMARY_SPLIT_RATIO: f32 = 0.5;
+// Pointer motion updates requested geometry immediately so later samples in
+// the same drag stay continuous. Ordinary layout publications use durable
+// geometry until the host confirms that a synchronized request was presented.
+static mut REQUESTED_LAYOUT: [LayoutTransform; MAX_PANES] = [LayoutTransform::EMPTY; MAX_PANES];
+static mut DURABLE_LAYOUT: [LayoutTransform; MAX_PANES] = [LayoutTransform::EMPTY; MAX_PANES];
+static mut LAYOUT_GEOMETRY_PANES: [u64; MAX_PANES] = [0; MAX_PANES];
+static mut LAYOUT_GEOMETRY_BACKENDS: [u64; MAX_PANES] = [0; MAX_PANES];
+static mut LAYOUT_GEOMETRY_PANE_COUNT: usize = 0;
+static mut LAYOUT_GEOMETRY_VIEWPORT_WIDTH: i32 = 0;
+static mut LAYOUT_GEOMETRY_VIEWPORT_HEIGHT: i32 = 0;
+static mut LAYOUT_GEOMETRY_CUSTOMIZED: bool = false;
 static mut PENDING_RESIZE_REQUEST_IDS: [u64; MAX_PENDING_RESIZE_PROPOSALS] =
     [0; MAX_PENDING_RESIZE_PROPOSALS];
-static mut PENDING_RESIZE_RATIOS: [f32; MAX_PENDING_RESIZE_PROPOSALS] =
+static mut PENDING_RESIZE_AXES: [u8; MAX_PENDING_RESIZE_PROPOSALS] =
+    [0; MAX_PENDING_RESIZE_PROPOSALS];
+static mut PENDING_RESIZE_NEGATIVE_MASKS: [u64; MAX_PENDING_RESIZE_PROPOSALS] =
+    [0; MAX_PENDING_RESIZE_PROPOSALS];
+static mut PENDING_RESIZE_POSITIVE_MASKS: [u64; MAX_PENDING_RESIZE_PROPOSALS] =
+    [0; MAX_PENDING_RESIZE_PROPOSALS];
+static mut PENDING_RESIZE_COORDINATES: [f32; MAX_PENDING_RESIZE_PROPOSALS] =
     [0.0; MAX_PENDING_RESIZE_PROPOSALS];
 static mut ACTIVE_POINTER_INTERACTION: u64 = 0;
 static mut HAS_ACTIVE_POINTER_INTERACTION: bool = false;
 static mut LAST_POINTER_EVENT_SEQUENCE: u64 = 0;
-static mut POINTER_SPLIT_OFFSET: f32 = 0.0;
+static mut ACTIVE_POINTER_ZONE: u64 = 0;
+static mut ACTIVE_BOUNDARY_AXIS: u8 = 0;
+static mut ACTIVE_BOUNDARY_NEGATIVE_MASK: u64 = 0;
+static mut ACTIVE_BOUNDARY_POSITIVE_MASK: u64 = 0;
+static mut POINTER_BOUNDARY_OFFSET: f32 = 0.0;
 static mut NEXT_LAYOUT_REQUEST_ID: u64 = 1;
 static mut CONSUMED_KEYS: [u64; 4] = [0; 4];
 
@@ -216,7 +232,7 @@ struct SynchronizedRequestContext {
     event_sequence: Option<u64>,
     request_id: u64,
     native_resize_revision: Option<u64>,
-    split_ratio: f32,
+    use_requested_geometry: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +241,36 @@ struct LayoutTransform {
     offset_v: f32,
     size_u: f32,
     size_v: f32,
+}
+
+impl LayoutTransform {
+    const EMPTY: Self = Self {
+        offset_u: 0.0,
+        offset_v: 0.0,
+        size_u: 0.0,
+        size_v: 0.0,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct LayoutBoundary {
+    axis: u8,
+    fixed: f32,
+    start: f32,
+    end: f32,
+    negative_mask: u64,
+    positive_mask: u64,
+}
+
+impl LayoutBoundary {
+    const EMPTY: Self = Self {
+        axis: 0,
+        fixed: 0.0,
+        start: 0.0,
+        end: 0.0,
+        negative_mask: 0,
+        positive_mask: 0,
+    };
 }
 
 #[derive(Deserialize)]
@@ -433,7 +479,7 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
                     event_sequence: None,
                     request_id,
                     native_resize_revision: Some(native_resize_revision),
-                    split_ratio: durable_primary_split_ratio(),
+                    use_requested_geometry: false,
                 },
             )
         } else {
@@ -934,6 +980,13 @@ fn store_layout_actor_state(
     size: LayoutStateSize,
 ) {
     let pane_count = panes.len().min(64);
+    let width = size.w.max(1);
+    let height = size.h.max(1);
+    let pane_backends = pane_realms_to_backends(&panes[..pane_count], pane_realms);
+    let topology_changed = !layout_geometry_topology_matches(&panes[..pane_count], &pane_backends);
+    let viewport_changed = unsafe {
+        LAYOUT_GEOMETRY_VIEWPORT_WIDTH != width || LAYOUT_GEOMETRY_VIEWPORT_HEIGHT != height
+    };
     unsafe {
         let target = ptr::addr_of_mut!(LAYOUT_PANES).cast::<u64>();
         let mut index = 0;
@@ -967,8 +1020,8 @@ fn store_layout_actor_state(
         } else {
             LAYOUT_HAS_LEASE = false;
         }
-        LAYOUT_VIEWPORT_WIDTH = size.w.max(1);
-        LAYOUT_VIEWPORT_HEIGHT = size.h.max(1);
+        LAYOUT_VIEWPORT_WIDTH = width;
+        LAYOUT_VIEWPORT_HEIGHT = height;
         let waitable_target = ptr::addr_of_mut!(LAYOUT_WAITABLE_PANES).cast::<u64>();
         let mut waitable_count = 0;
         for pane in waitable_panes {
@@ -983,6 +1036,31 @@ fn store_layout_actor_state(
         }
         LAYOUT_WAITABLE_PANE_COUNT = waitable_count;
     }
+    let preserve_custom_geometry = unsafe { LAYOUT_GEOMETRY_CUSTOMIZED } && !topology_changed;
+    if topology_changed || (viewport_changed && !preserve_custom_geometry) {
+        let (_, pane_backends, _, _, _, _) = layout_actor_state();
+        reset_layout_geometry(&panes[..pane_count], pane_backends, width, height);
+    } else if viewport_changed {
+        unsafe {
+            LAYOUT_GEOMETRY_VIEWPORT_WIDTH = width;
+            LAYOUT_GEOMETRY_VIEWPORT_HEIGHT = height;
+        }
+        clear_resize_proposals();
+        rebuild_requested_layout();
+        clear_pointer_interaction();
+    }
+}
+
+fn pane_realms_to_backends(panes: &[u64], pane_realms: &[PaneRealm]) -> FixedVec<u64, MAX_PANES> {
+    let mut backends = FixedVec::new();
+    for pane in panes {
+        let backend = pane_realms
+            .iter()
+            .find(|realm| realm.pane == *pane)
+            .map_or(0, |realm| realm.backend);
+        let _ = backends.push(backend);
+    }
+    backends
 }
 
 fn layout_actor_state() -> LayoutActorState {
@@ -1019,34 +1097,351 @@ fn layout_waitable_panes() -> &'static [u64] {
     }
 }
 
-fn primary_split_is_available(panes: &[u64]) -> bool {
-    panes.len() == 2
+fn layout_geometry_matches(panes: &[u64], pane_backends: &[u64], width: i32, height: i32) -> bool {
+    unsafe {
+        if LAYOUT_GEOMETRY_VIEWPORT_WIDTH != width || LAYOUT_GEOMETRY_VIEWPORT_HEIGHT != height {
+            return false;
+        }
+    }
+    layout_geometry_topology_matches(panes, pane_backends)
+}
+
+fn layout_geometry_topology_matches(panes: &[u64], pane_backends: &[u64]) -> bool {
+    unsafe {
+        if LAYOUT_GEOMETRY_PANE_COUNT != panes.len() {
+            return false;
+        }
+        let geometry_panes = ptr::addr_of!(LAYOUT_GEOMETRY_PANES).cast::<u64>();
+        let geometry_backends = ptr::addr_of!(LAYOUT_GEOMETRY_BACKENDS).cast::<u64>();
+        for (index, pane) in panes.iter().copied().enumerate() {
+            if geometry_panes.add(index).read() != pane
+                || geometry_backends.add(index).read()
+                    != pane_backends.get(index).copied().unwrap_or(0)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn clear_resize_proposals() {
+    unsafe {
+        let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
+        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+            ids.add(index).write(0);
+        }
+    }
+}
+
+fn reset_layout_geometry(panes: &[u64], pane_backends: &[u64], width: i32, height: i32) {
+    let pane_count = panes.len().min(MAX_PANES);
+    unsafe {
+        let requested = ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>();
+        let durable = ptr::addr_of_mut!(DURABLE_LAYOUT).cast::<LayoutTransform>();
+        let geometry_panes = ptr::addr_of_mut!(LAYOUT_GEOMETRY_PANES).cast::<u64>();
+        let geometry_backends = ptr::addr_of_mut!(LAYOUT_GEOMETRY_BACKENDS).cast::<u64>();
+        for index in 0..pane_count {
+            let transform = initial_layout_transform(index, panes, pane_backends, width, height);
+            requested.add(index).write(transform);
+            durable.add(index).write(transform);
+            geometry_panes.add(index).write(panes[index]);
+            geometry_backends
+                .add(index)
+                .write(pane_backends.get(index).copied().unwrap_or(0));
+        }
+        LAYOUT_GEOMETRY_PANE_COUNT = pane_count;
+        LAYOUT_GEOMETRY_VIEWPORT_WIDTH = width;
+        LAYOUT_GEOMETRY_VIEWPORT_HEIGHT = height;
+        LAYOUT_GEOMETRY_CUSTOMIZED = false;
+    }
+    clear_resize_proposals();
+    clear_pointer_interaction();
+}
+
+fn layout_transform(
+    index: usize,
+    panes: &[u64],
+    pane_backends: &[u64],
+    use_requested: bool,
+) -> LayoutTransform {
+    let (width, height) = unsafe { (LAYOUT_VIEWPORT_WIDTH, LAYOUT_VIEWPORT_HEIGHT) };
+    if layout_geometry_matches(panes, pane_backends, width, height) {
+        unsafe {
+            let source = if use_requested {
+                ptr::addr_of!(REQUESTED_LAYOUT).cast::<LayoutTransform>()
+            } else {
+                ptr::addr_of!(DURABLE_LAYOUT).cast::<LayoutTransform>()
+            };
+            return source.add(index).read();
+        }
+    }
+    initial_layout_transform(index, panes, pane_backends, width, height)
+}
+
+fn initial_layout_transform(
+    index: usize,
+    panes: &[u64],
+    pane_backends: &[u64],
+    width: i32,
+    height: i32,
+) -> LayoutTransform {
+    if panes.len() == 2
         && panes
             .iter()
             .all(|pane| layout_waitable_panes().contains(pane))
+    {
+        return LayoutTransform {
+            offset_u: index as f32 - 1.0,
+            offset_v: -1.0,
+            size_u: 1.0,
+            size_v: 2.0,
+        };
+    }
+    let placement = pane_placement(index, panes, pane_backends, width, height);
+    LayoutTransform {
+        offset_u: placement.offset_u,
+        offset_v: placement.offset_v,
+        size_u: placement.size_u,
+        size_v: placement.size_v,
+    }
 }
 
-fn primary_split_ratio() -> f32 {
-    unsafe { PRIMARY_SPLIT_RATIO.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO) }
+fn add_layout_boundary(
+    boundaries: &mut [LayoutBoundary; MAX_LAYOUT_BOUNDARIES],
+    count: &mut usize,
+    mut boundary: LayoutBoundary,
+) {
+    const EPSILON: f32 = 0.000_1;
+    let mut index = 0;
+    while index < *count {
+        let existing = boundaries[index];
+        let same_line =
+            existing.axis == boundary.axis && (existing.fixed - boundary.fixed).abs() <= EPSILON;
+        let connected =
+            existing.start <= boundary.end + EPSILON && boundary.start <= existing.end + EPSILON;
+        if same_line && connected {
+            boundary.start = boundary.start.min(existing.start);
+            boundary.end = boundary.end.max(existing.end);
+            boundary.negative_mask |= existing.negative_mask;
+            boundary.positive_mask |= existing.positive_mask;
+            *count -= 1;
+            boundaries[index] = boundaries[*count];
+            index = 0;
+            continue;
+        }
+        index += 1;
+    }
+    if *count < MAX_LAYOUT_BOUNDARIES {
+        boundaries[*count] = boundary;
+        *count += 1;
+    }
 }
 
-fn durable_primary_split_ratio() -> f32 {
-    unsafe { DURABLE_PRIMARY_SPLIT_RATIO.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO) }
+fn collect_layout_boundaries(
+    panes: &[u64],
+    pane_backends: &[u64],
+    use_requested: bool,
+    boundaries: &mut [LayoutBoundary; MAX_LAYOUT_BOUNDARIES],
+) -> usize {
+    const EPSILON: f32 = 0.000_1;
+    let mut count = 0;
+    for first in 0..panes.len() {
+        let a = layout_transform(first, panes, pane_backends, use_requested);
+        for second in first + 1..panes.len() {
+            let b = layout_transform(second, panes, pane_backends, use_requested);
+            let vertical_start = a.offset_v.max(b.offset_v);
+            let vertical_end = (a.offset_v + a.size_v).min(b.offset_v + b.size_v);
+            if vertical_end > vertical_start + EPSILON {
+                if (a.offset_u + a.size_u - b.offset_u).abs() <= EPSILON {
+                    add_layout_boundary(
+                        boundaries,
+                        &mut count,
+                        LayoutBoundary {
+                            axis: 0,
+                            fixed: b.offset_u,
+                            start: vertical_start,
+                            end: vertical_end,
+                            negative_mask: 1_u64 << first,
+                            positive_mask: 1_u64 << second,
+                        },
+                    );
+                } else if (b.offset_u + b.size_u - a.offset_u).abs() <= EPSILON {
+                    add_layout_boundary(
+                        boundaries,
+                        &mut count,
+                        LayoutBoundary {
+                            axis: 0,
+                            fixed: a.offset_u,
+                            start: vertical_start,
+                            end: vertical_end,
+                            negative_mask: 1_u64 << second,
+                            positive_mask: 1_u64 << first,
+                        },
+                    );
+                }
+            }
+            let horizontal_start = a.offset_u.max(b.offset_u);
+            let horizontal_end = (a.offset_u + a.size_u).min(b.offset_u + b.size_u);
+            if horizontal_end > horizontal_start + EPSILON {
+                if (a.offset_v + a.size_v - b.offset_v).abs() <= EPSILON {
+                    add_layout_boundary(
+                        boundaries,
+                        &mut count,
+                        LayoutBoundary {
+                            axis: 1,
+                            fixed: b.offset_v,
+                            start: horizontal_start,
+                            end: horizontal_end,
+                            negative_mask: 1_u64 << first,
+                            positive_mask: 1_u64 << second,
+                        },
+                    );
+                } else if (b.offset_v + b.size_v - a.offset_v).abs() <= EPSILON {
+                    add_layout_boundary(
+                        boundaries,
+                        &mut count,
+                        LayoutBoundary {
+                            axis: 1,
+                            fixed: a.offset_v,
+                            start: horizontal_start,
+                            end: horizontal_end,
+                            negative_mask: 1_u64 << second,
+                            positive_mask: 1_u64 << first,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    // The zone ID is its index, so keep ordering independent of pair traversal.
+    for index in 1..count {
+        let boundary = boundaries[index];
+        let mut destination = index;
+        while destination > 0 {
+            let previous = boundaries[destination - 1];
+            if (previous.axis, previous.fixed, previous.start)
+                <= (boundary.axis, boundary.fixed, boundary.start)
+            {
+                break;
+            }
+            boundaries[destination] = previous;
+            destination -= 1;
+        }
+        boundaries[destination] = boundary;
+    }
+    count
 }
 
-fn remember_resize_proposal(request_id: u64, ratio: f32) {
+fn boundary_is_waitable(boundary: LayoutBoundary, panes: &[u64]) -> bool {
+    let affected = boundary.negative_mask | boundary.positive_mask;
+    (0..panes.len()).all(|index| {
+        affected & (1_u64 << index) == 0 || layout_waitable_panes().contains(&panes[index])
+    })
+}
+
+const fn divider_zone_id(index: usize) -> u64 {
+    DIVIDER_ZONE_ID + index as u64
+}
+
+const fn divider_item_id(index: usize) -> u64 {
+    DIVIDER_ITEM_ID + index as u64
+}
+
+fn apply_boundary(
+    target: *mut LayoutTransform,
+    pane_count: usize,
+    axis: u8,
+    negative_mask: u64,
+    positive_mask: u64,
+    fixed: f32,
+) {
+    unsafe {
+        for index in 0..pane_count {
+            let bit = 1_u64 << index;
+            let mut transform = target.add(index).read();
+            if negative_mask & bit != 0 {
+                if axis == 0 {
+                    transform.size_u = fixed - transform.offset_u;
+                } else {
+                    transform.size_v = fixed - transform.offset_v;
+                }
+            } else if positive_mask & bit != 0 {
+                if axis == 0 {
+                    let end = transform.offset_u + transform.size_u;
+                    transform.offset_u = fixed;
+                    transform.size_u = end - fixed;
+                } else {
+                    let end = transform.offset_v + transform.size_v;
+                    transform.offset_v = fixed;
+                    transform.size_v = end - fixed;
+                }
+            }
+            target.add(index).write(transform);
+        }
+    }
+}
+
+fn clamped_boundary_coordinate(
+    axis: u8,
+    negative_mask: u64,
+    positive_mask: u64,
+    fixed: f32,
+) -> f32 {
+    let pane_count = unsafe { LAYOUT_GEOMETRY_PANE_COUNT.min(MAX_PANES) };
+    let (width, height) = unsafe { (LAYOUT_VIEWPORT_WIDTH.max(1), LAYOUT_VIEWPORT_HEIGHT.max(1)) };
+    let minimum = if axis == 0 {
+        2.0 * MIN_PANE_SIZE_PIXELS / width as f32
+    } else {
+        2.0 * MIN_PANE_SIZE_PIXELS / height as f32
+    };
+    let mut lower: f32 = -1.0;
+    let mut upper: f32 = 1.0;
+    unsafe {
+        let requested = ptr::addr_of!(REQUESTED_LAYOUT).cast::<LayoutTransform>();
+        for index in 0..pane_count {
+            let transform = requested.add(index).read();
+            let bit = 1_u64 << index;
+            if negative_mask & bit != 0 {
+                let start = if axis == 0 {
+                    transform.offset_u
+                } else {
+                    transform.offset_v
+                };
+                lower = lower.max(start + minimum);
+            }
+            if positive_mask & bit != 0 {
+                let end = if axis == 0 {
+                    transform.offset_u + transform.size_u
+                } else {
+                    transform.offset_v + transform.size_v
+                };
+                upper = upper.min(end - minimum);
+            }
+        }
+    }
+    if lower <= upper {
+        fixed.clamp(lower, upper)
+    } else {
+        (lower + upper) * 0.5
+    }
+}
+
+fn remember_resize_proposal(request_id: u64, boundary: LayoutBoundary, fixed: f32) {
     if request_id == 0 {
         return;
     }
     unsafe {
         let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
-        let ratios = ptr::addr_of_mut!(PENDING_RESIZE_RATIOS).cast::<f32>();
         let mut empty = None;
         let mut oldest = (0, u64::MAX);
         for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
             let candidate = ids.add(index).read();
             if candidate == request_id {
-                ratios.add(index).write(ratio);
+                PENDING_RESIZE_AXES[index] = boundary.axis;
+                PENDING_RESIZE_NEGATIVE_MASKS[index] = boundary.negative_mask;
+                PENDING_RESIZE_POSITIVE_MASKS[index] = boundary.positive_mask;
+                PENDING_RESIZE_COORDINATES[index] = fixed;
                 return;
             }
             if candidate == 0 && empty.is_none() {
@@ -1057,26 +1452,11 @@ fn remember_resize_proposal(request_id: u64, ratio: f32) {
         }
         let slot = empty.unwrap_or(oldest.0);
         ids.add(slot).write(request_id);
-        ratios.add(slot).write(ratio);
+        PENDING_RESIZE_AXES[slot] = boundary.axis;
+        PENDING_RESIZE_NEGATIVE_MASKS[slot] = boundary.negative_mask;
+        PENDING_RESIZE_POSITIVE_MASKS[slot] = boundary.positive_mask;
+        PENDING_RESIZE_COORDINATES[slot] = fixed;
     }
-}
-
-fn resize_proposal_ratio(request_id: u64) -> Option<f32> {
-    unsafe {
-        let ids = ptr::addr_of!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
-        let ratios = ptr::addr_of!(PENDING_RESIZE_RATIOS).cast::<f32>();
-        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
-            if ids.add(index).read() == request_id {
-                return Some(
-                    ratios
-                        .add(index)
-                        .read()
-                        .clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO),
-                );
-            }
-        }
-    }
-    None
 }
 
 fn remove_resize_proposal(request_id: u64) {
@@ -1103,41 +1483,91 @@ fn remove_resize_proposals_through(request_id: u64) {
     }
 }
 
-fn latest_resize_proposal_ratio() -> Option<f32> {
+fn rebuild_requested_layout() {
     unsafe {
+        let pane_count = LAYOUT_GEOMETRY_PANE_COUNT.min(MAX_PANES);
+        ptr::copy_nonoverlapping(
+            ptr::addr_of!(DURABLE_LAYOUT).cast::<LayoutTransform>(),
+            ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+            pane_count,
+        );
         let ids = ptr::addr_of!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
-        let ratios = ptr::addr_of!(PENDING_RESIZE_RATIOS).cast::<f32>();
-        let mut latest = None;
-        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
-            let request_id = ids.add(index).read();
-            if request_id != 0 && latest.is_none_or(|(latest_id, _)| request_id > latest_id) {
-                latest = Some((request_id, ratios.add(index).read()));
+        let mut applied_through = 0;
+        loop {
+            let mut next = None;
+            for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+                let candidate = ids.add(index).read();
+                if candidate > applied_through
+                    && next.is_none_or(|(_, next_id)| candidate < next_id)
+                {
+                    next = Some((index, candidate));
+                }
+            }
+            let Some((index, request_id)) = next else {
+                break;
+            };
+            apply_boundary(
+                ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+                pane_count,
+                PENDING_RESIZE_AXES[index],
+                PENDING_RESIZE_NEGATIVE_MASKS[index],
+                PENDING_RESIZE_POSITIVE_MASKS[index],
+                PENDING_RESIZE_COORDINATES[index],
+            );
+            applied_through = request_id;
+            if request_id == u64::MAX {
+                break;
             }
         }
-        latest.map(|(_, ratio)| ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO))
-    }
-}
-
-fn restore_requested_split_ratio() {
-    let ratio = latest_resize_proposal_ratio().unwrap_or_else(durable_primary_split_ratio);
-    unsafe {
-        PRIMARY_SPLIT_RATIO = ratio;
     }
 }
 
 fn commit_resize_proposal(request_id: u64) {
-    if let Some(ratio) = resize_proposal_ratio(request_id) {
+    let mut applied_through = 0;
+    let mut applied = false;
+    loop {
+        let mut next = None;
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "raw mutable static proposal columns cannot be safely iterated by reference"
+        )]
         unsafe {
-            DURABLE_PRIMARY_SPLIT_RATIO = ratio;
+            for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
+                let candidate = PENDING_RESIZE_REQUEST_IDS[index];
+                if candidate > applied_through
+                    && candidate <= request_id
+                    && next.is_none_or(|(_, next_id)| candidate < next_id)
+                {
+                    next = Some((index, candidate));
+                }
+            }
+            let Some((index, candidate)) = next else {
+                break;
+            };
+            apply_boundary(
+                ptr::addr_of_mut!(DURABLE_LAYOUT).cast::<LayoutTransform>(),
+                LAYOUT_GEOMETRY_PANE_COUNT.min(MAX_PANES),
+                PENDING_RESIZE_AXES[index],
+                PENDING_RESIZE_NEGATIVE_MASKS[index],
+                PENDING_RESIZE_POSITIVE_MASKS[index],
+                PENDING_RESIZE_COORDINATES[index],
+            );
+            applied = true;
+            applied_through = candidate;
+        }
+    }
+    if applied {
+        unsafe {
+            LAYOUT_GEOMETRY_CUSTOMIZED = true;
         }
     }
     remove_resize_proposals_through(request_id);
-    restore_requested_split_ratio();
+    rebuild_requested_layout();
 }
 
 fn reject_resize_proposal(request_id: u64) {
     remove_resize_proposal(request_id);
-    restore_requested_split_ratio();
+    rebuild_requested_layout();
 }
 
 fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
@@ -1165,46 +1595,8 @@ fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
     }
 }
 
-#[cfg(test)]
-fn reset_resize_proposal_state(ratio: f32) {
-    let ratio = ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO);
-    unsafe {
-        PRIMARY_SPLIT_RATIO = ratio;
-        DURABLE_PRIMARY_SPLIT_RATIO = ratio;
-        let ids = ptr::addr_of_mut!(PENDING_RESIZE_REQUEST_IDS).cast::<u64>();
-        let ratios = ptr::addr_of_mut!(PENDING_RESIZE_RATIOS).cast::<f32>();
-        for index in 0..MAX_PENDING_RESIZE_PROPOSALS {
-            ids.add(index).write(0);
-            ratios.add(index).write(0.0);
-        }
-    }
-}
-
-fn primary_divider_transforms(ratio: f32) -> (LayoutTransform, LayoutTransform) {
-    let width = unsafe { LAYOUT_VIEWPORT_WIDTH.max(1) } as f32;
-    let center = ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO) * 2.0 - 1.0;
-    let zone_width = (16.0 / width).clamp(0.005, 0.05);
-    let divider_width = (2.0 / width).clamp(0.001, 0.02);
-    (
-        LayoutTransform {
-            offset_u: center - zone_width * 0.5,
-            offset_v: -1.0,
-            size_u: zone_width,
-            size_v: 2.0,
-        },
-        LayoutTransform {
-            offset_u: center - divider_width * 0.5,
-            offset_v: -1.0,
-            size_u: divider_width,
-            size_v: 2.0,
-        },
-    )
-}
-
 fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
-    if message.zone != Some(DIVIDER_ZONE_ID) {
-        return 0;
-    }
+    let Some(zone) = message.zone else { return 0 };
     let Some(interaction) = message.interaction.filter(|interaction| *interaction != 0) else {
         return 0;
     };
@@ -1224,7 +1616,7 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
     let Some(lease) = lease.filter(|lease| Some(*lease) == message.lease) else {
         return 0;
     };
-    if fullscreen || !primary_split_is_available(panes) {
+    if fullscreen || panes.len() < 2 {
         return 0;
     }
 
@@ -1242,11 +1634,34 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
     }
 
     if phase == "button-press" && message.button == Some(PRIMARY_BUTTON) {
+        let mut boundaries = [LayoutBoundary::EMPTY; MAX_LAYOUT_BOUNDARIES];
+        let boundary_count = collect_layout_boundaries(panes, pane_backends, true, &mut boundaries);
+        let Some(boundary_index) = zone
+            .checked_sub(DIVIDER_ZONE_ID)
+            .map(|index| index as usize)
+        else {
+            return 0;
+        };
+        if boundary_index >= boundary_count
+            || !boundary_is_waitable(boundaries[boundary_index], panes)
+        {
+            return 0;
+        }
+        let boundary = boundaries[boundary_index];
+        let pointer_coordinate = if boundary.axis == 0 {
+            position.u as f32
+        } else {
+            position.v as f32
+        };
         unsafe {
             ACTIVE_POINTER_INTERACTION = interaction;
             HAS_ACTIVE_POINTER_INTERACTION = true;
             LAST_POINTER_EVENT_SEQUENCE = event_sequence;
-            POINTER_SPLIT_OFFSET = primary_split_ratio() * 2.0 - 1.0 - position.u as f32;
+            ACTIVE_POINTER_ZONE = zone;
+            ACTIVE_BOUNDARY_AXIS = boundary.axis;
+            ACTIVE_BOUNDARY_NEGATIVE_MASK = boundary.negative_mask;
+            ACTIVE_BOUNDARY_POSITIVE_MASK = boundary.positive_mask;
+            POINTER_BOUNDARY_OFFSET = boundary.fixed - pointer_coordinate;
         }
         return 0;
     }
@@ -1254,6 +1669,7 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
     let active = unsafe {
         HAS_ACTIVE_POINTER_INTERACTION
             && ACTIVE_POINTER_INTERACTION == interaction
+            && ACTIVE_POINTER_ZONE == zone
             && event_sequence > LAST_POINTER_EVENT_SEQUENCE
     };
     if !active {
@@ -1267,10 +1683,36 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
         return 0;
     }
 
+    let boundary = unsafe {
+        LayoutBoundary {
+            axis: ACTIVE_BOUNDARY_AXIS,
+            fixed: 0.0,
+            start: 0.0,
+            end: 0.0,
+            negative_mask: ACTIVE_BOUNDARY_NEGATIVE_MASK,
+            positive_mask: ACTIVE_BOUNDARY_POSITIVE_MASK,
+        }
+    };
+    let pointer_coordinate = if boundary.axis == 0 {
+        position.u as f32
+    } else {
+        position.v as f32
+    };
+    let fixed = clamped_boundary_coordinate(
+        boundary.axis,
+        boundary.negative_mask,
+        boundary.positive_mask,
+        pointer_coordinate + unsafe { POINTER_BOUNDARY_OFFSET },
+    );
     unsafe {
-        let center = position.u as f32 + POINTER_SPLIT_OFFSET;
-        PRIMARY_SPLIT_RATIO =
-            ((center + 1.0) * 0.5).clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO);
+        apply_boundary(
+            ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+            LAYOUT_GEOMETRY_PANE_COUNT.min(MAX_PANES),
+            boundary.axis,
+            boundary.negative_mask,
+            boundary.positive_mask,
+            fixed,
+        );
         LAST_POINTER_EVENT_SEQUENCE = event_sequence;
     }
     let request_id = next_layout_request_id();
@@ -1286,13 +1728,13 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
             event_sequence: Some(event_sequence),
             request_id,
             native_resize_revision: None,
-            split_ratio: primary_split_ratio(),
+            use_requested_geometry: true,
         },
     );
     if len > 0 {
-        remember_resize_proposal(request_id, primary_split_ratio());
+        remember_resize_proposal(request_id, boundary, fixed);
     } else {
-        restore_requested_split_ratio();
+        rebuild_requested_layout();
     }
     if phase == "button-release" {
         clear_pointer_interaction();
@@ -1313,7 +1755,11 @@ fn clear_pointer_interaction() {
         HAS_ACTIVE_POINTER_INTERACTION = false;
         ACTIVE_POINTER_INTERACTION = 0;
         LAST_POINTER_EVENT_SEQUENCE = 0;
-        POINTER_SPLIT_OFFSET = 0.0;
+        ACTIVE_POINTER_ZONE = 0;
+        ACTIVE_BOUNDARY_AXIS = 0;
+        ACTIVE_BOUNDARY_NEGATIVE_MASK = 0;
+        ACTIVE_BOUNDARY_POSITIVE_MASK = 0;
+        POINTER_BOUNDARY_OFFSET = 0.0;
     }
 }
 
@@ -1360,7 +1806,7 @@ fn write_synchronized_layout_outbox(
         pane_backends,
         request.focus,
         request.fullscreen,
-        request.split_ratio,
+        request.use_requested_geometry,
     );
     payload.bytes(br#"}"#);
     if let Some(focus) = request.focus {
@@ -1429,14 +1875,7 @@ fn write_layout_region_outbox(
     payload.bytes(br#"},"inventory_revision":"#);
     payload.u64(inventory_revision);
     payload.bytes(br#", "fragment":{"layout":"#);
-    write_resolved_layout_payload(
-        &mut payload,
-        panes,
-        pane_backends,
-        focus,
-        fullscreen,
-        durable_primary_split_ratio(),
-    );
+    write_resolved_layout_payload(&mut payload, panes, pane_backends, focus, fullscreen, false);
     payload.bytes(br#"}"#);
     if let Some(focus) = focus {
         payload.bytes(br#", "focus":"#);
@@ -1521,14 +1960,7 @@ fn write_set_resolved_layout_payload(
         payload.u64(revision);
     }
     payload.bytes(br#","layout":"#);
-    write_resolved_layout_payload(
-        payload,
-        panes,
-        pane_backends,
-        focus,
-        fullscreen,
-        durable_primary_split_ratio(),
-    );
+    write_resolved_layout_payload(payload, panes, pane_backends, focus, fullscreen, false);
     payload.bytes(br#", "focus":"#);
     if let Some(focus) = focus {
         payload.u64(focus);
@@ -1552,7 +1984,7 @@ fn write_resolved_layout_payload(
     pane_backends: &[u64],
     focus: Option<u64>,
     fullscreen: bool,
-    split_ratio: f32,
+    use_requested_geometry: bool,
 ) {
     payload.bytes(br#"{"items":["#);
     let pane_count = panes.len();
@@ -1561,29 +1993,13 @@ fn write_resolved_layout_payload(
             .filter(|focus| panes.contains(focus))
             .unwrap_or(panes[0]);
         write_pane_item_payload(payload, pane, 0.0, -1.0, -1.0, 2.0, 2.0);
-    } else if primary_split_is_available(panes) {
-        let ratio = split_ratio.clamp(MIN_PRIMARY_SPLIT_RATIO, MAX_PRIMARY_SPLIT_RATIO);
-        write_pane_item_payload(payload, panes[0], 0.0, -1.0, -1.0, ratio * 2.0, 2.0);
-        payload.byte(b',');
-        write_pane_item_payload(
-            payload,
-            panes[1],
-            1.0,
-            ratio * 2.0 - 1.0,
-            -1.0,
-            (1.0 - ratio) * 2.0,
-            2.0,
-        );
     } else {
-        let (viewport_width, viewport_height) =
-            unsafe { (LAYOUT_VIEWPORT_WIDTH, LAYOUT_VIEWPORT_HEIGHT) };
         let mut index = 0;
         while index < pane_count {
             if index > 0 {
                 payload.byte(b',');
             }
-            let placement =
-                pane_placement(index, panes, pane_backends, viewport_width, viewport_height);
+            let placement = layout_transform(index, panes, pane_backends, use_requested_geometry);
             write_pane_item_payload(
                 payload,
                 panes[index],
@@ -1597,12 +2013,38 @@ fn write_resolved_layout_payload(
         }
     }
     payload.byte(b']');
-    if !fullscreen && primary_split_is_available(panes) {
-        let (zone_transform, divider_transform) = primary_divider_transforms(split_ratio);
+    if !fullscreen && pane_count > 1 {
+        let mut boundaries = [LayoutBoundary::EMPTY; MAX_LAYOUT_BOUNDARIES];
+        let boundary_count = collect_layout_boundaries(
+            panes,
+            pane_backends,
+            use_requested_geometry,
+            &mut boundaries,
+        );
         payload.bytes(br#", "zones":["#);
-        write_interaction_zone_payload(payload, zone_transform);
+        let mut first = true;
+        for (index, boundary) in boundaries[..boundary_count].iter().copied().enumerate() {
+            if !boundary_is_waitable(boundary, panes) {
+                continue;
+            }
+            if !first {
+                payload.byte(b',');
+            }
+            first = false;
+            write_interaction_zone_payload(payload, index, boundary);
+        }
         payload.bytes(br#"],"dividers":["#);
-        write_divider_payload(payload, divider_transform);
+        first = true;
+        for (index, boundary) in boundaries[..boundary_count].iter().copied().enumerate() {
+            if !boundary_is_waitable(boundary, panes) {
+                continue;
+            }
+            if !first {
+                payload.byte(b',');
+            }
+            first = false;
+            write_divider_payload(payload, index, boundary);
+        }
         payload.byte(b']');
     }
     payload.byte(b'}');
@@ -1626,11 +2068,46 @@ fn write_pane_item_payload(
     }
 }
 
-fn write_interaction_zone_payload(payload: &mut PayloadWriter<'_, '_>, transform: LayoutTransform) {
+fn boundary_transform(boundary: LayoutBoundary, hit_zone: bool) -> LayoutTransform {
+    let (width, height) = unsafe {
+        (
+            LAYOUT_VIEWPORT_WIDTH.max(1) as f32,
+            LAYOUT_VIEWPORT_HEIGHT.max(1) as f32,
+        )
+    };
+    if boundary.axis == 0 {
+        let size = if hit_zone { 16.0 / width } else { 2.0 / width };
+        LayoutTransform {
+            offset_u: boundary.fixed - size * 0.5,
+            offset_v: boundary.start,
+            size_u: size,
+            size_v: boundary.end - boundary.start,
+        }
+    } else {
+        let size = if hit_zone {
+            16.0 / height
+        } else {
+            2.0 / height
+        };
+        LayoutTransform {
+            offset_u: boundary.start,
+            offset_v: boundary.fixed - size * 0.5,
+            size_u: boundary.end - boundary.start,
+            size_v: size,
+        }
+    }
+}
+
+fn write_interaction_zone_payload(
+    payload: &mut PayloadWriter<'_, '_>,
+    index: usize,
+    boundary: LayoutBoundary,
+) {
+    let transform = boundary_transform(boundary, true);
     let mut item = [0_u8; 512];
     let mut writer = Writer::new(&mut item);
     writer.bytes(br#"{"id":"#);
-    writer.u64(DIVIDER_ZONE_ID);
+    writer.u64(divider_zone_id(index));
     writer.bytes(br#", "transform":{"offset":{"u":"#);
     writer.f32(transform.offset_u);
     writer.bytes(br#", "v":"#);
@@ -1641,20 +2118,29 @@ fn write_interaction_zone_payload(payload: &mut PayloadWriter<'_, '_>, transform
     writer.f32(transform.size_v);
     writer.bytes(br#"}},"z":1000,"event_mask":"#);
     writer.u64(u64::from(DIVIDER_EVENT_MASK));
-    writer.bytes(br#", "cursor":"col-resize","input":"drag"}"#);
+    if boundary.axis == 0 {
+        writer.bytes(br#", "cursor":"col-resize","input":"drag"}"#);
+    } else {
+        writer.bytes(br#", "cursor":"row-resize","input":"drag"}"#);
+    }
     let len = writer.finish();
     if len > 0 {
         payload.bytes(&item[..len as usize]);
     }
 }
 
-fn write_divider_payload(payload: &mut PayloadWriter<'_, '_>, transform: LayoutTransform) {
+fn write_divider_payload(
+    payload: &mut PayloadWriter<'_, '_>,
+    index: usize,
+    boundary: LayoutBoundary,
+) {
+    let transform = boundary_transform(boundary, false);
     let mut item = [0_u8; 512];
     let mut writer = Writer::new(&mut item);
     writer.bytes(br#"{"id":"#);
-    writer.u64(DIVIDER_ITEM_ID);
+    writer.u64(divider_item_id(index));
     writer.bytes(br#", "zone":"#);
-    writer.u64(DIVIDER_ZONE_ID);
+    writer.u64(divider_zone_id(index));
     // Native chrome is a separate paint phase. Keep this divider below the
     // ordinary pane items so the real proof detects any z-only paint-order
     // regression.
@@ -1666,7 +2152,11 @@ fn write_divider_payload(payload: &mut PayloadWriter<'_, '_>, transform: LayoutT
     writer.f32(transform.size_u);
     writer.bytes(br#", "v":"#);
     writer.f32(transform.size_v);
-    writer.bytes(br#"}},"axis":"vertical","role":"split"}"#);
+    if boundary.axis == 0 {
+        writer.bytes(br#"}},"axis":"vertical","role":"split"}"#);
+    } else {
+        writer.bytes(br#"}},"axis":"horizontal","role":"split"}"#);
+    }
     let len = writer.finish();
     if len > 0 {
         payload.bytes(&item[..len as usize]);
@@ -2083,6 +2573,8 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn host_payloads(output: &[u8], len: i32) -> Vec<Value> {
         assert!(len > 0);
         let envelope: Value = serde_json::from_slice(&output[..len as usize]).unwrap();
@@ -2112,9 +2604,20 @@ mod tests {
         sequence: u64,
         button: Option<u32>,
     ) -> WorkspaceMessage {
+        pointer_message_for(DIVIDER_ZONE_ID, phase, position, 0.0, sequence, button)
+    }
+
+    fn pointer_message_for(
+        zone: u64,
+        phase: &str,
+        u: f64,
+        v: f64,
+        sequence: u64,
+        button: Option<u32>,
+    ) -> WorkspaceMessage {
         let button = button.map_or_else(|| "null".into(), |button| button.to_string());
         let json = format!(
-            "{{\"type\":\"layout-pointer\",\"interaction\":99,\"event_sequence\":{sequence},\"lease\":{{\"id\":5,\"generation\":2}},\"zone\":{DIVIDER_ZONE_ID},\"phase\":\"{phase}\",\"position\":{{\"u\":{position},\"v\":0.0}},\"button\":{button},\"modifiers\":0,\"inventory_revision\":7,\"base_layout_revision\":3}}"
+            "{{\"type\":\"layout-pointer\",\"interaction\":99,\"event_sequence\":{sequence},\"lease\":{{\"id\":5,\"generation\":2}},\"zone\":{zone},\"phase\":\"{phase}\",\"position\":{{\"u\":{u},\"v\":{v}}},\"button\":{button},\"modifiers\":0,\"inventory_revision\":7,\"base_layout_revision\":3}}"
         );
         decode_json(json.as_bytes()).unwrap()
     }
@@ -2135,6 +2638,9 @@ mod tests {
 
     #[test]
     fn divider_policy_and_actor_preserve_one_synchronized_drag() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let layout_state: WorkspaceMessage = decode_json(
             br#"{"type":"layout-state","revision":7,"inventory_revision":7,"layout_revision":3,"presented_layout_revision":3,"lease":{"id":5,"generation":2},"waitable_panes":[11,22],"visible_panes":[11,22],"size":{"w":1280,"h":720}}"#,
         )
@@ -2183,7 +2689,7 @@ mod tests {
         assert_eq!(pointer_capture_decision(&other_zone), Some("unchanged"));
 
         clear_pointer_interaction();
-        reset_resize_proposal_state(0.5);
+        clear_resize_proposals();
         unsafe {
             NEXT_LAYOUT_REQUEST_ID = 1;
         }
@@ -2211,6 +2717,10 @@ mod tests {
             &panes,
             LayoutStateSize { w: 1280, h: 720 },
         );
+        let narrow_left = initial_layout_transform(0, &panes, &[1, 1], 640, 686);
+        let narrow_right = initial_layout_transform(1, &panes, &[1, 1], 640, 686);
+        assert_eq!((narrow_left.offset_u, narrow_left.size_u), (-1.0, 1.0));
+        assert_eq!((narrow_right.offset_u, narrow_right.size_u), (0.0, 1.0));
 
         let mut output = [0_u8; OUTBOX_BYTES];
         assert_eq!(
@@ -2322,43 +2832,256 @@ mod tests {
         assert_eq!(durable["layout"]["items"][0]["transform"]["size"]["u"], 1.5);
         assert_eq!(durable["layout"]["zones"][0]["event_mask"], 15);
 
-        unsafe {
-            PRIMARY_SPLIT_RATIO = 0.8;
-        }
-        remember_resize_proposal(3, 0.8);
+        store_layout_actor_state(
+            &panes,
+            &realms,
+            Some(11),
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+            Some(8),
+            &panes,
+            LayoutStateSize { w: 1000, h: 720 },
+        );
+        assert!((layout_transform(0, &panes, &[1, 1], false).size_u - 1.5).abs() < f32::EPSILON);
+
+        let boundary = LayoutBoundary {
+            axis: 0,
+            fixed: 0.5,
+            start: -1.0,
+            end: 1.0,
+            negative_mask: 1,
+            positive_mask: 2,
+        };
+        apply_boundary(
+            ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+            2,
+            boundary.axis,
+            boundary.negative_mask,
+            boundary.positive_mask,
+            0.8,
+        );
+        remember_resize_proposal(3, boundary, 0.8);
         assert!(handle_synchronized_layout_notification(
             &synchronized_notification("rejected", 3)
         ));
-        assert!((primary_split_ratio() - 0.75).abs() < f32::EPSILON);
-        assert!((durable_primary_split_ratio() - 0.75).abs() < f32::EPSILON);
+        assert!((layout_transform(0, &panes, &[1, 1], true).size_u - 1.5).abs() < f32::EPSILON);
+        assert!((layout_transform(0, &panes, &[1, 1], false).size_u - 1.5).abs() < f32::EPSILON);
 
         // A completion for an older request advances durable state without
         // snapping an already-proposed newer pointer sample backwards.
-        reset_resize_proposal_state(0.5);
-        remember_resize_proposal(10, 0.6);
-        remember_resize_proposal(11, 0.7);
-        unsafe {
-            PRIMARY_SPLIT_RATIO = 0.7;
-        }
+        reset_layout_geometry(&panes, &[1, 1], 1000, 720);
+        apply_boundary(
+            ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+            2,
+            0,
+            1,
+            2,
+            0.2,
+        );
+        remember_resize_proposal(10, boundary, 0.2);
+        apply_boundary(
+            ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+            2,
+            0,
+            1,
+            2,
+            0.4,
+        );
+        remember_resize_proposal(11, boundary, 0.4);
         assert!(handle_synchronized_layout_notification(
             &completed_notification(10, 9)
         ));
         assert_eq!(unsafe { LAYOUT_BASE_PRESENTED_REVISION }, 9);
-        assert!((durable_primary_split_ratio() - 0.6).abs() < f32::EPSILON);
-        assert!((primary_split_ratio() - 0.7).abs() < f32::EPSILON);
+        assert!((layout_transform(0, &panes, &[1, 1], false).size_u - 1.2).abs() < f32::EPSILON);
+        assert!((layout_transform(0, &panes, &[1, 1], true).size_u - 1.4).abs() < f32::EPSILON);
         assert!(handle_synchronized_layout_notification(
             &synchronized_notification("rejected", 11)
         ));
-        assert!((primary_split_ratio() - 0.6).abs() < f32::EPSILON);
-        remember_resize_proposal(12, 0.8);
         unsafe {
-            PRIMARY_SPLIT_RATIO = 0.8;
+            assert!((REQUESTED_LAYOUT[0].size_u - 1.2).abs() < f32::EPSILON);
+            apply_boundary(
+                ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+                2,
+                0,
+                1,
+                2,
+                0.6,
+            );
         }
+        remember_resize_proposal(12, boundary, 0.6);
         assert!(handle_synchronized_layout_notification(
             &synchronized_notification("aborted", 12)
         ));
-        assert!((primary_split_ratio() - 0.6).abs() < f32::EPSILON);
+        assert!((layout_transform(0, &panes, &[1, 1], true).size_u - 1.2).abs() < f32::EPSILON);
         assert_native_window_resize_request();
+    }
+
+    #[test]
+    fn every_shared_boundary_in_a_three_pane_grid_is_draggable() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let panes = [11, 22, 33];
+        let realms = panes.map(|pane| PaneRealm { pane, backend: 1 });
+        store_layout_actor_state(
+            &panes,
+            &realms,
+            Some(11),
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+            Some(3),
+            &panes,
+            LayoutStateSize { w: 1600, h: 900 },
+        );
+        unsafe {
+            NEXT_LAYOUT_REQUEST_ID = 100;
+        }
+
+        let mut output = [0_u8; OUTBOX_BYTES];
+        let initial_len = write_layout_actor_update_outbox(
+            &mut output,
+            &panes,
+            &[1, 1, 1],
+            Some(11),
+            false,
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+        );
+        let initial = host_payload(&output, initial_len);
+        assert_eq!(initial["layout"]["zones"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            initial["layout"]["dividers"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(initial["layout"]["dividers"][0]["axis"], "vertical");
+        assert_eq!(initial["layout"]["dividers"][1]["axis"], "horizontal");
+
+        assert_eq!(
+            handle_layout_pointer(
+                &mut output,
+                &pointer_message_for(
+                    divider_zone_id(0),
+                    "button-press",
+                    0.0,
+                    -0.5,
+                    1,
+                    Some(PRIMARY_BUTTON),
+                ),
+            ),
+            0
+        );
+        let vertical_len = handle_layout_pointer(
+            &mut output,
+            &pointer_message_for(divider_zone_id(0), "motion", 0.25, -0.5, 2, None),
+        );
+        let vertical = host_payload(&output, vertical_len);
+        let items = vertical["fragment"]["layout"]["items"].as_array().unwrap();
+        assert_eq!(items[0]["transform"]["size"]["u"], 1.25);
+        assert_eq!(items[1]["transform"]["offset"]["u"], 0.25);
+        assert_eq!(items[2]["transform"]["size"]["u"], 2.0);
+        let release_len = handle_layout_pointer(
+            &mut output,
+            &pointer_message_for(
+                divider_zone_id(0),
+                "button-release",
+                0.25,
+                -0.5,
+                3,
+                Some(PRIMARY_BUTTON),
+            ),
+        );
+        assert!(release_len > 0);
+        assert!(handle_synchronized_layout_notification(
+            &completed_notification(101, 8)
+        ));
+
+        assert_eq!(
+            handle_layout_pointer(
+                &mut output,
+                &pointer_message_for(
+                    divider_zone_id(1),
+                    "button-press",
+                    0.0,
+                    0.0,
+                    1,
+                    Some(PRIMARY_BUTTON),
+                ),
+            ),
+            0
+        );
+        let horizontal_len = handle_layout_pointer(
+            &mut output,
+            &pointer_message_for(divider_zone_id(1), "motion", 0.0, 0.3, 2, None),
+        );
+        let horizontal = host_payload(&output, horizontal_len);
+        let items = horizontal["fragment"]["layout"]["items"]
+            .as_array()
+            .unwrap();
+        let value = |item: usize, field: &str, axis: &str| {
+            items[item]["transform"][field][axis].as_f64().unwrap()
+        };
+        assert!((value(0, "size", "v") - 1.3).abs() < 0.002);
+        assert!((value(1, "size", "v") - 1.3).abs() < 0.002);
+        assert!((value(2, "offset", "v") - 0.3).abs() < 0.002);
+        assert!((value(2, "size", "v") - 0.7).abs() < 0.002);
+        assert_eq!(
+            horizontal["fragment"]["layout"]["zones"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn maximum_inventory_keeps_all_panes_and_multiple_drag_zones() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let panes = core::array::from_fn::<_, MAX_PANES, _>(|index| index as u64 + 1);
+        let realms = panes.map(|pane| PaneRealm { pane, backend: 1 });
+        store_layout_actor_state(
+            &panes,
+            &realms,
+            Some(1),
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+            Some(3),
+            &panes,
+            LayoutStateSize { w: 1920, h: 1080 },
+        );
+        let mut output = [0_u8; OUTBOX_BYTES];
+        let len = write_layout_actor_update_outbox(
+            &mut output,
+            &panes,
+            &[1; MAX_PANES],
+            Some(1),
+            false,
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+        );
+        let publication = host_payload(&output, len);
+        assert_eq!(
+            publication["layout"]["items"].as_array().map(Vec::len),
+            Some(MAX_PANES)
+        );
+        assert!(publication["layout"]["zones"]
+            .as_array()
+            .is_some_and(|zones| zones.len() > 1));
     }
 
     fn assert_native_window_resize_request() {
@@ -2404,7 +3127,7 @@ mod tests {
                 event_sequence: None,
                 request_id: 9,
                 native_resize_revision: Some(41),
-                split_ratio: durable_primary_split_ratio(),
+                use_requested_geometry: false,
             },
         );
         let messages = host_payloads(&output, len);
@@ -2433,6 +3156,9 @@ mod tests {
 
     #[test]
     fn delegated_region_reply_echoes_the_exact_host_epoch_and_lease() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let decoded: WorkspaceMessage = decode_json(
             br#"{"type":"layout-region-resized","resize_epoch":{"id":31,"lease":1,"lease_generation":4,"base_layout_revision":7,"target_layout_revision":8},"lease":{"id":5,"generation":2},"size":{"w":900,"h":600},"scale":1.5}"#,
         )

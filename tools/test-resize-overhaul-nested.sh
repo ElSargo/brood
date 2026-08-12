@@ -388,7 +388,7 @@ start_proof_client() {
       && rg -q "settled presentation window resize .*to=${MODE_WIDTH}x${MODE_HEIGHT} .*elapsed_ms=[0-9]+$" "$CLIENT_LOG" \
       && [[ -n "$final_diagnostics_line" && "$target_scene_panes" -eq 2 ]] \
       && [[ -n "$startup_native_line" ]] \
-      && rg -q 'resize-present .*event_sequence=0 .*divider_x=[0-9]+ .*phase=settled .*superseded_epochs=[0-9]+$' "$CLIENT_LOG"; then
+      && rg -q 'resize-present .*event_sequence=0 .*divider_x=[0-9]+ .*phase=(settled|promoted) .*superseded_epochs=[0-9]+$' "$CLIENT_LOG"; then
       return 0
     fi
     kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -589,7 +589,7 @@ PY
   FRAME_INDEX=$((FRAME_INDEX + 1))
 }
 
-wait_resize_trace 0 settled 1
+wait_resize_trace 0 'settled|promoted' 1
 capture_frame initial-settled 0 initial -1 -1
 INITIAL_DIVIDER_X="$(sed -n 's/.* divider_x=\(-\{0,1\}[0-9][0-9]*\) .*/\1/p' <<< "$TRACE_TEXT")"
 [[ -n "$INITIAL_DIVIDER_X" && "$INITIAL_DIVIDER_X" -ge 0 ]]
@@ -1056,7 +1056,7 @@ start_proof_client \
   degraded \
   resize-proof-stall-after-first \
   resize-proof-gated-fast
-wait_resize_trace 0 settled 1
+wait_resize_trace 0 'settled|promoted' 1
 capture_frame timeout-initial-settled 0 initial -1 -1
 TIMEOUT_DIVIDER_X="$(sed -n 's/.* divider_x=\(-\{0,1\}[0-9][0-9]*\) .*/\1/p' <<< "$TRACE_TEXT")"
 [[ -n "$TIMEOUT_DIVIDER_X" && "$TIMEOUT_DIVIDER_X" -ge 0 ]]

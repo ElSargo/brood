@@ -242,22 +242,32 @@ CLIENT_PID=$!
 
 for _ in $(seq 1 1200); do
   TERMINAL_UI_PANE="$(sed -n 's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -n 1)"
-  READY_DIVIDER="$(awk '
+  SESSION_SWITCHER_PANE="$(sed -n 's/.*started presentation WASM actor id=session-switcher .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -n 1)"
+  # Child layouts can publish several earlier dividers. Derive the root shell
+  # boundary from its visible sidebar instead of selecting arbitrary chrome.
+  READY_DIVIDER="$(awk -v pane="$SESSION_SWITCHER_PANE" '
+    pane != "" && index($0, "accepted plugin draw packet pane=" pane " ") != 0 \
+      && $0 ~ /gpu_target=[0-9]+x/ {
+        sidebar = $0;
+        sub(/^.* gpu_target=/, "", sidebar);
+        sub(/x.*/, "", sidebar);
+      }
     index($0, "granted rest layout lease ") != 0 \
       && index($0, " actor=workspace panes=4") != 0 { rest = NR; next }
     rest > 0 && index($0, "resize-present ") != 0 \
       && index($0, " phase=settled ") != 0 \
-      && $0 ~ /divider_x=[0-9]+/ {
-        divider = $0;
-        sub(/^.* divider_x=/, "", divider);
-        sub(/ .*/, "", divider);
-        print NR "\t" divider;
+      && $0 ~ /composition_size=[0-9]+x/ && sidebar > 0 {
+        composition = $0;
+        sub(/^.* composition_size=/, "", composition);
+        sub(/x.*/, "", composition);
+        print NR "\t" composition - sidebar;
         exit;
       }
   ' "$CLIENT_LOG")"
   if rg -q 'granted claimed root layout lease actor=session-switcher ' "$CLIENT_LOG" \
     && rg -q 'granted rest layout lease .* actor=workspace panes=4' "$CLIENT_LOG" \
     && rg -q 'started component plugin actor actor=brood[.]session[.][0-9]+[.]terminal-session ' "$SERVER_LOG" \
+    && [[ -n "$SESSION_SWITCHER_PANE" ]] \
     && [[ -n "$TERMINAL_UI_PANE" ]] \
     && rg -q "accepted plugin draw packet pane=$TERMINAL_UI_PANE " "$CLIENT_LOG" \
     && [[ "$(rg -c 'uploaded window shared-memory image' "$CLIENT_LOG" || true)" -ge 2 ]] \
@@ -269,6 +279,7 @@ for _ in $(seq 1 1200); do
 done
 rg -q 'granted rest layout lease .* actor=workspace panes=4' "$CLIENT_LOG"
 rg -q 'started component plugin actor actor=brood[.]session[.][0-9]+[.]terminal-session ' "$SERVER_LOG"
+[[ -n "$SESSION_SWITCHER_PANE" ]]
 [[ -n "$TERMINAL_UI_PANE" ]]
 rg -q "accepted plugin draw packet pane=$TERMINAL_UI_PANE " "$CLIENT_LOG"
 [[ -n "$READY_DIVIDER" ]]
@@ -413,20 +424,26 @@ NATIVE_PREP_RESIZE_LINE="$WAIT_LINE"; NATIVE_PREP_RESIZE_TEXT="$WAIT_TEXT"
 NATIVE_LOGICAL_WIDTH=820
 read -r NATIVE_CURRENT_COMPOSITION NATIVE_CURRENT_DIVIDER NATIVE_CURRENT_B_WIDTH \
   NATIVE_EXPECTED_COMPOSITION NATIVE_EXPECTED_B_WIDTH < <(
-  python3 - "$NATIVE_PREP_RESIZE_TEXT" "$NATIVE_PREP_ACCEPT_TEXT" "$VIEW_PANE_B" \
+  python3 - "$NATIVE_PREP_RESIZE_TEXT" "$NATIVE_PREP_ACCEPT_TEXT" \
+    "$VIEW_PANE_B" "$SESSION_SWITCHER_PANE" \
     "$NATIVE_LOGICAL_WIDTH" "$OUTPUT_SCALE" <<'PY'
 import re, sys
 promoted, accepted = sys.argv[1:3]
 pane = int(sys.argv[3])
-logical_width, scale = int(sys.argv[4]), float(sys.argv[5])
+shell_pane = int(sys.argv[4])
+logical_width, scale = int(sys.argv[5]), float(sys.argv[6])
 composition = int(re.search(r" composition_size=(\d+)x", promoted).group(1))
-divider = int(re.search(r" divider_x=(\d+)", promoted).group(1))
 target = re.search(rf"(?:\[|,){pane}:-?\d+:-?\d+:(\d+):\d+", accepted)
-if target is None or divider <= 0:
+shell = re.search(
+    rf"(?:\[|,){shell_pane}:(-?\d+):-?\d+:(\d+):\d+", accepted
+)
+if target is None or shell is None:
+    raise SystemExit(1)
+divider, sidebar = map(int, shell.groups())
+if divider <= 0 or divider + sidebar != composition:
     raise SystemExit(1)
 current_b = int(target.group(1))
 expected_composition = round(logical_width * scale)
-sidebar = composition - divider
 expected_rest = expected_composition - sidebar
 expected_b = round(expected_rest * current_b / divider)
 print(composition, divider, current_b, expected_composition, expected_b)

@@ -14518,6 +14518,7 @@ impl Renderer {
     fn visible_plugin_panes(&self) -> Vec<u64> {
         visible_plugin_panes_for_realm(
             &self.plugin_pane_realms,
+            self.plugin_panes.keys().copied(),
             self.active_backend,
             self.active_session,
         )
@@ -15296,13 +15297,17 @@ fn plugin_pane_is_visible(
 
 fn visible_plugin_panes_for_realm(
     pane_realms: &BTreeMap<u64, Option<(BackendId, u64)>>,
+    drawable_panes: impl IntoIterator<Item = u64>,
     active_backend: Option<BackendId>,
     active_session: u64,
 ) -> Vec<u64> {
+    let drawable_panes = drawable_panes.into_iter().collect::<BTreeSet<_>>();
     pane_realms
         .iter()
         .filter_map(|(pane, realm)| {
-            plugin_pane_is_visible(*realm, active_backend, active_session).then_some(*pane)
+            (drawable_panes.contains(pane)
+                && plugin_pane_is_visible(*realm, active_backend, active_session))
+            .then_some(*pane)
         })
         .collect()
 }
@@ -19140,15 +19145,19 @@ mod tests {
     }
 
     #[test]
-    fn declared_plugin_panes_are_visible_before_their_first_graphics_packet() {
+    fn declared_plugin_panes_join_the_layout_after_their_first_graphics_packet() {
         let panes = BTreeMap::from([
             (11, None),
             (12, Some((BackendId(1), 7))),
             (13, Some((BackendId(1), 8))),
         ]);
 
+        assert!(
+            visible_plugin_panes_for_realm(&panes, [], Some(BackendId(1)), 7).is_empty(),
+            "a declared pane without drawable content must not reserve a layout cell"
+        );
         assert_eq!(
-            visible_plugin_panes_for_realm(&panes, Some(BackendId(1)), 7),
+            visible_plugin_panes_for_realm(&panes, [11, 12, 13], Some(BackendId(1)), 7),
             [11, 12]
         );
         let inventory = pane_inventory_from_catalogs(&panes, &[]);

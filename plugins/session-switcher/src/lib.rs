@@ -4067,7 +4067,11 @@ fn resize_paint_plan(
 fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePaintPlan) {
     let result = match paint {
         ResizePaintPlan::OrdinaryRedraw => redraw(state, None),
-        ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch)),
+        ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch))
+            // A newer shell transaction can settle before this actor handles
+            // its resize notification. The old epoch is then no longer a
+            // valid staging target, but the pane still needs a current frame.
+            .or_else(|_tagged_error| redraw(state, None)),
         ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch)
             .or_else(|_reuse_error| redraw(state, Some(resize_epoch)).map(|_| ())),
     };
@@ -4435,10 +4439,13 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
         state.width - 28.0,
     )?;
 
-    resize_epoch.map_or_else(
+    if let Err(error) = resize_epoch.map_or_else(
         || submit_packet(state.pane, &packet),
         |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
-    )?;
+    ) {
+        drop_resources(state.pane, resources);
+        return Err(error);
+    }
     drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())
