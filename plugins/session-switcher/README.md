@@ -40,11 +40,11 @@ the current session's registry, and selecting an entry starts a coding-agent
 UI already bound to that session and agent. The UI remains independently
 addressed and its tab bar continues to follow the whole session registry.
 
-The init actor also owns the diff viewer's pane lifecycle. `Ctrl+Alt+D` starts
-one diff actor per session with narrow read-only workspace and
-`subprocess:git` capabilities, or focuses that actor when it is already open.
-The diff viewer stays an ordinary workspace pane and does not participate in
-the switcher's root layout policy.
+The init actor also owns the diff viewer's pane lifecycle. Each session has an
+independent diff item. `Ctrl+Alt+D` toggles the active session's actor, started
+with narrow read-only workspace and `subprocess:git` capabilities. The diff
+viewer stays an ordinary workspace pane and does not participate in the
+switcher's root layout policy.
 
 `Ctrl+Alt+T` creates a new paired terminal session actor and terminal UI; there
 is no per-session terminal limit. `Ctrl+Alt+Q` closes the focused managed or

@@ -169,7 +169,7 @@ shortcuts or wrapper arguments:
 - `Ctrl+Alt+E` opens or focuses the active session's client-local Wasm Neovim
   pane;
 - `Ctrl+Alt+P` opens the reusable fuzzy session picker;
-- `Ctrl+Alt+D` opens or focuses the active session's single project-diff pane;
+- `Ctrl+Alt+D` toggles the active session's project-diff pane;
 - `Ctrl+Alt+Q` closes the focused managed or plugin pane;
 - `Ctrl+J` and `Ctrl+K` cycle focus through the presentation's managed
   windows;

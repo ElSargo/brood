@@ -1,9 +1,9 @@
 # Diff Viewer Plugin
 
 The diff viewer is a session-scoped, read-only project diff. It opens as an
-ordinary workspace pane. Each surface session can own one viewer:
-`Ctrl+Alt+D` opens it or focuses the existing pane, and `Ctrl+Alt+Q` closes the
-focused pane.
+ordinary workspace pane. Each surface session has an independent viewer item:
+`Ctrl+Alt+D` toggles that session's viewer, and `Ctrl+Alt+Q` closes the focused
+pane.
 
 The pane follows Zed's project-diff shape: every changed file appears in one
 continuous, scrollable surface and changed lines are aligned in a split view.

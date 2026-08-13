@@ -1903,7 +1903,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
         };
         let backend_id = state.backend_id;
         let session_id = state.session_id;
-        return show_diff(&mut state, backend_id, session_id);
+        return toggle_diff(&mut state, backend_id, session_id);
     }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalActionMessage>(bytes)
         && consumed == bytes.len()
@@ -2066,6 +2066,14 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
         }
         state.agents = message.agents;
         if state.agent_picker_pending && !state.agents.is_empty() {
+            // When the shortcut had to wait for the session's first agent,
+            // there is no choice to present. Open that agent directly rather
+            // than flashing an empty/stale picker after its creation.
+            if state.agents.len() == 1 {
+                state.agent_picker_pending = false;
+                let agent = state.agents[0].id.clone();
+                return open_coding_agent_ui(&mut state, agent);
+            }
             return open_agent_picker(&mut state);
         }
         return Vec::new();
@@ -2228,7 +2236,7 @@ fn handle_editor_message(sender: &str, message: EditorMessage) -> Vec<ActorComma
                 return Vec::new();
             };
             match message.action.as_str() {
-                "diff" => show_diff(&mut state, backend_id, session_id),
+                "diff" => toggle_diff(&mut state, backend_id, session_id),
                 "terminal" => {
                     let Ok(body) = serde_json::to_vec(&serde_json::json!({
                         "kind": "create-terminal",
@@ -2317,13 +2325,10 @@ fn sender_actor_is(sender: &str, expected: &str) -> bool {
     sender.rsplit(':').next() == Some(expected)
 }
 
-fn show_diff(state: &mut SwitcherState, backend_id: u64, session_id: u64) -> Vec<ActorCommand> {
+fn toggle_diff(state: &mut SwitcherState, backend_id: u64, session_id: u64) -> Vec<ActorCommand> {
     let id = format!("{DIFF_VIEWER_ID_PREFIX}b{backend_id}-s{session_id}");
-    if state.diff_viewers.contains(&id) {
-        vec![ActorCommand::SendLocalMessage(LocalActorMessage {
-            actor: id,
-            body: br#"{"kind":"focus"}"#.to_vec(),
-        })]
+    if state.diff_viewers.remove(&id) {
+        vec![ActorCommand::StopActor(id)]
     } else {
         state.diff_viewers.insert(id.clone());
         vec![start_diff_viewer(&id, backend_id, session_id)]
@@ -2618,6 +2623,10 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
         state.status = "The selected agent is no longer available".to_string();
         return Vec::new();
     }
+    open_coding_agent_ui(&mut state, agent)
+}
+
+fn open_coding_agent_ui(state: &mut SwitcherState, agent: String) -> Vec<ActorCommand> {
     let id = format!(
         "coding-agent-ui-b{}-s{}-{}",
         state.backend_id, state.session_id, state.next_coding_agent_ui
@@ -4528,8 +4537,8 @@ mod tests {
         ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
         open_creation_backend_picker, publish_layout, publish_synchronized_layout,
         publish_layout_region_response, request_creation_backend_picker, request_editor,
-        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus, show_diff,
-        start_neovim_client, submit, truncate_to_width, update_creation_backend_picker,
+        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus, start_neovim_client,
+        submit, toggle_diff, truncate_to_width, update_creation_backend_picker,
         valid_editor_actor_target,
     };
 
@@ -5529,9 +5538,9 @@ mod tests {
     }
 
     #[test]
-    fn editor_diff_request_reuses_one_preferred_session_viewer() {
+    fn diff_viewers_are_independent_toggleable_session_items() {
         let mut state = SwitcherState::new();
-        let first = show_diff(&mut state, 3, 9);
+        let first = toggle_diff(&mut state, 3, 9);
         let [ActorCommand::StartActor(started)] = first.as_slice() else {
             panic!("first diff request did not start a viewer");
         };
@@ -5548,12 +5557,20 @@ mod tests {
             ["filesystem:workspace-read", "subprocess:git"]
         );
 
-        let second = show_diff(&mut state, 3, 9);
-        let [ActorCommand::SendLocalMessage(focus)] = second.as_slice() else {
-            panic!("second diff request did not focus the viewer");
+        let other = toggle_diff(&mut state, 3, 10);
+        let [ActorCommand::StartActor(other)] = other.as_slice() else {
+            panic!("another session did not start its own viewer");
         };
-        assert_eq!(focus.actor, "diff-viewer-sb3-s9");
-        assert_eq!(focus.body, br#"{"kind":"focus"}"#);
+        assert_eq!(other.id, "diff-viewer-sb3-s10");
+        assert_eq!(state.diff_viewers.len(), 2);
+
+        let second = toggle_diff(&mut state, 3, 9);
+        let [ActorCommand::StopActor(stopped)] = second.as_slice() else {
+            panic!("second diff request did not toggle off the viewer");
+        };
+        assert_eq!(stopped, "diff-viewer-sb3-s9");
+        assert_eq!(state.diff_viewers.len(), 1);
+        assert!(state.diff_viewers.contains("diff-viewer-sb3-s10"));
     }
 
     #[test]
