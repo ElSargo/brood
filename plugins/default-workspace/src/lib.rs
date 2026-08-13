@@ -1097,13 +1097,18 @@ fn layout_waitable_panes() -> &'static [u64] {
     }
 }
 
-fn layout_geometry_matches(panes: &[u64], pane_backends: &[u64], width: i32, height: i32) -> bool {
-    unsafe {
-        if LAYOUT_GEOMETRY_VIEWPORT_WIDTH != width || LAYOUT_GEOMETRY_VIEWPORT_HEIGHT != height {
-            return false;
-        }
-    }
+fn layout_geometry_is_reusable(
+    panes: &[u64],
+    pane_backends: &[u64],
+    width: i32,
+    height: i32,
+) -> bool {
     layout_geometry_topology_matches(panes, pane_backends)
+        && unsafe {
+            LAYOUT_GEOMETRY_CUSTOMIZED
+                || (LAYOUT_GEOMETRY_VIEWPORT_WIDTH == width
+                    && LAYOUT_GEOMETRY_VIEWPORT_HEIGHT == height)
+        }
 }
 
 fn layout_geometry_topology_matches(panes: &[u64], pane_backends: &[u64]) -> bool {
@@ -1166,7 +1171,7 @@ fn layout_transform(
     use_requested: bool,
 ) -> LayoutTransform {
     let (width, height) = unsafe { (LAYOUT_VIEWPORT_WIDTH, LAYOUT_VIEWPORT_HEIGHT) };
-    if layout_geometry_matches(panes, pane_backends, width, height) {
+    if layout_geometry_is_reusable(panes, pane_backends, width, height) {
         unsafe {
             let source = if use_requested {
                 ptr::addr_of!(REQUESTED_LAYOUT).cast::<LayoutTransform>()
@@ -3202,6 +3207,64 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+    }
+
+    #[test]
+    fn delegated_region_resize_preserves_customized_split_geometry() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let panes = [11, 22];
+        let backends = [1, 1];
+        reset_layout_geometry(&panes, &backends, 1000, 720);
+        unsafe {
+            apply_boundary(
+                ptr::addr_of_mut!(DURABLE_LAYOUT).cast::<LayoutTransform>(),
+                panes.len(),
+                0,
+                1,
+                2,
+                0.5,
+            );
+            LAYOUT_GEOMETRY_CUSTOMIZED = true;
+            // A parent region resize is delivered before the next ordinary
+            // layout-state publication updates the durable viewport record.
+            LAYOUT_VIEWPORT_WIDTH = 1400;
+            LAYOUT_VIEWPORT_HEIGHT = 900;
+        }
+
+        let mut output = [0_u8; OUTBOX_BYTES];
+        let len = write_layout_region_outbox(
+            &mut output,
+            &panes,
+            &backends,
+            Some(11),
+            false,
+            LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            },
+            9,
+            LayoutNotificationEpoch {
+                id: 31,
+                lease: 1,
+                lease_generation: 4,
+                base_layout_revision: 7,
+                target_layout_revision: 8,
+            },
+        );
+        let response = host_payload(&output, len);
+        let items = response["fragment"]["layout"]["items"]
+            .as_array()
+            .expect("region response has pane items");
+        assert_eq!(items[0]["transform"]["size"]["u"], 1.5);
+        assert_eq!(items[1]["transform"]["offset"]["u"], 0.5);
+        assert_eq!(items[1]["transform"]["size"]["u"], 0.5);
+        reset_layout_geometry(&panes, &backends, 1000, 720);
+        unsafe {
+            LAYOUT_VIEWPORT_WIDTH = 1000;
+            LAYOUT_VIEWPORT_HEIGHT = 720;
+        }
     }
 }
 

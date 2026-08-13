@@ -3092,10 +3092,6 @@ impl ShellColumnGeometry {
         self.rest_width / self.width
     }
 
-    fn sidebar_fraction(self) -> f64 {
-        self.sidebar_width / self.width
-    }
-
     fn inbox_fraction(self) -> f64 {
         self.inbox_width / self.width
     }
@@ -3236,22 +3232,26 @@ fn publish_layout(
         state.sidebar_width,
         state.inbox_width,
     );
-    let sidebar_fraction = columns.sidebar_fraction();
     let inbox_fraction = columns.inbox_fraction();
     let rest_fraction = columns.rest_fraction();
     let sidebar_offset = -1.0 + 2.0 * rest_fraction;
-    let sidebar_size = 2.0 * sidebar_fraction;
     let inbox_offset = 1.0 - 2.0 * inbox_fraction;
-    let inbox_size = 2.0 * inbox_fraction;
-    let rest_size = 2.0 * rest_fraction;
+    // Derive edge-touching extents from their endpoints.  Computing an offset
+    // and its extent independently can serialize a mathematically exact edge
+    // as a value just beyond 1.0, which the host correctly rejects.  Keeping
+    // one shared boundary also prevents gaps between the shell columns.
+    let sidebar_end = if inbox_visible { inbox_offset } else { 1.0 };
+    let sidebar_size = sidebar_end - sidebar_offset;
+    let inbox_size = 1.0 - inbox_offset;
+    let rest_size = sidebar_offset + 1.0;
     let status_fraction = if status_bar_visible {
         (STATUS_BAR_HEIGHT / height).clamp(0.03, 0.14)
     } else {
         0.0
     };
-    let content_size = 2.0 * (1.0 - status_fraction);
     let status_offset = 1.0 - 2.0 * status_fraction;
-    let status_size = 2.0 * status_fraction;
+    let content_size = status_offset + 1.0;
+    let status_size = 1.0 - status_offset;
 
     let mut commands = vec![ActorCommand::SendHostMessage(
         format!(
@@ -4601,6 +4601,91 @@ mod tests {
         assert_eq!(switcher["transform"]["size"]["u"], 0.5);
         assert!(!items.iter().any(|item| item["id"] == 3));
         assert!(value.get("rest").is_none());
+    }
+
+    #[test]
+    fn shell_toggle_layout_keeps_edge_anchored_panes_inside_normalized_bounds() {
+        let mut state = SwitcherState::new();
+        state.pane = u64::MAX;
+        state.keybindings_pane = Some(u64::MAX - 2);
+        state.inbox_pane = Some(u64::MAX - 3);
+        state.status_bar_pane = Some(u64::MAX - 4);
+        state.picker_pane = Some(u64::MAX - 1);
+        state.inbox_visible = true;
+        let workspace = 7;
+        let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(
+            visible_panes
+                .extend_from_slice(&[
+                    state.pane,
+                    state.picker_pane.unwrap(),
+                    state.keybindings_pane.unwrap(),
+                    state.inbox_pane.unwrap(),
+                    state.status_bar_pane.unwrap(),
+                    workspace,
+                ])
+                .is_ok()
+        );
+        state.layout = Some(LayoutContext {
+            revision: 23,
+            presented_layout_revision: 22,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes: visible_panes.clone(),
+            presented_panes: visible_panes.clone(),
+            visible_panes,
+            focused_pane: Some(workspace),
+            size: LayoutStateSize {
+                w: 1365,
+                height: 767,
+            },
+            rest: true,
+        });
+
+        for sidebar_visible in [false, true] {
+            state.sidebar_visible = sidebar_visible;
+            let commands = publish_synchronized_layout(
+                &mut state,
+                Some(workspace),
+                "sidebar",
+                None,
+            );
+            let value: serde_json::Value =
+                serde_json::from_slice(host_command(&commands, "submit-synchronized-layout"))
+                    .expect("valid toggle layout JSON");
+            for item in value["fragment"]["layout"]["items"]
+                .as_array()
+                .expect("layout items")
+            {
+                for axis in ["u", "v"] {
+                    let offset = item["transform"]["offset"][axis]
+                        .as_f64()
+                        .expect("numeric offset");
+                    let size = item["transform"]["size"][axis]
+                        .as_f64()
+                        .expect("numeric size");
+                    assert!(offset >= -1.0, "item {} starts before {axis}", item["id"]);
+                    assert!(
+                        offset + size <= 1.0,
+                        "item {} ends after {axis}: {offset} + {size}",
+                        item["id"]
+                    );
+                }
+            }
+            let status = value["fragment"]["layout"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == u64::MAX - 4)
+                .expect("status bar item");
+            assert_eq!(
+                status["transform"]["offset"]["v"].as_f64().unwrap()
+                    + status["transform"]["size"]["v"].as_f64().unwrap(),
+                1.0
+            );
+        }
     }
 
     #[test]
