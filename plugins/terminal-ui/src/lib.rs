@@ -11,6 +11,7 @@ use brood_plugin_sdk::{
         Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
         WorkerRequest,
     },
+    graphics::submit_encoded_packet_for_resize,
     input::{
         BUTTON_MIDDLE as MIDDLE_BUTTON, BUTTON_PRIMARY as LEFT_BUTTON, MOD_ALT, MOD_CTRL, MOD_SHIFT,
     },
@@ -1375,16 +1376,8 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
     let bytes = packet
         .encode()
         .map_err(|error| format!("encode terminal draw packet: {error}"))?;
-    let submit_result = resize_epoch.map_or_else(
-        || {
-            host::graphics_submit_draw_packet(pane, &bytes)
-                .map_err(|error| format!("submit terminal draw packet: {error:?}"))
-        },
-        |resize_epoch| {
-            host::graphics_submit_tagged_draw_packet(pane, resize_epoch, &bytes)
-                .map_err(|error| format!("submit tagged terminal draw packet: {error:?}"))
-        },
-    );
+    let submit_result = submit_encoded_packet_for_resize(pane, resize_epoch, &bytes)
+        .map_err(|error| format!("submit terminal draw packet: {error}"));
     if let Err(error) = submit_result {
         if let Ok(mut guard) = STATE.lock()
             && let Some(state) = guard.as_mut()

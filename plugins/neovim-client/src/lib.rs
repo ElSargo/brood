@@ -11,6 +11,7 @@ use brood_plugin_sdk::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
         PresentationEvent, SessionActorMessage, StartContext, WorkerEvent, WorkerRequest,
     },
+    graphics::submit_packet_for_resize,
     input::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER},
 };
 use serde_json::{Map, Value, json};
@@ -1606,17 +1607,8 @@ fn redraw_with_layouts(
             (state.width - PADDING * 2.0).max(40.0),
         )?;
     }
-    let bytes = packet.encode().map_err(|error| error.to_string())?;
-    resize_epoch.map_or_else(
-        || {
-            host::graphics_submit_draw_packet(state.pane, &bytes)
-                .map_err(|error| format!("submit Neovim screen: {error:?}"))
-        },
-        |resize_epoch| {
-            host::graphics_submit_tagged_draw_packet(state.pane, resize_epoch, &bytes)
-                .map_err(|error| format!("submit tagged Neovim screen: {error:?}"))
-        },
-    )?;
+    submit_packet_for_resize(state.pane, resize_epoch, &packet)
+        .map_err(|error| format!("submit Neovim screen: {error}"))?;
 
     let stale = layouts
         .iter()

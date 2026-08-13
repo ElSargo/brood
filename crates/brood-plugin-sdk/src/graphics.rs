@@ -73,6 +73,98 @@ pub fn submit_tagged_packet(pane: u64, resize_epoch: u64, packet: &Packet) -> Re
         .map_err(|error| format!("submit tagged plugin draw packet: {error:?}"))
 }
 
+/// Submit a replacement packet for an ordinary draw or synchronized resize.
+///
+/// Resize epochs can be superseded while a guest is shaping text or building
+/// its packet. An inactive epoch is an expected race, so retry that packet as
+/// an ordinary draw. The host either presents it immediately or defers it
+/// behind the newer active resize. All other tagged-submit errors remain
+/// failures.
+pub fn submit_packet_for_resize(
+    pane: u64,
+    resize_epoch: Option<u64>,
+    packet: &Packet,
+) -> Result<u64, String> {
+    let bytes = packet
+        .encode()
+        .map_err(|error| format!("encode plugin draw packet: {error}"))?;
+    submit_encoded_packet_for_resize(pane, resize_epoch, &bytes)
+}
+
+/// Submit an already encoded replacement packet with stale-epoch recovery.
+pub fn submit_encoded_packet_for_resize(
+    pane: u64,
+    resize_epoch: Option<u64>,
+    bytes: &[u8],
+) -> Result<u64, String> {
+    submit_with_resize_recovery(
+        resize_epoch,
+        || host::graphics_submit_draw_packet(pane, bytes),
+        |resize_epoch| host::graphics_submit_tagged_draw_packet(pane, resize_epoch, bytes),
+    )
+}
+
+fn submit_with_resize_recovery(
+    resize_epoch: Option<u64>,
+    mut submit_ordinary: impl FnMut() -> Result<u64, host::GraphicsError>,
+    submit_tagged: impl FnOnce(u64) -> Result<u64, host::GraphicsError>,
+) -> Result<u64, String> {
+    let Some(resize_epoch) = resize_epoch else {
+        return submit_ordinary().map_err(|error| format!("submit plugin draw packet: {error:?}"));
+    };
+    match submit_tagged(resize_epoch) {
+        Ok(sequence) => Ok(sequence),
+        Err(host::GraphicsError::InvalidArgument) => submit_ordinary().map_err(|error| {
+            format!("submit plugin draw packet after stale resize epoch: {error:?}")
+        }),
+        Err(error) => Err(format!("submit tagged plugin draw packet: {error:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn stale_resize_epoch_retries_as_an_ordinary_draw() {
+        let ordinary_calls = Cell::new(0);
+        let tagged_epoch = Cell::new(0);
+        let result = submit_with_resize_recovery(
+            Some(41),
+            || {
+                ordinary_calls.set(ordinary_calls.get() + 1);
+                Ok(9)
+            },
+            |epoch| {
+                tagged_epoch.set(epoch);
+                Err(host::GraphicsError::InvalidArgument)
+            },
+        );
+
+        assert_eq!(result, Ok(9));
+        assert_eq!(tagged_epoch.get(), 41);
+        assert_eq!(ordinary_calls.get(), 1);
+    }
+
+    #[test]
+    fn non_epoch_errors_remain_failures() {
+        let ordinary_calls = Cell::new(0);
+        let result = submit_with_resize_recovery(
+            Some(41),
+            || {
+                ordinary_calls.set(ordinary_calls.get() + 1);
+                Ok(9)
+            },
+            |_epoch| Err(host::GraphicsError::InvalidPacket),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(ordinary_calls.get(), 0);
+    }
+}
+
 /// Mark one synchronized resize ready using the pane's current visible content.
 pub fn reuse_pane_content(pane: u64, resize_epoch: u64) -> Result<(), String> {
     host::graphics_reuse_pane_content(pane, resize_epoch)

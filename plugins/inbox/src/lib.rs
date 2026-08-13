@@ -7,7 +7,7 @@ use brood_plugin_sdk::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
     },
     graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet, submit_tagged_packet,
+        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
     },
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::one_line,
@@ -474,10 +474,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             state.width - 24.0,
         )?;
     }
-    resize_epoch.map_or_else(
-        || submit_packet(state.pane, &packet),
-        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
-    )?;
+    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
     drop_resources(state.pane, stale_resources);
     state.text_resources = resources;
     state.error.clear();

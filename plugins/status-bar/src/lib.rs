@@ -7,7 +7,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage,
         PresentationEvent, SessionEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
 };
 use serde::Deserialize;
 
@@ -198,10 +198,7 @@ fn submit_redraw_packet(
     resize_epoch: Option<u64>,
     packet: &Packet,
 ) -> Result<u64, String> {
-    resize_epoch.map_or_else(
-        || submit_packet(pane, packet),
-        |resize_epoch| submit_tagged_packet(pane, resize_epoch, packet),
-    )
+    submit_packet_for_resize(pane, resize_epoch, packet)
 }
 
 fn status_bar_text(state: &StatusBarState, width: f32) -> String {

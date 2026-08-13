@@ -12,7 +12,7 @@ use brood_plugin_sdk::{
         ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
         WorkerEvent, WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
 };
 use serde::{Deserialize, Serialize};
@@ -1679,10 +1679,7 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     draw_prompt(ui, &mut packet);
     let submitted = ui.draw_error.take().map_or_else(
         || {
-            resize_epoch.map_or_else(
-                || submit_packet(ui.pane, &packet).map(|_| ()),
-                |resize_epoch| submit_tagged_packet(ui.pane, resize_epoch, &packet).map(|_| ()),
-            )
+            submit_packet_for_resize(ui.pane, resize_epoch, &packet).map(|_| ())
         },
         Err,
     );

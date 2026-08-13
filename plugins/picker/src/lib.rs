@@ -8,7 +8,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet, submit_tagged_packet},
+    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::sleep,
     text::{truncate, truncate_to_width},
@@ -1232,10 +1232,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         width: 1.0,
     });
 
-    resize_epoch.map_or_else(
-        || submit_packet(state.pane, &packet),
-        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
-    )?;
+    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
     drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())

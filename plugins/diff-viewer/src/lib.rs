@@ -12,7 +12,7 @@ use brood_plugin_sdk::{
         WorkerRequest,
     },
     graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet, submit_tagged_packet,
+        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
     },
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::run_process,
@@ -666,10 +666,7 @@ fn redraw_with_layouts(
         state.width - 28.0,
     )?;
 
-    resize_epoch.map_or_else(
-        || submit_packet(state.pane, &packet),
-        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
-    )?;
+    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
 
     let stale = text_resources
         .layouts

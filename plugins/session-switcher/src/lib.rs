@@ -13,7 +13,7 @@ use brood_plugin_sdk::{
         SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
     },
     graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet, submit_tagged_packet,
+        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
     },
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
     text::truncate_to_width,
@@ -4439,10 +4439,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
         state.width - 28.0,
     )?;
 
-    if let Err(error) = resize_epoch.map_or_else(
-        || submit_packet(state.pane, &packet),
-        |resize_epoch| submit_tagged_packet(state.pane, resize_epoch, &packet),
-    ) {
+    if let Err(error) = submit_packet_for_resize(state.pane, resize_epoch, &packet) {
         drop_resources(state.pane, resources);
         return Err(error);
     }
