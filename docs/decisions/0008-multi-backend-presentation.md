@@ -77,7 +77,7 @@ The migration order is:
 3. move renderer inventory, focus, frame resources, and input routing to
    qualified pane keys;
 4. make client actors and layout state consume the global catalogue; and
-5. add local-plus-remote and two-local-backend behavior proofs.
+5. add local reconnect and local-plus-remote behavior proofs.
 
 ## Session creation
 
@@ -106,13 +106,18 @@ with an entropy suffix. Session numbers do not seed names, so independently
 started local and remote backends do not deterministically present the same
 initial name.
 
-Creating a local backend attaches another session-server connection to the
-same presentation. Connecting a remote backend starts a packaged SSH deployer
-whose lifetime pipe belongs to the client, then attaches the returned
-authenticated endpoint. Closing the client or disconnecting that backend
-closes the pipe and stops the remote session. Both paths publish the resulting
-backend and its session inventory through the same registry, so the view does
-not need a separate local or remote creation path.
+The local action resolves the client's configured control target. It reconnects
+to that backend and imports its complete session catalogue when the target is
+already present, and starts it only when discovery fails. A connected local
+backend remains a creation target for new sessions instead of being offered as
+another backend to start.
+
+Connecting a remote backend starts a packaged SSH deployer whose lifetime pipe
+belongs to the client, then attaches the returned authenticated endpoint.
+Closing the client or disconnecting that backend closes the pipe and stops the
+remote session. Both paths publish the resulting backend and its session
+inventory through the same registry, so the view does not need a separate
+local or remote creation path.
 
 The packaged SSH deployment workflow keeps both the deployed remote backend
 and the ordinary local backend connected. Each connected backend's active

@@ -541,16 +541,20 @@ fn main() -> Result<()> {
     let backend_deployer = backend_deployer_path();
     let mut backend_registry = BackendRegistry::default();
     let mut remote_config_template = None;
-    let local_server_template = if args.no_server {
+    let local_backend_template = if args.no_server {
         None
     } else {
         let mut server = ServerLaunch::discover()?;
-        server.config = Some(config_path.clone());
+        server.config = Some(config_path);
         if let Some(executable) = args.server.clone() {
             server.executable = executable;
         }
-        Some(server)
+        Some(LocalBackendTemplate {
+            target: resolve_control_target(args.dbus_name.clone(), args.dbus_address.clone()),
+            server,
+        })
     };
+    let mut initial_local_backend = None;
     let (
         input_sender,
         actor_message_sender,
@@ -657,16 +661,15 @@ fn main() -> Result<()> {
         let mut fast_path_enabled = false;
         let mut bound_session_id = None;
         if args.include_local {
-            let target = resolve_control_target(args.dbus_name, args.dbus_address);
-            let mut server = ServerLaunch::discover()?;
-            server.config = Some(config_path.clone());
-            if let Some(executable) = args.server.clone() {
-                server.executable = executable;
-            }
-            let _handshake = connect_or_spawn(&target, &server)?;
+            let local = local_backend_template
+                .as_ref()
+                .context("local backend configuration is unavailable")?;
+            let target = local.target.clone();
+            let _handshake = connect_or_spawn(&target, &local.server)?;
             let fast_path =
                 open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
             let backend = backend_registry.allocate(Some(fast_path.generation));
+            initial_local_backend = Some(backend);
             let bound_session = bound_session_for_active(backend, fast_path.active_session);
             let dmabuf_import_enabled =
                 fast_path.profile.frames == brood_protocol::FrameTransportKind::Dmabuf;
@@ -770,19 +773,18 @@ fn main() -> Result<()> {
             remote_connections,
         )
     } else {
-        let target = resolve_control_target(args.dbus_name, args.dbus_address);
-        let mut server = ServerLaunch::discover()?;
-        server.config = Some(config_path);
-        if let Some(executable) = args.server {
-            server.executable = executable;
-        }
-        let handshake = connect_or_spawn(&target, &server)?;
+        let local = local_backend_template
+            .as_ref()
+            .context("local backend configuration is unavailable")?;
+        let target = local.target.clone();
+        let handshake = connect_or_spawn(&target, &local.server)?;
         eprintln!(
             "connected to Brood server pid={} protocol={}",
             handshake.server_pid, handshake.protocol_version
         );
         let fast_path = open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
         let backend = backend_registry.allocate(Some(fast_path.generation));
+        initial_local_backend = Some(backend);
         eprintln!(
             "selected presentation transport carrier={:?} frames={:?}",
             fast_path.profile.carrier, fast_path.profile.frames
@@ -919,7 +921,8 @@ fn main() -> Result<()> {
         remote_connections,
         ssh_deployer: backend_deployer.clone(),
         container_deployer: backend_deployer,
-        local_server_template,
+        local_backend: initial_local_backend,
+        local_backend_template,
         backend_registry,
         proof_managed_frame_gate_enabled: std::env::var_os(
             "BROOD_MANAGED_RESIZE_PROOF_HOLD_FIRST_TAGGED",
@@ -3713,8 +3716,8 @@ struct Application {
     ssh_deployments: Vec<SshBackendDeployment>,
     container_deployer: Option<PathBuf>,
     container_deployments: Vec<ContainerBackendDeployment>,
-    local_server_template: Option<ServerLaunch>,
-    next_dynamic_local: u64,
+    local_backend_template: Option<LocalBackendTemplate>,
+    local_backend: Option<BackendId>,
     pending_frames: BTreeMap<BackendId, ClientEvent>,
     pending_backend_snapshots: BTreeMap<BackendId, (u64, Vec<PresentationWindowSummary>)>,
     last_presented_sequences: BTreeMap<BackendId, u64>,
@@ -3766,6 +3769,12 @@ struct Application {
     window_resize: Option<WindowResizeTransaction>,
     proof_managed_frame_gate_enabled: bool,
     proof_held_managed_frame: Option<(u64, ClientEvent)>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalBackendTemplate {
+    target: ControlTarget,
+    server: ServerLaunch,
 }
 
 impl Application {
@@ -3889,18 +3898,16 @@ impl Application {
     }
 
     fn connect_local_backend(&mut self) -> Result<()> {
-        let launch = self
-            .local_server_template
-            .clone()
-            .context("dynamic local backends are unavailable without a server configuration")?;
-        self.next_dynamic_local = self.next_dynamic_local.saturating_add(1).max(1);
-        let destination = format!(
-            "org.brood.Session.dynamic.{}.{}",
-            std::process::id(),
-            self.next_dynamic_local
+        anyhow::ensure!(
+            self.local_backend.is_none(),
+            "the local backend is already connected"
         );
-        let target = ControlTarget::new(destination, None);
-        let _handshake = connect_or_spawn(&target, &launch)?;
+        let local = self
+            .local_backend_template
+            .clone()
+            .context("local backends are unavailable without a server configuration")?;
+        let target = local.target;
+        let handshake = connect_or_spawn(&target, &local.server)?;
         let fast_path = open_presentation_fast_path(&target, &[FrameTransportKind::SharedMemory])?;
         let backend = self.backend_registry.allocate(Some(fast_path.generation));
         let session_id = bound_session_for_active(backend, fast_path.active_session)
@@ -3991,11 +3998,15 @@ impl Application {
             )?;
         self.backend_registry
             .observe(backend, Some(fast_path.generation));
+        self.local_backend = Some(backend);
         if let Some(runtime) = self.wasm_runtime.as_mut() {
             runtime.connect_backend(backend);
         }
         self.notify_backend_connected(backend)?;
-        eprintln!("started dynamic local backend={backend:?} session={session_id:?}");
+        eprintln!(
+            "connected local backend={backend:?} server_pid={} session={session_id:?}",
+            handshake.server_pid
+        );
         Ok(())
     }
 
@@ -4267,14 +4278,18 @@ impl Application {
             return Ok(());
         };
         let message = BackendCatalogueMessage::sessions(
-            self.local_server_template.is_some(),
+            self.local_backend_template.is_some() && self.local_backend.is_none(),
             self.ssh_deployer.is_some(),
             self.container_deployer.is_some(),
             self.backend_registry
                 .connected_backend_ids()
                 .map(|backend| BackendCatalogueEntry {
                     backend,
-                    label: format!("Backend {}", backend.0),
+                    label: if self.local_backend == Some(backend) {
+                        "Local".to_string()
+                    } else {
+                        format!("Backend {}", backend.0)
+                    },
                     sessions: self
                         .backend_sessions
                         .get(&backend)
@@ -4301,12 +4316,14 @@ impl Application {
             && let BackendCatalogueMessage::Sessions { backends, .. } = &message
         {
             for backend in backends {
-                if let Some(active) = backend.sessions.iter().find(|session| session.active) {
-                    eprintln!(
-                        "backend session catalogue backend={} active={} name={:?}",
-                        backend.backend.0, active.id, active.name
-                    );
-                }
+                let active = backend.sessions.iter().find(|session| session.active);
+                eprintln!(
+                    "backend session catalogue backend={} sessions={} active={} name={:?}",
+                    backend.backend.0,
+                    backend.sessions.len(),
+                    active.map_or(0, |session| session.id),
+                    active.map(|session| session.name.as_str()).unwrap_or("")
+                );
             }
         }
         runtime.send_actor_message(
