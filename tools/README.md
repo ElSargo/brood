@@ -3,6 +3,21 @@
 Checked-in development and verification tools live here. Run them through the
 repository's Nix environment.
 
+## Builds
+
+`brood-build.sh` builds the host programs and every WASM module with one shared
+parallel jobserver. Cargo checks each independent workspace for staleness, and
+Component Model artifacts are encoded and validated only after their core
+module changes. Once the independent builds finish, the tool co-locates the
+default client's declared package members with the session-switcher root so
+the repository `brood.toml` is directly runnable:
+
+```sh
+nix develop --command ./tools/brood-build.sh
+```
+
+Run `./tools/brood-build.sh --help` for the build modes and concurrency control.
+
 ## Presentation Proofs
 
 `test-client-layout-actor.sh` starts a real `brood-client` under headless

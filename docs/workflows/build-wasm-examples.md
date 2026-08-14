@@ -2,13 +2,30 @@
 status: current
 type: workflow
 authority: implementation
-last-reviewed: 2026-07-11
+last-reviewed: 2026-08-15
+code-links:
+  - tools/brood-build.sh
+  - tools/brood-build.mk
 ---
 
 # Build WASM Examples
 
 The repository contains several kinds of WASM artifact. Build each with the target
 expected by its runtime instead of treating every `.wasm` file as interchangeable.
+
+For normal development, build all stale host and WASM artifacts through the
+parallel aggregate builder:
+
+```sh
+nix develop --command ./tools/brood-build.sh
+```
+
+Cargo remains responsible for dependency-aware freshness. Independent guest
+workspaces build concurrently, while Component Model encoding is skipped when
+the validated component is newer than its core module. The default client
+package is then co-located with its root component for direct use by the
+repository configuration. The builder's `--help` output defines its exact
+modes and concurrency controls.
 
 The core-module examples and the default workspace actor target
 `wasm32-unknown-unknown`:

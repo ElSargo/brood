@@ -91,6 +91,7 @@ let
     pkgs.coreutils
     pkgs.findutils
     pkgs.git
+    pkgs.gnumake
     pkgs.neovim
     pkgs.pkg-config
     sessionSwitcherPython
