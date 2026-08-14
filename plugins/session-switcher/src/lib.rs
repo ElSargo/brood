@@ -177,6 +177,7 @@ struct SwitcherState {
     native_resize_revision: Option<u64>,
     durable_shell_layout: Option<ShellLayoutState>,
     pending_shell_layouts: BTreeMap<u64, PendingShellLayout>,
+    deferred_overlay_layout: Option<DeferredOverlayLayout>,
     pointer_drag: Option<ShellDividerDrag>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
@@ -286,6 +287,12 @@ struct PendingShellLayout {
     state: ShellLayoutState,
     native_resize_revision: Option<u64>,
     native_retry_count: u8,
+}
+
+#[derive(Clone)]
+struct DeferredOverlayLayout {
+    state: ShellLayoutState,
+    reason: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -623,6 +630,7 @@ impl SwitcherState {
             native_resize_revision: None,
             durable_shell_layout: None,
             pending_shell_layouts: BTreeMap::new(),
+            deferred_overlay_layout: None,
             pointer_drag: None,
             hovered: None,
             pressed: None,
@@ -1826,6 +1834,21 @@ fn apply_layout_transaction_notification(
                 && let Some(layout) = state.layout.as_mut()
             {
                 layout.presented_layout_revision = target_layout_revision;
+            }
+            if state.pending_shell_layouts.is_empty()
+                && let Some(deferred) = state.deferred_overlay_layout.take()
+            {
+                let focus = deferred.state.focus;
+                restore_shell_layout_state(state, &deferred.state);
+                return publish_synchronized_layout_attempt(
+                    state,
+                    focus,
+                    deferred.reason,
+                    None,
+                    0,
+                    None,
+                    None,
+                );
             }
         }
         "rejected" | "aborted" => {
@@ -3402,6 +3425,13 @@ fn publish_synchronized_layout(
     reason: &'static str,
     native_resize_revision: Option<u64>,
 ) -> Vec<ActorCommand> {
+    if matches!(reason, "picker" | "keybindings") && !state.pending_shell_layouts.is_empty() {
+        state.deferred_overlay_layout = Some(DeferredOverlayLayout {
+            state: shell_layout_state(state, requested_focus),
+            reason,
+        });
+        return Vec::new();
+    }
     publish_synchronized_layout_attempt(
         state,
         requested_focus,

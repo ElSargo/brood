@@ -116,9 +116,11 @@ Matching is case-insensitive subsequence matching with bonuses for contiguous
 characters and word boundaries. Ties retain append order. An empty query shows
 all items in append order.
 
-The default session-switcher actor is the first consumer. `Ctrl+Alt+P` sends a
-normal `picker-create` message and activates the session returned in
-`picker-selected`.
+The default session-switcher and keybindings actors are consumers.
+`Ctrl+Alt+P` sends a normal `picker-create` message and activates the session
+returned in `picker-selected`. `Ctrl+Shift+/` sends the action catalogue to the
+same actor; after selection, the keybindings actor owns only physical-chord
+capture and persistence.
 
 ## Verification
 

@@ -16,7 +16,8 @@ and streamed to the presentation actor over the bidirectional realm mailbox.
 The UI supports:
 
 - `Ctrl+Alt+A` globally to fuzzy-pick a running agent in the current session
-  and open a UI focused on it;
+  and open a UI focused on it; the selected agent is rendered immediately from
+  the launch binding while the full registry snapshot reconnects;
 - `Enter` to submit the prompt;
 - `Ctrl+V` to attach an image from the presentation clipboard (ordinary text
   is pasted into the prompt);

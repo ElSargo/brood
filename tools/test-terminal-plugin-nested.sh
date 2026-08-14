@@ -373,6 +373,14 @@ close_frontend() {
   CLIENT_PID=""
 }
 
+if [[ "${BROOD_TERMINAL_PICKER_CONSUMERS_ONLY:-0}" == 1 ]]; then
+  # Use a Ctrl+Alt binding in this lane because the terminal workload's compact
+  # virtual keyboard does not reliably report its synthetic Ctrl+Shift state to
+  # every wlroots version. The product default remains Ctrl+Shift+/.
+  jq -n '{version:1,bindings:[{action:"keybindings.open",key_code:29,modifiers:3}]}' \
+    > "$OUT/keybindings.json"
+fi
+
 start_client "$CLIENT1_LOG"
 wait_for_terminal_render "$CLIENT1_LOG"
 if [[ "$WESTON_DIRECT" != 1 ]]; then
@@ -433,6 +441,7 @@ done
 APPLICATION_KEY_HEX="$(od -An -tx1 "$APPLICATION_KEY_FILE" | tr -d ' \n')"
 [[ "$APPLICATION_KEY_HEX" == "1b4f41" ]]
 
+if [[ "${BROOD_TERMINAL_PICKER_CONSUMERS_ONLY:-0}" != 1 ]]; then
 INBOX_FOCUS_BASELINE="$(
   rg -a -c 'presentation local actor message sender=inbox recipient=terminal-ui body=\{"kind":"focus"\}' \
     "$CLIENT1_LOG" || true
@@ -533,6 +542,102 @@ if [[ "${BROOD_TERMINAL_INBOX_ONLY:-0}" == 1 ]]; then
 - screenshot: inbox-ctrl-alt-i-focused.png
 EOF
   echo "nested inbox shortcut proof passed"
+  echo "proof=$OUT/proof.md"
+  exit 0
+fi
+fi
+
+if [[ "${BROOD_TERMINAL_PICKER_CONSUMERS_ONLY:-0}" == 1 ]]; then
+  # The shortcut editor must delegate catalogue filtering and selection to the
+  # one presentation-global picker, then own only the physical-chord capture.
+  wayland_env "$OUT/virtual-keyboard-key" 21
+  for _ in $(seq 1 200); do
+    if rg -a -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT1_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -a -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT1_LOG"
+  type_line 'open session picker'
+  for _ in $(seq 1 200); do
+    if rg -a -q 'sender=picker recipient=keybindings body=.*"type":"picker-selected"' "$CLIENT1_LOG" \
+      && rg -a -q 'sender=keybindings recipient=session-switcher body=.*"type":"keybindings-pane".*"visible":true' "$CLIENT1_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -a -q 'sender=picker recipient=keybindings body=.*"type":"picker-selected"' "$CLIENT1_LOG"
+  rg -a -q 'sender=keybindings recipient=session-switcher body=.*"type":"keybindings-pane".*"visible":true' "$CLIENT1_LOG"
+  wayland_env "$OUT/virtual-keyboard-key" 22
+  for _ in $(seq 1 200); do
+    if [[ -s "$OUT/keybindings.json" ]] \
+      && jq -e 'any(.bindings[]; .action == "sessions.picker" and .key_code == 30 and .modifiers == 3)' \
+        "$OUT/keybindings.json" > /dev/null; then
+      break
+    fi
+    sleep 0.05
+  done
+  jq -e 'any(.bindings[]; .action == "sessions.picker" and .key_code == 30 and .modifiers == 3)' \
+    "$OUT/keybindings.json" > /dev/null
+
+  # Saving returns to the same shared picker. Close it, then exercise the agent
+  # consumer and select coding-agent-1 through real key input.
+  wayland_env "$OUT/virtual-keyboard-key" --none 1
+  sleep 0.1
+  PICKER_PANE="$(
+    sed -n 's/.*started presentation WASM actor id=picker .* pane=\([0-9][0-9]*\) .*/\1/p' \
+      "$CLIENT1_LOG" | tail -1
+  )"
+  [[ -n "$PICKER_PANE" ]]
+  PICKER_FOCUS_BEFORE="$(
+    rg -a -c "focused local plugin pane=$PICKER_PANE" "$CLIENT1_LOG" || true
+  )"
+  wayland_env "$OUT/virtual-keyboard-key" 30
+  for _ in $(seq 1 200); do
+    PICKER_FOCUS_AFTER="$(
+      rg -a -c "focused local plugin pane=$PICKER_PANE" "$CLIENT1_LOG" || true
+    )"
+    if rg -a -q 'recipient=picker body=.*"title":"Open coding agent"' "$CLIENT1_LOG" \
+      && ((PICKER_FOCUS_AFTER > PICKER_FOCUS_BEFORE)); then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -a -q 'recipient=picker body=.*"title":"Open coding agent"' "$CLIENT1_LOG"
+  ((PICKER_FOCUS_AFTER > PICKER_FOCUS_BEFORE))
+  wayland_env "$OUT/virtual-keyboard-key" --none 28
+
+  AGENT_UI=""
+  AGENT_PANE=""
+  for _ in $(seq 1 300); do
+    AGENT_START="$(
+      { rg -a 'started presentation WASM actor id=coding-agent-ui-b[0-9]+-s[0-9]+-[0-9]+ .* pane=[0-9]+' \
+        "$CLIENT1_LOG" || true; } | tail -1
+    )"
+    AGENT_UI="$(sed -n 's/.*actor id=\([^ ]*\).*/\1/p' <<< "$AGENT_START")"
+    AGENT_PANE="$(sed -n 's/.* pane=\([0-9][0-9]*\) .*/\1/p' <<< "$AGENT_START")"
+    AGENT_DRAW_COUNT="$({ rg -a -c "accepted plugin draw packet pane=$AGENT_PANE" "$CLIENT1_LOG" || true; })"
+    if [[ -n "$AGENT_UI" && -n "$AGENT_PANE" ]] \
+      && rg -a -q "recipient=$AGENT_UI body=.*\"kind\":\"bind\".*\"agent\":\"coding-agent-1\"" "$CLIENT1_LOG" \
+      && ((AGENT_DRAW_COUNT >= 1)); then
+      break
+    fi
+    sleep 0.05
+  done
+  [[ -n "$AGENT_UI" ]]
+  [[ -n "$AGENT_PANE" ]]
+  rg -a -q "recipient=$AGENT_UI body=.*\"kind\":\"bind\".*\"agent\":\"coding-agent-1\"" "$CLIENT1_LOG"
+  ((AGENT_DRAW_COUNT >= 1))
+  capture "$OUT/coding-agent-selected.png"
+
+  cat > "$OUT/proof.md" <<EOF
+# Shared picker consumer proof
+
+- keybindings: the configured Ctrl+Alt+Y sent the action catalogue to picker; selection opened only chord capture and persisted Ctrl+Alt+U
+- agent: Ctrl+Alt+A sent the session agent catalogue to the same picker; selecting coding-agent-1 launched and bound $AGENT_UI
+- screenshot: coding-agent-selected.png
+EOF
+  echo "nested shared picker consumer proof passed"
   echo "proof=$OUT/proof.md"
   exit 0
 fi

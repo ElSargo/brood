@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
-use brood_graphics::{Color, Command, Packet, Rect, Transform, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_keybindings::{ACTIONS, Action, Binding, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER};
 use brood_plugin_sdk::{
     actor::send_local,
@@ -15,18 +15,14 @@ use brood_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 
 const LAYOUT_ACTOR_ID: &str = "session-switcher";
-const HEADER_HEIGHT: f32 = 64.0;
-const FOOTER_HEIGHT: f32 = 32.0;
-const ROW_HEIGHT: f32 = 42.0;
-const SIDE_MARGIN: f32 = 16.0;
-const MAX_BINDING_WIDTH: f32 = 190.0;
+const PICKER_ACTOR_ID: &str = "picker";
+const PANEL_WIDTH: f32 = 620.0;
+const PANEL_HEIGHT: f32 = 190.0;
+const PANEL_MARGIN: f32 = 16.0;
+const SIDE_MARGIN: f32 = 20.0;
 const RADIUS: f32 = 9.0;
-const WINDOW_WIDTH: f32 = 820.0;
-const WINDOW_HEIGHT: f32 = 600.0;
-const WINDOW_MARGIN: f32 = 16.0;
 
 const BG: Color = ashen::BACKGROUND;
-const PANEL: Color = ashen::SURFACE;
 const PANEL_RAISED: Color = ashen::SURFACE_RAISED;
 const BORDER: Color = ashen::BORDER;
 const TEXT: Color = ashen::TEXT_STRONG;
@@ -35,8 +31,6 @@ const MUTED: Color = ashen::MUTED;
 const ACCENT: Color = ashen::ACCENT;
 const ERROR: Color = ashen::ERROR;
 const SCRIM: Color = Color::rgba(0.0, 0.0, 0.0, 0.48);
-const SHADOW_WIDE: Color = Color::rgba(0.0, 0.0, 0.0, 0.18);
-const SHADOW_NEAR: Color = Color::rgba(0.0, 0.0, 0.0, 0.30);
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -55,6 +49,21 @@ enum KeybindingsMessage {
         #[serde(default)]
         message: String,
     },
+    #[serde(rename = "picker-created")]
+    PickerCreated { picker: u64 },
+    #[serde(rename = "picker-selected")]
+    PickerSelected {
+        picker: u64,
+        result: PickerResult,
+    },
+    #[serde(rename = "picker-cancelled")]
+    PickerCancelled { picker: u64 },
+    #[serde(rename = "picker-error")]
+    PickerError {
+        #[serde(default)]
+        picker: Option<u64>,
+        message: String,
+    },
 }
 
 #[derive(Clone, Deserialize)]
@@ -64,25 +73,71 @@ struct BindingOverride {
     modifiers: i32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FloatingWindow {
+#[derive(Deserialize)]
+struct PickerResult {
+    value: PickerValue,
+}
+
+#[derive(Deserialize)]
+struct PickerValue {
+    action: String,
+}
+
+#[derive(Serialize)]
+struct PickerRequest {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    title: &'static str,
+    placeholder: &'static str,
+    items: Vec<PickerItem>,
+}
+
+#[derive(Serialize)]
+struct PickerItem {
+    label: &'static str,
+    detail: String,
+    value: PickerItemValue,
+}
+
+#[derive(Serialize)]
+struct PickerItemValue {
+    action: &'static str,
+}
+
+#[derive(Serialize)]
+struct PickerCancel {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    picker: u64,
+}
+
+#[derive(Serialize)]
+struct LayoutVisibility {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    pane: u64,
+    visible: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FloatingPanel {
     x: f32,
     y: f32,
     width: f32,
     height: f32,
 }
 
-impl FloatingWindow {
+impl FloatingPanel {
     fn in_viewport(width: f32, height: f32) -> Self {
         let width = width.max(1.0);
         let height = height.max(1.0);
-        let window_width = WINDOW_WIDTH.min((width - WINDOW_MARGIN * 2.0).max(1.0));
-        let window_height = WINDOW_HEIGHT.min((height - WINDOW_MARGIN * 2.0).max(1.0));
+        let panel_width = PANEL_WIDTH.min((width - PANEL_MARGIN * 2.0).max(1.0));
+        let panel_height = PANEL_HEIGHT.min((height - PANEL_MARGIN * 2.0).max(1.0));
         Self {
-            x: (width - window_width) * 0.5,
-            y: (height - window_height) * 0.5,
-            width: window_width,
-            height: window_height,
+            x: (width - panel_width) * 0.5,
+            y: (height - panel_height) * 0.5,
+            width: panel_width,
+            height: panel_height,
         }
     }
 
@@ -96,30 +151,19 @@ impl FloatingWindow {
     }
 }
 
-#[derive(Serialize)]
-struct LayoutVisibility {
-    #[serde(rename = "type")]
-    message_type: &'static str,
-    pane: u64,
-    visible: bool,
-}
-
 struct KeybindingsState {
     pane: u64,
     width: f32,
     height: f32,
     visible: bool,
-    query: String,
-    selected: Option<usize>,
-    scroll: usize,
+    picker: Option<u64>,
+    picker_requested: bool,
     capture: Option<usize>,
+    pending_save: Option<usize>,
     bindings: BTreeMap<String, Binding>,
     status: String,
     error: bool,
-    hovered: Option<usize>,
-    pressed: Option<usize>,
     backdrop_pressed: bool,
-    escape_pending: bool,
     text_resources: Vec<u64>,
 }
 
@@ -127,103 +171,27 @@ impl KeybindingsState {
     fn new() -> Self {
         Self {
             pane: 0,
-            width: WINDOW_WIDTH + WINDOW_MARGIN * 2.0,
-            height: WINDOW_HEIGHT + WINDOW_MARGIN * 2.0,
+            width: PANEL_WIDTH + PANEL_MARGIN * 2.0,
+            height: PANEL_HEIGHT + PANEL_MARGIN * 2.0,
             visible: false,
-            query: String::new(),
-            selected: Some(0),
-            scroll: 0,
+            picker: None,
+            picker_requested: false,
             capture: None,
+            pending_save: None,
             bindings: default_bindings(),
             status: String::new(),
             error: false,
-            hovered: None,
-            pressed: None,
             backdrop_pressed: false,
-            escape_pending: false,
             text_resources: Vec::new(),
         }
     }
 
-    fn visible_rows(&self) -> usize {
-        ((self.window().height - HEADER_HEIGHT - FOOTER_HEIGHT) / ROW_HEIGHT)
-            .floor()
-            .max(1.0) as usize
+    fn panel(&self) -> FloatingPanel {
+        FloatingPanel::in_viewport(self.width, self.height)
     }
 
-    fn resize(&mut self, width: f32, height: f32) {
-        self.width = width.max(1.0);
-        self.height = height.max(1.0);
-        self.hovered = None;
-        self.pressed = None;
-        self.backdrop_pressed = false;
-        self.ensure_selected_visible();
-    }
-
-    fn window(&self) -> FloatingWindow {
-        FloatingWindow::in_viewport(self.width, self.height)
-    }
-
-    fn filtered(&self) -> Vec<usize> {
-        let mut matches = ACTIONS
-            .iter()
-            .enumerate()
-            .filter_map(|(index, action)| {
-                let binding = self.binding(action);
-                let searchable = format!(
-                    "{} {} {} {} {}",
-                    action.title,
-                    action.category,
-                    action.id,
-                    action.scope.label(),
-                    binding_label(binding)
-                );
-                fuzzy_score(&self.query, &searchable).map(|score| (index, score))
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| left_index.cmp(right_index))
-        });
-        matches.into_iter().map(|(index, _)| index).collect()
-    }
-
-    fn binding(&self, action: &Action) -> Binding {
-        self.bindings
-            .get(action.id)
-            .copied()
-            .unwrap_or(action.default_binding)
-    }
-
-    fn ensure_selection(&mut self) {
-        let filtered = self.filtered();
-        if self
-            .selected
-            .is_some_and(|selected| filtered.contains(&selected))
-        {
-            self.ensure_selected_visible();
-            return;
-        }
-        self.selected = filtered.first().copied();
-        self.scroll = 0;
-    }
-
-    fn ensure_selected_visible(&mut self) {
-        let filtered = self.filtered();
-        let Some(position) = self
-            .selected
-            .and_then(|selected| filtered.iter().position(|item| *item == selected))
-        else {
-            self.scroll = 0;
-            return;
-        };
-        let rows = self.visible_rows();
-        if position < self.scroll {
-            self.scroll = position;
-        } else if position >= self.scroll + rows {
-            self.scroll = position + 1 - rows;
-        }
+    fn capture_action(&self) -> Option<&'static Action> {
+        self.capture.and_then(|index| ACTIONS.get(index))
     }
 }
 
@@ -244,7 +212,7 @@ impl Guest for KeybindingsActor {
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
-            Event::Mailbox(message) => handle_message(state, &message.body),
+            Event::Mailbox(message) => handle_message(state, &message.sender, &message.body),
             Event::Presentation(event) => handle_presentation(state, event),
             _ => Vec::new(),
         }
@@ -255,7 +223,11 @@ impl Guest for KeybindingsActor {
     }
 }
 
-fn handle_message(state: &mut KeybindingsState, bytes: &[u8]) -> Vec<ActorCommand> {
+fn handle_message(
+    state: &mut KeybindingsState,
+    sender: &str,
+    bytes: &[u8],
+) -> Vec<ActorCommand> {
     let Ok(message) = serde_json::from_slice::<KeybindingsMessage>(bytes) else {
         return Vec::new();
     };
@@ -269,47 +241,125 @@ fn handle_message(state: &mut KeybindingsState, bytes: &[u8]) -> Vec<ActorComman
                     state.bindings.insert(binding.action, candidate);
                 }
             }
+            if state.picker_requested || state.picker.is_some() || state.visible {
+                return Vec::new();
+            }
+            open_action_picker(state).into_iter().collect()
+        }
+        KeybindingsMessage::Close => close_editor(state),
+        KeybindingsMessage::Saved {
+            action,
+            success,
+            message,
+        } => handle_saved(state, &action, success, message),
+        KeybindingsMessage::PickerCreated { picker } if sender == PICKER_ACTOR_ID => {
+            state.picker_requested = false;
+            state.picker = Some(picker);
+            Vec::new()
+        }
+        KeybindingsMessage::PickerSelected { picker, result }
+            if sender == PICKER_ACTOR_ID && state.picker == Some(picker) =>
+        {
+            state.picker = None;
+            let Some(index) = ACTIONS
+                .iter()
+                .position(|action| action.id == result.value.action)
+            else {
+                state.error = true;
+                state.status = "The selected shortcut is unavailable".to_string();
+                return Vec::new();
+            };
+            state.capture = Some(index);
             state.visible = true;
-            state.query.clear();
-            state.capture = None;
-            state.scroll = 0;
-            state.status = "Select a shortcut to rebind".to_string();
+            state.status = "Press the new shortcut · Esc cancels".to_string();
             state.error = false;
-            state.hovered = None;
-            state.pressed = None;
-            state.backdrop_pressed = false;
-            state.escape_pending = false;
-            state.ensure_selection();
             redraw_or_record_error(state);
             (state.pane != 0)
                 .then(|| layout_visibility(state.pane, true))
                 .into_iter()
                 .collect()
         }
-        KeybindingsMessage::Close => hide(state),
-        KeybindingsMessage::Saved {
-            action,
-            success,
-            message,
-        } => {
-            state.error = !success;
-            state.status = if success {
-                ACTIONS
-                    .iter()
-                    .find(|candidate| candidate.id == action)
-                    .map_or_else(
-                        || "Shortcut saved".to_string(),
-                        |candidate| format!("Saved {}", candidate.title),
-                    )
-            } else if message.is_empty() {
-                "Could not save shortcut".to_string()
-            } else {
-                message
-            };
-            redraw_or_record_error(state);
+        KeybindingsMessage::PickerCancelled { picker }
+            if sender == PICKER_ACTOR_ID && state.picker == Some(picker) =>
+        {
+            state.picker = None;
+            state.picker_requested = false;
             Vec::new()
         }
+        KeybindingsMessage::PickerError { picker, message } if sender == PICKER_ACTOR_ID => {
+            if picker.is_none() || picker == state.picker {
+                state.picker = None;
+                state.picker_requested = false;
+                state.error = true;
+                state.status = message;
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
+}
+
+fn open_action_picker(state: &mut KeybindingsState) -> Option<ActorCommand> {
+    let items = ACTIONS
+        .iter()
+        .map(|action| PickerItem {
+            label: action.title,
+            detail: format!(
+                "{} · {} · {} · {}",
+                action.category,
+                action.scope.label(),
+                binding_label(state.binding(action)),
+                action.id
+            ),
+            value: PickerItemValue { action: action.id },
+        })
+        .collect();
+    let body = serde_json::to_vec(&PickerRequest {
+        message_type: "picker-create",
+        title: "Keyboard shortcuts",
+        placeholder: "Fuzzy-match an action or binding…",
+        items,
+    })
+    .ok()?;
+    state.picker_requested = true;
+    state.error = false;
+    Some(send_local(PICKER_ACTOR_ID, body))
+}
+
+fn handle_saved(
+    state: &mut KeybindingsState,
+    action: &str,
+    success: bool,
+    message: String,
+) -> Vec<ActorCommand> {
+    let saved = state.pending_save.take().filter(|index| {
+        ACTIONS
+            .get(*index)
+            .is_some_and(|candidate| candidate.id == action)
+    });
+    if !success {
+        state.capture = saved;
+        state.error = true;
+        state.status = if message.is_empty() {
+            "Could not save shortcut".to_string()
+        } else {
+            message
+        };
+        redraw_or_record_error(state);
+        return Vec::new();
+    }
+
+    state.capture = None;
+    state.visible = false;
+    state.error = false;
+    state.status.clear();
+    redraw_or_record_error(state);
+    let mut commands = Vec::new();
+    if state.pane != 0 {
+        commands.push(layout_visibility(state.pane, false));
+    }
+    commands.extend(open_action_picker(state));
+    commands
 }
 
 fn handle_presentation(
@@ -319,24 +369,23 @@ fn handle_presentation(
     match event {
         PresentationEvent::PaneCreated(created) => {
             state.pane = created.pane;
-            state.resize(created.width, created.height);
+            state.width = created.width.max(1.0);
+            state.height = created.height.max(1.0);
             redraw_or_record_error(state);
             vec![layout_visibility(state.pane, false)]
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
-            state.resize(resized.width, resized.height);
+            state.width = resized.width.max(1.0);
+            state.height = resized.height.max(1.0);
+            state.backdrop_pressed = false;
             redraw_for_resize_or_record_error(state, resized.resize_epoch);
             Vec::new()
         }
         PresentationEvent::Key(key) if key.pane == state.pane && !key.repeat => {
-            if !key.pressed {
-                if state.escape_pending && key.logical_key == "Escape" {
-                    state.escape_pending = false;
-                    return hide(state);
-                }
+            if !key.pressed || state.capture.is_none() {
                 return Vec::new();
             }
-            let commands = handle_key(
+            let commands = capture_key(
                 state,
                 key.physical_key,
                 &key.logical_key,
@@ -345,178 +394,94 @@ fn handle_presentation(
             redraw_or_record_error(state);
             commands
         }
-        PresentationEvent::Text(text) if text.pane == state.pane && state.capture.is_none() => {
-            state.query.extend(
-                text.text
-                    .chars()
-                    .filter(|character| !character.is_control()),
-            );
-            state.scroll = 0;
-            state.ensure_selection();
-            redraw_or_record_error(state);
-            Vec::new()
-        }
-        PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
-            let target = target_at(state, moved.x, moved.y);
-            if state.hovered != target {
-                state.hovered = target;
-                redraw_or_record_error(state);
-            }
-            Vec::new()
-        }
-        PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
-            state.hovered = None;
-            state.pressed = None;
-            state.backdrop_pressed = false;
-            redraw_or_record_error(state);
-            Vec::new()
-        }
         PresentationEvent::PointerButton(button)
             if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
-            let window = state.window();
-            let target = target_at(state, button.x, button.y);
+            let outside = !state.panel().contains(button.x, button.y);
             if button.pressed {
-                state.backdrop_pressed = !window.contains(button.x, button.y);
-                state.pressed = target;
-                state.hovered = target;
-                if let Some(target) = target {
-                    state.selected = Some(target);
-                }
-            } else {
-                if state.backdrop_pressed && !window.contains(button.x, button.y) {
-                    state.backdrop_pressed = false;
-                    return hide(state);
-                }
+                state.backdrop_pressed = outside;
+                Vec::new()
+            } else if state.backdrop_pressed && outside {
                 state.backdrop_pressed = false;
-                let pressed = state.pressed.take();
-                state.hovered = target;
-                if pressed.is_some() && pressed == target {
-                    state.capture = target;
-                    state.status = "Press the new shortcut · Esc cancels".to_string();
-                    state.error = false;
-                }
+                close_editor(state)
+            } else {
+                state.backdrop_pressed = false;
+                Vec::new()
             }
-            redraw_or_record_error(state);
-            Vec::new()
-        }
-        PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
-            if !state.window().contains(scroll.x, scroll.y) {
-                return Vec::new();
-            }
-            let filtered = state.filtered();
-            let max_scroll = filtered.len().saturating_sub(state.visible_rows());
-            if scroll.vertical < 0.0 {
-                state.scroll = (state.scroll + 1).min(max_scroll);
-            } else if scroll.vertical > 0.0 {
-                state.scroll = state.scroll.saturating_sub(1);
-            }
-            redraw_or_record_error(state);
-            Vec::new()
         }
         _ => Vec::new(),
     }
 }
 
-fn handle_key(
+fn capture_key(
     state: &mut KeybindingsState,
     physical_key: u32,
     logical_key: &str,
     modifiers: i32,
 ) -> Vec<ActorCommand> {
-    if let Some(target) = state.capture {
-        if logical_key == "Escape" && modifiers == 0 {
-            state.capture = None;
-            state.status = "Rebinding cancelled".to_string();
-            return Vec::new();
-        }
-        if is_modifier_key(logical_key) {
-            return Vec::new();
-        }
-        let Ok(key_code) = i32::try_from(physical_key.saturating_add(8)) else {
-            state.error = true;
-            state.status = "This input source has no usable physical key".to_string();
-            return Vec::new();
-        };
-        let binding = Binding::new(key_code, modifiers);
-        if physical_key == 0 || !binding.is_valid() {
-            state.error = true;
-            state.status = "This input source has no usable physical key".to_string();
-            return Vec::new();
-        }
-        let Some(action) = ACTIONS.get(target) else {
-            state.capture = None;
-            return Vec::new();
-        };
-        let action_id = action.id;
-        swap_binding(state, target, binding);
-        state.capture = None;
-        state.status = format!("Saving {}…", action.title);
-        state.error = false;
-        return vec![set_keybinding(action_id, binding)];
+    if logical_key == "Escape" && modifiers == 0 {
+        return close_editor(state);
     }
-
-    match logical_key {
-        "Escape" => {
-            state.escape_pending = true;
-            Vec::new()
-        }
-        "ArrowUp" => {
-            move_selection(state, -1);
-            Vec::new()
-        }
-        "ArrowDown" => {
-            move_selection(state, 1);
-            Vec::new()
-        }
-        "Enter" | "Return" | "NumpadEnter" => {
-            state.capture = state.selected;
-            state.status = "Press the new shortcut · Esc cancels".to_string();
-            state.error = false;
-            Vec::new()
-        }
-        "Backspace" => {
-            state.query.pop();
-            state.scroll = 0;
-            state.ensure_selection();
-            Vec::new()
-        }
-        _ => Vec::new(),
+    if is_modifier_key(logical_key) {
+        return Vec::new();
     }
-}
-
-fn move_selection(state: &mut KeybindingsState, delta: isize) {
-    let filtered = state.filtered();
-    if filtered.is_empty() {
-        state.selected = None;
-        return;
-    }
-    let current = state
-        .selected
-        .and_then(|selected| filtered.iter().position(|candidate| *candidate == selected))
-        .unwrap_or_default();
-    let next = if delta < 0 {
-        current.saturating_sub(delta.unsigned_abs())
-    } else {
-        (current + delta as usize).min(filtered.len() - 1)
+    let Ok(key_code) = i32::try_from(physical_key.saturating_add(8)) else {
+        state.error = true;
+        state.status = "This input source has no usable physical key".to_string();
+        return Vec::new();
     };
-    state.selected = filtered.get(next).copied();
-    state.ensure_selected_visible();
+    let binding = Binding::new(key_code, modifiers);
+    if physical_key == 0 || !binding.is_valid() {
+        state.error = true;
+        state.status = "This input source has no usable physical key".to_string();
+        return Vec::new();
+    }
+    let Some(target) = state.capture else {
+        return Vec::new();
+    };
+    let Some(action) = ACTIONS.get(target) else {
+        return close_editor(state);
+    };
+    let action_id = action.id;
+    let title = action.title;
+    swap_binding(state, target, binding);
+    state.capture = None;
+    state.pending_save = Some(target);
+    state.status = format!("Saving {title}…");
+    state.error = false;
+    vec![set_keybinding(action_id, binding)]
 }
 
-fn target_at(state: &KeybindingsState, x: f32, y: f32) -> Option<usize> {
-    let window = state.window();
-    if !window.contains(x, y) {
-        return None;
+fn close_editor(state: &mut KeybindingsState) -> Vec<ActorCommand> {
+    let mut commands = Vec::new();
+    if let Some(picker) = state.picker.take()
+        && let Ok(body) = serde_json::to_vec(&PickerCancel {
+            message_type: "picker-cancel",
+            picker,
+        })
+    {
+        commands.push(send_local(PICKER_ACTOR_ID, body));
     }
-    let local_y = y - window.y;
-    if local_y < HEADER_HEIGHT || local_y >= window.height - FOOTER_HEIGHT {
-        return None;
+    state.picker_requested = false;
+    state.visible = false;
+    state.capture = None;
+    state.pending_save = None;
+    state.backdrop_pressed = false;
+    state.status.clear();
+    redraw_or_record_error(state);
+    if state.pane != 0 {
+        commands.push(layout_visibility(state.pane, false));
     }
-    let row = ((local_y - HEADER_HEIGHT) / ROW_HEIGHT)
-        .floor()
-        .max(0.0) as usize;
-    state.filtered().get(state.scroll + row).copied()
+    commands
+}
+
+impl KeybindingsState {
+    fn binding(&self, action: &Action) -> Binding {
+        self.bindings
+            .get(action.id)
+            .copied()
+            .unwrap_or(action.default_binding)
+    }
 }
 
 fn swap_binding(state: &mut KeybindingsState, target: usize, binding: Binding) {
@@ -537,21 +502,6 @@ fn swap_binding(state: &mut KeybindingsState, target: usize, binding: Binding) {
             .bindings
             .insert(conflicting_action.id.to_string(), previous);
     }
-}
-
-fn hide(state: &mut KeybindingsState) -> Vec<ActorCommand> {
-    state.visible = false;
-    state.capture = None;
-    state.hovered = None;
-    state.pressed = None;
-    state.backdrop_pressed = false;
-    state.escape_pending = false;
-    state.status.clear();
-    redraw_or_record_error(state);
-    (state.pane != 0)
-        .then(|| layout_visibility(state.pane, false))
-        .into_iter()
-        .collect()
 }
 
 fn default_bindings() -> BTreeMap<String, Binding> {
@@ -592,42 +542,6 @@ fn is_modifier_key(logical_key: &str) -> bool {
     )
 }
 
-fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
-    let query = query
-        .trim()
-        .to_lowercase()
-        .chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '+' | '-' | '.'))
-        .collect::<String>();
-    if query.is_empty() {
-        return Some(0);
-    }
-    let candidate = candidate
-        .to_lowercase()
-        .chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '+' | '-' | '.'))
-        .collect::<String>();
-    let mut query_chars = query.chars();
-    let mut wanted = query_chars.next()?;
-    let mut score = 0_i64;
-    let mut previous = None;
-    for (position, character) in candidate.chars().enumerate() {
-        if character != wanted {
-            continue;
-        }
-        score += 20;
-        if position == 0 || previous.is_some_and(|previous: char| !previous.is_alphanumeric()) {
-            score += 16;
-        }
-        match query_chars.next() {
-            Some(next) => wanted = next,
-            None => return Some(score - i64::try_from(position).unwrap_or(i64::MAX / 4).min(96)),
-        }
-        previous = Some(character);
-    }
-    None
-}
-
 fn binding_label(binding: Binding) -> String {
     let mut parts = Vec::new();
     if binding.modifiers & MOD_CTRL != 0 {
@@ -666,11 +580,7 @@ fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch:
 }
 
 fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(), String> {
-    let window = state.window();
-    let width = window.width;
-    let height = window.height;
-    let header = header_geometry(width);
-    let row_layout = row_geometry(width);
+    let panel = state.panel();
     let mut packet = Packet::new();
     let mut resources = Vec::new();
     packet.push(Command::FillRect {
@@ -678,313 +588,109 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
         color: SCRIM,
     });
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(
-            window.x - 12.0,
-            window.y - 6.0,
-            window.width + 24.0,
-            window.height + 28.0,
-        ),
-        radius: RADIUS + 12.0,
-        color: SHADOW_WIDE,
-    });
-    packet.push(Command::FillRoundedRect {
-        rect: Rect::new(
-            window.x - 5.0,
-            window.y - 2.0,
-            window.width + 10.0,
-            window.height + 13.0,
-        ),
-        radius: RADIUS + 5.0,
-        color: SHADOW_NEAR,
-    });
-    packet.push(Command::Save);
-    packet.push(Command::SetTransform(Transform {
-        tx: window.x,
-        ty: window.y,
-        ..Transform::IDENTITY
-    }));
-    packet.push(Command::FillRoundedRect {
-        rect: Rect::new(0.0, 0.0, width, height),
+        rect: Rect::new(panel.x, panel.y, panel.width, panel.height),
         radius: RADIUS,
         color: BG,
     });
-    packet.push(Command::FillRoundedRect {
-        rect: Rect::new(0.0, 0.0, width, HEADER_HEIGHT),
-        radius: RADIUS,
-        color: PANEL,
-    });
-    packet.push(Command::FillRect {
-        rect: Rect::new(0.0, RADIUS, width, HEADER_HEIGHT - RADIUS),
-        color: PANEL,
-    });
-    add_text(
-        state,
-        &mut packet,
-        &mut resources,
-        if header.title_width < 150.0 {
-            "Shortcuts"
-        } else {
-            "Keyboard shortcuts"
-        },
-        18.0,
-        TEXT,
-        SIDE_MARGIN,
-        11.0,
-        header.title_width,
-    )?;
-    add_text(
-        state,
-        &mut packet,
-        &mut resources,
-        "Global key policy",
-        10.0,
-        MUTED,
-        SIDE_MARGIN,
-        36.0,
-        header.title_width,
-    )?;
-    packet.push(Command::FillRoundedRect {
-        rect: Rect::new(header.search_x, 14.0, header.search_width, 36.0),
-        radius: 5.0,
-        color: PANEL_RAISED,
-    });
     packet.push(Command::StrokeRoundedRect {
-        rect: Rect::new(header.search_x, 14.0, header.search_width, 36.0),
-        radius: 5.0,
-        color: ACCENT,
-        width: 1.0,
-    });
-    let query = if let Some(capture) = state.capture {
-        ACTIONS.get(capture).map_or_else(
-            || "Press a shortcut…".to_string(),
-            |action| format!("Press a shortcut for {}…", action.title),
-        )
-    } else if state.query.is_empty() {
-        "Fuzzy search actions…".to_string()
-    } else {
-        format!("{}▏", state.query)
-    };
-    add_text(
-        state,
-        &mut packet,
-        &mut resources,
-        &truncate_to_width(&query, header.search_width - 18.0, 13.0),
-        13.0,
-        if state.query.is_empty() && state.capture.is_none() {
-            MUTED
-        } else {
-            FG
-        },
-        header.search_x + 9.0,
-        23.0,
-        header.search_width - 18.0,
-    )?;
-
-    let filtered = state.filtered();
-    packet.push(Command::Save);
-    packet.push(Command::ClipRect(Rect::new(
-        0.0,
-        HEADER_HEIGHT,
-        width,
-        height - HEADER_HEIGHT - FOOTER_HEIGHT,
-    )));
-    for (row, index) in filtered
-        .iter()
-        .skip(state.scroll)
-        .take(state.visible_rows())
-        .copied()
-        .enumerate()
-    {
-        let Some(action) = ACTIONS.get(index) else {
-            continue;
-        };
-        let y = HEADER_HEIGHT + row as f32 * ROW_HEIGHT;
-        let selected = state.selected == Some(index);
-        let hovered = state.hovered == Some(index);
-        let pressed = state.pressed == Some(index);
-        if selected || hovered || pressed {
-            packet.push(Command::FillRect {
-                rect: Rect::new(0.0, y, width, ROW_HEIGHT),
-                color: if pressed {
-                    ashen::INTERACTIVE_PRESSED
-                } else if hovered {
-                    ashen::INTERACTIVE_HOVER
-                } else {
-                    ashen::SELECTION
-                },
-            });
-        }
-        if state.capture == Some(index) {
-            packet.push(Command::FillRect {
-                rect: Rect::new(0.0, y, 4.0, ROW_HEIGHT),
-                color: ACCENT,
-            });
-        }
-        packet.push(Command::FillRect {
-            rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, width, 1.0),
-            color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.32),
-        });
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            &truncate_to_width(action.title, row_layout.title_width, 13.0),
-            13.0,
-            FG,
-            SIDE_MARGIN,
-            y + 4.0,
-            row_layout.title_width,
-        )?;
-        let detail = format!(
-            "{} · {} · {}",
-            action.category,
-            action.scope.label(),
-            action.id
-        );
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            &truncate_to_width(&detail, row_layout.title_width, 9.0),
-            9.0,
-            MUTED,
-            SIDE_MARGIN,
-            y + 23.0,
-            row_layout.title_width,
-        )?;
-        let binding = binding_label(state.binding(action));
-        let binding_text_size = if row_layout.chip_width < 130.0 {
-            9.5
-        } else {
-            11.0
-        };
-        packet.push(Command::FillRoundedRect {
-            rect: Rect::new(row_layout.chip_x, y + 7.0, row_layout.chip_width, 28.0),
-            radius: 5.0,
-            color: PANEL_RAISED,
-        });
-        packet.push(Command::StrokeRoundedRect {
-            rect: Rect::new(row_layout.chip_x, y + 7.0, row_layout.chip_width, 28.0),
-            radius: 5.0,
-            color: if state.capture == Some(index) {
-                ACCENT
-            } else {
-                BORDER
-            },
-            width: 1.0,
-        });
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            &truncate_to_width(&binding, row_layout.chip_width - 16.0, binding_text_size),
-            binding_text_size,
-            TEXT,
-            row_layout.chip_x + 8.0,
-            y + 14.0,
-            row_layout.chip_width - 16.0,
-        )?;
-    }
-    packet.push(Command::Restore);
-
-    if filtered.is_empty() {
-        add_text(
-            state,
-            &mut packet,
-            &mut resources,
-            "No matching shortcuts",
-            13.0,
-            MUTED,
-            SIDE_MARGIN,
-            HEADER_HEIGHT + 14.0,
-            width - SIDE_MARGIN * 2.0,
-        )?;
-    }
-
-    let footer_y = height - FOOTER_HEIGHT;
-    packet.push(Command::FillRoundedRect {
-        rect: Rect::new(0.0, footer_y, width, FOOTER_HEIGHT),
-        radius: RADIUS,
-        color: PANEL,
-    });
-    packet.push(Command::FillRect {
-        rect: Rect::new(0.0, footer_y, width, RADIUS),
-        color: PANEL,
-    });
-    let footer = if state.status.is_empty() {
-        format!(
-            "{} shortcuts · ↑↓ select · Enter rebind · Esc close",
-            filtered.len()
-        )
-    } else {
-        state.status.clone()
-    };
-    add_text(
-        state,
-        &mut packet,
-        &mut resources,
-        &truncate_to_width(&footer, width - SIDE_MARGIN * 2.0, 10.0),
-        10.0,
-        if state.error { ERROR } else { MUTED },
-        SIDE_MARGIN,
-        footer_y + 9.0,
-        width - SIDE_MARGIN * 2.0,
-    )?;
-    packet.push(Command::StrokeRoundedRect {
-        rect: Rect::new(0.5, 0.5, width - 1.0, height - 1.0),
+        rect: Rect::new(
+            panel.x + 0.5,
+            panel.y + 0.5,
+            (panel.width - 1.0).max(1.0),
+            (panel.height - 1.0).max(1.0),
+        ),
         radius: RADIUS,
         color: BORDER,
         width: 1.0,
     });
-    packet.push(Command::Restore);
+
+    let action = state.capture_action();
+    let title = action.map_or("Keyboard shortcut", |action| action.title);
+    add_text(
+        state,
+        &mut packet,
+        &mut resources,
+        title,
+        18.0,
+        TEXT,
+        panel.x + SIDE_MARGIN,
+        panel.y + 20.0,
+        panel.width - SIDE_MARGIN * 2.0,
+    )?;
+    let detail = action.map_or_else(
+        || "Waiting for an action from the shared picker".to_string(),
+        |action| {
+            format!(
+                "{} · {} · currently {}",
+                action.category,
+                action.scope.label(),
+                binding_label(state.binding(action))
+            )
+        },
+    );
+    add_text(
+        state,
+        &mut packet,
+        &mut resources,
+        &truncate_to_width(&detail, panel.width - SIDE_MARGIN * 2.0, 12.0),
+        12.0,
+        MUTED,
+        panel.x + SIDE_MARGIN,
+        panel.y + 52.0,
+        panel.width - SIDE_MARGIN * 2.0,
+    )?;
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(
+            panel.x + SIDE_MARGIN,
+            panel.y + 86.0,
+            panel.width - SIDE_MARGIN * 2.0,
+            48.0,
+        ),
+        radius: 6.0,
+        color: PANEL_RAISED,
+    });
+    packet.push(Command::StrokeRoundedRect {
+        rect: Rect::new(
+            panel.x + SIDE_MARGIN,
+            panel.y + 86.0,
+            panel.width - SIDE_MARGIN * 2.0,
+            48.0,
+        ),
+        radius: 6.0,
+        color: if state.error { ERROR } else { ACCENT },
+        width: 1.0,
+    });
+    add_text(
+        state,
+        &mut packet,
+        &mut resources,
+        if state.status.is_empty() {
+            "Press the new shortcut · Esc cancels"
+        } else {
+            &state.status
+        },
+        13.0,
+        if state.error { ERROR } else { FG },
+        panel.x + SIDE_MARGIN + 14.0,
+        panel.y + 101.0,
+        panel.width - SIDE_MARGIN * 2.0 - 28.0,
+    )?;
+    add_text(
+        state,
+        &mut packet,
+        &mut resources,
+        "Action selection is provided by the shared picker",
+        10.0,
+        MUTED,
+        panel.x + SIDE_MARGIN,
+        panel.y + panel.height - 28.0,
+        panel.width - SIDE_MARGIN * 2.0,
+    )?;
 
     submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
     drop_resources(state.pane, state.text_resources.drain(..));
     state.text_resources = resources;
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HeaderGeometry {
-    title_width: f32,
-    search_x: f32,
-    search_width: f32,
-}
-
-fn header_geometry(width: f32) -> HeaderGeometry {
-    let desired_search_width = if width < 560.0 {
-        (width * 0.42).max(120.0)
-    } else {
-        width - 250.0 - SIDE_MARGIN
-    };
-    let max_search_width = (width - SIDE_MARGIN * 3.0 - 80.0).max(1.0);
-    let search_width = desired_search_width.min(max_search_width);
-    let search_x = width - SIDE_MARGIN - search_width;
-    HeaderGeometry {
-        title_width: (search_x - SIDE_MARGIN * 2.0).max(1.0),
-        search_x,
-        search_width,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RowGeometry {
-    title_width: f32,
-    chip_x: f32,
-    chip_width: f32,
-}
-
-fn row_geometry(width: f32) -> RowGeometry {
-    let max_chip_width = (width - SIDE_MARGIN * 3.0 - 80.0).max(1.0);
-    let chip_width = (width * 0.38)
-        .clamp(96.0, MAX_BINDING_WIDTH)
-        .min(max_chip_width);
-    let chip_x = width - SIDE_MARGIN - chip_width;
-    RowGeometry {
-        title_width: (chip_x - SIDE_MARGIN * 2.0).max(1.0),
-        chip_x,
-        chip_width,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1023,12 +729,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fuzzy_search_matches_title_category_and_binding() {
+    fn action_picker_contains_every_binding_and_preserves_action_identity() {
         let mut state = KeybindingsState::new();
-        state.query = "sess pick".to_string();
-        assert!(state.filtered().contains(&8) || state.filtered().contains(&9));
-        state.query = "ctrl shift /".to_string();
-        assert_eq!(state.filtered().first().copied(), Some(0));
+        let ActorCommand::SendLocalMessage(message) =
+            open_action_picker(&mut state).expect("picker request")
+        else {
+            panic!("action picker did not use a local actor message");
+        };
+        assert_eq!(message.actor, PICKER_ACTOR_ID);
+        let value: serde_json::Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(value["type"], "picker-create");
+        assert_eq!(value["items"].as_array().map(Vec::len), Some(ACTIONS.len()));
+        assert_eq!(value["items"][0]["value"]["action"], ACTIONS[0].id);
+    }
+
+    #[test]
+    fn shared_picker_selection_enters_only_chord_capture() {
+        let mut state = KeybindingsState::new();
+        state.picker = Some(7);
+        let commands = handle_message(
+            &mut state,
+            PICKER_ACTOR_ID,
+            br#"{"type":"picker-selected","picker":7,"result":{"label":"Open session picker","value":{"action":"sessions.picker"}},"index":4}"#,
+        );
+        assert_eq!(state.capture, ACTIONS.iter().position(|action| action.id == "sessions.picker"));
+        assert!(state.visible);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn action_picker_uses_current_persisted_overrides_in_details() {
+        let mut state = KeybindingsState::new();
+        let override_binding = Binding::new(31, MOD_CTRL | MOD_ALT);
+        state
+            .bindings
+            .insert("sessions.picker".to_string(), override_binding);
+        let ActorCommand::SendLocalMessage(message) =
+            open_action_picker(&mut state).expect("picker request")
+        else {
+            panic!("action picker did not use a local actor message");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&message.body).unwrap();
+        let item = value["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["value"]["action"] == "sessions.picker")
+            })
+            .expect("session picker binding");
+        assert!(
+            item["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&binding_label(override_binding))
+        );
     }
 
     #[test]
@@ -1042,31 +797,11 @@ mod tests {
     }
 
     #[test]
-    fn floating_window_is_centered_and_uses_the_real_narrow_extent() {
-        let mut state = KeybindingsState::new();
-        state.resize(330.0, 300.0);
-        assert_eq!((state.width, state.height), (330.0, 300.0));
-        assert_eq!(state.visible_rows(), 4);
-
-        let window = state.window();
-        assert_eq!(window, FloatingWindow::in_viewport(330.0, 300.0));
-        assert_eq!((window.x, window.y), (16.0, 16.0));
-        assert_eq!((window.width, window.height), (298.0, 268.0));
-        assert!(window.contains(16.0, 16.0));
-        assert!(!window.contains(0.0, 0.0));
-
-        let header = header_geometry(window.width);
-        assert!(header.title_width > 0.0);
-        assert!(header.search_width > 0.0);
-        assert!(header.search_x + header.search_width <= window.width - SIDE_MARGIN);
-
-        let row = row_geometry(window.width);
-        assert!(row.title_width > 0.0);
-        assert!(row.chip_width > 0.0);
-        assert!(row.chip_x + row.chip_width <= window.width - SIDE_MARGIN);
-
-        assert_eq!(target_at(&state, window.x + 1.0, window.y + HEADER_HEIGHT), Some(0));
-        assert_eq!(target_at(&state, 0.0, 0.0), None);
+    fn compact_capture_panel_stays_inside_narrow_viewport() {
+        let panel = FloatingPanel::in_viewport(360.0, 320.0);
+        assert!(panel.x >= 0.0 && panel.y >= 0.0);
+        assert!(panel.x + panel.width <= 360.0);
+        assert!(panel.y + panel.height <= 320.0);
     }
 }
 

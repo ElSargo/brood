@@ -29,6 +29,7 @@ abi = "brood-component-v1"
 source = "plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.component.wasm"
 placement = "brood_keybindings_plugin.component.wasm"
 capabilities = ["actor:mailbox", "input:key-policy"]
+dependencies = ["picker"]
 
 [[artifacts]]
 id = "diff-viewer"

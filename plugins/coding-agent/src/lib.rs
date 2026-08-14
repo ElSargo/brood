@@ -1138,7 +1138,28 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
         "bind" => {
             ui.backend_id = message.backend_id;
             ui.session_id = message.session_id;
-            ui.preferred_agent = (!message.agent.is_empty()).then_some(message.agent);
+            if !message.agent.is_empty() {
+                // The picker already established this identity. Seed the UI from
+                // the bind so its first frame is useful even before the session
+                // registry reply completes the normal reconciliation handshake.
+                let agent = message.agent;
+                ui.preferred_agent = Some(agent.clone());
+                if !ui.agents.contains(&agent) {
+                    ui.agents.push(agent.clone());
+                }
+                let selected = ui
+                    .agents
+                    .iter()
+                    .position(|candidate| candidate == &agent)
+                    .unwrap_or_default();
+                ui.views.entry(agent).or_insert_with(|| AgentView {
+                    status: "connecting".to_string(),
+                    model: "default".to_string(),
+                    reasoning: "medium".to_string(),
+                    logs: VecDeque::new(),
+                });
+                ui.selected = selected;
+            }
         }
         "registry" => {
             if message.session_id != 0 && message.session_id != ui.session_id {
@@ -2397,6 +2418,50 @@ fn runtime_error<T: core::fmt::Debug>(context: &'static str) -> impl FnOnce(T) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_agent_bind_seeds_a_non_empty_ui_before_registry_reply() {
+        let mut ui = UiState::new();
+        apply_ui_message(
+            &mut ui,
+            WireMessage {
+                kind: "bind".to_string(),
+                backend_id: 4,
+                session_id: 9,
+                agent: "coding-agent-1".to_string(),
+                ..WireMessage::default()
+            },
+        );
+
+        assert_eq!(ui.backend_id, 4);
+        assert_eq!(ui.session_id, 9);
+        assert_eq!(ui.selected_agent(), Some("coding-agent-1"));
+        assert_eq!(
+            ui.views.get("coding-agent-1").map(|view| view.status.as_str()),
+            Some("connecting")
+        );
+
+        apply_ui_message(
+            &mut ui,
+            WireMessage {
+                kind: "registry".to_string(),
+                session_id: 9,
+                agents: vec![WireAgent {
+                    id: "coding-agent-1".to_string(),
+                    status: "idle".to_string(),
+                    model: "gpt-5".to_string(),
+                    reasoning: "high".to_string(),
+                }],
+                ..WireMessage::default()
+            },
+        );
+
+        assert_eq!(ui.selected_agent(), Some("coding-agent-1"));
+        let view = ui.views.get("coding-agent-1").unwrap();
+        assert_eq!(view.status, "idle");
+        assert_eq!(view.model, "gpt-5");
+        assert_eq!(view.reasoning, "high");
+    }
 
     fn png_bytes(size: usize) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();

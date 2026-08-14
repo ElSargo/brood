@@ -433,13 +433,15 @@ PY
   send_keybindings
   for _ in $(seq 1 200); do
     if rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG" \
-      && rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG"; then
+      && rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG" \
+      && rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG"; then
       break
     fi
     sleep 0.05
   done
   rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG"
   rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG"
+  rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG"
   capture "$OUT/empty-startup-keybindings.png"
   python3 - \
     "$OUT/empty-startup.png" \
@@ -470,7 +472,7 @@ PY
 - backend picker: New discovered backend 1 with no sessions, routed a real daemon directory request, and opened the directory picker without an unknown-backend failure
 - presentation actors: session-switcher and status-bar visible; inbox started but excluded from the two-pane composition
 - status bar: composed at 1280x34 with visible text/detail below a 320x686 session picker and empty content viewport
-- synthetic input: Ctrl+Shift+/ opened the keybindings actor
+- synthetic input: Ctrl+Shift+/ made the keybindings actor request the shared picker
 - captures: empty-startup.png, empty-startup-status-bar.png, empty-startup-backend-picker.png, empty-startup-directory-picker.png, and empty-startup-keybindings.png
 EOF
   echo "empty_startup_plugins=verified"
@@ -611,6 +613,7 @@ for _ in $(seq 1 100); do
   KEYBINDINGS_LAYOUT_OPEN="$(accepted_layout_count)"
   if rg -q "started presentation WASM actor id=keybindings" "$CLIENT_LOG" \
     && rg -q "sent key-policy actor message actor=keybindings" "$CLIENT_LOG" \
+    && rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG" \
     && ((KEYBINDINGS_LAYOUT_OPEN > KEYBINDINGS_LAYOUT_BEFORE)); then
     break
   fi
@@ -618,6 +621,7 @@ for _ in $(seq 1 100); do
 done
 rg -q "started presentation WASM actor id=keybindings" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=keybindings" "$CLIENT_LOG"
+rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG"
 ((KEYBINDINGS_LAYOUT_OPEN > KEYBINDINGS_LAYOUT_BEFORE))
 KEYBINDINGS_PANE="$(
   sed -n 's/.*started presentation WASM actor id=keybindings .* pane=\([0-9][0-9]*\) .*/\1/p' \
@@ -651,9 +655,22 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype "toggle session switcher" -s 100
 capture "$OUT/keybindings-filtered.png"
+KEYBINDINGS_CAPTURE_LAYOUT_BEFORE="$(accepted_layout_count)"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" --none 28
+for _ in $(seq 1 100); do
+  KEYBINDINGS_CAPTURE_LAYOUT_AFTER="$(accepted_layout_count)"
+  if rg -q 'sender=picker recipient=keybindings body=.*"type":"picker-selected"' "$CLIENT_LOG" \
+    && rg -q 'sender=keybindings recipient=session-switcher body=.*"type":"keybindings-pane".*"visible":true' "$CLIENT_LOG" \
+    && ((KEYBINDINGS_CAPTURE_LAYOUT_AFTER > KEYBINDINGS_CAPTURE_LAYOUT_BEFORE)); then
+    break
+  fi
+  sleep 0.05
+done
+rg -q 'sender=picker recipient=keybindings body=.*"type":"picker-selected"' "$CLIENT_LOG"
+rg -q 'sender=keybindings recipient=session-switcher body=.*"type":"keybindings-pane".*"visible":true' "$CLIENT_LOG"
+((KEYBINDINGS_CAPTURE_LAYOUT_AFTER > KEYBINDINGS_CAPTURE_LAYOUT_BEFORE))
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" 23
@@ -720,7 +737,8 @@ if [[ "${BROOD_KEYBINDINGS_ONLY:-0}" == "1" ]]; then
   cat > "$OUT/proof.md" <<EOF
 # Global keybinding remapping proof
 
-- Ctrl+Shift+/ opened the presentation-global keybindings actor as a modal floating window.
+- Ctrl+Shift+/ made the keybindings actor send its action catalogue to the shared picker.
+- Selecting the action closed the picker and opened the keybindings actor only for physical-chord capture.
 - $KEYBINDINGS_CLOSE_PROOF
 - Fuzzy text \`toggle session switcher\` narrowed the action catalogue.
 - Capturing Ctrl+Alt+I rebound \`sessions.toggle\` and swapped the conflicting
