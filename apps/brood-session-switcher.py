@@ -20,9 +20,6 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
-GTK4 = True
-
-
 APP_ID = "org.brood.SessionSwitcher"
 DEFAULT_DESTINATION = "org.brood.Session"
 DISCLOSURE_COLUMN_WIDTH = 28
@@ -262,32 +259,10 @@ class SessionSwitcher:
         self.last_error = None
 
     def run(self):
-        if not GTK4:
-            self.window = self.make_window(None)
-            self.configure_window_icon(self.window)
-            self.window.connect("destroy", Gtk.main_quit)
-            self.build_ui()
-            self.setup_notifications()
-            self.refresh_sessions()
-            self.refresh_statuses()
-            self.mark_ready()
-            self.present_window()
-            GLib.timeout_add(self.args.refresh_ms, self.refresh_sessions)
-            GLib.timeout_add(self.args.refresh_ms, self.refresh_statuses)
-            GLib.timeout_add(450, self.animate_working_agents)
-            Gtk.main()
-            return 0
-
-        if Adw is not None:
-            app = Adw.Application(
-                application_id=APP_ID,
-                flags=Gio.ApplicationFlags.NON_UNIQUE,
-            )
-        else:
-            app = Gtk.Application(
-                application_id=APP_ID,
-                flags=Gio.ApplicationFlags.NON_UNIQUE,
-            )
+        app = Adw.Application(
+            application_id=APP_ID,
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
         self.configure_style()
         app.connect("activate", self.on_activate)
         return app.run([])
@@ -306,12 +281,8 @@ class SessionSwitcher:
         GLib.timeout_add(450, self.animate_working_agents)
 
     def make_window(self, app):
-        if GTK4:
-            window = Gtk.ApplicationWindow(application=app)
-            window.set_default_size(self.args.width, 720)
-        else:
-            window = Gtk.Window()
-            window.set_default_size(self.args.width, 720)
+        window = Gtk.ApplicationWindow(application=app)
+        window.set_default_size(self.args.width, 720)
         window.set_title("Brood Sessions")
         return window
 
@@ -356,10 +327,7 @@ class SessionSwitcher:
         )
 
     def present_window(self):
-        if GTK4:
-            self.window.present()
-        else:
-            self.window.show_all()
+        self.window.present()
         GLib.idle_add(self.focus_command_entry)
 
     def focus_command_entry(self):
@@ -380,32 +348,21 @@ class SessionSwitcher:
         self.command_entry.set_placeholder_text("Search or create session")
         self.command_entry.connect("changed", self.filter_sessions)
         self.command_entry.connect("activate", self.submit_command)
-        if GTK4:
-            command_button = Gtk.Button.new_from_icon_name("go-next-symbolic")
-            key_controller = Gtk.EventControllerKey()
-            key_controller.connect("key-pressed", self.handle_command_key_pressed)
-            self.command_entry.add_controller(key_controller)
-        else:
-            command_button = Gtk.Button.new_from_icon_name(
-                "go-next-symbolic", Gtk.IconSize.BUTTON
-            )
+        command_button = Gtk.Button.new_from_icon_name("go-next-symbolic")
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self.handle_command_key_pressed)
+        self.command_entry.add_controller(key_controller)
         command_button.set_tooltip_text("Open selected session or create one")
         command_button.connect("clicked", self.submit_command)
         self.pack(command_row, self.command_entry, expand=True)
         self.pack(command_row, command_button, expand=False)
         self.pack(outer, command_row, expand=False)
 
-        if GTK4:
-            self.listbox = Gtk.ListBox()
-            self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-            self.listbox.connect("row-activated", self.activate_row)
-        else:
-            self.listbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.listbox.connect("row-activated", self.activate_row)
         scroller = Gtk.ScrolledWindow()
-        if GTK4:
-            scroller.set_child(self.listbox)
-        else:
-            scroller.add(self.listbox)
+        scroller.set_child(self.listbox)
         self.pack(outer, scroller, expand=True)
 
         self.status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -418,17 +375,10 @@ class SessionSwitcher:
         self.pack(self.status_box, self.passthrough_button, expand=True)
         self.pack(outer, self.status_box, expand=False)
 
-        if GTK4:
-            if hasattr(self.window, "set_content"):
-                self.window.set_content(outer)
-            else:
-                self.window.set_child(outer)
+        if hasattr(self.window, "set_content"):
+            self.window.set_content(outer)
         else:
-            outer.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
-            outer.connect("button-release-event", self.activate_session_from_gtk3_click)
-            self.window.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
-            self.window.connect("button-release-event", self.activate_session_from_gtk3_click)
-            self.window.add(outer)
+            self.window.set_child(outer)
 
     def install_css(self):
         css = Gtk.CssProvider()
@@ -490,30 +440,20 @@ class SessionSwitcher:
             }
             """
         )
-        if GTK4:
-            display = Gdk.Display.get_default()
-            if display is not None:
-                Gtk.StyleContext.add_provider_for_display(
-                    display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-                )
-        else:
-            screen = Gdk.Screen.get_default()
-            if screen is not None:
-                Gtk.StyleContext.add_provider_for_screen(
-                    screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-                )
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
 
     def pack(self, box, child, expand):
-        if GTK4:
-            if box.get_orientation() == Gtk.Orientation.VERTICAL:
-                child.set_vexpand(expand)
-                child.set_hexpand(True)
-            else:
-                child.set_hexpand(expand)
-                child.set_vexpand(False)
-            box.append(child)
+        if box.get_orientation() == Gtk.Orientation.VERTICAL:
+            child.set_vexpand(expand)
+            child.set_hexpand(True)
         else:
-            box.pack_start(child, expand, expand, 0)
+            child.set_hexpand(expand)
+            child.set_vexpand(False)
+        box.append(child)
 
     def mark_ready(self):
         write_status(
@@ -747,15 +687,11 @@ class SessionSwitcher:
         )
 
     def clear_listbox(self):
-        if GTK4:
-            child = self.listbox.get_first_child()
-            while child is not None:
-                next_child = child.get_next_sibling()
-                self.listbox.remove(child)
-                child = next_child
-        else:
-            for child in self.listbox.get_children():
-                self.listbox.remove(child)
+        child = self.listbox.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            self.listbox.remove(child)
+            child = next_child
 
     def add_session_row(self, session):
         label = f"{session['name']}  {session['windows']}w"
@@ -829,18 +765,10 @@ class SessionSwitcher:
         session_label.set_xalign(0)
         session_label.set_hexpand(True)
         session_label.set_ellipsize(Pango.EllipsizeMode.END)
-        if GTK4:
-            session_button.set_child(session_label)
-        else:
-            session_button.add(session_label)
+        session_button.set_child(session_label)
         self.pack(session_row, session_button, expand=True)
 
-        if GTK4:
-            worktree_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
-        else:
-            worktree_button = Gtk.Button.new_from_icon_name(
-                "list-add-symbolic", Gtk.IconSize.BUTTON
-            )
+        worktree_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
         worktree_button.get_style_context().add_class("worktree-create")
         worktree_button.set_tooltip_text("Create worktree session")
         worktree_button.set_hexpand(False)
@@ -864,18 +792,12 @@ class SessionSwitcher:
         self.pack(content, agent_box, expand=False)
         self.pack(row_shell, content, expand=True)
 
-        if GTK4:
-            row = Gtk.ListBoxRow()
-            row.session_id = session["id"]
-            row.set_activatable(False)
-            row.set_child(row_shell)
-            self.listbox.append(row)
-            root = row
-        else:
-            self.listbox.pack_start(row_shell, False, False, 0)
-            row_shell.show_all()
-            agent_box.set_visible(session["id"] in self.expanded_sessions)
-            root = row_shell
+        row = Gtk.ListBoxRow()
+        row.session_id = session["id"]
+        row.set_activatable(False)
+        row.set_child(row_shell)
+        self.listbox.append(row)
+        root = row
 
         self.fade_in(row_shell)
         self.session_rows[session["id"]] = {
@@ -898,15 +820,11 @@ class SessionSwitcher:
         }
 
     def replace_agent_items(self, agent_box, agents):
-        if GTK4:
-            child = agent_box.get_first_child()
-            while child is not None:
-                next_child = child.get_next_sibling()
-                agent_box.remove(child)
-                child = next_child
-        else:
-            for child in agent_box.get_children():
-                agent_box.remove(child)
+        child = agent_box.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            agent_box.remove(child)
+            child = next_child
         if agents:
             for agent in agents:
                 self.pack(agent_box, self.make_agent_button(agent), expand=False)
@@ -916,9 +834,6 @@ class SessionSwitcher:
             empty.set_margin_start(0)
             empty.set_margin_bottom(4)
             self.pack(agent_box, empty, expand=False)
-        if not GTK4:
-            agent_box.show_all()
-
     def fade_in(self, widget, step=0):
         opacity = min(1.0, 0.20 + step * 0.20)
         widget.set_opacity(opacity)
@@ -943,14 +858,10 @@ class SessionSwitcher:
             agent_box = widgets.get("agent_box")
             if agent_box is None:
                 continue
-            if GTK4:
-                child = agent_box.get_first_child()
-                while child is not None:
-                    self.update_agent_dot_pulse(child)
-                    child = child.get_next_sibling()
-            else:
-                for child in agent_box.get_children():
-                    self.update_agent_dot_pulse(child)
+            child = agent_box.get_first_child()
+            while child is not None:
+                self.update_agent_dot_pulse(child)
+                child = child.get_next_sibling()
         return True
 
     def update_agent_dot_pulse(self, widget):
@@ -1273,10 +1184,7 @@ class SessionSwitcher:
         )
         dialog.format_secondary_text(message)
         dialog.connect("response", lambda dialog, _response: dialog.destroy())
-        if GTK4:
-            dialog.present()
-        else:
-            dialog.show_all()
+        dialog.present()
 
     def make_agent_button(self, agent):
         button = Gtk.Button()
@@ -1309,10 +1217,7 @@ class SessionSwitcher:
         label.set_ellipsize(Pango.EllipsizeMode.END)
         self.pack(row, label, expand=True)
 
-        if GTK4:
-            button.set_child(row)
-        else:
-            button.add(row)
+        button.set_child(row)
         return button
 
     def agent_is_done(self, agent):
@@ -1373,10 +1278,7 @@ class SessionSwitcher:
             write_status(self.args.event_file, event="activate-error", error=err)
 
     def close_standalone_window(self):
-        if GTK4:
-            self.window.close()
-        else:
-            self.window.destroy()
+        self.window.close()
         return False
 
     def activate_agent(self, _button, agent, activation_token=""):
@@ -1452,30 +1354,6 @@ class SessionSwitcher:
         self.notification_agents.pop(notification_id, None)
         self.notification_tokens.pop(notification_id, None)
         self.activated_notifications.discard(notification_id)
-
-    def activate_session_from_gtk3_click(self, _widget, event):
-        self.activate_session_at_position(event.x, event.y, event_name="panel-click")
-        return False
-
-    def activate_session_at_position(self, x, y, event_name="panel-click"):
-        if y < 54 and x >= max(0, self.args.width - 80):
-            write_status(
-                self.args.event_file,
-                event=f"{event_name}-create",
-                x=round(x, 1),
-                y=round(y, 1),
-            )
-            self.submit_command()
-            return
-        list_top = 54
-        if y < list_top:
-            return
-        write_status(
-            self.args.event_file,
-            event=f"{event_name}-ignored-list",
-            x=round(x, 1),
-            y=round(y, 1),
-        )
 
     def submit_command(self, *_args):
         if self.selected_session_id is not None:
