@@ -1498,6 +1498,9 @@ impl Screen {
 
     fn resize(&mut self, rows: u16, cols: u16) {
         let next = resize_rows(&self.cells, rows, cols);
+        for row in &mut self.scrollback {
+            *row = resize_row(row, cols);
+        }
         if let Some((main, _, _)) = self.alternate.as_mut() {
             *main = resize_rows(main, rows, cols);
         }
@@ -1506,6 +1509,12 @@ impl Screen {
         self.cells = next;
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        self.saved_cursor.0 = self.saved_cursor.0.min(rows.saturating_sub(1));
+        self.saved_cursor.1 = self.saved_cursor.1.min(cols.saturating_sub(1));
+        if let Some((_, row, col)) = self.alternate.as_mut() {
+            *row = (*row).min(rows.saturating_sub(1));
+            *col = (*col).min(cols.saturating_sub(1));
+        }
         self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
     }
@@ -1543,22 +1552,7 @@ impl Screen {
     }
 
     fn normalize_row(&mut self, row: u16) {
-        for col in 0..self.cols {
-            let valid = col > 0 && {
-                let previous = &self.cells[usize::from(row)][usize::from(col - 1)];
-                !previous.continuation
-                    && previous
-                        .text
-                        .chars()
-                        .map(|character| UnicodeWidthChar::width(character).unwrap_or(1))
-                        .sum::<usize>()
-                        == 2
-            };
-            let cell = &mut self.cells[usize::from(row)][usize::from(col)];
-            if cell.continuation && !valid {
-                reset_cell(cell, self.style);
-            }
-        }
+        normalize_cells(&mut self.cells[usize::from(row)]);
     }
 
     fn insert_blank_chars(&mut self, count: u16) {
@@ -1689,10 +1683,19 @@ impl Screen {
     fn put_char(&mut self, character: char) {
         let width = UnicodeWidthChar::width(character).unwrap_or(1);
         if width == 0 {
-            let col = self.cursor_col.saturating_sub(1);
-            self.cells[usize::from(self.cursor_row)][usize::from(col)]
-                .text
-                .push(character);
+            let row = &mut self.cells[usize::from(self.cursor_row)];
+            let Some(mut col) = usize::from(self.cursor_col).checked_sub(1) else {
+                return;
+            };
+            if row[col].continuation {
+                let Some(lead) = col.checked_sub(1) else {
+                    return;
+                };
+                col = lead;
+            }
+            if !row[col].continuation {
+                row[col].text.push(character);
+            }
             return;
         }
         if self.cursor_col >= self.cols || (width == 2 && self.cursor_col + 1 >= self.cols) {
@@ -1706,13 +1709,19 @@ impl Screen {
         if self.insert_mode {
             self.insert_blank_chars(width as u16);
         }
-        self.cells[usize::from(self.cursor_row)][usize::from(self.cursor_col)] = Cell {
+        let row = &mut self.cells[usize::from(self.cursor_row)];
+        let col = usize::from(self.cursor_col);
+        clear_glyph_at(row, col);
+        if width == 2 {
+            clear_glyph_at(row, col + 1);
+        }
+        row[col] = Cell {
             text: character.to_string(),
             continuation: false,
             style: self.style,
         };
         if width == 2 && self.cursor_col + 1 < self.cols {
-            self.cells[usize::from(self.cursor_row)][usize::from(self.cursor_col + 1)] = Cell {
+            row[col + 1] = Cell {
                 text: String::new(),
                 continuation: true,
                 style: self.style,
@@ -1844,16 +1853,83 @@ fn reset_row(row: &mut [Cell], style: Style) {
     }
 }
 
+fn clear_glyph_at(row: &mut [Cell], col: usize) {
+    if col >= row.len() {
+        return;
+    }
+    let lead = if row[col].continuation {
+        col.saturating_sub(1)
+    } else {
+        col
+    };
+    let width = row[lead]
+        .text
+        .chars()
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(1))
+        .sum::<usize>();
+    let style = row[lead].style;
+    reset_cell(&mut row[lead], style);
+    if width == 2 && lead + 1 < row.len() {
+        let continuation_style = row[lead + 1].style;
+        reset_cell(&mut row[lead + 1], continuation_style);
+    }
+}
+
 fn resize_rows(cells: &[Vec<Cell>], rows: u16, cols: u16) -> Vec<Vec<Cell>> {
     let mut next = blank_rows(rows, cols, Style::default());
     let copy_rows = usize::from(rows).min(cells.len());
     for row in 0..copy_rows {
-        let copy_cols = usize::from(cols).min(cells[row].len());
-        for col in 0..copy_cols {
-            next[row][col] = cells[row][col].clone();
-        }
+        next[row] = resize_row(&cells[row], cols);
     }
     next
+}
+
+fn resize_row(row: &[Cell], cols: u16) -> Vec<Cell> {
+    let mut next = row
+        .iter()
+        .take(usize::from(cols))
+        .cloned()
+        .collect::<Vec<_>>();
+    next.resize_with(usize::from(cols), || Cell::blank(Style::default()));
+    normalize_cells(&mut next);
+    next
+}
+
+/// Restore the invariant shared by live, alternate, and scrollback rows: a row
+/// has no orphan continuation cells and every two-cell glyph owns exactly the
+/// following cell. Resizing can split a wide glyph at the right edge, while
+/// insertion/deletion can move only one half of a glyph.
+fn normalize_cells(row: &mut [Cell]) {
+    let mut col = 0;
+    while col < row.len() {
+        if row[col].continuation {
+            let style = row[col].style;
+            reset_cell(&mut row[col], style);
+            col += 1;
+            continue;
+        }
+
+        let width = row[col]
+            .text
+            .chars()
+            .map(|character| UnicodeWidthChar::width(character).unwrap_or(1))
+            .sum::<usize>();
+        if width == 2 {
+            if col + 1 == row.len() {
+                let style = row[col].style;
+                reset_cell(&mut row[col], style);
+            } else {
+                row[col + 1] = Cell {
+                    text: String::new(),
+                    continuation: true,
+                    style: row[col].style,
+                };
+                col += 2;
+                continue;
+            }
+        }
+        col += 1;
+    }
 }
 
 impl Perform for Screen {
@@ -2219,13 +2295,56 @@ fn encode_row(screen: &Screen, viewport_offset: usize, row: u16) -> Vec<u8> {
     bytes
 }
 
+struct EncodedRun {
+    cells_offset: usize,
+    text_length_offset: usize,
+    text_start: usize,
+}
+
+fn begin_encoded_run(bytes: &mut Vec<u8>, start: u16, style: Style) -> EncodedRun {
+    let (fg, bg) = if style.inverse {
+        (style.bg, style.fg)
+    } else {
+        (style.fg, style.bg)
+    };
+    bytes.extend_from_slice(&start.to_le_bytes());
+    let cells_offset = bytes.len();
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&fg.to_le_bytes());
+    bytes.extend_from_slice(&bg.to_le_bytes());
+    bytes.push(
+        u8::from(style.bold)
+            | (u8::from(style.faint) << 1)
+            | (u8::from(style.italic) << 2)
+            | (u8::from(style.underline) << 3)
+            | (u8::from(style.strikethrough) << 4),
+    );
+    let text_length_offset = bytes.len();
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    EncodedRun {
+        cells_offset,
+        text_length_offset,
+        text_start: bytes.len(),
+    }
+}
+
+fn finish_encoded_run(bytes: &mut [u8], run: EncodedRun, cells: u16) {
+    bytes[run.cells_offset..run.cells_offset + 2].copy_from_slice(&cells.to_le_bytes());
+    let text_length = (bytes.len() - run.text_start) as u16;
+    bytes[run.text_length_offset..run.text_length_offset + 2]
+        .copy_from_slice(&text_length.to_le_bytes());
+}
+
+bindings::export!(TerminalSession with_types_in bindings);
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EditorOpen, MAX_PENDING_EDITOR_CONTROLS, SNAPSHOT_FULL, SNAPSHOT_VERSION, Screen,
-        SessionState, decode_editor_control, editor_cursor_arguments, editor_remote_arguments,
-        editor_socket_path, editor_worker_finished_message, encode_snapshot,
-        is_editor_session_instance, parse_editor_open, route_editor_action, trusted_input_sender,
+        Cell, EditorOpen, MAX_PENDING_EDITOR_CONTROLS, SNAPSHOT_FULL, SNAPSHOT_VERSION, Screen,
+        SessionState, Style, decode_editor_control, editor_cursor_arguments,
+        editor_remote_arguments, editor_socket_path, editor_worker_finished_message, encode_row,
+        encode_snapshot, is_editor_session_instance, parse_editor_open, route_editor_action,
+        trusted_input_sender,
     };
     use brood_plugin_sdk::exports::brood::plugin::actor::Command;
     use serde_json::Value;
@@ -2236,6 +2355,144 @@ mod tests {
             u16::from_le_bytes([chunk[41], chunk[42]]),
             u16::from_le_bytes([chunk[43], chunk[44]]),
         )
+    }
+
+    fn encoded_row_runs(row: &[u8]) -> Vec<(u16, u16, Style, String)> {
+        let mut offset = 0;
+        let take_u16 = |bytes: &[u8], offset: &mut usize| {
+            let value = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]);
+            *offset += 2;
+            value
+        };
+        let take_u32 = |bytes: &[u8], offset: &mut usize| {
+            let value =
+                u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().expect("encoded u32"));
+            *offset += 4;
+            value
+        };
+        let count = take_u16(row, &mut offset);
+        (0..count)
+            .map(|_| {
+                let start = take_u16(row, &mut offset);
+                let cells = take_u16(row, &mut offset);
+                let fg = take_u32(row, &mut offset);
+                let bg = take_u32(row, &mut offset);
+                let flags = row[offset];
+                offset += 1;
+                let text_len = usize::from(take_u16(row, &mut offset));
+                let text = std::str::from_utf8(&row[offset..offset + text_len])
+                    .expect("encoded row UTF-8")
+                    .to_string();
+                offset += text_len;
+                (
+                    start,
+                    cells,
+                    Style {
+                        fg,
+                        bg,
+                        bold: flags & 1 != 0,
+                        faint: flags & 2 != 0,
+                        italic: flags & 4 != 0,
+                        underline: flags & 8 != 0,
+                        strikethrough: flags & 16 != 0,
+                        inverse: false,
+                    },
+                    text,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn width_resize_normalizes_styled_live_alternate_and_scrollback_rows() {
+        let styled = Style {
+            fg: 0x12_34_56,
+            bg: 0x65_43_21,
+            bold: true,
+            ..Style::default()
+        };
+        let wide_row = || {
+            let mut row = vec![Cell::blank(styled); 6];
+            row[0].text = "h".to_string();
+            row[4].text = "界".to_string();
+            row[5] = Cell {
+                text: String::new(),
+                continuation: true,
+                style: styled,
+            };
+            row
+        };
+        let mut screen = Screen::new(2, 6, false);
+        screen.scrollback.push_back(wide_row());
+        screen.cells[0] = wide_row();
+        screen.enter_alternate();
+        screen.cells[0] = wide_row();
+
+        screen.resize(2, 5);
+        for row in [
+            &screen.scrollback[0],
+            &screen.cells[0],
+            &screen.alternate.as_ref().unwrap().0[0],
+        ] {
+            assert_eq!(row.len(), 5);
+            assert_eq!(row[0].style, styled);
+            assert_eq!(row[4], Cell::blank(styled));
+            assert!(!row.iter().any(|cell| cell.continuation));
+        }
+
+        screen.resize(2, 8);
+        for row in [
+            &screen.scrollback[0],
+            &screen.cells[0],
+            &screen.alternate.as_ref().unwrap().0[0],
+        ] {
+            assert_eq!(row.len(), 8);
+            assert_eq!(row[0].style, styled);
+            assert_eq!(row[4], Cell::blank(styled));
+            assert_eq!(row[7], Cell::blank(Style::default()));
+        }
+    }
+
+    #[test]
+    fn resized_scrollback_encodes_only_runs_within_the_new_width() {
+        let mut screen = Screen::new(2, 7, false);
+        let mut history = vec![Cell::blank(Style::default()); 7];
+        history[0].text = "o".to_string();
+        history[0].style.bold = true;
+        history[1].style.bold = true;
+        history[5].style.bold = true;
+        history[6].style.bold = true;
+        screen.scrollback.push_back(history);
+
+        screen.resize(2, 3);
+        let encoded = encode_row(&screen, 1, 0);
+        let runs = encoded_row_runs(&encoded);
+        assert!(!runs.is_empty());
+        assert!(
+            runs.iter()
+                .all(|(start, cells, _, _)| start.saturating_add(*cells) <= 3)
+        );
+        assert_eq!(runs.iter().map(|(_, cells, _, _)| cells).sum::<u16>(), 3);
+        assert!(runs.iter().any(|(_, _, _, text)| text.starts_with('o')));
+        assert!(runs.iter().any(|(_, _, style, _)| style.bold));
+    }
+
+    #[test]
+    fn combining_mark_after_wide_glyph_belongs_to_the_lead_cell_and_snapshot() {
+        let mut screen = Screen::new(2, 6, false);
+        let mut parser = Parser::new();
+        parser.advance(&mut screen, "界\u{301}".as_bytes());
+
+        assert_eq!(screen.cursor_col, 2);
+        assert_eq!(screen.cells[0][0].text, "界\u{301}");
+        assert!(screen.cells[0][1].continuation);
+        assert!(screen.cells[0][1].text.is_empty());
+
+        let runs = encoded_row_runs(&encode_row(&screen, 0, 0));
+        assert!(
+            runs.iter()
+                .any(|(_, _, _, text)| text.starts_with("界\u{301}"))
+        );
     }
 
     #[test]
@@ -2607,45 +2864,3 @@ mod tests {
         assert!(!trusted_input_sender("other-session-actor"));
     }
 }
-
-struct EncodedRun {
-    cells_offset: usize,
-    text_length_offset: usize,
-    text_start: usize,
-}
-
-fn begin_encoded_run(bytes: &mut Vec<u8>, start: u16, style: Style) -> EncodedRun {
-    let (fg, bg) = if style.inverse {
-        (style.bg, style.fg)
-    } else {
-        (style.fg, style.bg)
-    };
-    bytes.extend_from_slice(&start.to_le_bytes());
-    let cells_offset = bytes.len();
-    bytes.extend_from_slice(&0_u16.to_le_bytes());
-    bytes.extend_from_slice(&fg.to_le_bytes());
-    bytes.extend_from_slice(&bg.to_le_bytes());
-    bytes.push(
-        u8::from(style.bold)
-            | (u8::from(style.faint) << 1)
-            | (u8::from(style.italic) << 2)
-            | (u8::from(style.underline) << 3)
-            | (u8::from(style.strikethrough) << 4),
-    );
-    let text_length_offset = bytes.len();
-    bytes.extend_from_slice(&0_u16.to_le_bytes());
-    EncodedRun {
-        cells_offset,
-        text_length_offset,
-        text_start: bytes.len(),
-    }
-}
-
-fn finish_encoded_run(bytes: &mut [u8], run: EncodedRun, cells: u16) {
-    bytes[run.cells_offset..run.cells_offset + 2].copy_from_slice(&cells.to_le_bytes());
-    let text_length = (bytes.len() - run.text_start) as u16;
-    bytes[run.text_length_offset..run.text_length_offset + 2]
-        .copy_from_slice(&text_length.to_le_bytes());
-}
-
-bindings::export!(TerminalSession with_types_in bindings);
