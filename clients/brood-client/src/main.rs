@@ -345,7 +345,7 @@ fn main() -> Result<()> {
         wasm_actor_specs.push(format!("{provider}={path}"));
     }
     if args.check_wasm_actors {
-        let mut runtime = PresentationWasmRuntime::start(
+        let runtime = PresentationWasmRuntime::start(
             &wasm_actor_specs,
             init_actor.as_deref(),
             Some((BackendId(1), 1)),
@@ -355,7 +355,6 @@ fn main() -> Result<()> {
         runtime
             .shutdown()
             .context("stop checked presentation WASM runtime")?;
-        drop(runtime);
         eprintln!("presentation WASM actor check passed");
         return Ok(());
     }
@@ -946,7 +945,7 @@ fn main() -> Result<()> {
     }
     let shutdown_result = application
         .wasm_runtime
-        .as_mut()
+        .take()
         .map_or(Ok(()), PresentationWasmRuntime::shutdown)
         .context("stop presentation WASM runtime");
     if let Some(graphics) = application.plugin_graphics.as_ref()
@@ -1130,6 +1129,7 @@ enum ClientEvent {
     },
     WaylandDroppedFile(WaylandDropEvent),
     ActorHostMessagesReady,
+    ActorLifecycleReady,
     BackendActorMessage {
         backend: BackendId,
         realm: BackendActorRealm,
@@ -4755,6 +4755,11 @@ impl Application {
             }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
+            }
+            ClientEvent::ActorLifecycleReady => {
+                return Err(anyhow!(
+                    "actor lifecycle event reached scene transport path"
+                ));
             }
             ClientEvent::BackendActorMessage { .. } => {
                 return Err(anyhow!(
@@ -9284,6 +9289,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.fail(event_loop, error);
                 }
             }
+            // Lifecycle completions are drained by the common pre-dispatch
+            // pass at the top of `user_event`.
+            ClientEvent::ActorLifecycleReady => {}
             ClientEvent::BackendActorMessage {
                 backend,
                 realm,

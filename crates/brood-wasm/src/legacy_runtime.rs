@@ -87,18 +87,27 @@ impl LegacyWasmActorGeneration {
             .collect()
     }
 
-    pub async fn cancel_and_join(self) {
+    pub async fn cancel_and_join(mut self) {
         let actor_names = self.actor_names();
         if self.cancellation.send(true).is_err() {
             tracing::debug!("legacy WASM generation had no cancellation receivers");
         }
-        for (actor_name, task) in actor_names.into_iter().zip(self.tasks) {
+        for (actor_name, task) in actor_names.into_iter().zip(self.tasks.drain(..)) {
             match task.await {
                 Ok(()) => {}
                 Err(error) => {
                     warn!(actor = %actor_name, error = %error, "legacy WASM actor join failed");
                 }
             }
+        }
+    }
+}
+
+impl Drop for LegacyWasmActorGeneration {
+    fn drop(&mut self) {
+        let _cancelled = self.cancellation.send(true);
+        for task in self.tasks.drain(..) {
+            task.abort();
         }
     }
 }
@@ -150,4 +159,54 @@ fn spawn_actor_task(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_legacy_generation_aborts_a_stuck_actor_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_drop = Arc::clone(&dropped);
+        let (started, observed_start) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(task_drop);
+            let _sent = started.send(());
+            std::future::pending::<()>().await;
+        });
+        assert!(observed_start.await.is_ok());
+        let (cancellation, _receiver) = watch::channel(false);
+        let generation = LegacyWasmActorGeneration {
+            declarations: Vec::new(),
+            actor_ids: BTreeMap::new(),
+            cancellation,
+            tasks: vec![task],
+        };
+
+        drop(generation);
+        for _attempt in 0..10 {
+            if dropped.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "dropping a generation left its actor task detached"
+        );
+    }
 }

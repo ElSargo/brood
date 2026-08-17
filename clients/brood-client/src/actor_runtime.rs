@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -17,12 +18,19 @@ use brood_wasm::{
     SessionEvent, SessionSnapshot, WasmActor, WasmActorDeclaration, WasmActorEventKind,
     WasmPluginArtifact,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use winit::event_loop::EventLoopProxy;
 
 use crate::{ClientEvent, plugin_graphics::PluginGraphicsBridge};
 
 const CLIENT_INIT_ACTOR_ID: &str = "brood.client-init";
+const ACTOR_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+const ACTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_START_MESSAGES: usize = 64;
+const MAX_PENDING_START_MESSAGE_BYTES: usize = 1024 * 1024;
+
+type PendingStartMessage = (String, Vec<u8>);
+type PendingStartMailboxes = BTreeMap<String, VecDeque<PendingStartMessage>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PresentationActorSpec {
@@ -41,9 +49,17 @@ pub struct PresentationWasmRuntime {
     graphics: Option<PluginGraphicsBridge>,
     init: Option<PresentationInitState>,
     failed_init_children: BTreeSet<String>,
+    starting_init_children: BTreeSet<String>,
+    stopping_init_children: BTreeSet<String>,
+    stop_requested_while_starting: BTreeSet<String>,
+    lifecycle_completions: mpsc::UnboundedReceiver<ActorLifecycleCompletion>,
+    lifecycle_completion_sender: mpsc::UnboundedSender<ActorLifecycleCompletion>,
+    lifecycle_tasks: Vec<tokio::task::JoinHandle<()>>,
+    pending_start_messages: StdMutex<PendingStartMailboxes>,
     outbound_backend_messages: VecDeque<BackendActorMessageRequest>,
     outbound_session_commands: VecDeque<SessionCommandEnvelope>,
     outbound_host_messages: VecDeque<HostActorMessage>,
+    started_panes_awaiting_start_barrier: VecDeque<u64>,
     pending_pane_creations: VecDeque<u64>,
     pending_pane_removals: VecDeque<u64>,
     bound_backend_id: Option<BackendId>,
@@ -96,6 +112,27 @@ struct LegacyPresentationActor {
     generation: LegacyWasmActorGeneration,
 }
 
+enum ActorLifecycleCompletion {
+    Started {
+        id: String,
+        generation: u64,
+        actor: Box<PresentationActor>,
+        result: std::result::Result<(), String>,
+    },
+    Stopped {
+        id: String,
+        pane: Option<u64>,
+        disposition: StopDisposition,
+        result: std::result::Result<(), String>,
+    },
+}
+
+enum StopDisposition {
+    Requested,
+    Failed,
+    StartFailed(String),
+}
+
 impl PresentationWasmRuntime {
     pub fn start(
         actor_specs: &[String],
@@ -119,6 +156,7 @@ impl PresentationWasmRuntime {
         let host_mailbox = registry
             .register_host_mailbox(64)
             .context("register presentation host actor mailbox")?;
+        let (lifecycle_completion_sender, lifecycle_completions) = mpsc::unbounded_channel();
         let mut runtime = Self {
             executor,
             actors: BTreeMap::new(),
@@ -130,9 +168,17 @@ impl PresentationWasmRuntime {
             graphics: graphics.cloned(),
             init: None,
             failed_init_children: BTreeSet::new(),
+            starting_init_children: BTreeSet::new(),
+            stopping_init_children: BTreeSet::new(),
+            stop_requested_while_starting: BTreeSet::new(),
+            lifecycle_completions,
+            lifecycle_completion_sender,
+            lifecycle_tasks: Vec::new(),
+            pending_start_messages: StdMutex::new(BTreeMap::new()),
             outbound_backend_messages: VecDeque::new(),
             outbound_session_commands: VecDeque::new(),
             outbound_host_messages: VecDeque::new(),
+            started_panes_awaiting_start_barrier: VecDeque::new(),
             pending_pane_creations: VecDeque::new(),
             pending_pane_removals: VecDeque::new(),
             bound_backend_id: bound_session.map(|(backend, _session)| backend),
@@ -444,6 +490,7 @@ impl PresentationWasmRuntime {
         &mut self,
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<()> {
+        self.drain_lifecycle_completions();
         let mut events = Vec::new();
         for (actor_id, hosted) in &mut self.actors {
             match &mut hosted.actor {
@@ -707,6 +754,10 @@ impl PresentationWasmRuntime {
                 _ => {}
             }
         }
+        if self.starting_init_children.is_empty() {
+            self.pending_pane_creations
+                .append(&mut self.started_panes_awaiting_start_barrier);
+        }
         Ok(())
     }
 
@@ -715,6 +766,8 @@ impl PresentationWasmRuntime {
             .as_ref()
             .is_some_and(|init| init.children.contains(id))
             || self.failed_init_children.contains(id)
+            || self.starting_init_children.contains(id)
+            || self.stopping_init_children.contains(id)
     }
 
     fn handle_init_start(
@@ -725,12 +778,8 @@ impl PresentationWasmRuntime {
         presentation_scope: PresentationScope,
         graphics: Option<&PluginGraphicsBridge>,
     ) {
-        let result =
-            self.start_init_child(&id, guest_path, capabilities, presentation_scope, graphics);
-        match result {
-            Ok(generation) => {
-                self.send_init_child_event(ComponentChildEvent::Started { id, generation });
-            }
+        match self.start_init_child(&id, guest_path, capabilities, presentation_scope, graphics) {
+            Ok(()) => {}
             Err(error) => self.send_init_child_event(ComponentChildEvent::Failed {
                 id,
                 message: format!("{error:#}"),
@@ -745,7 +794,7 @@ impl PresentationWasmRuntime {
         capabilities: &[String],
         presentation_scope: PresentationScope,
         graphics: Option<&PluginGraphicsBridge>,
-    ) -> Result<u64> {
+    ) -> Result<()> {
         ensure!(
             !id.trim().is_empty(),
             "init child actor id must not be empty"
@@ -755,7 +804,9 @@ impl PresentationWasmRuntime {
             "init actor cannot replace itself"
         );
         ensure!(
-            !self.actors.contains_key(id) || self.is_init_child(id),
+            !self.actors.contains_key(id)
+                && !self.starting_init_children.contains(id)
+                && !self.stopping_init_children.contains(id),
             "init actor cannot replace an actor it does not own"
         );
         let relative = Path::new(guest_path);
@@ -836,48 +887,36 @@ impl PresentationWasmRuntime {
                 value: "client".to_string(),
             }],
         });
-        if let Err(error) = self.executor.block_on(
-            self.actors
-                .get(id)
-                .context("init child did not produce a hosted actor")?
-                .actor
-                .lifecycle(lifecycle, Duration::from_secs(2)),
-        ) {
-            if let Some(mut actor) = self.actors.remove(id)
-                && let Err(shutdown_error) = self.executor.block_on(actor.actor.shutdown())
-            {
-                eprintln!(
-                    "failed to shut down init child after lifecycle failure id={id}: \
-                     {shutdown_error:#}"
-                );
-            }
-            return Err(error).context("init child start lifecycle failed");
-        }
+        let actor = self
+            .actors
+            .remove(id)
+            .context("init child did not produce a hosted actor")?;
         if let Some(init) = self.init.as_mut() {
             init.children.insert(id.to_string());
         }
+        self.starting_init_children.insert(id.to_string());
         self.failed_init_children.remove(id);
-        if let HostedWasmActor::Component(actor) = &self
-            .actors
-            .get(id)
-            .context("init child did not produce a hosted actor")?
-            .actor
-        {
-            for snapshot in self
-                .session_snapshots
-                .iter()
-                .filter(|(known_backend, _snapshot)| {
-                    backend.is_none_or(|backend| backend == **known_backend)
-                })
-                .map(|(_backend, snapshot)| snapshot)
-            {
-                actor
-                    .try_send_session_event(SessionEvent::Snapshot(snapshot.clone()))
-                    .with_context(|| format!("hydrate init child {id:?} with session snapshot"))?;
-            }
-        }
-        self.pending_pane_creations.push_back(pane);
-        Ok(generation)
+        let completion = self.lifecycle_completion_sender.clone();
+        let proxy = self.event_proxy.clone();
+        let id = id.to_string();
+        let task = self.executor.spawn(async move {
+            let result = run_bounded_actor_operation(
+                "init child start lifecycle",
+                ACTOR_LIFECYCLE_TIMEOUT,
+                actor.actor.lifecycle(lifecycle, ACTOR_LIFECYCLE_TIMEOUT),
+            )
+            .await
+            .map_err(|error| format!("init child start lifecycle failed: {error}"));
+            let _sent = completion.send(ActorLifecycleCompletion::Started {
+                id,
+                generation,
+                actor: Box::new(actor),
+                result,
+            });
+            wake_lifecycle_completion(proxy.as_ref());
+        });
+        self.lifecycle_tasks.push(task);
+        Ok(())
     }
 
     fn handle_init_stop(&mut self, id: String) {
@@ -888,62 +927,222 @@ impl PresentationWasmRuntime {
             });
             return;
         }
-        let mut removed_pane = None;
-        let result = self.actors.remove(&id).map_or_else(
-            || Err(anyhow::anyhow!("init child actor is unavailable")),
-            |mut actor| {
-                removed_pane = (actor.pane != 0).then_some(actor.pane);
-                let lifecycle = PluginLifecycleEvent::Stop(brood_wasm::PluginStopContext {
-                    instance_id: id.clone(),
-                    generation: actor.actor.generation(),
-                    reason: brood_wasm::PluginStopReason::Shutdown,
-                    next_generation: None,
-                });
-                let lifecycle_result = self
-                    .executor
-                    .block_on(actor.actor.lifecycle(lifecycle, Duration::from_secs(2)));
-                let shutdown_result = self.executor.block_on(actor.actor.shutdown());
-                lifecycle_result.and(shutdown_result)
-            },
-        );
+        if self.starting_init_children.contains(&id) {
+            self.stop_requested_while_starting.insert(id);
+            return;
+        }
+        let Some(actor) = self.actors.remove(&id) else {
+            self.send_init_child_event(ComponentChildEvent::Failed {
+                id,
+                message: "init child actor is unavailable".to_string(),
+            });
+            return;
+        };
         if let Some(init) = self.init.as_mut() {
             init.children.remove(&id);
         }
         self.failed_init_children.remove(&id);
-        match result {
-            Ok(()) => {
-                if let Some(pane) = removed_pane {
-                    self.pending_pane_removals.push_back(pane);
-                }
-                eprintln!("stopped presentation init child actor id={id}");
-                self.send_init_child_event(ComponentChildEvent::Stopped { id });
-                if let Some(proxy) = &self.event_proxy {
-                    drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
-                }
-            }
-            Err(error) => self.send_init_child_event(ComponentChildEvent::Failed {
-                id,
-                message: format!("{error:#}"),
-            }),
-        }
+        self.spawn_actor_stop(id, actor, StopDisposition::Requested);
     }
 
     fn remove_failed_init_child(&mut self, id: &str) {
-        let Some(mut actor) = self.actors.remove(id) else {
+        let Some(actor) = self.actors.remove(id) else {
             return;
         };
         if let Some(init) = self.init.as_mut() {
             init.children.remove(id);
         }
         self.failed_init_children.insert(id.to_string());
-        if actor.pane != 0 {
-            self.pending_pane_removals.push_back(actor.pane);
-        }
-        if let Err(error) = self.executor.block_on(actor.actor.shutdown()) {
-            eprintln!("joined failed presentation init child id={id}: {error:#}");
-        }
-        if let Some(proxy) = &self.event_proxy {
-            drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+        self.spawn_actor_stop(id.to_string(), actor, StopDisposition::Failed);
+    }
+
+    fn spawn_actor_stop(
+        &mut self,
+        id: String,
+        mut actor: PresentationActor,
+        disposition: StopDisposition,
+    ) {
+        let pane = (actor.pane != 0).then_some(actor.pane);
+        let generation = actor.actor.generation();
+        let send_stop_lifecycle = matches!(disposition, StopDisposition::Requested);
+        self.starting_init_children.remove(&id);
+        self.stopping_init_children.insert(id.clone());
+        let completion = self.lifecycle_completion_sender.clone();
+        let proxy = self.event_proxy.clone();
+        let task = self.executor.spawn(async move {
+            let lifecycle_result = if send_stop_lifecycle {
+                let lifecycle = PluginLifecycleEvent::Stop(brood_wasm::PluginStopContext {
+                    instance_id: id.clone(),
+                    generation,
+                    reason: brood_wasm::PluginStopReason::Shutdown,
+                    next_generation: None,
+                });
+                run_bounded_actor_operation(
+                    "stop lifecycle",
+                    ACTOR_LIFECYCLE_TIMEOUT,
+                    actor.actor.lifecycle(lifecycle, ACTOR_LIFECYCLE_TIMEOUT),
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            // Dropping the actor after a timeout invokes the runtime's hard-stop
+            // fallback and aborts every owned async task.
+            let shutdown_result = run_bounded_actor_operation(
+                "actor shutdown",
+                ACTOR_SHUTDOWN_TIMEOUT,
+                actor.actor.shutdown(),
+            )
+            .await;
+            let result = lifecycle_result.and(shutdown_result);
+            let _sent = completion.send(ActorLifecycleCompletion::Stopped {
+                id,
+                pane,
+                disposition,
+                result,
+            });
+            wake_lifecycle_completion(proxy.as_ref());
+        });
+        self.lifecycle_tasks.push(task);
+    }
+
+    fn drain_lifecycle_completions(&mut self) {
+        self.lifecycle_tasks.retain(|task| !task.is_finished());
+        while let Ok(completion) = self.lifecycle_completions.try_recv() {
+            match completion {
+                ActorLifecycleCompletion::Started {
+                    id,
+                    generation,
+                    actor,
+                    result,
+                } => {
+                    self.starting_init_children.remove(&id);
+                    if let Err(message) = result {
+                        self.discard_pending_start_messages(&id);
+                        self.stop_requested_while_starting.remove(&id);
+                        if let Some(init) = self.init.as_mut() {
+                            init.children.remove(&id);
+                        }
+                        self.failed_init_children.insert(id.clone());
+                        self.spawn_actor_stop(id, *actor, StopDisposition::StartFailed(message));
+                        continue;
+                    }
+
+                    let message_result =
+                        self.take_pending_start_messages(&id)
+                            .and_then(|queued_messages| {
+                                queued_messages
+                                    .into_iter()
+                                    .try_for_each(|(sender, payload)| {
+                                        actor.actor.try_send_message(sender, payload)
+                                    })
+                            });
+                    if let Err(error) = message_result {
+                        self.stop_requested_while_starting.remove(&id);
+                        if let Some(init) = self.init.as_mut() {
+                            init.children.remove(&id);
+                        }
+                        self.failed_init_children.insert(id.clone());
+                        self.spawn_actor_stop(
+                            id,
+                            *actor,
+                            StopDisposition::StartFailed(format!(
+                                "deliver messages queued during start: {error:#}"
+                            )),
+                        );
+                        continue;
+                    }
+
+                    let hydration_result = if let HostedWasmActor::Component(component) =
+                        &actor.actor
+                    {
+                        self.session_snapshots
+                            .iter()
+                            .filter(|(known_backend, _snapshot)| {
+                                actor
+                                    .backend
+                                    .is_none_or(|backend| backend == **known_backend)
+                            })
+                            .try_for_each(|(_backend, snapshot)| {
+                                component
+                                    .try_send_session_event(SessionEvent::Snapshot(
+                                        snapshot.clone(),
+                                    ))
+                                    .with_context(|| {
+                                        format!("hydrate init child {id:?} with session snapshot")
+                                    })
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = hydration_result {
+                        self.stop_requested_while_starting.remove(&id);
+                        if let Some(init) = self.init.as_mut() {
+                            init.children.remove(&id);
+                        }
+                        self.failed_init_children.insert(id.clone());
+                        self.spawn_actor_stop(
+                            id,
+                            *actor,
+                            StopDisposition::StartFailed(format!("{error:#}")),
+                        );
+                        continue;
+                    }
+
+                    let pane = actor.pane;
+                    let replaced_actor = self.actors.insert(id.clone(), *actor);
+                    debug_assert!(replaced_actor.is_none());
+                    drop(replaced_actor);
+                    self.started_panes_awaiting_start_barrier.push_back(pane);
+                    self.send_init_child_event(ComponentChildEvent::Started {
+                        id: id.clone(),
+                        generation,
+                    });
+                    if self.stop_requested_while_starting.remove(&id) {
+                        self.handle_init_stop(id);
+                    }
+                }
+                ActorLifecycleCompletion::Stopped {
+                    id,
+                    pane,
+                    disposition,
+                    result,
+                } => {
+                    self.stopping_init_children.remove(&id);
+                    if let Some(pane) = pane {
+                        self.pending_pane_removals.push_back(pane);
+                    }
+                    match disposition {
+                        StopDisposition::Requested => match result {
+                            Ok(()) => {
+                                eprintln!("stopped presentation init child actor id={id}");
+                                self.send_init_child_event(ComponentChildEvent::Stopped { id });
+                            }
+                            Err(message) => {
+                                self.failed_init_children.insert(id.clone());
+                                self.send_init_child_event(ComponentChildEvent::Failed {
+                                    id,
+                                    message,
+                                });
+                            }
+                        },
+                        StopDisposition::Failed => {
+                            if let Err(message) = result {
+                                eprintln!(
+                                    "failed to tear down failed presentation init child \
+                                     id={id}: {message}"
+                                );
+                            }
+                        }
+                        StopDisposition::StartFailed(mut message) => {
+                            if let Err(cleanup) = result {
+                                message = format!("{message}; teardown failed: {cleanup}");
+                            }
+                            self.send_init_child_event(ComponentChildEvent::Failed { id, message });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1118,11 +1317,13 @@ impl PresentationWasmRuntime {
                 .try_send_message("key-policy".to_string(), payload)
                 .with_context(|| format!("enqueue key-policy message for actor {actor_id:?}"));
         }
-        ensure!(
-            self.legacy_actors.contains_key(actor_id),
-            "presentation actor {actor_id:?} is unavailable"
-        );
-        self.send_legacy_message(actor_id, payload)
+        if self.legacy_actors.contains_key(actor_id) {
+            return self.send_legacy_message(actor_id, payload);
+        }
+        if self.buffer_starting_actor_message(actor_id, "key-policy".to_string(), payload)? {
+            return Ok(());
+        }
+        anyhow::bail!("presentation actor {actor_id:?} is unavailable")
     }
 
     pub fn send_layout_state_to(&self, actor: &ActorIdentity, payload: Vec<u8>) -> Result<()> {
@@ -1294,7 +1495,63 @@ impl PresentationWasmRuntime {
         if self.legacy_actors.contains_key(actor_id) {
             return self.send_legacy_message(actor_id, payload);
         }
+        if self.buffer_starting_actor_message(actor_id, sender, payload)? {
+            return Ok(());
+        }
         anyhow::bail!("presentation actor {actor_id:?} is unavailable")
+    }
+
+    fn buffer_starting_actor_message(
+        &self,
+        actor_id: &str,
+        sender: String,
+        payload: Vec<u8>,
+    ) -> Result<bool> {
+        if !self.starting_init_children.contains(actor_id) {
+            return Ok(false);
+        }
+        let mut pending = self
+            .pending_start_messages
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("pending-start message queue is poisoned"))?;
+        let messages = pending.entry(actor_id.to_string()).or_default();
+        ensure!(
+            messages.len() < MAX_PENDING_START_MESSAGES,
+            "presentation actor {actor_id:?} pending-start mailbox is full"
+        );
+        let retained_bytes = messages.iter().fold(0_usize, |bytes, (sender, payload)| {
+            bytes
+                .saturating_add(sender.len())
+                .saturating_add(payload.len())
+        });
+        ensure!(
+            retained_bytes
+                .saturating_add(sender.len())
+                .saturating_add(payload.len())
+                <= MAX_PENDING_START_MESSAGE_BYTES,
+            "presentation actor {actor_id:?} pending-start mailbox byte budget is exhausted"
+        );
+        messages.push_back((sender, payload));
+        drop(pending);
+        Ok(true)
+    }
+
+    fn take_pending_start_messages(&self, actor_id: &str) -> Result<VecDeque<PendingStartMessage>> {
+        self.pending_start_messages
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("pending-start message queue is poisoned"))
+            .map(|mut pending| pending.remove(actor_id).unwrap_or_default())
+    }
+
+    fn discard_pending_start_messages(&self, actor_id: &str) {
+        match self.pending_start_messages.lock() {
+            Ok(mut pending) => {
+                pending.remove(actor_id);
+            }
+            Err(_poisoned) => {
+                eprintln!("pending-start message queue is poisoned while removing {actor_id:?}");
+            }
+        }
     }
 
     pub fn send_backend_actor_message(
@@ -1368,23 +1625,85 @@ impl PresentationWasmRuntime {
         })
     }
 
-    pub fn shutdown(&mut self) -> Result<()> {
-        let actor_ids = self.actors.keys().cloned().collect::<Vec<_>>();
+    pub fn shutdown(mut self) -> Result<()> {
         let mut first_error = None;
-        for actor_id in actor_ids {
-            let Some(mut actor) = self.actors.remove(&actor_id) else {
-                continue;
+        let tasks = self.lifecycle_tasks.drain(..).collect::<Vec<_>>();
+        for task in &tasks {
+            task.abort();
+        }
+        self.executor.block_on(async {
+            for task in tasks {
+                let _joined = tokio::time::timeout(Duration::from_secs(1), task).await;
+            }
+        });
+        let actors = std::mem::take(&mut self.actors);
+        let actor_shutdowns = actors
+            .into_iter()
+            .map(|(actor_id, mut actor)| {
+                self.executor.spawn(async move {
+                    let result = run_bounded_actor_operation(
+                        &format!("presentation actor {actor_id:?} shutdown"),
+                        ACTOR_SHUTDOWN_TIMEOUT,
+                        actor.actor.shutdown(),
+                    )
+                    .await;
+                    (actor_id, result)
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in actor_shutdowns {
+            let result = self.executor.block_on(task);
+            let (_actor_id, result) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "join presentation actor shutdown task: {error}"
+                        ));
+                    }
+                    continue;
+                }
             };
-            if let Err(error) = self.executor.block_on(actor.actor.shutdown())
+            if let Err(error) = result
                 && first_error.is_none()
             {
-                first_error = Some(error);
+                first_error = Some(anyhow::anyhow!(error));
             }
         }
 
-        for (_actor_id, actor) in std::mem::take(&mut self.legacy_actors) {
-            let actor_ids = actor.generation.actor_ids().clone();
-            self.executor.block_on(actor.generation.cancel_and_join());
+        let legacy_shutdowns = std::mem::take(&mut self.legacy_actors)
+            .into_iter()
+            .map(|(actor_id, actor)| {
+                let actor_ids = actor.generation.actor_ids().clone();
+                self.executor.spawn(async move {
+                    let joined = tokio::time::timeout(
+                        ACTOR_SHUTDOWN_TIMEOUT,
+                        actor.generation.cancel_and_join(),
+                    )
+                    .await;
+                    (actor_id, actor_ids, joined)
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in legacy_shutdowns {
+            let result = self.executor.block_on(task);
+            let (actor_id, actor_ids, joined) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "join legacy presentation actor shutdown task: {error}"
+                        ));
+                    }
+                    continue;
+                }
+            };
+            if joined.is_err() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!(
+                    "legacy presentation actor {actor_id:?} shutdown exceeded {} ms and was aborted",
+                    ACTOR_SHUTDOWN_TIMEOUT.as_millis()
+                ));
+            }
             self.executor.block_on({
                 let registry = Arc::clone(&self.legacy_registry);
                 async move {
@@ -1395,6 +1714,11 @@ impl PresentationWasmRuntime {
                 }
             });
         }
+        // A completed lifecycle task may have returned its actor into the
+        // completion queue just before shutdown began. Drop those actors so
+        // their hard-stop fallbacks run before the Tokio runtime is retired.
+        drop(self.lifecycle_completions);
+        self.executor.shutdown_timeout(ACTOR_SHUTDOWN_TIMEOUT);
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -1416,6 +1740,32 @@ fn direct_actor_start_context(
             value: "client".to_string(),
         }],
     }
+}
+
+fn wake_lifecycle_completion(proxy: Option<&EventLoopProxy<ClientEvent>>) {
+    if let Some(proxy) = proxy {
+        drop(proxy.send_event(ClientEvent::ActorLifecycleReady));
+    }
+}
+
+async fn run_bounded_actor_operation<F, E>(
+    operation: &str,
+    deadline: Duration,
+    future: F,
+) -> std::result::Result<(), String>
+where
+    F: Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    tokio::time::timeout(deadline, future)
+        .await
+        .map_err(|_elapsed| {
+            format!(
+                "{operation} exceeded {} ms and was aborted",
+                deadline.as_millis()
+            )
+        })?
+        .map_err(|error| error.to_string())
 }
 
 impl PresentationActorSpec {
@@ -1625,6 +1975,48 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn stuck_actor_teardown_is_scheduled_without_blocking_the_caller() -> Result<()> {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()?;
+        let caller_started = Instant::now();
+        let task = executor.spawn(async {
+            run_bounded_actor_operation(
+                "test actor shutdown",
+                Duration::from_millis(100),
+                std::future::pending::<std::result::Result<(), &'static str>>(),
+            )
+            .await
+        });
+        ensure!(
+            caller_started.elapsed() < Duration::from_millis(50),
+            "scheduling teardown blocked the event-loop-facing caller"
+        );
+        let result = executor.block_on(task)?;
+        let Err(error) = result else {
+            anyhow::bail!("stuck teardown unexpectedly succeeded");
+        };
+        ensure!(error.contains("exceeded 100 ms and was aborted"));
+        Ok(())
+    }
+
+    #[test]
+    fn normal_actor_teardown_completes_before_its_deadline() -> Result<()> {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        executor
+            .block_on(run_bounded_actor_operation(
+                "test actor shutdown",
+                Duration::from_secs(1),
+                std::future::ready(Ok::<(), &'static str>(())),
+            ))
+            .map_err(anyhow::Error::msg)
+    }
 
     #[test]
     fn direct_component_start_context_preserves_each_instance_identity() {
