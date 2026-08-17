@@ -23,6 +23,7 @@ name = "brood-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
+ "serde",
  "wit-bindgen",
 ]
 
