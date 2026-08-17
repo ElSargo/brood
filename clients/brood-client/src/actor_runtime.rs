@@ -501,17 +501,11 @@ impl PresentationWasmRuntime {
 
     pub fn drain_events(&mut self) -> Result<()> {
         self.flush_pending_actor_events()?;
-        if self.has_pending_actor_events() {
-            return Ok(());
-        }
+        // A retained input means the component command lane is full. The actor
+        // may be waiting for us to consume its observer output before it can
+        // service that lane, so output must keep flowing while input retries.
         let graphics = self.graphics.clone();
         self.drain_events_with_graphics(graphics.as_ref())
-    }
-
-    pub fn has_pending_actor_events(&self) -> bool {
-        self.pending_actor_events
-            .lock()
-            .is_ok_and(|pending| !pending.is_empty())
     }
 
     fn flush_pending_actor_events(&self) -> Result<()> {
@@ -594,16 +588,22 @@ impl PresentationWasmRuntime {
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<()> {
         self.drain_lifecycle_completions();
+        let retained_input = self
+            .pending_actor_events
+            .lock()
+            .map_err(|error| anyhow::anyhow!("pending component actor input is poisoned: {error}"))?
+            .len();
         let mut events = Vec::new();
         for (actor_id, hosted) in &mut self.actors {
             match &mut hosted.actor {
                 HostedWasmActor::Component(actor) => {
-                    while events.len()
-                        + self.outbound_backend_messages.len()
-                        + self.outbound_session_commands.len()
-                        + self.outbound_host_messages.len()
-                        < ACTOR_OUTPUT_BACKLOG
-                    {
+                    while actor_output_has_capacity(
+                        retained_input,
+                        events.len(),
+                        self.outbound_backend_messages.len(),
+                        self.outbound_session_commands.len(),
+                        self.outbound_host_messages.len(),
+                    ) {
                         let Some(event) = actor.try_recv_event() else {
                             break;
                         };
@@ -2114,10 +2114,37 @@ const fn presentation_event_pane(event: &PresentationEvent) -> u64 {
     }
 }
 
+fn actor_output_has_capacity(
+    retained_input: usize,
+    events: usize,
+    backend_messages: usize,
+    session_commands: usize,
+    host_messages: usize,
+) -> bool {
+    debug_assert!(retained_input <= ACTOR_OUTPUT_BACKLOG);
+    events
+        .saturating_add(backend_messages)
+        .saturating_add(session_commands)
+        .saturating_add(host_messages)
+        < ACTOR_OUTPUT_BACKLOG
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn retained_actor_input_does_not_starve_bounded_actor_output() {
+        assert!(actor_output_has_capacity(ACTOR_OUTPUT_BACKLOG, 0, 0, 0, 0));
+        assert!(!actor_output_has_capacity(
+            ACTOR_OUTPUT_BACKLOG,
+            ACTOR_OUTPUT_BACKLOG,
+            0,
+            0,
+            0
+        ));
+    }
 
     #[test]
     fn stuck_actor_teardown_is_scheduled_without_blocking_the_caller() -> Result<()> {

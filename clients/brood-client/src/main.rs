@@ -8361,9 +8361,6 @@ impl Application {
                 return Ok(());
             };
             runtime.drain_events()?;
-            if runtime.has_pending_actor_events() {
-                return Ok(());
-            }
             let pane_sessions = runtime.pane_realms().collect::<Vec<_>>();
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_plugin_pane_realms(&pane_sessions);

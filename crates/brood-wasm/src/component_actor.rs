@@ -2625,9 +2625,7 @@ async fn run_component_event_loop(
     let mut dispatch_lane = 0_usize;
 
     loop {
-        if !dispatcher_busy
-            && event_observer.has_ordinary_capacity(config.command_capacity.saturating_mul(2))
-        {
+        if component_dispatch_can_start(dispatcher_busy, event_observer) {
             let event = pop_component_dispatch(
                 &mut dispatch_lane,
                 &mut completion_queue,
@@ -2663,6 +2661,17 @@ async fn run_component_event_loop(
             permits = event_observer.sender.reserve_many(ComponentActorEventObserver::TERMINAL_RESERVE + 1), if !event_observer.has_ordinary_capacity(1) => {
                 // Waiting on a real channel permit makes observer saturation
                 // pause this actor without polling or allocating a side queue.
+                drop(permits);
+            }
+            permits = event_observer.sender.reserve_many(
+                config.command_capacity
+                    .saturating_add(ComponentActorEventObserver::TERMINAL_RESERVE + 1)
+            ), if !calls.is_empty()
+                && !event_observer.has_ordinary_capacity(config.command_capacity.saturating_add(1)) => {
+                // A completed dispatch can return `command_capacity` observed
+                // host records plus DispatcherReturned. Register a capacity
+                // waiter so the actor is woken when the host drains output;
+                // merely disabling `calls.next()` would sleep forever.
                 drop(permits);
             }
             command = commands.recv(), if event_observer.has_ordinary_capacity(1)
@@ -3660,6 +3669,13 @@ const fn component_system_capacity(config: &ComponentActorConfig) -> usize {
         .saturating_add(config.command_capacity)
 }
 
+fn component_dispatch_can_start(
+    dispatcher_busy: bool,
+    event_observer: &ComponentActorEventObserver,
+) -> bool {
+    !dispatcher_busy && event_observer.has_ordinary_capacity(1)
+}
+
 fn completion_to_guest(completion: &ActorCompletion) -> GuestEvent {
     use bindings::exports::brood::plugin::actor as abi;
     let operation = completion.operation.sequence();
@@ -3686,6 +3702,18 @@ fn completion_to_guest(completion: &ActorCompletion) -> GuestEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_pending_observer_record_does_not_starve_the_next_dispatch() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let observer = ComponentActorEventObserver::new(sender, None);
+        observer
+            .try_send(ComponentActorEvent::DispatcherReturned)
+            .unwrap();
+
+        assert!(component_dispatch_can_start(false, &observer));
+        assert!(!component_dispatch_can_start(true, &observer));
+    }
 
     #[test]
     fn saturated_component_command_lane_returns_the_unadmitted_event() {
