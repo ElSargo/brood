@@ -11,9 +11,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
-    },
+    graphics::{drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::run_process,
 };
@@ -1013,7 +1011,7 @@ fn parse_diff(input: &str) -> DiffDocument {
             continue;
         }
         if let Some(path) = line.strip_prefix("rename to ") {
-            current_file.path = path.to_string();
+            current_file.path = decode_git_path(path);
             continue;
         }
         if let Some(path) = line.strip_prefix("+++ ")
@@ -1194,25 +1192,122 @@ fn parse_range_start(range: &str) -> Option<u32> {
 }
 
 fn split_diff_paths(paths: &str) -> (String, String) {
-    let mut parts = paths.splitn(2, ' ');
-    (
-        parts.next().unwrap_or_default().to_string(),
-        parts.next().unwrap_or_default().to_string(),
-    )
+    if !paths.starts_with('"') {
+        return paths.rsplit_once(" b/").map_or_else(
+            || (paths.to_string(), String::new()),
+            |(old, new)| (old.to_string(), format!("b/{new}")),
+        );
+    }
+    let Some((old_path, rest)) = take_git_path(paths) else {
+        return (String::new(), String::new());
+    };
+    let Some((new_path, _rest)) = take_git_path(rest) else {
+        return (old_path, String::new());
+    };
+    (old_path, new_path)
 }
 
 fn display_path(old_path: &str, new_path: &str) -> String {
+    let old_path = decode_git_path(old_path);
+    let new_path = decode_git_path(new_path);
     let preferred = if new_path == "/dev/null" {
-        old_path
+        old_path.as_str()
     } else {
-        new_path
+        new_path.as_str()
     };
     preferred
         .strip_prefix("b/")
         .or_else(|| preferred.strip_prefix("a/"))
         .unwrap_or(preferred)
-        .trim_matches('"')
         .to_string()
+}
+
+fn decode_git_path(path: &str) -> String {
+    let path = path.trim();
+    if path.starts_with('"') {
+        take_git_path(path)
+            .map(|(path, _rest)| path)
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        path.split_once('\t')
+            .map_or(path, |(path, _time)| path)
+            .to_string()
+    }
+}
+
+fn take_git_path(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start_matches(' ');
+    let bytes = input.as_bytes();
+    if bytes.first().copied()? != b'"' {
+        let end = bytes
+            .iter()
+            .position(|byte| matches!(byte, b' ' | b'\t'))
+            .unwrap_or(bytes.len());
+        return Some((input[..end].to_string(), &input[end..]));
+    }
+
+    let mut decoded = Vec::new();
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                return Some((
+                    String::from_utf8_lossy(&decoded).into_owned(),
+                    &input[index + 1..],
+                ));
+            }
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index)?;
+                if escaped.is_ascii_digit() && escaped < b'8' {
+                    let mut value = escaped - b'0';
+                    let mut digits = 1;
+                    while digits < 3
+                        && bytes
+                            .get(index + 1)
+                            .is_some_and(|byte| (b'0'..=b'7').contains(byte))
+                    {
+                        index += 1;
+                        value = value.saturating_mul(8).saturating_add(bytes[index] - b'0');
+                        digits += 1;
+                    }
+                    decoded.push(value);
+                } else {
+                    decoded.push(match escaped {
+                        b'a' => 0x07,
+                        b'b' => 0x08,
+                        b'f' => 0x0c,
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'v' => 0x0b,
+                        other => other,
+                    });
+                }
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    None
+}
+
+fn quote_git_path(path: &str) -> String {
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for byte in path.bytes() {
+        match byte {
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            b'\n' => quoted.push_str("\\n"),
+            b'\r' => quoted.push_str("\\r"),
+            b'\t' => quoted.push_str("\\t"),
+            0x20..=0x7e => quoted.push(char::from(byte)),
+            byte => quoted.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn expand_tabs(text: &str) -> String {
@@ -1301,14 +1396,16 @@ async fn collect_project_diff() -> Result<Vec<u8>, String> {
 }
 
 fn append_untracked_diff(output: &mut Vec<u8>, path: &str, bytes: &[u8]) {
+    let old_path = quote_git_path(&format!("a/{path}"));
+    let new_path = quote_git_path(&format!("b/{path}"));
     let header = format!(
-        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+        "diff --git {old_path} {new_path}\nnew file mode 100644\n--- /dev/null\n+++ {new_path}\n"
     );
     append_bounded(output, header.as_bytes());
     if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
         append_bounded(
             output,
-            format!("Binary files /dev/null and b/{path} differ\n").as_bytes(),
+            format!("Binary files /dev/null and {new_path} differ\n").as_bytes(),
         );
         return;
     }
@@ -1451,6 +1548,71 @@ rename to new.txt
     fn parses_hunk_ranges_without_counts() {
         assert_eq!(parse_hunk_starts("@@ -12 +4 @@"), Some((12, 4)));
         assert_eq!(parse_hunk_starts("@@ -12,3 +4,8 @@ label"), Some((12, 4)));
+    }
+
+    #[test]
+    fn parses_git_quoted_paths_without_splitting_on_embedded_whitespace() {
+        let document = parse_diff(
+            "diff --git \"a/old name.txt\" \"b/new name.txt\"\n\
+             similarity index 90%\n\
+             rename from old name.txt\n\
+             rename to \"new name.txt\"\n\
+             --- \"a/old name.txt\"\n\
+             +++ \"b/new name.txt\"\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             +new\n",
+        );
+        assert!(
+            document
+                .rows
+                .iter()
+                .any(|row| matches!(row, DisplayRow::File { path, .. } if path == "new name.txt"))
+        );
+    }
+
+    #[test]
+    fn parses_git_unquoted_space_paths_and_rename_headers() {
+        let document = parse_diff(
+            "diff --git a/old name.txt b/new name.txt\n\
+             similarity index 90%\n\
+             rename from old name.txt\n\
+             rename to new name.txt\n\
+             --- a/old name.txt\n\
+             +++ b/new name.txt\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             +new\n",
+        );
+        assert!(
+            document
+                .rows
+                .iter()
+                .any(|row| matches!(row, DisplayRow::File { path, .. } if path == "new name.txt"))
+        );
+    }
+
+    #[test]
+    fn decodes_git_path_escapes_and_utf8_octal_bytes() {
+        assert_eq!(
+            decode_git_path(r#""b/tab\tquote\"slash\\.txt""#),
+            "b/tab\tquote\"slash\\.txt"
+        );
+        assert_eq!(decode_git_path(r#""b/caf\303\251.txt""#), "b/café.txt");
+    }
+
+    #[test]
+    fn deleted_file_uses_the_decoded_old_path() {
+        assert_eq!(
+            display_path(r#""a/deleted file.txt""#, "/dev/null"),
+            "deleted file.txt"
+        );
+    }
+
+    #[test]
+    fn quoted_path_round_trips_every_supported_escape() {
+        let path = "b/sp ace\tquote\"slash\\café.txt";
+        assert_eq!(decode_git_path(&quote_git_path(path)), path);
     }
 
     #[test]
