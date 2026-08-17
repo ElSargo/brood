@@ -6,9 +6,11 @@
 
 mod application;
 mod browser;
+mod buffer_readback;
 mod clipboard;
 mod command;
 mod compositor;
+mod computer_use;
 mod config;
 mod control;
 mod debug_dump;

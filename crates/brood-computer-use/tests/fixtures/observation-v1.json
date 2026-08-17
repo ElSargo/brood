@@ -1,0 +1,29 @@
+{
+  "protocol_version": 1,
+  "task": "task-7",
+  "sequence": 1,
+  "captured_at_ms": 1100,
+  "viewport_width": 1440,
+  "viewport_height": 900,
+  "active_window": 41,
+  "windows": [
+    {
+      "pane": 41,
+      "session": 3,
+      "application_id": "fixture",
+      "title": "Fixture window",
+      "bounds": { "x": 0, "y": 0, "width": 1440, "height": 900 },
+      "content_width": 1440,
+      "content_height": 900,
+      "active": true
+    }
+  ],
+  "png": [137, 80, 78, 71],
+  "settle": {
+    "settled": true,
+    "quiet_ms": 50,
+    "timed_out": false,
+    "frame_sequence": 9,
+    "input_sequence": 3
+  }
+}

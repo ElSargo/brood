@@ -44,7 +44,7 @@ use smithay::{
             native,
         },
         renderer::{
-            Bind, ExportMem, ImportDma, ImportEgl, Offscreen, RendererSuper,
+            Bind, ImportDma, ImportEgl, Offscreen, RendererSuper,
             damage::OutputDamageTracker,
             element::solid::SolidColorRenderElement,
             gles::{GlesError, GlesRenderbuffer, GlesRenderer},
@@ -52,7 +52,7 @@ use smithay::{
     },
     desktop::{Space, Window},
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    utils::{DeviceFd, Physical, Rectangle, Size, Transform},
+    utils::{DeviceFd, Physical, Size, Transform},
     wayland::{
         dmabuf::DmabufFeedbackBuilder,
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
@@ -60,7 +60,10 @@ use smithay::{
 };
 use tracing::{info, warn};
 
-use crate::state::{Brood, SESSION_OUTPUT_REFRESH_MILLIHZ};
+use crate::{
+    buffer_readback,
+    state::{Brood, SESSION_OUTPUT_REFRESH_MILLIHZ},
+};
 
 type ExportAllocator = DmabufAllocator<GbmAllocator<DrmDeviceFd>>;
 pub type SharedFrameExporter = Rc<RefCell<FrameExporter>>;
@@ -626,20 +629,11 @@ fn render_window_shared_memory(
     .sync;
     sync.wait()
         .map_err(|error| FrameExportFailure::new("wait_window_shared_memory", error))?;
-    let mapping = renderer
-        .copy_framebuffer(
-            &framebuffer,
-            Rectangle::from_size((size.w, size.h).into()),
-            Fourcc::Abgr8888,
-        )
-        .map_err(|error| FrameExportFailure::new("copy_window_shared_memory", error))?;
+    let frame = buffer_readback::read_gles_framebuffer(renderer, &framebuffer, size)
+        .map_err(|error| FrameExportFailure::new("read_window_shared_memory", error))?;
     drop(framebuffer);
-    let pixels = renderer
-        .map_texture(&mapping)
-        .map_err(|error| FrameExportFailure::new("map_window_shared_memory", error))?
-        .to_vec();
     drop(sync);
-    Ok(pixels)
+    Ok(frame.bytes)
 }
 
 fn window_render_space(
@@ -1164,7 +1158,7 @@ pub struct FrameExportFailure {
 }
 
 impl FrameExportFailure {
-    fn new(context: &'static str, error: impl fmt::Debug) -> Self {
+    pub(crate) fn new(context: &'static str, error: impl fmt::Debug) -> Self {
         Self {
             context,
             detail: format!("{error:?}"),
@@ -1173,6 +1167,12 @@ impl FrameExportFailure {
 
     fn status_value(&self) -> String {
         sanitize_status_value(&format!("frame_export_{}:{}", self.context, self.detail))
+    }
+}
+
+impl fmt::Display for FrameExportFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.detail)
     }
 }
 

@@ -1,0 +1,73 @@
+{
+  "task": {
+    "protocol_version": 1,
+    "id": "task-7",
+    "principal": "test-adapter",
+    "scope": { "session": 3, "windows": [41] },
+    "policy": { "human_input": "pause", "require_approval": ["script"] },
+    "limits": {
+      "max_actions_per_batch": 64,
+      "max_script_wall_ms": 30000,
+      "max_script_cpu_ms": 5000,
+      "max_script_memory_bytes": 67108864,
+      "max_output_bytes": 1048576,
+      "max_display_images": 16,
+      "max_queued_host_calls": 64
+    },
+    "state": "running",
+    "next_sequence": 1,
+    "created_at_ms": 1000,
+    "updated_at_ms": 1010
+  },
+  "lease": {
+    "task": "task-7",
+    "generation": 1,
+    "session": 3,
+    "windows": [41],
+    "acquired_at_ms": 1010,
+    "expires_at_ms": 6010
+  },
+  "script_request": {
+    "protocol_version": 1,
+    "task": "task-7",
+    "lease_generation": 1,
+    "expected_sequence": 1,
+    "source": "globalThis.counter = (globalThis.counter || 0) + 1",
+    "approval_proof": "approval-script-1"
+  },
+  "script_result": {
+    "task": "task-7",
+    "sequence": 1,
+    "console": ["counter=1"],
+    "displayed_pngs": [[137, 80, 78, 71]],
+    "value_json": "1",
+    "exception": null,
+    "metrics": {
+      "wall_ms": 4,
+      "cpu_ms": 2,
+      "peak_memory_bytes": 65536,
+      "host_calls": 1
+    }
+  },
+  "approval_request": {
+    "id": "approval-script-1",
+    "task": "task-7",
+    "sequence": 1,
+    "kind": "script",
+    "prompt": "allow script execution",
+    "created_at_ms": 1020,
+    "expires_at_ms": 6020
+  },
+  "approval_decision": {
+    "request_id": "approval-script-1",
+    "approved": true,
+    "principal": "operator",
+    "decided_at_ms": 1030
+  },
+  "cancellation": {
+    "task": "task-7",
+    "reason": "operator_stop",
+    "requested_at_ms": 2000
+  },
+  "error": "stale_lease"
+}

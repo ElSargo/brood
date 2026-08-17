@@ -422,6 +422,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "brood-computer-use"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "brood-dmabuf"
 version = "0.1.0"
 dependencies = [
@@ -547,6 +556,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "brood-cli",
+ "brood-computer-use",
  "brood-ipc",
  "brood-protocol",
  "brood-wasm",

@@ -2,6 +2,7 @@
 members = [
     "clients/brood-client",
     "crates/brood-cli",
+    "crates/brood-computer-use",
     "crates/brood-dmabuf",
     "crates/brood-graphics",
     "crates/brood-ipc",
@@ -40,6 +41,7 @@ raw-window-handle = "0.6.2"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 rustix = { version = "1.1.4", features = ["pipe"] }
 brood-cli = { path = "crates/brood-cli" }
+brood-computer-use = { path = "crates/brood-computer-use" }
 brood-graphics = { path = "crates/brood-graphics" }
 brood-ipc = { path = "crates/brood-ipc" }
 brood-keybindings = { path = "crates/brood-keybindings" }

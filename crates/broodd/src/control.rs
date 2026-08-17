@@ -2377,7 +2377,23 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
             command,
             json,
             response,
-        } => send_response(response, execute_dbus_request(command, json, state)),
+        } => {
+            let batch_json = (!json
+                && command.first().is_some_and(|token| token == "computer-use")
+                && command.get(1).is_some_and(|token| token == "batch"))
+            .then(|| command.get(2).cloned())
+            .flatten();
+            if let Some(batch_json) = batch_json {
+                match serde_json::from_str::<brood_computer_use::ComputerActionBatch>(&batch_json) {
+                    Ok(batch) => {
+                        crate::computer_use::begin_action_batch(state, batch, response);
+                    }
+                    Err(error) => send_response(response, Err(anyhow::anyhow!(error))),
+                }
+            } else {
+                send_response(response, execute_dbus_request(command, json, state));
+            }
+        }
         DbusStateRequest::CurrentStatus { response } => {
             send_response(response, status_json_string(state));
         }
@@ -2932,6 +2948,18 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
     }
 }
 
+const fn is_primary_human_input(input: &InputEvent) -> bool {
+    matches!(
+        input,
+        InputEvent::KeyboardKey { .. }
+            | InputEvent::KeyboardReset
+            | InputEvent::PointerMotion { .. }
+            | InputEvent::PointerButton { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::PointerWheel { .. }
+    )
+}
+
 fn drain_fast_path_input(state: &mut Brood) {
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
@@ -2960,6 +2988,16 @@ fn drain_fast_path_input(state: &mut Brood) {
             continue;
         };
         let time = monotonic_time_msec(state);
+        if matches!(&message, ClientMessage::Input(input) if is_primary_human_input(input)) {
+            let now_ms = u64::from(time);
+            if let Some(task) = state.computer_use.handle_human_input(now_ms) {
+                crate::computer_use::cancel_pending_batch(
+                    state,
+                    &task,
+                    "automation paused by human primary input",
+                );
+            }
+        }
         match message {
             ClientMessage::Input(InputEvent::KeyboardKey { keycode, pressed }) => {
                 state.forward_keyboard_key(
@@ -3407,6 +3445,39 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
         "status-json" if args.is_empty() => {
             format!("{}\n", status_json_string(state)?)
         }
+        "computer-use" => match args {
+            [subcommand, task, session, lease_ms] if subcommand == "start" => {
+                start_computer_use_task(state, task, session, None, lease_ms)?
+            }
+            [subcommand, task, session, pane, lease_ms] if subcommand == "start" => {
+                start_computer_use_task(state, task, session, Some(pane), lease_ms)?
+            }
+            [subcommand, task] if subcommand == "stop" => {
+                let task = brood_computer_use::TaskId(task.clone());
+                crate::computer_use::cancel_pending_batch(
+                    state,
+                    &task,
+                    "computer-use task stopped",
+                );
+                let now_ms = u64::from(monotonic_time_msec(state));
+                state.computer_use.stop(&task, now_ms)?;
+                "OK computer-use stopped\n".to_string()
+            }
+            [subcommand, task] if subcommand == "inspect" => {
+                let task = brood_computer_use::TaskId(task.clone());
+                let task = state
+                    .computer_use
+                    .task(&task)
+                    .context("computer-use task was not found")?;
+                format!("{}\n", serde_json::to_string(task)?)
+            }
+            [subcommand, _] if subcommand == "batch" => {
+                bail!("computer-use batch must be sent through the DBus control boundary")
+            }
+            _ => bail!(
+                "usage: computer-use start <task> <session> [pane] <lease-ms>|batch <json>|inspect <task>|stop <task>"
+            ),
+        },
         "quit" if args.is_empty() => {
             let closed_browsers = state.browsers.close_all().len();
             // Stop dispatching first and return the control reply promptly.
@@ -3849,6 +3920,16 @@ struct StatusSnapshot {
     requested_fullscreen: usize,
     focused_fullscreen: bool,
     browsers: usize,
+    computer_use_tasks: usize,
+    computer_use_lease_generation: Option<u64>,
+    computer_use_capture_attempts: u64,
+    computer_use_capture_failures: u64,
+    computer_use_capture_cadence_drops: u64,
+    computer_use_observation_queue: usize,
+    computer_use_observation_backpressure_drops: u64,
+    computer_use_batch_pending: bool,
+    computer_use_held_keys: usize,
+    computer_use_held_buttons: usize,
     agents: Vec<crate::state::AgentSummary>,
     plugin_actors: Vec<DbusPluginActor>,
     plugin_actor_messages: u64,
@@ -4023,6 +4104,20 @@ impl StatusSnapshot {
             requested_fullscreen: state.requested_fullscreen_count(),
             focused_fullscreen: state.focused_window_fullscreen(),
             browsers: state.browsers.len(),
+            computer_use_tasks: state.computer_use.task_count(),
+            computer_use_lease_generation: state.computer_use.lease().map(|lease| lease.generation),
+            computer_use_capture_attempts: state.computer_use_automation.capture_attempts,
+            computer_use_capture_failures: state.computer_use_automation.capture_failures,
+            computer_use_capture_cadence_drops: state
+                .computer_use_automation
+                .captures_dropped_cadence,
+            computer_use_observation_queue: state.computer_use_automation.queued_observations(),
+            computer_use_observation_backpressure_drops: state
+                .computer_use_automation
+                .observations_dropped_backpressure,
+            computer_use_batch_pending: state.computer_use_automation.pending_batch(),
+            computer_use_held_keys: state.computer_use_automation.held_key_count(),
+            computer_use_held_buttons: state.computer_use_automation.held_button_count(),
             agents: state.agent_summaries(),
             plugin_actors: dbus_plugin_actors(state.plugin_actor_summaries()),
             plugin_actor_messages: state.plugin_actor_message_count(),
@@ -4212,6 +4307,37 @@ impl StatusSnapshot {
 fn monotonic_time_msec(state: &Brood) -> u32 {
     let millis = state.start_time.elapsed().as_millis();
     u32::try_from(millis.min(u128::from(u32::MAX))).expect("millis clamped to u32 range")
+}
+
+fn start_computer_use_task(
+    state: &mut Brood,
+    task: &str,
+    session: &str,
+    pane: Option<&String>,
+    lease_ms: &str,
+) -> Result<String> {
+    let session = parse_u64(session, "session")?;
+    let lease_ms = parse_u64(lease_ms, "lease duration")?;
+    let windows = pane
+        .map(|pane| parse_u64(pane, "pane"))
+        .transpose()?
+        .into_iter()
+        .collect();
+    let task = brood_computer_use::TaskId(task.to_string());
+    let now_ms = u64::from(monotonic_time_msec(state));
+    state.computer_use.create_task(
+        &task,
+        "local-control".to_string(),
+        brood_computer_use::ComputerUseScope { session, windows },
+        brood_computer_use::ComputerUsePolicy::default(),
+        brood_computer_use::ComputerUseLimits::default(),
+        now_ms,
+    )?;
+    let lease = state.computer_use.acquire_lease(&task, now_ms, lease_ms)?;
+    if let Some(pane) = lease.windows.iter().next().copied() {
+        crate::computer_use::activate_window(state, session, pane).map_err(anyhow::Error::msg)?;
+    }
+    Ok(format!("{}\n", serde_json::to_string(&lease)?))
 }
 
 fn parse_u64(value: &str, name: &str) -> Result<u64> {

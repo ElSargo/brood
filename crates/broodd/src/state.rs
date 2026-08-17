@@ -738,6 +738,8 @@ pub struct Brood {
 
     focus: FocusService,
     pub browsers: BrowserManager,
+    pub(crate) computer_use: brood_computer_use::ComputerUseSupervisor,
+    pub(crate) computer_use_automation: crate::computer_use::AutomationRuntime,
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
@@ -864,6 +866,8 @@ impl Brood {
             seat,
             focus: FocusService::default(),
             browsers: BrowserManager::default(),
+            computer_use: brood_computer_use::ComputerUseSupervisor::new(),
+            computer_use_automation: crate::computer_use::AutomationRuntime::default(),
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
@@ -3064,6 +3068,17 @@ impl Brood {
     pub(crate) fn window_app_id(&self, window: &Window) -> Option<String> {
         let surface = Self::window_toplevel_surface(window)?;
         toplevel_app_id(&surface)
+    }
+
+    pub(crate) fn window_title(&self, window: &Window) -> Option<String> {
+        let surface = Self::window_toplevel_surface(window)?;
+        toplevel_title(&surface)
+    }
+
+    pub(crate) fn window_session_id(&self, window: &Window) -> Option<u64> {
+        let surface = Self::window_toplevel_surface(window)?;
+        self.session_for_toplevel_surface(&surface)
+            .map(SurfaceSessionId::raw)
     }
 
     pub fn presentation_window_summaries(&self) -> Vec<PresentationWindowSummary> {

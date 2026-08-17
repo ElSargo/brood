@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "task": "task-7",
+  "lease_generation": 1,
+  "expected_sequence": 1,
+  "target_session": 3,
+  "target_window": 41,
+  "actions": [
+    { "type": "click", "x": 320.5, "y": 240.0, "button": "left" },
+    { "type": "type", "text": "hello" },
+    { "type": "screenshot" }
+  ],
+  "approval_proof": null
+}
