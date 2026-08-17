@@ -4841,7 +4841,11 @@ impl Application {
             )?;
         }
         flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
-        flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+        flush_renderer_plugin_resize_events_best_effort(
+            self.wasm_runtime.as_ref(),
+            renderer,
+            "managed frame readiness",
+        );
         self.flush_managed_resource_releases();
         Ok(())
     }
@@ -8228,7 +8232,11 @@ impl Application {
             };
             renderer.sync_plugin_graphics_extents()?;
             flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
-            flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+            flush_renderer_plugin_resize_events_best_effort(
+                self.wasm_runtime.as_ref(),
+                renderer,
+                "actor host message",
+            );
             renderer.window.request_redraw();
         }
         if !messages.is_empty() {
@@ -8676,7 +8684,11 @@ impl Application {
         replacement.window.request_redraw();
         self.renderer = Some(replacement);
         if let Some(renderer) = self.renderer.as_mut() {
-            flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)?;
+            flush_renderer_plugin_resize_events_best_effort(
+                self.wasm_runtime.as_ref(),
+                renderer,
+                "renderer recovery",
+            );
         }
         Ok(())
     }
@@ -9047,14 +9059,11 @@ impl ApplicationHandler<ClientEvent> for Application {
                         Err(error) => failure = Some(error),
                     }
                     flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
-                    if failure.is_none()
-                        && let Err(error) = flush_renderer_plugin_resize_events(
-                            self.wasm_runtime.as_ref(),
-                            renderer,
-                        )
-                    {
-                        failure = Some(error);
-                    }
+                    flush_renderer_plugin_resize_events_best_effort(
+                        self.wasm_runtime.as_ref(),
+                        renderer,
+                        "plugin frame acceptance",
+                    );
                 }
                 if failure.is_none()
                     && let Some(epoch) = resize_epoch
@@ -9481,13 +9490,13 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.fail(event_loop, error);
             return;
         }
-        if let Some(renderer) = self.renderer.as_mut()
-            && let Err(error) =
-                flush_renderer_plugin_resize_events(self.wasm_runtime.as_ref(), renderer)
-        {
-            self.fail(event_loop, error);
-            return;
-        }
+        let plugin_resize_backpressured = self.renderer.as_mut().is_some_and(|renderer| {
+            !flush_renderer_plugin_resize_events_best_effort(
+                self.wasm_runtime.as_ref(),
+                renderer,
+                "event-loop flush",
+            )
+        });
         let input_backpressured = self.input_sender.as_mut().is_some_and(|lane| {
             lane.flush_deferred();
             lane.has_deferred()
@@ -9552,10 +9561,10 @@ impl ApplicationHandler<ClientEvent> for Application {
         if input_backpressured
             || actor_message_backpressured
             || synchronized_notification_backpressured
+            || plugin_resize_backpressured
         {
-            // The shared-memory consumer already has a wakeup for the records
-            // which filled its ring. Retry promptly without busy-spinning a
-            // CPU while the consumer is descheduled or slow to free a slot.
+            // Retry bounded lanes promptly without busy-spinning a CPU while
+            // a consumer is descheduled or slow to free a slot.
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(1),
             ));
@@ -11222,41 +11231,17 @@ fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer
     }
 }
 
-fn flush_renderer_plugin_resize_events(
-    runtime: Option<&PresentationWasmRuntime>,
-    renderer: &mut Renderer,
-) -> Result<()> {
-    for (pane, size) in renderer.pending_plugin_resize_events() {
-        send_presentation_event(
-            runtime,
-            PresentationEvent::PaneResized {
-                pane,
-                width: size.width,
-                height: size.height,
-                scale: size.scale,
-                resize_epoch: None,
-            },
-        )?;
-        renderer.mark_plugin_resize_sent(pane, size);
-        eprintln!(
-            "sent plugin pane resize pane={pane} logical_size={:.0}x{:.0} scale={:.2}",
-            size.width, size.height, size.scale
-        );
-    }
-    Ok(())
-}
-
 fn flush_renderer_plugin_resize_events_best_effort(
     runtime: Option<&PresentationWasmRuntime>,
     renderer: &mut Renderer,
     context: &str,
-) {
+) -> bool {
     let panes = renderer
         .pending_plugin_resize_events()
         .into_iter()
         .map(|(pane, _size)| pane)
         .collect::<Vec<_>>();
-    send_plugin_pane_resize_events_best_effort(runtime, renderer, &panes, None, context);
+    send_plugin_pane_resize_events_best_effort(runtime, renderer, &panes, None, context)
 }
 
 fn send_plugin_pane_resize_events(
@@ -11301,16 +11286,19 @@ fn send_plugin_pane_resize_events_best_effort(
     panes: &[u64],
     resize_epoch: Option<u64>,
     context: &str,
-) {
+) -> bool {
+    let mut all_sent = true;
     for pane in panes {
         if let Err(error) =
             send_plugin_pane_resize_events(runtime, renderer, &[*pane], resize_epoch)
         {
+            all_sent = false;
             eprintln!(
                 "could not notify plugin pane resize pane={pane} resize_epoch={resize_epoch:?} context={context}: {error:#}"
             );
         }
     }
+    all_sent
 }
 
 fn promote_ready_synchronized_resize(
