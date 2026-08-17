@@ -12,9 +12,7 @@ use brood_plugin_sdk::{
         LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
         SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
     },
-    graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
-    },
+    graphics::{TextLayoutCache, reuse_pane_content},
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
     layout::{
         Axis, DelegateLayoutRest, DividerItem, InputZone, ItemKind, LayoutFragment, LayoutItem,
@@ -166,7 +164,7 @@ struct SwitcherState {
     terminal_uis: BTreeMap<String, (u64, u64)>,
     neovim_uis_starting: BTreeMap<(u64, u64), String>,
     neovim_uis: BTreeMap<(u64, u64), String>,
-    text_resources: Vec<u64>,
+    text_cache: Option<TextLayoutCache>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
     picker_pane: Option<u64>,
@@ -619,7 +617,7 @@ impl SwitcherState {
             terminal_uis: BTreeMap::new(),
             neovim_uis_starting: BTreeMap::new(),
             neovim_uis: BTreeMap::new(),
-            text_resources: Vec::new(),
+            text_cache: None,
             layout: None,
             workspace_focus: None,
             picker_pane: None,
@@ -4090,8 +4088,26 @@ fn redraw_for_resize_or_record_error(state: &mut SwitcherState, resize_epoch: Op
 }
 
 fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), String> {
+    let mut cache = state
+        .text_cache
+        .take()
+        .unwrap_or_else(|| TextLayoutCache::new(state.pane));
+    cache.set_pane(state.pane);
+    cache.begin_frame();
+    let result = redraw_with_cache(state, resize_epoch, &mut cache);
+    if result.is_err() {
+        cache.abort_frame();
+    }
+    state.text_cache = Some(cache);
+    result
+}
+
+fn redraw_with_cache(
+    state: &mut SwitcherState,
+    resize_epoch: Option<u64>,
+    cache: &mut TextLayoutCache,
+) -> Result<(), String> {
     let mut packet = Packet::new();
-    let mut resources = Vec::new();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: BG,
@@ -4109,7 +4125,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         if header.narrow_title { "S" } else { "Sessions" },
         17.0,
         TEXT,
@@ -4152,7 +4168,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         &truncate_to_width(&prompt, header.input_width - 16.0, 14.0),
         14.0,
         if state.query.is_empty() { MUTED } else { FG },
@@ -4180,7 +4196,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         if state.pending.is_some() {
             "…"
         } else if state.mode == EditMode::Search {
@@ -4234,7 +4250,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     if collapsed { "▸" } else { "▾" },
                     12.0,
                     MUTED,
@@ -4245,7 +4261,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     &truncate_to_width(&project.name, state.width - 126.0, 13.0),
                     13.0,
                     TEXT,
@@ -4256,7 +4272,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     &project.sessions.len().to_string(),
                     10.0,
                     MUTED,
@@ -4277,7 +4293,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                     add_text(
                         state,
                         &mut packet,
-                        &mut resources,
+                        cache,
                         "+",
                         16.0,
                         YELLOW,
@@ -4340,7 +4356,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     &truncate_to_width(&session.name, name_width, 13.0),
                     13.0,
                     FG,
@@ -4359,7 +4375,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                     add_text(
                         state,
                         &mut packet,
-                        &mut resources,
+                        cache,
                         &count,
                         10.0,
                         if session.active { TEXT } else { MUTED },
@@ -4371,7 +4387,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     "×",
                     16.0,
                     RED,
@@ -4428,7 +4444,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         &truncate_to_width(&footer, state.width - 28.0, 10.0),
         10.0,
         if state.error { RED } else { MUTED },
@@ -4437,12 +4453,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
         state.width - 28.0,
     )?;
 
-    if let Err(error) = submit_packet_for_resize(state.pane, resize_epoch, &packet) {
-        drop_resources(state.pane, resources);
-        return Err(error);
-    }
-    drop_resources(state.pane, state.text_resources.drain(..));
-    state.text_resources = resources;
+    cache.submit(resize_epoch, &packet)?;
     Ok(())
 }
 
@@ -4482,9 +4493,9 @@ const fn item_height(item: &ListItem) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    state: &SwitcherState,
+    _state: &SwitcherState,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    cache: &mut TextLayoutCache,
     text: &str,
     size: f32,
     color: Color,
@@ -4492,22 +4503,18 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = layout_ui_text(state.pane, text, size, max_width, size + 4.0, color)
+    cache
+        .draw_text_clipped(
+            packet,
+            text,
+            size,
+            max_width,
+            size + 4.0,
+            color,
+            x,
+            y,
+        )
         .map_err(|error| format!("layout session switcher text: {error}"))?;
-    resources.push(layout.handle);
-    packet.push(Command::Save);
-    packet.push(Command::ClipRect(Rect::new(
-        x,
-        y,
-        max_width.max(1.0),
-        size + 4.0,
-    )));
-    packet.push(Command::DrawTextLayout {
-        layout: layout.handle,
-        x,
-        y,
-    });
-    packet.push(Command::Restore);
     Ok(())
 }
 

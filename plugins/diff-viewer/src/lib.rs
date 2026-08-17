@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
-};
+use std::sync::Mutex;
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_plugin_sdk::{
@@ -11,7 +8,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize},
+    graphics::{TextLayoutCache, reuse_pane_content},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::run_process,
 };
@@ -105,21 +102,6 @@ struct ScrollbarGeometry {
     thumb_height: f32,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct TextLayoutKey {
-    text: String,
-    font_size: u32,
-    max_width: u32,
-    line_height: u32,
-    color: [u32; 4],
-}
-
-struct TextResources<'a> {
-    pane: u64,
-    layouts: &'a mut BTreeMap<TextLayoutKey, u64>,
-    used: &'a mut BTreeSet<u64>,
-}
-
 struct ViewerState {
     pane: u64,
     width: f32,
@@ -134,7 +116,7 @@ struct ViewerState {
     scrollbar_hovered: bool,
     refresh_hovered: bool,
     refresh_pressed: bool,
-    text_layouts: BTreeMap<TextLayoutKey, u64>,
+    text_cache: Option<TextLayoutCache>,
 }
 
 impl ViewerState {
@@ -159,7 +141,7 @@ impl ViewerState {
             scrollbar_hovered: false,
             refresh_hovered: false,
             refresh_pressed: false,
-            text_layouts: BTreeMap::new(),
+            text_cache: None,
         }
     }
 
@@ -452,24 +434,26 @@ fn redraw_for_resize_or_record_error(state: &mut ViewerState, resize_epoch: Opti
 }
 
 fn redraw(state: &mut ViewerState, resize_epoch: Option<u64>) -> Result<(), String> {
-    let mut text_layouts = std::mem::take(&mut state.text_layouts);
-    let result = redraw_with_layouts(state, &mut text_layouts, resize_epoch);
-    state.text_layouts = text_layouts;
+    let mut text_cache = state
+        .text_cache
+        .take()
+        .unwrap_or_else(|| TextLayoutCache::new(state.pane));
+    text_cache.set_pane(state.pane);
+    let result = redraw_with_cache(state, &mut text_cache, resize_epoch);
+    if result.is_err() {
+        text_cache.abort_frame();
+    }
+    state.text_cache = Some(text_cache);
     result
 }
 
-fn redraw_with_layouts(
+fn redraw_with_cache(
     state: &ViewerState,
-    text_layouts: &mut BTreeMap<TextLayoutKey, u64>,
+    text_cache: &mut TextLayoutCache,
     resize_epoch: Option<u64>,
 ) -> Result<(), String> {
     let mut packet = Packet::new();
-    let mut used_layouts = BTreeSet::new();
-    let mut text_resources = TextResources {
-        pane: state.pane,
-        layouts: text_layouts,
-        used: &mut used_layouts,
-    };
+    text_cache.begin_frame();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: BG,
@@ -484,7 +468,7 @@ fn redraw_with_layouts(
     });
     add_text(
         &mut packet,
-        &mut text_resources,
+        text_cache,
         "Project Diff",
         17.0,
         TEXT,
@@ -503,7 +487,7 @@ fn redraw_with_layouts(
     };
     add_text(
         &mut packet,
-        &mut text_resources,
+        text_cache,
         &summary,
         13.0,
         if state.loading { MODIFIED } else { MUTED },
@@ -526,7 +510,7 @@ fn redraw_with_layouts(
     });
     add_text(
         &mut packet,
-        &mut text_resources,
+        text_cache,
         if state.loading {
             "Refreshing…"
         } else {
@@ -563,15 +547,7 @@ fn redraw_with_layouts(
     for row in &state.document.rows {
         let height = row.height();
         if y + height >= content_top && y <= content_bottom {
-            draw_row(
-                state,
-                &mut packet,
-                &mut text_resources,
-                row,
-                y,
-                height,
-                split_x,
-            )?;
+            draw_row(state, &mut packet, text_cache, row, y, height, split_x)?;
         }
         y += height;
         if y > content_bottom {
@@ -583,7 +559,7 @@ fn redraw_with_layouts(
     if state.document.rows.is_empty() && state.error.is_none() {
         add_text(
             &mut packet,
-            &mut text_resources,
+            text_cache,
             if state.loading {
                 "Loading project changes…"
             } else {
@@ -597,7 +573,7 @@ fn redraw_with_layouts(
         )?;
         add_text(
             &mut packet,
-            &mut text_resources,
+            text_cache,
             if state.loading {
                 "Git runs in a worker; the pane remains responsive."
             } else {
@@ -618,7 +594,7 @@ fn redraw_with_layouts(
         });
         add_text(
             &mut packet,
-            &mut text_resources,
+            text_cache,
             "Could not load project diff",
             17.0,
             DELETED,
@@ -628,7 +604,7 @@ fn redraw_with_layouts(
         )?;
         add_text(
             &mut packet,
-            &mut text_resources,
+            text_cache,
             &one_line(error, 180),
             13.0,
             FG,
@@ -655,7 +631,7 @@ fn redraw_with_layouts(
     };
     add_text(
         &mut packet,
-        &mut text_resources,
+        text_cache,
         footer,
         11.0,
         MUTED,
@@ -664,26 +640,14 @@ fn redraw_with_layouts(
         state.width - 28.0,
     )?;
 
-    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
-
-    let stale = text_resources
-        .layouts
-        .iter()
-        .filter_map(|(key, handle)| (!text_resources.used.contains(handle)).then_some(key.clone()))
-        .collect::<Vec<_>>();
-    for key in stale {
-        let Some(handle) = text_resources.layouts.remove(&key) else {
-            continue;
-        };
-        drop_resources(state.pane, [handle]);
-    }
+    text_cache.submit(resize_epoch, &packet)?;
     Ok(())
 }
 
 fn draw_row(
     state: &ViewerState,
     packet: &mut Packet,
-    text_resources: &mut TextResources<'_>,
+    text_cache: &mut TextLayoutCache,
     row: &DisplayRow,
     y: f32,
     height: f32,
@@ -705,7 +669,7 @@ fn draw_row(
             });
             add_text(
                 packet,
-                text_resources,
+                text_cache,
                 &one_line(path, 160),
                 14.0,
                 TEXT,
@@ -715,7 +679,7 @@ fn draw_row(
             )?;
             add_text(
                 packet,
-                text_resources,
+                text_cache,
                 &format!("+{additions}  −{deletions}"),
                 12.0,
                 MUTED,
@@ -731,7 +695,7 @@ fn draw_row(
             });
             add_text(
                 packet,
-                text_resources,
+                text_cache,
                 &one_line(header, 180),
                 12.0,
                 MUTED,
@@ -782,7 +746,7 @@ fn draw_row(
             if let Some(line) = old_line {
                 add_text(
                     packet,
-                    text_resources,
+                    text_cache,
                     &line.to_string(),
                     11.0,
                     LINE_NUMBER,
@@ -794,7 +758,7 @@ fn draw_row(
             if let Some(line) = new_line {
                 add_text(
                     packet,
-                    text_resources,
+                    text_cache,
                     &line.to_string(),
                     11.0,
                     LINE_NUMBER,
@@ -808,7 +772,7 @@ fn draw_row(
             if let Some(text) = left {
                 add_text(
                     packet,
-                    text_resources,
+                    text_cache,
                     &one_line(&expand_tabs(text), left_chars),
                     12.0,
                     FG,
@@ -820,7 +784,7 @@ fn draw_row(
             if let Some(text) = right {
                 add_text(
                     packet,
-                    text_resources,
+                    text_cache,
                     &one_line(&expand_tabs(text), right_chars),
                     12.0,
                     FG,
@@ -943,7 +907,7 @@ fn apply_pointer_scroll(state: &mut ViewerState, vertical: f32) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn add_text(
     packet: &mut Packet,
-    resources: &mut TextResources<'_>,
+    text_cache: &mut TextLayoutCache,
     text: &str,
     size: f32,
     color: Color,
@@ -953,27 +917,10 @@ fn add_text(
 ) -> Result<(), String> {
     let max_width = max_width.max(1.0);
     let line_height = size + 3.0;
-    let key = TextLayoutKey {
-        text: text.to_string(),
-        font_size: size.to_bits(),
-        max_width: max_width.to_bits(),
-        line_height: line_height.to_bits(),
-        color: [
-            color.r.to_bits(),
-            color.g.to_bits(),
-            color.b.to_bits(),
-            color.a.to_bits(),
-        ],
-    };
-    let handle = if let Some(handle) = resources.layouts.get(&key) {
-        *handle
-    } else {
-        let layout = layout_ui_text(resources.pane, text, size, max_width, line_height, color)
-            .map_err(|error| format!("layout diff text: {error}"))?;
-        resources.layouts.insert(key, layout.handle);
-        layout.handle
-    };
-    resources.used.insert(handle);
+    let handle = text_cache
+        .layout_text(text, size, max_width, line_height, color)
+        .map_err(|error| format!("layout diff text: {error}"))?
+        .handle;
     packet.push(Command::DrawTextLayout {
         layout: handle,
         x,

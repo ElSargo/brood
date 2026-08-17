@@ -8,7 +8,7 @@ use brood_plugin_sdk::{
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
+    graphics::UiFrame,
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::truncate_to_width,
 };
@@ -582,7 +582,7 @@ fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch:
 fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(), String> {
     let panel = state.panel();
     let mut packet = Packet::new();
-    let mut resources = Vec::new();
+    let mut frame = UiFrame::new(state.pane);
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: SCRIM,
@@ -609,7 +609,7 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        &mut frame,
         title,
         18.0,
         TEXT,
@@ -631,7 +631,7 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        &mut frame,
         &truncate_to_width(&detail, panel.width - SIDE_MARGIN * 2.0, 12.0),
         12.0,
         MUTED,
@@ -663,7 +663,7 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        &mut frame,
         if state.status.is_empty() {
             "Press the new shortcut · Esc cancels"
         } else {
@@ -678,7 +678,7 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        &mut frame,
         "Action selection is provided by the shared picker",
         10.0,
         MUTED,
@@ -687,17 +687,15 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
         panel.width - SIDE_MARGIN * 2.0,
     )?;
 
-    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
-    drop_resources(state.pane, state.text_resources.drain(..));
-    state.text_resources = resources;
+    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    state: &KeybindingsState,
+    _state: &KeybindingsState,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    frame: &mut UiFrame,
     text: &str,
     size: f32,
     color: Color,
@@ -705,22 +703,18 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = layout_ui_text(state.pane, text, size, max_width, size + 4.0, color)
+    frame
+        .draw_text_clipped(
+            packet,
+            text,
+            size,
+            max_width,
+            size + 4.0,
+            color,
+            x,
+            y,
+        )
         .map_err(|error| format!("layout keybinding text: {error}"))?;
-    resources.push(layout.handle);
-    packet.push(Command::Save);
-    packet.push(Command::ClipRect(Rect::new(
-        x,
-        y,
-        max_width.max(1.0),
-        size + 4.0,
-    )));
-    packet.push(Command::DrawTextLayout {
-        layout: layout.handle,
-        x,
-        y,
-    });
-    packet.push(Command::Restore);
     Ok(())
 }
 

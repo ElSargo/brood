@@ -7,7 +7,7 @@ use brood_plugin_sdk::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
     },
     graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
+        UiFrame, reuse_pane_content,
     },
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::one_line,
@@ -330,9 +330,8 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
     if state.pane == 0 {
         return Ok(());
     }
-    let stale_resources = std::mem::take(&mut state.text_resources);
     let mut packet = Packet::new();
-    let mut resources = Vec::new();
+    let mut frame = UiFrame::new(state.pane);
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: BG,
@@ -348,7 +347,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
     add_text(
         state.pane,
         &mut packet,
-        &mut resources,
+        &mut frame,
         "Inbox",
         17.0,
         TEXT,
@@ -359,7 +358,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
     add_text(
         state.pane,
         &mut packet,
-        &mut resources,
+        &mut frame,
         &state.items.len().to_string(),
         12.0,
         ACCENT,
@@ -372,7 +371,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
         add_text(
             state.pane,
             &mut packet,
-            &mut resources,
+            &mut frame,
             "No notifications",
             14.0,
             MUTED,
@@ -416,7 +415,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             add_text(
                 state.pane,
                 &mut packet,
-                &mut resources,
+                &mut frame,
                 category,
                 10.0,
                 if item.failed { ERROR } else { ACCENT },
@@ -428,7 +427,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
                 add_text(
                     state.pane,
                     &mut packet,
-                    &mut resources,
+                    &mut frame,
                     if pressed { "Opening…" } else { "Open  ›" },
                     10.0,
                     ACCENT,
@@ -440,7 +439,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             add_text(
                 state.pane,
                 &mut packet,
-                &mut resources,
+                &mut frame,
                 &truncate(&item.title, state.width, 13.0),
                 13.0,
                 FG,
@@ -451,7 +450,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             add_text(
                 state.pane,
                 &mut packet,
-                &mut resources,
+                &mut frame,
                 &truncate(&item.detail, state.width, 11.0),
                 11.0,
                 MUTED,
@@ -465,7 +464,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
         add_text(
             state.pane,
             &mut packet,
-            &mut resources,
+            &mut frame,
             &one_line(&state.error, 80),
             10.0,
             ERROR,
@@ -474,18 +473,16 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             state.width - 24.0,
         )?;
     }
-    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
-    drop_resources(state.pane, stale_resources);
-    state.text_resources = resources;
+    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
     state.error.clear();
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    pane: u64,
+    _pane: u64,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    frame: &mut UiFrame,
     text: &str,
     size: f32,
     color: Color,
@@ -493,14 +490,9 @@ fn add_text(
     y: f32,
     width: f32,
 ) -> Result<(), String> {
-    let layout = layout_ui_text(pane, text, size, width, size * 1.3, color)
+    frame
+        .draw_text_clipped(packet, text, size, width, size * 1.3, color, x, y)
         .map_err(|error| format!("layout inbox text: {error}"))?;
-    resources.push(layout.handle);
-    packet.push(DrawCommand::DrawTextLayout {
-        layout: layout.handle,
-        x,
-        y,
-    });
     Ok(())
 }
 
