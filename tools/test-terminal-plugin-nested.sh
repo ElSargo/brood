@@ -467,13 +467,13 @@ for _ in $(seq 1 100); do
     rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
   )"
   if ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE)) \
-    && rg -a -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT1_LOG"; then
+    && rg -a -q "staged plugin draw pane=$INBOX_PANE .* gpu_target=320x686 " "$CLIENT1_LOG"; then
     break
   fi
   sleep 0.05
 done
 ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE))
-rg -a -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT1_LOG"
+rg -a -q "staged plugin draw pane=$INBOX_PANE .* gpu_target=320x686 " "$CLIENT1_LOG"
 INBOX_CLICK_X=$((1280 - 320 / 2))
 wayland_env "$OUT/virtual-pointer-input" click "$INBOX_CLICK_X" 100 1280 720
 for _ in $(seq 1 100); do
