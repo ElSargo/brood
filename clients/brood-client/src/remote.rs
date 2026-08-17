@@ -36,7 +36,6 @@ use brood_wasm::{
 
 const INPUT_CAPACITY: usize = 512;
 const RELIABLE_CAPACITY: usize = 128;
-const MAX_DEFERRED_CRITICAL_INPUTS: usize = 512;
 const MAX_PENDING_BACKEND_REQUESTS: usize = 128;
 const MAX_PENDING_SCENES: usize = 4;
 const MAX_PENDING_FRAME_PACKETS: usize = 256;
@@ -594,11 +593,11 @@ async fn send_actor_messages(
                         usize::try_from(session % 4).unwrap_or_default()
                     }
                 };
-                senders
-                    .get(lane)
-                    .context("interactive actor lane index is invalid")?
-                    .try_send(command)
-                    .map_err(|_error| anyhow!("interactive actor sender is full or stopped"))?;
+                send_retained(
+                    senders.get(lane).context("interactive actor lane index is invalid")?,
+                    command,
+                    "interactive actor sender stopped",
+                ).await?;
             }
         }
     }
@@ -607,6 +606,13 @@ async fn send_actor_messages(
         completed.context("interactive actor sender panicked")??;
     }
     Ok(())
+}
+
+async fn send_retained<T>(sender: &tokio_mpsc::Sender<T>, value: T, closed: &str) -> Result<()> {
+    sender
+        .send(value)
+        .await
+        .map_err(|_error| anyhow!(closed.to_string()))
 }
 
 async fn send_actor_lane(
@@ -1225,13 +1231,10 @@ impl RemoteInputLane {
     }
 
     fn defer(&mut self, message: ClientMessage) -> bool {
-        if self.deferred.len() >= MAX_DEFERRED_CRITICAL_INPUTS {
-            eprintln!("critical network input backlog is full");
-            return false;
-        }
         if self.deferred.is_empty() {
             eprintln!("critical network input lane backpressured; deferring input messages");
         }
+        debug_assert!(self.deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG);
         self.deferred.push_back(message);
         self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
         true
@@ -1270,11 +1273,15 @@ impl RemoteActorMessageLane {
             queued_at: Instant::now(),
         };
         if self.has_deferred() {
-            return self.defer(command);
+            self.defer(command);
+            return Ok(());
         }
         match self.sender.try_send(command) {
             Ok(()) => Ok(()),
-            Err(tokio_mpsc::error::TrySendError::Full(command)) => self.defer(command),
+            Err(tokio_mpsc::error::TrySendError::Full(command)) => {
+                self.defer(command);
+                Ok(())
+            }
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
                 bail!("remote actor-message channel is closed")
             }
@@ -1301,19 +1308,16 @@ impl RemoteActorMessageLane {
         !self.deferred.is_empty()
     }
 
-    fn defer(&mut self, command: ActorCommand) -> Result<()> {
-        ensure!(
-            self.deferred.len() < 64,
-            "remote actor-message backlog is full"
-        );
+    fn defer(&mut self, command: ActorCommand) {
+        debug_assert!(self.deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG);
         self.deferred.push_back(command);
-        Ok(())
     }
 }
 
 #[derive(Clone)]
 pub struct RemoteBackendCommandLane {
     sender: tokio_mpsc::Sender<ReliableCommand>,
+    deferred: Arc<std::sync::Mutex<VecDeque<ReliableCommand>>>,
     next_request: Arc<AtomicU64>,
 }
 
@@ -1321,6 +1325,7 @@ impl RemoteBackendCommandLane {
     fn new(sender: tokio_mpsc::Sender<ReliableCommand>) -> Self {
         Self {
             sender,
+            deferred: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             next_request: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -1355,27 +1360,88 @@ impl RemoteBackendCommandLane {
     }
 
     pub fn try_release_resource(&self, resource: u64) -> Result<()> {
-        self.sender
-            .try_send(ReliableCommand::ReleaseResource(resource))
-            .context("remote resource-release queue is full or closed")
+        self.send_retained(ReliableCommand::ReleaseResource(resource))
     }
 
     fn try_send_command(&self, operation: BackendOperation, context: PendingBackend) -> Result<()> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        self.sender
-            .try_send(ReliableCommand::Backend {
-                request: BackendRequest { id, operation },
-                context,
-            })
-            .context("remote backend command queue is full or closed")
+        self.send_retained(ReliableCommand::Backend {
+            request: BackendRequest { id, operation },
+            context,
+        })
+    }
+
+    fn send_retained(&self, command: ReliableCommand) -> Result<()> {
+        let mut deferred = self
+            .deferred
+            .lock()
+            .map_err(|error| anyhow!("remote backend command backlog is poisoned: {error}"))?;
+        if !deferred.is_empty() {
+            ensure!(
+                deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG,
+                "remote backend command backlog is full"
+            );
+            deferred.push_back(command);
+            drop(deferred);
+            return Ok(());
+        }
+        match self.sender.try_send(command) {
+            Ok(()) => {
+                drop(deferred);
+                Ok(())
+            }
+            Err(tokio_mpsc::error::TrySendError::Full(command)) => {
+                ensure!(
+                    deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG,
+                    "remote backend command backlog is full"
+                );
+                deferred.push_back(command);
+                drop(deferred);
+                Ok(())
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                drop(deferred);
+                bail!("remote backend command queue is closed")
+            }
+        }
+    }
+
+    pub fn flush_deferred(&self) {
+        let Ok(mut deferred) = self.deferred.lock() else {
+            return;
+        };
+        while let Some(command) = deferred.pop_front() {
+            match self.sender.try_send(command) {
+                Ok(()) => {}
+                Err(tokio_mpsc::error::TrySendError::Full(command)) => {
+                    deferred.push_front(command);
+                    break;
+                }
+                Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                    deferred.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn has_deferred(&self) -> bool {
+        self.deferred
+            .lock()
+            .is_ok_and(|deferred| !deferred.is_empty())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use brood_protocol::{ClientMessage, InputEvent, PanePosition};
+    use brood_protocol::{BackendActorRealm, BackendId, ClientMessage, InputEvent, PanePosition};
 
-    use super::RemoteInputLane;
+    use super::{
+        ReliableCommand, RemoteActorMessageLane, RemoteBackendCommandLane, RemoteInputLane,
+        send_retained,
+    };
+    use crate::actor_runtime::BackendActorMessageRequest;
+    use std::time::Duration;
 
     fn pointer(x: f64) -> ClientMessage {
         ClientMessage::Input(InputEvent::PointerMotion {
@@ -1398,5 +1464,85 @@ mod tests {
             critical_receiver.try_recv().ok(),
             Some(ClientMessage::Input(InputEvent::KeyboardReset))
         );
+    }
+
+    #[test]
+    fn critical_input_is_retained_fifo_beyond_channel_capacity() {
+        let (critical_sender, mut critical_receiver) = tokio::sync::mpsc::channel(1);
+        let (latest_sender, _latest_receiver) = tokio::sync::watch::channel(None);
+        let mut lane = RemoteInputLane::new(critical_sender, latest_sender);
+
+        for _ in 0..=crate::actor_runtime::ACTOR_OUTPUT_BACKLOG {
+            assert!(lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
+            assert!(lane.deferred.len() <= crate::actor_runtime::ACTOR_OUTPUT_BACKLOG);
+        }
+        assert_eq!(
+            lane.deferred.len(),
+            crate::actor_runtime::ACTOR_OUTPUT_BACKLOG
+        );
+        for _ in 0..=crate::actor_runtime::ACTOR_OUTPUT_BACKLOG {
+            assert_eq!(
+                critical_receiver.try_recv().ok(),
+                Some(ClientMessage::Input(InputEvent::KeyboardReset))
+            );
+            lane.flush_deferred();
+        }
+        assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn actor_messages_are_retained_fifo_beyond_channel_capacity() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut lane = RemoteActorMessageLane::new(sender);
+        for sequence in 0_u16..256 {
+            lane.send(&BackendActorMessageRequest {
+                backend: BackendId(1),
+                sender: "source".to_string(),
+                realm: BackendActorRealm::Daemon,
+                actor: "sink".to_string(),
+                body: sequence.to_le_bytes().to_vec(),
+            })
+            .unwrap();
+        }
+        for sequence in 0_u16..256 {
+            let command = receiver.try_recv().unwrap();
+            assert_eq!(command.message.body, sequence.to_le_bytes());
+            lane.flush_deferred();
+        }
+        assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn reliable_backend_records_are_retained_fifo_until_closed() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let lane = RemoteBackendCommandLane::new(sender);
+        for resource in 0..256 {
+            lane.try_release_resource(resource).unwrap();
+        }
+        for resource in 0..256 {
+            lane.flush_deferred();
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                ReliableCommand::ReleaseResource(actual) if actual == resource
+            ));
+        }
+        lane.flush_deferred();
+        assert!(!lane.has_deferred());
+    }
+
+    #[tokio::test]
+    async fn remote_actor_fanout_waits_for_capacity_without_losing_the_record() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(1_u8).await.unwrap();
+        let pending = send_retained(&sender, 2_u8, "closed");
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), pending.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(receiver.recv().await, Some(1));
+        pending.await.unwrap();
+        assert_eq!(receiver.recv().await, Some(2));
     }
 }

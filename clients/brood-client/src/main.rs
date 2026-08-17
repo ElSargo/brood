@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -97,7 +97,6 @@ pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false
 const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const SYNCHRONIZED_RESIZE_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS: usize = 64;
-const MAX_DEFERRED_ACTOR_HOST_MESSAGES: usize = 128;
 const MAX_POINTER_INTERACTIONS: usize = 64;
 const MAX_POINTER_INTERACTION_SEQUENCES: usize = 64;
 const MAX_ACTIVE_RESIZE_REGIONS: usize = 32;
@@ -1942,6 +1941,8 @@ struct LocalInputLane {
     pane_routes: BTreeMap<u64, u64>,
 }
 
+const RETAINED_LANE_BACKLOG: usize = actor_runtime::ACTOR_OUTPUT_BACKLOG;
+
 enum ActorMessageLane {
     Local(LocalActorMessageLane),
     Remote(remote::RemoteActorMessageLane),
@@ -1972,10 +1973,12 @@ impl LocalActorMessageLane {
             &message.body,
         )?;
         if self.has_deferred() {
-            return self.defer(record);
+            self.defer(record);
+            return Ok(());
         }
         if let Err(record) = self.producer.try_send(record) {
-            return self.defer(record);
+            self.defer(record);
+            return Ok(());
         }
         self.notifications.notify()?;
         Ok(())
@@ -1995,13 +1998,9 @@ impl LocalActorMessageLane {
         }
     }
 
-    fn defer(&mut self, record: Box<brood_ipc::ActorMessageRecord>) -> Result<()> {
-        anyhow::ensure!(
-            self.deferred.len() < 64,
-            "presentation actor-message backlog is full"
-        );
+    fn defer(&mut self, record: Box<brood_ipc::ActorMessageRecord>) {
+        debug_assert!(self.deferred.len() < RETAINED_LANE_BACKLOG);
         self.deferred.push_back(record);
-        Ok(())
     }
 
     fn has_deferred(&self) -> bool {
@@ -2149,6 +2148,7 @@ impl LocalInputLane {
         if self.deferred.is_empty() {
             eprintln!("presentation input lane backpressured; deferring input records");
         }
+        debug_assert!(self.deferred.len() < RETAINED_LANE_BACKLOG);
         self.deferred.push_back(record);
         self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
     }
@@ -2360,6 +2360,7 @@ enum BackendCommandLane {
 
 struct LocalBackendCommandLane {
     sender: Option<mpsc::SyncSender<BackendRequest>>,
+    deferred: Mutex<VecDeque<BackendRequest>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -2415,27 +2416,86 @@ impl LocalBackendCommandLane {
             .context("spawn presentation backend command worker")?;
         Ok(Self {
             sender: Some(sender),
+            deferred: Mutex::new(VecDeque::new()),
             worker: Some(worker),
         })
     }
 
     fn try_send(&self, description: impl Into<String>, argv: Vec<String>) -> Result<()> {
-        self.sender
-            .as_ref()
-            .context("presentation backend command worker is stopped")?
-            .try_send(BackendRequest::Control(BackendCommand {
-                description: description.into(),
-                argv,
-            }))
-            .context("presentation backend command queue is full or closed")
+        self.send_request(BackendRequest::Control(BackendCommand {
+            description: description.into(),
+            argv,
+        }))
     }
 
     fn try_send_session(&self, command: actor_runtime::SessionCommandEnvelope) -> Result<()> {
-        self.sender
+        self.send_request(BackendRequest::Session(command))
+    }
+
+    fn send_request(&self, request: BackendRequest) -> Result<()> {
+        let sender = self
+            .sender
             .as_ref()
-            .context("presentation backend command worker is stopped")?
-            .try_send(BackendRequest::Session(command))
-            .context("presentation session-command queue is full or closed")
+            .context("presentation backend command worker is stopped")?;
+        let mut deferred = self.deferred.lock().map_err(|error| {
+            anyhow!("presentation backend command backlog is poisoned: {error}")
+        })?;
+        if !deferred.is_empty() {
+            anyhow::ensure!(
+                deferred.len() < RETAINED_LANE_BACKLOG,
+                "presentation backend command backlog is full"
+            );
+            deferred.push_back(request);
+            drop(deferred);
+            return Ok(());
+        }
+        match sender.try_send(request) {
+            Ok(()) => {
+                drop(deferred);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(request)) => {
+                anyhow::ensure!(
+                    deferred.len() < RETAINED_LANE_BACKLOG,
+                    "presentation backend command backlog is full"
+                );
+                deferred.push_back(request);
+                drop(deferred);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                drop(deferred);
+                anyhow::bail!("presentation backend command queue is closed")
+            }
+        }
+    }
+
+    fn flush_deferred(&self) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        let Ok(mut deferred) = self.deferred.lock() else {
+            return;
+        };
+        while let Some(request) = deferred.pop_front() {
+            match sender.try_send(request) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(request)) => {
+                    deferred.push_front(request);
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    deferred.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        self.deferred
+            .lock()
+            .is_ok_and(|deferred| !deferred.is_empty())
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -2450,6 +2510,22 @@ impl LocalBackendCommandLane {
 }
 
 impl BackendCommandLane {
+    fn flush_deferred(&self) {
+        match self {
+            Self::Local(lane) => lane.flush_deferred(),
+            Self::Remote(lane) => lane.flush_deferred(),
+            Self::Multi { lanes, .. } => lanes.values().for_each(|lane| lane.flush_deferred()),
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        match self {
+            Self::Local(lane) => lane.has_deferred(),
+            Self::Remote(lane) => lane.has_deferred(),
+            Self::Multi { lanes, .. } => lanes.values().any(|lane| lane.has_deferred()),
+        }
+    }
+
     fn remove_backend(&mut self, backend: BackendId) -> Result<bool> {
         let Self::Multi { lanes, default, .. } = self else {
             return Ok(false);
@@ -7673,7 +7749,6 @@ impl Application {
         } else {
             std::mem::take(&mut self.deferred_actor_host_messages)
         };
-        debug_assert!(messages.len() <= MAX_DEFERRED_ACTOR_HOST_MESSAGES);
         while self.pending_synchronized_layout_notifications.is_empty() {
             let Some(actor_message) = messages.pop_front() else {
                 break;
@@ -8252,10 +8327,6 @@ impl Application {
             renderer.window.request_redraw();
         }
         if !messages.is_empty() {
-            debug_assert!(
-                self.deferred_actor_host_messages.len() + messages.len()
-                    <= MAX_DEFERRED_ACTOR_HOST_MESSAGES
-            );
             self.deferred_actor_host_messages.append(&mut messages);
         }
         Ok(())
@@ -8270,11 +8341,29 @@ impl Application {
         if !self.pending_synchronized_layout_notifications.is_empty() {
             return true;
         }
+        // `Full` retains the record in the outbound lane. Pause actor output
+        // admission until the consumer catches up; the actor observer remains
+        // a lossless FIFO meanwhile.
+        if self.actor_message_sender.as_mut().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        }) {
+            return true;
+        }
+        if self.backend_commands.as_ref().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        }) {
+            return true;
+        }
         let result = (|| {
             let Some(runtime) = self.wasm_runtime.as_mut() else {
                 return Ok(());
             };
             runtime.drain_events()?;
+            if runtime.has_pending_actor_events() {
+                return Ok(());
+            }
             let pane_sessions = runtime.pane_realms().collect::<Vec<_>>();
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_plugin_pane_realms(&pane_sessions);
@@ -9503,6 +9592,10 @@ impl ApplicationHandler<ClientEvent> for Application {
             lane.flush_deferred();
             lane.has_deferred()
         });
+        let backend_command_backpressured = self.backend_commands.as_ref().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        });
         let synchronized_notification_backpressured =
             !self.pending_synchronized_layout_notifications.is_empty();
         // A full actor lane keeps the latest position for the next Winit turn.
@@ -9558,6 +9651,7 @@ impl ApplicationHandler<ClientEvent> for Application {
         };
         if input_backpressured
             || actor_message_backpressured
+            || backend_command_backpressured
             || synchronized_notification_backpressured
             || plugin_resize_backpressured
         {
@@ -16177,6 +16271,100 @@ mod tests {
     use super::*;
     use brood_layout::LayoutItemId;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    #[test]
+    fn local_critical_input_is_retained_fifo_beyond_ring_capacity() {
+        const GENERATION: u64 = 9;
+        let file = brood_ipc::CriticalLaneFile::create(GENERATION).unwrap();
+        let producer = brood_ipc::CriticalProducer::map(file.as_fd(), GENERATION).unwrap();
+        let mut consumer = brood_ipc::CriticalConsumer::map(file.as_fd(), GENERATION).unwrap();
+        let mut lane = LocalInputLane {
+            producer,
+            notifications: brood_ipc::EventNotifier::create().unwrap(),
+            generation: GENERATION,
+            sequence: 0,
+            deferred: VecDeque::new(),
+            deferred_high_water: 0,
+            coalesced_motion: 0,
+            pane_routes: BTreeMap::new(),
+        };
+
+        for _ in 0..256 {
+            assert!(lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
+            assert!(lane.deferred.len() <= RETAINED_LANE_BACKLOG);
+        }
+        for expected in 1..=256 {
+            let record = consumer.try_recv().expect("next retained input record");
+            assert_eq!(record.sequence, expected);
+            assert_eq!(
+                brood_ipc::decode_client_record(&record).unwrap(),
+                ClientMessage::Input(InputEvent::KeyboardReset)
+            );
+            drop(record);
+            lane.flush_deferred();
+        }
+        assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn local_actor_messages_are_retained_fifo_beyond_ring_capacity() {
+        const GENERATION: u64 = 11;
+        let file = brood_ipc::ActorMessageLaneFile::create(GENERATION).unwrap();
+        let producer = brood_ipc::ActorMessageProducer::map(file.as_fd(), GENERATION).unwrap();
+        let mut consumer = brood_ipc::ActorMessageConsumer::map(file.as_fd(), GENERATION).unwrap();
+        let mut lane = LocalActorMessageLane {
+            producer,
+            notifications: brood_ipc::EventNotifier::create().unwrap(),
+            generation: GENERATION,
+            sequence: 0,
+            deferred: VecDeque::new(),
+        };
+
+        for sequence in 1_u16..=256 {
+            lane.send(&actor_runtime::BackendActorMessageRequest {
+                backend: BackendId(1),
+                sender: "source".to_string(),
+                realm: BackendActorRealm::Daemon,
+                actor: "sink".to_string(),
+                body: sequence.to_le_bytes().to_vec(),
+            })
+            .unwrap();
+            assert!(lane.deferred.len() <= RETAINED_LANE_BACKLOG);
+        }
+        for sequence in 1_u16..=256 {
+            let record = consumer.try_recv().expect("next retained actor record");
+            assert_eq!(record.sequence(), u64::from(sequence));
+            assert_eq!(record.body().unwrap(), sequence.to_le_bytes());
+            drop(record);
+            lane.flush_deferred();
+        }
+        assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn local_backend_commands_are_retained_fifo_beyond_worker_capacity() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let lane = LocalBackendCommandLane {
+            sender: Some(sender),
+            deferred: Mutex::new(VecDeque::new()),
+            worker: None,
+        };
+        for sequence in 0..256 {
+            lane.try_send(sequence.to_string(), vec![sequence.to_string()])
+                .unwrap();
+            assert!(lane.deferred.lock().unwrap().len() <= RETAINED_LANE_BACKLOG);
+        }
+        for sequence in 0..256 {
+            lane.flush_deferred();
+            let BackendRequest::Control(command) = receiver.try_recv().unwrap() else {
+                panic!("expected retained control command");
+            };
+            assert_eq!(command.description, sequence.to_string());
+            assert_eq!(command.argv, vec![sequence.to_string()]);
+        }
+        lane.flush_deferred();
+        assert!(!lane.has_deferred());
+    }
 
     fn managed_route(view_pane: u64) -> ManagedPaneRoute {
         ManagedPaneRoute {

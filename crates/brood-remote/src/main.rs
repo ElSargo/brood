@@ -1368,11 +1368,14 @@ async fn send_server_messages(
                     },
                     _ => 0,
                 };
-                senders
-                    .get(lane)
-                    .context("remote actor lane index is invalid")?
-                    .try_send(message)
-                    .map_err(|_error| anyhow!("remote actor sender is full or stopped"))?;
+                // Actor records are lossless. Await capacity in the selected
+                // per-realm FIFO instead of treating transient saturation as
+                // a transport failure.
+                send_retained(
+                    senders.get(lane).context("remote actor lane index is invalid")?,
+                    message,
+                    "remote actor sender stopped",
+                ).await?;
             }
         }
     }
@@ -1381,6 +1384,38 @@ async fn send_server_messages(
         completed.context("remote actor sender panicked")??;
     }
     Ok(())
+}
+
+async fn send_retained<T>(sender: &mpsc::Sender<T>, value: T, closed: &str) -> Result<()> {
+    sender
+        .send(value)
+        .await
+        .map_err(|_error| anyhow!(closed.to_string()))
+}
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn server_actor_fanout_waits_for_capacity_without_losing_the_record() -> Result<()> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(1_u8)
+            .await
+            .map_err(|_error| anyhow!("test receiver stopped"))?;
+        let pending = send_retained(&sender, 2_u8, "closed");
+        tokio::pin!(pending);
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(1), pending.as_mut())
+                .await
+                .is_err()
+        );
+        ensure!(receiver.recv().await == Some(1));
+        pending.await?;
+        ensure!(receiver.recv().await == Some(2));
+        Ok(())
+    }
 }
 
 async fn send_server_actor_lane(

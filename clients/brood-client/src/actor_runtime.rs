@@ -10,13 +10,13 @@ use anyhow::{Context, Result, ensure};
 use brood_protocol::{BackendActorRealm, BackendId};
 use brood_wasm::{
     ActorId, ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
-    ComponentChildEvent, FilesystemGrant, HostedWasmActor, LegacyWasmActorGeneration,
-    LegacyWasmRuntimeEvent, Mailbox, NativeFilesystemWatcherService, PluginLifecycleEntry,
-    PluginLifecycleEvent, PluginStartContext, PluginStartReason, PresentationEvent,
-    PresentationScope, Preview1ActorCapabilities, Preview1CompatActor, Preview1FilesystemGrant,
-    Preview1WorkerConfig, Registry, RuntimeIoCapabilities, RuntimeIoConfig, SessionCommandRequest,
-    SessionEvent, SessionSnapshot, WasmActor, WasmActorDeclaration, WasmActorEventKind,
-    WasmPluginArtifact,
+    ComponentActorSendError, ComponentChildEvent, FilesystemGrant, HostedWasmActor,
+    LegacyWasmActorGeneration, LegacyWasmRuntimeEvent, Mailbox, NativeFilesystemWatcherService,
+    PluginLifecycleEntry, PluginLifecycleEvent, PluginStartContext, PluginStartReason,
+    PresentationEvent, PresentationScope, Preview1ActorCapabilities, Preview1CompatActor,
+    Preview1FilesystemGrant, Preview1WorkerConfig, Registry, RuntimeIoCapabilities,
+    RuntimeIoConfig, SessionCommandRequest, SessionEvent, SessionSnapshot, WasmActor,
+    WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
 };
 use tokio::sync::{Mutex, mpsc};
 use winit::event_loop::EventLoopProxy;
@@ -28,6 +28,7 @@ const ACTOR_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_START_MESSAGES: usize = 64;
 const MAX_PENDING_START_MESSAGE_BYTES: usize = 1024 * 1024;
+pub(crate) const ACTOR_OUTPUT_BACKLOG: usize = 256;
 
 type PendingStartMessage = (String, Vec<u8>);
 type PendingStartMailboxes = BTreeMap<String, VecDeque<PendingStartMessage>>;
@@ -69,6 +70,22 @@ pub struct PresentationWasmRuntime {
     workspace_root: PathBuf,
     session_workspaces: BTreeMap<(BackendId, u64), PathBuf>,
     session_snapshots: BTreeMap<BackendId, SessionSnapshot>,
+    pending_actor_events: std::sync::Mutex<VecDeque<PendingActorEvent>>,
+}
+
+enum PendingActorEvent {
+    Presentation {
+        actor: String,
+        event: PresentationEvent,
+    },
+    Session {
+        actor: String,
+        event: SessionEvent,
+    },
+    Child {
+        actor: String,
+        event: ComponentChildEvent,
+    },
 }
 
 pub struct BackendActorMessageRequest {
@@ -190,6 +207,7 @@ impl PresentationWasmRuntime {
             workspace_root,
             session_workspaces: BTreeMap::new(),
             session_snapshots: BTreeMap::new(),
+            pending_actor_events: std::sync::Mutex::new(VecDeque::new()),
         };
         if let Some(path) = init_actor {
             runtime.load_init_actor(path, bound_session, graphics)?;
@@ -482,8 +500,93 @@ impl PresentationWasmRuntime {
     }
 
     pub fn drain_events(&mut self) -> Result<()> {
+        self.flush_pending_actor_events()?;
+        if self.has_pending_actor_events() {
+            return Ok(());
+        }
         let graphics = self.graphics.clone();
         self.drain_events_with_graphics(graphics.as_ref())
+    }
+
+    pub fn has_pending_actor_events(&self) -> bool {
+        self.pending_actor_events
+            .lock()
+            .is_ok_and(|pending| !pending.is_empty())
+    }
+
+    fn flush_pending_actor_events(&self) -> Result<()> {
+        let mut pending = self.pending_actor_events.lock().map_err(|error| {
+            anyhow::anyhow!("pending component actor input is poisoned: {error}")
+        })?;
+        while let Some(command) = pending.pop_front() {
+            let retry = match command {
+                PendingActorEvent::Presentation { actor, event } => match self
+                    .component_actor(&actor)?
+                    .try_send_presentation_event(event)
+                {
+                    Ok(()) => None,
+                    Err(ComponentActorSendError::Full(event)) => {
+                        Some(PendingActorEvent::Presentation { actor, event })
+                    }
+                    Err(ComponentActorSendError::Closed(_)) => {
+                        anyhow::bail!("component actor {actor:?} command queue is closed")
+                    }
+                },
+                PendingActorEvent::Session { actor, event } => {
+                    match self.component_actor(&actor)?.try_send_session_event(event) {
+                        Ok(()) => None,
+                        Err(ComponentActorSendError::Full(event)) => {
+                            Some(PendingActorEvent::Session { actor, event })
+                        }
+                        Err(ComponentActorSendError::Closed(_)) => {
+                            anyhow::bail!("component actor {actor:?} command queue is closed")
+                        }
+                    }
+                }
+                PendingActorEvent::Child { actor, event } => {
+                    match self.component_actor(&actor)?.try_send_child_event(event) {
+                        Ok(()) => None,
+                        Err(ComponentActorSendError::Full(event)) => {
+                            Some(PendingActorEvent::Child { actor, event })
+                        }
+                        Err(ComponentActorSendError::Closed(_)) => {
+                            anyhow::bail!("component actor {actor:?} command queue is closed")
+                        }
+                    }
+                }
+            };
+            if let Some(command) = retry {
+                pending.push_front(command);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn component_actor(&self, id: &str) -> Result<&ComponentActor> {
+        match &self
+            .actors
+            .get(id)
+            .with_context(|| format!("presentation actor {id:?} is unavailable"))?
+            .actor
+        {
+            HostedWasmActor::Component(actor) => Ok(actor),
+            HostedWasmActor::Preview1(_) => {
+                anyhow::bail!("Preview 1 actor has no component command lane")
+            }
+        }
+    }
+
+    fn retain_actor_event(&self, command: PendingActorEvent) -> Result<()> {
+        let mut pending = self.pending_actor_events.lock().map_err(|error| {
+            anyhow::anyhow!("pending component actor input is poisoned: {error}")
+        })?;
+        anyhow::ensure!(
+            pending.len() < ACTOR_OUTPUT_BACKLOG,
+            "pending component actor input backlog is full"
+        );
+        pending.push_back(command);
+        Ok(())
     }
 
     fn drain_events_with_graphics(
@@ -495,7 +598,15 @@ impl PresentationWasmRuntime {
         for (actor_id, hosted) in &mut self.actors {
             match &mut hosted.actor {
                 HostedWasmActor::Component(actor) => {
-                    while let Some(event) = actor.try_recv_event() {
+                    while events.len()
+                        + self.outbound_backend_messages.len()
+                        + self.outbound_session_commands.len()
+                        + self.outbound_host_messages.len()
+                        < ACTOR_OUTPUT_BACKLOG
+                    {
+                        let Some(event) = actor.try_recv_event() else {
+                            break;
+                        };
                         events.push((actor_id.clone(), Ok(event)));
                     }
                 }
@@ -627,10 +738,6 @@ impl PresentationWasmRuntime {
                         destination.0.0,
                         destination.1,
                     );
-                    ensure!(
-                        self.outbound_backend_messages.len() < 64,
-                        "presentation actor backend-message queue is full"
-                    );
                     self.outbound_backend_messages
                         .push_back(BackendActorMessageRequest {
                             backend: destination.0,
@@ -659,10 +766,6 @@ impl PresentationWasmRuntime {
                         self.connected_backends.contains(&backend),
                         "presentation actor {actor_id:?} addressed unknown backend {}",
                         backend.0,
-                    );
-                    ensure!(
-                        self.outbound_backend_messages.len() < 64,
-                        "presentation actor backend-message queue is full"
                     );
                     self.outbound_backend_messages
                         .push_back(BackendActorMessageRequest {
@@ -724,10 +827,6 @@ impl PresentationWasmRuntime {
                             "presentation actor {actor_id:?} requested a different session"
                         );
                     }
-                    ensure!(
-                        self.outbound_session_commands.len() < 64,
-                        "presentation session-command queue is full"
-                    );
                     eprintln!(
                         "queued presentation actor session command actor={} request={} operation={:?}",
                         actor_id, request.request, request.operation
@@ -736,10 +835,6 @@ impl PresentationWasmRuntime {
                         .push_back(SessionCommandEnvelope { actor_id, request });
                 }
                 ComponentActorEvent::HostMessageRequested { payload } => {
-                    ensure!(
-                        self.outbound_host_messages.len() < 64,
-                        "presentation actor host-message queue is full"
-                    );
                     let sender = self
                         .actor_identity(&actor_id)
                         .context("component host message lost its actor identity")?;
@@ -1154,8 +1249,19 @@ impl PresentationWasmRuntime {
         else {
             return;
         };
-        if let Err(error) = actor.try_send_child_event(event) {
-            eprintln!("failed to deliver child lifecycle event to client init actor: {error:#}");
+        match actor.try_send_child_event(event) {
+            Ok(()) => {}
+            Err(ComponentActorSendError::Full(event)) => {
+                if let Err(error) = self.retain_actor_event(PendingActorEvent::Child {
+                    actor: CLIENT_INIT_ACTOR_ID.to_string(),
+                    event,
+                }) {
+                    eprintln!("failed to retain child lifecycle event: {error:#}");
+                }
+            }
+            Err(ComponentActorSendError::Closed(_)) => {
+                eprintln!("failed to deliver child lifecycle event: actor is closed");
+            }
         }
     }
 
@@ -1198,9 +1304,18 @@ impl PresentationWasmRuntime {
         let mut delivered = 0;
         for (actor_id, actor) in &self.actors {
             if let HostedWasmActor::Component(actor) = &actor.actor {
-                actor
-                    .try_send_session_event(event.clone())
-                    .with_context(|| format!("deliver session event to actor {actor_id:?}"))?;
+                match actor.try_send_session_event(event.clone()) {
+                    Ok(()) => {}
+                    Err(ComponentActorSendError::Full(event)) => {
+                        self.retain_actor_event(PendingActorEvent::Session {
+                            actor: actor_id.clone(),
+                            event,
+                        })?
+                    }
+                    Err(ComponentActorSendError::Closed(_)) => {
+                        anyhow::bail!("deliver session event to closed actor {actor_id:?}")
+                    }
+                }
                 delivered += 1;
             }
         }
@@ -1213,7 +1328,18 @@ impl PresentationWasmRuntime {
             .get(actor_id)
             .with_context(|| format!("presentation actor {actor_id:?} is unavailable"))?;
         match &actor.actor {
-            HostedWasmActor::Component(actor) => actor.try_send_session_event(event),
+            HostedWasmActor::Component(actor) => match actor.try_send_session_event(event) {
+                Ok(()) => Ok(()),
+                Err(ComponentActorSendError::Full(event)) => {
+                    self.retain_actor_event(PendingActorEvent::Session {
+                        actor: actor_id.to_string(),
+                        event,
+                    })
+                }
+                Err(ComponentActorSendError::Closed(_)) => {
+                    anyhow::bail!("component actor command queue is closed")
+                }
+            },
             HostedWasmActor::Preview1(_) => {
                 anyhow::bail!("Preview 1 compatibility actors cannot use session control")
             }
@@ -1303,7 +1429,23 @@ impl PresentationWasmRuntime {
             .find(|actor| actor.pane == pane)
             .with_context(|| format!("presentation pane {pane} has no actor"))?;
         match &actor.actor {
-            HostedWasmActor::Component(actor) => actor.try_send_presentation_event(event),
+            HostedWasmActor::Component(actor) => match actor.try_send_presentation_event(event) {
+                Ok(()) => Ok(()),
+                Err(ComponentActorSendError::Full(event)) => {
+                    self.retain_actor_event(PendingActorEvent::Presentation {
+                        actor: self
+                            .actors
+                            .iter()
+                            .find(|(_, candidate)| candidate.pane == pane)
+                            .map(|(id, _)| id.clone())
+                            .unwrap(),
+                        event,
+                    })
+                }
+                Err(ComponentActorSendError::Closed(_)) => {
+                    anyhow::bail!("component actor command queue is closed")
+                }
+            },
             HostedWasmActor::Preview1(_) => {
                 anyhow::bail!("Preview 1 compatibility actors cannot own presentation panes")
             }
